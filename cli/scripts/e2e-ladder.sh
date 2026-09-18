@@ -78,6 +78,9 @@
 #   CURIE_E2E_LIVE         1 = real model on every named rung, including
 #                            rung 1 (cli/scripts/e2e.sh reads this same var
 #                            itself rather than being told by the ladder).
+#   CURIE_E2E_HOOK_APPROVAL
+#                          1 = run the standalone hook approval proof and exit
+#                            before the ordinary ladder setup.
 #   CURIE_NAMESPACE        Kubernetes namespace the cluster rung targets.
 #                            Default curie when unset on the regular path
 #                            (empty-but-set does not default). Forwarded as
@@ -120,6 +123,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ "${CURIE_E2E_HOOK_APPROVAL:-0}" == "1" ]]; then
+    exec python3 "$REPO_ROOT/charts/curie/ci/hook-approval-proof.py"
+fi
+
 TIERS="${CURIE_E2E_TIERS:-skill,local}"
 LIVE="${CURIE_E2E_LIVE:-0}"
 # Fixed, not an env knob: the ladder asserts PLUMBING, so the bundle it ships is

@@ -1628,6 +1628,37 @@ def test_matching_patch_milestone_on_main_passes(tmp_path: Path) -> None:
     assert not call_log.exists(), "an excused declaration must not run curie"
 
 
+def test_v092_patch_milestone_accepts_main_and_rejects_next(tmp_path: Path) -> None:
+    main_path = tmp_path / "main"
+    main_path.mkdir()
+    accepted, main_call_log = _run_checker(
+        main_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone="v0.9.2",
+        base_ref="main",
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert not main_call_log.exists(), "an excused declaration must not run curie"
+
+    next_path = tmp_path / "next"
+    next_path.mkdir()
+    rejected, next_call_log = _run_checker(
+        next_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone="v0.9.2",
+        base_ref="next",
+    )
+    shown = f"{rejected.stdout}\n{rejected.stderr}"
+    assert rejected.returncode != 0, shown
+    assert "v0.9.2" in rejected.stderr, shown
+    assert "maps to main" in rejected.stderr, shown
+    assert "targets next" in rejected.stderr, shown
+    assert not next_call_log.exists(), "a train mismatch must not run curie"
+
+
 def test_one_exact_same_repository_prerequisite_resolves_the_effective_train(
     tmp_path: Path,
 ) -> None:
