@@ -96,9 +96,7 @@ def test_secretref_only_connector_is_not_a_failed_capability(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     dialed: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        "curie_runner.mcp_tool_capability._probe_server", _answering_probe(dialed)
-    )
+    monkeypatch.setattr("curie_runner.mcp_tool_capability._probe_server", _answering_probe(dialed))
     monkeypatch.delenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", raising=False)
 
     derived = derive_mcp_servers(_bundle(tmp_path, SECRETREF_ONLY), **SCOPE)
@@ -111,7 +109,9 @@ def test_secretref_only_connector_is_not_a_failed_capability(
 
     assert boot.connector_failures == ()
     assert [config["url"] for config in dialed] == [derived["grafana"]["url"]]
-    decision = _hook_decision(ConnectorAvailability(boot.connector_failures), "mcp__grafana__search_dashboards")
+    decision = _hook_decision(
+        ConnectorAvailability(boot.connector_failures), "mcp__grafana__search_dashboards"
+    )
     assert decision.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
 
 
@@ -121,9 +121,7 @@ def test_named_secret_still_derives_the_bearer_and_reports_it_missing(
     # Negative control: a Curie-resolved secret IS delivered to the sandbox, so
     # the derived header stays and a missing value is still a real failure.
     dialed: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        "curie_runner.mcp_tool_capability._probe_server", _answering_probe(dialed)
-    )
+    monkeypatch.setattr("curie_runner.mcp_tool_capability._probe_server", _answering_probe(dialed))
     monkeypatch.delenv("GITHUB_PERSONAL_ACCESS_TOKEN", raising=False)
 
     derived = derive_mcp_servers(_bundle(tmp_path, NAMED_SECRET), **SCOPE)
