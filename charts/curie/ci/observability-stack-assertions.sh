@@ -1104,7 +1104,7 @@ roles = [doc for doc in curie_install_docs if doc.get("kind") == "Role"
          and doc.get("metadata", {}).get("name") == role_name]
 assert len(roles) == 1
 restart_deployments = set(at(curie_values, "grafanaConnector", "restartDeploymentNames"))
-assert restart_deployments == {"curie-sre-bot-grafana", "curie-sre-bot-tempo"}
+assert restart_deployments == {"curie-sre-bot-mcp-grafana", "curie-sre-bot-mcp-tempo"}
 if mutation == "restart-scope":
     for rule in roles[0].get("rules", []):
         if "deployments" in rule.get("resources", []):
