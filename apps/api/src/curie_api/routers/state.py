@@ -21,7 +21,7 @@ from typing import Annotated, Any
 
 from curie_telemetry import record_metric
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from sqlalchemy import Text, cast, func, select, text
+from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import crud, sandbox_token
@@ -241,7 +241,7 @@ async def _enforce_caps(
             )
         raise HTTPException(
             413,
-            f"value is {value_bytes} bytes, over the "
+            f"value for key {key!r} is {value_bytes} bytes, over the "
             f"{settings.state_max_value_bytes}-byte per-value cap",
         )
 
@@ -279,9 +279,17 @@ async def _enforce_caps(
     if bool(has_multibyte) or (
         value_bytes + sibling_bound_bytes > settings.state_max_namespace_bytes
     ):
-        others = await session.scalars(select(WorkflowStateEntry.value).where(*sibling_filter))
-        namespace_bytes = value_bytes + sum(_json_size(v) for v in others)
+        others = await session.execute(
+            select(WorkflowStateEntry.key, WorkflowStateEntry.value).where(*sibling_filter)
+        )
+        sizes = {key: value_bytes}
+        sizes.update((other_key, _json_size(v)) for other_key, v in others)
+        namespace_bytes = sum(sizes.values())
         if namespace_bytes > settings.state_max_namespace_bytes:
+            # Name the key holding the most bytes (#2820): in the transcript
+            # namespace that is the runaway thread to recover, which is often
+            # not the thread whose append was refused.
+            largest = max(sizes, key=lambda k: (sizes[k], k == key))
             if namespace == "transcript":
                 record_metric(
                     "curie.history.persistence.failure",
@@ -295,7 +303,8 @@ async def _enforce_caps(
             raise HTTPException(
                 413,
                 f"namespace {namespace!r} would be {namespace_bytes} bytes, over the "
-                f"{settings.state_max_namespace_bytes}-byte per-namespace cap",
+                f"{settings.state_max_namespace_bytes}-byte per-namespace cap; "
+                f"largest key {largest!r} is {sizes[largest]} bytes",
             )
 
     # Per-agent namespace-count cap (#852): refuse only a NEW namespace, and only
@@ -667,12 +676,46 @@ async def list_state_for_binding(
 
 
 async def _delete_state(
-    agent_id: uuid.UUID, scope: str | None, namespace: str, key: str, session: AsyncSession
+    agent_id: uuid.UUID,
+    scope: str | None,
+    namespace: str,
+    key: str,
+    expected_version: int | None,
+    session: AsyncSession,
 ) -> Response:
+    # expected_version opts into compare-and-delete (#2820), so an operator
+    # that exported a transcript never deletes turns appended after the export.
+    # The version is a predicate of the DELETE itself, so an append that
+    # commits between the read and the delete cannot be removed with it.
     entry = await _get_entry(session, agent_id, scope, namespace, key)
-    if entry is not None:
-        await session.delete(entry)
-        await session.commit()
+    if expected_version is None:
+        if entry is not None:
+            await session.delete(entry)
+            await session.commit()
+    else:
+        stored = entry.version if entry is not None else None
+        deleted = None
+        if stored == expected_version and entry is not None:
+            deleted = await session.scalar(
+                delete(WorkflowStateEntry)
+                .where(
+                    WorkflowStateEntry.id == entry.id,
+                    WorkflowStateEntry.version == expected_version,
+                )
+                .returning(WorkflowStateEntry.id)
+            )
+            await session.commit()
+        if deleted is None:
+            if stored is None:
+                found = "entry does not exist"
+            elif stored != expected_version:
+                found = f"stored {stored}"
+            else:
+                found = "entry changed during the delete"
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"version mismatch: expected {expected_version}, {found}",
+            )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -682,9 +725,13 @@ async def _delete_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def delete_state(
-    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    expected_version: int | None = None,
 ) -> Response:
-    return await _delete_state(agent_id, None, namespace, key, session)
+    return await _delete_state(agent_id, None, namespace, key, expected_version, session)
 
 
 @router.delete(
@@ -693,7 +740,13 @@ async def delete_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def delete_state_for_binding(
-    agent_id: uuid.UUID, kind: str, address: str, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    expected_version: int | None = None,
 ) -> Response:
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _delete_state(agent_id, scope, namespace, key, session)
+    return await _delete_state(agent_id, scope, namespace, key, expected_version, session)
