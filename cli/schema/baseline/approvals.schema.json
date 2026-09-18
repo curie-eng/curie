@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v2.1.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.2.json",
   "title": "curie <tier> approvals --json",
-  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority.",
+  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds three further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; `recovered`, one approval administratively rejected under the recovery grant; and `resume_cancelled`, one approval's resume turn tombstoned, kept a distinct key from `resolved` so no consumer can mistake a cancellation for a resolution.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -161,6 +161,96 @@
       "required": [
         "resolution"
       ]
+    },
+    "approvalRecoveryOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The RECORDED outcome of one administrative act, read back off the approval row so a replay of the same `recovery_key` renders an identical body. NOT an approval record: it is keyed `approval_id`, carries no conversation fields, and names the reason, the actor and the instant the act landed.",
+      "properties": {
+        "approval_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "recovery_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recovered_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "approval_id",
+        "status",
+        "recovery_key",
+        "reason",
+        "actor",
+        "recovered_at"
+      ]
+    },
+    "approvalResumeCancellation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The RECORDED outcome of one administrative act, read back off the approval row so a replay of the same `recovery_key` renders an identical body. NOT an approval record: it is keyed `approval_id`, carries no conversation fields, and names the reason, the actor and the instant the act landed.",
+      "properties": {
+        "approval_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "recovery_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cancelled_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "approval_id",
+        "status",
+        "recovery_key",
+        "reason",
+        "actor",
+        "cancelled_at"
+      ]
     }
   },
   "oneOf": [
@@ -240,14 +330,26 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "token": {"type": "string"},
-            "subject": {"type": "string"},
-            "expires_at": {"type": "string"}
+            "token": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "expires_at": {
+              "type": "string"
+            }
           },
-          "required": ["token", "subject", "expires_at"]
+          "required": [
+            "token",
+            "subject",
+            "expires_at"
+          ]
         }
       },
-      "required": ["operator_principal"]
+      "required": [
+        "operator_principal"
+      ]
     },
     {
       "type": "object",
@@ -257,14 +359,26 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "code": {"type": "string"},
-            "subject": {"type": "string"},
-            "expires_at": {"type": "string"}
+            "code": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "expires_at": {
+              "type": "string"
+            }
           },
-          "required": ["code", "subject", "expires_at"]
+          "required": [
+            "code",
+            "subject",
+            "expires_at"
+          ]
         }
       },
-      "required": ["console_login_code"]
+      "required": [
+        "console_login_code"
+      ]
     },
     {
       "type": "object",
@@ -287,6 +401,43 @@
         "agent",
         "routes",
         "count"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "identity_report": {
+          "type": "object",
+          "description": "The reporter's document, forwarded as the API rendered it. Deliberately open: it is diagnostic evidence an operator acts on, so a field this CLI does not model must still reach them."
+        }
+      },
+      "required": [
+        "identity_report"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "recovered": {
+          "$ref": "#/$defs/approvalRecoveryOutcome"
+        }
+      },
+      "required": [
+        "recovered"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resume_cancelled": {
+          "$ref": "#/$defs/approvalResumeCancellation"
+        }
+      },
+      "required": [
+        "resume_cancelled"
       ]
     }
   ]

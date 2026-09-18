@@ -475,13 +475,20 @@ class BindingResolver:
         if approval_id is None:
             return None
         sql = text(
-            f"SELECT status, summary, agent_id, gate_kind, granted_tool "
+            f"SELECT status, summary, agent_id, gate_kind, granted_tool, resume_cancelled_at "
             f"FROM {self._config.db_schema}.approvals WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": approval_id})
             row = result.mappings().first()
         if row is None:
+            return None
+        if row["resume_cancelled_at"] is not None:
+            # The resume tombstone (#2753): a cancelled resume confers NOTHING.
+            # Placed with the status gate rather than only in the kernel because
+            # this method MINTS authority -- a tombstoned row that still handed
+            # back a granted tool would let the vetoed action run the moment any
+            # other path booted a runner from it.
             return None
         # Literal status compare: the worker must not import the API's ApprovalStatus.
         if row["status"] != "approved":
@@ -512,6 +519,92 @@ class BindingResolver:
         tool = summary[len(_PERMISSION_GATE_SUMMARY_PREFIX) :].split(" ", 1)[0]
         return tool or None
 
+    async def approval_resume_cancelled(
+        self,
+        event_id: str,
+        *,
+        lease_key: str | None,
+        owner: str | None,
+        generation: int | None,
+    ) -> str | None:
+        """RECORD execution of a resume turn (#2753): None to proceed, a refusal
+        detail string when the resume was administratively cancelled.
+
+        One UPDATE with no exclusivity predicate::
+
+            UPDATE approvals
+               SET resume_executing_at = now(),
+                   resume_executing_lease_key = :lease_key,
+                   resume_executing_owner = :owner,
+                   resume_executing_generation = :generation
+             WHERE id = :id AND resume_cancelled_at IS NULL
+            RETURNING id
+
+        Zero rows means tombstoned (or no such row), and only a tombstone
+        vetoes. A redelivery after a crash re-records under its own lease and
+        runs, so an owed continuation is never lost to a stale record. The
+        record is monotonic "started at least once": the API refuses to
+        tombstone ANY resume whose ``resume_executing_at`` is set, so a stale
+        overwrite of the lease columns is harmless (they only feed that
+        refusal's diagnostic). Concurrent duplicate execution of an ordinary,
+        non-cancelled resume is NOT prevented by this record; that stays the
+        residual ``ResumeReconciler`` documents.
+
+        This UPDATE and the API's tombstone UPDATE (``... WHERE
+        resume_executing_at IS NULL``) are conditional writes on the same row,
+        so Postgres serializes them and exactly one wins: a cancellation that
+        commits first makes this match nothing (veto); a record that commits
+        first makes the cancellation match nothing (409).
+
+        NOT agent-bound, unlike ``approval_grant_tool``: binding a veto would
+        turn a NULL or rebound ``agent_id`` into permission to run a cancelled
+        resume. The queued event id names the approval directly.
+
+        A non-approval event id fast-returns None with no DB round trip.
+        """
+        approval_id = _parse_resume_event_id(event_id)
+        if approval_id is None:
+            return None
+        schema = self._config.db_schema
+        record = text(
+            f"UPDATE {schema}.approvals "
+            f"   SET resume_executing_at = now(), "
+            f"       resume_executing_lease_key = :lease_key, "
+            f"       resume_executing_owner = :owner, "
+            f"       resume_executing_generation = :generation "
+            f" WHERE id = :id AND resume_cancelled_at IS NULL "
+            f"RETURNING id"
+        )
+        detail = text(
+            f"SELECT resume_cancelled_at, resume_cancelled_reason, resume_cancelled_by "
+            f"FROM {schema}.approvals WHERE id = :id"
+        )
+        async with self._engine.begin() as conn:
+            recorded = (
+                await conn.execute(
+                    record,
+                    {
+                        "id": approval_id,
+                        "lease_key": lease_key,
+                        "owner": owner,
+                        "generation": generation,
+                    },
+                )
+            ).first()
+            if recorded is not None:
+                return None
+            row = (await conn.execute(detail, {"id": approval_id})).mappings().first()
+        if row is None or row["resume_cancelled_at"] is None:
+            # No such approval: nothing was cancelled and nothing is owed; the
+            # ordinary resume-path reads answer None for this id too.
+            return None
+        actor: str | None = row["resume_cancelled_by"]
+        reason: str | None = row["resume_cancelled_reason"]
+        return (
+            f"resume cancelled by {actor or 'an unrecorded actor'} at "
+            f"{row['resume_cancelled_at'].isoformat()}: {reason or 'no reason recorded'}"
+        )
+
     async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
         Decision A2), or None.
@@ -532,13 +625,17 @@ class BindingResolver:
         if approval_id is None:
             return None
         sql = text(
-            f"SELECT status, agent_id, gate_kind "
+            f"SELECT status, agent_id, gate_kind, resume_cancelled_at "
             f"FROM {self._config.db_schema}.approvals WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": approval_id})
             row = result.mappings().first()
         if row is None:
+            return None
+        if row["resume_cancelled_at"] is not None:
+            # Tombstoned (#2753): the execution path refuses this resume, so the
+            # fact paths must not report a decision it never acted on.
             return None
         # Literal status compare: the worker must not import the API's
         # ApprovalStatus. A rejected/expired/pending resume did nothing that was
@@ -575,12 +672,17 @@ class BindingResolver:
         if approval_id is None:
             return None
         sql = text(
-            f"SELECT status, agent_id FROM {self._config.db_schema}.approvals WHERE id = :id"
+            f"SELECT status, agent_id, resume_cancelled_at "
+            f"FROM {self._config.db_schema}.approvals WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": approval_id})
             row = result.mappings().first()
         if row is None:
+            return None
+        if row["resume_cancelled_at"] is not None:
+            # Tombstoned (#2753): the execution path refuses this resume, so the
+            # fact paths must not report a decision it never acted on.
             return None
         row_agent_id = row["agent_id"]
         if row_agent_id is None or row_agent_id != agent_id:

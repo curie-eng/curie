@@ -1404,6 +1404,24 @@ enum SkillAction {
         /// as --route-resolution.
         #[arg(long)]
         clear_routes: bool,
+        /// Report approval identity facts. Accepted so it can be DECLINED with
+        /// a reason: this tier keeps no durable approval store (#2753).
+        #[arg(long)]
+        report_identity: bool,
+        /// Administratively reject a durable approval. Declined at this tier for
+        /// the same reason as --report-identity.
+        #[arg(long, value_name = "APPROVAL_ID")]
+        recover: Option<String>,
+        /// Tombstone a durable approval's resume turn. Declined at this tier for
+        /// the same reason as --report-identity.
+        #[arg(long, value_name = "APPROVAL_ID")]
+        cancel_resume: Option<String>,
+        /// Audit reason for a recovery. Accepted only to be declined cleanly.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// Idempotency key for a recovery. Accepted only to be declined cleanly.
+        #[arg(long = "recovery-key", value_name = "KEY")]
+        recovery_key: Option<String>,
     },
     // The about text is composed from the same consts the runtime `{error, fix}`
     // payload uses, so the discovery surface cannot drift from the answer
@@ -1955,6 +1973,30 @@ enum LocalAction {
         /// Remove every approval route binding on the agent.
         #[arg(long)]
         clear_routes: bool,
+        /// Report installation-wide approval identity FACTS, plus the
+        /// declaration skeleton to fill in and feed back to the upgrade. A pure
+        /// read: no agent lookup, no principal, nothing mutated.
+        #[arg(long)]
+        report_identity: bool,
+        /// Administratively reject this approval under the installation-wide
+        /// recovery grant (`api.approvalRecovery.enabled`). Requires --reason
+        /// and --recovery-key; every use is audited.
+        #[arg(long, value_name = "APPROVAL_ID")]
+        recover: Option<String>,
+        /// Tombstone this approval's resume turn without resolving the record.
+        /// Requires --reason and --recovery-key; every use is audited.
+        #[arg(long, value_name = "APPROVAL_ID")]
+        cancel_resume: Option<String>,
+        /// Why this administrative recovery is being performed. Written
+        /// verbatim to the durable audit row. Required by --recover and
+        /// --cancel-resume.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// The caller-chosen idempotency key for --recover/--cancel-resume.
+        /// Retrying the identical command with the same key is absorbed by the
+        /// server as one act; the CLI never generates or decorates it.
+        #[arg(long = "recovery-key", value_name = "KEY")]
+        recovery_key: Option<String>,
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
@@ -2956,6 +2998,30 @@ enum ClusterAction {
         /// Remove every approval route binding on the agent.
         #[arg(long)]
         clear_routes: bool,
+        /// Report installation-wide approval identity FACTS, plus the
+        /// declaration skeleton to fill in and feed back to the upgrade. A pure
+        /// read: no agent lookup, no principal, nothing mutated.
+        #[arg(long)]
+        report_identity: bool,
+        /// Administratively reject this approval under the installation-wide
+        /// recovery grant (`api.approvalRecovery.enabled`). Requires --reason
+        /// and --recovery-key; every use is audited.
+        #[arg(long, value_name = "APPROVAL_ID")]
+        recover: Option<String>,
+        /// Tombstone this approval's resume turn without resolving the record.
+        /// Requires --reason and --recovery-key; every use is audited.
+        #[arg(long, value_name = "APPROVAL_ID")]
+        cancel_resume: Option<String>,
+        /// Why this administrative recovery is being performed. Written
+        /// verbatim to the durable audit row. Required by --recover and
+        /// --cancel-resume.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// The caller-chosen idempotency key for --recover/--cancel-resume.
+        /// Retrying the identical command with the same key is absorbed by the
+        /// server as one act; the CLI never generates or decorates it.
+        #[arg(long = "recovery-key", value_name = "KEY")]
+        recovery_key: Option<String>,
     },
 }
 
@@ -3554,6 +3620,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                report_identity,
+                recover,
+                cancel_resume,
                 ..
             } => {
                 // Answered, not absent (ADR-0041, ADR-0077): the durable
@@ -3570,7 +3639,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                     || routes_from.is_some()
                     || list_routes
                     || clear_routes;
-                if routes_asked {
+                //
+                // The recovery verbs decline FIRST and with their own reason
+                // (#2753): they address the durable store's administrative
+                // surface, and answering them with the route or list reason
+                // would point the operator at the wrong absent thing.
+                if report_identity || recover.is_some() || cancel_resume.is_some() {
+                    Err(commands::skill_approvals_recovery_unavailable())
+                } else if routes_asked {
                     Err(commands::skill_approval_routes_unavailable())
                 } else if list || resolve.is_some() {
                     Err(commands::skill_approvals_list_unavailable())
@@ -3914,6 +3990,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                report_identity,
+                recover,
+                cancel_resume,
+                reason,
+                recovery_key,
             } => emit(
                 commands::approvals(
                     target.into(),
@@ -3931,6 +4012,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                         routes_from,
                         list_routes,
                         clear_routes,
+                        report_identity,
+                        recover,
+                        cancel_resume,
+                        reason,
+                        recovery_key,
                     },
                 )
                 .await?,
@@ -5218,6 +5304,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                report_identity,
+                recover,
+                cancel_resume,
+                reason,
+                recovery_key,
             } => {
                 let ClusterAgentTarget {
                     agent,
@@ -5248,6 +5339,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                             routes_from,
                             list_routes,
                             clear_routes,
+                            report_identity,
+                            recover,
+                            cancel_resume,
+                            reason,
+                            recovery_key,
                         },
                     )
                     .await?,

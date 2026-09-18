@@ -693,6 +693,7 @@ def _parse_approval_targets(
     return resolution_pair, (kind, address, TargetRoute(endpoint=endpoint, adapter=adapter))
 
 
+
 def _approval_id_from_resume_event(event_id: str) -> str | None:
     """The approval id inside a resume turn's deterministic event id (#1084).
 
@@ -1528,6 +1529,56 @@ class Kernel:
                 )
                 return
 
+            # The resume EXECUTION RECORD (#2753), and the ONE arbitration point
+            # between a resume and its tombstone. One UPDATE, vetoed only by a
+            # tombstone: it records that this delivery started and under which
+            # delivery lease, and excludes nothing, so a redelivery after a
+            # crash re-records and runs. The API refuses to tombstone any
+            # resume with a record, and both writes are conditional UPDATEs on
+            # the same row, so exactly one wins: a tombstone committed first
+            # vetoes here.
+            #
+            # It sits AFTER the side-effect check and BEFORE binding resolution
+            # and every ``_drop_with_message`` refusal. A vetoed resume whose
+            # channel is now unbound, undeployed or paused must settle silently
+            # rather than try to post a drop reply over a transport that may be
+            # exactly the broken one #2753 is about (retries, then a
+            # dead-letter). The veto needs only the event id and the delivery
+            # lease, never the binding: it is deliberately not agent-bound,
+            # since binding it would turn a NULL or rebound agent into
+            # permission to run a cancelled resume.
+            #
+            # Accepted consequence: a resume recorded here and THEN dropped for
+            # an unbound or paused agent counts as started, so it is no longer
+            # cancellable. That is correct -- processing began.
+            #
+            # Still before everything observable: no grant minted, no shimmer,
+            # no sandbox, no runner turn. Gated on the resume event id, so an
+            # ordinary turn pays no round trip. getattr: binding doubles may not
+            # carry the method.
+            if self._binding is not None and self._is_approval_resume(event_id):
+                record_fn = getattr(self._binding, "approval_resume_cancelled", None)
+                fenced = lease if lease is not None and _is_fenced(lease) else None
+                refusal = (
+                    await record_fn(
+                        event_id,
+                        lease_key=(
+                            self._config.delivery_lease_key(
+                                fenced.stream, fenced.group, fenced.entry_id
+                            )
+                            if fenced is not None
+                            else None
+                        ),
+                        owner=fenced.owner if fenced is not None else None,
+                        generation=fenced.generation if fenced is not None else None,
+                    )
+                    if record_fn is not None
+                    else None
+                )
+                if refusal is not None:
+                    await self._settle_cancelled_resume(qevent, refusal)
+                    return
+
             # Deployment-to-runtime binding: resolve which agent/version this
             # channel runs, and refuse a killed agent. An unmapped channel is a
             # polite drop, not a crash.
@@ -2251,6 +2302,35 @@ class Kernel:
         await self._complete(
             qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease
         )
+
+    async def _settle_cancelled_resume(self, qevent: QueuedTurn, refusal: str) -> None:
+        """Settle a resume turn the database vetoed: mark done, emit nothing.
+
+        The ONE sanctioned marker-only terminal path, and the exception
+        ``_complete``'s docstring anticipates by construction rather than by
+        oversight. ``_complete`` exists so that a turn which is durably done can
+        never owe an undelivered ``turn.completed``; a vetoed resume owes
+        nothing at all -- no reply was posted, no action ran, and the card was
+        already settled by its resolution -- so there is no record to write and
+        nothing for a sweeper to recover. Writing one would manufacture a
+        completion for a turn that never started.
+
+        Marking done is what makes the veto STABLE rather than merely silent:
+        without it the entry is redelivered until the cap and then dead-lettered,
+        which turns an administrator's deliberate cancellation into noise. With
+        it, a redelivery of the same entry short-circuits at the terminal check
+        at the top of ``process_event`` and is a no-op.
+        """
+        logger.warning(
+            "refusing cancelled approval resume for event %s: %s",
+            qevent.event_id,
+            refusal,
+        )
+        # No lifecycle metric point: ``curie.approval.lifecycle`` declares a
+        # closed ``outcome`` domain in packages/telemetry, and widening a shared
+        # contract is not this change. The WARNING above carries the reason and
+        # the actor, which is what an operator needs to see.
+        await self._markers.mark_done(qevent.event_id)
 
     async def _reply(
         self,

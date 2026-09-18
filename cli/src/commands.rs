@@ -6098,6 +6098,19 @@ pub struct ApprovalCmd {
     pub routes_from: Option<PathBuf>,
     pub list_routes: bool,
     pub clear_routes: bool,
+    /// `--report-identity`: the installation-wide approval identity report.
+    pub report_identity: bool,
+    /// `--recover <APPROVAL_ID>`: administratively reject one approval under
+    /// the installation-wide recovery grant (#2753).
+    pub recover: Option<String>,
+    /// `--cancel-resume <APPROVAL_ID>`: tombstone one approval's resume turn.
+    pub cancel_resume: Option<String>,
+    /// Operator free text recorded on the recovery audit row. Required by both
+    /// mutating recovery verbs.
+    pub reason: Option<String>,
+    /// The CALLER's idempotency key for a recovery operation. Required, never
+    /// generated: the server keys replay absorption on it.
+    pub recovery_key: Option<String>,
 }
 
 // --- Approval route bindings (#1052) -----------------------------------------
@@ -6543,6 +6556,26 @@ pub enum ApprovalsOutput {
     Resolved {
         record: crate::api::ApprovalRecord,
     },
+    /// The installation-wide approval identity report (#2753). Forwarded as the
+    /// server rendered it: it is diagnostic evidence plus the declaration
+    /// skeleton the operator fills in, so a field this CLI does not know about
+    /// must still reach the operator rather than be silently dropped.
+    IdentityReport {
+        report: serde_json::Value,
+    },
+    /// One approval administratively rejected under the recovery grant. Carries
+    /// the route's RECORDED outcome (`ApprovalRecoveryOut`), not an ordinary
+    /// approval record: the recovery route answers with the administrative
+    /// facts, and a record shape would not decode at all.
+    Recovered {
+        outcome: crate::api::ApprovalRecoveryOutcome,
+    },
+    /// One approval's resume turn tombstoned. Deliberately a DISTINCT variant
+    /// from `Recovered`, and a distinct `--json` key, so no script can mistake
+    /// a cancellation for a resolution.
+    ResumeCancelled {
+        outcome: crate::api::ApprovalResumeCancellation,
+    },
     /// One-time delivery of a reusable operator credential. The token is never
     /// persisted and is emitted only from this explicit mint result.
     OperatorPrincipal {
@@ -6604,6 +6637,29 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             }),
             ApprovalsOutput::Resolved { record } => serde_json::json!({
                 "resolved": approval_record_json(record),
+            }),
+            ApprovalsOutput::IdentityReport { report } => serde_json::json!({
+                "identity_report": report,
+            }),
+            ApprovalsOutput::Recovered { outcome } => serde_json::json!({
+                "recovered": {
+                    "approval_id": outcome.approval_id,
+                    "status": outcome.status,
+                    "recovery_key": outcome.recovery_key,
+                    "reason": outcome.reason,
+                    "actor": outcome.actor,
+                    "recovered_at": outcome.recovered_at,
+                },
+            }),
+            ApprovalsOutput::ResumeCancelled { outcome } => serde_json::json!({
+                "resume_cancelled": {
+                    "approval_id": outcome.approval_id,
+                    "status": outcome.status,
+                    "recovery_key": outcome.recovery_key,
+                    "reason": outcome.reason,
+                    "actor": outcome.actor,
+                    "cancelled_at": outcome.cancelled_at,
+                },
             }),
             ApprovalsOutput::OperatorPrincipal { delivery } => serde_json::json!({
                 "operator_principal": {
@@ -6695,6 +6751,65 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                     record.id,
                     record.status,
                     record.resolved_by.as_deref().unwrap_or("?")
+                ));
+            }
+            ApprovalsOutput::IdentityReport { report } => {
+                let approvals = report
+                    .get("approvals")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if approvals.is_empty() {
+                    ui.payload("no pending approval row was reported");
+                } else {
+                    ui.payload(&format!("{} pending approval row(s):", approvals.len()));
+                    for row in approvals {
+                        let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        // The observations live in `facts`, a string array, NOT
+                        // in boolean columns. Reading booleans hid
+                        // `card_identity_missing` and
+                        // `reply_identity_unreconstructable` -- the two
+                        // obligations an operator has to recover -- while
+                        // surfacing the unrelated `has_reply_placeholder` flag.
+                        let facts: Vec<&str> = row
+                            .get("facts")
+                            .and_then(|value| value.as_array())
+                            .map(|values| values.iter().filter_map(|v| v.as_str()).collect())
+                            .unwrap_or_default();
+                        // A row with no fact is REPORTED, not dropped: the
+                        // reporter excludes nothing, and a renderer that hid
+                        // the healthy rows would answer a different question.
+                        let facts = if facts.is_empty() {
+                            "(no identity fact observed)".to_string()
+                        } else {
+                            facts.join(", ")
+                        };
+                        ui.kv(id, &facts);
+                    }
+                }
+                let declarations = report
+                    .get("declarations")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                ui.payload(&format!(
+                    "declarations carries {declarations} entr(y/ies) to fill in and feed back \
+                     to the upgrade; re-run with --json to capture it"
+                ));
+            }
+            ApprovalsOutput::Recovered { outcome } => {
+                ui.payload(&format!(
+                    "approval {} administratively recovered -> {} by {} (this act is audited)",
+                    outcome.approval_id,
+                    outcome.status,
+                    outcome.actor.as_deref().unwrap_or("?")
+                ));
+            }
+            ApprovalsOutput::ResumeCancelled { outcome } => {
+                ui.payload(&format!(
+                    "approval {}: resume turn cancelled; the record's status is unchanged at \
+                     {} (this act is audited)",
+                    outcome.approval_id, outcome.status
                 ));
             }
             ApprovalsOutput::OperatorPrincipal { delivery } => {
@@ -6829,6 +6944,168 @@ pub async fn approvals(
         || !cmd.route_approvers.is_empty()
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
+
+    // --- Administrative recovery (#2753) -------------------------------------
+    //
+    // Handled ahead of EVERY other branch, including the route and mint blocks,
+    // because each of those refuses with a message naming only its own flags. A
+    // recovery verb combined with one of them has to be refused by a message
+    // that names BOTH sides, otherwise the operator is told to drop a flag they
+    // did not think they were using.
+    //
+    // These three verbs address the durable approval STORE under an
+    // installation-wide grant, not this agent's gates, routes or pending list.
+    // The agent argument is positional on the verb and is deliberately not used
+    // to scope them: the report is installation-wide and a recovery is
+    // id-addressed, so resolving an agent first would add a lookup that can fail
+    // for reasons unrelated to the act being performed.
+    let recovery_verbs: Vec<&str> = [
+        cmd.report_identity.then_some("--report-identity"),
+        cmd.recover.as_ref().map(|_| "--recover"),
+        cmd.cancel_resume.as_ref().map(|_| "--cancel-resume"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !recovery_verbs.is_empty() {
+        if recovery_verbs.len() > 1 {
+            return Err(crate::exit::usage(format!(
+                "{} are separate administrative acts against the same approval row; \
+                 combining them in one invocation would make the durable outcome \
+                 ambiguous. Run one per invocation",
+                recovery_verbs.join(" and "),
+            )));
+        }
+        let verb = recovery_verbs[0];
+        let conflicts: Vec<&str> = [
+            cmd.list.then_some("--list"),
+            cmd.resolve.as_ref().map(|_| "--resolve"),
+            cmd.list_routes.then_some("--list-routes"),
+            cmd.clear_routes.then_some("--clear-routes"),
+            (!cmd.route_resolution.is_empty()).then_some("--route-resolution"),
+            (!cmd.route_approvers.is_empty()).then_some("--route-approvers"),
+            cmd.routes_from.as_ref().map(|_| "--routes-from"),
+            (!gate.is_empty()).then_some("--gate"),
+            clear.then_some("--clear"),
+            cmd.mint_operator_principal
+                .as_ref()
+                .map(|_| "--mint-operator-principal"),
+            cmd.mint_console_login_code
+                .as_ref()
+                .map(|_| "--mint-console-login-code"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !conflicts.is_empty() {
+            return Err(crate::exit::usage(format!(
+                "{verb} is an administrative act on the durable approval store; it cannot \
+                 be combined with {} (tool gates, route bindings, and the ordinary \
+                 pending-record verbs address different objects). Run them as separate \
+                 invocations",
+                conflicts.join(", "),
+            )));
+        }
+
+        if cmd.report_identity {
+            if opts.dry_run {
+                return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
+                    lines: vec![format!(
+                        "GET {}/approvals/identity-report  (installation-wide; no agent \
+                         lookup, no principal, nothing mutated)",
+                        opts.api_url
+                    )],
+                }));
+            }
+            let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+            return Ok(ApprovalsOutput::IdentityReport {
+                report: client.approval_identity_report().await?,
+            });
+        }
+
+        let (approval_id, recover) = match (cmd.recover.as_deref(), cmd.cancel_resume.as_deref()) {
+            (Some(id), None) => (id, true),
+            (None, Some(id)) => (id, false),
+            // Both-set and neither-set are already answered above.
+            _ => unreachable!("exactly one mutating recovery verb reaches here"),
+        };
+
+        // Every input is validated BEFORE any network call and before the
+        // principal is even read, so a malformed administrative act can never
+        // half-happen and never reaches the API for it to reject.
+        let reason = cmd
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "{verb} requires a non-empty --reason. It is written verbatim to the \
+                     durable audit row, which is the only record of why this approval was \
+                     administratively disposed of"
+                ))
+            })?;
+        // Deliberately NOT generated, defaulted or decorated: the server's
+        // idempotency is keyed on this value, so a CLI-chosen one would turn
+        // every retry into a fresh administrative act.
+        let recovery_key = cmd
+            .recovery_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "{verb} requires --recovery-key. The key is caller-supplied so that \
+                     retrying the identical command is absorbed by the server as one act; \
+                     the CLI will not invent one"
+                ))
+            })?;
+
+        if opts.dry_run {
+            let line = if recover {
+                format!(
+                    "POST {}/approvals/{approval_id}/recover disposition=rejected \
+                     recovery_key={recovery_key:?} (attributed to the principal read from \
+                     CURIE_APPROVAL_PRINCIPAL_TOKEN at execution)",
+                    opts.api_url
+                )
+            } else {
+                format!(
+                    "POST {}/approvals/{approval_id}/resume/cancel recovery_key={recovery_key:?} \
+                     (no disposition; tombstones the resume turn only)",
+                    opts.api_url
+                )
+            };
+            return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
+                lines: vec![line],
+            }));
+        }
+
+        let principal_token = std::env::var("CURIE_APPROVAL_PRINCIPAL_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "{verb} requires CURIE_APPROVAL_PRINCIPAL_TOKEN, which names WHO acted \
+                     in the audit row (the platform key authorizes the act but identifies \
+                     nobody). Mint a reusable operator credential with `curie \
+                     <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`, \
+                     export the one-time result, and retry"
+                ))
+            })?;
+        let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+        return if recover {
+            Ok(ApprovalsOutput::Recovered {
+                outcome: client
+                    .recover_approval(approval_id, reason, recovery_key, &principal_token)
+                    .await?,
+            })
+        } else {
+            Ok(ApprovalsOutput::ResumeCancelled {
+                outcome: client
+                    .cancel_approval_resume(approval_id, reason, recovery_key, &principal_token)
+                    .await?,
+            })
+        };
+    }
 
     let mint_subject = match (
         cmd.mint_operator_principal.as_deref(),
@@ -8140,6 +8417,31 @@ pub fn skill_approvals_list_unavailable() -> anyhow::Error {
         "approvals --list/--resolve",
         APPROVALS_LIST_REASON,
         APPROVALS_LIST_ALT,
+    )
+}
+
+/// Why the administrative recovery verbs cannot be answered at the skill tier
+/// (#2753).
+///
+/// Same root as `APPROVALS_LIST_REASON` and stated separately for the same
+/// reason the route decline is: the operator needs to read that the missing
+/// thing is the durable store, not that they typed a flag this build does not
+/// know. There is nothing here to report on, recover, or tombstone, because
+/// `skill message` resolves its gate inside the one live session.
+pub const APPROVALS_RECOVERY_REASON: &str =
+    "approval recovery reports on and administratively disposes of rows in the durable Approval store, and `skill message` talks straight to the local runner with no worker, no Valkey and no durable-Approval or resume machinery (ADR-0063), so this tier has no durable row to report on, recover, or tombstone";
+/// Where to run an administrative recovery instead.
+pub const APPROVALS_RECOVERY_ALT: &str =
+    "use `curie local approvals <agent> --report-identity`/`--recover`/`--cancel-resume`, or the same verbs under `curie cluster approvals <agent>` for a deployed agent; a skill-tier gate is resolved within the same `skill message` session";
+
+/// The recovery verbs are answered but unavailable at this tier by construction
+/// (ADR-0041). Accepted so the tier reports WHY (exit 4) rather than erroring
+/// like an unknown-flag typo, matching `--list`/`--resolve` above.
+pub fn skill_approvals_recovery_unavailable() -> anyhow::Error {
+    crate::exit::unsupported(
+        "approvals --report-identity/--recover/--cancel-resume",
+        APPROVALS_RECOVERY_REASON,
+        APPROVALS_RECOVERY_ALT,
     )
 }
 

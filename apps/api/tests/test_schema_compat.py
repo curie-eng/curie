@@ -41,7 +41,13 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
-REVIEW_SCHEMA_MIN = "0044"
+# The schema floor the application declares. It rises whenever the serving
+# code reads a new column unconditionally, because a pod that would
+# SELECT a column the live database does not have must refuse to serve
+# rather than fail per request. 0044 was review ingress (#2275); 0045 is
+# approval recovery and the resume tombstone (#2753), which the worker
+# reads on every approval-resume turn.
+APP_SCHEMA_MIN = "0045"
 PREV = "0040"
 
 
@@ -91,7 +97,7 @@ def _exec(sql: str, params: dict[str, Any] | None = None) -> None:
 
 def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
-    assert window.schema_min == REVIEW_SCHEMA_MIN
+    assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
@@ -327,7 +333,7 @@ def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
 
     # Red-on-revert: the current image still closes the application rollback window.
     n = load_window()
-    assert n.schema_min == REVIEW_SCHEMA_MIN
+    assert n.schema_min == APP_SCHEMA_MIN
     assert n.schema_head == HEAD
     assert can_serve(PREV, n, {PREV, CONTRACT, HEAD}) is False
 

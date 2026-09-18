@@ -360,6 +360,55 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 }))
                 .expect("approval route response mirror deserializes its display shape"),
             },
+            // #2753. The report is forwarded verbatim from the API, so the
+            // sample carries the reporter's full shape: the per-row facts and
+            // the declaration skeleton the operator fills in.
+            "IdentityReport" => ApprovalsOutput::IdentityReport {
+                report: serde_json::json!({
+                    "approvals": [{
+                        "id": "33333333-3333-3333-3333-333333333333",
+                        "agent_id": "11111111-1111-1111-1111-111111111111",
+                        "status": "pending",
+                        "route": "explicit-reviewers",
+                        "reply_kind": "email",
+                        "reply_adapter": serde_json::Value::Null,
+                        "reply_channel": "ops@example.com",
+                        "card_channel": serde_json::Value::Null,
+                        "has_reply_placeholder": false,
+                        "created_at": "2026-09-18T09:00:00Z",
+                        "facts": ["card_identity_missing", "reply_identity_unreconstructable"]
+                    }],
+                    "declarations": [{
+                        "approval_id": "33333333-3333-3333-3333-333333333333",
+                        "reply_kind": serde_json::Value::Null,
+                        "reply_adapter": serde_json::Value::Null,
+                        "actor": serde_json::Value::Null,
+                        "reason": serde_json::Value::Null
+                    }]
+                }),
+            },
+            "Recovered" => ApprovalsOutput::Recovered {
+                outcome: serde_json::from_value(serde_json::json!({
+                    "approval_id": "33333333-3333-3333-3333-333333333333",
+                    "status": "rejected",
+                    "recovery_key": "rk-2753-0001",
+                    "reason": "card identity unreconstructable after the upgrade",
+                    "actor": "U0OPERATOR",
+                    "recovered_at": "2026-09-18T10:00:00Z"
+                }))
+                .expect("the recovery outcome mirror deserializes ApprovalRecoveryOut"),
+            },
+            "ResumeCancelled" => ApprovalsOutput::ResumeCancelled {
+                outcome: serde_json::from_value(serde_json::json!({
+                    "approval_id": "33333333-3333-3333-3333-333333333333",
+                    "status": "approved",
+                    "recovery_key": "rk-2753-0002",
+                    "reason": "the owed resume can never be delivered",
+                    "actor": "U0OPERATOR",
+                    "cancelled_at": "2026-09-18T10:05:00Z"
+                }))
+                .expect("the cancellation mirror deserializes ApprovalResumeCancelOut"),
+            },
         ],
     );
     m.insert(
