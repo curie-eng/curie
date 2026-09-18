@@ -8,7 +8,7 @@
 # command`. That exception is not classified by the kernel, so the turn hangs,
 # the entry is re-delivered to dead-letter, and every attempt leaks a sandbox.
 # `values.schema.json` makes helm refuse the value at install/template time so it
-# never reaches worker env at all. Twelve assertions:
+# never reaches worker env at all. Thirteen assertions:
 #
 #   (a) POSITIVE, defaults: the render SUCCEEDS and the worker Deployment
 #       carries the three env vars at their shipped defaults.
@@ -76,6 +76,14 @@
 #       runnerTotalTimeoutSeconds=1700 / deliveryBudgetSeconds=600 and names
 #       both keys, values, inequality, and corrective actions in chart-owned
 #       output. This is the cross-field negative JSON Schema cannot express.
+#   (l) LADDER CONSUMER CONTRACT, positive and negative: the actual cluster
+#       reply-timeout helper reads the rendered worker Deployment through an
+#       external kubectl stub. Defaults yield 600 + 60 = 660 seconds and a
+#       900-second chart override yields 960. Missing, duplicate, nonliteral,
+#       or out-of-range delivery-budget entries are refused with the helper's
+#       diagnostic. This is chart and CLI consumer coverage only. A separate
+#       disposable cluster proof drives a real installed release and proves
+#       replies at the cluster tier.
 #   (m) RETAINED extraEnv TIMEOUT, positive: a v0.8.4-era worker.extraEnv
 #       override of CURIE_RUNNER_TOTAL_TIMEOUT_S=1700 must not duplicate the
 #       first-class env. The rendered worker keeps exactly one copy at the
@@ -103,17 +111,22 @@
 # passes on the author's machine and fails in CI, or the reverse, for a reason
 # that has nothing to do with the chart.
 #
-# The relationship negatives in (j), (k), and (l) are the deliberate
+# The relationship negatives in (j) and (k) are the deliberate
 # exceptions: their messages are CHART-OWNED text from `fail` in _helpers.tpl,
 # not helm's validator, so they cannot drift with the helm version and
 # asserting them is what proves each guard -- rather than some unrelated
 # template error -- is what refused the render. They check stable
 # operands/actions, not full sentences.
 #
+# The helper negatives in (l) instead assert diagnostics owned by the actual
+# ladder helper. They are neither Helm wording nor a cluster runtime claim.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
 
 CHART="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$CHART/../.." && pwd)"
+LADDER="$REPO_ROOT/cli/scripts/e2e-ladder.sh"
 fail() { echo "FAIL [$1] $2" >&2; exit 1; }
 render() { helm template curie "$CHART" "$@" 2>&1; }
 
@@ -256,6 +269,155 @@ assert_refused() {
   grep -q "$knob" <<<"$out" \
     || fail "$letter" "the refusal of $* does not name $knob
   $(head -5 <<<"$out")"
+}
+
+# This proves the chart-to-ladder consumer contract. It is deliberately not a
+# cluster runtime claim: the manifest is rendered locally and an external
+# kubectl stub serves the exact worker Deployment JSON the helper requests.
+# The nightly runtime check uses a real installed release and real replies.
+[[ -f "$LADDER" ]] || fail l "missing cluster ladder helper: $LADDER"
+LADDER_STUB_DIR="$TMP/ladder-kubectl"
+mkdir -p "$LADDER_STUB_DIR"
+cat >"$LADDER_STUB_DIR/kubectl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+expected_deployment="deployment/${LADDER_STUB_DEPLOYMENT:?}"
+if (( $# != 6 )) || [[ "$1" != "-n" ]] || [[ "$2" != "${LADDER_STUB_NAMESPACE:?}" ]] \
+  || [[ "$3" != "get" ]] || [[ "$4" != "$expected_deployment" ]] \
+  || [[ "$5" != "-o" ]] || [[ "$6" != "json" ]]; then
+  printf 'kubectl stub received an unexpected request: %q ' "$@" >&2
+  printf '\n' >&2
+  exit 64
+fi
+cat "${LADDER_STUB_JSON:?}"
+SH
+chmod +x "$LADDER_STUB_DIR/kubectl"
+
+render_worker_deployment_json() {
+  local output_json="$1" rendered_yaml="${1%.json}.yaml"
+  shift
+  if ! helm template curie "$CHART" -s templates/worker.yaml "$@" >"$rendered_yaml" 2>&1; then
+    fail l "worker render failed while preparing the ladder consumer contract
+  $(head -5 "$rendered_yaml")"
+  fi
+  if ! python3 - "$rendered_yaml" "$output_json" <<'PY'
+import json
+import sys
+import yaml
+
+documents = [document for document in yaml.safe_load_all(open(sys.argv[1])) if document]
+deployments = [
+    document
+    for document in documents
+    if document.get("kind") == "Deployment"
+    and (document["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "worker"
+]
+if len(deployments) != 1:
+    raise SystemExit(f"expected exactly one rendered worker Deployment, found {len(deployments)}")
+json.dump(deployments[0], open(sys.argv[2], "w"), sort_keys=True)
+PY
+  then
+    fail l "could not convert the rendered worker Deployment into the ladder's kubectl JSON input"
+  fi
+}
+
+mutate_ladder_budget_json() {
+  local source_json="$1" target_json="$2" mutation="$3"
+  if ! python3 - "$source_json" "$target_json" "$mutation" <<'PY'
+import json
+import sys
+
+source, target, mutation = sys.argv[1:]
+deployment = json.load(open(source))
+containers = deployment["spec"]["template"]["spec"]["containers"]
+workers = [container for container in containers if container.get("name") == "worker"]
+if len(workers) != 1:
+    raise SystemExit(f"expected exactly one worker container, found {len(workers)}")
+env = workers[0].get("env")
+if not isinstance(env, list):
+    raise SystemExit("worker env is not a list")
+matches = [
+    (index, entry)
+    for index, entry in enumerate(env)
+    if isinstance(entry, dict) and entry.get("name") == "CURIE_DELIVERY_BUDGET_S"
+]
+if len(matches) != 1:
+    raise SystemExit(f"expected one rendered CURIE_DELIVERY_BUDGET_S entry, found {len(matches)}")
+index, entry = matches[0]
+if mutation == "nonliteral":
+    entry["value"] = "not-a-budget"
+elif mutation == "duplicate":
+    env.insert(index + 1, dict(entry))
+elif mutation == "missing":
+    del env[index]
+elif mutation == "below-minimum":
+    entry["value"] = "59"
+else:
+    raise SystemExit(f"unknown mutation {mutation!r}")
+json.dump(deployment, open(target, "w"), sort_keys=True)
+PY
+  then
+    fail l "could not prepare the $mutation delivery-budget negative input"
+  fi
+}
+
+run_ladder_reply_timeout() {
+  local deployment_json="$1" stdout="$2" stderr="$3"
+  PATH="$LADDER_STUB_DIR:$PATH" \
+    LADDER_STUB_JSON="$deployment_json" \
+    LADDER_STUB_NAMESPACE="worker-budget-contract" \
+    LADDER_STUB_DEPLOYMENT="curie-worker" \
+    CURIE_NAMESPACE="worker-budget-contract" \
+    CURIE_RELEASE="curie" \
+    bash -c '
+      set -euo pipefail
+      source <(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p}" "$1")
+      if ! declare -F cluster_reply_timeout_seconds >/dev/null; then
+        echo "cluster: required cluster_reply_timeout_seconds helper is absent from the ladder source" >&2
+        exit 1
+      fi
+      cluster_reply_timeout_seconds
+    ' bash "$LADDER" >"$stdout" 2>"$stderr"
+}
+
+assert_ladder_helper_present() {
+  local stderr="$TMP/l-helper-presence.err"
+  if ! bash -c '
+    set -euo pipefail
+    source <(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p}" "$1")
+    if ! declare -F cluster_reply_timeout_seconds >/dev/null; then
+      echo "cluster: required cluster_reply_timeout_seconds helper is absent from the ladder source" >&2
+      exit 1
+    fi
+  ' bash "$LADDER" >/dev/null 2>"$stderr"; then
+    fail l "the cluster ladder does not export the required reply-timeout helper
+  $(cat "$stderr")"
+  fi
+}
+
+assert_ladder_reply_timeout() {
+  local deployment_json="$1" expected="$2" stdout="$TMP/l-timeout.out" stderr="$TMP/l-timeout.err" got
+  if ! run_ladder_reply_timeout "$deployment_json" "$stdout" "$stderr"; then
+    fail l "the cluster ladder helper rejected the rendered worker Deployment
+  $(cat "$stderr")"
+  fi
+  got="$(<"$stdout")"
+  [[ "$got" == "$expected" ]] || fail l \
+    "the cluster ladder helper returned ${got:-<empty>} seconds, expected $expected"
+}
+
+assert_ladder_budget_refused() {
+  local deployment_json="$1" expected_fragment="$2" stdout="$TMP/l-refusal.out" stderr="$TMP/l-refusal.err" diagnostic
+  if run_ladder_reply_timeout "$deployment_json" "$stdout" "$stderr"; then
+    fail l "the cluster ladder helper accepted an invalid rendered delivery-budget input"
+  fi
+  diagnostic="$(cat "$stderr")"
+  for token in "cluster: Deployment/curie-worker field CURIE_DELIVERY_BUDGET_S" "$expected_fragment"; do
+    grep -qF "$token" <<<"$diagnostic" \
+      || fail l "the ladder refusal does not name $token
+  $diagnostic"
+  done
 }
 
 # (a) The DEFAULT render must SUCCEED before anything else is asserted. A schema
@@ -466,9 +628,34 @@ for token in \
   $(head -3 <<<"$K_RELATIONSHIP_OUT")"
 done
 
+# (l) The chart's rendered worker Deployment is the ladder helper's source of
+# truth. The kubectl stub only returns that rendered JSON for the exact get
+# request, so this verifies the production consumer without pretending to run
+# a cluster. The disposable cluster proof separately proves real cluster replies.
+assert_ladder_helper_present
+L_DEFAULT_JSON="$TMP/l-default-worker.json"
+render_worker_deployment_json "$L_DEFAULT_JSON"
+assert_ladder_reply_timeout "$L_DEFAULT_JSON" 660
+
+L_CUSTOM_JSON="$TMP/l-custom-worker.json"
+render_worker_deployment_json "$L_CUSTOM_JSON" --set worker.deliveryBudgetSeconds=900
+assert_ladder_reply_timeout "$L_CUSTOM_JSON" 960
+
+for mutation_and_fragment in \
+  "nonliteral:must be a literal integer from 60 through 1800" \
+  "below-minimum:must be from 60 through 1800" \
+  "duplicate:must appear exactly once in the worker container env" \
+  "missing:is absent from the worker container env"; do
+  mutation="${mutation_and_fragment%%:*}"
+  expected_fragment="${mutation_and_fragment#*:}"
+  L_NEGATIVE_JSON="$TMP/l-${mutation}-worker.json"
+  mutate_ladder_budget_json "$L_DEFAULT_JSON" "$L_NEGATIVE_JSON" "$mutation"
+  assert_ladder_budget_refused "$L_NEGATIVE_JSON" "$expected_fragment"
+done
+
 # (m) A retained extraEnv copy of a chart-owned timeout is refused at render.
 # Fail-closed reserved-env (#2442) replaces the earlier silent drop.
 assert_refused m "CURIE_RUNNER_TOTAL_TIMEOUT_S" \
   --set-json 'worker.extraEnv=[{"name":"CURIE_RUNNER_TOTAL_TIMEOUT_S","value":"1700"},{"name":"CURIE_UPGRADE_FIXTURE","value":"kept"}]'
 
-echo "worker-ttl-bounds-assertions: all twelve assertions passed"
+echo "worker-ttl-bounds-assertions: all thirteen assertions passed"

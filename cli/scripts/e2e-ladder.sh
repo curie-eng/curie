@@ -2065,6 +2065,67 @@ cluster_worker_deploy() {
     printf '%s' "${fullname}-worker"
 }
 
+cluster_reply_timeout_seconds() {
+    local deployment deployment_json
+    deployment="$(cluster_worker_deploy)"
+    if ! deployment_json="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$deployment" -o json)"; then
+        echo "cluster: Deployment/$deployment field CURIE_DELIVERY_BUDGET_S could not be read" >&2
+        return 1
+    fi
+    printf '%s' "$deployment_json" | python3 -c '
+import json, re, sys
+
+deployment = sys.argv[1]
+field = "CURIE_DELIVERY_BUDGET_S"
+
+def fail(detail):
+    raise SystemExit(f"cluster: Deployment/{deployment} field {field} {detail}")
+
+try:
+    document = json.load(sys.stdin)
+    containers = document["spec"]["template"]["spec"]["containers"]
+except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    fail(f"could not be parsed from the Deployment JSON: {exc}")
+
+if not isinstance(containers, list):
+    fail("could not be parsed because spec.template.spec.containers is not a list")
+workers = [
+    container
+    for container in containers
+    if isinstance(container, dict) and container.get("name") == "worker"
+]
+if len(workers) != 1:
+    fail(f"requires exactly one worker container, found {len(workers)}")
+env = workers[0].get("env", [])
+if not isinstance(env, list):
+    fail("could not be parsed because the worker container env is not a list")
+entries = [
+    entry
+    for entry in env
+    if isinstance(entry, dict) and entry.get("name") == field
+]
+if not entries:
+    fail("is absent from the worker container env")
+if len(entries) != 1:
+    fail(f"must appear exactly once in the worker container env, found {len(entries)} entries")
+entry = entries[0]
+if "valueFrom" in entry:
+    fail("must be a literal value and must not use valueFrom")
+value = entry.get("value")
+if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+    fail(f"must be a literal integer from 60 through 1800, found {value!r}")
+budget = int(value)
+if not 60 <= budget <= 1800:
+    fail(f"must be from 60 through 1800, found {budget}")
+timeout = budget + 60
+print(
+    f"cluster: worker delivery budget {budget}s plus 60s reply observation headroom; waiting {timeout}s",
+    file=sys.stderr,
+)
+print(timeout)
+' "$deployment"
+}
+
 probe_cluster_fake_model() {
     # Defaults remain curie when unset. The probe follows the selected
     # namespace and the chart fullname worker.
@@ -5369,6 +5430,8 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         echo "fix: install a release with \`curie cluster up --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE --fake-model\` (or point kubectl at the right context), or drop cluster from CURIE_E2E_TIERS." >&2
         return 1
     fi
+    local cluster_reply_timeout_seconds
+    cluster_reply_timeout_seconds="$(cluster_reply_timeout_seconds)" || return 1
 
     echo
     echo "=== curie --json cluster deploy ==="
@@ -5471,6 +5534,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     local msg_args=(--json cluster message)
     msg_args+=("${ns_rel[@]}")
     msg_args+=("$PROMPT")
+    msg_args+=(--timeout-secs "$cluster_reply_timeout_seconds")
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         echo "using --listen-host ${CURIE_E2E_LISTEN_HOST} (worker->stub reply host)"
         msg_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
@@ -5553,7 +5617,7 @@ print(address)
     local retention_args=(--json cluster --context "$retention_context" message)
     retention_args+=("${ns_rel[@]}")
     retention_args+=("$PROMPT" --channel "$retention_channel")
-    retention_args+=(--thread "$retention_thread" --timeout-secs 300)
+    retention_args+=(--thread "$retention_thread" --timeout-secs "$cluster_reply_timeout_seconds")
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         retention_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
     fi
