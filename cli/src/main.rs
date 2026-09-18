@@ -943,10 +943,8 @@ enum SreBotAction {
         slack_channel: Option<String>,
         /// Slack user IDs allowed to resolve the bot's Kubernetes mutation
         /// gates (route sre-approvals). Comma separated and repeatable.
-        /// Required for operator principals (`curie cluster approvals
-        /// --resolve`) to approve; without it only members of the bound Slack
-        /// channel can approve.
-        #[arg(long, value_name = "USER_IDS")]
+        /// At least one explicit user is required.
+        #[arg(long, value_name = "USER_IDS", required = true)]
         approvers: Vec<String>,
         /// Install the upgrade path: the self-upgrade connector, the platform
         /// upgrade Job, and the two identities behind them.

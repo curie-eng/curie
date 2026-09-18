@@ -29,6 +29,7 @@ const REGISTRY_INDEX_WITHOUT_REQUIRED_FIELDS: &str =
 const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
 const VERSION_ID: &str = "00000000-0000-0000-0000-000000000002";
 const PLATFORM_PUBLISH_GATE: &str = "mcp__curie__publish_changes";
+const DEFAULT_APPROVER: &str = "U0EXAMPLE1";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -575,6 +576,21 @@ exit 64
     }
 
     fn run_from(&self, extra: &[&str], current_dir: &Path, release_cache: Option<&Path>) -> Output {
+        let mut args = vec!["--approvers", DEFAULT_APPROVER];
+        args.extend_from_slice(extra);
+        self.run_from_args(&args, current_dir, release_cache)
+    }
+
+    fn run_without_default_approver(&self, extra: &[&str]) -> Output {
+        self.run_from_args(extra, &repo_root(), None)
+    }
+
+    fn run_from_args(
+        &self,
+        extra: &[&str],
+        current_dir: &Path,
+        release_cache: Option<&Path>,
+    ) -> Output {
         let mut paths = vec![self.bin_dir.clone()];
         if let Some(current) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&current));
@@ -926,6 +942,11 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
     assert!(
         text.contains("--approvers"),
         "the install surface must expose --approvers as its single approval input: {text}"
+    );
+    let usage = text.split("Options:").next().unwrap_or(&text);
+    assert!(
+        usage.contains("--approvers <USER_IDS>"),
+        "the usage line must mark --approvers as required: {text}"
     );
     for forbidden in [
         "--route-approvers",
@@ -2919,7 +2940,7 @@ fn default_install_applies_one_identity_with_a_fixed_demo_namespace_ceiling() {
 fn approvers_dry_run_plan(fixture: &Fixture, extra: &[&str]) -> Vec<String> {
     let mut args = vec!["--dry-run", "--json"];
     args.extend_from_slice(extra);
-    let output = fixture.run(&args);
+    let output = fixture.run_without_default_approver(&args);
     let text = shown(&output);
     assert!(output.status.success(), "dry run must succeed: {text}");
     let document: Value = serde_json::from_slice(&output.stdout)
@@ -2952,10 +2973,15 @@ fn dry_run_plans_the_sre_approvals_binding_with_comma_separated_approvers_before
     let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
     let lines = approvers_dry_run_plan(
         &fixture,
-        &["--slack-channel", "C0SREOPS", "--approvers", "U0AAA,U0BBB"],
+        &[
+            "--slack-channel",
+            "C0EXAMPLE1",
+            "--approvers",
+            "U0EXAMPLE1,U0EXAMPLE2",
+        ],
     );
     let (bind, line) = route_binding_line(&lines);
-    for user in ["U0AAA", "U0BBB"] {
+    for user in ["U0EXAMPLE1", "U0EXAMPLE2"] {
         assert!(
             line.contains(user),
             "binding line must name approver {user}: {line}"
@@ -2981,36 +3007,43 @@ fn repeated_approvers_flags_accumulate_into_one_binding() {
     let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
     let lines = approvers_dry_run_plan(
         &fixture,
-        &["--approvers", "U0AAA", "--approvers", "U0BBB,U0CCC"],
+        &[
+            "--approvers",
+            "U0EXAMPLE2,U0EXAMPLE1",
+            "--approvers",
+            "U0EXAMPLE2,U0EXAMPLE3",
+        ],
     );
     let (_, line) = route_binding_line(&lines);
-    for user in ["U0AAA", "U0BBB", "U0CCC"] {
-        assert!(
-            line.contains(user),
-            "binding line must name approver {user}: {line}"
-        );
-    }
+    assert!(
+        line.contains("approvers users U0EXAMPLE2,U0EXAMPLE1,U0EXAMPLE3"),
+        "the binding must preserve first occurrence order and remove duplicates: {line}"
+    );
 }
 
 #[test]
-fn dry_run_without_approvers_binds_the_channel_member_default_and_names_the_operator_gap() {
+fn missing_approvers_is_refused_by_clap_before_all_external_activity() {
     let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
-    let lines = approvers_dry_run_plan(&fixture, &["--slack-channel", "C0SREOPS"]);
-    let (_, line) = route_binding_line(&lines);
-    let lower = line.to_ascii_lowercase();
-    assert!(
-        lower.contains("channel member") || lower.contains("channel-member"),
-        "binding line must disclose the channel-member approver default: {line}"
-    );
-    let plan = lines.join("\n");
-    let lower_plan = plan.to_ascii_lowercase();
-    assert!(
-        lower_plan.contains("operator principal"),
-        "the plan must say operator principals cannot resolve these gates: {lines:?}"
+    let output = fixture.run_without_default_approver(&[]);
+    let text = shown(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "omitting approvers must be a Clap usage error: {text}"
     );
     assert!(
-        plan.contains("--approvers") && plan.contains("--route-approvers sre-approvals=users:"),
-        "the plan must name both ways to bind approvers: {lines:?}"
+        text.contains("required") && text.contains("--approvers <USER_IDS>"),
+        "the refusal must name the missing required flag: {text}"
+    );
+    assert!(fixture.kubectl_calls().is_empty(), "no kubectl activity");
+    assert!(fixture.helm_calls().is_empty(), "no Helm activity");
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "no platform API activity"
+    );
+    assert!(
+        fixture.registry.recorded().is_empty(),
+        "no registry activity"
     );
 }
 
@@ -3018,7 +3051,7 @@ fn dry_run_without_approvers_binds_the_channel_member_default_and_names_the_oper
 fn blank_approver_ids_are_refused_before_any_cluster_mutation() {
     for bad in ["", "   ", "U0AAA,", "U0AAA, ,U0BBB"] {
         let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
-        let output = fixture.run(&["--approvers", bad]);
+        let output = fixture.run_without_default_approver(&["--approvers", bad]);
         let text = shown(&output);
         assert_eq!(
             output.status.code(),
@@ -3062,14 +3095,110 @@ fn full_install_fixture() -> Fixture {
 }
 
 #[test]
+fn rerun_moves_route_narrows_users_preserves_other_routes_and_reports_rebound() {
+    let fixture = full_install_fixture().with_existing_agent_routes(json!({
+        "deploys": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "approvers": {"users": ["U0EXAMPLE1"]},
+        },
+        "sre-approvals": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "approvers": {"users": ["U0EXAMPLE1", "U0EXAMPLE2"]},
+        },
+    }));
+    let install_args = ["--slack-channel", "C0EXAMPLE2", "--approvers", "U0EXAMPLE2"];
+    let output = fixture.run_without_default_approver(&install_args);
+    let text = shown(&output);
+    assert!(output.status.success(), "rerun must complete: {text}");
+
+    let requests = fixture.api.recorded();
+    let route_writes: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
+        })
+        .collect();
+    assert_eq!(
+        route_writes.len(),
+        1,
+        "rerun must send one route PATCH: {requests:?}"
+    );
+    let route_write_index = requests
+        .iter()
+        .position(|request| {
+            request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
+        })
+        .expect("rerun must send a route PATCH");
+    let deployment_index = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/deployments")
+        .expect("rerun must deploy the bundle");
+    assert!(
+        route_write_index < deployment_index,
+        "the route PATCH must precede deployment: {requests:?}"
+    );
+    let body: Value = serde_json::from_slice(&requests[route_write_index].body)
+        .expect("route PATCH body must remain valid JSON");
+    assert_eq!(
+        body["approval_routes"],
+        json!({
+            "deploys": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "approvers": {"users": ["U0EXAMPLE1"]},
+            },
+            "sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+                "approvers": {"users": ["U0EXAMPLE2"]},
+            },
+        }),
+        "the managed route must move and narrow without changing other routes"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line == "rebound approval route sre-approvals on agent sre-bot: resolution \
+                     C0EXAMPLE2; approvers users U0EXAMPLE2"
+        }),
+        "a changed binding must be reported with its new channel and users: {text}"
+    );
+    let first_request_count = requests.len();
+    let second_output = fixture.run_without_default_approver(&install_args);
+    let second_text = shown(&second_output);
+    assert!(
+        second_output.status.success(),
+        "identical rerun must complete: {second_text}"
+    );
+    let all_requests = fixture.api.recorded();
+    let second_requests = &all_requests[first_request_count..];
+    assert!(
+        !second_requests
+            .iter()
+            .any(|request| request.method == "PATCH"),
+        "identical rerun must send no additional route PATCH: {second_requests:?}"
+    );
+    assert_eq!(
+        second_requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/deployments")
+            .count(),
+        1,
+        "identical rerun must deploy once without rebinding: {second_requests:?}"
+    );
+    assert!(
+        !second_text.contains("bound approval route sre-approvals")
+            && !second_text.contains("rebound approval route sre-approvals"),
+        "identical rerun must not claim a bind or rebound: {second_text}"
+    );
+}
+
+#[test]
 fn a_needed_route_write_that_would_drop_a_notification_is_refused_before_deploy() {
     let fixture = full_install_fixture().with_existing_agent_routes(json!({
         "deploys": {
-            "resolution": {"kind": "slack", "address": "C0DEPLOY"},
-            "notification": {"kind": "slack", "address": "C0NOTIFY"},
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "notification": {"kind": "slack", "address": "C0EXAMPLE2"},
         },
     }));
-    let output = fixture.run(&["--approvers", "U0AAA"]);
+    let output = fixture.run_without_default_approver(&["--approvers", "U0EXAMPLE1"]);
     let text = shown(&output);
     assert_eq!(
         output.status.code(),
@@ -3097,15 +3226,20 @@ fn a_needed_route_write_that_would_drop_a_notification_is_refused_before_deploy(
 fn an_identical_binding_with_a_notification_elsewhere_proceeds_without_a_route_write() {
     let fixture = full_install_fixture().with_existing_agent_routes(json!({
         "deploys": {
-            "resolution": {"kind": "slack", "address": "C0DEPLOY"},
-            "notification": {"kind": "slack", "address": "C0NOTIFY"},
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "notification": {"kind": "slack", "address": "C0EXAMPLE2"},
         },
         "sre-approvals": {
-            "resolution": {"kind": "slack", "address": "#local-dev"},
-            "approvers": {"users": ["U0AAA"]},
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+            "approvers": {"users": ["U0EXAMPLE2"]},
         },
     }));
-    let output = fixture.run(&["--approvers", "U0AAA"]);
+    let output = fixture.run_without_default_approver(&[
+        "--slack-channel",
+        "C0EXAMPLE2",
+        "--approvers",
+        "U0EXAMPLE2",
+    ]);
     let text = shown(&output);
     assert!(
         output.status.success(),
@@ -3123,24 +3257,8 @@ fn an_identical_binding_with_a_notification_elsewhere_proceeds_without_a_route_w
         "the bundle must still deploy: {requests:?}"
     );
     assert!(
-        !text.contains("operator principals cannot resolve"),
-        "an explicit users list closes the operator gap: {text}"
-    );
-}
-
-#[test]
-fn a_group_only_bound_route_still_warns_about_the_operator_gap() {
-    let fixture = full_install_fixture().with_existing_agent_routes(json!({
-        "sre-approvals": {
-            "resolution": {"kind": "slack", "address": "#local-dev"},
-            "approvers": {"group": "S0ONCALL"},
-        },
-    }));
-    let output = fixture.run(&[]);
-    let text = shown(&output);
-    assert!(output.status.success(), "install must complete: {text}");
-    assert!(
-        text.contains("operator principals cannot resolve") && text.contains("approver group"),
-        "a group-only route must warn about the operator gap: {text}"
+        !text.contains("bound approval route sre-approvals")
+            && !text.contains("rebound approval route sre-approvals"),
+        "an identical rerun must not claim a bind or rebound: {text}"
     );
 }

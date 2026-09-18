@@ -40,11 +40,10 @@ curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
 
 The installer binds the `sre-approvals` route that gates the six Kubernetes
 mutations and platform publication before it deploys. Terminal resolution
-requires an explicit users list. Add it with `--approvers` using comma separated
-Slack user IDs. Without it the Slack install still succeeds, but only members
-of the bound Slack channel can approve from Slack, and the installer says so.
-Bind users later with
-`curie cluster approvals sre-bot --route-resolution sre-approvals=<CHANNEL> --route-approvers sre-approvals=users:<ids>`.
+requires an explicit users list. Supply it with the required `--approvers` flag
+using comma separated Slack user IDs. The installer refuses an omitted or empty
+list before it reads or changes cluster state. A rerun replaces the managed
+route channel and user list with the requested values.
 If any bound route carries a notification target, the installer refuses to
 rewrite the route map (the API does not return the notification transport);
 write the full map with `curie cluster approvals sre-bot --routes-from <file>`.
@@ -57,6 +56,7 @@ is also accepted), or set the chart value yourself:
 
 ```bash
 curie example sre-bot install --observability \
+  --approvers U0EXAMPLE1 \
   --workspace-repo acme-corp/acme-bot
 curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
 ```

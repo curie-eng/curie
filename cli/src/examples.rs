@@ -239,8 +239,8 @@ pub struct SreBotInstallOpts {
     /// Repeatable `owner/repo` or `owner/*` entries for `api.githubRepoAllowlist`.
     pub workspace_repo: Vec<String>,
     /// Slack user IDs bound as the explicit approvers of the `sre-approvals`
-    /// route. Each raw `--approvers` value may be comma separated; empty means
-    /// the channel-member default, which operator principals cannot resolve.
+    /// route. Each raw `--approvers` value may be comma separated. At least one
+    /// explicit user is required.
     pub approvers: Vec<String>,
 }
 
@@ -551,22 +551,12 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             .slack_channel
             .clone()
             .unwrap_or_else(|| "<the agent's bound Slack channel>".to_string());
-        lines.push(match approvers.is_empty() {
-            false => format!(
-                "bind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} (creating the \
-                 agent if absent): resolution {resolution}, approvers users {} (the only users, \
-                 operator principals minted for them included, who may resolve its gates)",
-                approvers.join(",")
-            ),
-            true => format!(
-                "bind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} (creating the \
-                 agent if absent): resolution {resolution}, approvers left to the channel member \
-                 default unless already bound"
-            ),
-        });
-        if approvers.is_empty() {
-            lines.push(operator_gap_notice());
-        }
+        lines.push(format!(
+            "bind or rebind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} \
+             (creating the agent if absent): resolution {resolution}, approvers users {} (the \
+             only users, operator principals minted for them included, who may resolve its gates)",
+            approvers.join(",")
+        ));
         let mut deploy = format!(
             "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
             identity.namespace, identity.release
@@ -1439,6 +1429,11 @@ const SRE_BOT_AGENT: &str = "sre-bot";
 /// error raised before any cluster work, never silently skipped: dropping it
 /// would bind a narrower approver set than the operator typed.
 fn parse_approvers(raw: &[String]) -> Result<Vec<String>> {
+    if raw.is_empty() {
+        return Err(crate::exit::usage(
+            "at least one explicit Slack user ID is required; pass --approvers <USER_IDS>",
+        ));
+    }
     let mut ids = Vec::new();
     for value in raw {
         for id in value.split(',') {
@@ -1455,27 +1450,6 @@ fn parse_approvers(raw: &[String]) -> Result<Vec<String>> {
         }
     }
     Ok(ids)
-}
-
-fn operator_gap_notice() -> String {
-    format!(
-        "route {SRE_APPROVALS_ROUTE} binds no explicit approver user list: operator principals \
-         cannot resolve the six Kubernetes mutations and platform publication on it until users are bound; approval stays \
-         with the route's Slack channel members or approver group. Re-run with --approvers \
-         <USER_IDS>, or run `curie cluster approvals {SRE_BOT_AGENT} --route-resolution \
-         {SRE_APPROVALS_ROUTE}=<CHANNEL> --route-approvers {SRE_APPROVALS_ROUTE}=users:<ids>` (a \
-         full replacement of the route map; use --routes-from to keep other routes)"
-    )
-}
-
-/// Whether an operator principal is locked out of `binding`: only a non-empty
-/// explicit `users` list is operator-eligible, so a missing route, a
-/// channel-member default, or a group-only binding all leave the gap.
-fn route_lacks_operator_approvers(binding: Option<&crate::api::ApprovalRouteBindingWrite>) -> bool {
-    binding
-        .and_then(|binding| binding.approvers.as_ref())
-        .and_then(|approvers| approvers.users.as_ref())
-        .is_none_or(|users| users.is_empty())
 }
 
 fn route_binding_as_write(
@@ -1495,8 +1469,8 @@ fn route_binding_as_write(
 }
 
 /// The full-replacement route map the installer writes: every other bound route
-/// kept as is, `sre-approvals` kept if already bound (only its approvers
-/// replaced, and only when some are given), else bound to `channel`.
+/// is kept as is, while `sre-approvals` is replaced with `channel` and the
+/// explicit approver list.
 ///
 /// Notifications do not survive this map; call
 /// [`refuse_unwritable_notifications`] on `existing` before writing it.
@@ -1513,22 +1487,20 @@ fn sre_approvals_route_map(
                 .collect()
         })
         .unwrap_or_default();
-    let binding = map
-        .entry(SRE_APPROVALS_ROUTE.to_string())
-        .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
+    map.insert(
+        SRE_APPROVALS_ROUTE.to_string(),
+        crate::api::ApprovalRouteBindingWrite {
             resolution: crate::api::ApprovalResolutionTargetWrite {
                 kind: "slack".to_string(),
                 address: channel.to_string(),
             },
             notification: None,
-            approvers: None,
-        });
-    if !approvers.is_empty() {
-        binding.approvers = Some(crate::api::ApprovalApprovers {
-            group: None,
-            users: Some(approvers.to_vec()),
-        });
-    }
+            approvers: Some(crate::api::ApprovalApprovers {
+                group: None,
+                users: Some(approvers.to_vec()),
+            }),
+        },
+    );
     map
 }
 
@@ -1603,12 +1575,16 @@ async fn bind_sre_approvals_route(
     if desired != current {
         refuse_unwritable_notifications(existing)?;
         client.set_approval_routes(&agent.id, &desired).await?;
+        let action = if existing.is_some_and(|routes| routes.contains_key(SRE_APPROVALS_ROUTE)) {
+            "rebound"
+        } else {
+            "bound"
+        };
         ui.note(&format!(
-            "bound approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}"
+            "{action} approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}: resolution \
+             {channel}; approvers users {}",
+            approvers.join(",")
         ));
-    }
-    if route_lacks_operator_approvers(desired.get(SRE_APPROVALS_ROUTE)) {
-        ui.warn(&operator_gap_notice());
     }
     Ok(())
 }
@@ -2582,19 +2558,11 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 mod tests {
     use super::*;
 
-    fn sre_route(
-        channel: &str,
-        users: Option<&[&str]>,
-    ) -> crate::api::ApprovalRouteBindingResponse {
-        serde_json::from_value(match users {
-            Some(users) => serde_json::json!({
-                "resolution": {"kind": "slack", "address": channel},
-                "approvers": {"users": users},
-            }),
-            None => serde_json::json!({
-                "resolution": {"kind": "slack", "address": channel},
-            }),
-        })
+    fn sre_route(channel: &str, users: &[&str]) -> crate::api::ApprovalRouteBindingResponse {
+        serde_json::from_value(serde_json::json!({
+            "resolution": {"kind": "slack", "address": channel},
+            "approvers": {"users": users},
+        }))
         .unwrap()
     }
 
@@ -2603,47 +2571,17 @@ mod tests {
     }
 
     #[test]
-    fn operator_gap_is_flagged_for_a_group_only_or_empty_users_route() {
-        let group_only: crate::api::ApprovalRouteBindingResponse =
-            serde_json::from_value(serde_json::json!({
-                "resolution": {"kind": "slack", "address": "C0SREOPS"},
-                "approvers": {"group": "S0ONCALL"},
-            }))
-            .unwrap();
-        let mut existing = std::collections::BTreeMap::new();
-        existing.insert("sre-approvals".to_string(), group_only);
-        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &[]);
-        assert!(route_lacks_operator_approvers(map.get("sre-approvals")));
-
-        let empty_users = sre_route("C0SREOPS", Some(&[]));
-        existing.insert("sre-approvals".to_string(), empty_users);
-        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &[]);
-        assert!(route_lacks_operator_approvers(map.get("sre-approvals")));
-
-        assert!(route_lacks_operator_approvers(None));
-        let map = sre_approvals_route_map(None, "C0SREOPS", &approvers(&["U0AAA"]));
-        assert!(!route_lacks_operator_approvers(map.get("sre-approvals")));
-    }
-
-    #[test]
     fn sre_approvals_route_map_binds_users_when_approvers_given() {
-        let map = sre_approvals_route_map(None, "C0SREOPS", &approvers(&["U0AAA", "U0BBB"]));
-        assert_eq!(
-            serde_json::to_value(&map).unwrap(),
-            serde_json::json!({"sre-approvals": {
-                "resolution": {"kind": "slack", "address": "C0SREOPS"},
-                "approvers": {"users": ["U0AAA", "U0BBB"]},
-            }})
+        let map = sre_approvals_route_map(
+            None,
+            "C0EXAMPLE1",
+            &approvers(&["U0EXAMPLE1", "U0EXAMPLE2"]),
         );
-    }
-
-    #[test]
-    fn sre_approvals_route_map_omits_approvers_for_the_channel_member_default() {
-        let map = sre_approvals_route_map(None, "C0SREOPS", &[]);
         assert_eq!(
             serde_json::to_value(&map).unwrap(),
             serde_json::json!({"sre-approvals": {
-                "resolution": {"kind": "slack", "address": "C0SREOPS"},
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "approvers": {"users": ["U0EXAMPLE1", "U0EXAMPLE2"]},
             }})
         );
     }
@@ -2653,49 +2591,58 @@ mod tests {
         let mut existing = std::collections::BTreeMap::new();
         existing.insert(
             "deploys".to_string(),
-            sre_route("C0DEPLOY", Some(&["U0ZZZ"])),
+            sre_route("C0EXAMPLE2", &["U0EXAMPLE3"]),
         );
-        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &approvers(&["U0AAA"]));
+        let map =
+            sre_approvals_route_map(Some(&existing), "C0EXAMPLE1", &approvers(&["U0EXAMPLE1"]));
         let value = serde_json::to_value(&map).unwrap();
         assert_eq!(
             value["deploys"],
             serde_json::json!({
-                "resolution": {"kind": "slack", "address": "C0DEPLOY"},
-                "approvers": {"users": ["U0ZZZ"]},
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+                "approvers": {"users": ["U0EXAMPLE3"]},
             })
         );
         assert_eq!(
             value["sre-approvals"]["approvers"],
-            serde_json::json!({"users": ["U0AAA"]})
+            serde_json::json!({"users": ["U0EXAMPLE1"]})
         );
         assert_eq!(value.as_object().unwrap().len(), 2);
     }
 
     #[test]
-    fn sre_approvals_route_map_keeps_an_existing_binding_and_replaces_only_approvers() {
+    fn sre_approvals_route_map_moves_an_existing_binding_and_replaces_approvers() {
         let mut existing = std::collections::BTreeMap::new();
         existing.insert(
             "sre-approvals".to_string(),
-            sre_route("C0KEPT", Some(&["U0OLD"])),
+            sre_route("C0EXAMPLE1", &["U0EXAMPLE1", "U0EXAMPLE2"]),
         );
 
-        let replaced = sre_approvals_route_map(Some(&existing), "C0NEW", &approvers(&["U0NEW"]));
+        let replaced =
+            sre_approvals_route_map(Some(&existing), "C0EXAMPLE2", &approvers(&["U0EXAMPLE2"]));
         assert_eq!(
             serde_json::to_value(&replaced).unwrap(),
             serde_json::json!({"sre-approvals": {
-                "resolution": {"kind": "slack", "address": "C0KEPT"},
-                "approvers": {"users": ["U0NEW"]},
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+                "approvers": {"users": ["U0EXAMPLE2"]},
             }})
         );
+    }
 
-        let untouched = sre_approvals_route_map(Some(&existing), "C0NEW", &[]);
-        assert_eq!(
-            serde_json::to_value(&untouched).unwrap(),
-            serde_json::json!({"sre-approvals": {
-                "resolution": {"kind": "slack", "address": "C0KEPT"},
-                "approvers": {"users": ["U0OLD"]},
-            }})
+    #[test]
+    fn sre_approvals_route_map_matches_current_when_binding_is_identical() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert(
+            "sre-approvals".to_string(),
+            sre_route("C0EXAMPLE2", &["U0EXAMPLE2"]),
         );
+        let desired =
+            sre_approvals_route_map(Some(&existing), "C0EXAMPLE2", &approvers(&["U0EXAMPLE2"]));
+        let current = existing
+            .iter()
+            .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(desired, current);
     }
 
     #[test]

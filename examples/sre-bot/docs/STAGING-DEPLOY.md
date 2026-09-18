@@ -3,7 +3,7 @@
 The supported cluster reproduction is one command:
 
 ```bash
-curie example sre-bot install --observability
+curie example sre-bot install --observability --approvers U0EXAMPLE1
 ```
 
 With no targeting flags, Curie lands as release `curie` in namespace `curie`,
@@ -12,6 +12,7 @@ beside an existing release:
 
 ```bash
 curie example sre-bot install --observability \
+  --approvers U0EXAMPLE1 \
   --namespace <ns> \
   --release <release> \
   --observability-namespace <obs-ns>
@@ -48,7 +49,8 @@ Passing the flag keeps the `self-upgrade` connector and installs the platform
 upgrade Job path:
 
 ```bash
-curie example sre-bot install --observability --platform-upgrade
+curie example sre-bot install --observability --platform-upgrade \
+  --approvers U0EXAMPLE1
 ```
 
 After the ordinary deploy, the installer:
@@ -85,8 +87,8 @@ curie example sre-bot install --observability --slack-channel <channel-id> \
 ```
 
 `--approvers` binds explicit Slack user IDs on the `sre-approvals` route. You
-need it to resolve approvals from the CLI with an operator principal; without
-it only members of the bound Slack channel can approve.
+must supply at least one user. The installer refuses omission before reading or
+changing cluster state.
 
 Bind by channel ID, never `#name`. `deploy.yaml` carries no active documentation
 placeholder binding. Both API and CLI refuse the `C0EXAMPLE<digits>` placeholder
