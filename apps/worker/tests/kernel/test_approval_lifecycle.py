@@ -32,10 +32,13 @@ from curie_worker.approvals import (
     PublicationCreateRequest,
     SettledApproval,
 )
+from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import GRANT_TOOL_ENV
 from curie_worker.kernel import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox.types import RouteState
+from curie_worker.workspace import WorkspaceSelectionRefused
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
@@ -4411,5 +4414,201 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
             assert h.sink.last_text is not None
             assert "route is not bound" in h.sink.last_text
             assert "unexpected approval route" not in h.sink.last_text
+
+    asyncio.run(go())
+
+
+# --- Approval resume must not re-derive a repository from its own text (#2828) --
+
+
+class _WorkspacelessBinding:
+    """A deployment with repository workspaces off, as `curie cluster message`
+    installs it: a deployment id (so selection runs) and no bound repository."""
+
+    def __init__(self, deployment_id: uuid.UUID) -> None:
+        self.deployment_id = deployment_id
+        self.grant_reads: list[str] = []
+
+    async def approval_grant_tool(self, event_id: str, _agent_id: uuid.UUID) -> str | None:
+        # The resolver's answer once an operator principal has approved the
+        # persisted row: only that approval's resume event carries the one-shot
+        # grant for the gated tool (binding.approval_grant_tool, ADR-0035).
+        self.grant_reads.append(event_id)
+        if event_id == _RESUME_EVENT_ID:
+            return _GATED_TOOL
+        return None
+
+    async def resolve(self, _kind: str, _channel: str) -> object:
+        return SimpleNamespace(
+            agent_id=uuid.UUID("22222222-2222-4222-8222-222222222828"),
+            agent_name="sre-bot",
+            deployment_id=self.deployment_id,
+            workspace_enabled=False,
+            endpoint=None,
+            adapter=None,
+        )
+
+    def boot_env(
+        self,
+        _resolved: object,
+        _thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+    ) -> dict[str, str]:
+        return {}
+
+    def packs_for(self, _resolved: object) -> BehaviorPacks:
+        return BehaviorPacks()
+
+
+_GATED_TOOL = "mcp__kubernetes__resources_delete"
+_RESUME_APPROVAL_ID = uuid.UUID("a1057a26-0000-4000-8000-000000002828")
+_RESUME_EVENT_ID = f"approval-{_RESUME_APPROVAL_ID}-resolved"
+
+_ALLOWLIST_REFUSAL = (
+    "That repository is not in api.githubRepoAllowlist for this installation; "
+    "allow `owner/repo` or `owner/*` in the chart values."
+)
+
+
+class _ApiShapedWorkspace:
+    """The worker coordinator against the real API contract: a null repository
+    with no selection is a 200 with nothing selected, a sticky selection is
+    returned for a null request, and any named repository outside the
+    allowlist (or different from the sticky one) is refused."""
+
+    def __init__(self, *, selected: str | None = None) -> None:
+        self.selected = selected
+        self.requested: list[str | None] = []
+
+    def select_repository(
+        self,
+        *,
+        thread_key: str,
+        deployment_id: uuid.UUID,
+        author: str,
+        repo_full_name: str | None,
+    ) -> str | None:
+        self.requested.append(repo_full_name)
+        if repo_full_name is None:
+            return self.selected
+        if self.selected is not None and repo_full_name != self.selected:
+            raise WorkspaceSelectionRefused(
+                "This thread is already bound to a different repository."
+            )
+        raise WorkspaceSelectionRefused(_ALLOWLIST_REFUSAL)
+
+    def touch(self, thread_key: str, *, ttl_seconds: int) -> bool:
+        return True
+
+
+def _kubernetes_resume_turn(thread: str, *, placeholder: str | None) -> QueuedTurn:
+    """The resume the API really enqueues for the #2828 repro: its text embeds
+    the gated tool's arguments, and ``apiVersion: batch/v1`` is shaped exactly
+    like a bare ``owner/repo``."""
+
+    from curie_api.resumequeue import build_resume_turn
+
+    summary = (
+        "Tool call awaiting approval: mcp__kubernetes__resources_delete "
+        '{"apiVersion": "batch/v1", "kind": "Job", '
+        '"name": "curie-preflight-gvisor", "namespace": "curie"}'
+    )
+    turn = build_resume_turn(
+        SimpleNamespace(  # type: ignore[arg-type]
+            id=_RESUME_APPROVAL_ID,
+            conversation_id=thread,
+            status="approved",
+            summary=summary,
+            resolved_by="U0ACC2570OP",
+            resolution_note=None,
+            reply_kind="slack",
+            reply_channel="C0LOCALDEV",
+            reply_placeholder=placeholder,
+            reply_endpoint=None,
+            reply_adapter=None,
+        )
+    )
+    assert "batch/v1" in turn.text
+    assert turn.event_id == _RESUME_EVENT_ID
+    return turn
+
+
+@pytest.mark.parametrize("coordinator", ["api", "off"])
+def test_approval_resume_with_slash_argument_runs_the_approved_turn_once(
+    make_harness,
+    coordinator: str,
+) -> None:
+    """#2828: an operator-approved gate raised by a cluster-message turn on an
+    install with workspaces off must resume into the runner exactly once. The
+    resume text carries ``batch/v1``; it must never become a repository
+    selection (403 from the API, or the workspaces-off refusal)."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = _WorkspacelessBinding(
+            uuid.UUID("77777777-7777-4777-8777-000000002828")
+        )
+        async with make_harness(binding=binding, approvals=approvals) as h:
+            probe = _ApiShapedWorkspace() if coordinator == "api" else None
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            thread = f"th_2828_{coordinator}"
+            h.runner.default_script = _awaiting_script(
+                "mcp__kubernetes__resources_delete batch/v1 Job"
+            )
+            ask = "Delete the failed Job curie-preflight-gvisor in namespace curie."
+            await h.kernel.process_event(
+                _qevent(ask, thread=thread, channel="C0LOCALDEV")
+            )
+            assert approvals.create_calls == 1
+            assert h.runner.opened == [ask]
+
+            h.runner.default_script = [
+                Final(text="Deleted Job curie-preflight-gvisor.", status=DONE)
+            ]
+            resume = _kubernetes_resume_turn(thread, placeholder="p-1")
+            await h.kernel.process_event(resume)
+            # Redelivery of the same resume must not run the tool again.
+            await h.kernel.process_event(resume)
+
+            assert h.runner.opened == [ask, resume.text]
+            # The approved tool reaches the runner exactly once: one claim carries
+            # the one-shot grant, and redelivery claims nothing further.
+            grant_claims = [
+                env for env in h.fake_k8s.claim_envs if (env or {}).get(GRANT_TOOL_ENV)
+            ]
+            assert len(grant_claims) == 1
+            assert grant_claims[0][GRANT_TOOL_ENV] == _GATED_TOOL
+            assert _RESUME_EVENT_ID in binding.grant_reads
+            assert h.sink.last_text == "Deleted Job curie-preflight-gvisor."
+            assert await h.async_redis.exists(h.config.done_key(resume.event_id))
+            if probe is not None:
+                assert "batch/v1" not in probe.requested
+                assert all(repo is None for repo in probe.requested)
+
+    asyncio.run(go())
+
+
+def test_genuine_repository_message_on_workspaceless_install_is_still_refused(
+    make_harness,
+) -> None:
+    """#2683 is untouched: a PERSON naming a repository on this install is
+    still refused before any claim or model turn."""
+
+    async def go() -> None:
+        binding = _WorkspacelessBinding(
+            uuid.UUID("77777777-7777-4777-8777-000000002829")
+        )
+        async with make_harness(binding=binding) as h:
+            probe = _ApiShapedWorkspace()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            await h.kernel.process_event(
+                _qevent("Change acme-corp/acme-bot", thread="th_2828_person")
+            )
+
+            assert probe.requested == ["acme-corp/acme-bot"]
+            assert h.runner.opened == []
+            assert h.sink.last_text == _ALLOWLIST_REFUSAL
 
     asyncio.run(go())

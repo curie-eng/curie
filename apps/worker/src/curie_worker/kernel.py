@@ -2802,6 +2802,7 @@ class Kernel:
                             verified_review=verified_review,
                             review_turn=qevent if verified_review is not None else None,
                             workspace_inference=workspace_inference,
+                            approval_resume=self._is_approval_resume(qevent.event_id),
                         )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -3173,6 +3174,7 @@ class Kernel:
                             ignore_message=(
                                 verified_review is not None
                                 or source is TurnSource.WEBHOOK
+                                or self._is_approval_resume(qevent.event_id)
                             ),
                         )
                         is not None
@@ -3359,6 +3361,9 @@ class Kernel:
                                 review_turn=review_turn,
                                 workspace_inference=workspace_inference,
                                 attachment_fresh_only=True,
+                                approval_resume=self._is_approval_resume(
+                                    qevent.event_id
+                                ),
                             )
                         except RouteChangedError:
                             # Another worker bound a runner after the lookup
@@ -3473,6 +3478,7 @@ class Kernel:
         review_turn: QueuedTurn | None = None,
         workspace_inference: _WorkspaceInferenceCarry,
         attachment_fresh_only: bool = False,
+        approval_resume: bool = False,
     ) -> _RouteResult:
         # A thread that requires a repository must establish (or confirm) it
         # before any platform response path. This deliberately precedes the
@@ -3490,11 +3496,16 @@ class Kernel:
             # workspace. Links in the untrusted review body are context, not a
             # request to select another repository. Webhook jobs (#2572) likewise
             # never parse a GitHub URL from the payload; the operator map is the
-            # only coding target.
+            # only coding target. An approval resume (#2828) is platform text that
+            # quotes the gated tool's arguments, so ``apiVersion: batch/v1`` would
+            # read as a repository; its repository is the thread's existing
+            # selection, which a null request returns.
             repo_fact = trusted_repository_fact(
                 event.text,
                 ignore_message=(
-                    verified_review is not None or source is TurnSource.WEBHOOK
+                    verified_review is not None
+                    or source is TurnSource.WEBHOOK
+                    or approval_resume
                 ),
             )
             if self._workspace is None:
