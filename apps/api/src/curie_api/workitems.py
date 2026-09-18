@@ -1,4 +1,9 @@
-"""Transactional lifecycle operations for durable WorkItems."""
+"""Transactional lifecycle operations for durable WorkItems.
+
+Each public operation owns and commits the supplied session transaction,
+including conflict outcomes. Callers should dedicate the session to one operation
+and avoid attaching unrelated pending work.
+"""
 
 from __future__ import annotations
 
