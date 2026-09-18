@@ -4,6 +4,7 @@ create agent -> create version -> deploy to dev -> list/get, the B1 done-when.
 """
 
 import asyncio
+import uuid
 from typing import Any
 
 from curie_api.config import get_settings
@@ -537,6 +538,122 @@ def test_delete_agent_removes_it_and_cascades_versions(
         )
         == 0
     )
+
+
+def test_delete_agent_removes_work_requests_and_internal_lineage_without_github(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: Any,
+) -> None:
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "published-work-agent",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    ).json()
+    agent_id = agent["id"]
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "fixture"},
+        headers=auth_headers,
+    ).json()
+    deployment = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version["id"],
+            "environment": "dev",
+        },
+        headers=auth_headers,
+    ).json()
+    lineage_id, work_item_id, request_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    async def seed() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.thread_publication_lineages "
+                        "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                        "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
+                        "latest_revision) VALUES "
+                        "(:id, :agent, :deployment, :conversation, :repo, :base_sha, "
+                        ":branch, 123, :pr_url, :head_sha, 'open', 1, 1)"
+                    ),
+                    {
+                        "id": lineage_id,
+                        "agent": agent_id,
+                        "deployment": deployment["id"],
+                        "conversation": "slack:C0EXAMPLE1:1700000000.000100",
+                        "repo": "acme-corp/acme-bot",
+                        "base_sha": "0123456789abcdef0123456789abcdef01234567",
+                        "branch": f"curie/publication-{lineage_id.hex}",
+                        "pr_url": "https://github.com/acme-corp/acme-bot/pull/123",
+                        "head_sha": "1123456789abcdef0123456789abcdef01234567",
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.work_items "
+                        "(id, github_repository_id, github_issue_number, "
+                        "github_installation_id, agent_id, repo_full_name, "
+                        "conversation_id, publication_lineage_id, version, "
+                        "next_sequence) VALUES "
+                        "(:id, 101, 2573, 202, :agent, :repo, :conversation, "
+                        ":lineage, 2, 2)"
+                    ),
+                    {
+                        "id": work_item_id,
+                        "agent": agent_id,
+                        "repo": "acme-corp/acme-bot",
+                        "conversation": "slack:C0EXAMPLE1:1700000000.000100",
+                        "lineage": lineage_id,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.execution_requests "
+                        "(id, work_item_id, sequence, status, wait_deadline, version) "
+                        "VALUES (:id, :work_item, 1, 'waiting', "
+                        "clock_timestamp() + interval '1 hour', 1)"
+                    ),
+                    {"id": request_id, "work_item": work_item_id},
+                )
+                await conn.execute(
+                    text("UPDATE curie.deployments SET status = 'stopped' WHERE id = :id"),
+                    {"id": deployment["id"]},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+
+    def refuse_github(*_args: Any, **_kwargs: Any) -> str:
+        raise AssertionError("agent deletion attempted a GitHub operation")
+
+    monkeypatch.setattr(
+        "curie_api.github_app.GitHubCredentials.token_for", refuse_github
+    )
+    response = client.delete(f"/agents/{agent_id}", headers=auth_headers)
+    assert response.status_code == 204
+    assert response.content == b""
+
+    for query, row_id in (
+        ("SELECT count(*) FROM curie.agents WHERE id = :aid", agent_id),
+        ("SELECT count(*) FROM curie.agent_versions WHERE id = :aid", version["id"]),
+        ("SELECT count(*) FROM curie.deployments WHERE id = :aid", deployment["id"]),
+        (
+            "SELECT count(*) FROM curie.thread_publication_lineages WHERE id = :aid",
+            lineage_id,
+        ),
+        ("SELECT count(*) FROM curie.work_items WHERE id = :aid", work_item_id),
+        ("SELECT count(*) FROM curie.execution_requests WHERE id = :aid", request_id),
+    ):
+        assert _count(query, str(row_id)) == 0
 
 
 def test_delete_agent_with_active_deployment_returns_409(
