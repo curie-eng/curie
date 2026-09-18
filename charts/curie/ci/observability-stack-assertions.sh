@@ -235,15 +235,19 @@ def hook_annotations(doc):
     return str(doc.get("metadata", {}).get("annotations", {}).get("helm.sh/hook", ""))
 
 
-def storage_requests(docs):
-    requests = []
+def claim_specs(docs):
+    specs = []
     for doc in docs:
         if doc.get("kind") == "PersistentVolumeClaim":
-            requests.append(at(doc, "spec", "resources", "requests", "storage"))
+            specs.append(at(doc, "spec"))
         if doc.get("kind") == "StatefulSet":
             for claim in doc.get("spec", {}).get("volumeClaimTemplates", []):
-                requests.append(at(claim, "spec", "resources", "requests", "storage"))
-    return requests
+                specs.append(at(claim, "spec"))
+    return specs
+
+
+def storage_requests(docs):
+    return [at(spec, "resources", "requests", "storage") for spec in claim_specs(docs)]
 
 
 grafana_values = load_one(assets / "grafana-values.yaml")
@@ -364,15 +368,7 @@ rendered_storage = {
 if mutation == "storage-class":
     grafana_pvcs[0]["spec"]["storageClassName"] = ""
 for label, docs in rendered_storage.items():
-    claims = []
-    for doc in docs:
-        if doc.get("kind") == "PersistentVolumeClaim":
-            claims.append(at(doc, "spec"))
-        if doc.get("kind") == "StatefulSet":
-            claims.extend(
-                at(claim, "spec")
-                for claim in doc.get("spec", {}).get("volumeClaimTemplates", [])
-            )
+    claims = claim_specs(docs)
     assert claims, f"{label} must render persistent storage"
     assert all("storageClassName" not in claim for claim in claims), (
         f"{label} must leave rendered storageClassName absent so the cluster "

@@ -174,22 +174,21 @@ def _required_release_images(
     return images
 
 
-def curie_images_for_profiles(compose_text: str, profiles: Sequence[str]) -> list[str]:
-    """ghcr curie image refs from services selected by `profiles`."""
+def _compose_services_from_text(compose_text: str) -> dict[str, object]:
+    """Parse resolved compose text; PyYAML is only needed on this path."""
     import yaml
 
-    return _curie_images_for_profiles(
-        _compose_services(yaml.safe_load(compose_text)), profiles
-    )
+    return _compose_services(yaml.safe_load(compose_text))
+
+
+def curie_images_for_profiles(compose_text: str, profiles: Sequence[str]) -> list[str]:
+    """ghcr curie image refs from services selected by `profiles`."""
+    return _curie_images_for_profiles(_compose_services_from_text(compose_text), profiles)
 
 
 def required_release_images(compose_text: str, profiles: Sequence[str]) -> list[str]:
     """Required refs from resolved compose text, including one shot images."""
-    import yaml
-
-    return _required_release_images(
-        _compose_services(yaml.safe_load(compose_text)), profiles
-    )
+    return _required_release_images(_compose_services_from_text(compose_text), profiles)
 
 
 def _image_present(image: str) -> bool:
