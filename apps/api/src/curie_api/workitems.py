@@ -566,14 +566,23 @@ async def link_publication_lineage(
         )
 
     lineage = await session.scalar(
-        select(ThreadPublicationLineage).where(
-            ThreadPublicationLineage.id == publication_lineage_id
-        )
+        select(ThreadPublicationLineage)
+        .where(ThreadPublicationLineage.id == publication_lineage_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
     )
     if lineage is None or (
         lineage.agent_id != work_item.agent_id
         or lineage.conversation_id != work_item.conversation_id
         or lineage.repo_full_name.casefold() != work_item.repo_full_name.casefold()
+        or (
+            lineage.github_repository_id is not None
+            and lineage.github_repository_id != work_item.github_repository_id
+        )
+        or (
+            lineage.github_installation_id is not None
+            and lineage.github_installation_id != work_item.github_installation_id
+        )
     ):
         return await _conflict(
             session, "lineage_mismatch", work_item=work_item, request=request
