@@ -1773,6 +1773,91 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
     return result
 
 
+# Per served agent: its approval route map, read fresh, and the (kind, address)
+# pairs of the adapter's bindings that belong to that agent.
+_ServedTargets = dict[uuid.UUID, tuple[Any, frozenset[tuple[str, str]]]]
+
+
+async def _adapter_served_targets(
+    session: AsyncSession, bindings: frozenset[uuid.UUID]
+) -> _ServedTargets:
+    """What an adapter serving ``bindings`` can reach, keyed by agent id.
+
+    Read fresh on every call, like ``get_approval_route_binding``: a binding
+    deleted or a route re-pointed after the credential was issued narrows what
+    the adapter sees immediately.
+    """
+
+    if not bindings:
+        return {}
+    rows = await session.execute(
+        select(
+            AgentChannel.agent_id,
+            AgentChannel.kind,
+            AgentChannel.address,
+            Agent.approval_routes,
+        )
+        .join(Agent, Agent.id == AgentChannel.agent_id)
+        .where(AgentChannel.id.in_(bindings))
+    )
+    pairs: dict[uuid.UUID, set[tuple[str, str]]] = {}
+    routes: dict[uuid.UUID, Any] = {}
+    for agent_id, kind, address, approval_routes in rows:
+        pairs.setdefault(agent_id, set()).add((kind, address))
+        routes[agent_id] = approval_routes
+    return {agent_id: (routes[agent_id], frozenset(p)) for agent_id, p in pairs.items()}
+
+
+def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
+    """THE served predicate (ADR-0154), shared by the list and the resolver.
+
+    An approval is served when it names an agent and a route, and that agent's
+    route resolves to the ``(kind, address)`` of one of the adapter's bindings
+    ON THE SAME AGENT. A routeless approval, or a route whose resolution is
+    missing or malformed, is served by no adapter: fail closed.
+    """
+
+    if approval.agent_id is None or not approval.route:
+        return False
+    target = targets.get(approval.agent_id)
+    if target is None:
+        return False
+    approval_routes, pairs = target
+    if not isinstance(approval_routes, dict):
+        return False
+    binding = approval_routes.get(approval.route)
+    if not isinstance(binding, dict):
+        return False
+    resolution = binding.get("resolution")
+    if not isinstance(resolution, dict):
+        return False
+    kind, address = resolution.get("kind"), resolution.get("address")
+    if not isinstance(kind, str) or not isinstance(address, str):
+        return False
+    return (kind, address) in pairs
+
+
+async def approval_served_by(
+    session: AsyncSession, approval: Approval, bindings: frozenset[uuid.UUID]
+) -> bool:
+    """Whether an adapter serving ``bindings`` may see and resolve ``approval``."""
+
+    return _approval_served(approval, await _adapter_served_targets(session, bindings))
+
+
+async def existing_channel_binding_ids(
+    session: AsyncSession, binding_ids: frozenset[uuid.UUID]
+) -> frozenset[uuid.UUID]:
+    """The subset of ``binding_ids`` that still name an ``agent_channels`` row."""
+
+    if not binding_ids:
+        return frozenset()
+    result = await session.scalars(
+        select(AgentChannel.id).where(AgentChannel.id.in_(binding_ids))
+    )
+    return frozenset(result)
+
+
 async def list_approvals(
     session: AsyncSession,
     *,
@@ -1780,16 +1865,31 @@ async def list_approvals(
     agent_id: uuid.UUID | None = None,
     conversation_id: str | None = None,
     limit: int = 50,
+    served_by: frozenset[uuid.UUID] | None = None,
 ) -> list[Approval]:
-    stmt = select(Approval).order_by(Approval.created_at.desc()).limit(limit)
+    """Newest first. ``served_by`` (an adapter principal's bindings) narrows the
+    result to approvals that adapter serves, BEFORE ``limit`` applies, so an
+    adapter never gets a short page because unserved rows took the slots."""
+
+    stmt = select(Approval).order_by(Approval.created_at.desc())
     if status is not None:
         stmt = stmt.where(Approval.status == status)
     if agent_id is not None:
         stmt = stmt.where(Approval.agent_id == agent_id)
     if conversation_id is not None:
         stmt = stmt.where(Approval.conversation_id == conversation_id)
-    result = await session.scalars(stmt)
-    return list(result)
+    if served_by is None:
+        result = await session.scalars(stmt.limit(limit))
+        return list(result)
+    targets = await _adapter_served_targets(session, served_by)
+    if not targets:
+        return []
+    # Narrow in SQL to the served agents' routed rows, then apply the one
+    # predicate the resolver also uses; the route map is JSONB, so the
+    # resolution match itself stays in Python.
+    stmt = stmt.where(Approval.agent_id.in_(targets), Approval.route.is_not(None))
+    served = [a for a in await session.scalars(stmt) if _approval_served(a, targets)]
+    return served[:limit]
 
 
 async def pending_approval_inventory(
@@ -2086,11 +2186,14 @@ async def append_approval_audit(
     evidence: dict[str, Any] | None = None,
     principal_kind: str | None = None,
     authenticated: bool = False,
+    principal_subject: str | None = None,
 ) -> ApprovalAuditEntry:
     """Append one audit row (#247). Append-only by design; never updated.
 
     ``evidence`` (#420) is the membership snapshot the authorizer decided on;
-    None for writers that made no membership decision.
+    None for writers that made no membership decision. ``principal_subject``
+    names the adapter that transported an ``adapter`` principal's decision
+    (ADR-0154); None for every other kind.
     """
 
     entry = ApprovalAuditEntry(
@@ -2100,6 +2203,7 @@ async def append_approval_audit(
         actor_channel=actor_channel,
         principal_kind=principal_kind,
         authenticated=authenticated,
+        principal_subject=principal_subject,
         decision=decision,
         authorizer=authorizer,
         authorized=authorized,

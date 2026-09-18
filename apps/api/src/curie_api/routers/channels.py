@@ -3,10 +3,11 @@
 Two endpoints, and every request/response model they use lives here rather than
 in ``schemas.py``:
 
-- ``POST /channels/token`` (platform key only) mints a ``chn`` token over a
-  binding ROW's id plus a bumped generation, so an ingress adapter holds a
-  credential scoped to exactly one binding instead of the platform key, and a
-  remint revokes the token it replaces.
+- ``POST /channels/token`` (platform key, or an adapter principal serving the
+  binding, ADR-0154) mints a ``chn`` token over a binding ROW's id plus a
+  bumped generation, so an ingress adapter holds a credential scoped to
+  exactly one binding instead of the platform key, and a remint revokes the
+  token it replaces.
 - ``POST /channels/turns`` (platform key OR a ``chn`` token) enqueues a
   ``QueuedTurn`` for the binding named in the BODY.
 
@@ -57,8 +58,9 @@ from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
-from .. import channel_token
-from ..auth import require_api_key, verify_platform_key
+from .. import adapter_principal, channel_token
+from ..approval_auth import platform_key_or_adapter
+from ..auth import verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..delivery import (
@@ -246,18 +248,23 @@ def _unroutable(kind: str, address: str) -> HTTPException:
 # --- POST /channels/token -----------------------------------------------------
 
 
-@router.post(
-    "/token", response_model=ChannelTokenOut, dependencies=[Depends(require_api_key)]
-)
+@router.post("/token", response_model=ChannelTokenOut)
 async def mint_channel_token(
-    data: ChannelTokenRequest, session: SessionDep
+    data: ChannelTokenRequest,
+    session: SessionDep,
+    adapter: Annotated[
+        adapter_principal.AdapterClaims | None,
+        Depends(platform_key_or_adapter(adapter_principal.SCOPE_CHANNELS_TOKEN)),
+    ],
 ) -> ChannelTokenOut:
-    """Mint a `chn` token for one binding (platform key only).
+    """Mint a `chn` token for one binding (platform key or adapter principal).
 
-    Platform-key-only on purpose: a `chn` token does exactly one thing, enqueue
-    for the binding in its claims. If it could mint, a compromised adapter would
-    defeat both the TTL and the generation -- the only two things standing in for
-    a revocation list.
+    Never a `chn` token: it does exactly one thing, enqueue for the binding in
+    its claims. If it could mint, a compromised adapter would defeat both the
+    TTL and the generation -- the only two things standing in for a revocation
+    list. An adapter principal (ADR-0154) may mint only for a binding in its own
+    set, so a compromised adapter renews its own binding's token and nothing
+    else, under the same cap and the same generation bump.
 
     The token claims the ROW's id and the generation this mint stamps. Minting
     is a rotation write: it bumps the row under `FOR UPDATE` and signs the NEW
@@ -276,6 +283,12 @@ async def mint_channel_token(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    if adapter is not None and (row is None or row.id not in adapter.bindings):
+        # Unknown and unserved read the same, so an adapter cannot probe which
+        # pairs are bound outside its own set.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "adapter principal does not serve this binding"
+        )
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -296,6 +309,13 @@ async def mint_channel_token(
         exp=int(time.time()) + data.ttl_s,
     )
     await session.commit()
+    if adapter is not None:
+        # ADR-0154: the mint audit record (approval_audit is per-approval).
+        logger.info(
+            "channel token minted principal_kind=adapter subject=%s binding=%s",
+            adapter.subject,
+            row.id,
+        )
     return ChannelTokenOut(token=token)
 
 

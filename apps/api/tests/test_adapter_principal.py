@@ -222,10 +222,14 @@ def test_adapter_mints_chn_for_served_binding_and_generation_bump_kills_old_toke
     assert second.status_code == 200, second.text
     new = second.json()["token"]
 
-    accepted = adapter_client.post("/channels/turns", json=_turn(address), headers={"X-API-Key": new})
+    accepted = adapter_client.post(
+        "/channels/turns", json=_turn(address), headers={"X-API-Key": new}
+    )
     assert accepted.status_code == 200, accepted.text
     assert len(valkey.xrange(runs_stream)) == 1
-    refused = adapter_client.post("/channels/turns", json=_turn(address), headers={"X-API-Key": old})
+    refused = adapter_client.post(
+        "/channels/turns", json=_turn(address), headers={"X-API-Key": old}
+    )
     assert refused.status_code == 401, refused.text
     assert len(valkey.xrange(runs_stream)) == 1
 

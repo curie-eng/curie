@@ -801,7 +801,9 @@ export interface ApprovalAudit {
   actor_channel: string | null;
   // Proof attached to the derived actor (ADR-0106). Historical rows retain a
   // null kind and authenticated=false rather than being retroactively trusted.
-  principal_kind: "chat" | "console" | "operator" | null;
+  principal_kind: "chat" | "console" | "operator" | "adapter" | null;
+  // The adapter that carried the decision (ADR-0154); null for other kinds.
+  principal_subject: string | null;
   authenticated: boolean;
   decision: string;
   authorizer: string;
