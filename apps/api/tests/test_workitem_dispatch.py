@@ -570,9 +570,14 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
 
 
 def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
-    request_id = str(uuid.uuid4())
-    work_item_id = str(uuid.uuid4())
-    admissions = _facts_json(_facts(uuid.uuid4(), request_id=UUID(request_id)))
+    request_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    work_item_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    admissions = _facts_json(
+        _facts(
+            UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            request_id=UUID(request_id),
+        )
+    )
     return [
         ("POST", f"{INTERNAL_PREFIX}/admissions", admissions),
         ("GET", f"{INTERNAL_PREFIX}/requests/{request_id}", None),
