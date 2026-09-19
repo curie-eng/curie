@@ -567,8 +567,12 @@ bindings (where the verified card resolves, where a text-only notification goes,
 approve) are per-agent deployment config (#247, #1460).
 
 The audit trail now records both halves rather than overstating either one. Authentication
-establishes the actor and writes `principal_kind` (`chat`, `console`, or `operator`) with
-`authenticated=true`; authorization writes the selected set's evidence and verdict.
+establishes the actor and writes `principal_kind` (`chat`, `console`, `operator`, or
+`adapter`) with `authenticated=true`; authorization writes the selected set's evidence
+and verdict. For an `adapter` principal, `principal_subject` names the adapter itself, not
+the sender it vouches for: the sender is carried as `actor` from the
+`X-Curie-Approval-Actor` header, and an adapter resolves only explicit-user routes, the
+same restriction as `operator`.
 Historical assertion-era rows remain visibly unauthenticated with a null principal kind.
 An audit row may truthfully show the same principal as requester and approver: that says
 one authenticated member confirmed their own request, not that a second person reviewed it.

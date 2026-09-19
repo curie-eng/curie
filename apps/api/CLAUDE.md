@@ -33,9 +33,21 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   platform key. `POST /channels/token` bumps that generation on every mint so a
   remint revokes the previous token (#2379). It is a SIBLING credential, never a
   widening of the sandbox token: the two verify against different modules and
-  neither authenticates as the other. `POST /channels/token` (the mint) stays
-  platform-key-only, and a `chn` token is refused on every other router,
-  `/approvals/{id}/resolve` included. Extending it further still takes a new ADR.
+  neither authenticates as the other. A `chn` token never mints, and it is
+  refused on every other router, `/approvals/{id}/resolve` included. Extending
+  it further still takes a new ADR.
+- **A channel adapter is a principal (ADR-0154, #2806), the THIRD exception.**
+  An `adp` credential (`adapter_principal.py`, header
+  `X-Curie-Adapter-Principal`), issued by the platform key at
+  `POST /approvals/principals/adapter` and self-rotated at `.../rotate`, is
+  accepted by exactly three routes, each checking its binding set:
+  `POST /channels/token` (only for a binding it serves; else 403),
+  `GET /approvals` (filtered to approvals it serves) and
+  `/approvals/{id}/resolve` (with `X-Curie-Approval-Actor`; unserved is 404).
+  Served is ONE predicate, `crud._approval_served`, for both. Presenting it
+  with the platform key or another resolver credential is 401, never a
+  precedence choice. The resolver kinds are `chat`, `console`, `operator` and
+  `adapter`; `operator` and `adapter` resolve only explicit-user routes.
 - **The GitHub webhook is authenticated differently, on purpose.** `/github/webhook`
   verifies the HMAC signature GitHub sends (`x-hub-signature-256` against
   `settings.github_webhook_secret`), not the API key -- GitHub cannot send an

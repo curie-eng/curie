@@ -220,7 +220,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
     )
     .expect("parse application schema catalog");
     assert_eq!(
-        catalog["windows"]["0.9.0"]["schema_head"], "0044",
+        catalog["windows"]["0.9.0"]["schema_head"], "0045",
         "the supported 0.9.0 rollback head must remain pinned"
     );
     assert!(
