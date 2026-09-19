@@ -1125,6 +1125,7 @@ class Kernel:
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
+        self._active_work_item_request_id: uuid.UUID | None = None
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
@@ -1516,6 +1517,7 @@ class Kernel:
                         exc.code,
                     )
                     return
+                self._active_work_item_request_id = parsed_work_item.request_id
                 self._work_item_runs[parsed_work_item.request_id] = WorkItemRun(
                     client=self._work_items,
                     request_id=parsed_work_item.request_id,
@@ -1973,6 +1975,8 @@ class Kernel:
                 owned_run = self._work_item_runs.pop(owned_work_item_id, None)
                 if owned_run is not None:
                     await owned_run.close()
+                if self._active_work_item_request_id == owned_work_item_id:
+                    self._active_work_item_request_id = None
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
             # path (success, escalate, drop, or error). Best-effort and
@@ -2367,29 +2371,14 @@ class Kernel:
             )
 
     async def _abandon_stale_work_item(self, thread_key: str, run: WorkItemRun) -> None:
-        """Heartbeat 409 stale_owner: interrupt and release without recording."""
+        """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
 
         run.finished = True
-        try:
-            await asyncio.wait_for(
-                self.interrupt_thread(thread_key, "stale work-item owner"),
-                _RESET_INTERRUPT_TIMEOUT_S,
-            )
-        except Exception:
-            logger.warning(
-                "stale work-item owner interrupt failed for thread %s",
-                thread_key,
-                exc_info=True,
-            )
-        try:
-            async with self._lock.hold(self._config.lock_key(thread_key)):
-                await asyncio.to_thread(self._substrate.release, thread_key)
-        except Exception:
-            logger.warning(
-                "stale work-item owner release failed for thread %s",
-                thread_key,
-                exc_info=True,
-            )
+        logger.warning(
+            "stale work-item owner abandoning request %s on thread %s without releasing the route",
+            run.request_id,
+            thread_key,
+        )
 
     async def _halt_work_item_runtime(
         self,
@@ -2565,7 +2554,10 @@ class Kernel:
                 "completed" if outcome in ("delivered", "awaiting-approval") else "failed"
             )
             try:
-                await run.finish(outcome=finish_outcome, cause=telemetry_outcome)
+                await run.finish(
+                    outcome=finish_outcome,
+                    cause="completed" if finish_outcome == "completed" else telemetry_outcome,
+                )
             except WorkItemConflict as exc:
                 logger.warning(
                     "work-item finish refused for %s: %s; writing no marker",
@@ -4111,14 +4103,10 @@ class Kernel:
         # Register before start_turn so a kill during the POST can find this
         # thread. Canned and steered returns above never register. A failed
         # start unregisters so a turn that never opened cannot leak an entry.
-        run = next(
-            (
-                candidate
-                for candidate in self._work_item_runs.values()
-                if candidate.thread_key == thread_key
-            ),
-            None,
-        )
+        active_id = self._active_work_item_request_id
+        run = self._work_item_runs.get(active_id) if active_id is not None else None
+        if run is not None and run.finished:
+            raise WorkItemStartRefused("work item authority is finished")
         if run is not None and not run.started:
             started = await run.start(
                 claim_name=handle.claim_name,

@@ -44,7 +44,6 @@ class WorkItemReconciler:
         self._valkey = valkey
         self._settings = settings
         self._owner = f"work-item-reconciler:{uuid.uuid4()}"
-        self._group_ready = False
 
     def _stream(self) -> str:
         return self._settings.runs_stream
@@ -53,8 +52,6 @@ class WorkItemReconciler:
         return self._settings.runs_consumer_group or WORKER_GROUP_DEFAULT
 
     async def _ensure_group(self) -> None:
-        if self._group_ready:
-            return
         try:
             await self._valkey.xgroup_create(
                 self._stream(), self._group(), id="$", mkstream=True
@@ -62,7 +59,6 @@ class WorkItemReconciler:
         except ResponseError as exc:
             if "BUSYGROUP" not in str(exc):
                 raise
-        self._group_ready = True
 
     async def _xadd(self, turn: QueuedTurn) -> None:
         try:
@@ -73,7 +69,6 @@ class WorkItemReconciler:
         except ResponseError as exc:
             message = str(exc)
             if "NOGROUP" in message or "no such key" in message.lower():
-                self._group_ready = False
                 await self._ensure_group()
                 await self._valkey.xadd(
                     self._stream(),
