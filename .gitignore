@@ -45,6 +45,13 @@ oauth.env
 # this the `*secret*` rule drops them and the red-on-revert coverage is untracked.
 !cli/tests/cluster_secret_scope.rs
 !cli/tests/cluster_secret_scope_kind.rs
+# Same exception for the desktop shell's secrets bridge (apps/desktop): it
+# delegates to `curie secrets` and only ever handles secret NAMES, never
+# material, and hands a value to the CLI through the environment rather than
+# argv. Without this the `*secret*` rule above silently drops the file, `git
+# add` skips it without a word, and the desktop build fails in CI on a missing
+# import.
+!apps/desktop/electron/ipc/secrets.ts
 
 # Python
 __pycache__/
@@ -92,3 +99,14 @@ apps/ui/src/generated/
 
 # Cross-build output for the linux/arm64 CLI (docker buildx / rust image).
 cli/target-linux-*/
+
+# Agent bundles scaffolded at the REPO ROOT by `curie init` while trying the app
+# out. Somebody's scratch copy of an agent, not part of this repo; two of them
+# reached a commit by accident during a demo recording.
+#
+# Both rules are root-anchored, which is the point: `examples/squawk` is a real
+# committed example and the eval falsifiability gate reads its cases. Only a
+# bundle left loose at the root is scratch.
+/squawk/
+/test/
+
