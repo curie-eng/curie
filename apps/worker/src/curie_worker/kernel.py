@@ -131,6 +131,14 @@ from .sandbox.types import (
     SuspendedThreadError,
 )
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
+from .workitem_dispatch import (
+    TerminationObservation,
+    WorkItemConflict,
+    WorkItemDispatchClient,
+    WorkItemRun,
+    WorkItemStartRefused,
+    parse_work_item_event_id,
+)
 from .workspace import (
     WORKSPACES_DISABLED_REFUSAL,
     WorkspaceClaimCoordinator,
@@ -789,6 +797,10 @@ class TurnOutcome:
     workspace_inferred_repo: str | None = None
 
 
+class _WorkItemDeferred(Exception):
+    """The execute wake was deferred in SQL; ACK it and start nothing."""
+
+
 class ThreadBusyError(RuntimeError):
     """A non-steering turn found a live thread, so it was not started.
 
@@ -1062,6 +1074,7 @@ class Kernel:
         card_store: ApprovalCardStore | None = None,
         route_ttl_seconds: int = 3600,
         suspended_route_ttl_seconds: int = 86400,
+        work_items: WorkItemDispatchClient | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -1108,6 +1121,11 @@ class Kernel:
         self._card_store = card_store
         self._route_ttl_seconds = route_ttl_seconds
         self._suspended_route_ttl_seconds = suspended_route_ttl_seconds
+        self._work_items = work_items
+        # Keyed by request id, never thread key: a steered follow-up shares the
+        # thread and must not see or remove this run.
+        self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
+        self._active_work_item_request_id: uuid.UUID | None = None
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
@@ -1449,6 +1467,7 @@ class Kernel:
                 entry.lock.release()
                 self._release_order_entry(thread_key, entry)
 
+        owned_work_item_id: uuid.UUID | None = None
         try:
             if await self._markers.is_terminal(event_id):
                 # ``is_terminal``, not ``is_done``: a DONE outbox record proves
@@ -1466,6 +1485,50 @@ class Kernel:
                 # confirmed, which it re-emits from the STORED record.
                 await self._reemit_pending_completion(event_id)
                 return
+
+            parsed_work_item = parse_work_item_event_id(event_id)
+            if parsed_work_item is not None and parsed_work_item.kind in {"terminate"}:
+                await self._terminate_work_item(qevent, parsed_work_item.request_id)
+                return
+            if parsed_work_item is not None and parsed_work_item.kind in {"execute"}:
+                if self._work_items is None:
+                    logger.error(
+                        "work-item execute %s has no dispatch client; dropping the wake",
+                        event_id,
+                    )
+                    return
+                if qevent.attachments:
+                    logger.error(
+                        "work-item execute %s carried attachments; refusing",
+                        event_id,
+                    )
+                    return
+                assert parsed_work_item.generation is not None
+                try:
+                    grant = await self._work_items.acquire(
+                        parsed_work_item.request_id,
+                        owner=self._config.consumer_name,
+                        generation=parsed_work_item.generation,
+                    )
+                except WorkItemConflict as exc:
+                    logger.info(
+                        "work-item acquire refused for %s: %s",
+                        event_id,
+                        exc.code,
+                    )
+                    return
+                self._active_work_item_request_id = parsed_work_item.request_id
+                self._work_item_runs[parsed_work_item.request_id] = WorkItemRun(
+                    client=self._work_items,
+                    request_id=parsed_work_item.request_id,
+                    owner=self._config.consumer_name,
+                    grant=grant,
+                    event_id=event_id,
+                    thread_key=thread_key,
+                    on_stop=self._stop_owned_work_item,
+                    on_stale=self._abandon_stale_work_item,
+                )
+                owned_work_item_id = parsed_work_item.request_id
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
@@ -1764,20 +1827,47 @@ class Kernel:
                             lease=lease,
                         )
                         return
-                outcome = await self._attempt(
-                    qevent,
-                    route,
-                    release_order,
-                    boot_env,
-                    agent_id,
-                    nav,
-                    packs,
-                    workspace_deployment_id,
-                    agent_name,
-                    remaining_s=_remaining_budget(lease),
-                    pressure_retried=False,
-                    workspace_inference=workspace_inference,
-                )
+                try:
+                    outcome = await self._attempt(
+                        qevent,
+                        route,
+                        release_order,
+                        boot_env,
+                        agent_id,
+                        nav,
+                        packs,
+                        workspace_deployment_id,
+                        agent_name,
+                        remaining_s=_remaining_budget(lease),
+                        pressure_retried=False,
+                        workspace_inference=workspace_inference,
+                    )
+                except _WorkItemDeferred:
+                    return
+                except WorkItemStartRefused as exc:
+                    logger.info(
+                        "work-item start refused for %s: %s",
+                        event_id,
+                        exc.code,
+                    )
+                    return
+                except ThreadBusyError:
+                    run = (
+                        self._work_item_runs.get(owned_work_item_id)
+                        if owned_work_item_id is not None
+                        else None
+                    )
+                    if run is not None and not run.started:
+                        try:
+                            await run.defer("thread_busy", capacity=False)
+                        except WorkItemConflict as exc:
+                            logger.info(
+                                "work-item thread_busy defer refused for %s: %s",
+                                event_id,
+                                exc.code,
+                            )
+                        return
+                    raise
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
                     # A gate fired (ADR-0010): persist the durable record, then
@@ -1881,6 +1971,12 @@ class Kernel:
                     backoff_s = min(backoff_s, max(0.0, lease.remaining_s()))
                 await asyncio.sleep(backoff_s)
         finally:
+            if owned_work_item_id is not None:
+                owned_run = self._work_item_runs.pop(owned_work_item_id, None)
+                if owned_run is not None:
+                    await owned_run.close()
+                if getattr(self, "_active_work_item_request_id", None) == owned_work_item_id:
+                    self._active_work_item_request_id = None
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
             # path (success, escalate, drop, or error). Best-effort and
@@ -2183,6 +2279,136 @@ class Kernel:
         finally:
             await self._lock.release(lock_key, token)
 
+    async def _terminate_work_item(
+        self, qevent: QueuedTurn, request_id: uuid.UUID
+    ) -> None:
+        """Claim termination ownership, observe sandbox absence, and record it."""
+
+        if self._work_items is None:
+            logger.error(
+                "work-item terminate %s has no dispatch client; dropping the wake",
+                qevent.event_id,
+            )
+            return
+        thread_key = _thread_key_for(qevent)
+        try:
+            epoch = await self._work_items.claim_termination(
+                request_id,
+                owner=self._config.consumer_name,
+            )
+        except WorkItemConflict as exc:
+            logger.info(
+                "work-item terminate claim refused for %s: %s",
+                request_id,
+                exc.code,
+            )
+            return
+        claim_name: str | None = None
+        sandbox_name: str | None = None
+        try:
+            view = await self._work_items.get_request(request_id)
+        except WorkItemConflict as exc:
+            logger.info(
+                "work-item terminate could not read request %s: %s",
+                request_id,
+                exc.code,
+            )
+        else:
+            claim_name = view.runtime_claim_name
+            sandbox_name = view.runtime_sandbox_name
+        observation = await self._halt_work_item_runtime(
+            thread_key,
+            claim_name=claim_name,
+            sandbox_name=sandbox_name,
+        )
+        if observation is None:
+            logger.warning(
+                "work-item terminate for %s did not observe absence; reconciler retries",
+                request_id,
+            )
+            return
+        try:
+            await self._work_items.record_termination(
+                request_id,
+                runtime_epoch=epoch,
+                observation=observation.render(),
+            )
+        except WorkItemConflict as exc:
+            logger.warning(
+                "work-item record_termination refused for %s: %s",
+                request_id,
+                exc.code,
+            )
+
+    async def _stop_owned_work_item(self, thread_key: str, run: WorkItemRun) -> None:
+        """Heartbeat saw cancellation_requested: interrupt, observe, record."""
+
+        if self._work_items is None or run.runtime_epoch is None:
+            return
+        observation = await self._halt_work_item_runtime(
+            thread_key,
+            claim_name=run.claim_name,
+            sandbox_name=run.sandbox_name,
+        )
+        if observation is None:
+            logger.warning(
+                "work-item owner stop for %s did not observe absence",
+                run.request_id,
+            )
+            return
+        try:
+            await self._work_items.record_termination(
+                run.request_id,
+                runtime_epoch=run.runtime_epoch,
+                observation=observation.render(),
+            )
+            run.finished = True
+        except WorkItemConflict as exc:
+            logger.warning(
+                "work-item owner record_termination refused for %s: %s",
+                run.request_id,
+                exc.code,
+            )
+
+    async def _abandon_stale_work_item(self, thread_key: str, run: WorkItemRun) -> None:
+        """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
+
+        run.finished = True
+        logger.warning(
+            "stale work-item owner abandoning request %s on thread %s without releasing the route",
+            run.request_id,
+            thread_key,
+        )
+
+    async def _halt_work_item_runtime(
+        self,
+        thread_key: str,
+        *,
+        claim_name: str | None,
+        sandbox_name: str | None,
+    ) -> TerminationObservation | None:
+        """Interrupt, then poll until stored claim and sandbox names are gone."""
+
+        try:
+            await asyncio.wait_for(
+                self.interrupt_thread(thread_key, "work-item termination"),
+                _RESET_INTERRUPT_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "work-item interrupt did not land for thread %s; terminating anyway",
+                thread_key,
+                exc_info=True,
+            )
+        async with self._lock.hold(self._config.lock_key(thread_key)):
+            return await asyncio.to_thread(
+                self._substrate.terminate_thread,
+                thread_key,
+                claim_name=claim_name,
+                sandbox_name=sandbox_name,
+                observer=self._config.consumer_name,
+            )
+
     def attach_killswitch(self, killswitch: KillSwitch) -> None:
         """Wire the kill switch after construction (it needs interrupt_agent)."""
         self._killswitch = killswitch
@@ -2315,6 +2541,39 @@ class Kernel:
         entry stays pending for whoever now holds the fence. Without that, a turn
         whose settle was refused would be acked with no completion written at all.
         """
+        parsed = parse_work_item_event_id(qevent.event_id)
+        run = (
+            self._work_item_runs.get(parsed.request_id)
+            if parsed is not None and parsed.kind in {"execute"}
+            else None
+        )
+        if run is not None and run.event_id != qevent.event_id:
+            run = None
+        if run is not None and run.started and not run.finished:
+            finish_outcome = (
+                "completed" if outcome in ("delivered", "awaiting-approval") else "failed"
+            )
+            try:
+                await run.finish(
+                    outcome=finish_outcome,
+                    cause="completed" if finish_outcome == "completed" else telemetry_outcome,
+                )
+            except WorkItemConflict as exc:
+                logger.warning(
+                    "work-item finish refused for %s: %s; writing no marker",
+                    qevent.event_id,
+                    exc.code,
+                )
+                return
+        elif run is not None and not run.started:
+            try:
+                await run.defer(f"not_started:{telemetry_outcome}", capacity=False)
+            except WorkItemConflict as exc:
+                logger.info(
+                    "work-item unstarted defer refused for %s: %s",
+                    qevent.event_id,
+                    exc.code,
+                )
         event_id = qevent.event_id
         record = CompletionRecord(
             event_id=event_id,
@@ -2821,6 +3080,20 @@ class Kernel:
                 rejection.used,
                 rejection.hard,
             )
+            parsed_execute = parse_work_item_event_id(qevent.event_id)
+            if parsed_execute is not None and parsed_execute.kind in {"execute"}:
+                run = self._work_item_runs.get(parsed_execute.request_id)
+                if run is not None and not run.started:
+                    release_order()
+                    try:
+                        await run.defer("capacity", capacity=True)
+                    except WorkItemConflict as exc:
+                        logger.info(
+                            "work-item capacity defer refused for %s: %s",
+                            qevent.event_id,
+                            exc.code,
+                        )
+                    raise _WorkItemDeferred() from None
             if self._is_approval_resume(qevent.event_id):
                 release_order()
                 return TurnOutcome(terminal_ok=False, classification="runner-error")
@@ -3830,6 +4103,23 @@ class Kernel:
         # Register before start_turn so a kill during the POST can find this
         # thread. Canned and steered returns above never register. A failed
         # start unregisters so a turn that never opened cannot leak an entry.
+        active_id = getattr(self, "_active_work_item_request_id", None)
+        runs = getattr(self, "_work_item_runs", {})
+        run = runs.get(active_id) if active_id is not None else None
+        if run is not None and run.finished:
+            raise WorkItemStartRefused("work item authority is finished")
+        if run is not None and not run.started:
+            started = await run.start(
+                claim_name=handle.claim_name,
+                sandbox_name=handle.sandbox_name,
+            )
+            remaining_s = (
+                started.remaining_s
+                if remaining_s is None
+                else min(remaining_s, started.remaining_s)
+            )
+        elif run is not None:
+            remaining_s = run.bound_remaining_s(remaining_s)
         if agent_id is not None:
             self._register_run(agent_id, thread_key)
         try:
@@ -4679,6 +4969,12 @@ class Kernel:
         # so the durable record, the card and the publication request stay free
         # of it.
         inference = _workspace_inference_notice(outcome.workspace_inferred_repo)
+        parsed_publication = parse_work_item_event_id(qevent.event_id)
+        publication_run = (
+            self._work_item_runs.get(parsed_publication.request_id)
+            if parsed_publication is not None and parsed_publication.kind in {"execute"}
+            else None
+        )
         try:
             if is_publication:
                 publication_creator = self._publication_creator
@@ -4717,6 +5013,19 @@ class Kernel:
                         max_patch_bytes=self._config.publication_patch_max_bytes,
                         review_origin_key=outcome.review_origin_key,
                         route=route_name,
+                        work_item_request_id=(
+                            parsed_publication.request_id
+                            if parsed_publication is not None
+                            and parsed_publication.kind in {"execute"}
+                            and publication_run is not None
+                            and publication_run.started
+                            else None
+                        ),
+                        work_item_runtime_epoch=(
+                            publication_run.runtime_epoch
+                            if publication_run is not None and publication_run.started
+                            else None
+                        ),
                     )
                 )
                 created = CreatedApproval(

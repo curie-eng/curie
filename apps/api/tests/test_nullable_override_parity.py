@@ -81,6 +81,7 @@ KNOWN_BODY_MODULES = frozenset(
         "aci_protocol.wire",
         "curie_api.routers.channels",
         "curie_api.routers.github_reviews",
+        "curie_api.routers.work_items",
     }
 )
 # FastAPI synthesises one wrapper model per multi-param body (`Body_<operation>`)

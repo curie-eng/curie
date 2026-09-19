@@ -1477,6 +1477,8 @@ class PublicationCreate(BaseModel):
     review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
     route: str | None = None
     base_sha: str
+    work_item_request_id: uuid.UUID | None = None
+    work_item_runtime_epoch: int | None = Field(default=None, ge=1)
     patch_b64: str = Field(min_length=1)
     changed_paths: list[str] = Field(min_length=1, max_length=4096)
     expires_in_seconds: int | None = Field(default=None, ge=1)

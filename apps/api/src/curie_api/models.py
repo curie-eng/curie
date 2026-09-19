@@ -638,7 +638,7 @@ class ExecutionRequest(Base):
             "OR (status = 'cancellation_requested' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause IN ('issue_cancelled', 'execution_deadline') "
+            "AND terminal_cause IN ('issue_cancelled', 'execution_deadline', 'owner_lost') "
             "AND termination_observation IS NULL) "
             "OR (status = 'completed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
@@ -646,7 +646,9 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NULL) "
             "OR (status = 'failed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
-            "AND terminal_cause IS NOT NULL AND termination_observation IS NULL) "
+            "AND terminal_cause IS NOT NULL AND "
+            "((terminal_cause = 'owner_lost' AND termination_observation IS NOT NULL) "
+            "OR (terminal_cause <> 'owner_lost' AND termination_observation IS NULL))) "
             "OR (status = 'expired' AND terminal_at IS NOT NULL AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
             "AND terminal_cause IS NOT NULL "
@@ -665,6 +667,48 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NOT NULL)))) IS TRUE",
             name="execution_requests_state_shape_ck",
         ),
+        CheckConstraint(
+            "dispatch_generation >= 1",
+            name="execution_requests_dispatch_generation_ck",
+        ),
+        CheckConstraint(
+            "published_generation IS NULL OR "
+            "published_generation BETWEEN 1 AND dispatch_generation",
+            name="execution_requests_published_generation_ck",
+        ),
+        CheckConstraint(
+            "acquired_generation IS NULL OR "
+            "acquired_generation BETWEEN 1 AND dispatch_generation",
+            name="execution_requests_acquired_generation_ck",
+        ),
+        CheckConstraint(
+            "capacity_deferrals >= 0",
+            name="execution_requests_capacity_deferrals_ck",
+        ),
+        CheckConstraint(
+            "dispatch_epoch >= 0",
+            name="execution_requests_dispatch_epoch_ck",
+        ),
+        CheckConstraint(
+            "runtime_epoch >= 0",
+            name="execution_requests_runtime_epoch_ck",
+        ),
+        CheckConstraint(
+            "execution_attempts IN (0, 1) AND "
+            "(execution_attempts = 1) = (started_at IS NOT NULL)",
+            name="execution_requests_execution_attempts_ck",
+        ),
+        CheckConstraint(
+            "(objective IS NULL AND requester IS NULL AND reply_kind IS NULL "
+            "AND reply_address IS NULL AND reply_conversation_id IS NULL) OR "
+            "(objective IS NOT NULL AND requester IS NOT NULL AND "
+            "reply_kind IS NOT NULL AND reply_address IS NOT NULL AND "
+            "reply_conversation_id IS NOT NULL AND length(btrim(objective)) > 0 "
+            "AND length(objective) <= 65536 AND length(btrim(requester)) > 0 "
+            "AND length(btrim(reply_kind)) > 0 AND length(btrim(reply_address)) > 0 "
+            "AND length(btrim(reply_conversation_id)) > 0)",
+            name="execution_requests_snapshot_ck",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -676,6 +720,18 @@ class ExecutionRequest(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('waiting', 'running', 'cancellation_requested')"
+            ),
+        ),
+        Index(
+            "ix_execution_requests_dispatch_due",
+            "dispatch_not_before",
+            postgresql_where=text("status = 'waiting'"),
+        ),
+        Index(
+            "ix_execution_requests_runtime_liveness",
+            "runtime_heartbeat_expires_at",
+            postgresql_where=text(
+                "status IN ('running','cancellation_requested')"
             ),
         ),
     )
@@ -707,6 +763,43 @@ class ExecutionRequest(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    dispatch_generation: Mapped[int] = mapped_column(default=1, server_default="1")
+    published_generation: Mapped[int | None] = mapped_column(default=None)
+    dispatch_not_before: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    dispatch_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    dispatch_epoch: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0"
+    )
+    dispatch_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    acquired_generation: Mapped[int | None] = mapped_column(default=None)
+    acquire_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    acquire_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    capacity_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
+    last_deferral_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    execution_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    runtime_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    runtime_epoch: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0"
+    )
+    runtime_heartbeat_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    terminate_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    runtime_claim_name: Mapped[str | None] = mapped_column(Text, default=None)
+    runtime_sandbox_name: Mapped[str | None] = mapped_column(Text, default=None)
+    objective: Mapped[str | None] = mapped_column(Text, default=None)
+    requester: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_address: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_conversation_id: Mapped[str | None] = mapped_column(Text, default=None)
 
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 

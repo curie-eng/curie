@@ -16,6 +16,7 @@ from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
     RUNS_STREAM_DEFAULT,
     STREAM_ENV,
+    WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
 from pydantic import AliasChoices, Field, model_validator
@@ -297,6 +298,92 @@ class Settings(BaseSettings):
     # is picked up on a later pass as the graveyard trims.
     resume_dead_letter_stream: str = ""
     resume_dead_letter_scan_limit: int = 1000
+
+    work_item_reconciler_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RECONCILER_ENABLED",
+            "WORK_ITEM_RECONCILER_ENABLED",
+        ),
+    )
+    work_item_reconciler_interval_seconds: int = Field(
+        default=5,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS",
+            "WORK_ITEM_RECONCILER_INTERVAL_SECONDS",
+        ),
+    )
+    work_item_batch_limit: int = Field(
+        default=50,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_BATCH_LIMIT", "WORK_ITEM_BATCH_LIMIT"
+        ),
+    )
+    work_item_wait_budget_seconds: int = Field(
+        default=86400,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS",
+            "WORK_ITEM_WAIT_BUDGET_SECONDS",
+        ),
+    )
+    work_item_dispatch_lease_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS",
+            "WORK_ITEM_DISPATCH_LEASE_SECONDS",
+        ),
+    )
+    work_item_acquire_lease_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+            "WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+        ),
+    )
+    work_item_runtime_ttl_seconds: int = Field(
+        default=45,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS",
+            "WORK_ITEM_RUNTIME_TTL_SECONDS",
+        ),
+    )
+    work_item_backoff_base_seconds: int = Field(
+        default=10,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS",
+            "WORK_ITEM_BACKOFF_BASE_SECONDS",
+        ),
+    )
+    work_item_backoff_max_seconds: int = Field(
+        default=120,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS",
+            "WORK_ITEM_BACKOFF_MAX_SECONDS",
+        ),
+    )
+    work_item_terminate_retry_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS",
+            "WORK_ITEM_TERMINATE_RETRY_SECONDS",
+        ),
+    )
+    runs_consumer_group: str = Field(
+        default=WORKER_GROUP_DEFAULT,
+        min_length=1,
+        validation_alias=AliasChoices(
+            "CURIE_CONSUMER_GROUP", "RUNS_CONSUMER_GROUP"
+        ),
+    )
 
     # The Slack bot token the API uses for its OWN user-group lookups (#420),
     # rather than trusting a caller's claim about who is in a group. The same
