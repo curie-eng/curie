@@ -106,7 +106,15 @@ _THREAD_ATTRIBUTES = {
 }
 _SANDBOX_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["claim", "resume", "release", "suspend", "cleanup", "reclaim"],
+    "operation": [
+        "claim",
+        "resume",
+        "release",
+        "suspend",
+        "cleanup",
+        "reclaim",
+        "terminate",
+    ],
     "outcome": [
         "claimed",
         "reused",
@@ -116,6 +124,7 @@ _SANDBOX_ATTRIBUTES = {
         "failed",
         "orphan-cleaned",
         "observed",
+        "terminated",
         "expiry-unsupported",
         "race-lost",
         "reclaimed",
@@ -256,6 +265,16 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/{publication_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/selection",
+    "/v1/internal/work-items/admissions",
+    "/v1/internal/work-items/requests/{request_id}",
+    "/v1/internal/work-items/{work_item_id}/cancel",
+    "/v1/internal/work-items/requests/{request_id}/acquire",
+    "/v1/internal/work-items/requests/{request_id}/defer",
+    "/v1/internal/work-items/requests/{request_id}/start",
+    "/v1/internal/work-items/requests/{request_id}/heartbeat",
+    "/v1/internal/work-items/requests/{request_id}/finish",
+    "/v1/internal/work-items/requests/{request_id}/termination/claim",
+    "/v1/internal/work-items/requests/{request_id}/termination",
     "unmatched",
 ]
 _HTTP_ATTRIBUTES = {

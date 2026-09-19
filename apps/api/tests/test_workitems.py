@@ -216,8 +216,8 @@ async def _elapsed_running(
         text(
             "INSERT INTO curie.execution_requests "
             "(id, work_item_id, sequence, status, wait_deadline, started_at, "
-            "execution_deadline, version) VALUES "
-            "(:id, :item, 1, 'running', :wait, :started, :deadline, 2)"
+            "execution_deadline, version, execution_attempts) VALUES "
+            "(:id, :item, 1, 'running', :wait, :started, :deadline, 2, 1)"
         ),
         {
             "id": request_id,
@@ -1309,8 +1309,9 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                     text(
                         "INSERT INTO curie.execution_requests "
                         "(id, work_item_id, sequence, status, wait_deadline, "
-                        "started_at, execution_deadline, version) VALUES "
-                        "(:id, :item, 1, 'running', :wait, :started, :deadline, 2)"
+                        "started_at, execution_deadline, version, "
+                        "execution_attempts) VALUES "
+                        "(:id, :item, 1, 'running', :wait, :started, :deadline, 2, 1)"
                     ),
                     {
                         "id": request_id,

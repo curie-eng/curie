@@ -1,6 +1,26 @@
 {
   "components": {
     "schemas": {
+      "AcquireBody": {
+        "properties": {
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "generation"
+        ],
+        "title": "AcquireBody",
+        "type": "object"
+      },
       "ActionAuditOut": {
         "description": "One entry in an action's audit trail: an authorized undo, or a refused one.",
         "properties": {
@@ -496,6 +516,81 @@
           "restore"
         ],
         "title": "ActionUndoOut",
+        "type": "object"
+      },
+      "AdmissionFacts": {
+        "properties": {
+          "address": {
+            "minLength": 1,
+            "title": "Address",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "github_installation_id": {
+            "exclusiveMinimum": 0.0,
+            "title": "Github Installation Id",
+            "type": "integer"
+          },
+          "github_issue_number": {
+            "exclusiveMinimum": 0.0,
+            "title": "Github Issue Number",
+            "type": "integer"
+          },
+          "github_repository_id": {
+            "exclusiveMinimum": 0.0,
+            "title": "Github Repository Id",
+            "type": "integer"
+          },
+          "kind": {
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          },
+          "objective": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          },
+          "reply_conversation_id": {
+            "minLength": 1,
+            "title": "Reply Conversation Id",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "minLength": 1,
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requester": {
+            "minLength": 1,
+            "title": "Requester",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "kind",
+          "address",
+          "reply_conversation_id",
+          "repo_full_name",
+          "github_repository_id",
+          "github_issue_number",
+          "github_installation_id",
+          "objective",
+          "requester",
+          "request_id"
+        ],
+        "title": "AdmissionFacts",
         "type": "object"
       },
       "AgentCreate": {
@@ -1872,6 +1967,20 @@
         "title": "BundleOut",
         "type": "object"
       },
+      "CancelBody": {
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "CancelBody",
+        "type": "object"
+      },
       "ChannelBindingOut": {
         "additionalProperties": false,
         "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe shape stays `{kind, address}`, identical to what `ChannelBinding`\nserialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring\nalready describes that as the read contract.",
@@ -2209,6 +2318,37 @@
           "points"
         ],
         "title": "CostReport",
+        "type": "object"
+      },
+      "DeferBody": {
+        "properties": {
+          "capacity": {
+            "title": "Capacity",
+            "type": "boolean"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "reason": {
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "generation",
+          "reason",
+          "capacity"
+        ],
+        "title": "DeferBody",
         "type": "object"
       },
       "DeploymentCreate": {
@@ -2814,6 +2954,35 @@
         "title": "EvalTriggerResult",
         "type": "object"
       },
+      "FinishBody": {
+        "properties": {
+          "cause": {
+            "minLength": 1,
+            "title": "Cause",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "completed",
+              "failed"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch",
+          "outcome",
+          "cause"
+        ],
+        "title": "FinishBody",
+        "type": "object"
+      },
       "GateKind": {
         "description": "Which gate raised an approval: a permission gate or a policy gate.\n\nA ``StrEnum`` rather than a ``Literal`` for two reasons. It is what the Rust\ngenerator can express (a multi-valued ``Literal`` raises; the ``Enum`` branch\nis the sanctioned path, exactly as ``SessionStatus`` uses). And the field is\nauthority-bearing per #544/ADR-0046, so the value domain is a named, exported\npart of the contract rather than an inline annotation.",
         "enum": [
@@ -2889,6 +3058,20 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HeartbeatBody": {
+        "properties": {
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch"
+        ],
+        "title": "HeartbeatBody",
         "type": "object"
       },
       "HelpPackConfig": {
@@ -3618,6 +3801,30 @@
               }
             ],
             "title": "Title"
+          },
+          "work_item_request_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Item Request Id"
+          },
+          "work_item_runtime_epoch": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Item Runtime Epoch"
           }
         },
         "required": [
@@ -4824,6 +5031,38 @@
         "title": "SourceTraceOut",
         "type": "object"
       },
+      "StartBody": {
+        "properties": {
+          "claim_name": {
+            "minLength": 1,
+            "title": "Claim Name",
+            "type": "string"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "sandbox_name": {
+            "minLength": 1,
+            "title": "Sandbox Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "generation",
+          "claim_name",
+          "sandbox_name"
+        ],
+        "title": "StartBody",
+        "type": "object"
+      },
       "StateAppendIn": {
         "description": "Append ``item`` to a log-shaped (JSON array) state entry (#248). If the\nentry does not exist it is created as a single-element array; if it exists\nits value must already be an array, else the append is rejected.",
         "properties": {
@@ -4918,6 +5157,40 @@
           "last_updated"
         ],
         "title": "StateNamespaceOut",
+        "type": "object"
+      },
+      "TerminationBody": {
+        "properties": {
+          "observation": {
+            "minLength": 1,
+            "title": "Observation",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch",
+          "observation"
+        ],
+        "title": "TerminationBody",
+        "type": "object"
+      },
+      "TerminationClaimBody": {
+        "properties": {
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner"
+        ],
+        "title": "TerminationClaimBody",
         "type": "object"
       },
       "ThreadResetState": {
@@ -11745,6 +12018,696 @@
         "summary": "Advance Publication Lineage",
         "tags": [
           "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/work-items/admissions": {
+      "post": {
+        "operationId": "admit_work_item_v1_internal_work_items_admissions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdmissionFacts"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admit Work Item V1 Internal Work Items Admissions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admit Work Item",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}": {
+      "get": {
+        "operationId": "get_work_item_request_v1_internal_work_items_requests__request_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Work Item Request V1 Internal Work Items Requests  Request Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/acquire": {
+      "post": {
+        "operationId": "acquire_work_item_request_v1_internal_work_items_requests__request_id__acquire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcquireBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Acquire Work Item Request V1 Internal Work Items Requests  Request Id  Acquire Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acquire Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/defer": {
+      "post": {
+        "operationId": "defer_work_item_request_v1_internal_work_items_requests__request_id__defer_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeferBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Defer Work Item Request V1 Internal Work Items Requests  Request Id  Defer Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Defer Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/finish": {
+      "post": {
+        "operationId": "finish_work_item_request_v1_internal_work_items_requests__request_id__finish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinishBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Finish Work Item Request V1 Internal Work Items Requests  Request Id  Finish Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finish Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/heartbeat": {
+      "post": {
+        "operationId": "heartbeat_work_item_request_v1_internal_work_items_requests__request_id__heartbeat_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeartbeatBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Heartbeat Work Item Request V1 Internal Work Items Requests  Request Id  Heartbeat Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Heartbeat Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/start": {
+      "post": {
+        "operationId": "start_work_item_request_v1_internal_work_items_requests__request_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Work Item Request V1 Internal Work Items Requests  Request Id  Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/termination": {
+      "post": {
+        "operationId": "record_work_item_termination_v1_internal_work_items_requests__request_id__termination_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Record Work Item Termination V1 Internal Work Items Requests  Request Id  Termination Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Work Item Termination",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/termination/claim": {
+      "post": {
+        "operationId": "claim_work_item_termination_v1_internal_work_items_requests__request_id__termination_claim_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminationClaimBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Claim Work Item Termination V1 Internal Work Items Requests  Request Id  Termination Claim Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Work Item Termination",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/{work_item_id}/cancel": {
+      "post": {
+        "operationId": "cancel_work_item_v1_internal_work_items__work_item_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Work Item V1 Internal Work Items  Work Item Id  Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Work Item",
+        "tags": [
+          "internal-work-items"
         ]
       }
     },

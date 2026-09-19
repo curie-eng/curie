@@ -4,6 +4,8 @@ Date: 2026-09-18
 
 Status: Accepted
 
+Partially amended by [ADR 0156](0156-factory-work-dispatches-from-sql-over-the-runs-stream.md), which realizes dispatch, runtime admission and termination.
+
 Partially amends
 [ADR 0145](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md)
 and

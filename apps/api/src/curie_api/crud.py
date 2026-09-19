@@ -28,6 +28,7 @@ from .models import (
     CredentialRedemptionAuditEntry,
     Deployment,
     Environment,
+    ExecutionRequest,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
@@ -830,6 +831,58 @@ async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
 # -- approvals (#244, ADR-0010) -------------------------------------------------
 
 
+_ACTIVE_WORK_ITEM_STATUSES = ("waiting", "running", "cancellation_requested")
+
+
+async def _refuse_fenced_work_item(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    request_id: uuid.UUID | None,
+    runtime_epoch: int | None,
+) -> None:
+    work_item = await session.scalar(
+        select(WorkItem)
+        .where(
+            WorkItem.agent_id == agent_id,
+            WorkItem.conversation_id == conversation_id,
+        )
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    if work_item is None:
+        return
+    if work_item.cancelled_at is not None:
+        raise PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    active = await session.scalar(
+        select(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.status.in_(_ACTIVE_WORK_ITEM_STATUSES),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if active is None:
+        return
+    if active.status == "cancellation_requested":
+        raise PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    if active.status == "running" and (
+        request_id != active.id or runtime_epoch != active.runtime_epoch
+    ):
+        raise PublicationLineageConflict(
+            "publication.work_item_stale_owner",
+            "the publication is not owned by the running work item request",
+        )
+
+
 async def create_publication(
     session: AsyncSession,
     data: PublicationCreate,
@@ -864,6 +917,13 @@ async def create_publication(
         conversation_id=workspace_conversation_id,
     )
 
+    await _refuse_fenced_work_item(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+        request_id=data.work_item_request_id,
+        runtime_epoch=data.work_item_runtime_epoch,
+    )
     lineage = await _get_thread_publication_lineage(
         session,
         agent_id=deployment.agent_id,
