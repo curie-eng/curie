@@ -81,10 +81,12 @@ SCENARIOS_ALL=(
     previous-serves
 )
 
-MATRIX_PHASES=(plan validate drain checkpoint migrate apply converge canary commit)
-# interrupt-resume runs a subset (issue #2733): plan/validate/drain interrupt
-# before any mutation and converge/canary follow apply, so checkpoint, migrate,
-# apply, commit are the distinct resume states. fail-every-phase keeps all nine.
+MATRIX_PHASES=(plan validate drain_preflight checkpoint migrate apply converge canary commit)
+# interrupt-resume runs a subset (issue #2733): plan/validate/drain_preflight
+# interrupt before any mutation and converge/canary follow apply, so
+# checkpoint, migrate, apply, commit are the distinct resume states.
+# fail-every-phase keeps all nine. drain_preflight is a worker-reachability
+# check, not the #2010 drain gate itself (issue #2830).
 INTERRUPT_PHASES=(checkpoint migrate apply commit)
 # Tag the kind node currently holds exclusively; "" when unknown. Any path
 # that loads or untags app images on the node must clear it.
@@ -96,7 +98,7 @@ EXCLUSIVE_KIND_TAG=""
 # upgrade to 0.9.0). --list-shards, --shard and the self-test coverage gate all
 # read SHARDS, so CI cannot run a manifest the gate did not check.
 SHARDS_CANONICAL="s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
-s02 setup fail-every-phase:plan+validate+drain
+s02 setup fail-every-phase:plan+validate+drain_preflight
 s03 setup fail-every-phase:checkpoint+migrate+apply
 s04 setup fail-every-phase:converge
 s05 setup fail-every-phase:canary

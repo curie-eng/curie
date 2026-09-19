@@ -437,9 +437,12 @@ command. Success is refused unless convergence is exact and the canary
 passed. After a normal command failure, run the same command to resume only
 when cleanup successfully released ownership.
 
-This composes configuration migration (issue 2299) with the drain gate
-(issue 2010): a resume after a completed drain does not drain accepted
-work again.
+This composes configuration migration (issue 2299) with a `drain_preflight`
+phase that confirms the worker workload is reachable ahead of Apply (issue
+2830): a resume after a completed preflight does not repeat it. That phase is
+not the drain gate itself; the gate (issue 2010) is the chart's own
+pre-upgrade Helm hook Job, which runs during Apply and whose outcome the
+convergence check above reports as the drained-queue gate.
 
 After confirmation, the command claims the namespaced
 `<release>-upgrade-checkpoint` ConfigMap before it reads release snapshots or

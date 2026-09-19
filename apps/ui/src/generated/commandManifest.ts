@@ -2936,7 +2936,7 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "long_about": "Run the resumable cluster upgrade lifecycle to a target version.\n\nPlans, validates, drains accepted work, checkpoints, migrates, applies, proves exact convergence, runs a target-version canary, and records the new known-good revision. The operator does not pass Helm merge flags. A failed attempt either leaves the previous known-good version serving or returns one fail-forward command. See issue #2301.",
+          "long_about": "Run the resumable cluster upgrade lifecycle to a target version.\n\nPlans, validates, checks the worker workload is reachable, checkpoints, migrates, applies, proves exact convergence, runs a target-version canary, and records the new known-good revision. The worker drain gate itself is the chart's own pre-upgrade Helm hook, which runs during apply and is observed at the convergence step. The operator does not pass Helm merge flags. A failed attempt either leaves the previous known-good version serving or returns one fail-forward command. See issue #2301.",
           "name": "upgrade"
         },
         {
