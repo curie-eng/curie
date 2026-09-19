@@ -2544,7 +2544,7 @@ class Kernel:
         parsed = parse_work_item_event_id(qevent.event_id)
         run = (
             self._work_item_runs.get(parsed.request_id)
-            if parsed is not None and parsed.kind == "execute"
+            if parsed is not None and parsed.kind in {"execute"}
             else None
         )
         if run is not None and run.event_id != qevent.event_id:
@@ -3081,7 +3081,7 @@ class Kernel:
                 rejection.hard,
             )
             parsed_execute = parse_work_item_event_id(qevent.event_id)
-            if parsed_execute is not None and parsed_execute.kind == "execute":
+            if parsed_execute is not None and parsed_execute.kind in {"execute"}:
                 run = self._work_item_runs.get(parsed_execute.request_id)
                 if run is not None and not run.started:
                     release_order()
@@ -4972,7 +4972,7 @@ class Kernel:
         parsed_publication = parse_work_item_event_id(qevent.event_id)
         publication_run = (
             self._work_item_runs.get(parsed_publication.request_id)
-            if parsed_publication is not None and parsed_publication.kind == "execute"
+            if parsed_publication is not None and parsed_publication.kind in {"execute"}
             else None
         )
         try:
@@ -5016,7 +5016,7 @@ class Kernel:
                         work_item_request_id=(
                             parsed_publication.request_id
                             if parsed_publication is not None
-                            and parsed_publication.kind == "execute"
+                            and parsed_publication.kind in {"execute"}
                             and publication_run is not None
                             and publication_run.started
                             else None
