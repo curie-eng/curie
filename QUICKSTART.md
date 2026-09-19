@@ -179,9 +179,8 @@ curie cluster message "Is any pod crashlooping right now?"
 ```
 
 The installer binds the `sre-approvals` route that gates the Kubernetes
-mutations. You need to add approvers with `--approvers` (Slack user IDs, comma
-separated) to resolve those approvals from the CLI with an operator principal;
-without it only members of the bound Slack channel can approve.
+mutations. The required `--approvers` flag takes Slack user IDs, separated by
+commas, and binds the only users who may resolve those approvals.
 
 Run the installer with `--dry-run` first to inspect its ordered mutation plan.
 The optional `--platform-upgrade` flag adds a separate, much wider

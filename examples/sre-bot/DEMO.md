@@ -60,10 +60,9 @@ If the App private key already lives in a Secret you manage, use
 instead of `--private-key`.
 
 Install the SRE bot (observability stack, Kubernetes identity, kubeconfig,
-bundle) and name `--workspace` on a follow-up deploy. You need to add approvers
-with `--approvers` to approve the Kubernetes gates from the CLI
-(`curie cluster approvals sre-bot --resolve`); without it only members of the
-bound Slack channel can approve:
+bundle) and name `--workspace` on a follow-up deploy. The required
+`--approvers` flag sets the Slack users who may approve the Kubernetes gates,
+including through `curie cluster approvals sre-bot --resolve`:
 
 ```bash
 curie example sre-bot install --observability --dry-run --slack-channel C0EXAMPLE1 --approvers U0EXAMPLE1
