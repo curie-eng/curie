@@ -1975,7 +1975,7 @@ class Kernel:
                 owned_run = self._work_item_runs.pop(owned_work_item_id, None)
                 if owned_run is not None:
                     await owned_run.close()
-                if self._active_work_item_request_id == owned_work_item_id:
+                if getattr(self, "_active_work_item_request_id", None) == owned_work_item_id:
                     self._active_work_item_request_id = None
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
@@ -4103,8 +4103,9 @@ class Kernel:
         # Register before start_turn so a kill during the POST can find this
         # thread. Canned and steered returns above never register. A failed
         # start unregisters so a turn that never opened cannot leak an entry.
-        active_id = self._active_work_item_request_id
-        run = self._work_item_runs.get(active_id) if active_id is not None else None
+        active_id = getattr(self, "_active_work_item_request_id", None)
+        runs = getattr(self, "_work_item_runs", {})
+        run = runs.get(active_id) if active_id is not None else None
         if run is not None and run.finished:
             raise WorkItemStartRefused("work item authority is finished")
         if run is not None and not run.started:
