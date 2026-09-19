@@ -395,6 +395,12 @@ def upgrade() -> None:
         sa.Column("reply_conversation_id", sa.Text(), nullable=True),
         schema=SCHEMA,
     )
+    op.execute(
+        sa.text(
+            f"UPDATE {SCHEMA}.execution_requests "
+            "SET execution_attempts = 1 WHERE started_at IS NOT NULL"
+        )
+    )
 
     op.drop_constraint(
         "execution_requests_state_shape_ck",

@@ -720,25 +720,26 @@ class SandboxSubstrate:
         if sandbox_name:
             sandbox_names.add(sandbox_name)
         record = self._affinity.get(thread_key)
-        if record is not None:
+        if not claim_names and not sandbox_names and record is not None:
             claim_names.add(record.handle.claim_name)
             sandbox_names.add(record.handle.sandbox_name)
-        thread_hash = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()[:10]
-        try:
-            labelled = self._k8s.list_claims(
-                label_selector=f"{THREAD_HASH_LABEL}={thread_hash}"
-            )
-        except Exception as exc:  # noqa: BLE001 - still terminate known names
-            logger.warning(
-                "terminate could not list claims for thread %s: %s",
-                thread_key,
-                type(exc).__name__,
-            )
-            labelled = []
-        for view in labelled:
-            claim_names.add(view.name)
-            if view.sandbox_name:
-                sandbox_names.add(view.sandbox_name)
+        if not claim_names:
+            thread_hash = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()[:10]
+            try:
+                labelled = self._k8s.list_claims(
+                    label_selector=f"{THREAD_HASH_LABEL}={thread_hash}"
+                )
+            except Exception as exc:  # noqa: BLE001 - still terminate known names
+                logger.warning(
+                    "terminate could not list claims for thread %s: %s",
+                    thread_key,
+                    type(exc).__name__,
+                )
+                labelled = []
+            for view in labelled:
+                claim_names.add(view.name)
+                if view.sandbox_name:
+                    sandbox_names.add(view.sandbox_name)
         affinity_claim = record.handle.claim_name if record is not None else None
         for name in list(claim_names):
             try:

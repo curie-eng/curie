@@ -689,6 +689,18 @@ async def heartbeat(
             request_id=request.id,
             status=request.status,
         )
+    now = await session.scalar(select(func.clock_timestamp()))
+    if (
+        request.runtime_heartbeat_expires_at is not None
+        and now is not None
+        and now >= request.runtime_heartbeat_expires_at
+    ):
+        return await _refuse(
+            session,
+            "stale_owner",
+            request_id=request.id,
+            status=request.status,
+        )
     settings = get_settings()
     if request.status == "running":
         await session.execute(
@@ -760,6 +772,19 @@ async def finish(
             session, "not_found", work_item_id=work_item.id, request_id=request_id
         )
     if request.runtime_epoch != runtime_epoch:
+        return await _refuse(
+            session,
+            "stale_owner",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
+    now = await session.scalar(select(func.clock_timestamp()))
+    if (
+        request.runtime_heartbeat_expires_at is not None
+        and now is not None
+        and now >= request.runtime_heartbeat_expires_at
+    ):
         return await _refuse(
             session,
             "stale_owner",
