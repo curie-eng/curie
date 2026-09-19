@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    DateTime,
     Enum,
     ForeignKey,
     Index,
@@ -529,6 +530,185 @@ class ThreadPublicationLineage(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     publications: Mapped[list[Publication]] = relationship(back_populates="lineage")
+
+
+class WorkItem(Base):
+    """Durable execution identity for one canonical GitHub issue."""
+
+    __tablename__ = "work_items"
+    __table_args__ = (
+        CheckConstraint(
+            "github_repository_id > 0",
+            name="work_items_github_repository_id_ck",
+        ),
+        CheckConstraint(
+            "github_issue_number > 0",
+            name="work_items_github_issue_number_ck",
+        ),
+        CheckConstraint(
+            "github_installation_id > 0",
+            name="work_items_github_installation_id_ck",
+        ),
+        CheckConstraint("version >= 1", name="work_items_version_ck"),
+        CheckConstraint("next_sequence >= 1", name="work_items_next_sequence_ck"),
+        UniqueConstraint(
+            "github_repository_id",
+            "github_issue_number",
+            name="work_items_github_issue_key",
+        ),
+        UniqueConstraint(
+            "publication_lineage_id",
+            name="work_items_publication_lineage_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    github_repository_id: Mapped[int] = mapped_column(BigInteger)
+    github_issue_number: Mapped[int]
+    github_installation_id: Mapped[int] = mapped_column(BigInteger)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    repo_full_name: Mapped[str]
+    conversation_id: Mapped[str]
+    publication_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            f"{SCHEMA}.thread_publication_lineages.id",
+            ondelete="RESTRICT",
+        ),
+        default=None,
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    publication_lineage: Mapped[ThreadPublicationLineage | None] = relationship()
+    execution_requests: Mapped[list[ExecutionRequest]] = relationship(
+        back_populates="work_item",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ExecutionRequest(Base):
+    """One bounded execution attempt owned by a WorkItem."""
+
+    __tablename__ = "execution_requests"
+    __table_args__ = (
+        CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
+        CheckConstraint("version >= 1", name="execution_requests_version_ck"),
+        CheckConstraint(
+            "status IS NOT NULL AND status IN "
+            "('waiting', 'running', 'cancellation_requested', 'completed', "
+            "'failed', 'expired', 'cancelled')",
+            name="execution_requests_status_ck",
+        ),
+        CheckConstraint(
+            "terminal_cause IS NULL OR length(btrim(terminal_cause)) > 0",
+            name="execution_requests_terminal_cause_ck",
+        ),
+        CheckConstraint(
+            "termination_observation IS NULL "
+            "OR length(btrim(termination_observation)) > 0",
+            name="execution_requests_termination_observation_ck",
+        ),
+        CheckConstraint(
+            "(started_at IS NULL AND execution_deadline IS NULL) OR "
+            "(started_at IS NOT NULL AND execution_deadline IS NOT NULL AND "
+            "execution_deadline = started_at + interval '1800 seconds')",
+            name="execution_requests_deadline_ck",
+        ),
+        CheckConstraint(
+            "((status = 'waiting' AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'running' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'cancellation_requested' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause IN ('issue_cancelled', 'execution_deadline') "
+            "AND termination_observation IS NULL) "
+            "OR (status = 'completed' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause IS NOT NULL AND terminal_cause = 'completed' "
+            "AND termination_observation IS NULL) "
+            "OR (status = 'failed' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause IS NOT NULL AND termination_observation IS NULL) "
+            "OR (status = 'expired' AND terminal_at IS NOT NULL AND "
+            "((started_at IS NULL AND execution_deadline IS NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause = 'capacity_wait_expired' "
+            "AND termination_observation IS NULL) OR "
+            "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause = 'execution_deadline' "
+            "AND termination_observation IS NOT NULL))) "
+            "OR (status = 'cancelled' AND terminal_at IS NOT NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause = 'issue_cancelled' AND "
+            "((started_at IS NULL AND execution_deadline IS NULL "
+            "AND termination_observation IS NULL) OR "
+            "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
+            "AND termination_observation IS NOT NULL)))) IS TRUE",
+            name="execution_requests_state_shape_ck",
+        ),
+        UniqueConstraint(
+            "work_item_id",
+            "sequence",
+            name="execution_requests_work_item_sequence_key",
+        ),
+        Index(
+            "uq_execution_requests_active_work_item",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('waiting', 'running', 'cancellation_requested')"
+            ),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    sequence: Mapped[int]
+    status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
+    wait_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    execution_deadline: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    terminal_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    terminal_cause: Mapped[str | None] = mapped_column(default=None)
+    termination_observation: Mapped[str | None] = mapped_column(
+        Text, default=None
+    )
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 
 
 class PublicationReviewReservation(Base):

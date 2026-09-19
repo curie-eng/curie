@@ -4,6 +4,11 @@ Date: 2026-09-10
 
 Status: Accepted
 
+Partially amended by
+[ADR 0155](0155-work-items-own-durable-execution-identity.md). The tracker
+remains the backlog and Curie still does not copy tracker content. The stream no
+longer owns durable admitted execution state.
+
 Proposed as part of the dark-factory decision set, discussed in
 [discussion #2551](https://github.com/curie-eng/curie/discussions/2551).
 

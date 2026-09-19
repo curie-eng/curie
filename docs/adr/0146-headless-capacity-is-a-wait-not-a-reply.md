@@ -4,6 +4,11 @@ Date: 2026-09-10
 
 Status: Accepted
 
+Partially amended by
+[ADR 0155](0155-work-items-own-durable-execution-identity.md). A `WorkItem` and
+its active `ExecutionRequest` now own durable waiting identity. Explicit factory
+identity replaces reply route inference for this lane.
+
 Proposed as part of the dark-factory decision set, discussed in
 [discussion #2551](https://github.com/curie-eng/curie/discussions/2551).
 
