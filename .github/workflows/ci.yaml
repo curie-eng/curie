@@ -2878,6 +2878,12 @@ jobs:
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow-level block, so contents:read
+    # is repeated. actions:read is required to list this run's jobs for the
+    # 20 minute upgrade-matrix wall-clock assertion (#2823).
+    permissions:
+      contents: read
+      actions: read
     needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
@@ -2981,3 +2987,12 @@ jobs:
           echo "Selected and skipped negative control passed"
 
           echo "E2E required passed"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: ${{ !cancelled() }}
+        with:
+          persist-credentials: false
+      - name: Assert upgrade matrix wall clock
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py
