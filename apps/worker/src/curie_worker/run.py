@@ -73,6 +73,7 @@ from .sandbox import (
 )
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
+from .workitem_dispatch import WorkItemDispatchClient
 from .workspace import (
     SubprocessCommands,
     WorkspaceClaimCoordinator,
@@ -484,6 +485,15 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         card_store=card_store,
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
+        work_items=(
+            WorkItemDispatchClient(
+                api_base_url=config.api_base_url,
+                worker_token=config.internal_worker_token,
+                client=eval_http,
+            )
+            if config.internal_worker_token
+            else None
+        ),
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)

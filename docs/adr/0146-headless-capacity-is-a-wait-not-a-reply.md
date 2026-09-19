@@ -4,6 +4,8 @@ Date: 2026-09-10
 
 Status: Accepted
 
+Partially amended by [ADR 0157](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md). Dispatch, deferral and expiry are recorded in PostgreSQL.
+
 Partially amended by
 [ADR 0155](0155-work-items-own-durable-execution-identity.md). A `WorkItem` and
 its active `ExecutionRequest` now own durable waiting identity. Explicit factory

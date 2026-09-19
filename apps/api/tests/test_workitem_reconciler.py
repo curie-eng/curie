@@ -17,12 +17,7 @@ from aci_protocol import STREAM_PAYLOAD_FIELD, WORKER_GROUP_DEFAULT
 from curie_api.config import get_settings
 from curie_api.workitem_dispatch import admit, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
-from curie_test_support.valkey import (
-    VALKEY_HOST,
-    VALKEY_PORT,
-    VALKEY_PW,
-    connect_or_skip,
-)
+from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -416,29 +411,30 @@ def test_deadline_and_owner_lost_cancellation_are_requested(
             await admit(session, owner_facts)
             await session.execute(
                 text(
-                    "UPDATE curie.execution_requests SET "
+                    "UPDATE curie.execution_requests e SET "
                     "status = 'running', "
-                    "started_at = clock_timestamp() - interval '1801 seconds', "
-                    "execution_deadline = clock_timestamp() - interval '1 second', "
+                    "started_at = s.ts, "
+                    "execution_deadline = s.ts + interval '1800 seconds', "
                     "execution_attempts = 1, "
                     "version = version + 1 "
-                    "WHERE id = :id"
+                    "FROM (SELECT clock_timestamp() - interval '1801 seconds' AS ts) s "
+                    "WHERE e.id = :id"
                 ),
                 {"id": deadline_facts.request_id},
             )
             await session.execute(
                 text(
-                    "UPDATE curie.execution_requests SET "
+                    "UPDATE curie.execution_requests e SET "
                     "status = 'running', "
-                    "started_at = clock_timestamp() - interval '60 seconds', "
-                    "execution_deadline = clock_timestamp() + interval '1740 seconds', "
+                    "started_at = s.ts, "
+                    "execution_deadline = s.ts + interval '1800 seconds', "
                     "execution_attempts = 1, "
                     "runtime_owner = 'worker-a', "
                     "runtime_epoch = 1, "
-                    "runtime_heartbeat_expires_at = clock_timestamp() "
-                    "- interval '1 second', "
+                    "runtime_heartbeat_expires_at = s.ts + interval '59 seconds', "
                     "version = version + 1 "
-                    "WHERE id = :id"
+                    "FROM (SELECT clock_timestamp() - interval '60 seconds' AS ts) s "
+                    "WHERE e.id = :id"
                 ),
                 {"id": owner_facts.request_id},
             )
@@ -477,18 +473,17 @@ def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(
             admitted = await admit(session, facts)
             await session.execute(
                 text(
-                    "UPDATE curie.execution_requests SET "
+                    "UPDATE curie.execution_requests e SET "
                     "status = 'cancellation_requested', "
-                    "started_at = clock_timestamp() - interval '60 seconds', "
-                    "execution_deadline = clock_timestamp() "
-                    "+ interval '1740 seconds', "
+                    "started_at = s.ts, "
+                    "execution_deadline = s.ts + interval '1800 seconds', "
                     "execution_attempts = 1, "
                     "terminal_cause = 'owner_lost', "
                     "runtime_owner = NULL, "
-                    "runtime_heartbeat_expires_at = clock_timestamp() "
-                    "- interval '1 second', "
+                    "runtime_heartbeat_expires_at = s.ts + interval '59 seconds', "
                     "version = version + 1 "
-                    "WHERE id = :id"
+                    "FROM (SELECT clock_timestamp() - interval '60 seconds' AS ts) s "
+                    "WHERE e.id = :id"
                 ),
                 {"id": facts.request_id},
             )

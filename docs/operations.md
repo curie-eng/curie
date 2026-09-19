@@ -775,6 +775,40 @@ Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
 built artifact without rebuilding.
 
+### Factory work items wait for capacity
+
+Factory execution waits in PostgreSQL rather than on the runs-stream pending
+list. Admission, acquire, start, heartbeat, finish, and termination are internal
+worker-token routes under `/v1/internal/work-items`. The API lifespan reconciler
+publishes execute and terminate wakes onto `curie:runs`.
+
+The knobs are `CURIE_WORK_ITEM_*` on the API (settable through `api.extraEnv`
+until chart-owned values land):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CURIE_WORK_ITEM_RECONCILER_ENABLED` | `true` | Lifespan task off-switch |
+| `CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS` | `5` | Pass interval |
+| `CURIE_WORK_ITEM_BATCH_LIMIT` | `50` | Due rows claimed per pass |
+| `CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS` | `86400` | Waiting deadline from admission |
+| `CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS` | `30` | Reconciler publish lease |
+| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `300` | Worker acquire lease |
+| `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS` | `45` | Runtime heartbeat expiry; interval is ttl / 3 |
+| `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
+| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Capacity defer backoff cap |
+| `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
+| `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
+
+There are two time bounds after start: the ExecutionRequest deadline (1800 s)
+and the worker delivery budget (`worker.deliveryBudgetSeconds`, default 600).
+The runner request is bounded by the smaller of the two remaining times. A
+default install therefore fails a work item at 600 s (`deadline_halted`) unless
+operators raise the delivery budget for factory agents.
+
+Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
+`GET /v1/internal/work-items/requests/{id}`. It is not written to the
+dead-letter graveyard.
+
 ## Talking to your agent
 
 The plugin bundle you just deployed is the agent's backend. There are two

@@ -62,6 +62,7 @@ from .routers import (
     publications,
     runs,
     state,
+    work_items,
     workspaces,
 )
 from .schema_compat import assert_servable
@@ -70,6 +71,7 @@ from .slack_usergroups import SlackUserGroupClient
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
+from .workitem_reconciler import WorkItemReconciler
 
 _LOG = logging.getLogger("curie_api")
 
@@ -155,6 +157,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         dead_letter_scan_limit=settings.resume_dead_letter_scan_limit,
     )
     app.state.resume_reconciler = reconciler
+    work_item_reconciler = WorkItemReconciler(
+        app.state.sessionmaker,
+        valkey,
+        settings,
+    )
+    app.state.work_item_reconciler = work_item_reconciler
+    app.state.work_item_reconciler_task = (
+        asyncio.create_task(work_item_reconciler.run_forever())
+        if settings.work_item_reconciler_enabled
+        else None
+    )
     app.state.resume_reconciler_task = (
         asyncio.create_task(reconciler.run_forever())
         if settings.resume_reconciler_enabled
@@ -244,6 +257,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Both background loops enqueue via resume_queue (which uses the valkey
         # client) and read via the sessionmaker, so both are stopped BEFORE
         # valkey.aclose()/engine.dispose() below.
+        work_item_task = getattr(app.state, "work_item_reconciler_task", None)
+        if work_item_task is not None:
+            work_item_task.cancel()
+            try:
+                await work_item_task
+            except asyncio.CancelledError:
+                pass
         task = getattr(app.state, "resume_reconciler_task", None)
         if task is not None:
             task.cancel()
@@ -395,6 +415,7 @@ def create_app() -> FastAPI:
     app.include_router(actions.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(work_items.router)
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspaces.router)

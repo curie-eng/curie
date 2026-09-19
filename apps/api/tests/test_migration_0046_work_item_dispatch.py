@@ -242,7 +242,9 @@ def test_0046_adds_dispatch_columns_checks_indexes_and_trigger_rules(
     }
     assert DISPATCH_COLUMNS <= columns
 
-    request_defs = [str(row["definition"]).lower() for row in _constraint_rows("execution_requests")]
+    request_defs = [
+        str(row["definition"]).lower() for row in _constraint_rows("execution_requests")
+    ]
     check_defs = "\n".join(
         definition for definition in request_defs if definition.startswith("check")
     )
