@@ -174,10 +174,16 @@ def _without_unreachable_bearer(entry: dict[str, Any], spec: ConnectorSpec) -> d
     (mcp-grafana and the SRE bot's tempo server). Without the header the boot
     probe dials the server for real: one that does authenticate the client
     still fails, as ``probe_failed``. An explicit ``bearer_secret`` is the
-    author asking for the header, so it is kept.
+    author asking for the header, so it is kept, as is a remote connector's
+    authored header, which authenticates the client.
     """
 
-    if spec.bearer_secret or len(spec.secrets) != 1 or isinstance(spec.secrets[0], str):
+    if (
+        not spec.is_hosted
+        or spec.bearer_secret
+        or len(spec.secrets) != 1
+        or isinstance(spec.secrets[0], str)
+    ):
         return entry
     headers = entry.get("headers")
     if not isinstance(headers, dict) or headers.get("Authorization") != (

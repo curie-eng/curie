@@ -161,3 +161,25 @@ def test_secretref_server_that_refuses_the_client_is_still_a_failure(
     assert [(f.connector, f.reason) for f in boot.connector_failures] == [
         ("grafana", "probe_failed")
     ]
+
+
+REMOTE_SECRETREF_AUTHORED_BEARER = (
+    "connectors:\n"
+    "  vendor:\n"
+    "    url: https://mcp.example.com/mcp\n"
+    "    headers:\n"
+    "      Authorization: Bearer ${VENDOR_TOKEN}\n"
+    "    secrets:\n"
+    "      - name: VENDOR_TOKEN\n"
+    "        from_secret: vendor-token\n"
+)
+
+
+@pytest.mark.parametrize("scoped", [True, False])
+def test_remote_connector_keeps_its_authored_bearer(tmp_path: Path, scoped: bool) -> None:
+    # Negative control, both scope paths: only the HOSTED derived header is an
+    # upstream credential; a remote connector's authored header authenticates
+    # the client and must survive.
+    scope = SCOPE if scoped else {"release": None, "agent": None, "namespace": None}
+    derived = derive_mcp_servers(_bundle(tmp_path, REMOTE_SECRETREF_AUTHORED_BEARER), **scope)
+    assert derived["vendor"]["headers"] == {"Authorization": "Bearer ${VENDOR_TOKEN}"}
