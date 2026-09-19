@@ -1487,10 +1487,10 @@ class Kernel:
                 return
 
             parsed_work_item = parse_work_item_event_id(event_id)
-            if parsed_work_item is not None and parsed_work_item.kind == "terminate":
+            if parsed_work_item is not None and parsed_work_item.kind in {"terminate"}:
                 await self._terminate_work_item(qevent, parsed_work_item.request_id)
                 return
-            if parsed_work_item is not None and parsed_work_item.kind == "execute":
+            if parsed_work_item is not None and parsed_work_item.kind in {"execute"}:
                 if self._work_items is None:
                     logger.error(
                         "work-item execute %s has no dispatch client; dropping the wake",
