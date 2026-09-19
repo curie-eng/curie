@@ -1529,7 +1529,24 @@ mailAdapter:
     # rotates to an edge outside the list (TLS is still verified against the
     # hostname) -- this is what kept a CDN-fronted provider from being refused
     # when its DNS rotated (#2731).
+    #
+    # AgentMail is fronted by CloudFront. /32 pins resolved from
+    # api.agentmail.to WILL break when CloudFront moves the name to other
+    # edges (#2824). Use the provider's published ranges (for CloudFront, the
+    # CLOUDFRONT entries in https://ip-ranges.amazonaws.com/ip-ranges.json),
+    # a controlled egress proxy with a stable address, or egressMode below.
     httpsCidrs: []
+    # `cidrs` (default): port 443 only to httpsCidrs.
+    # `publicHttps`: port 443 to any public address, with private, loopback,
+    # link-local (cloud metadata), CGNAT, multicast and reserved ranges
+    # denied. Survives any CDN move. The trade-off: this credential-bearing pod
+    # can then open HTTPS to any public host, not just AgentMail. httpsCidrs
+    # must be empty in this mode.
+    egressMode: cidrs
+    # publicHttps only: extra ranges to deny. Pod, Service and node ranges in
+    # public address space (dual-stack IPv6 pod/Service CIDRs, GKE public pod
+    # ranges, public node IPs) are NOT denied by default: list them here.
+    publicHttpsExcept: []
   # The `chn` channel token minted by the API's POST /channels/token, scoped to
   # this adapter's channel binding. The adapter presents it on every inbound post.
   channelToken: ""
