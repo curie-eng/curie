@@ -1616,3 +1616,140 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
         ) == expected
 
     with_session(verify)
+
+
+async def _elapsed_running_with_lapsed_heartbeat(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    *,
+    issue: int = 2573,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    item_id, request_id = uuid.uuid4(), uuid.uuid4()
+    started_at = await _now(session) - timedelta(seconds=1801)
+    execution_deadline = started_at + timedelta(seconds=1800)
+    await session.execute(
+        text(
+            "INSERT INTO curie.work_items "
+            "(id, github_repository_id, github_issue_number, "
+            "github_installation_id, agent_id, repo_full_name, conversation_id, "
+            "version, next_sequence) VALUES "
+            "(:id, 101, :issue, 202, :agent, :repo, :conversation, 2, 2)"
+        ),
+        {
+            "id": item_id,
+            "issue": issue,
+            "agent": agent_id,
+            "repo": REPO,
+            "conversation": CONVERSATION,
+        },
+    )
+    await session.execute(
+        text(
+            "INSERT INTO curie.execution_requests "
+            "(id, work_item_id, sequence, status, wait_deadline, started_at, "
+            "execution_deadline, version, execution_attempts, "
+            "runtime_heartbeat_expires_at) VALUES "
+            "(:id, :item, 1, 'running', :wait, :started, :deadline, 2, 1, "
+            ":heartbeat)"
+        ),
+        {
+            "id": request_id,
+            "item": item_id,
+            "wait": started_at - timedelta(seconds=1),
+            "started": started_at,
+            "deadline": execution_deadline,
+            "heartbeat": started_at,
+        },
+    )
+    await session.commit()
+    return item_id, request_id
+
+
+def test_owner_lost_cancellation_fails_with_observation_and_yields_to_issue_cancel(
+    clean_db: None,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item_id, request_id = await _elapsed_running_with_lapsed_heartbeat(
+            session, agent_id
+        )
+        marked = await workitems.request_owner_lost_cancellation(
+            session,
+            work_item_id=item_id,
+            request_id=request_id,
+            expected_work_item_version=2,
+            expected_request_version=2,
+        )
+        assert isinstance(marked, workitems.WorkItemOutcome), marked
+        assert marked.request is not None
+        assert (
+            marked.request.status,
+            marked.request.terminal_cause,
+            marked.request.termination_observation,
+        ) == ("cancellation_requested", "owner_lost", None)
+
+        observed = await workitems.record_runtime_termination(
+            session,
+            work_item_id=item_id,
+            request_id=request_id,
+            termination_observation=FIXTURE_TERMINATION,
+            expected_work_item_version=2,
+            expected_request_version=3,
+        )
+        assert isinstance(observed, workitems.WorkItemOutcome), observed
+        assert observed.request is not None
+        assert (
+            observed.request.status,
+            observed.request.terminal_cause,
+            observed.request.termination_observation,
+        ) == ("failed", "owner_lost", FIXTURE_TERMINATION)
+
+        other_item, other_request = await _elapsed_running_with_lapsed_heartbeat(
+            session, agent_id, issue=2574
+        )
+        owner_lost = await workitems.request_owner_lost_cancellation(
+            session,
+            work_item_id=other_item,
+            request_id=other_request,
+            expected_work_item_version=2,
+            expected_request_version=2,
+        )
+        assert isinstance(owner_lost, workitems.WorkItemOutcome), owner_lost
+        explicit = await workitems.request_cancellation(
+            session, work_item_id=other_item, expected_work_item_version=2
+        )
+        assert isinstance(explicit, workitems.WorkItemOutcome), explicit
+        assert explicit.request is not None
+        assert explicit.request.terminal_cause == "issue_cancelled"
+        assert explicit.request.status == "cancellation_requested"
+
+    with_session(body)
+
+
+def test_start_execution_spends_exactly_one_attempt(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        waiting = await _request(
+            session, (await _item(session, await _agent(session))).work_item
+        )
+        assert waiting.request is not None
+        waiting_attempts = await session.scalar(
+            text(
+                "SELECT execution_attempts FROM curie.execution_requests "
+                "WHERE id = :id"
+            ),
+            {"id": waiting.request.id},
+        )
+        assert waiting_attempts == 0
+        running = await _start(session, waiting)
+        assert running.request is not None
+        started_attempts = await session.scalar(
+            text(
+                "SELECT execution_attempts FROM curie.execution_requests "
+                "WHERE id = :id"
+            ),
+            {"id": running.request.id},
+        )
+        assert started_attempts == 1
+        assert running.request.started_at is not None
+
+    with_session(body)
