@@ -2988,9 +2988,11 @@ jobs:
 
           echo "E2E required passed"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: ${{ !cancelled() }}
         with:
           persist-credentials: false
       - name: Assert upgrade matrix wall clock
+        if: ${{ !cancelled() }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py

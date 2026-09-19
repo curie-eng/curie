@@ -337,10 +337,15 @@ def test_e2e_required_runs_the_wall_clock_helper() -> None:
         and str(step.get("uses", "")).startswith("actions/checkout@")
     )
     assert checkout["with"]["persist-credentials"] is False
+    # Outcome failure must not hide the seconds: a 32 minute shard that also
+    # failed a scenario would otherwise skip the annotation (#2823).
+    assert checkout.get("if") == "${{ !cancelled() }}"
     assert "Assert upgrade matrix wall clock" in named
-    run = named["Assert upgrade matrix wall clock"]["run"]
+    budget = named["Assert upgrade matrix wall clock"]
+    run = budget["run"]
     assert "tools/e2e-ci-selection/assert_upgrade_matrix_budget.py" in run
-    assert "continue-on-error" not in named["Assert upgrade matrix wall clock"]
+    assert "continue-on-error" not in budget
+    assert budget.get("if") == "${{ !cancelled() }}"
     # Outcome matching stays the gate for selected results; wall clock is a
     # later step so a budget miss cannot skip the selected-outcome negative
     # control.
