@@ -47,6 +47,14 @@ class ShardTiming:
     bake_seconds: int | None
     run_seconds: int | None
 
+    @property
+    def shard_plus_bake_seconds(self) -> int:
+        if self.bake_seconds is None or self.run_seconds is None:
+            raise BudgetError(
+                f"missing bake or matrix-run step timestamps on {self.shard}"
+            )
+        return self.bake_seconds + self.run_seconds
+
 
 def parse_iso8601(value: object, label: str) -> datetime:
     # Observed GitHub jobs API timestamps use a trailing Z (run 35356180678).
@@ -156,25 +164,26 @@ def render_summary(rows: list[ShardTiming], longest: ShardTiming, over: bool) ->
         "## Upgrade matrix wall clock",
         "",
         f"Budget: {BUDGET_SECONDS} seconds (20 minutes). "
-        "The asserted number is the longest shard job, which includes the image bake "
+        "The asserted number is bake plus matrix-run on the slowest shard "
         "(#2823, #2778).",
         "",
-        "| Shard | Job seconds | Bake seconds | Matrix-run seconds |",
-        "| --- | ---: | ---: | ---: |",
+        "| Shard | Job seconds | Bake seconds | Matrix-run seconds | Bake plus run |",
+        "| --- | ---: | ---: | ---: | ---: |",
     ]
-    for row in sorted(rows, key=lambda item: (-item.job_seconds, item.shard)):
+    for row in sorted(rows, key=lambda item: (-item.shard_plus_bake_seconds, item.shard)):
         lines.append(
             f"| {row.shard} | {row.job_seconds} | {optional_seconds(row.bake_seconds)} | "
-            f"{optional_seconds(row.run_seconds)} |"
+            f"{optional_seconds(row.run_seconds)} | {row.shard_plus_bake_seconds} |"
         )
     result = "over budget" if over else "within budget"
-    bake = optional_seconds(longest.bake_seconds)
+    asserted = longest.shard_plus_bake_seconds
     lines.extend(
         [
             "",
-            f"Longest shard plus bake: {longest.job_seconds} seconds "
-            f"({format_clock(longest.job_seconds)}) on {longest.shard} "
-            f"(bake {bake} seconds).",
+            f"Longest shard plus bake: {asserted} seconds "
+            f"({format_clock(asserted)}) on {longest.shard} "
+            f"(job {longest.job_seconds}s, bake {optional_seconds(longest.bake_seconds)}s, "
+            f"matrix-run {optional_seconds(longest.run_seconds)}s).",
             f"Result: {result}",
             "",
         ]
@@ -313,13 +322,19 @@ def main(argv: list[str] | None = None) -> int:
         emit(str(exc), error=True)
         return 1
 
-    longest = max(rows, key=lambda row: (row.job_seconds, row.shard))
-    over = longest.job_seconds > BUDGET_SECONDS
+    try:
+        longest = max(rows, key=lambda row: (row.shard_plus_bake_seconds, row.shard))
+        asserted = longest.shard_plus_bake_seconds
+    except BudgetError as exc:
+        write_summary(summary_path, f"## Upgrade matrix wall clock\n\nResult: failed ({exc})\n")
+        emit(str(exc), error=True)
+        return 1
+    over = asserted > BUDGET_SECONDS
     write_summary(summary_path, render_summary(rows, longest, over))
     if over:
         emit(
             (
-                f"longest shard plus bake {longest.job_seconds}s on {longest.shard} "
+                f"longest shard plus bake {asserted}s on {longest.shard} "
                 f"exceeds {BUDGET_SECONDS}s budget"
             ),
             error=True,
@@ -327,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     emit(
         (
-            f"longest shard plus bake {longest.job_seconds}s on {longest.shard} "
+            f"longest shard plus bake {asserted}s on {longest.shard} "
             f"(budget {BUDGET_SECONDS}s)"
         ),
         error=False,

@@ -157,6 +157,7 @@ def test_under_budget_shard_plus_bake_passes_and_writes_the_seconds(tmp_path: Pa
     summary = _summary(tmp_path)
     assert "1073" in summary
     assert "86" in summary
+    assert "924" in summary
     assert "1200" in summary
     assert "s07" in summary
     assert "within budget" in summary.lower()
@@ -186,6 +187,7 @@ def test_over_budget_shard_plus_bake_fails_and_still_writes_the_seconds(tmp_path
     summary = _summary(tmp_path)
     assert "1920" in summary
     assert "180" in summary
+    assert "1680" in summary
     assert "1200" in summary
     assert "over budget" in summary.lower()
     assert "::error" in completed.stdout
@@ -220,8 +222,8 @@ def test_exactly_budget_is_within_budget(tmp_path: Path) -> None:
     payload = _payload(
         _job(
             "E2E cluster upgrade matrix (s01)",
-            job_seconds=BUDGET_SECONDS,
-            bake_seconds=100,
+            job_seconds=1300,
+            bake_seconds=200,
             run_seconds=1000,
         ),
     )
@@ -235,14 +237,44 @@ def test_one_second_over_budget_fails(tmp_path: Path) -> None:
     payload = _payload(
         _job(
             "E2E cluster upgrade matrix (s01)",
-            job_seconds=BUDGET_SECONDS + 1,
-            bake_seconds=100,
-            run_seconds=1000,
+            job_seconds=1300,
+            bake_seconds=200,
+            run_seconds=1001,
         ),
     )
     completed = _run(tmp_path, payload)
     assert completed.returncode != 0
     assert "over budget" in _summary(tmp_path).lower()
+
+
+def test_full_job_over_budget_still_passes_when_bake_plus_run_is_inside(
+    tmp_path: Path,
+) -> None:
+    # Observed on PR 2845 after rebase (run 35525521589): s07 job 1259s,
+    # bake 299s, matrix-run 827s. Kind/setup jitter must not fail the 20
+    # minute bake-plus-run budget.
+    payload = _payload(
+        _job(
+            "E2E cluster upgrade matrix (s07)",
+            job_seconds=1259,
+            bake_seconds=299,
+            run_seconds=827,
+        ),
+    )
+    completed = _run(tmp_path, payload)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    summary = _summary(tmp_path)
+    assert "1259" in summary
+    assert "1126" in summary
+    assert "within budget" in summary.lower()
+
+
+def test_missing_bake_or_run_step_fails_closed(tmp_path: Path) -> None:
+    job = _job("E2E cluster upgrade matrix (s01)", job_seconds=900)
+    job["steps"] = [step for step in job["steps"] if step["name"] != BAKE_STEP]
+    completed = _run(tmp_path, _payload(job))
+    assert completed.returncode != 0
+    assert "missing bake or matrix-run" in (completed.stdout + completed.stderr).lower()
 
 
 def test_fetch_paginates_jobs_and_uses_documented_headers(tmp_path: Path) -> None:
