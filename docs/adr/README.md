@@ -184,4 +184,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0155 | [WorkItems own durable execution identity](0155-work-items-own-durable-execution-identity.md) | Accepted |
 | 0156 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0156-adapter-principal-with-a-scoped-credential.md) | Accepted |
 | 0159 | [A canary is a weighted second active deployment and every trace carries its version](0159-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
+| 0160 | [A long scheduled sweep is a chain of ordinary turns](0160-a-long-scheduled-sweep-is-a-chain-of-ordinary-turns.md) | Accepted |
 <!-- END GENERATED: adr-index -->
