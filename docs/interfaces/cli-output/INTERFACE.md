@@ -86,7 +86,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   it emits one object even when the bundle declares nothing to build, because
   under `--json` an agent cannot tell "nothing to build" from "the command
   produced nothing" — the #485 failure this seam exists to prevent.
-- **`cli/src/local.rs`**, **`cli/src/ops/up.rs`**, and **`cli/src/ops/verbs.rs`**, the operator verbs, one output per
+- **`cli/src/local.rs`**, **`cli/src/ops/up.rs`**, **`cli/src/ops/upgrade.rs`**, and **`cli/src/ops/verbs.rs`**, the operator verbs, one output per
   verb per tier: `LocalUpOutput`, `LocalRebuildOutput`, `LocalStatusOutput`,
   `LocalDownOutput`; `ClusterUpOutput`, `ClusterUpgradeOutput`, `ClusterStatusOutput`, `ClusterDownOutput`,
   `ClusterRollbackOutput`.

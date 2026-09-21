@@ -47,9 +47,11 @@ A third party ships a package declaring an entry point in the group
 whose value is `"curie.harness"`. The entry point resolves to a zero-argument
 callable returning a `HarnessContribution`
 (`runner/src/curie_runner/harness/contribution.py::HarnessContribution`), a
-frozen dataclass whose ten fields are, in declaration order: `name`, `image`,
+frozen dataclass whose eleven fields are, in declaration order: `name`, `image`,
 `install`, `auth`, `readonly_tools`, `model_override_env_keys`,
-`build_spawn_env`, `compile_bundle`, `aliases`, `labels`. It declares **no
+`build_spawn_env`, `compile_bundle`, `supports_structured_replay`, `aliases`, `labels`.
+`supports_structured_replay` is an explicit opt-in to ordered role/content replay
+(ADR-0119); recovered history is refused when the selected harness leaves it false. It declares **no
 methods**; the two behavioral hooks are callable fields, which is the whole
 code surface a third party writes.
 
@@ -148,7 +150,7 @@ concrete gaps:
 - **Most of the manifest has no reader.** `image`, `install`, `auth` and
   `model_override_env_keys` are declared and consumed by nothing in production;
   `labels` has no reader anywhere, tests included. Only `build_spawn_env`,
-  `compile_bundle` and `readonly_tools` are load-bearing, plus `name`/`aliases`
+  `compile_bundle`, `supports_structured_replay` and `readonly_tools` are load-bearing, plus `name`/`aliases`
   inside the registry. A second harness that fills the other fields correctly
   changes no behavior.
 - **The facts the manifest declares are still hardcoded elsewhere, in two
