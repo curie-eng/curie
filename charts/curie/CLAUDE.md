@@ -154,12 +154,12 @@ component and rail detail in `charts/curie/README.md`.
   refuses the render without it, rather than a broad allow in the chart for an
   address the chart cannot know. It never selects a runner sandbox and has no
   explicit Kubernetes API carveout. An operator must list a public Kubernetes
-  API endpoint in `mailAdapter.agentmail.publicHttpsExcept` to exclude it from
-  public HTTPS egress. The runtime pod mounts no ServiceAccount token and has
-  no RBAC. Prefix-0 and prefix-1 routes fail render, including split default
-  routes. Do not turn provider DNS into a broad CIDR or add a private-network
-  allow: use current provider ranges or a controlled egress proxy with a
-  stable range.
+  control plane or node CIDR in `mailAdapter.agentmail.publicHttpsExcept` to
+  exclude it from public HTTPS egress. The runtime pod mounts no ServiceAccount
+  token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
+  split default routes. Do not turn provider DNS into a broad CIDR or add a
+  private-network allow: use current provider ranges or a controlled egress
+  proxy with a stable range.
 - **Every backing store follows the same toggle + BYO idiom.** `<store>.deploy`
   (default `true`) gates whether the in-chart resource renders; flipping it
   to `false` repoints consumers (Langfuse env, the collector config) at the
