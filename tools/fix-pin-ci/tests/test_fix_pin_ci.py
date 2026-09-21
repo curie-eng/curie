@@ -1593,6 +1593,7 @@ def test_pull_request_template_documents_the_tier_waiver() -> None:
 FEATURE_MILESTONE = "v0.8.6"
 PATCH_MILESTONE = "v0.8.5"
 V0_9_2_MILESTONE = "v0.9.2"
+V0_9_3_MILESTONE = "v0.9.3"
 MAPPING_PATH = REPO_ROOT / "tools" / "fix-pin-ci" / "milestone-trains.json"
 NA_BODY = "Closes #12\n\nFix pin: n/a - the fix is a chart template with no test surface\n"
 
@@ -1947,6 +1948,14 @@ def test_milestone_mapping_sends_patch_to_main_and_feature_to_next() -> None:
 def test_v0_9_2_maps_to_the_patch_train_on_main() -> None:
     mapping = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
     train = mapping["milestones"].get(V0_9_2_MILESTONE)
+
+    assert train == "patch"
+    assert mapping["trains"].get(train) == "main"
+
+
+def test_v0_9_3_maps_to_the_patch_train_on_main() -> None:
+    mapping = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+    train = mapping["milestones"].get(V0_9_3_MILESTONE)
 
     assert train == "patch"
     assert mapping["trains"].get(train) == "main"
