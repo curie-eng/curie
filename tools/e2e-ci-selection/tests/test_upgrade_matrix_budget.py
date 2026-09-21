@@ -305,7 +305,8 @@ def test_fetch_paginates_jobs_and_uses_documented_headers(tmp_path: Path) -> Non
                 return
             body = json.dumps(page1).encode()
             host, port = self.server.server_address
-            next_url = f"http://{host}:{port}{self.path}&page=2"
+            safe_path = self.path.replace("\r", "").replace("\n", "")
+            next_url = f"http://{host}:{port}{safe_path}&page=2"
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
