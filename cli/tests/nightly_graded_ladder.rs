@@ -1872,7 +1872,19 @@ fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
 }
 
 #[test]
-fn cluster_rung_proves_the_post_eval_claim_without_cutting_the_reply_budget() {
+fn cluster_rung_uses_the_worker_delivery_budget_without_weakening_reply_gates() {
+    let timeout_reader = ladder_function("cluster_reply_timeout_seconds");
+    assert!(
+        timeout_reader.contains(r#"kubectl -n "$CURIE_NAMESPACE""#)
+            && timeout_reader.contains("cluster_worker_deploy")
+            && timeout_reader.contains("-o json"),
+        "the timeout reader must inspect the selected worker Deployment as JSON; helper contents:\n{timeout_reader}"
+    );
+    assert!(
+        timeout_reader.contains("CURIE_DELIVERY_BUDGET_S"),
+        "the timeout reader must read CURIE_DELIVERY_BUDGET_S from the selected worker Deployment; helper contents:\n{timeout_reader}"
+    );
+
     let cluster = ladder_function("rung_cluster");
     assert!(
         cluster.contains("#1534 repeated cluster eval then message still claims"),
@@ -1888,10 +1900,20 @@ fn cluster_rung_proves_the_post_eval_claim_without_cutting_the_reply_budget() {
          its worker claim log cannot be borrowed from an earlier turn; rung \
          contents:\n{cluster}"
     );
+    let timeout_resolved = cluster
+        .find(r#"cluster_reply_timeout_seconds="$(cluster_reply_timeout_seconds)""#)
+        .expect("the cluster rung must resolve the selected worker delivery budget once");
+    let first_message = cluster
+        .find(r#"msg_args+=(--timeout-secs "$cluster_reply_timeout_seconds")"#)
+        .expect("the first cluster message must use the resolved worker delivery timeout");
+    let retention_message = cluster
+        .find(
+            r#"retention_args+=(--thread "$retention_thread" --timeout-secs "$cluster_reply_timeout_seconds")"#,
+        )
+        .expect("the post eval cluster message must use the same resolved worker delivery timeout");
     assert!(
-        cluster.contains(r#"retention_args+=(--thread "$retention_thread" --timeout-secs 300)"#),
-        "the post-eval message must carry its unique thread and retain the CLI's \
-         normal 300 second reply budget; rung contents:\n{cluster}"
+        timeout_resolved < first_message && first_message < retention_message,
+        "the worker delivery timeout must be resolved before the first enqueue and reused for the post eval message; rung contents:\n{cluster}"
     );
     assert!(
         !cluster.contains(r#"timeout 45 "$BIN" "${retention_args[@]}""#),
@@ -1900,7 +1922,7 @@ fn cluster_rung_proves_the_post_eval_claim_without_cutting_the_reply_budget() {
     );
     let message_finished = cluster
         .find(r#"retention_out="$("$BIN" "${retention_args[@]}")"#)
-        .expect("the post-eval message must finish under its normal reply budget");
+        .expect("the post eval message must finish under the worker delivery timeout");
     let claim_proof = cluster
         .find(r#"assert_retention_claim "$retention_log" "slack:$retention_channel:$retention_thread" "$retention_launch_epoch""#)
         .expect("the completed message must be tied to its own bounded worker claim");
@@ -2103,6 +2125,7 @@ release=""
 context=""
 channel=""
 thread_key=""
+timeout_secs=""
 observability_start=""
 observability_end=""
 prev=""
@@ -2113,6 +2136,7 @@ for arg in "$@"; do
     if [ "$prev" = "--context" ]; then context="$arg"; fi
     if [ "$prev" = "--channel" ]; then channel="$arg"; fi
     if [ "$prev" = "--thread" ]; then thread_key="$arg"; fi
+    if [ "$prev" = "--timeout-secs" ]; then timeout_secs="$arg"; fi
     if [ "$prev" = "--start" ]; then observability_start="$arg"; fi
     if [ "$prev" = "--end" ]; then observability_end="$arg"; fi
     prev="$arg"
@@ -2404,6 +2428,10 @@ print(json.dumps({
         ;;
     "--json cluster --context ${STUB_EXPECT_CONTEXT:-stub-context} message "*|"--json cluster message "*)
         require_expected_ns_rel "$@"
+        if [ "$timeout_secs" != "${STUB_EXPECT_REPLY_TIMEOUT_SECS:-660}" ]; then
+            echo "unexpected cluster reply timeout: ${timeout_secs:-missing}" >&2
+            exit 97
+        fi
         if [ -n "$thread_key" ]; then
             require_parent_retention_context "$@"
             require_retention_context
@@ -2411,7 +2439,11 @@ print(json.dumps({
             printf '%s' "$thread_key" > "$STUB_STATE/retention-thread"
             printf '%s' "$channel" > "$STUB_STATE/retention-channel"
         fi
-        printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
+        if [ -n "$thread_key" ] && [ "${STUB_RETENTION_REPLY_FINALIZED:-1}" = "0" ]; then
+            printf '%s\n' '{"finalized":false,"reply":"stub cluster weather reply"}'
+        else
+            printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
+        fi
         if [ -n "$thread_key" ] && [ "${STUB_RETENTION_MESSAGE_EXIT:-0}" != "0" ]; then
             exit "$STUB_RETENTION_MESSAGE_EXIT"
         fi
@@ -2656,6 +2688,40 @@ case " $* " in
         esac
         ;;
 esac
+# Return the selected worker Deployment for the delivery budget read. The
+# controls vary the literal env entries while preserving the real Kubernetes
+# object shape consumed by the ladder.
+case "$*" in
+    *" -o json")
+        if [ "$matched_target" = 1 ]; then
+            python3 - "$worker" <<'PYWORKER'
+import json
+import os
+import sys
+
+worker = sys.argv[1]
+mode = os.environ.get("STUB_WORKER_ENV_MODE", "valid")
+budget = os.environ.get("STUB_DELIVERY_BUDGET_S", "600")
+env = []
+if mode == "budget_nonliteral":
+    env.append({"name": "CURIE_DELIVERY_BUDGET_S", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}})
+elif mode != "budget_absent":
+    env.append({"name": "CURIE_DELIVERY_BUDGET_S", "value": budget})
+if mode == "budget_duplicate":
+    env.append({"name": "CURIE_DELIVERY_BUDGET_S", "value": budget})
+print(json.dumps({
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {"name": worker},
+    "spec": {"template": {"spec": {"containers": [
+        {"name": "worker", "env": env},
+    ]}}},
+}, separators=(",", ":")))
+PYWORKER
+        fi
+        exit 0
+        ;;
+esac
 # Answer env probes only for the selected worker. A hardcoded curie probe must
 # not satisfy a nondefault control.
 case "$*" in
@@ -2830,7 +2896,11 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("STUB_UNKNOWN_TRACE_EXIT")
         .env_remove("STUB_UNKNOWN_TRACE_NO_FIX")
         .env_remove("STUB_RETENTION_CLAIM_MODE")
-        .env_remove("STUB_RETENTION_MESSAGE_EXIT");
+        .env_remove("STUB_RETENTION_MESSAGE_EXIT")
+        .env_remove("STUB_RETENTION_REPLY_FINALIZED")
+        .env_remove("STUB_EXPECT_REPLY_TIMEOUT_SECS")
+        .env_remove("STUB_WORKER_ENV_MODE")
+        .env_remove("STUB_DELIVERY_BUDGET_S");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -4188,6 +4258,98 @@ fn run_cluster_target_control(extra_envs: &[(&str, &str)]) -> (Output, String, S
     (output, invocations, kubectl)
 }
 
+fn cluster_message_invocations(invocations: &str) -> Vec<&str> {
+    invocations
+        .lines()
+        .filter(|line| {
+            line.starts_with("--json cluster message ")
+                || (line.starts_with("--json cluster --context ") && line.contains(" message "))
+        })
+        .collect()
+}
+
+#[test]
+fn cluster_ladder_uses_the_installed_worker_budget_for_both_messages() {
+    for (budget, expected) in [("600", "660"), ("900", "960")] {
+        let (output, invocations, kubectl) = run_cluster_target_control(&[
+            ("STUB_DELIVERY_BUDGET_S", budget),
+            ("STUB_EXPECT_REPLY_TIMEOUT_SECS", expected),
+        ]);
+        let output_transcript = transcript(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "worker budget {budget} plus observation headroom must pass the cluster ladder; transcript:\n{output_transcript}"
+        );
+        assert!(
+            output_transcript.contains(&format!(
+                "cluster: worker delivery budget {budget}s plus 60s reply observation headroom; waiting {expected}s"
+            )),
+            "the ladder must report the installed delivery budget and fixed observation headroom; transcript:\n{output_transcript}"
+        );
+        let messages = cluster_message_invocations(&invocations);
+        assert_eq!(
+            messages.len(),
+            2,
+            "the rung must make its two ordinary message calls exactly once each; invocations:\n{invocations}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|line| line.contains(&format!("--timeout-secs {expected}"))),
+            "both ordinary message calls must use the installed worker budget plus headroom {expected}; invocations:\n{invocations}"
+        );
+        assert_eq!(
+            kubectl
+                .lines()
+                .filter(|line| line.contains("deployment/curie-worker") && line.ends_with(" -o json"))
+                .count(),
+            1,
+            "the selected worker delivery budget must be resolved once before enqueue; kubectl invocations:\n{kubectl}"
+        );
+    }
+}
+
+#[test]
+fn cluster_ladder_rejects_invalid_worker_budgets_before_enqueue() {
+    let cases = [
+        ("budget_absent", "600", "absent budget"),
+        ("budget_duplicate", "600", "duplicate budget"),
+        ("budget_nonliteral", "600", "nonliteral budget"),
+        ("valid", "six hundred", "nonnumeric budget"),
+        ("valid", "59", "budget below minimum"),
+        ("valid", "1801", "budget above maximum"),
+    ];
+
+    for (mode, budget, label) in cases {
+        let (output, invocations, kubectl) = run_cluster_target_control(&[
+            ("STUB_WORKER_ENV_MODE", mode),
+            ("STUB_DELIVERY_BUDGET_S", budget),
+        ]);
+        let output_transcript = transcript(&output);
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "an {label} must fail the cluster ladder; transcript:\n{output_transcript}"
+        );
+        assert!(
+            cluster_message_invocations(&invocations).is_empty(),
+            "an {label} must fail before the first cluster message is enqueued; invocations:\n{invocations}"
+        );
+        assert!(
+            output_transcript.contains("curie-worker")
+                && output_transcript.contains("CURIE_DELIVERY_BUDGET_S"),
+            "an {label} failure must name the selected Deployment and offending delivery budget field; transcript:\n{output_transcript}"
+        );
+        assert!(
+            kubectl
+                .lines()
+                .any(|line| line.contains("deployment/curie-worker") && line.ends_with(" -o json")),
+            "an {label} control must inspect the selected worker Deployment JSON; kubectl invocations:\n{kubectl}"
+        );
+    }
+}
+
 fn cluster_verbs_carry_ns_rel(invocations: &str, namespace: &str, release: &str) -> bool {
     let ns_flag = format!("--namespace {namespace}");
     let rel_flag = format!("--release {release}");
@@ -4285,6 +4447,31 @@ fn cluster_ladder_accepts_a_finalized_retention_reply_despite_its_cli_exit_statu
 }
 
 #[test]
+fn cluster_ladder_still_rejects_a_nonfinal_retention_reply_after_a_valid_claim() {
+    let (output, invocations, kubectl) =
+        run_cluster_target_control(&[("STUB_RETENTION_REPLY_FINALIZED", "0")]);
+    let output_transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a timely worker claim must not make a nonfinal reply pass: {output_transcript}"
+    );
+    assert!(
+        output_transcript.contains("cluster: finalized=false status=not_finalized"),
+        "the existing finalized reply gate must reject the nonfinal retention payload: {output_transcript}"
+    );
+    assert_eq!(
+        cluster_message_invocations(&invocations).len(),
+        2,
+        "the nonfinal control must reach the post eval message without a retry: {invocations}"
+    );
+    assert!(
+        kubectl.contains(" logs ") && kubectl.contains("--timestamps"),
+        "the nonfinal reply must be judged after the exact worker claim proof: {kubectl}"
+    );
+}
+
+#[test]
 fn cluster_ladder_rejects_missing_or_unrelated_post_eval_worker_claims() {
     for mode in ["missing", "unrelated"] {
         let (output, invocations, kubectl) =
@@ -4307,7 +4494,7 @@ fn cluster_ladder_rejects_missing_or_unrelated_post_eval_worker_claims() {
             invocations.lines().any(|line| {
                 line.starts_with("--json cluster --context stub-context message ")
                     && line.contains("--thread ")
-                    && line.contains("--timeout-secs 300")
+                    && line.contains("--timeout-secs 660")
             }),
             "the negative must drive the real post-eval message caller: {invocations}"
         );
