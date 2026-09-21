@@ -175,7 +175,9 @@ in that same Secret. The public proposal must reflect this boundary.
 
 A custom connector is a bundle built HTTP MCP server, delivered through the
 existing digest lock from ADR 0113. Its provider credential stays outside the
-runner sandbox. The bundle owns the connector's deliberately limited tool
+runner sandbox. The sandbox must never receive or retrieve the provider
+credential, including access tokens, refresh tokens and client secrets.
+The bundle owns the connector's deliberately limited tool
 surface. Python and the MCP SDK are a reference implementation, not a language
 requirement. Prefer one connector per external system; split where credentials
 or authority must differ.
@@ -194,10 +196,10 @@ crash the server. The image must run under the rendered user and filesystem
 constraints. Use a declared scratch location and ensure container arguments
 select the intended process.
 
-### 2. Choose an explicit credential owner
+### 2. The connector owns its provider credential
 
-For providers served directly by the connector, credentials arrive by Secret
-reference. No credential value belongs in source, image layers, bundle
+For this custom connector shape, the connector owns its provider credential.
+Credentials arrive by Secret reference. No credential value belongs in source, image layers, bundle
 history, logs or errors. Static credentials, provider workload identity and
 externally managed access tokens do not require connector refresh storage.
 
@@ -272,7 +274,7 @@ image under ADRs 0087 and 0113.
 
 | Review question | Recommendation | What accepting this proposal means |
 | --- | --- | --- |
-| Is connector ownership a supported shape for a provider's rotating credential? | Yes, alongside an explicitly selected platform grant owner. | Adopt persistence before use and the single owner requirement without declaring either owner universal. |
+| Who owns the credential for this custom connector shape? | Confirmed by the maintainer on 2026-09-21: the connector owns it and the sandbox never has access. | Preserve persistence before use and one refresh owner. A separately selected platform grant service must also keep provider credentials out of the sandbox. |
 | How should the holder get Kubernetes authority? | Start with an explicit dedicated account reference and operator owned grants. | Require a separate frozen schema prerequisite and deployment ordering; do not approve automatic RBAC generation. |
 | Does declared provider reach become enforced policy? | Defer the field and enforcement mechanism together. | No `reaches` field or Egress NetworkPolicy is promised by this ADR. |
 | Does connector deployment supersede previous active agent deployments? | Decide in the deployment lifecycle work. | Connector holder exclusivity remains required; agent deployment row semantics do not change here. |
