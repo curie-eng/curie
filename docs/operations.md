@@ -82,8 +82,17 @@ Two things to know:
 ### `curie apply`
 
 Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
-`curie.yaml` and customize it. Credential fields contain credential names, not
-secret values.
+`curie.yaml` and customize it, or write the same starter from a released binary
+with `curie apply --init`. Credential fields contain credential names, not
+secret values. `install.context` (and `curie apply --context` / `curie diff
+--context`, which win over the file) selects the kube context; `curie diff`
+prints the cluster that context names. Shared-cluster singleton opt-outs are
+modeled as `platform.sandbox_controller` and `platform.priority_classes.platform`
+/ `sandbox`. `platform.gvisor` is `auto`, `require`, or `off` and controls
+runner kernel isolation, not those singletons. `set:` values are always strings;
+a boolean or null is refused and the error names the empty string form, except
+for keys that have a modeled field. The input schema is
+`curie schema-index curie-yaml`.
 Before either command, provide values for `ANTHROPIC_API_KEY`,
 `SLACK_APP_TOKEN`, and `SLACK_BOT_TOKEN` in the environment or store them with
 `curie secrets set <NAME>`.

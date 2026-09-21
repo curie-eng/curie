@@ -778,6 +778,7 @@ async fn apply_curie_platform(
         install: crate::installation::Install {
             namespace: identity.namespace.clone(),
             release: identity.release.clone(),
+            context: None,
         },
         platform: crate::installation::Platform::default(),
         credentials: crate::installation::Credentials::default(),
@@ -795,6 +796,7 @@ async fn apply_curie_platform(
     {
         crate::installation::ApplyOutput::DryRun(plan) => Ok(plan.lines),
         crate::installation::ApplyOutput::Applied { .. } => Ok(Vec::new()),
+        crate::installation::ApplyOutput::WroteStarter { .. } => Ok(Vec::new()),
     }
 }
 

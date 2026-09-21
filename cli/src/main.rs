@@ -794,13 +794,14 @@ enum Command {
     /// `dump-commands`.
     #[command(hide = true, alias = "dump-commands")]
     Schema,
-    /// Print the committed, versioned JSON Schemas for the `--json` result outputs.
+    /// Print the committed, versioned JSON Schemas for `--json` results and the
+    /// `curie.yaml` installation input (`curie-yaml`).
     ///
     /// With no NAME, emits the schema inventory index (`cli/schema/index.json`):
     /// every agent-facing result family, the schema file it maps to, and its
-    /// version. With a NAME (e.g. `kill`, or `kill.schema.json`), emits that
-    /// schema. The schemas are embedded in the binary, so this works from a
-    /// released `curie` with no source checkout (issue #634).
+    /// version. With a NAME (e.g. `kill`, or `kill.schema.json`, or
+    /// `curie-yaml`), emits that schema. The schemas are embedded in the binary,
+    /// so this works from a released `curie` with no source checkout (issue #634).
     SchemaIndex {
         /// The schema to print (short name like `kill`, or `kill.schema.json`).
         /// Omit to print the inventory index of all result schemas.
@@ -822,11 +823,24 @@ enum Command {
     /// the `--set`/`--reuse-values` shape kept producing.
     ///
     /// A worked common installation is available at `examples/curie.yaml` in
-    /// the Curie repository.
+    /// the Curie repository. A released binary writes the same starter with
+    /// `curie apply --init`.
     Apply {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
         file: std::path::PathBuf,
+        /// Write a starter `curie.yaml` from this binary and exit. Refuses to
+        /// overwrite an existing file.
+        #[arg(
+            long,
+            conflicts_with_all = ["dry_run", "chart", "migrate_store", "allow_stateful_removal", "context"]
+        )]
+        init: bool,
+        /// Kubernetes context for every helm and kubectl call. Wins over
+        /// `install.context` in the file. Defaults to the kubeconfig
+        /// current-context, which is resolved once and pinned.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
         /// Print the plan without touching the cluster.
         #[arg(long)]
         dry_run: bool,
@@ -885,6 +899,11 @@ enum Command {
     ///
     /// Read-only. Safe to run anywhere, including against production.
     Doctor {
+        /// Kubernetes context for every helm and kubectl call. Wins over
+        /// `install.context` in `curie.yaml`. Defaults to the kubeconfig
+        /// current-context, which is resolved once and pinned.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
         /// Kubernetes namespace to inspect. Defaults to `curie.yaml`'s `install:`
         /// block when one is present in this directory, otherwise `curie`.
         #[arg(long)]
@@ -913,6 +932,12 @@ enum Command {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
         file: std::path::PathBuf,
+        /// Kubernetes context for every helm and kubectl call. Wins over
+        /// `install.context` in the file. Defaults to the kubeconfig
+        /// current-context, which is resolved once and pinned. Diff prints the
+        /// cluster this context names.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
         /// Chart reference override, as `cluster up` takes. Diff RENDERS this
         /// chart to detect stateful components the apply would delete, so point
         /// it at the same chart `curie apply --chart` would use.
@@ -5604,12 +5629,31 @@ async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Guide) => curie::guide::run(),
         Some(Command::Apply {
             file,
+            init,
+            context,
             dry_run,
             chart,
             migrate_store,
             allow_stateful_removal,
         }) => {
+            if init {
+                curie::installation::write_starter(&file)?;
+                return emit(curie::installation::ApplyOutput::WroteStarter {
+                    path: file.display().to_string(),
+                });
+            }
             let cfg = curie::installation::Installation::load(&file)?;
+            if let Some(target) =
+                curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
+                    context.as_deref(),
+                    cfg.install.context.as_deref(),
+                ))?
+            {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
+            }
             let local = curie::installation::plan_installation(cfg, dry_run)?;
             let resolved = artifacts::resolve_chart(
                 chart.as_deref(),
@@ -5648,6 +5692,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             .await?,
         ),
         Some(Command::Doctor {
+            context,
             namespace,
             release,
             api_url,
@@ -5678,6 +5723,19 @@ async fn run(command: Option<Command>) -> Result<()> {
                          falling back to the {defaults}"
                     ));
                 }
+            }
+            if let Some(target) =
+                curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
+                    context.as_deref(),
+                    declared
+                        .as_ref()
+                        .and_then(|cfg| cfg.install.context.as_deref()),
+                ))?
+            {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
             }
             let target = curie::doctor::resolve_target(
                 namespace.as_deref(),
@@ -5724,8 +5782,27 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             emit(out)
         }
-        Some(Command::Diff { file, chart }) => {
+        Some(Command::Diff {
+            file,
+            context,
+            chart,
+        }) => {
             let cfg = curie::installation::Installation::load(&file)?;
+            let cluster = match curie::kube_context::pin_for_cluster_command(
+                curie::installation::resolve_context(
+                    context.as_deref(),
+                    cfg.install.context.as_deref(),
+                ),
+            )? {
+                Some(target) => {
+                    ui::ui().note(&format!(
+                        "Kubernetes context: {} (cluster {})",
+                        target.context, target.cluster
+                    ));
+                    Some(target.cluster).filter(|name| !name.is_empty())
+                }
+                None => None,
+            };
             // Lenient on purpose: `diff` mutates nothing, so a credential it
             // cannot resolve must not withhold the answer. See
             // installation::resolve_credentials_lenient.
@@ -5763,6 +5840,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 curie::installation::diff(curie::installation::DiffOpts {
                     local,
                     unresolved_credentials: missing,
+                    cluster,
                     chart,
                     chart_target,
                 })

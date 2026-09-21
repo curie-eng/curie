@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/diff/v2.2.json",
+  "$id": "https://schemas.curietech.ai/cli/diff/v2.3.json",
   "title": "curie diff --json",
   "description": "The agent facing payload of `curie diff`: every chart value the effective installation plan and the live release disagree about, plus the values the release carries that the plan does not declare. Read only. Available credentials and provider addresses are resolved to construct the same plan used by apply. Comparisons that depend on an unavailable declared credential are marked unknown. No cluster state is mutated. Secret values are rendered as the literal string `<secret>` and never in the clear.",
   "type": "object",
@@ -11,6 +11,13 @@
     },
     "release": {
       "type": "string"
+    },
+    "cluster": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The Kubernetes cluster the pinned context points at. Null when no context could be resolved. THIS CLI always emits the key, as a string or as null; the property is left out of the top level required list so a consumer pinned to the previous $id still validates (adding it required would be a MAJOR bump)."
     },
     "release_exists": {
       "type": "boolean",
