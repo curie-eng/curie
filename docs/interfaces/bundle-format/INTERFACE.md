@@ -324,24 +324,41 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   runs at deploy, but no runtime scheduler/ingress consumes a declared trigger yet (Epic #29).
 - `toolPolicy` (`{enforcement, allow, approvalRequired, deny}` glob collections over canonical
   `"<server>/<tool>"` MCP tool names,
-  `packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) is **declaration-only and
-  fenced as such**. Precedence is by class — `deny` > `approvalRequired` > `allow` — and an
+  `packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) is **declared at deploy and
+  enforced at runtime** (#2119): both of the runner's interception points, the SDK permission
+  callback and the PreToolUse hook, take the policy decision through the one shared
+  `runner/src/curie_runner/approval.py::_decide_gate`. Precedence is by class — `deny` >
+  `approvalRequired` > `allow` — and an
   unmatched tool is DENIED, so server tool-surface drift fails closed. The grammar and pattern
   rules live in one shared module, `packages/plugin-format/src/plugin_format/tool_policy.py`, so
-  the deploy validator and the future runtime loader normalize identically — the #453/#544 lesson
+  the deploy validator and the runtime loader normalize identically — the #453/#544 lesson
   that normalizing separately silently disagrees and ships a fail-open. The deploy validator
   (`packages/plugin-format/src/plugin_format/validate.py::_validate_tool_policy`) calls that
   module's `check_policy_patterns` / `validate_pattern` (grammar, duplicates, cross-collection
   conflicts) and `literal_server_segment` (the declared-server cross-check) today; it never
   classifies a live tool, because at deploy time there is no live tool surface to classify.
   `packages/plugin-format/src/plugin_format/tool_policy.py::classify_tool`, the precedence ladder that turns a policy plus a runtime tool
-  name into allow/approval-required/deny, belongs to the not-yet-built runtime enforcement lane —
+  name into allow/approval-required/deny, belongs to the runtime enforcement lane —
   the deploy validator does not call it. Because a declared-but-unenforced restriction is worse
   than no restriction, `validate_bundle`
   takes an `enforces_tool_policy` handshake argument and REFUSES a policy-bearing bundle from any
   caller that does not name `curie/mcp-tool-policy@1`; `load_tool_policy` raises rather than
-  returning a policy such a caller would not apply. Runtime enforcement is a separate **blocking**
-  follow-up, and no bundle may ship a `toolPolicy` until it lands.
+  returning a policy such a caller would not apply.
+  **Curie's own platform-owned MCP servers, `curie` and `curie-state`, are outside `toolPolicy`
+  scope entirely** (#2286, ADR-0139). A bundle cannot declare them as connectors
+  (`packages/plugin-format/src/plugin_format/connectors.py::RESERVED_CONNECTOR_NAMES`), so it
+  cannot express a policy over them, and the runtime exempts them by server through
+  `runner/src/curie_runner/approval.py::platform_server_for_tool` before `classify_tool` is ever
+  consulted. A policy therefore cannot remove the approval, publication or channel-memory paths,
+  and a literal pattern naming one of those servers that the bundle does not declare is a
+  deploy-time error (`tool_policy.platform_server`). The cost, stated rather than hidden: a bundle
+  cannot restrict its agent's use of those tools either, so `deny: ["curie-state/delete"]` is
+  inexpressible and would be inert. ADR-0139 is the authority for accepting that, since bundle
+  configuration may add restrictions but may not hollow out operator or platform controls, and the
+  same predicate decides both directions; platform-scope patterns for an operator-level need would
+  be new semantics and belong to a future `@2` enforcement id. A bundle's own plugin-mounted
+  `mcpServers` entry named `curie` is a different server, carries the `plugin_<bundle>_` infix in
+  its live names, and stays fully in scope.
 
 Their validators live alongside the others in `validate.py` (`triggers.*` / `approval_policy.*` /
 `tool_policy.*` error codes).

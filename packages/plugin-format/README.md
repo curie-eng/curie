@@ -122,7 +122,15 @@ Pydantic models mirroring the Claude Code shapes:
     a typo would become permission *widening*), an unsupported `enforcement` id,
     a malformed pattern, a pattern repeated within one collection, the identical
     pattern string in two collections, and a literal server segment naming a
-    server the bundle declares in neither `mcpServers` nor `connectors.yaml`.
+    server the bundle declares in neither `mcpServers` nor `connectors.yaml`
+    (`tool_policy.unknown_server`). When that undeclared segment names one of
+    Curie's own platform owned servers (`connectors.RESERVED_CONNECTOR_NAMES`,
+    today `curie` and `curie-state`) the code is `tool_policy.platform_server`
+    instead: those servers are outside `toolPolicy` scope, so the pattern is
+    inert and the generic advice to declare it is a dead end, because a
+    connector may not take a reserved name. A bundle that DOES declare its own
+    plugin-mounted `mcpServers` entry by one of those names is unaffected and
+    keeps full policy scope over it.
     Overlapping but *different* globs are legal and resolve by precedence. A
     policy with all three collections empty warns (`tool_policy.denies_everything`)
     but still validates: it denies everything, which is coherent.
@@ -159,7 +167,8 @@ Error codes include `bundle.missing`, `manifest.missing`,
 `tool_policy.unenforced`, `tool_policy.invalid`,
 `tool_policy.enforcement_unsupported`, `tool_policy.pattern_invalid`,
 `tool_policy.pattern_duplicate`, `tool_policy.pattern_conflict`,
-`tool_policy.unknown_server`, `scripts.not_a_directory`.
+`tool_policy.unknown_server`, `tool_policy.platform_server`,
+`scripts.not_a_directory`.
 
 `tool_policy.denies_everything` is the one **warning** code in this list, not an
 error: it reports a declared policy whose three collections are all empty, which

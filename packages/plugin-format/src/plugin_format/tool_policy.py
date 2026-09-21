@@ -20,6 +20,26 @@ live form would repeat the #453/#1495 authoring trap in a place where the failur
 is a silent permission GRANT rather than a silent missed approval. Mapping
 canonical -> live SDK name is the runtime lane's job and is out of scope here.
 
+**Curie's own platform-owned servers are outside this policy's scope** (#2286,
+ADR-0139). ``curie`` (approval and publication) and ``curie-state`` (ADR-0095
+channel memory) are mounted by the runner, and ``connectors.py`` refuses those
+names to a bundle connector (``RESERVED_CONNECTOR_NAMES``), so a canonical name
+naming one can never be a rule this package would have anything to classify. A
+runtime that does enforce a policy therefore exempts them by SERVER before it
+consults the precedence ladder, and ``validate.py`` reports
+``tool_policy.platform_server`` for such a pattern rather than the
+declare-the-server advice it gives for a typo. The cost is stated rather than
+hidden: a bundle cannot restrict its agent's use of those tools either, so
+``deny: ["curie-state/delete"]`` is inexpressible and would be inert. ADR-0139
+is the authority for accepting it, since bundle configuration may add
+restrictions but may not hollow out operator or platform controls, and the two
+directions are the same predicate. An operator-level need for platform-scope
+patterns would be new semantics, so it belongs to a future ``@2`` contract id,
+not to a relaxation of this one. Note that a bundle MAY still declare a
+plugin-mounted ``mcpServers`` entry of its own called ``curie``: its live names
+carry the ``plugin_<bundle>_`` infix, it is not the platform server, and it
+stays fully in scope.
+
 **Declaration-only today.** Nothing in this repository enforces a ``toolPolicy``
 at runtime yet. ``load_tool_policy`` refuses to hand a policy to a caller that
 does not name ``TOOL_POLICY_ENFORCEMENT``, and ``validate_bundle`` REJECTS a

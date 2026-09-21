@@ -76,6 +76,14 @@ in code now:
   including an unknown or unreachable surface) and no permission gate already pages.
   An explicit `approvalPolicy` or `toolPolicy.approvalRequired` gate is already a pager;
   keeping `request_approval` beside it raises a second card for the same action (#2657).
+  A `toolPolicy` can never take the pager itself away: `mcp__curie__request_approval`,
+  publication, and the `curie-state` channel-memory tools are platform owned and outside
+  `toolPolicy` scope, exempted by server in
+  `runner/src/curie_runner/approval.py::platform_server_for_tool` before the policy is
+  classified at all (#2286, ADR-0139). The same rule costs a bundle the ability to restrict
+  those tools, which ADR-0139 accepts: bundle configuration may add restrictions but may not
+  hollow out platform controls. Outside policy scope is not permission to run, so an operator
+  gate naming one of these tools still blocks it.
   A surface with no MCP tools or only explicitly read-only tools and no grantable
   policy route carries no generic pager, because approval cannot unlock an action it
   cannot perform. `readOnlyHint` is not authorization and does not change gates

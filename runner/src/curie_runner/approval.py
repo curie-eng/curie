@@ -72,6 +72,8 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .state import STATE_SERVER_NAME
+
 logger = logging.getLogger(__name__)
 
 # Best-effort only (#712): NOT authoritative, NOT used for any gating
@@ -221,6 +223,30 @@ APPROVAL_SERVER_NAME = "curie"
 _TOOL_NAME = "request_approval"
 # The fully qualified tool identifier as it appears on ToolUseBlock.name.
 APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
+
+# Curie's own platform-owned MCP servers, enumerated ONCE (#2286). The runner
+# mounts both itself and a bundle cannot declare either: plugin_format's
+# ``connectors.RESERVED_CONNECTOR_NAMES`` refuses the names at deploy, so a
+# bundle can never express a toolPolicy over them. ADR-0139 settles what that
+# means -- bundle configuration may add restrictions but may not hollow out
+# operator or platform controls -- so these servers are outside toolPolicy
+# scope entirely rather than classified against a policy they cannot appear in.
+#
+# A SERVER set, not a list of tool names, and that distinction is the bug this
+# constant fixes. Two exact names were exempted when publication landed, which
+# left every tool the platform added afterwards falling through to the
+# unmatched-is-DENY default: all five ADR-0095 channel-memory tools were told
+# they were forbidden by the bundle's own policy. Enumerating names again would
+# reopen it the next time a platform server grows a tool.
+#
+# Direction of truth: RESERVED_CONNECTOR_NAMES in plugin_format is the source
+# (runner depends on plugin_format and never the reverse) and this mirrors it.
+# runner/tests/test_connectors.py pins both against the set actually mounted at
+# boot, because two constants can agree with each other and still be wrong
+# about what the boot mounted.
+PLATFORM_MCP_SERVER_NAMES: frozenset[str] = frozenset(
+    {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+)
 
 # Platform-owned remote-development publication gate.  This is deliberately
 # mounted beside the policy tool rather than shipped by a bundle: a bundle is
@@ -838,15 +864,59 @@ def canonical_tool_name(
     return None
 
 
+def platform_server_for_tool(live_tool_name: str) -> str | None:
+    """The platform server owning a live SDK name, or ``None`` (#2286).
+
+    Curie's own servers mount bare on ``ClaudeAgentOptions.mcp_servers``, with
+    no ``plugin_<bundle>_`` infix, so their live names are built by the SAME
+    ``connector_tool_prefix`` a connector uses -- imported rather than spelled
+    here, for the #453/#1495 anti-drift reason: a prefix this module invents
+    could stop matching the one the SDK produces and the exemption would
+    silently arm nothing.
+
+    Ownership is the WHOLE ``mcp__<server>__`` prefix with a non-empty tool
+    remainder, matching ``canonical_tool_name``'s contract, and that precision
+    is load bearing in both directions. A substring or bare
+    ``startswith("mcp__curie")`` check would hand a bundle a policy bypass:
+    ``mcp__plugin_<bundle>_curie__x`` is a bundle's own plugin-mounted server
+    and must stay fully inside policy scope, and so must an undeclared
+    ``mcp__curie-stat__get``. A bare ``mcp__curie__`` with nothing after it is
+    not a tool call either, so it returns ``None`` and falls through to the
+    fail-closed default.
+
+    Longest server name first, the same tie rule ``canonical_tool_name`` uses:
+    ``curie`` is a proper prefix of ``curie-state``, so an arbitrary iteration
+    order would attribute ``mcp__curie-state__get`` to ``curie`` and leave a
+    remainder that is not a tool name.
+    """
+
+    if not is_mcp_tool(live_tool_name):
+        return None
+    for server in sorted(PLATFORM_MCP_SERVER_NAMES, key=lambda name: (-len(name), name)):
+        prefix = connector_tool_prefix(server)
+        if live_tool_name.startswith(prefix) and len(live_tool_name) > len(prefix):
+            return server
+    return None
+
+
 def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecision | None:
     """Classify one live tool, preserving built-ins outside MCP policy."""
 
     if gate.tool_policy is None or not is_mcp_tool(tool_name):
         return None
-    # These exact tools belong to the platform-owned approval server, not to
-    # the bundle or one of its connectors.  Leave them to their existing
-    # permission/in-process gates; every other MCP name remains fail-closed.
-    if tool_name == APPROVAL_TOOL_NAME or tool_name == PLATFORM_PUBLISH_TOOL_NAME:
+    # Curie's own platform-owned servers are outside toolPolicy scope entirely
+    # (ADR-0139, #2286): a bundle cannot declare them, so it cannot express a
+    # policy over them, and per that ADR bundle configuration may not hollow
+    # out a platform control. Leave every tool on them to its existing
+    # permission/in-process gate. Taken BEFORE classify_tool deliberately: a
+    # wildcarded server segment such as `deny: ["*/get"]` is the one pattern
+    # shape the deploy validator never cross-checks, and returning here is what
+    # makes it inert rather than a way to fence the approval path.
+    #
+    # Outside policy scope is not permission to run. Returning None means the
+    # policy has no opinion; `_decide_gate` still applies gate.required, the
+    # operator gates, and the publication special case below.
+    if platform_server_for_tool(tool_name) is not None:
         return None
     canonical = canonical_tool_name(
         tool_name,
@@ -854,6 +924,13 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
         mcp_servers=gate.mcp_servers,
         connector_servers=gate.connector_servers,
     )
+    # LOAD BEARING, do not relax (#2119, #453/#544). An MCP name that maps to no
+    # declared server is refused, not waved through: this unmatched-is-DENY
+    # default is the property that actually defends the surface, and the
+    # exemption above widened what precedes it. Turning this into `return None`
+    # is the fail-open, and it is what
+    # test_a_tool_from_an_undeclared_server_is_refused_at_both_interception_points
+    # exists to redden.
     if canonical is None:
         return ToolPolicyDecision.DENY
     return classify_tool(gate.tool_policy, canonical)
