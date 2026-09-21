@@ -937,9 +937,9 @@
     {
       "id": "bundle-example",
       "type": "code",
-      "title": "Bundle manifest example",
-      "path": "bundles/curie.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/cc5019504be48fca0ecae824d8b7d91a33c1715d/bundles/curie.yaml"
+      "title": "Example bundle manifest",
+      "path": "examples/sre-bot/.claude-plugin/plugin.json",
+      "href": "https://github.com/curie-eng/curie/blob/cc5019504be48fca0ecae824d8b7d91a33c1715d/examples/sre-bot/.claude-plugin/plugin.json"
     }
   ],
   "documentationDrift": [
