@@ -5,7 +5,9 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next, "task/**"]
-    types: [opened, synchronize, reopened, edited]
+    # Commit events only. A title or body edit must not cancel an in-flight
+    # run and restart kind shards. Body-edit guards live in their own workflows.
+    types: [opened, synchronize, reopened]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
 # stacking. Keyed per workflow+ref: each PR branch and main have independent
@@ -446,6 +448,8 @@ jobs:
   rust-build:
     name: Build the curie release binary
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true' }}
     defaults:
       run:
         working-directory: cli
@@ -471,6 +475,8 @@ jobs:
   cli-portability:
     name: CLI runs on old glibc (and publishes per-commit binaries)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.cli_release == 'true' }}
     # The release cross-compile path was never exercised before a tag, so a
     # regression in it was undiscoverable until someone tried the artifact on a
     # real host. #1341 shipped exactly that way: both Linux targets inherited
@@ -552,6 +558,8 @@ jobs:
   cli-darwin:
     name: CLI builds for macOS (the fourth release target)
     runs-on: macos-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.cli_release == 'true' }}
     # `aarch64-apple-darwin` ships in the release matrix (release.yaml) and was
     # compiled for the FIRST TIME when a tag was pushed. Anything that breaks it
     # -- a dependency that does not build on macOS, a `cfg(unix)` assumption that
@@ -727,6 +735,8 @@ jobs:
   images:
     name: Build ${{ matrix.name }} image (no push)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -820,6 +830,8 @@ jobs:
   worker-local-image:
     name: Build worker-local overlay image (no push)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -860,6 +872,8 @@ jobs:
   dispatcher-image-smoke:
     name: Dispatcher image imports resolve
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -898,6 +912,8 @@ jobs:
   mail-adapter-image-smoke:
     name: Mail adapter image imports resolve
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -932,6 +948,8 @@ jobs:
   ui-image-smoke:
     name: UI image response headers are correct
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1242,6 +1260,8 @@ jobs:
   repo-toolchain-proof:
     name: Repository toolchain proof (runner image)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     env:
       CURIE_REPO_TOOLCHAIN_PROOF: required
     steps:
@@ -1320,7 +1340,8 @@ jobs:
   eval-falsifiability:
     name: Eval falsifiability gate (fake model, offline)
     runs-on: ubuntu-latest
-    needs: rust-build
+    needs: [rust-build, changes]
+    if: ${{ needs.changes.outputs.skill == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1760,6 +1781,8 @@ jobs:
       cluster: ${{ steps.filter.outputs.cluster }}
       released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
+      images: ${{ steps.filter.outputs.images }}
+      cli_release: ${{ steps.filter.outputs.cli_release }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -2696,9 +2719,9 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
 
-  # The upgrade matrix runs on every PR as independent shards (issue #2733).
-  # The script owns the shard list and its --self-test proves every scenario
-  # is assigned to exactly one shard, so CI never hardcodes shard ids.
+  # The upgrade matrix is sharded (issue #2733) and change-selected with
+  # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 14 kind
+  # runners. The shard lister stays on every PR so coverage cannot drift.
   e2e-cluster-upgrade-matrix-shards:
     name: E2E cluster upgrade matrix shards
     runs-on: ubuntu-latest
@@ -2727,9 +2750,11 @@ jobs:
     name: E2E cluster upgrade matrix (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [rust-build, e2e-cluster-upgrade-matrix-shards]
+    needs: [rust-build, changes, e2e-cluster-upgrade-matrix-shards]
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}
     steps:
@@ -2937,9 +2962,9 @@ jobs:
           if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
             released_upgrade_expected="success"
           fi
-          # Required on every PR, not change-selected. A matrix job reports
-          # success only when every shard succeeded.
-          upgrade_matrix_expected="success"
+          # Same selector as released-upgrade: a matrix job reports success
+          # only when every selected shard succeeded, and skipped otherwise.
+          upgrade_matrix_expected="$released_upgrade_expected"
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
@@ -2982,7 +3007,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Assert upgrade matrix wall clock
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py

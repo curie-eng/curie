@@ -770,12 +770,11 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     assert isinstance(pull_request, dict), "CI must run for pull requests"
     actions = pull_request.get("types")
     assert isinstance(actions, list), "CI must declare its pull request actions"
-    assert len(actions) == 4 and set(actions) == {
+    assert len(actions) == 3 and set(actions) == {
         "opened",
         "synchronize",
         "reopened",
-        "edited",
-    }, "CI must rerun required checks when code or the pull request body changes"
+    }, "CI must rerun required checks on new commits, not on title or body edits"
 
     job, steps = _python_job(document)
     assert job.get("name") == "Python (ruff + mypy + pytest)"

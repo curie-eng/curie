@@ -82,7 +82,23 @@ def _invoke_selector(
     return completed, output
 
 
-def _expected_output(*selected: str, pytest_needed: bool = True) -> str:
+def _path_needs_images(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    if path in {"uv.lock", "pyproject.toml"} or name in {"uv.lock", "pyproject.toml"}:
+        return True
+    return "Dockerfile" in name or name.endswith(".dockerfile")
+
+
+def _path_needs_cli_release(path: str) -> bool:
+    return path == "cli" or path.startswith("cli/")
+
+
+def _expected_output(
+    *selected: str,
+    pytest_needed: bool = True,
+    images_needed: bool = False,
+    cli_release_needed: bool = False,
+) -> str:
     selected_tiers = set(selected)
     lines = [
         f"{OUTPUT_KEYS[tier]}={'true' if tier in selected_tiers else 'false'}"
@@ -91,6 +107,8 @@ def _expected_output(*selected: str, pytest_needed: bool = True) -> str:
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected_tiers)
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
+    lines.append(f"images={'true' if images_needed else 'false'}")
+    lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -100,10 +118,21 @@ def _assert_selection(
     selected: tuple[str, ...],
     *,
     pytest_needed: bool = True,
+    images_needed: bool | None = None,
+    cli_release_needed: bool | None = None,
 ) -> None:
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
-    assert output == _expected_output(*selected, pytest_needed=pytest_needed)
+    assert output == _expected_output(
+        *selected,
+        pytest_needed=pytest_needed,
+        images_needed=_path_needs_images(path) if images_needed is None else images_needed,
+        cli_release_needed=(
+            _path_needs_cli_release(path)
+            if cli_release_needed is None
+            else cli_release_needed
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -118,6 +147,8 @@ def _assert_selection(
         ("otel/collector.yaml", ("local", "local-release")),
         ("cli/example.rs", BASE_TIERS),
         ("cli/src/main.rs", BASE_TIERS),
+        ("cli/src/ops/upgrade.rs", TIERS),
+        ("cli/scripts/cluster-upgrade-matrix.sh", TIERS),
         ("packages/example.py", BASE_TIERS),
         ("packages/aci-protocol/src/aci_protocol/wire.py", BASE_TIERS),
         ("packages/plugin-format/src/plugin_format/manifest.py", BASE_TIERS),
@@ -141,8 +172,19 @@ def test_registry_maps_each_known_surface(
         "tools/e2e-ci-selection/select_tiers.py",
     ],
 )
-def test_enforcement_paths_select_every_tier(tmp_path: Path, path: str) -> None:
-    _assert_selection(tmp_path, path, TIERS)
+def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str) -> None:
+    _assert_selection(tmp_path, path, (), pytest_needed=True)
+
+
+def test_ui_dockerfile_selects_images_without_e2e(tmp_path: Path) -> None:
+    _assert_selection(
+        tmp_path,
+        "apps/ui/Dockerfile",
+        (),
+        pytest_needed=True,
+        images_needed=True,
+        cli_release_needed=False,
+    )
 
 
 def test_weather_fixture_does_not_select_released_upgrade(tmp_path: Path) -> None:
@@ -159,6 +201,10 @@ def test_weather_fixture_does_not_select_released_upgrade(tmp_path: Path) -> Non
         "apps/worker/src/curie_worker/approval_cards.py",
         "apps/worker/src/curie_worker/consumer_liveness.py",
         "apps/worker/src/curie_worker/workspace.py",
+        "cli/src/ops/upgrade.rs",
+        "cli/src/ops/convergence.rs",
+        "cli/scripts/cluster-upgrade-matrix.sh",
+        "cli/tests/data/upgrade-driver.py",
     ],
 )
 def test_released_upgrade_selects_upgrade_state_owners(
@@ -178,6 +224,7 @@ def test_released_upgrade_selects_upgrade_state_owners(
         "apps/worker/src/curie_worker/binding.py",
         "apps/worker/src/curie_worker/state/config.py",
         "apps/ui/src/main.tsx",
+        "cli/src/main.rs",
         "docs/guides/getting-started.md",
     ],
 )
@@ -211,7 +258,9 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
         ("scripts/README.md", False),
         ("scripts/check-docs.sh", False),
         ("scripts/check-pr-body.sh", False),
-        (".github/workflows/pr-body.yaml", False),
+        (".github/workflows/pr-body.yaml", True),
+        ("release/authorize.py", True),
+        ("runner/tests/test_repo_toolchain_proof_ci.py", True),
         ("packages/test-support/src/curie_test_support/valkey.py", True),
         ("examples/coder/evals/cases.json", False),
     ],
@@ -238,9 +287,6 @@ def test_charts_curie_still_selects_cluster(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("path", "selected"),
     [
-        (".github/e2e-selection.yaml", TIERS),
-        (".github/workflows/ci.yaml", TIERS),
-        (".github/workflows/README.md", BASE_TIERS),
         (".github/action.yml", BASE_TIERS),
         ("apps/api/README.md", ("local", "local-release", "cluster")),
         ("apps/api/runtime-config.yaml", ("local", "local-release", "cluster")),
@@ -299,7 +345,9 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
 def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
     completed, output = _invoke_selector(tmp_path, push=True)
     assert completed.returncode == 0, completed.stderr
-    assert output == _expected_output(*TIERS)
+    assert output == _expected_output(
+        *TIERS, images_needed=True, cli_release_needed=True
+    )
 
 
 def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> None:
@@ -478,6 +526,8 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "cluster": "${{ steps.filter.outputs.cluster }}",
         "released_upgrade": "${{ steps.filter.outputs.released_upgrade }}",
         "skill_local_tiers": "${{ steps.filter.outputs.skill_local_tiers }}",
+        "images": "${{ steps.filter.outputs.images }}",
+        "cli_release": "${{ steps.filter.outputs.cli_release }}",
     }
 
     skill_local = jobs["e2e-ladder"]
@@ -510,8 +560,24 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert set(jobs["e2e-released-upgrade-negative"]["needs"]) == set(
         jobs["e2e-released-upgrade"]["needs"]
     )
-    assert "if" not in jobs["e2e-cluster-upgrade-matrix"]
+    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == (
+        jobs["e2e-released-upgrade"]["if"]
+    )
     assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
+    assert jobs["images"]["if"] == "${{ needs.changes.outputs.images == 'true' }}"
+    assert jobs["worker-local-image"]["if"] == jobs["images"]["if"]
+    assert jobs["dispatcher-image-smoke"]["if"] == jobs["images"]["if"]
+    assert jobs["mail-adapter-image-smoke"]["if"] == jobs["images"]["if"]
+    assert jobs["ui-image-smoke"]["if"] == jobs["images"]["if"]
+    assert jobs["repo-toolchain-proof"]["if"] == jobs["images"]["if"]
+    assert jobs["cli-portability"]["if"] == (
+        "${{ needs.changes.outputs.cli_release == 'true' }}"
+    )
+    assert jobs["cli-darwin"]["if"] == jobs["cli-portability"]["if"]
+    assert "changes" in jobs["rust-build"]["needs"]
+    assert jobs["eval-falsifiability"]["if"] == (
+        "${{ needs.changes.outputs.skill == 'true' }}"
+    )
 
 
 def test_upgrade_matrix_shards_job_gates_coverage_and_lists_shards() -> None:
@@ -534,10 +600,15 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     needs = job["needs"]
     if isinstance(needs, str):
         needs = [needs]
-    assert set(needs) == {"rust-build", "e2e-cluster-upgrade-matrix-shards"}
-    assert "if" not in job
+    assert set(needs) == {
+        "rust-build",
+        "changes",
+        "e2e-cluster-upgrade-matrix-shards",
+    }
+    assert job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     assert job["timeout-minutes"] == 45
     assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["max-parallel"] == 4
     assert job["strategy"]["matrix"] == {
         "shard": (
             "${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}"
@@ -1049,7 +1120,7 @@ def _run_aggregate(
         "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "skipped",
         "upgrade_matrix_shards_result": "success",
-        "upgrade_matrix_result": "success",
+        "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
     environment = os.environ.copy()
@@ -1075,6 +1146,8 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
         local_selected=outputs["local"],
         local_release_selected=outputs["local_release"],
         cluster_selected=outputs["cluster"],
+        released_upgrade_selected=outputs["released_upgrade"],
+        upgrade_matrix_result="skipped",
     )
     assert skipped.returncode == 0, skipped.stdout + skipped.stderr
 
@@ -1083,6 +1156,7 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
         local_selected=outputs["local"],
         local_release_selected=outputs["local_release"],
         cluster_selected=outputs["cluster"],
+        released_upgrade_selected=outputs["released_upgrade"],
         skill_local_result="success",
     )
     assert unexpected_result.returncode != 0
@@ -1107,6 +1181,7 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
             "released_upgrade_selected": "true",
             "released_upgrade_result": "success",
             "released_upgrade_negative_result": "success",
+            "upgrade_matrix_result": "success",
         },
     ],
 )
@@ -1115,10 +1190,28 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_aggregate_requires_upgrade_matrix_success_on_every_pr() -> None:
-    ok = _run_aggregate(upgrade_matrix_result="success")
+def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -> None:
+    ok = _run_aggregate(
+        released_upgrade_selected="true",
+        released_upgrade_result="success",
+        released_upgrade_negative_result="success",
+        upgrade_matrix_result="success",
+    )
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in ("skipped", "failure", "cancelled"):
+        rejected = _run_aggregate(
+            released_upgrade_selected="true",
+            released_upgrade_result="success",
+            released_upgrade_negative_result="success",
+            upgrade_matrix_result=result,
+        )
+        assert rejected.returncode != 0, result
+
+
+def test_aggregate_requires_upgrade_matrix_skip_when_released_upgrade_is_not_selected() -> None:
+    ok = _run_aggregate(upgrade_matrix_result="skipped")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    for result in ("success", "failure", "cancelled"):
         rejected = _run_aggregate(upgrade_matrix_result=result)
         assert rejected.returncode != 0, result
 
@@ -1141,7 +1234,7 @@ def test_aggregate_requires_upgrade_matrix_shards_success(result: str) -> None:
         {"skill_local_result": "success"},
         {"local_release_result": "success"},
         {"cluster_result": "success"},
-        {"upgrade_matrix_result": "skipped"},
+        {"upgrade_matrix_result": "success"},
         {"upgrade_matrix_result": "failure"},
         {"released_upgrade_negative_result": "success"},
         {
