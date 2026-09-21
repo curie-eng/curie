@@ -96,7 +96,11 @@ def step_seconds(job: Mapping[str, Any], step_name: str) -> int | None:
 
 
 def is_shard_job(name: object) -> bool:
-    return isinstance(name, str) and name.startswith(SHARD_PREFIX) and name.endswith(")")
+    if not (isinstance(name, str) and name.startswith(SHARD_PREFIX) and name.endswith(")")):
+        return False
+    shard = name[len(SHARD_PREFIX) : -1]
+    # A skipped matrix job keeps the unexpanded GitHub expression as its name.
+    return "${{" not in shard and "matrix." not in shard
 
 
 def shard_id(name: str) -> str:
