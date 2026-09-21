@@ -16,9 +16,13 @@ so the bundle's policy has nothing to classify them against and the fail-closed
 default refuses them. The agent then sees its own channel memory and its own
 approval path answer "denied by this agent's tool policy, do not retry". That
 is a refusal with no audience, over a capability the bundle never governed. These
-tests pin the scope rule (ADR-0139): platform-owned servers are outside a
-bundle's `toolPolicy`, decided by the SERVER, never by a list of tool names, and
-the deny-by-default that defends every genuinely undeclared server stays.
+tests pin the scope rule (ADR-0139): the tools those servers publish are outside
+a bundle's `toolPolicy`, decided by EXACT published tool name and only for a
+server this session actually mounted, and the deny-by-default that defends every
+genuinely undeclared server stays. Matching the `mcp__<server>__` prefix instead
+was the first attempt, and it exempted every tool of any server merely keyed
+`curie__...`, which is the bypass `test_an_ambient_server_keyed_onto_a_platform_prefix_is_refused`
+now holds shut.
 """
 
 from collections.abc import AsyncIterator

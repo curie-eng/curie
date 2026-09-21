@@ -72,7 +72,7 @@ from plugin_format import (
     resolve_manifest,
 )
 
-from .state import STATE_SERVER_NAME, STATE_TOOL_NAMES
+from .state import STATE_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -224,27 +224,21 @@ _TOOL_NAME = "request_approval"
 # The fully qualified tool identifier as it appears on ToolUseBlock.name.
 APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 
-# Curie's own platform-owned MCP servers, enumerated ONCE (#2286). The runner
-# mounts both itself and a bundle cannot declare either: plugin_format's
-# ``connectors.RESERVED_CONNECTOR_NAMES`` refuses the names at deploy, so a
-# bundle can never express a toolPolicy over them. ADR-0139 settles what that
-# means -- bundle configuration may add restrictions but may not hollow out
-# operator or platform controls -- so the tools these servers publish are
-# outside toolPolicy scope entirely rather than classified against a policy they
-# cannot appear in.
+# Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
+# (#2286). The runner mounts both itself and a bundle cannot declare either:
+# plugin_format's ``connectors.RESERVED_CONNECTOR_NAMES`` refuses the names at
+# deploy, so a bundle can never express a toolPolicy over them. ADR-0139 settles
+# what that means -- bundle configuration may add restrictions but may not
+# hollow out operator or platform controls -- so the tools these servers publish
+# are outside toolPolicy scope entirely rather than classified against a policy
+# they cannot appear in.
 #
-# Direction of truth: RESERVED_CONNECTOR_NAMES in plugin_format is the source
-# (runner depends on plugin_format and never the reverse) and this mirrors it.
-# runner/tests/test_connectors.py pins both against the set actually mounted at
-# boot, because two constants can agree with each other and still be wrong
-# about what the boot mounted.
-#
-# This set names SERVERS and is used for the deploy-side mirror pin only. The
-# runtime exemption is decided on exact live TOOL names below, never on this
-# set: see ``is_platform_owned_tool``.
-PLATFORM_MCP_SERVER_NAMES: frozenset[str] = frozenset(
-    {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
-)
+# There is deliberately NO server-set constant here. RESERVED_CONNECTOR_NAMES is
+# the one list of these names (runner depends on plugin_format and never the
+# reverse), and a mirror of it in this module would be a second copy that only a
+# test ever read. The runtime exemption is decided on exact live TOOL names, not
+# on a server set: see ``is_platform_owned_tool``, which is where the first
+# #2286 fix went wrong by matching the server prefix instead.
 
 # The live tool names the ``curie`` server publishes, enumerated from the two
 # constants that already own them rather than respelled: ``APPROVAL_TOOL_NAME``

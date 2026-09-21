@@ -398,9 +398,11 @@ def build_runner(
     # passed to ``build_approval_gate`` deliberately: the gate is built above at
     # the three fail-closed approval boot checks, which must raise before any
     # other boot work happens, and hoisting ``resolve_state_client`` above them
-    # would reorder the boot to suit a field. One expression decides both the
-    # fact and the mount below (``state_client is not None``), so the exemption
-    # and the mount cannot disagree.
+    # would reorder the boot to suit a field. Both this flag and the conditional
+    # mount below read the same ``state_client`` local, which nothing rebinds in
+    # between, so the exemption and the mount cannot disagree. The mount keeps
+    # its own ``is not None`` because ``build_state_server`` needs the narrowed
+    # client, not the bool.
     state_mounted = state_client is not None
     if approval_gate is not None:
         approval_gate.state_server_mounted = state_mounted
