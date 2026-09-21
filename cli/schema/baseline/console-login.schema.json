@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/console-login/v1.json",
+  "title": "curie <tier> console login --json",
+  "description": "The agent-facing payload of `curie <tier> console login`: the dry-run plan, or a minted single-use login code, when it stops being redeemable, and where to spend it. Never the platform key, which is used here and does not leave the CLI (ADR-0083).",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Single-use and short-lived. Copied into one browser, once."
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "console_url": {
+          "type": "string",
+          "description": "Where to spend the code."
+        }
+      },
+      "required": [
+        "code",
+        "expires_at",
+        "console_url"
+      ]
+    }
+  ]
+}
