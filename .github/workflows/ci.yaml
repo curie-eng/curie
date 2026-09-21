@@ -448,6 +448,8 @@ jobs:
   rust-build:
     name: Build the curie release binary
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true' }}
     defaults:
       run:
         working-directory: cli
@@ -473,6 +475,8 @@ jobs:
   cli-portability:
     name: CLI runs on old glibc (and publishes per-commit binaries)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.cli_release == 'true' }}
     # The release cross-compile path was never exercised before a tag, so a
     # regression in it was undiscoverable until someone tried the artifact on a
     # real host. #1341 shipped exactly that way: both Linux targets inherited
@@ -554,6 +558,8 @@ jobs:
   cli-darwin:
     name: CLI builds for macOS (the fourth release target)
     runs-on: macos-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.cli_release == 'true' }}
     # `aarch64-apple-darwin` ships in the release matrix (release.yaml) and was
     # compiled for the FIRST TIME when a tag was pushed. Anything that breaks it
     # -- a dependency that does not build on macOS, a `cfg(unix)` assumption that
@@ -729,6 +735,8 @@ jobs:
   images:
     name: Build ${{ matrix.name }} image (no push)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -822,6 +830,8 @@ jobs:
   worker-local-image:
     name: Build worker-local overlay image (no push)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -862,6 +872,8 @@ jobs:
   dispatcher-image-smoke:
     name: Dispatcher image imports resolve
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -900,6 +912,8 @@ jobs:
   mail-adapter-image-smoke:
     name: Mail adapter image imports resolve
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -934,6 +948,8 @@ jobs:
   ui-image-smoke:
     name: UI image response headers are correct
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1244,6 +1260,8 @@ jobs:
   repo-toolchain-proof:
     name: Repository toolchain proof (runner image)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     env:
       CURIE_REPO_TOOLCHAIN_PROOF: required
     steps:
@@ -1322,7 +1340,8 @@ jobs:
   eval-falsifiability:
     name: Eval falsifiability gate (fake model, offline)
     runs-on: ubuntu-latest
-    needs: rust-build
+    needs: [rust-build, changes]
+    if: ${{ needs.changes.outputs.skill == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1762,6 +1781,8 @@ jobs:
       cluster: ${{ steps.filter.outputs.cluster }}
       released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
+      images: ${{ steps.filter.outputs.images }}
+      cli_release: ${{ steps.filter.outputs.cli_release }}
     steps:
       - uses: actions/checkout@v7
         with:
