@@ -99,11 +99,11 @@
       "schema_head": "0044"
     },
     "0.10.0": {
-      "schema_min": "0046",
+      "schema_min": "0044",
       "schema_head": "0046"
     },
     "0.10.1": {
-      "schema_min": "0046",
+      "schema_min": "0044",
       "schema_head": "0046"
     }
   }

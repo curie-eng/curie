@@ -521,3 +521,7 @@ def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(
     assert handle.get("endpoint") is None
     assert handle.get("adapter") is None
 
+
+def test_suite_create_app_does_not_start_the_work_item_reconciler(client: Any) -> None:
+    assert client.app.state.work_item_reconciler_task is None
+

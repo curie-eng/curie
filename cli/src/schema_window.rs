@@ -352,7 +352,7 @@ mod tests {
     fn packaged_n_and_n1_share_this_tree_head_so_rollback_is_compatible() {
         let n = window_for("0.10.0").expect("0.10.0 is catalogued for the next train matrix");
         let n1 = window_for("0.10.1").expect("0.10.1 is catalogued for the next train matrix");
-        assert_eq!(n.schema_min, "0046");
+        assert_eq!(n.schema_min, "0044");
         assert_eq!(n.schema_head, "0046");
         assert_eq!(n.schema_min, n1.schema_min);
         assert_eq!(n.schema_head, n1.schema_head);

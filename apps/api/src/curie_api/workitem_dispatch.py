@@ -377,13 +377,9 @@ def _generation_refusal(generation: int, dispatch_generation: int) -> RefusalCod
     return "not_dispatchable"
 
 
-async def acquire(
-    session: AsyncSession,
-    request_id: uuid.UUID,
-    *,
-    owner: str,
-    generation: int,
-) -> AcquireGrant | DispatchConflict:
+async def _lock_pair(
+    session: AsyncSession, request_id: uuid.UUID
+) -> tuple[WorkItem, ExecutionRequest] | DispatchConflict:
     found = await session.scalar(
         select(ExecutionRequest).where(ExecutionRequest.id == request_id)
     )
@@ -399,6 +395,20 @@ async def acquire(
         return await _refuse(
             session, "not_found", work_item_id=work_item.id, request_id=request_id
         )
+    return work_item, request
+
+
+async def acquire(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    owner: str,
+    generation: int,
+) -> AcquireGrant | DispatchConflict:
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
     if work_item.cancelled_at is not None:
         return await _refuse(
             session,
@@ -585,21 +595,10 @@ async def start(
     claim_name: str,
     sandbox_name: str,
 ) -> StartResult | DispatchConflict:
-    found = await session.scalar(
-        select(ExecutionRequest).where(ExecutionRequest.id == request_id)
-    )
-    if found is None:
-        return await _refuse(session, "not_found", request_id=request_id)
-    work_item = await _lock_work_item(session, found.work_item_id)
-    if work_item is None:
-        return await _refuse(session, "not_found", request_id=request_id)
-    request = await _lock_request(
-        session, work_item_id=work_item.id, request_id=request_id
-    )
-    if request is None:
-        return await _refuse(
-            session, "not_found", work_item_id=work_item.id, request_id=request_id
-        )
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
     now = await _database_now(session)
     if (
         request.acquire_owner != owner
@@ -664,8 +663,6 @@ def _map_start_conflict(result: WorkItemConflict) -> RefusalCode:
         "waiting_deadline_elapsed",
     }:
         return cast(RefusalCode, result.code)
-    if result.code == "illegal_transition":
-        return "not_dispatchable"
     return "not_dispatchable"
 
 
@@ -689,10 +686,9 @@ async def heartbeat(
             request_id=request.id,
             status=request.status,
         )
-    now = await session.scalar(select(func.clock_timestamp()))
+    now = await _database_now(session)
     if (
         request.runtime_heartbeat_expires_at is not None
-        and now is not None
         and now >= request.runtime_heartbeat_expires_at
     ):
         return await _refuse(
@@ -743,8 +739,6 @@ def _map_finish_conflict(
         if request.terminal_cause == "issue_cancelled":
             return "work_item_cancelled"
         return "not_running"
-    if result.code in {"illegal_transition", "execution_deadline_elapsed"}:
-        return "not_running"
     return "not_running"
 
 
@@ -756,21 +750,10 @@ async def finish(
     outcome: Literal["completed", "failed"],
     cause: str,
 ) -> WorkItemOutcome | DispatchConflict:
-    found = await session.scalar(
-        select(ExecutionRequest).where(ExecutionRequest.id == request_id)
-    )
-    if found is None:
-        return await _refuse(session, "not_found", request_id=request_id)
-    work_item = await _lock_work_item(session, found.work_item_id)
-    if work_item is None:
-        return await _refuse(session, "not_found", request_id=request_id)
-    request = await _lock_request(
-        session, work_item_id=work_item.id, request_id=request_id
-    )
-    if request is None:
-        return await _refuse(
-            session, "not_found", work_item_id=work_item.id, request_id=request_id
-        )
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
     if request.runtime_epoch != runtime_epoch:
         return await _refuse(
             session,
@@ -779,10 +762,9 @@ async def finish(
             request_id=request.id,
             status=request.status,
         )
-    now = await session.scalar(select(func.clock_timestamp()))
+    now = await _database_now(session)
     if (
         request.runtime_heartbeat_expires_at is not None
-        and now is not None
         and now >= request.runtime_heartbeat_expires_at
     ):
         return await _refuse(
@@ -868,21 +850,10 @@ async def record_termination(
     runtime_epoch: int,
     observation: str,
 ) -> WorkItemOutcome | DispatchConflict:
-    found = await session.scalar(
-        select(ExecutionRequest).where(ExecutionRequest.id == request_id)
-    )
-    if found is None:
-        return await _refuse(session, "not_found", request_id=request_id)
-    work_item = await _lock_work_item(session, found.work_item_id)
-    if work_item is None:
-        return await _refuse(session, "not_found", request_id=request_id)
-    request = await _lock_request(
-        session, work_item_id=work_item.id, request_id=request_id
-    )
-    if request is None:
-        return await _refuse(
-            session, "not_found", work_item_id=work_item.id, request_id=request_id
-        )
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
     if request.runtime_epoch != runtime_epoch:
         return await _refuse(
             session,

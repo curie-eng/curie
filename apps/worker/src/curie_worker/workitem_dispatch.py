@@ -135,16 +135,11 @@ def _conflict_code(response: httpx.Response) -> str:
         return "conflict"
     if not isinstance(body, dict):
         return "conflict"
-    code = body.get("code")
-    if isinstance(code, str) and code:
-        return code
     detail = body.get("detail")
     if isinstance(detail, dict):
         nested = detail.get("code")
         if isinstance(nested, str) and nested:
             return nested
-    if isinstance(detail, str) and detail:
-        return detail
     return "conflict"
 
 
