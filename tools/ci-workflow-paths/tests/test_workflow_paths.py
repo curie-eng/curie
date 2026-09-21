@@ -586,6 +586,28 @@ def _pull_request_body_workflow_steps() -> list[dict[str, Any]]:
     return [step for step in steps if isinstance(step, dict)]
 
 
+def test_ci_workflow_runs_on_commits_not_body_edits() -> None:
+    """A title or body edit must not cancel and restart the heavy CI graph.
+
+    `synchronize` is the new-commit event. `edited` belongs to pr-body.yaml
+    and p0-closes.yaml, which are cheap and must keep seeing body-only changes.
+    """
+    workflow = _load_workflows()["ci.yaml"]
+    trigger = workflow.get(True, workflow.get("on"))
+    assert isinstance(trigger, dict), "ci.yaml must declare an `on:` mapping"
+    pull_request = trigger.get("pull_request")
+    assert isinstance(pull_request, dict), "ci.yaml must configure pull_request events"
+    assert set(pull_request.get("types") or []) == {
+        "opened",
+        "reopened",
+        "synchronize",
+    }, (
+        "ci.yaml must run on opened, reopened, and synchronize only. "
+        "`edited` retriggers kind shards on a title or body change."
+    )
+    assert "edited" not in (pull_request.get("types") or [])
+
+
 def test_pr_body_guard_workflow_handles_body_only_pull_request_edits() -> None:
     """Pin #1713's runner wiring over the real workflow GitHub executes.
 

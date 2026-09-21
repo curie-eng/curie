@@ -118,6 +118,8 @@ def _assert_selection(
         ("otel/collector.yaml", ("local", "local-release")),
         ("cli/example.rs", BASE_TIERS),
         ("cli/src/main.rs", BASE_TIERS),
+        ("cli/src/ops/upgrade.rs", TIERS),
+        ("cli/scripts/cluster-upgrade-matrix.sh", TIERS),
         ("packages/example.py", BASE_TIERS),
         ("packages/aci-protocol/src/aci_protocol/wire.py", BASE_TIERS),
         ("packages/plugin-format/src/plugin_format/manifest.py", BASE_TIERS),
@@ -159,6 +161,10 @@ def test_weather_fixture_does_not_select_released_upgrade(tmp_path: Path) -> Non
         "apps/worker/src/curie_worker/approval_cards.py",
         "apps/worker/src/curie_worker/consumer_liveness.py",
         "apps/worker/src/curie_worker/workspace.py",
+        "cli/src/ops/upgrade.rs",
+        "cli/src/ops/convergence.rs",
+        "cli/scripts/cluster-upgrade-matrix.sh",
+        "cli/tests/data/upgrade-driver.py",
     ],
 )
 def test_released_upgrade_selects_upgrade_state_owners(
@@ -178,6 +184,7 @@ def test_released_upgrade_selects_upgrade_state_owners(
         "apps/worker/src/curie_worker/binding.py",
         "apps/worker/src/curie_worker/state/config.py",
         "apps/ui/src/main.tsx",
+        "cli/src/main.rs",
         "docs/guides/getting-started.md",
     ],
 )
@@ -510,7 +517,9 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert set(jobs["e2e-released-upgrade-negative"]["needs"]) == set(
         jobs["e2e-released-upgrade"]["needs"]
     )
-    assert "if" not in jobs["e2e-cluster-upgrade-matrix"]
+    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == (
+        jobs["e2e-released-upgrade"]["if"]
+    )
     assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
 
 
@@ -534,10 +543,15 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     needs = job["needs"]
     if isinstance(needs, str):
         needs = [needs]
-    assert set(needs) == {"rust-build", "e2e-cluster-upgrade-matrix-shards"}
-    assert "if" not in job
+    assert set(needs) == {
+        "rust-build",
+        "changes",
+        "e2e-cluster-upgrade-matrix-shards",
+    }
+    assert job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     assert job["timeout-minutes"] == 45
     assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["max-parallel"] == 4
     assert job["strategy"]["matrix"] == {
         "shard": (
             "${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}"
@@ -1049,7 +1063,7 @@ def _run_aggregate(
         "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "skipped",
         "upgrade_matrix_shards_result": "success",
-        "upgrade_matrix_result": "success",
+        "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
     environment = os.environ.copy()
@@ -1075,6 +1089,8 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
         local_selected=outputs["local"],
         local_release_selected=outputs["local_release"],
         cluster_selected=outputs["cluster"],
+        released_upgrade_selected=outputs["released_upgrade"],
+        upgrade_matrix_result="skipped",
     )
     assert skipped.returncode == 0, skipped.stdout + skipped.stderr
 
@@ -1083,6 +1099,7 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
         local_selected=outputs["local"],
         local_release_selected=outputs["local_release"],
         cluster_selected=outputs["cluster"],
+        released_upgrade_selected=outputs["released_upgrade"],
         skill_local_result="success",
     )
     assert unexpected_result.returncode != 0
@@ -1107,6 +1124,7 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
             "released_upgrade_selected": "true",
             "released_upgrade_result": "success",
             "released_upgrade_negative_result": "success",
+            "upgrade_matrix_result": "success",
         },
     ],
 )
@@ -1115,10 +1133,28 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_aggregate_requires_upgrade_matrix_success_on_every_pr() -> None:
-    ok = _run_aggregate(upgrade_matrix_result="success")
+def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -> None:
+    ok = _run_aggregate(
+        released_upgrade_selected="true",
+        released_upgrade_result="success",
+        released_upgrade_negative_result="success",
+        upgrade_matrix_result="success",
+    )
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in ("skipped", "failure", "cancelled"):
+        rejected = _run_aggregate(
+            released_upgrade_selected="true",
+            released_upgrade_result="success",
+            released_upgrade_negative_result="success",
+            upgrade_matrix_result=result,
+        )
+        assert rejected.returncode != 0, result
+
+
+def test_aggregate_requires_upgrade_matrix_skip_when_released_upgrade_is_not_selected() -> None:
+    ok = _run_aggregate(upgrade_matrix_result="skipped")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    for result in ("success", "failure", "cancelled"):
         rejected = _run_aggregate(upgrade_matrix_result=result)
         assert rejected.returncode != 0, result
 
@@ -1141,7 +1177,7 @@ def test_aggregate_requires_upgrade_matrix_shards_success(result: str) -> None:
         {"skill_local_result": "success"},
         {"local_release_result": "success"},
         {"cluster_result": "success"},
-        {"upgrade_matrix_result": "skipped"},
+        {"upgrade_matrix_result": "success"},
         {"upgrade_matrix_result": "failure"},
         {"released_upgrade_negative_result": "success"},
         {
