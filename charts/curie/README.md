@@ -448,8 +448,16 @@ default or mounts a named same-namespace single-writer Filesystem `existingClaim
 with exactly one `ReadWriteOnce` or `ReadWriteOncePod` access mode. Its
 root filesystem remains read-only; only the state mount and an `emptyDir` at
 `/tmp` are writable. Enabling it also requires an explicit
-`mailAdapter.agentmail.httpsCidrs` list. One egress-only NetworkPolicy then
-allows DNS, this release's API pods, those provider/proxy CIDRs on TCP 443, and
+`mailAdapter.agentmail.httpsCidrs` list, or `mailAdapter.agentmail.egressMode=publicHttps`.
+AgentMail is fronted by CloudFront, so `/32` pins resolved from `api.agentmail.to`
+break when CloudFront moves the name (#2824): use published CloudFront ranges, a
+controlled proxy, or `publicHttps`, which allows TCP 443 to any public address with
+private, loopback, link-local, CGNAT, documentation, multicast and reserved ranges
+denied (public-space pod, Service or node ranges must be added to
+`mailAdapter.agentmail.publicHttpsExcept`). The trade-off is that this pod can then
+reach any public HTTPS host. One egress-only NetworkPolicy then
+allows DNS, this release's API pods, those provider/proxy CIDRs (or public
+addresses) on TCP 443, and
 -- when the release exports to its own in-chart collector -- that Collector on
 its gRPC and HTTP ports, or else the required `mailAdapter.otelEgress.httpsCidrs`
 peers for an external collector, so the adapter's OTLP export is not dropped by

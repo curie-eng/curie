@@ -601,6 +601,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/mail-adapter-wiring-assertions.sh
 
+      # Prove the mail adapter's egress survives a CDN move (issue #2824): the
+      # default cidrs render is unchanged, egressMode=publicHttps admits public
+      # TCP 443 with internal ranges excepted and hands the adapter no pin list,
+      # and keys the chosen mode would ignore refuse the render.
+      - name: helm render assertions (mail adapter CDN egress)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/mail-adapter-cdn-egress-assertions.sh
+
       # Prove the tenant capacity ceiling (issue #758, ADR-0059 decision 4): the
       # ResourceQuota scopes to the sandbox PriorityClass with the published
       # (overridable) hard ceilings, the LimitRange ships safe default-only

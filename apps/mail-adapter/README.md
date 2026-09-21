@@ -149,6 +149,12 @@ addresses, and fails the call (status 0) when nothing admitted is available. Onl
 the dialed IP changes: TLS still verifies the certificate against the URL
 hostname. Platform API calls are never pinned.
 
+Pinning cannot help once every configured `/32` has gone stale: CloudFront moves
+`api.agentmail.to` between edges, and a pin list resolved at install time
+eventually admits no live edge (#2824). Configure published provider ranges, or
+`mailAdapter.agentmail.egressMode=publicHttps`, which leaves this variable empty;
+see the mail adapter section of `docs/operations.md`.
+
 Every discovery pass that does not return 200 extends the current failure run;
 a 200 clears it. `/statusz` reports `discovery` as `ok`, `failing`, or
 `unreachable` with the failure count and duration. Once the run exceeds
