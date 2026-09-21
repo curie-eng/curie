@@ -128,7 +128,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0096 | [A third-party port adapter is a deployed service, not a loaded plugin](0096-port-adapters-are-deployed-services.md) | Accepted |
 | 0097 | [One file declares an installation](0097-one-file-declares-an-installation.md) | Accepted |
 | 0098 | [Thinking depth is an operator knob, never a bundle one](0098-thinking-depth-is-an-operator-knob-never-a-bundle-one.md) | Accepted |
-| 0099 | [Hooks are bundle-declared turns the system starts](0099-hooks-are-bundle-declared-turns-the-system-starts.md) | Draft |
+| 0099 | [Hooks are bundle-declared turns the system starts](0099-hooks-are-bundle-declared-turns-the-system-starts.md) | Accepted |
 | 0100 | [Agents search their own surface through the channel port](0100-agents-search-their-own-surface-through-the-channel-port.md) | Draft |
 | 0101 | [Closed schemas version on every change: minor for optional, major for required](0101-schema-compatibility-for-closed-schemas.md) | Accepted |
 | 0102 | [Accepted alongside implementation with explicit approval](0102-accepted-alongside-implementation-with-explicit-approval.md) | Accepted |
