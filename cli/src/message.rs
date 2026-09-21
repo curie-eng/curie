@@ -498,7 +498,15 @@ fn save_turn_context(
 
 fn persist_and_hint(opts: &MessageOpts, verb: TurnVerb, channel: &str, thread_ts: &str) {
     let ui = crate::ui::ui();
-    let verb_str = format!("{} message", tier_str(verb));
+    let verb_str = match verb {
+        TurnVerb::Local => format!("{} message", tier_str(verb)),
+        TurnVerb::Cluster => format!(
+            "{} message --namespace {} --release {}",
+            tier_str(verb),
+            crate::ops::shell_quote(&opts.namespace),
+            crate::ops::shell_quote(&opts.release),
+        ),
+    };
     match save_turn_context(opts, verb, channel, thread_ts) {
         Ok(()) => ui.note(&continue_hint_line(&verb_str)),
         Err(err) => {
@@ -4732,6 +4740,144 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PERSIST_HINT_DRIVER: &str = "CURIE_TEST_PERSIST_HINT_DRIVER";
+
+    fn capture_persist_hint(mode: &str) -> std::process::Output {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--exact",
+                "message::tests::persist_and_hint_subprocess_driver",
+                "--nocapture",
+            ])
+            .env(PERSIST_HINT_DRIVER, mode)
+            .env("NO_COLOR", "1")
+            .env("CI", "1")
+            .current_dir(dir.path())
+            .output()
+            .expect("run hint driver")
+    }
+
+    fn captured_stderr(output: &std::process::Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    #[test]
+    fn persist_and_hint_subprocess_driver() {
+        let Ok(mode) = std::env::var(PERSIST_HINT_DRIVER) else {
+            return;
+        };
+        let mut opts = MessageOpts::default();
+        match mode.as_str() {
+            "cluster-short" => {
+                opts.namespace = "acme-platform".into();
+                opts.release = "acme-prod".into();
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
+            }
+            "cluster-fallback" => {
+                opts.namespace = "acme-platform".into();
+                opts.release = "acme-prod".into();
+                std::fs::write(".curie", "blocks the state directory")
+                    .expect("create state obstruction");
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
+            }
+            "cluster-default" => {
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100")
+            }
+            "cluster-default-fallback" => {
+                std::fs::write(
+                    "curie.yaml",
+                    "version: 1\ninstall:\n  namespace: acme-platform\n  release: acme-prod\n",
+                )
+                .expect("write conflicting installation file");
+                std::fs::write(".curie", "blocks the state directory")
+                    .expect("create state obstruction");
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
+            }
+            "local" => {
+                opts.namespace = "must-not-appear".into();
+                opts.release = "must-not-appear".into();
+                persist_and_hint(&opts, TurnVerb::Local, "C0EXAMPLE1", "1700000000.000100");
+            }
+            other => panic!("unknown hint driver mode {other}"),
+        }
+    }
+
+    #[test]
+    fn cluster_continue_hint_carries_a_nondefault_target() {
+        let output = capture_persist_hint("cluster-short");
+        let text = captured_stderr(&output);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("curie cluster message"), "{text}");
+        assert!(
+            text.contains("--namespace") && text.contains("acme-platform"),
+            "{text}"
+        );
+        assert!(
+            text.contains("--release") && text.contains("acme-prod"),
+            "{text}"
+        );
+        assert!(text.contains("--continue"), "{text}");
+    }
+
+    #[test]
+    fn cluster_fallback_hint_carries_a_nondefault_target() {
+        let output = capture_persist_hint("cluster-fallback");
+        let text = captured_stderr(&output);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("could not save turn context"), "{text}");
+        assert!(text.contains("curie cluster message"), "{text}");
+        assert!(
+            text.contains("--namespace") && text.contains("acme-platform"),
+            "{text}"
+        );
+        assert!(
+            text.contains("--release") && text.contains("acme-prod"),
+            "{text}"
+        );
+        assert!(
+            text.contains("--channel") && text.contains("C0EXAMPLE1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("--thread") && text.contains("1700000000.000100"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn default_cluster_hint_carries_both_target_flags() {
+        let output = capture_persist_hint("cluster-default");
+        let text = captured_stderr(&output);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("--namespace curie"), "{text}");
+        assert!(text.contains("--release curie"), "{text}");
+        assert!(text.contains("--continue"), "{text}");
+    }
+
+    #[test]
+    fn default_cluster_fallback_hint_cannot_redirect_to_the_file_target() {
+        let output = capture_persist_hint("cluster-default-fallback");
+        let text = captured_stderr(&output);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("could not save turn context"), "{text}");
+        assert!(text.contains("--namespace curie"), "{text}");
+        assert!(text.contains("--release curie"), "{text}");
+        assert!(!text.contains("acme-platform"), "{text}");
+        assert!(!text.contains("acme-prod"), "{text}");
+        assert!(!text.contains("--continue"), "{text}");
+    }
+
+    #[test]
+    fn local_hint_does_not_carry_cluster_target_flags() {
+        let output = capture_persist_hint("local");
+        let text = captured_stderr(&output);
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("--namespace"), "{text}");
+        assert!(!text.contains("--release"), "{text}");
+        assert!(!text.contains("must-not-appear"), "{text}");
+    }
 
     const EXPECTED_OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
         "OTEL_EXPORTER_OTLP_ENDPOINT",
