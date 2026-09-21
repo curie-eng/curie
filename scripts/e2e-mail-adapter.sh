@@ -218,6 +218,62 @@ api_post /channels/token "$TMP/token-request.json" "$TMP/token-response.json"
 json_field "$TMP/token-response.json" token >"$TOKEN_FILE"
 [[ -s "$TOKEN_FILE" ]] || fail "channel token mint returned no token"
 
+banner "Prove a private peer is reachable before mail policy selection"
+python3 - "$TMP/private-peer.json" "$NAMESPACE" <<'PY'
+import json, sys
+
+peer = {
+    "apiVersion": "v1", "kind": "Pod",
+    "metadata": {
+        "name": "mail-egress-private-peer", "namespace": sys.argv[2],
+        "labels": {"app": "mail-egress-private-peer"},
+    },
+    "spec": {
+        "automountServiceAccountToken": False,
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "peer", "image": "hashicorp/http-echo:1.0.0",
+            "args": ["-listen=:8080", "-text=private-peer"],
+            "ports": [{"containerPort": 8080}],
+        }],
+    },
+}
+service = {
+    "apiVersion": "v1", "kind": "Service",
+    "metadata": {"name": "mail-egress-private-peer", "namespace": sys.argv[2]},
+    "spec": {
+        "selector": {"app": "mail-egress-private-peer"},
+        "ports": [{"name": "https", "port": 443, "targetPort": 8080}],
+    },
+}
+json.dump({"apiVersion": "v1", "kind": "List", "items": [peer, service]}, open(sys.argv[1], "w"))
+PY
+kubectl --context "$CONTEXT" apply -n "$NAMESPACE" -f "$TMP/private-peer.json" >/dev/null
+kubectl --context "$CONTEXT" wait -n "$NAMESPACE" --for=condition=Ready \
+  pod/mail-egress-private-peer --timeout=3m >/dev/null
+PRIVATE_PEER_IP="$(kubectl --context "$CONTEXT" get service mail-egress-private-peer -n "$NAMESPACE" \
+  -o jsonpath='{.spec.clusterIP}')"
+PRIVATE_PEER_URL="$(python3 - "$PRIVATE_PEER_IP" <<'PY'
+import ipaddress, sys
+
+address = ipaddress.ip_address(sys.argv[1])
+if not address.is_private:
+    raise SystemExit(f"private peer Service ClusterIP is not private: {address}")
+host = f"[{address}]" if address.version == 6 else str(address)
+print(f"http://{host}:443")
+PY
+)" || fail "private peer Service ClusterIP is not private"
+kubectl --context "$CONTEXT" run -n "$NAMESPACE" mail-egress-control \
+  --image=curlimages/curl:8.12.1 --restart=Never \
+  --overrides='{"spec":{"automountServiceAccountToken":false}}' \
+  --command -- sleep 600 >/dev/null
+kubectl --context "$CONTEXT" wait -n "$NAMESPACE" --for=condition=Ready \
+  pod/mail-egress-control --timeout=3m >/dev/null
+kubectl --context "$CONTEXT" exec -n "$NAMESPACE" mail-egress-control -- \
+  curl --silent --fail --output /dev/null --connect-timeout 5 --max-time 10 \
+  "$PRIVATE_PEER_URL" \
+  || fail "private TCP 443 peer was not reachable before mail policy selection"
+
 banner "Enable the candidate mail adapter on durable RWO state"
 write_values true "$TOKEN_FILE"
 helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" \
@@ -255,11 +311,15 @@ kubectl --context "$CONTEXT" wait -n "$NAMESPACE" --for=condition=Ready \
   pod/mail-egress-probe --timeout=3m >/dev/null
 kubectl --context "$CONTEXT" exec -n "$NAMESPACE" mail-egress-probe -- \
   curl --silent --output /dev/null --connect-timeout 5 https://api.agentmail.to/v0/inboxes \
-  || fail "mail NetworkPolicy blocked its configured AgentMail HTTPS CIDRs"
+  || fail "mail NetworkPolicy blocked AgentMail public HTTPS egress"
 if kubectl --context "$CONTEXT" exec -n "$NAMESPACE" mail-egress-probe -- \
-  curl --silent --output /dev/null --connect-timeout 5 https://example.com; then
-  fail "mail NetworkPolicy permitted a non-configured HTTPS destination"
+  curl --silent --output /dev/null --connect-timeout 5 --max-time 5 "$PRIVATE_PEER_URL"; then
+  fail "mail NetworkPolicy permitted the private TCP 443 peer"
+else
+  private_peer_status=$?
 fi
+[[ "$private_peer_status" -eq 28 ]] \
+  || fail "mail NetworkPolicy private peer curl exited $private_peer_status, expected 28"
 python3 - "$TMP/mail-deployment.json" <<'PY'
 import json, sys
 pod = json.load(open(sys.argv[1]))["spec"]["template"]["spec"]
