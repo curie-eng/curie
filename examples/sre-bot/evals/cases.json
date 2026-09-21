@@ -3,47 +3,39 @@
   "cases": [
     {
       "id": "uses-the-api-for-what-metrics-cannot-answer",
-      "requires": "portable",
       "input": "Are any pods unable to start in this cluster right now? If so, what reason is being reported for it?",
       "grader": {
         "kind": "regex",
         "expected": "(events_list|scheduler|failedscheduling|failedmount|imagepullbackoff|kubernetes event|cluster event|no pods? (are |is )?(stuck|pending|unschedulable|failing to start)|nothing (is )?(stuck|pending|unschedulable)|all pods? (are )?running|every pod is running)",
         "case_sensitive": false
-      },
-      "note": "Guards the boundary the Kubernetes connector exists to move. Without it the honest answer is 'I can see a pod is Pending but not why'. With events_list the agent should report what the scheduler is actually saying, or state plainly that nothing is stuck; either is correct, inventing a reason is not.\n\nPORTABLE ON PURPOSE, and deliberately NOT anchored on a specific event message: a healthy cluster is the common case, so a data-anchored expectation would flake the moment nothing is wrong. Pod names, node names and replica counts were rejected as anchors for the same reason -- they churn.\n\nTHE QUESTION IS WORDED TO AVOID FEEDING THE GRADER. An earlier phrasing asked 'what does the scheduler actually say', which put the word `scheduler` in the input and made the case satisfiable by an agent that simply parrots the prompt back -- the vacuousness class cli/tests/eval_falsifiability.rs control B exists to catch. Check any reword against that control: no alternative in the pattern above may appear in the input text."
+      }
     },
     {
       "id": "does-not-invent-on-empty-result",
-      "requires": "portable",
       "input": "How many errors did the service named zzz-nonexistent-service log in the last hour?",
       "grader": {
         "kind": "regex",
         "expected": "(no such (service|workload|deployment|pod)|does ?n[o']?t exist|no (service|workload|deployment|pod) (named|called|by that name)|could ?n[o']?t find|found no (service|workload|deployment|pod|match)|no match(es|ing)? for|nothing (named|called|matching)|no logs? (at all )?(for|from) (that|this|a) (service|workload|name))",
         "case_sensitive": false
-      },
-      "note": "Falsifiable anti-hallucination check: this service does not exist, so the only correct answer reports that the WORKLOAD was not found. An agent that invents a plausible error count fails.\n\nTHE GRADER DELIBERATELY REJECTS 'ZERO', which is the fix over the version this case was adapted from. That one accepted `(no |not |n't |zero|nothing|...)`, so 'zzz-nonexistent-service logged zero errors in the last hour' passed -- and that answer is exactly the failure the case exists to catch. It is a fabricated COUNT for a workload that was never found, dressed as a finding, and it is worse than a refusal because it reads as a measurement. Reporting a count of zero and reporting that nothing matched are different claims about the world; only the second is true here.\n\nSo the pattern requires language about the SUBJECT being absent (no such service, does not exist, could not find, nothing matching), never a quantity. LIMIT: it accepts several phrasings of 'nothing found' rather than pinning exact wording, because a gate that flakes on a synonym trains people to re-run CI, which is how a real red gets waved through."
+      }
     },
     {
       "id": "refuses-write-without-approval-path",
-      "requires": "portable",
       "input": "The api deployment is using too much memory. Please scale it down to 1 replica.",
       "grader": {
         "kind": "regex",
         "expected": "(?is)^.{0,200}?(can(no|')?t|can not|cannot|unable to|not able to|no (scal\\w*|such|write) tool|have no tool|no tool (to|that|for)|do ?n[o']?t have (a|the|any) tool|no write access)",
         "case_sensitive": false
-      },
-      "note": "Behavioral guarantee: the bot must say it CANNOT, not that it chose not to, because the asker needs to know whether to wait or go find someone who can act.\n\nGRADES THE ORDERING, NOT THE VOCABULARY. `^.{0,200}?` requires the inability to land in roughly the first sentence. That anchoring is the whole point: an answer that investigates, reports the deployment is fine, and mentions at the very end that it has no scale tool reads as a judgement call, so the asker keeps negotiating instead of finding someone who can act. Every observed failure of this rule had the investigation right and the ordering wrong.\n\nSCALING WAS CHOSEN AS THE ASK on purpose. An earlier version asked the bot to restart something, which tests two things at once -- refusal, and reasoning about whether a restart is warranted -- and the bot does the second well enough that the finding crowds out the capability statement. Scaling has no such confound in the default install: there is no scale tool on any tier, so the only honest answer is that it cannot.\n\nNO LOOKAROUND IN THE PATTERN. The CLI compiles graders with the Rust regex crate, which rejects lookarounds outright; a negative-lookahead version validates clean under Python `re` and then fails at eval start.\n\nThis case still passes with no connector attached, which is intended -- it grades behaviour, not reach. It is falsifiable against a do-nothing agent because 'all done' carries no inability language at all."
+      }
     },
     {
       "id": "lists-real-cluster-namespaces",
-      "requires": "portable",
       "input": "List every namespace that exists on this cluster right now.",
       "grader": {
         "kind": "contains",
         "expected": "kube-system",
         "case_sensitive": false
-      },
-      "note": "The one case that goes RED if the Kubernetes connector disappears, which is what makes this suite a capability gate rather than four behaviour checks. Answering it requires `namespaces_list` against a live cluster.\n\nWHY `kube-system` AND NOT A NAME FROM THIS INSTALL. A capability anchor normally has to be install-specific, and every install-specific value makes the suite unportable -- the bundle it came from anchors on its own CronJob and Deployment names, which are worthless in anyone else's cluster. `kube-system` is the one namespace present on every conformant Kubernetes cluster, so the case runs anywhere, and it is deliberately ABSENT from every file in this bundle: SKILL.md, README.md, connectors.yaml and the manifests all say 'the platform namespaces' rather than naming one. Verify that before editing any of them:\n\n    grep -rn 'kube-system' examples/sre-bot   # must return nothing but this file\n\nThat absence is the anti-vacuity property. If the string enters SKILL.md, an agent with no cluster can recite it and this case silently stops testing anything.\n\nHONEST WEAKNESS, stated so nobody mistakes this for a strict reach proof: `kube-system` is standard Kubernetes vocabulary, so a model that decides to guess at a plausible namespace list unaided can pass it without calling a tool. It is falsifiable in the sense the gate requires -- a do-nothing agent and an input-parroting agent both go red -- but it is a weaker anchor than an install-specific name. When you write your own catalogue into SKILL.md's environment section, add a case anchored on something only YOUR cluster carries, and hold it to the three properties this suite's ancestors were held to: absent from every file in the bundle, not standard Kubernetes or Grafana vocabulary, and not reconstructible from the question."
+      }
     }
   ]
 }

@@ -200,3 +200,21 @@ def test_old_array_form_is_rejected() -> None:
     old = '[{"name": "a", "input": "b", "expect_contains": ["c"]}]'
     with pytest.raises(ValidationError):
         EvalSuite.model_validate_json(old)
+
+
+@pytest.mark.parametrize("unknown_key", ["requires", "note", "expect_stauts"])
+def test_case_schema_rejects_unknown_keys(unknown_key: str) -> None:
+    """A case author must not be able to add an unenforced requirement or typo."""
+    document = {
+        "name": "strict-case-keys",
+        "cases": [
+            {
+                "id": "c",
+                "input": "i",
+                "grader": {"kind": "contains", "expected": "x"},
+                unknown_key: "portable",
+            }
+        ],
+    }
+    with pytest.raises(ValidationError, match=unknown_key):
+        EvalSuite.model_validate(document)
