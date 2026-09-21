@@ -30,7 +30,12 @@ from .connector_lock import (
     source_digest_of,
     validate_connector_lock,
 )
-from .connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
+from .connectors import (
+    CONNECTORS_FILE,
+    RESERVED_CONNECTOR_NAMES,
+    ConnectorsFile,
+    validate_connectors,
+)
 from .deploy_targets import validate_deploy_targets
 from .gate_summary import check_gate_summary_template
 from .manifest import resolve_manifest
@@ -1142,6 +1147,24 @@ def _validate_tool_policy(
             server = literal_server_segment(pattern)
             if server is None or server in expected_servers:
                 continue
+            # Same error, better message, and NOTHING new is rejected here
+            # (#2286). The branch sits INSIDE the undeclared case on purpose: a
+            # reserved name is only reserved against connectors.yaml, so a
+            # bundle may legally declare a plugin-mounted mcpServers entry
+            # called `curie`, whose live names carry the plugin infix and stay
+            # fully inside policy scope. That bundle passes the guard above and
+            # never reaches this line. What lands here is the dead end: a
+            # pattern naming a server the bundle does not declare and, because
+            # the platform owns the name, cannot declare as a connector either.
+            # The generic advice would send that author in a circle, telling
+            # them to declare exactly what `connectors.reserved_name` refuses.
+            if server in RESERVED_CONNECTOR_NAMES:
+                c.error(
+                    "tool_policy.platform_server",
+                    _platform_tool_policy_server_message(pattern, server),
+                    f"plugin.json (toolPolicy.{collection}[{i}])",
+                )
+                continue
             c.error(
                 "tool_policy.unknown_server",
                 _unknown_tool_policy_server_message(pattern, server, expected_servers),
@@ -1191,6 +1214,39 @@ def _tool_policy_invalid_messages(exc: ValidationError) -> list[str]:
         )
 
     return _explain(exc, rewrite=rewrite)
+
+
+def _platform_tool_policy_server_message(pattern: str, server: str) -> str:
+    """Message for a pattern naming one of Curie's own platform servers (#2286).
+
+    Deliberately NOT a variant of the unknown-server advice. That advice ends in
+    "declare the server", which is the one fix this author is forbidden to
+    apply: ``connectors.reserved_name`` refuses the very declaration it asks
+    for, so the author fixes the typo, re-runs the build, and gets a different
+    error pointing back at the first. Both halves have to be said here, where
+    the author is still looking: the pattern cannot be made live, and the thing
+    it was reaching for was never in danger.
+
+    The reserved set is imported rather than retyped for the #453/#544 reason:
+    a second copy of a name list owned by a different module is how a validator
+    and the thing it validates drift into disagreeing.
+    """
+
+    return (
+        f"tool pattern {pattern!r} names {server!r}, which is one of Curie's own "
+        "platform owned MCP servers (the approval server and the durable state "
+        "server). Those servers are mounted by the platform, not by a bundle, and "
+        "they are outside toolPolicy scope entirely: a bundle policy neither grants "
+        "nor removes the platform paths they carry (approval, publication and "
+        "channel memory). Whether one of those paths is mounted at all is the "
+        "platform's decision and not this policy's -- channel memory needs a state "
+        "URL, and the generic approval pager is omitted when a permission gate "
+        "already pages. This pattern is therefore inert at "
+        "runtime and the bundle does not declare a server by that name, so remove "
+        "it. If you meant one of your own MCP servers, give it a different name and "
+        f"add it to the manifest's mcpServers map, because {CONNECTORS_FILE} reserves "
+        f"{server!r} for the platform."
+    )
 
 
 def _unknown_tool_policy_server_message(

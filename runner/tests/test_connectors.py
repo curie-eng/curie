@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
 from aci_protocol import BootEnv, Budget
 from curie_runner import RunnerConfig
@@ -706,6 +707,110 @@ def test_the_reserved_list_matches_the_runner_constants() -> None:
     # never the reverse. This is the pin that keeps the copy honest: rename
     # either constant here and the deploy-time guard stops fencing it.
     assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+
+
+def test_the_boot_mounts_exactly_the_reserved_platform_servers(
+    tmp_path, monkeypatch
+) -> None:
+    # #2286. Pinned against the boot MOUNT, not against another constant: the
+    # sibling above already pins RESERVED_CONNECTOR_NAMES against the two runner
+    # constants, and two constants can agree with each other and both be wrong
+    # about what this boot actually mounted. A platform server mounted without
+    # being reserved is denied for every policy-bearing bundle, which is exactly
+    # the #2286 defect recurring, so this reddens instead.
+    env = _boot_env(monkeypatch, tmp_path, "platform-set")
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
+
+    assert set(mounted) == set(RESERVED_CONNECTOR_NAMES)
+
+
+def _published_live_tool_names(mcp_servers: dict[str, Any]) -> set[str]:
+    """Every live tool name the mounted in-process servers actually publish.
+
+    Asked of the SDK server objects themselves rather than of any constant: the
+    live `mcp__<server>__<tool>` string is the only thing an authorization
+    decision ever compares, so a pin that re-derived it from the same constant
+    it is pinning would agree with itself and still be wrong about the wire.
+    """
+
+    async def listed(instance: Any) -> list[str]:
+        entry = instance.get_request_handler("tools/list")
+        result = await entry.handler(None, None)
+        return [published.name for published in result.tools]
+
+    names: set[str] = set()
+    for server_name, config in mcp_servers.items():
+        assert config["type"] == "sdk", server_name
+        names.update(
+            f"mcp__{server_name}__{tool_name}"
+            for tool_name in anyio.run(listed, config["instance"])
+        )
+    return names
+
+
+def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
+    tmp_path, monkeypatch
+) -> None:
+    # The #2286 adversarial round. The toolPolicy exemption stopped being "any
+    # name on a platform server's prefix" -- which also exempted every tool of
+    # an ambient MCP server keyed `curie__extra` or `curie-state__extra`, since
+    # `strict_mcp_config` is off and the CLI loads ambient servers beside the
+    # ones the runner mounts -- and became exact membership in the set of names
+    # Curie's own servers publish.
+    #
+    # That makes a THIRD thing capable of drifting: the exemption set and the
+    # tools actually registered. So it is pinned against the live tool list the
+    # mounted server objects answer with, not against a constant. A tool added
+    # to `state._STATE_TOOL_SPECS` is exempt for free (the set is rendered from
+    # that list); a tool registered anywhere ELSE on a platform server, or a
+    # renamed one, reddens here instead of being denied on arrival for every
+    # policy-bearing bundle, which is the defect #2286 opened with.
+    from curie_runner.approval import platform_tool_names
+
+    env = _boot_env(monkeypatch, tmp_path, "exemption-set")
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
+
+    # `_boot_env` sets CURIE_STATE_URL, so this boot mounts both platform
+    # servers and the exemption set for it is the state-mounted one.
+    assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+    assert _published_live_tool_names(mounted) == platform_tool_names(
+        state_server_mounted=True
+    )
+
+
+def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
+    tmp_path, monkeypatch
+) -> None:
+    # The other half, and the reason the exemption is not simply "both servers,
+    # always". `curie-state` mounts only when `resolve_state_client` returns a
+    # client, so without CURIE_STATE_URL the platform publishes no
+    # `mcp__curie-state__*` tool at all. A name wearing that spelling then came
+    # from somewhere the platform does not control, and exempting it would hand
+    # a bundle-influenced ambient server a policy bypass for a capability this
+    # session does not even have. Pinned against the boot rather than asserted
+    # of the predicate alone, because the claim is about what was mounted.
+    from curie_runner.approval import platform_tool_names
+
+    env = _boot_env(monkeypatch, tmp_path, "no-state")
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
+
+    assert set(mounted) == {APPROVAL_SERVER_NAME}
+    published = _published_live_tool_names(mounted)
+    assert published == platform_tool_names(state_server_mounted=False)
+    assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
 
 
 # --------------------------------------------------------------------------- #
