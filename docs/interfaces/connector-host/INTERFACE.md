@@ -221,13 +221,12 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   (`apps/worker/src/curie_worker/connector_reconcile.py::OWNER_LABEL`) and a Rust
   constant in `cli/src/connectors.rs`, with no codegen or drift gate tying them
   together the way the ACI contract is tied. The derived Bearer selection rule is
-  another ungated mirror that has already diverged. The renderer accepts an explicit
-  `bearer_secret` or one plain string secret and excludes an implicit `SecretRef`
-  (`packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers`),
-  while `ConnectorSpec.bearer_secret_name`
-  (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec.bearer_secret_name`)
-  and the Rust `bearer_secret_name` (`cli/src/connector_build.rs`)
-  both flatten a lone `SecretRef` into the derived Bearer name.
+  another Python/Rust copy of one rule, the same class as `OWNER_LABEL`. The
+  renderer (`packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers`)
+  and the CLI (`cli/src/connector_build.rs`) both accept an explicit
+  `bearer_secret` or one plain-string secret and exclude an implicit `SecretRef`.
+  Unlike `OWNER_LABEL`, the four cases are frozen in
+  `tests/vectors/connector-derived-bearer.json`.
 - **The port's own docstring miscounts itself.** `ConnectorClient` is introduced
   as "deliberately four verbs" while declaring three; the cluster module states
   the true shape, four object kinds and three verbs. A second implementer reading

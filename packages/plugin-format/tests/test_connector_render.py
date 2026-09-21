@@ -44,6 +44,13 @@ def _objs(
     )
 
 
+_VECTORS = Path(__file__).resolve().parents[3] / "tests" / "vectors"
+_DERIVED_BEARER = json.loads(
+    (_VECTORS / "connector-derived-bearer.json").read_text(encoding="utf-8")
+)
+_DERIVED_BEARER_KEYS = {"name", "why", "document", "expected_name"}
+
+
 def test_shipped_sre_bot_connector_names_and_secret_refs_match_renderer() -> None:
     root = Path(__file__).resolve().parents[3]
     bundle = root / "examples" / "sre-bot"
@@ -1644,3 +1651,31 @@ def test_a_single_declared_secret_still_derives_the_header_without_bearer_secret
     assert _github_entry(spec)["headers"] == {
         "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
     }
+
+
+def test_derived_bearer_vector_keys_are_known() -> None:
+    # A key added for the Rust lane alone would pass vacuously here.
+    assert set(_DERIVED_BEARER) == {"comment", "vectors"}
+    for vector in _DERIVED_BEARER["vectors"]:
+        assert set(vector) == _DERIVED_BEARER_KEYS, vector["name"]
+
+
+@pytest.mark.parametrize(
+    "vector",
+    _DERIVED_BEARER["vectors"],
+    ids=lambda v: v["name"],
+)
+def test_derived_bearer_header_matches_the_frozen_vector(vector: dict) -> None:
+    # Cross-language pin: the renderer and the CLI bearer_secret_name helper
+    # must name the same secret, including the SecretRef case that used to
+    # diverge.
+    connectors = vector["document"]["connectors"]
+    assert list(connectors) == ["gh"], vector["name"]
+    spec = ConnectorSpec.model_validate(connectors["gh"])
+    entry = r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "gh", spec)
+    authorization = (entry.get("headers") or {}).get("Authorization")
+    expected = vector["expected_name"]
+    if expected is None:
+        assert authorization is None, vector["name"]
+    else:
+        assert authorization == f"Bearer ${{{expected}}}", vector["name"]

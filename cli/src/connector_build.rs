@@ -6,10 +6,10 @@
 //! and `curie cluster deploy` preflights that lock. Rust cannot import the
 //! Pydantic models, so the shapes are mirrored here and the seam is frozen in
 //! `tests/vectors/connector-build-decl.json`, `connector-lock.json`,
-//! `connector-fields.json`, `connector-service-dns.json` and
-//! `connector-source-digest.json` -- every one of them read by both this
-//! crate's tests and the Python suite, so a change made in one language and not
-//! the other fails that language.
+//! `connector-fields.json`, `connector-service-dns.json`,
+//! `connector-source-digest.json` and `connector-derived-bearer.json` -- every
+//! one of them read by both this crate's tests and the Python suite, so a
+//! change made in one language and not the other fails that language.
 //!
 //! Every struct here carries `#[serde(deny_unknown_fields)]`. A tolerant reader
 //! would silently drop a key the bundle author wrote, which is how an operator
@@ -81,8 +81,8 @@ pub struct ConnectorSpecDecl {
     #[serde(default)]
     pub secrets: Vec<SecretDecl>,
     /// The env-var name the derived `Authorization: Bearer ${NAME}` header
-    /// expands. Optional; a single `secrets:` entry is that name. See
-    /// [`bearer_secret_name`].
+    /// expands. Optional; a single plain-string `secrets:` entry is that name.
+    /// A lone [`SecretDecl::Ref`] is not. See [`bearer_secret_name`].
     #[serde(default)]
     pub bearer_secret: Option<String>,
     #[serde(default)]
@@ -1683,19 +1683,20 @@ pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
 
 /// The secret name the derived `Authorization: Bearer ${NAME}` header expands.
 ///
-/// Mirrors `plugin_format.ConnectorSpec.bearer_secret_name`: an explicit
-/// `bearer_secret` wins; a single declared secret is that name; two or more
-/// without an explicit name is None (the Python validator refuses that
+/// Mirrors `plugin_format.connector_render._derived_headers`: an explicit
+/// `bearer_secret` wins; otherwise a single plain-string secret is that name
+/// (the github-mcp-server shape). A lone [`SecretDecl::Ref`] is not a Bearer
+/// name: its value never reaches the sandbox (ADR-0090), so deriving a header
+/// would ship the literal `${NAME}` and hide the connector tools. Two or more
+/// secrets without an explicit name is None (the Python validator refuses that
 /// document rather than picking `secrets[0]`).
 pub fn bearer_secret_name(spec: &ConnectorSpecDecl) -> Option<String> {
     if let Some(name) = &spec.bearer_secret {
         return Some(name.clone());
     }
-    let names = declared_secret_names(spec);
-    if names.len() == 1 {
-        Some(names[0].clone())
-    } else {
-        None
+    match spec.secrets.as_slice() {
+        [SecretDecl::Name(name)] => Some(name.clone()),
+        _ => None,
     }
 }
 
