@@ -282,7 +282,7 @@ fn all_output(output: &Output) -> String {
     )
 }
 
-fn render_retained_probe_with_real_helm(fixture: &Fixture) -> Value {
+fn render_retained_values_with_real_helm(fixture: &Fixture) -> Value {
     let helm = Command::new("sh")
         .args(["-c", "command -v helm"])
         .output()
@@ -302,13 +302,19 @@ fn render_retained_probe_with_real_helm(fixture: &Fixture) -> Value {
     )
     .expect("write probe Chart.yaml");
     fs::write(
+        probe_chart.join("values.yaml"),
+        fs::read_to_string(Path::new(chart()).join("values.yaml"))
+            .expect("read chart defaults for probe"),
+    )
+    .expect("write probe values.yaml");
+    fs::write(
         templates.join("values.yaml"),
         r#"apiVersion: v1
 kind: ConfigMap
 metadata:
   name: retained-probe
 data:
-  values.json: {{ dict "metricsIngress" .Values.security.otelCollectorNetworkPolicy.metricsIngress "independentLabels" .Values.independentLabels "ordinary" .Values.ordinary | toJson | quote }}
+  values.json: {{ .Values | toJson | quote }}
 "#,
     )
     .expect("write probe template");
@@ -360,6 +366,51 @@ data:
         .unwrap_or_else(|| panic!("probe ConfigMap has no values JSON: {manifest}"));
     serde_json::from_str(values)
         .unwrap_or_else(|error| panic!("parse rendered values ({error}): {values}"))
+}
+
+fn render_retained_probe_with_real_helm(fixture: &Fixture) -> Value {
+    let values = render_retained_values_with_real_helm(fixture);
+    serde_json::json!({
+        "metricsIngress": values.pointer("/security/otelCollectorNetworkPolicy/metricsIngress").cloned().unwrap_or(Value::Null),
+        "independentLabels": values.get("independentLabels").cloned().unwrap_or(Value::Null),
+        "ordinary": values.get("ordinary").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn assert_helm_value_argument(fixture: &Fixture, flag: &str, expression: &str) {
+    assert!(
+        fixture
+            .upgrade_argv()
+            .windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == expression),
+        "Helm did not receive {flag} {expression}: {:?}",
+        fixture.upgrade_argv()
+    );
+}
+
+fn assert_retained_empty_collection_refusal(shape: &str, existing: Value, key: &str) {
+    let fixture = Fixture::new(&existing.to_string());
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    let shown = all_output(&output);
+
+    assert!(
+        !output.status.success(),
+        "retained empty {shape} succeeded: {shown}"
+    );
+    assert!(
+        shown.contains(key),
+        "the refusal must name the escaped retained {shape} key {key}: {shown}"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "the retained empty {shape} must refuse before Helm mutation"
+    );
+    assert!(
+        fixture.kubectl_log().is_empty(),
+        "the retained empty {shape} must refuse before Kubernetes mutation: {}",
+        fixture.kubectl_log()
+    );
 }
 
 fn assert_success(fixture: &Fixture, output: &Output) {
@@ -1042,6 +1093,280 @@ fn retained_dotted_keys_render_as_literal_maps_and_operator_override_wins() {
             }
         }),
         "captured cluster up arguments must reconstruct the exact retained maps and scalar types"
+    );
+}
+
+#[test]
+fn retained_empty_string_replaces_a_nonempty_chart_default_in_real_helm() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "global":{"imagePullPolicy":""}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+    assert_helm_value_argument(&fixture, "--set-string", "global.imagePullPolicy=");
+
+    assert_eq!(
+        render_retained_values_with_real_helm(&fixture).pointer("/global/imagePullPolicy"),
+        Some(&serde_json::json!("")),
+        "the retained empty string must replace the nonempty chart default"
+    );
+}
+
+#[test]
+fn retained_empty_null_reaches_helm_and_removes_the_coalesced_default_leaf() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "global":{"imagePullPolicy":null}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+    assert_helm_value_argument(&fixture, "--set", "global.imagePullPolicy=null");
+
+    // Real Helm 3 removes this nonempty chart default when --set reaches it as null.
+    assert!(
+        render_retained_values_with_real_helm(&fixture)
+            .pointer("/global/imagePullPolicy")
+            .is_none(),
+        "a retained null must remove the coalesced default leaf"
+    );
+}
+
+#[test]
+fn retained_empty_absent_key_keeps_the_chart_default() {
+    let fixture = Fixture::new(r#"{"security":{"allowDevDefaults":true}}"#);
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    assert_eq!(
+        render_retained_values_with_real_helm(&fixture).pointer("/global/imagePullPolicy"),
+        Some(&serde_json::json!("IfNotPresent")),
+        "an absent retained key must leave the chart default in place"
+    );
+}
+
+#[test]
+fn retained_empty_false_zero_and_string_controls_keep_their_types() {
+    let existing = serde_json::json!({
+        "security": {"allowDevDefaults": true},
+        "retainedControls": {
+            "flag": false,
+            "zero": 0,
+            "word": "off"
+        }
+    });
+    let fixture = Fixture::new(&existing.to_string());
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    assert_eq!(
+        render_retained_values_with_real_helm(&fixture).get("retainedControls"),
+        existing.get("retainedControls"),
+        "false, zero, and an ordinary string must remain distinct shapes"
+    );
+}
+
+#[test]
+fn retained_empty_map_refuses_with_the_escaped_path_before_mutation() {
+    assert_retained_empty_collection_refusal(
+        "map",
+        serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "retained.with.dot": {"empty\\map": {}}
+        }),
+        r"retained\.with\.dot.empty\\map",
+    );
+}
+
+#[test]
+fn retained_empty_list_refuses_with_the_escaped_array_path_before_mutation() {
+    assert_retained_empty_collection_refusal(
+        "list",
+        serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "retained.with.dot": {"items": [{"empty.list": []}]}
+        }),
+        r"retained\.with\.dot.items[0].empty\.list",
+    );
+}
+
+#[test]
+fn retained_empty_operator_overrides_replace_empty_collection_shapes() {
+    let map = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{"empty\\map":{}}
+        }"#,
+    );
+    let output = map.run(
+        &[],
+        VALID_RESOLVER,
+        &[
+            "--set",
+            r"retained\.with\.dot.empty\\map.replacement=operator",
+        ],
+    );
+    assert_success(&map, &output);
+    assert_eq!(
+        render_retained_values_with_real_helm(&map)
+            .pointer("/retained.with.dot/empty\\map/replacement"),
+        Some(&serde_json::json!("operator")),
+        "the operator map replacement must win over the retained empty map"
+    );
+
+    let list = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{"items":[{"empty.list":[]}]}
+        }"#,
+    );
+    let output = list.run(
+        &[],
+        VALID_RESOLVER,
+        &[
+            "--set",
+            r"retained\.with\.dot.items[0].empty\.list[0]=operator",
+        ],
+    );
+    assert_success(&list, &output);
+    assert_eq!(
+        render_retained_values_with_real_helm(&list)
+            .pointer("/retained.with.dot/items/0/empty.list/0"),
+        Some(&serde_json::json!("operator")),
+        "the operator list replacement must win over the retained empty list"
+    );
+}
+
+#[test]
+fn retained_empty_managed_collection_does_not_refuse() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "api":{"extraEnv":[]}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+}
+
+#[test]
+fn retained_secret_dotted_and_backslash_paths_render_one_literal_map() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{
+            "nested\\segment":{
+              "referenceExistingSecret":"acme-external-secret",
+              "ordinary.value":"retained"
+            }
+          }
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    let rendered = render_retained_values_with_real_helm(&fixture);
+    assert_eq!(
+        rendered
+            .get("retained.with.dot")
+            .and_then(|value| value.get("nested\\segment")),
+        Some(&serde_json::json!({
+            "referenceExistingSecret": "acme-external-secret",
+            "ordinary.value": "retained"
+        })),
+        "both overlay walkers must name the original literal map"
+    );
+    assert!(
+        rendered.get("retained").is_none(),
+        "the unescaped Secret walker must not create a sibling map: {rendered}"
+    );
+}
+
+#[test]
+fn retained_secret_operator_override_wins_without_an_unescaped_sibling() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{
+            "nested\\segment":{
+              "referenceExistingSecret":"acme-retained-secret",
+              "ordinary.value":"retained"
+            }
+          }
+        }"#,
+    );
+    let output = fixture.run(
+        &[],
+        VALID_RESOLVER,
+        &[
+            "--set",
+            r"retained\.with\.dot.nested\\segment.referenceExistingSecret=acme-operator-secret",
+        ],
+    );
+    assert_success(&fixture, &output);
+
+    let rendered = render_retained_values_with_real_helm(&fixture);
+    assert_eq!(
+        rendered
+            .get("retained.with.dot")
+            .and_then(|value| value.get("nested\\segment")),
+        Some(&serde_json::json!({
+            "referenceExistingSecret": "acme-operator-secret",
+            "ordinary.value": "retained"
+        })),
+        "the operator Secret reference must replace the retained value"
+    );
+    assert!(
+        rendered.get("retained").is_none(),
+        "the retained Secret reference must not create an unescaped sibling: {rendered}"
+    );
+}
+
+#[test]
+fn retained_secret_empty_string_and_null_keep_their_distinct_helm_meanings() {
+    let fixture = Fixture::new(
+        r#"{
+          "security":{"allowDevDefaults":true},
+          "retained.with.dot":{
+            "nested\\segment":{
+              "emptyExistingSecret":"",
+              "nullExistingSecret":null
+            }
+          }
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+    assert_helm_value_argument(
+        &fixture,
+        "--set-string",
+        r"retained\.with\.dot.nested\\segment.emptyExistingSecret=",
+    );
+    assert_helm_value_argument(
+        &fixture,
+        "--set",
+        r"retained\.with\.dot.nested\\segment.nullExistingSecret=null",
+    );
+
+    let rendered = render_retained_values_with_real_helm(&fixture);
+    // Real Helm 3 preserves a null key that has no chart default to coalesce.
+    assert_eq!(
+        rendered
+            .get("retained.with.dot")
+            .and_then(|value| value.get("nested\\segment")),
+        Some(&serde_json::json!({
+            "emptyExistingSecret": "",
+            "nullExistingSecret": null
+        })),
+        "an empty Secret reference and a null Secret reference must remain distinct"
+    );
+    assert!(
+        rendered.get("retained").is_none(),
+        "the empty Secret references must not create an unescaped sibling: {rendered}"
     );
 }
 
