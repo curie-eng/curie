@@ -82,7 +82,23 @@ def _invoke_selector(
     return completed, output
 
 
-def _expected_output(*selected: str, pytest_needed: bool = True) -> str:
+def _path_needs_images(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    if path in {"uv.lock", "pyproject.toml"} or name in {"uv.lock", "pyproject.toml"}:
+        return True
+    return "Dockerfile" in name or name.endswith(".dockerfile")
+
+
+def _path_needs_cli_release(path: str) -> bool:
+    return path == "cli" or path.startswith("cli/")
+
+
+def _expected_output(
+    *selected: str,
+    pytest_needed: bool = True,
+    images_needed: bool = False,
+    cli_release_needed: bool = False,
+) -> str:
     selected_tiers = set(selected)
     lines = [
         f"{OUTPUT_KEYS[tier]}={'true' if tier in selected_tiers else 'false'}"
@@ -91,6 +107,8 @@ def _expected_output(*selected: str, pytest_needed: bool = True) -> str:
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected_tiers)
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
+    lines.append(f"images={'true' if images_needed else 'false'}")
+    lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -100,10 +118,21 @@ def _assert_selection(
     selected: tuple[str, ...],
     *,
     pytest_needed: bool = True,
+    images_needed: bool | None = None,
+    cli_release_needed: bool | None = None,
 ) -> None:
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
-    assert output == _expected_output(*selected, pytest_needed=pytest_needed)
+    assert output == _expected_output(
+        *selected,
+        pytest_needed=pytest_needed,
+        images_needed=_path_needs_images(path) if images_needed is None else images_needed,
+        cli_release_needed=(
+            _path_needs_cli_release(path)
+            if cli_release_needed is None
+            else cli_release_needed
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -143,8 +172,19 @@ def test_registry_maps_each_known_surface(
         "tools/e2e-ci-selection/select_tiers.py",
     ],
 )
-def test_enforcement_paths_select_every_tier(tmp_path: Path, path: str) -> None:
-    _assert_selection(tmp_path, path, TIERS)
+def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str) -> None:
+    _assert_selection(tmp_path, path, (), pytest_needed=True)
+
+
+def test_ui_dockerfile_selects_images_without_e2e(tmp_path: Path) -> None:
+    _assert_selection(
+        tmp_path,
+        "apps/ui/Dockerfile",
+        (),
+        pytest_needed=True,
+        images_needed=True,
+        cli_release_needed=False,
+    )
 
 
 def test_weather_fixture_does_not_select_released_upgrade(tmp_path: Path) -> None:
@@ -218,7 +258,7 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
         ("scripts/README.md", False),
         ("scripts/check-docs.sh", False),
         ("scripts/check-pr-body.sh", False),
-        (".github/workflows/pr-body.yaml", False),
+        (".github/workflows/pr-body.yaml", True),
         ("packages/test-support/src/curie_test_support/valkey.py", True),
         ("examples/coder/evals/cases.json", False),
     ],
@@ -245,9 +285,6 @@ def test_charts_curie_still_selects_cluster(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("path", "selected"),
     [
-        (".github/e2e-selection.yaml", TIERS),
-        (".github/workflows/ci.yaml", TIERS),
-        (".github/workflows/README.md", BASE_TIERS),
         (".github/action.yml", BASE_TIERS),
         ("apps/api/README.md", ("local", "local-release", "cluster")),
         ("apps/api/runtime-config.yaml", ("local", "local-release", "cluster")),
@@ -306,7 +343,9 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
 def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
     completed, output = _invoke_selector(tmp_path, push=True)
     assert completed.returncode == 0, completed.stderr
-    assert output == _expected_output(*TIERS)
+    assert output == _expected_output(
+        *TIERS, images_needed=True, cli_release_needed=True
+    )
 
 
 def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> None:
@@ -485,6 +524,8 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "cluster": "${{ steps.filter.outputs.cluster }}",
         "released_upgrade": "${{ steps.filter.outputs.released_upgrade }}",
         "skill_local_tiers": "${{ steps.filter.outputs.skill_local_tiers }}",
+        "images": "${{ steps.filter.outputs.images }}",
+        "cli_release": "${{ steps.filter.outputs.cli_release }}",
     }
 
     skill_local = jobs["e2e-ladder"]
@@ -521,6 +562,20 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         jobs["e2e-released-upgrade"]["if"]
     )
     assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
+    assert jobs["images"]["if"] == "${{ needs.changes.outputs.images == 'true' }}"
+    assert jobs["worker-local-image"]["if"] == jobs["images"]["if"]
+    assert jobs["dispatcher-image-smoke"]["if"] == jobs["images"]["if"]
+    assert jobs["mail-adapter-image-smoke"]["if"] == jobs["images"]["if"]
+    assert jobs["ui-image-smoke"]["if"] == jobs["images"]["if"]
+    assert jobs["repo-toolchain-proof"]["if"] == jobs["images"]["if"]
+    assert jobs["cli-portability"]["if"] == (
+        "${{ needs.changes.outputs.cli_release == 'true' }}"
+    )
+    assert jobs["cli-darwin"]["if"] == jobs["cli-portability"]["if"]
+    assert "changes" in jobs["rust-build"]["needs"]
+    assert jobs["eval-falsifiability"]["if"] == (
+        "${{ needs.changes.outputs.skill == 'true' }}"
+    )
 
 
 def test_upgrade_matrix_shards_job_gates_coverage_and_lists_shards() -> None:
