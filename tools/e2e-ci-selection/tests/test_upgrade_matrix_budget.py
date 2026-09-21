@@ -193,6 +193,21 @@ def test_over_budget_shard_plus_bake_fails_and_still_writes_the_seconds(tmp_path
     assert "::error" in completed.stdout
 
 
+def test_unexpanded_skipped_matrix_job_is_not_a_shard(tmp_path: Path) -> None:
+    payload = _payload(
+        _job(
+            "E2E cluster upgrade matrix (${{ matrix.shard }})",
+            job_seconds=1,
+            bake_seconds=0,
+            run_seconds=0,
+        ),
+        _job("E2E cluster upgrade matrix shards", job_seconds=6, bake_seconds=0, run_seconds=1),
+    )
+    completed = _run(tmp_path, payload)
+    assert completed.returncode != 0
+    assert "no upgrade matrix shard jobs" in (completed.stdout + completed.stderr).lower()
+
+
 def test_listing_job_alone_is_not_a_shard(tmp_path: Path) -> None:
     payload = _payload(
         _job("E2E cluster upgrade matrix shards", job_seconds=6, bake_seconds=0, run_seconds=1),
@@ -378,7 +393,9 @@ def test_e2e_required_runs_the_wall_clock_helper() -> None:
     run = budget["run"]
     assert "tools/e2e-ci-selection/assert_upgrade_matrix_budget.py" in run
     assert "continue-on-error" not in budget
-    assert budget.get("if") == "${{ !cancelled() }}"
+    assert budget.get("if") == (
+        "${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' }}"
+    )
     # Outcome matching stays the gate for selected results; wall clock is a
     # later step so a budget miss cannot skip the selected-outcome negative
     # control.

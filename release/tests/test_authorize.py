@@ -1750,7 +1750,12 @@ class TestLegitimateSkips:
             if job.get("name") in authorize_module.REQUIRED_CHECK_NAMES
             and "if" in job
         }
+        images_if = "${{ needs.changes.outputs.images == 'true' }}"
         expected = {
+            "worker-local-image": images_if,
+            "dispatcher-image-smoke": images_if,
+            "repo-toolchain-proof": images_if,
+            "eval-falsifiability": "${{ needs.changes.outputs.skill == 'true' }}",
             "e2e-ladder": (
                 "${{ needs.changes.outputs.skill == 'true' || "
                 "needs.changes.outputs.local == 'true' }}"
@@ -1813,6 +1818,8 @@ class TestLegitimateSkips:
             "released_upgrade=true",
             "skill_local_tiers=skill,local",
             "pytest=true",
+            "images=true",
+            "cli_release=true",
         ], (
             "ci.yaml's push selection no longer emits the complete tier contract: "
             f"{github_output.read_text()!r}"
