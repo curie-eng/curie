@@ -226,6 +226,10 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
         printf '%s\n' 'Error: UPGRADE FAILED: pre-upgrade hooks failed: job target-release-preflight-gvisor failed: DeadlineExceeded' >&2
         exit 1
     fi
+    if [ "$CURIE_TEST_HISTORY_STATUS" = "failed" ] && [ ! -s "$CURIE_TEST_UNINSTALL_LOG" ]; then
+        printf '%s\n' 'Error: UPGRADE FAILED: pre-upgrade hooks failed: job target-release-upgrade-drain failed: secret not found' >&2
+        exit 1
+    fi
     sleep 1
     printf '%s\n' 'Release installed'
     exit 0
@@ -250,9 +254,21 @@ if [ "$1" = "history" ]; then
             printf '%s\n' '[{"revision":1,"status":"superseded","chart":"curie-0.0.0","description":"Upgrade complete"},{"revision":2,"status":"failed","chart":"curie-0.0.0","description":"Upgrade \"target-release\" failed: context canceled"}]'
             exit 0
             ;;
-        *)
+        failed)
             printf '%s\n' '[{"revision":1,"status":"failed","chart":"curie-0.0.0","description":"Release \"target-release\" failed: context canceled"}]'
             exit 0
+            ;;
+        pending-install)
+            printf '%s\n' '[{"revision":1,"status":"pending-install","chart":"curie-0.0.0","description":"Initial install underway"}]'
+            exit 0
+            ;;
+        *)
+            if [ -s "$CURIE_TEST_UPGRADE_LOG" ]; then
+                printf '%s\n' '[{"revision":1,"status":"failed","chart":"curie-0.0.0","description":"Release \"target-release\" failed: context canceled"}]'
+                exit 0
+            fi
+            printf '%s\n' 'Error: release: not found' >&2
+            exit 1
             ;;
     esac
 fi
@@ -477,7 +493,7 @@ exit 64
             event_mode: event_mode.to_string(),
             singleton_mode: singleton_mode.to_string(),
             credential: credential.to_string(),
-            history_status: "failed".to_string(),
+            history_status: "auto".to_string(),
         }
     }
 
@@ -604,8 +620,8 @@ exit 64
         );
         assert_eq!(
             uninstalls.trim(),
-            "uninstall target-release -n target-namespace",
-            "the discard must reuse cluster down's helm uninstall argv:\n{uninstalls}"
+            "uninstall target-release -n target-namespace --wait --timeout 60s",
+            "the discard must helm uninstall --wait so owned namespaces are gone before reinstall:\n{uninstalls}"
         );
         let mutations = self.helm_mutations();
         assert_eq!(
@@ -618,7 +634,7 @@ exit 64
             "the interrupted first attempt must be helm upgrade --install:\n{mutations:?}"
         );
         assert_eq!(
-            mutations[1], "uninstall target-release -n target-namespace",
+            mutations[1], "uninstall target-release -n target-namespace --wait --timeout 60s",
             "the failed revision must be uninstalled before the retry:\n{mutations:?}"
         );
         assert!(
@@ -643,6 +659,72 @@ exit 64
         assert!(
             uninstalls.is_empty(),
             "this path must not helm uninstall the release:\n{uninstalls}"
+        );
+    }
+
+    fn write_apply_plan(&self, gvisor_mode: &str) {
+        fs::write(
+            &self.plan_file,
+            format!(
+                "version: 1\ninstall:\n  namespace: {TARGET_NAMESPACE}\n  release: {TARGET_RELEASE}\ncredentials:\n  model: CURIE_CREDENTIALS\nset:\n  fullnameOverride: acme-runtime\n  security.gvisor.mode: \"{gvisor_mode}\"\n"
+            ),
+        )
+        .expect("write apply plan");
+    }
+
+    /// Issue #2856: a later apply/up against a failed-only history must
+    /// uninstall before `helm upgrade --install`, not fire the pre-upgrade drain.
+    fn assert_failed_only_release_discarded_before_install(&self) {
+        let uninstalls = fs::read_to_string(&self.uninstall_log).unwrap_or_default();
+        assert_eq!(
+            uninstalls.lines().count(),
+            1,
+            "a failed-only history must be uninstalled once before install:\n{uninstalls}"
+        );
+        assert_eq!(
+            uninstalls.trim(),
+            "uninstall target-release -n target-namespace --wait --timeout 60s",
+            "the discard must helm uninstall --wait so owned namespaces are gone before reinstall:\n{uninstalls}"
+        );
+        let mutations = self.helm_mutations();
+        assert_eq!(
+            mutations.len(),
+            2,
+            "must uninstall then upgrade --install, not upgrade a failed revision:\n{mutations:?}"
+        );
+        assert_eq!(
+            mutations[0], "uninstall target-release -n target-namespace --wait --timeout 60s",
+            "the failed revision must be uninstalled before helm upgrade --install:\n{mutations:?}"
+        );
+        assert!(
+            mutations[1].starts_with("upgrade --install"),
+            "install after discard must be helm upgrade --install:\n{mutations:?}"
+        );
+        let sequence = fs::read_to_string(&self.helm_sequence).unwrap_or_default();
+        let history = sequence
+            .lines()
+            .position(|line| {
+                line.starts_with("history ")
+                    && line.contains("target-release")
+                    && line.contains("-n target-namespace")
+                    && line.contains("-o json")
+                    && line.contains("--max")
+                    && line.contains("256")
+            })
+            .expect("must read helm history before deciding to discard");
+        let uninstall = sequence
+            .lines()
+            .position(|line| {
+                line == "uninstall target-release -n target-namespace --wait --timeout 60s"
+            })
+            .expect("must uninstall the failed revision");
+        let upgrade = sequence
+            .lines()
+            .position(|line| line.starts_with("upgrade --install"))
+            .expect("must helm upgrade --install after discard");
+        assert!(
+            history < uninstall && uninstall < upgrade,
+            "history, uninstall, then upgrade --install; got:\n{sequence}"
         );
     }
 
@@ -1216,4 +1298,125 @@ fn gvisor_retry_tolerates_an_absent_release_history() {
     assert_automatic_gvisor_recovery_narration(&shown);
     fixture.assert_failed_revision_discarded_before_retry();
     fixture.assert_children_stopped();
+}
+
+/// Issue #2856: `curie apply` against a failed-only revision 1 must discard
+/// that record and install, not take Helm's upgrade path.
+#[test]
+fn apply_discards_a_failed_only_revision_before_install() {
+    let fixture =
+        Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL).with_history_status("failed");
+    fixture.write_apply_plan("off");
+    let (output, elapsed) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "apply must converge after discarding the failed revision\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must not wait on the pre-upgrade drain hook, elapsed {elapsed:?}\n{shown}"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        1,
+        "apply must install once:\n{shown}"
+    );
+    fixture.assert_failed_only_release_discarded_before_install();
+    fixture.assert_no_event_watch();
+    assert_process_stopped(&fixture.helm_pid, "helm upgrade");
+}
+
+/// Negative for #2856: a known-good history is an in-place upgrade.
+#[test]
+fn apply_preserves_a_known_good_release() {
+    for status in ["deployed", "superseded"] {
+        let fixture =
+            Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL).with_history_status(status);
+        fixture.write_apply_plan("off");
+        let (output, elapsed) = fixture.run_apply();
+        let shown = stderr(&output);
+
+        assert!(
+            output.status.success(),
+            "{status} history must still apply\nstdout:\n{}\nstderr:\n{shown}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(elapsed < Duration::from_secs(3), "{status}: {elapsed:?}");
+        assert_eq!(fixture.upgrade_count(), 1, "{status}");
+        fixture.assert_no_failed_revision_discard();
+        let mutations = fixture.helm_mutations();
+        assert_eq!(
+            mutations.len(),
+            1,
+            "{status}: must upgrade the known-good release, not uninstall it:\n{mutations:?}"
+        );
+        assert!(
+            mutations[0].starts_with("upgrade --install"),
+            "{status}: {mutations:?}"
+        );
+        fixture.assert_no_event_watch();
+        assert_process_stopped(&fixture.helm_pid, "helm upgrade");
+    }
+}
+
+/// Sibling of apply: `cluster up` against a failed-only history must discard
+/// before `helm upgrade --install` even when gVisor is already off.
+#[test]
+fn cluster_up_discards_a_failed_only_revision_before_install() {
+    let fixture = Fixture::new("matching", "absent", "").with_history_status("failed");
+    let (output, elapsed) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=off"]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "cluster up must converge after discarding the failed revision\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must not wait on the pre-upgrade drain hook, elapsed {elapsed:?}\n{shown}"
+    );
+    assert_eq!(fixture.upgrade_count(), 1);
+    fixture.assert_failed_only_release_discarded_before_install();
+    fixture.assert_no_event_watch();
+    assert_process_stopped(&fixture.helm_pid, "helm upgrade");
+}
+
+/// In-flight Helm status is not an upgrade target and is not silently discarded.
+#[test]
+fn apply_refuses_a_pending_only_revision() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL)
+        .with_history_status("pending-install");
+    fixture.write_apply_plan("off");
+    let (output, elapsed) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert!(
+        !output.status.success(),
+        "pending-install must refuse, not helm upgrade --install\n{shown}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "must refuse at once, elapsed {elapsed:?}\n{shown}"
+    );
+    assert!(
+        shown.contains("no deployed revision") && shown.contains("pending-install"),
+        "must name the in-flight status:\n{shown}"
+    );
+    assert!(
+        shown.contains(
+            "curie cluster down --yes --namespace target-namespace --release target-release"
+        ),
+        "must name the teardown command:\n{shown}"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "must not helm upgrade:\n{shown}"
+    );
+    fixture.assert_no_failed_revision_discard();
+    fixture.assert_no_event_watch();
 }
