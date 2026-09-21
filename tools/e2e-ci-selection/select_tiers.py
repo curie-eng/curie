@@ -117,6 +117,7 @@ MUST_RUN_PYTEST_PREFIXES = (
     "examples/tests",
     "cli",
     "tools",
+    "release",
     ".github/workflows",
 )
 IMAGE_LOCKFILES = frozenset({"uv.lock", "pyproject.toml"})
