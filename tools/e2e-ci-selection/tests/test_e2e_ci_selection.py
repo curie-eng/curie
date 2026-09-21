@@ -259,6 +259,8 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
         ("scripts/check-docs.sh", False),
         ("scripts/check-pr-body.sh", False),
         (".github/workflows/pr-body.yaml", True),
+        ("release/authorize.py", True),
+        ("runner/tests/test_repo_toolchain_proof_ci.py", True),
         ("packages/test-support/src/curie_test_support/valkey.py", True),
         ("examples/coder/evals/cases.json", False),
     ],
