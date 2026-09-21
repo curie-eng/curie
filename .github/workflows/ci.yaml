@@ -5,7 +5,9 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next, "task/**"]
-    types: [opened, synchronize, reopened, edited]
+    # Commit events only. A title or body edit must not cancel an in-flight
+    # run and restart kind shards. pr-body.yaml and p0-closes.yaml own `edited`.
+    types: [opened, synchronize, reopened]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
 # stacking. Keyed per workflow+ref: each PR branch and main have independent
@@ -2696,9 +2698,9 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
 
-  # The upgrade matrix runs on every PR as independent shards (issue #2733).
-  # The script owns the shard list and its --self-test proves every scenario
-  # is assigned to exactly one shard, so CI never hardcodes shard ids.
+  # The upgrade matrix is sharded (issue #2733) and change-selected with
+  # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 14 kind
+  # runners. The shard lister stays on every PR so coverage cannot drift.
   e2e-cluster-upgrade-matrix-shards:
     name: E2E cluster upgrade matrix shards
     runs-on: ubuntu-latest
@@ -2727,9 +2729,11 @@ jobs:
     name: E2E cluster upgrade matrix (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [rust-build, e2e-cluster-upgrade-matrix-shards]
+    needs: [rust-build, changes, e2e-cluster-upgrade-matrix-shards]
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}
     steps:
@@ -2937,9 +2941,9 @@ jobs:
           if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
             released_upgrade_expected="success"
           fi
-          # Required on every PR, not change-selected. A matrix job reports
-          # success only when every shard succeeded.
-          upgrade_matrix_expected="success"
+          # Same selector as released-upgrade: a matrix job reports success
+          # only when every selected shard succeeded, and skipped otherwise.
+          upgrade_matrix_expected="$released_upgrade_expected"
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
