@@ -370,6 +370,9 @@ if tool == "helm":
     if has_sequence(["get", "values"]):
         print('{"mailAdapter":{"deploy":false},"api":{"ingress":{"enabled":true}}}')
         sys.exit(0)
+    if args and args[0] == "history":
+        print("Error: release: not found", file=sys.stderr)
+        sys.exit(1)
     print("unexpected helm invocation: " + shlex.join(args), file=sys.stderr)
     sys.exit(64)
 

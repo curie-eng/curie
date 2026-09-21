@@ -4,6 +4,10 @@
 # their existing successful Helm mutation. No earlier mutation/preflight reply
 # or assertion is changed here.
 case "${0##*/}:$1:${2:-}" in
+    helm:history:*)
+        printf '%s\n' 'Error: release: not found' >&2
+        exit 1
+        ;;
     helm:status:*)
         if [ -f "${0%/*}/convergence-release-failed" ]; then
             printf '%s\n' '{"version":1,"info":{"status":"failed"},"hooks":[]}'

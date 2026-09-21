@@ -124,6 +124,9 @@ def emit(value):
 
 
 if program == "helm":
+    if args[0] == "history":
+        print("Error: release: not found", file=sys.stderr)
+        sys.exit(1)
     if args[:2] == ["get", "values"]:
         emit({"security": {"allowDevDefaults": True}})
     if args[:2] == ["get", "manifest"]:
