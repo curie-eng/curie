@@ -122,9 +122,96 @@ impl Installation {
     /// Parse and validate, naming the file in every error so a schema mistake
     /// reads like a compiler message rather than a serde dump.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&raw).with_context(|| format!("in {}", path.display()))
+        let path_text = path.display().to_string();
+        let quoted_path = crate::ops::shell_quote(&path_text);
+        // Keep the same concise pair on both output surfaces while retaining
+        // the original source for debug plumbing.
+        let render = |source: anyhow::Error, message: String, remedy: Option<String>| {
+            let payload = serde_json::json!({ "error": &message, "fix": &remedy });
+            crate::exit::operator_context(
+                crate::exit::with_json_payload(source, payload),
+                message,
+                remedy,
+            )
+        };
+        let raw = std::fs::read_to_string(path).map_err(|source| {
+            let (message, remedy, source) = if source.kind() == std::io::ErrorKind::NotFound {
+                let message = format!("installation file {path_text} was not found");
+                let remedy = format!(
+                    "create it with `vi -- {quoted_path}` and add the required `version` and `install` fields, or select an existing file with `--file PATH`"
+                );
+                // Classification walks the source chain, so the typed error
+                // remains the source and the raw cause is debug context.
+                let source = anyhow::Error::new(
+                    crate::exit::CliError::usage(message.clone()).with_fix(remedy.clone()),
+                )
+                .context(source);
+                (message, remedy, source)
+            } else {
+                let message = format!("installation file {path_text} could not be read");
+                let remedy = format!(
+                    "inspect it with `ls -ld -- {quoted_path}`, then pass a readable file with `--file PATH`"
+                );
+                let source = anyhow::Error::new(
+                    crate::exit::CliError::failure(message.clone()).with_fix(remedy.clone()),
+                )
+                .context(source);
+                (message, remedy, source)
+            };
+            render(source, message, Some(remedy))
+        })?;
+
+        Self::parse(&raw).map_err(|source| {
+            if let Some(parse_error) = source.downcast_ref::<serde_norway::Error>() {
+                let detail = parse_error
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let location = parse_error.location();
+                let diagnostic = location.as_ref().map_or(detail.as_str(), |location| {
+                    let suffix = format!(
+                        " at line {} column {}",
+                        location.line(),
+                        location.column()
+                    );
+                    detail.strip_suffix(&suffix).unwrap_or(detail.as_str())
+                });
+                let message = match location.as_ref() {
+                    Some(location) => format!(
+                        "installation file {path_text} has invalid YAML at line {} column {}, {diagnostic}",
+                        location.line(),
+                        location.column()
+                    ),
+                    None => {
+                        format!("installation file {path_text} has invalid YAML, {diagnostic}")
+                    }
+                };
+                let remedy = location.map_or_else(
+                    || format!("edit the file with `vi -- {quoted_path}`"),
+                    |location| {
+                        format!(
+                            "edit the reported location with `vi +{} -- {quoted_path}`",
+                            location.line()
+                        )
+                    },
+                );
+                let classified = crate::exit::CliError::usage(message.clone())
+                    .with_fix(remedy.clone());
+                // Keep the usage tag in the source chain while the parser
+                // error remains available to debug output.
+                let source = anyhow::Error::new(classified).context(source);
+                render(source, message, Some(remedy))
+            } else {
+                let (message, _) = crate::exit::present_error(&source);
+                let (_, remedy) = crate::exit::classify(&source);
+                render(
+                    source,
+                    format!("installation file {path_text} is invalid, {message}"),
+                    remedy,
+                )
+            }
+        })
     }
 
     pub fn parse(raw: &str) -> Result<Self> {
