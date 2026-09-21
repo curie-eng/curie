@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main, next, "task/**"]
     # Commit events only. A title or body edit must not cancel an in-flight
-    # run and restart kind shards. pr-body.yaml and p0-closes.yaml own `edited`.
+    # run and restart kind shards. Body-edit guards live in their own workflows.
     types: [opened, synchronize, reopened]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
@@ -3007,7 +3007,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Assert upgrade matrix wall clock
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py

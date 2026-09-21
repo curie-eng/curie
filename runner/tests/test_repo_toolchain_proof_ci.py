@@ -53,12 +53,16 @@ def assert_proof_job_gates(doc: dict[str, Any]) -> None:
         "every run instead of gating in the dedicated job"
     )
 
-    assert "needs" not in job, (
-        "repo-toolchain-proof must not serialise behind another job; it is "
-        "the parallel half of the Python suite"
+    needs = job.get("needs")
+    if isinstance(needs, str):
+        needs = [needs]
+    assert needs == ["changes"], (
+        "repo-toolchain-proof may wait on the path selector only; it is not "
+        "a merge-required check, and needs: changes is an 11s filter"
     )
-    assert "if" not in job, (
-        "a job-level if: makes a required check skip, which is not a pass (#1470)"
+    assert job.get("if") == "${{ needs.changes.outputs.images == 'true' }}", (
+        "repo-toolchain-proof runs when images are selected; a skip here is "
+        "not a merge-required check"
     )
 
     env = job.get("env") or {}
