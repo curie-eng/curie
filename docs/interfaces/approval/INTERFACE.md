@@ -78,9 +78,12 @@ in code now:
   keeping `request_approval` beside it raises a second card for the same action (#2657).
   A `toolPolicy` can never take the pager itself away: `mcp__curie__request_approval`,
   publication, and the `curie-state` channel-memory tools are platform owned and outside
-  `toolPolicy` scope, exempted by server in
-  `runner/src/curie_runner/approval.py::platform_server_for_tool` before the policy is
-  classified at all (#2286, ADR-0139). The same rule costs a bundle the ability to restrict
+  `toolPolicy` scope, exempted by exact live tool name in
+  `runner/src/curie_runner/approval.py::is_platform_owned_tool` before the policy is
+  classified at all (#2286, ADR-0139). By exact name and not by server prefix, because
+  `strict_mcp_config` is off and an ambient project `.mcp.json` server keyed
+  `curie__extra` would otherwise inherit the exemption; and the `curie-state` names are
+  exempt only when that server was actually mounted, which needs a state URL. The same rule costs a bundle the ability to restrict
   those tools, which ADR-0139 accepts: bundle configuration may add restrictions but may not
   hollow out platform controls. Outside policy scope is not permission to run, so an operator
   gate naming one of these tools still blocks it.

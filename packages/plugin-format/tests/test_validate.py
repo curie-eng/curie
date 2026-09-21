@@ -1764,6 +1764,41 @@ def test_a_pattern_naming_a_platform_server_says_so_instead_of_unknown_server(
     assert "declare the server" not in issue.message
 
 
+def test_a_bundle_that_declares_its_own_curie_server_keeps_the_pattern_valid(
+    tmp_path: Path,
+) -> None:
+    """The other side of the reserved-name fence, pinned at DEPLOY.
+
+    `RESERVED_CONNECTOR_NAMES` fences a CONNECTOR named `curie`. It does not
+    fence a plugin-mounted `mcpServers` entry by that name, which the SDK
+    namespaces to `mcp__plugin_<bundle>_curie__<tool>` -- a different server
+    from the platform's, fully inside policy scope, and one whose tools a
+    bundle may legitimately restrict.
+
+    The runtime already pins that
+    (`runner/tests/test_tool_policy_enforcement.py::test_a_plugin_mounted_bundle_server_named_curie_stays_inside_policy_scope`),
+    but the deploy validator had no cover for it, and the validator is where the
+    author finds out. The platform-server branch runs only after the
+    declared-server cross-check has already accepted the segment, so a `curie`
+    the bundle DOES declare must reach neither `tool_policy.platform_server`
+    nor `tool_policy.unknown_server`. A branch reordered to fire first would
+    refuse a legal bundle with advice it cannot act on, and nothing else here
+    would redden.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["curie/delete_everything"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"curie": {"command": "curie-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    codes = _tool_policy_codes(bundle)
+    assert "tool_policy.platform_server" not in codes
+    assert "tool_policy.unknown_server" not in codes
+    assert result.valid, [(i.code, i.message) for i in result.errors]
+
+
 def test_a_misspelled_undeclared_server_still_reports_unknown_server(
     tmp_path: Path,
 ) -> None:

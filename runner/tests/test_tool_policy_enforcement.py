@@ -40,6 +40,7 @@ from curie_runner.approval import (
     policy_disallowed_tools,
     resolve_approval_policy,
 )
+from curie_runner.state import STATE_TOOL_NAMES
 from mcp import Tool
 from mcp.types import ToolAnnotations
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, ToolPolicy
@@ -99,8 +100,19 @@ def _catalog_gate() -> ApprovalGate:
     )
 
 
-def _production_sre_gate(*, managed_workspace: bool) -> ApprovalGate:
-    """Build the gate from the exact production SRE bundle policy and skill."""
+def _production_sre_gate(
+    *, managed_workspace: bool, state_server_mounted: bool = True
+) -> ApprovalGate:
+    """Build the gate from the exact production SRE bundle policy and skill.
+
+    `state_server_mounted` defaults True because that is the shape these tests
+    are about: a session the worker gave a `CURIE_STATE_URL`, so the runner
+    mounted `curie-state` and its five channel-memory tools genuinely exist.
+    `__main__` stamps the same fact onto the gate from the expression that
+    decides the mount; a session without a state URL publishes no
+    `mcp__curie-state__*` tool and exempts none, which
+    `test_the_state_tools_are_exempt_only_when_the_platform_mounted_them` pins.
+    """
 
     bundle = Path(__file__).parents[2] / "examples" / "sre-bot"
     assert (bundle / "skills" / "sre-bot" / "SKILL.md").is_file()
@@ -117,6 +129,7 @@ def _production_sre_gate(*, managed_workspace: bool) -> ApprovalGate:
         tool_policy=resolution.tool_policy,
     )
     assert gate is not None
+    gate.state_server_mounted = state_server_mounted
     return gate
 
 
@@ -516,21 +529,99 @@ def test_every_platform_owned_tool_escapes_the_production_sre_tool_policy(
 
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])
-def test_a_tool_the_platform_adds_later_is_outside_policy_scope_too(
+def test_a_tool_the_platform_adds_later_is_exempt_without_a_second_list(
     interceptor: str,
 ) -> None:
-    """The reason the exemption is a server set and not a list of tool names.
+    """The anti-drift property, carried by one source list rather than a prefix.
 
     Two exact names were exempted when publication landed, so every tool added
-    to a platform server afterwards was denied on arrival. That is how channel
-    memory broke, and re-enumerating names would let it break again the next
-    time the platform grows a tool.
+    to a platform server afterwards was denied on arrival; that is how channel
+    memory broke, and re-enumerating names by hand would let it break again at
+    the next tool. The first fix answered that by exempting the whole
+    `mcp__<platform server>__` PREFIX, which handed the same bypass to any MCP
+    server whose key merely begins `curie__` or `curie-state__`.
+
+    So the exemption is now the exact set of names the platform publishes, and
+    that set is RENDERED from `state._STATE_TOOL_SPECS` -- the one list
+    `build_state_server` registers with the SDK. A sixth state tool is exempt
+    the moment it is registered, and there is no second list to forget. Read
+    out of the derivation here on purpose, then cross-checked against the
+    literal names this file pins, so a rename that breaks the live wire format
+    still reddens.
     """
 
     gate = _production_sre_gate(managed_workspace=False)
-    reason = _interception_reason(gate, "mcp__curie__some_future_tool", interceptor)
 
-    assert "denied by this agent's tool policy" not in reason
+    assert set(_CHANNEL_MEMORY_TOOLS) == set(STATE_TOOL_NAMES), (
+        "the live names build_state_server publishes and the literal names this"
+        " file pins must be the same set, or one of the two is stale"
+    )
+    for tool_name in sorted(STATE_TOOL_NAMES):
+        reason = _interception_reason(gate, tool_name, interceptor)
+        assert "denied by this agent's tool policy" not in reason
+
+    _assert_no_approval_was_recorded(gate)
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize(
+    "tool_name",
+    ["mcp__curie__extra__foo", "mcp__curie-state__extra__bar"],
+    ids=["curie", "state"],
+)
+def test_an_ambient_server_keyed_onto_a_platform_prefix_is_refused(
+    tool_name: str, interceptor: str
+) -> None:
+    """The regression this fix closes, and it was reachable rather than theoretical.
+
+    `ClaudeAgentOptions.strict_mcp_config` defaults to False and
+    `adapter.build_options` never sets it, so the CLI loads project `.mcp.json`,
+    user settings and plugin servers BESIDE the `--mcp-config` dict
+    `build_mcp_servers` controls; `check.py::evaluate` already treats those
+    ambient servers as real. A mounted workspace is the session cwd, it is
+    writable, and it survives across sandboxes, so a `.mcp.json` planted there
+    is bundle-influenced input. An ambient server keyed `curie__extra` publishes
+    `mcp__curie__extra__foo`, which carries the `mcp__curie__` prefix while
+    being no tool the platform ever mounted.
+
+    A connector cannot do this -- a connector name may not contain `_` -- which
+    is why the earlier negative table (hyphen and concatenation neighbours such
+    as `mcp__curie-state-archive__get`) never tried these two shapes and a
+    prefix check passed it. Exact membership refuses both, and the names stay on
+    the unmatched-is-DENY default that defends every other undeclared server.
+    """
+
+    gate = _gate(_policy(allow=["k8s-write/restart_deployment"]), state_server_mounted=True)
+    reason = _interception_reason(gate, tool_name, interceptor)
+
+    assert "denied by this agent's tool policy" in reason
+    # A refusal, not a request: an undeclared server has no audience to ask.
+    _assert_no_approval_was_recorded(gate)
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize("mounted", [False, True], ids=["unmounted", "mounted"])
+def test_the_state_tools_are_exempt_only_when_the_platform_mounted_them(
+    mounted: bool, interceptor: str
+) -> None:
+    """The exemption is scoped to what THIS session actually published.
+
+    `curie-state` mounts only when `resolve_state_client` returns a client,
+    which needs `CURIE_STATE_URL`. With no state URL the platform publishes no
+    `mcp__curie-state__*` tool at all, so a call wearing that name came from an
+    ambient server and must land on the deny default -- exempting it would grant
+    a bundle-influenced server a policy bypass for a platform capability the
+    session does not even have. With the server mounted the same name is Curie's
+    own channel memory and stays outside policy scope, which is #2286's fix.
+
+    Both rulings in one table because asserting either alone passes against a
+    flag that is ignored.
+    """
+
+    gate = _gate(_policy(allow=["k8s-write/restart_deployment"]), state_server_mounted=mounted)
+    reason = _interception_reason(gate, "mcp__curie-state__get", interceptor)
+
+    assert ("denied by this agent's tool policy" in reason) is not mounted
     _assert_no_approval_was_recorded(gate)
 
 
@@ -556,7 +647,7 @@ def test_a_wildcarded_server_segment_cannot_reach_a_platform_tool(
     a bundle could fence its own approval path with one wildcard.
     """
 
-    gate = _gate(_policy(deny=[pattern]))
+    gate = _gate(_policy(deny=[pattern]), state_server_mounted=True)
     reason = _interception_reason(gate, tool_name, interceptor, _input_for(tool_name))
 
     assert reason == ""
@@ -572,15 +663,15 @@ def test_each_platform_server_covers_its_own_tools(
 ) -> None:
     """Both directions of the overlapping-name pair, in one table.
 
-    `curie` is a prefix of `curie-state`, so an ownership check that stopped at
-    the first match in an arbitrary order would attribute `mcp__curie-state__get`
-    to `curie` and leave a remainder that is not a tool name. Ordering the
-    servers longest name first is what makes the answer deterministic, and
-    asserting only one of these two names would pass against a check that knew
-    about one server and not the other.
+    `curie` is a prefix of `curie-state`, so a check that answered by walking
+    server prefixes could attribute `mcp__curie-state__get` to `curie` and leave
+    a remainder that is not a tool name. Exact membership in the union of what
+    both servers publish has no ordering to get wrong, and asserting only one of
+    these two names would pass against a set that knew about one server and not
+    the other.
     """
 
-    gate = _gate(_policy(deny=["*/*"]))
+    gate = _gate(_policy(deny=["*/*"]), state_server_mounted=True)
     reason = _interception_reason(gate, tool_name, interceptor)
 
     assert reason == ""

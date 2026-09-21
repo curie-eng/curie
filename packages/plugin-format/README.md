@@ -134,13 +134,18 @@ Pydantic models mirroring the Claude Code shapes:
     Overlapping but *different* globs are legal and resolve by precedence. A
     policy with all three collections empty warns (`tool_policy.denies_everything`)
     but still validates: it denies everything, which is coherent.
-  - **DECLARATION-ONLY today.** Nothing enforces a `toolPolicy` at runtime yet;
-    that lane is a **blocking follow-up**, and **no bundle may ship a `toolPolicy`
-    until it lands**. The residual gap, stated rather than discovered: a platform
-    built before this package version does not model the key at all, and the
-    lenient `PluginManifest` accepts and silently ignores it. Nothing in this
-    package can reach such a platform — the `enforcement` discriminator and the
-    handshake only gate consumers that already parse the field.
+  - **Declared here, enforced by the runner** (#2119). Both of the runner's
+    interception points, the SDK permission callback and the PreToolUse hook,
+    take the decision through one shared
+    `runner/src/curie_runner/approval.py::_decide_gate`, and an unmatched MCP
+    tool is DENIED. Nothing in this package enforces anything: `validate_bundle`
+    and `load_tool_policy` both refuse a policy-bearing bundle unless the caller
+    names `curie/mcp-tool-policy@1`, which is how "declared" and "enforced" are
+    kept from drifting apart. The residual gap, stated rather than discovered: a
+    platform built before this package version does not model the key at all,
+    and the lenient `PluginManifest` accepts and silently ignores it. Nothing in
+    this package can reach such a platform — the `enforcement` discriminator and
+    the handshake only gate consumers that already parse the field.
 - `scripts/` is a directory convention (no manifest schema of its own).
 
 `validate_bundle(path) -> ValidationResult` is the entry point the bundle pipeline calls. It
