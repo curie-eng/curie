@@ -5486,6 +5486,70 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn message_value_flags(path: &[&str]) -> std::collections::BTreeSet<String> {
+        let root = Cli::command();
+        let mut command = &root;
+        let mut flags = std::collections::BTreeSet::new();
+
+        for (index, name) in path.iter().enumerate() {
+            let is_leaf = index + 1 == path.len();
+            for arg in command.get_arguments() {
+                if (!is_leaf && !arg.is_global_set()) || !arg.get_action().takes_values() {
+                    continue;
+                }
+                if let Some(long) = arg.get_long() {
+                    flags.insert(format!("--{long}"));
+                }
+            }
+            command = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing command path component {name:?}"));
+        }
+
+        for arg in command.get_arguments() {
+            if arg.get_action().takes_values() {
+                if let Some(long) = arg.get_long() {
+                    flags.insert(format!("--{long}"));
+                }
+            }
+        }
+
+        flags
+    }
+
+    fn message_value_flags_from_source() -> std::collections::BTreeSet<String> {
+        let source = include_str!("message.rs");
+        let body = source
+            .split("const MESSAGE_VALUE_FLAGS: &[&str] = &[")
+            .nth(1)
+            .and_then(|rest| rest.split_once("];"))
+            .map(|(body, _)| body)
+            .expect("message.rs must contain MESSAGE_VALUE_FLAGS");
+
+        body.lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|flag| flag.strip_suffix("\","))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn message_preflight_value_flags_match_clap_command_graph() {
+        let mut derived = message_value_flags(&["local", "message"]);
+        derived.extend(message_value_flags(&["cluster", "message"]));
+        let source = message_value_flags_from_source();
+        let missing: Vec<_> = derived.difference(&source).cloned().collect();
+        let stale: Vec<_> = source.difference(&derived).cloned().collect();
+
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "message value flag inventory drifted from clap: missing={missing:?}, stale={stale:?}, derived={derived:?}, source={source:?}"
+        );
+    }
+
     /// Serializes the `cluster_connector_bind_values` cases that mutate the
     /// process environment, for the same reason and with the same limits as
     /// `GITHUB_TOKEN_ENV_LOCK` below: `set_var` is not thread-safe against a
