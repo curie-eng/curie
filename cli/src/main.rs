@@ -2279,11 +2279,14 @@ enum ClusterAction {
     },
     /// Run the resumable cluster upgrade lifecycle to a target version.
     ///
-    /// Plans, validates, drains accepted work, checkpoints, migrates, applies,
-    /// proves exact convergence, runs a target-version canary, and records the
-    /// new known-good revision. The operator does not pass Helm merge flags.
-    /// A failed attempt either leaves the previous known-good version serving
-    /// or returns one fail-forward command. See issue #2301.
+    /// Plans, validates, checks the worker workload is reachable, checkpoints,
+    /// migrates, applies, proves exact convergence, runs a target-version
+    /// canary, and records the new known-good revision. The worker drain gate
+    /// itself is the chart's own pre-upgrade Helm hook, which runs during
+    /// apply and is observed at the convergence step. The operator does not
+    /// pass Helm merge flags. A failed attempt either leaves the previous
+    /// known-good version serving or returns one fail-forward command. See
+    /// issue #2301.
     Upgrade {
         /// Target Curie version (chart/app version) to upgrade to.
         #[arg(long = "to", value_name = "VERSION")]

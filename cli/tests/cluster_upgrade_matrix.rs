@@ -409,7 +409,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         [
             "plan",
             "validate",
-            "drain",
+            "drain_preflight",
             "checkpoint",
             "migrate",
             "apply",
@@ -472,7 +472,7 @@ fn self_test_checks_shard_coverage_and_timing() {
 }
 
 const GOOD_SHARDS: &str = "s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
-s02 setup fail-every-phase:plan+validate+drain
+s02 setup fail-every-phase:plan+validate+drain_preflight
 s03 setup fail-every-phase:checkpoint+migrate+apply
 s04 setup fail-every-phase:converge
 s05 setup fail-every-phase:canary
