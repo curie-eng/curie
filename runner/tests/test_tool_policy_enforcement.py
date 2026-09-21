@@ -44,7 +44,6 @@ from curie_runner.approval import (
     policy_disallowed_tools,
     resolve_approval_policy,
 )
-from curie_runner.state import STATE_TOOL_NAMES
 from mcp import Tool
 from mcp.types import ToolAnnotations
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, ToolPolicy
@@ -553,6 +552,13 @@ def test_a_tool_the_platform_adds_later_is_exempt_without_a_second_list(
     literal names this file pins, so a rename that breaks the live wire format
     still reddens.
     """
+
+    # Function-local on purpose. STATE_TOOL_NAMES does not exist on the base,
+    # so importing it at module scope would make every test in this file fail to
+    # COLLECT whenever the product hunks are reversed, and a collection error is
+    # not attributable to any one test. The fix-pin verifier refuses that, and
+    # so should a reader trying to tell which assertion actually bit.
+    from curie_runner.state import STATE_TOOL_NAMES
 
     gate = _production_sre_gate(managed_workspace=False)
 
