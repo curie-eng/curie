@@ -133,11 +133,6 @@ if program == "helm":
         # JSON documents are YAML documents too; no optional YAML dependency.
         print("\n---\n".join(json.dumps(item) for item in expected))
         sys.exit(0)
-    if args[0] == "history":
-        # #2856 reads history before upgrade --install. These fixtures are a
-        # fresh install: a missing release is an empty history, not a driver miss.
-        print("Error: release: not found", file=sys.stderr)
-        sys.exit(1)
     if args[0] == "status":
         if "json" in args:
             if scenario == "degraded-then-hung":
