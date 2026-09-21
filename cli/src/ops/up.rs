@@ -1952,7 +1952,7 @@ fn complete_up_opts_without_runner_egress(
         stamp_config_schema(&mut opts, &outcome);
         overlay_migration_results(&mut opts, &outcome.values, &operator_sets);
         if overlay_live {
-            overlay_live_operator_values(&mut opts, &outcome.values, &operator_sets);
+            overlay_live_operator_values(&mut opts, &outcome.values, &operator_sets)?;
         }
         migrated_owned = Some(outcome.values);
         migrated_owned.as_ref()
@@ -2082,9 +2082,9 @@ fn overlay_live_operator_values(
     opts: &mut UpOpts,
     values: &serde_json::Value,
     operator_sets: &[String],
-) {
+) -> Result<()> {
     let overridden = overlay_overridden_keys(opts, operator_sets);
-    overlay_json(opts, values, "", &overridden);
+    overlay_json(opts, values, "", &overridden)
 }
 
 fn overlay_family_is_managed(key: &str) -> bool {
@@ -2124,20 +2124,16 @@ fn overlay_secret_refs(
         return;
     };
     for (key, child) in map {
-        let path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
+        let path = join_escaped_helm_set_path(prefix, key);
         if is_external_secret_ref_key(&path)
             && !overridden.contains(&path)
             && !is_retained_mail_key(&path)
         {
             match child {
-                serde_json::Value::String(raw) if raw.is_empty() => {}
                 serde_json::Value::String(raw) => opts
                     .set_string
                     .push(format!("{path}={}", escape_helm_set_string_value(raw))),
+                serde_json::Value::Null => opts.set.push(format!("{path}=null")),
                 _ => {}
             }
         }
@@ -2180,64 +2176,73 @@ fn escape_helm_set_key_segment(key: &str) -> String {
     key.replace('\\', "\\\\").replace('.', "\\.")
 }
 
+fn join_escaped_helm_set_path(prefix: &str, key: &str) -> String {
+    let key = escape_helm_set_key_segment(key);
+    if prefix.is_empty() {
+        key
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
 fn overlay_json(
     opts: &mut UpOpts,
     value: &serde_json::Value,
     prefix: &str,
     overridden: &std::collections::HashSet<String>,
-) {
+) -> Result<()> {
     match value {
-        serde_json::Value::Object(map) => {
+        serde_json::Value::Object(map) if !map.is_empty() => {
             for (key, child) in map {
-                let key = escape_helm_set_key_segment(key);
-                let path = if prefix.is_empty() {
-                    key
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                overlay_json(opts, child, &path, overridden);
+                let path = join_escaped_helm_set_path(prefix, key);
+                overlay_json(opts, child, &path, overridden)?;
             }
         }
-        serde_json::Value::Array(items) => {
+        serde_json::Value::Array(items) if !items.is_empty() => {
             for (index, child) in items.iter().enumerate() {
-                overlay_json(opts, child, &format!("{prefix}[{index}]"), overridden);
+                overlay_json(opts, child, &format!("{prefix}[{index}]"), overridden)?;
             }
         }
-        serde_json::Value::Null => {}
         other => {
             if prefix.is_empty() {
-                return;
+                return Ok(());
             }
             if prefix == "config.schemaVersion" || prefix == "config.migratedFrom" {
-                return;
+                return Ok(());
             }
             if is_retained_mail_key(prefix) {
-                return;
+                return Ok(());
             }
             if overridden.contains(prefix)
                 || overridden.iter().any(|key| {
                     key_is_or_descends_from(prefix, key) || key_is_or_descends_from(key, prefix)
                 })
             {
-                return;
+                return Ok(());
             }
             if overlay_family_is_managed(prefix) && !is_external_secret_ref_key(prefix) {
-                return;
+                return Ok(());
             }
             if is_secret_value_key(prefix) && !is_external_secret_ref_key(prefix) {
-                return;
+                return Ok(());
             }
             match other {
-                serde_json::Value::String(raw) if raw.is_empty() => {}
+                serde_json::Value::Object(_) => {
+                    bail!("refusing to retain empty object at {prefix}");
+                }
+                serde_json::Value::Array(_) => {
+                    bail!("refusing to retain empty array at {prefix}");
+                }
+                serde_json::Value::Null => opts.set.push(format!("{prefix}=null")),
                 serde_json::Value::String(raw) => opts
                     .set_string
                     .push(format!("{prefix}={}", escape_helm_set_string_value(raw))),
                 serde_json::Value::Bool(flag) => opts.set.push(format!("{prefix}={flag}")),
                 serde_json::Value::Number(number) => opts.set.push(format!("{prefix}={number}")),
-                _ => {}
             }
         }
     }
+    Ok(())
 }
 
 /// Finish an already validated up plan with the one live values read and, when
@@ -5140,7 +5145,8 @@ mod tests {
     fn up_invents_no_slack_trusted_origins_when_none_is_recorded() {
         for existing in [
             Some(serde_json::json!({ "worker": { "slackTrustedOrigins": "" } })),
-            Some(serde_json::json!({ "worker": {} })),
+            // An absent worker tree is not the explicit empty map that now refuses.
+            Some(serde_json::json!({})),
             None,
         ] {
             let opts = complete_up_opts_without_runner_egress(
