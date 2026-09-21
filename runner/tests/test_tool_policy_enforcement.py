@@ -487,6 +487,34 @@ def test_a_tool_from_an_undeclared_server_is_refused_at_both_interception_points
     _assert_no_approval_was_recorded(gate)
 
 
+def test_the_shipped_sre_bundle_can_still_reach_its_channel_memory() -> None:
+    """The #2286 fix pin: one test, one assertion, the shipped policy.
+
+    Deliberately NOT parametrized, and deliberately the whole refused set in a
+    single assertion. The fix-pin verifier reverses this change's product hunks,
+    runs exactly this node, and requires the report to carry one testcase and
+    one failure; a parametrized twin of this test produces ten failures and is
+    refused as unattributable. The broader coverage lives in the parametrized
+    tests below, which also drive the hook. This one exists to be the pin.
+
+    Reversed, every name here comes back "denied by this agent's tool policy".
+    """
+
+    gate = _production_sre_gate(managed_workspace=False)
+
+    refused = [
+        tool_name
+        for tool_name in _CHANNEL_MEMORY_TOOLS
+        if "denied by this agent's tool policy"
+        in _interception_reason(gate, tool_name, "callback")
+    ]
+
+    assert refused == [], (
+        "a bundle's toolPolicy refused the platform's own channel-memory tools;"
+        " the bundle cannot declare curie-state, so it can never allow them"
+    )
+
+
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])
 @pytest.mark.parametrize(
     "tool_name",
