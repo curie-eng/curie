@@ -9,6 +9,16 @@ The load-bearing test is `test_a_denied_tool_is_refused_by_the_hook_not_only_the
 lives only there is bypassable, which is #1852. A policy enforced only in the
 callback would be a policy a bundle can walk around by declaring its own
 permissions, and every other test here would still pass.
+
+The second cluster here is the mirror-image failure, #2286. Curie mounts its own
+MCP servers (`curie`, `curie-state`) that a bundle is forbidden from declaring,
+so the bundle's policy has nothing to classify them against and the fail-closed
+default refuses them. The agent then sees its own channel memory and its own
+approval path answer "denied by this agent's tool policy, do not retry". That
+is a refusal with no audience, over a capability the bundle never governed. These
+tests pin the scope rule (ADR-0139): platform-owned servers are outside a
+bundle's `toolPolicy`, decided by the SERVER, never by a list of tool names, and
+the deny-by-default that defends every genuinely undeclared server stays.
 """
 
 from collections.abc import AsyncIterator
@@ -108,6 +118,26 @@ def _production_sre_gate(*, managed_workspace: bool) -> ApprovalGate:
     )
     assert gate is not None
     return gate
+
+
+def _interception_reason(
+    gate: ApprovalGate,
+    tool_name: str,
+    interceptor: str,
+    tool_input: dict[str, Any] | None = None,
+) -> str:
+    """The refusal one interception point produced, in its own words, or "".
+
+    Both points share `_decide_gate` and must not disagree, so a test asking
+    "was this refused, and by whom" should not also have to know which of the
+    two result shapes the answer arrived in.
+    """
+
+    if interceptor == "hook":
+        result = _hook_call(gate, tool_name, tool_input)
+        return _reason(result) if _denied(result) else ""
+    outcome = anyio.run(build_can_use_tool(gate), tool_name, tool_input or {}, None)
+    return outcome.message if isinstance(outcome, PermissionResultDeny) else ""
 
 
 def _assert_no_approval_was_recorded(gate: ApprovalGate) -> None:
@@ -387,3 +417,292 @@ def test_the_callback_agrees_with_the_hook(tool: str) -> None:
     callback = build_can_use_tool(gate)
     result = anyio.run(callback, tool, {}, None)
     assert type(result).__name__ == "PermissionResultDeny"
+
+
+# --------------------------------------------------------------------------- #
+# Platform-owned MCP servers are outside a bundle's toolPolicy (#2286)
+#
+# `curie` and `curie-state` are mounted by the runner, and a bundle cannot
+# declare them (`plugin_format.connectors.RESERVED_CONNECTOR_NAMES` refuses the
+# names at deploy). A bundle therefore cannot express a policy over them, so
+# classifying them against one can only ever produce the unmatched default.
+# Spelled as literal live names on purpose: these are the strings the SDK puts
+# on the wire, and deriving them from the constants under test would make a
+# rename of either server invisible here.
+
+_CHANNEL_MEMORY_TOOLS = [
+    "mcp__curie-state__get",
+    "mcp__curie-state__set",
+    "mcp__curie-state__append",
+    "mcp__curie-state__list",
+    "mcp__curie-state__delete",
+]
+
+# Publication refuses a request it cannot record, so its two fields ride every
+# call to it. Nothing else here reads tool_input.
+_PUBLISH_INPUT = {"title": "Workspace tool check", "body": "prior-turn marker"}
+
+
+def _input_for(tool_name: str) -> dict[str, Any]:
+    return dict(_PUBLISH_INPUT) if tool_name == PLATFORM_PUBLISH_TOOL_NAME else {}
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+def test_a_tool_from_an_undeclared_server_is_refused_at_both_interception_points(
+    interceptor: str,
+) -> None:
+    """The fail-closed default, pinned where the decision is taken rather than
+    where the name is mapped.
+
+    Mutation this exists to catch, and the one the implementer must run: in
+    `_tool_policy_outcome`, change `if canonical is None: return
+    ToolPolicyDecision.DENY` to `return None`. The whole suite stayed green
+    under that mutation on the pre-fix base, because every other test reaches
+    DENY through a pattern that matched. Widening the platform exemption is
+    exactly the edit that invites a reader to relax this branch, so the
+    exemption and its guard must land together.
+    """
+
+    gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
+    reason = _interception_reason(gate, "mcp__not-declared__whatever", interceptor)
+
+    assert "denied by this agent's tool policy" in reason
+    # A refusal, not a request: an undeclared server has no audience to ask.
+    _assert_no_approval_was_recorded(gate)
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize(
+    "tool_name",
+    [*_CHANNEL_MEMORY_TOOLS, APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME],
+)
+def test_every_platform_owned_tool_escapes_the_production_sre_tool_policy(
+    tool_name: str, interceptor: str
+) -> None:
+    """The defect, read from the shipped bundle rather than a fixture.
+
+    The production SRE policy names only `kubernetes/*`, `grafana/*`, `tempo/*`
+    and `self-upgrade/*`, which is the only policy it CAN name: the bundle is
+    forbidden from declaring `curie` or `curie-state`. Every ADR-0095 channel
+    memory tool therefore fell through to the deny default, and the agent was
+    told its own memory was forbidden and not to retry. Loading the real bundle
+    keeps this test tracking the policy that actually ships, so a future policy
+    edit cannot quietly make the platform reachable for the wrong reason.
+
+    `managed_workspace=True` throughout, so publication is gated exactly as the
+    existing publication regression gates it; the channel-memory names are not
+    in `gate.required` under either setting.
+    """
+
+    gate = _production_sre_gate(managed_workspace=True)
+
+    reason = _interception_reason(gate, tool_name, interceptor, _input_for(tool_name))
+
+    assert "denied by this agent's tool policy" not in reason
+    if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
+        # Blocked, and rightly so: the platform permission gate still owns
+        # publication. Outside policy scope is not permission to run.
+        assert gate.pending_gate_kind == "permission"
+        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+    else:
+        _assert_no_approval_was_recorded(gate)
+
+    # A negative pin, not a restoration. The capability probe only ever observes
+    # connector and bundle MCP servers, so a platform name never reaches this
+    # projection in production and no catalog delta is expected from the fix.
+    # Asserted anyway so the projection and the two interception points cannot
+    # drift into disagreeing about the same name.
+    assert policy_disallowed_tools(gate, [tool_name]) == ()
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+def test_a_tool_the_platform_adds_later_is_outside_policy_scope_too(
+    interceptor: str,
+) -> None:
+    """The reason the exemption is a server set and not a list of tool names.
+
+    Two exact names were exempted when publication landed, so every tool added
+    to a platform server afterwards was denied on arrival. That is how channel
+    memory broke, and re-enumerating names would let it break again the next
+    time the platform grows a tool.
+    """
+
+    gate = _production_sre_gate(managed_workspace=False)
+    reason = _interception_reason(gate, "mcp__curie__some_future_tool", interceptor)
+
+    assert "denied by this agent's tool policy" not in reason
+    _assert_no_approval_was_recorded(gate)
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize(
+    ("pattern", "tool_name"),
+    [
+        ("*/get", "mcp__curie-state__get"),
+        ("*/publish_changes", PLATFORM_PUBLISH_TOOL_NAME),
+    ],
+    ids=["channel-memory", "publication"],
+)
+def test_a_wildcarded_server_segment_cannot_reach_a_platform_tool(
+    pattern: str, tool_name: str, interceptor: str
+) -> None:
+    """The deploy validator never cross-checks a wildcarded server segment, by
+    design, so `*/get` is the one pattern shape that can be written against a
+    server the bundle may not name.
+
+    It is inert, and this is where that is true rather than merely intended: the
+    exemption is taken before `classify_tool` is ever consulted, so the pattern
+    has nothing to match. If the exemption were ever moved after classification,
+    a bundle could fence its own approval path with one wildcard.
+    """
+
+    gate = _gate(_policy(deny=[pattern]))
+    reason = _interception_reason(gate, tool_name, interceptor, _input_for(tool_name))
+
+    assert reason == ""
+    _assert_no_approval_was_recorded(gate)
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize(
+    "tool_name", ["mcp__curie-state__get", APPROVAL_TOOL_NAME], ids=["state", "curie"]
+)
+def test_each_platform_server_covers_its_own_tools(
+    tool_name: str, interceptor: str
+) -> None:
+    """Both directions of the overlapping-name pair, in one table.
+
+    `curie` is a prefix of `curie-state`, so an ownership check that stopped at
+    the first match in an arbitrary order would attribute `mcp__curie-state__get`
+    to `curie` and leave a remainder that is not a tool name. Ordering the
+    servers longest name first is what makes the answer deterministic, and
+    asserting only one of these two names would pass against a check that knew
+    about one server and not the other.
+    """
+
+    gate = _gate(_policy(deny=["*/*"]))
+    reason = _interception_reason(gate, tool_name, interceptor)
+
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__curie-stat__get",
+        "mcp__curie-state-archive__get",
+        "mcp__curiestate__get",
+        "mcp__curied__get",
+    ],
+)
+def test_a_server_that_merely_shares_a_platform_prefix_is_still_refused(
+    tool_name: str,
+) -> None:
+    """The companion negative: ownership is the whole `mcp__<server>__` prefix.
+
+    A check written as a bare `startswith("mcp__curie")` would answer yes for
+    every name here, and each one is a server the bundle never declared. Without
+    this table, a prefix check and an exact-prefix check are indistinguishable.
+    """
+
+    gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
+    assert "denied by this agent's tool policy" in _interception_reason(
+        gate, tool_name, "hook"
+    )
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+def test_a_plugin_mounted_bundle_server_named_curie_stays_inside_policy_scope(
+    interceptor: str,
+) -> None:
+    """The bypass a substring check would hand a bundle.
+
+    Nothing stops a bundle from calling one of its own MCP servers `curie`: the
+    reserved-name refusal covers connectors, and a plugin mount is namespaced
+    instead, arriving as `mcp__plugin_<bundle>_curie__<tool>`. That name
+    contains the platform server's name and is not the platform, so it must
+    stay fully governed. An implementation matching on `"curie" in tool_name`
+    would let a bundle mint an unpoliced server by naming it after the platform.
+    """
+
+    gate = ApprovalGate(
+        tool_policy=_policy(allow=["curie/read_state"]),
+        bundle_name="sre-bot",
+        mcp_servers={"curie"},
+        connector_servers=set(),
+    )
+    reason = _interception_reason(
+        gate, "mcp__plugin_sre-bot_curie__delete_everything", interceptor
+    )
+
+    assert "denied by this agent's tool policy" in reason
+    _assert_no_approval_was_recorded(gate)
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize(
+    ("policy", "refused"),
+    [(_policy(deny=["curie-docs/search"]), True), (_policy(allow=["curie-docs/search"]), False)],
+    ids=["denied", "allowed"],
+)
+def test_a_connector_named_after_the_platform_still_obeys_its_policy(
+    policy: ToolPolicy, refused: bool, interceptor: str
+) -> None:
+    """`RESERVED_CONNECTOR_NAMES` fences two exact names, not the `curie-`
+    prefix, so `curie-docs` is a connector a bundle may legitimately ship.
+
+    Both rulings are asserted: exempting it would silently unpolice a real
+    connector, and refusing it outright would make the deny rule unfalsifiable.
+    """
+
+    gate = ApprovalGate(
+        tool_policy=policy,
+        bundle_name="sre-bot",
+        mcp_servers=set(),
+        connector_servers={"curie-docs"},
+    )
+    reason = _interception_reason(gate, "mcp__curie-docs__search", interceptor)
+
+    assert ("denied by this agent's tool policy" in reason) is refused
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["mcp__curie__", "mcp__curie-state__"], ids=["curie", "state"]
+)
+def test_a_platform_prefix_with_no_tool_left_ends_at_the_deny_default(
+    tool_name: str,
+) -> None:
+    """`mcp__curie__` names no tool, so nothing owns it and nothing may exempt it.
+
+    `canonical_tool_name` already refuses this shape rather than inventing an
+    empty tool, and the ownership check has to agree: treating a bare prefix as
+    platform-owned would turn a malformed name into a pass.
+    """
+
+    gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
+    assert "denied by this agent's tool policy" in _interception_reason(
+        gate, tool_name, "hook"
+    )
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+def test_an_operator_gate_on_a_platform_tool_still_blocks(interceptor: str) -> None:
+    """Outside policy scope is not permission to run (ADR-0139).
+
+    The exemption answers one question only: whether the bundle's policy has
+    anything to say about this call. The operator gate, the bundle's
+    `approvalPolicy` and the platform's own gates all still apply afterwards. An
+    implementation that returned early from the decision instead of only from
+    the classification would hollow out the operator layer while every
+    policy test here stayed green.
+    """
+
+    gate = _gate(
+        _policy(allow=["k8s-write/restart_deployment"]),
+        required=frozenset({APPROVAL_TOOL_NAME}),
+    )
+    reason = _interception_reason(gate, APPROVAL_TOOL_NAME, interceptor)
+
+    assert reason != "", "an operator-gated platform tool must stay gated"
+    assert "denied by this agent's tool policy" not in reason
+    assert gate.pending_summary is not None, "and it must still ask a human"

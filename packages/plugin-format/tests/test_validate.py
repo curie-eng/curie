@@ -1721,6 +1721,76 @@ def test_unknown_server_check_stays_silent_when_the_mcp_declaration_is_unreadabl
     assert "tool_policy.unknown_server" not in codes
 
 
+# --- platform-owned servers are outside policy scope (#2286) -------------------
+#
+# `curie` and `curie-state` are mounted by the runner and refused to a bundle by
+# RESERVED_CONNECTOR_NAMES, so a pattern naming one can never be made valid by
+# following the unknown_server advice: declaring the server is the one fix the
+# author is not allowed to apply. The runtime exempts these servers from policy
+# outright, so the pattern is also inert. Both halves have to be said at deploy,
+# where the author is still looking.
+
+
+@pytest.mark.parametrize(
+    "pattern", ["curie/request_approval", "curie-state/get"], ids=["curie", "state"]
+)
+def test_a_pattern_naming_a_platform_server_says_so_instead_of_unknown_server(
+    tmp_path: Path, pattern: str
+) -> None:
+    """The authoring trap: the generic advice sends the author in a circle.
+
+    "Fix the server name, declare the server, or use a wildcard" is good advice
+    for a typo and a dead end for a reserved name, because the connector
+    validator refuses the declaration it just asked for. The absence of that
+    sentence is asserted explicitly, not only the presence of a new code.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["' + pattern + '"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    codes = _tool_policy_codes(bundle)
+    assert "tool_policy.platform_server" in codes
+    assert "tool_policy.unknown_server" not in codes
+
+    issue = next(i for i in result.errors if i.code == "tool_policy.platform_server")
+    assert pattern.split("/")[0] in issue.message
+    assert "platform" in issue.message.lower()
+    assert "outside" in issue.message.lower()
+    assert "declare the server" not in issue.message
+
+
+def test_a_misspelled_undeclared_server_still_reports_unknown_server(
+    tmp_path: Path,
+) -> None:
+    """The negative control for the branch above: it narrowed nothing.
+
+    A reserved-name branch placed carelessly ahead of the cross-check could
+    swallow every literal segment and leave real typos unreported, which is the
+    inert-rule defect the cross-check was built for in the first place.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["grafanaa/get_datasource"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    codes = _tool_policy_codes(bundle)
+    assert "tool_policy.unknown_server" in codes
+    assert "tool_policy.platform_server" not in codes
+
+    issue = next(i for i in result.errors if i.code == "tool_policy.unknown_server")
+    assert "grafanaa" in issue.message
+    assert "declare the server" in issue.message
+
+
 def test_a_policy_denying_everything_warns_but_still_validates(tmp_path: Path) -> None:
     """Three empty collections deny every tool: coherent, so a WARNING, not an error.
 

@@ -708,6 +708,39 @@ def test_the_reserved_list_matches_the_runner_constants() -> None:
     assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
 
 
+def test_the_platform_server_set_matches_the_reserved_list_and_the_boot_mount(
+    tmp_path, monkeypatch
+) -> None:
+    # #2286. The runner decides toolPolicy scope by SERVER, so there is now a
+    # third copy of the platform server list and it is the one an authorization
+    # decision reads. Direction of truth is unchanged: RESERVED_CONNECTOR_NAMES
+    # in plugin_format is the source, because runner depends on plugin_format
+    # and never the reverse, and it is the set the deploy validator uses to
+    # refuse a colliding connector. The runner constant mirrors it.
+    #
+    # Pinned against the boot mount as well, not against the reserved list
+    # alone: two constants can agree with each other and both be wrong about
+    # what this boot actually mounted. A platform server mounted without being
+    # added to both sets is denied for every policy-bearing bundle, which is
+    # exactly the present defect recurring, so this reddens instead.
+    #
+    # The import is function-local on purpose. PLATFORM_MCP_SERVER_NAMES does
+    # not exist until the fix lands, and a module-level import would turn every
+    # other test in this file red for a reason that has nothing to do with them.
+    from curie_runner.approval import PLATFORM_MCP_SERVER_NAMES
+
+    assert PLATFORM_MCP_SERVER_NAMES == RESERVED_CONNECTOR_NAMES
+
+    env = _boot_env(monkeypatch, tmp_path, "platform-set")
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
+
+    assert set(mounted) == set(PLATFORM_MCP_SERVER_NAMES)
+
+
 # --------------------------------------------------------------------------- #
 # An agent name that forges the object-name join -- #1446
 #
