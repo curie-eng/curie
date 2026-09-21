@@ -90,7 +90,7 @@ than an open bag of `gen_ai.*` names.
 - The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
   contract for operational counters, histograms, and gauges across turn, queue,
   thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
-  background-loop, eval work, and supervised-task restarts. `record_metric`
+  background-loop, eval work, transcript-capacity, and supervised-task restarts. `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, agent, or
@@ -270,13 +270,16 @@ model attribute the backend recognizes for the span to ingest as a generation ra
 an untyped span, and the Langfuse read-side integration test seeds both spellings
 (`apps/api/tests/test_langfuse_integration.py`). A second backend inherits the duplicate.
 
-The two hoist readers bind those keys through the closed enum:
+The three hoist readers bind those keys through the closed enum:
 `_SANDBOX_ATTR` (`apps/api/src/curie_api/langfuse.py::_SANDBOX_ATTR`) is
 `SpanAttributeKey.CURIE_SANDBOX_ID.value` and `_APPROVAL_DECISION_ATTR`
 (`apps/api/src/curie_api/langfuse.py::_APPROVAL_DECISION_ATTR`) is
 `SpanAttributeKey.APPROVAL_DECISION.value`, read by `hoist_sandbox_id` and
 `hoist_approval_decision`
-(`apps/api/src/curie_api/langfuse.py::hoist_approval_decision`). The remaining leak
+(`apps/api/src/curie_api/langfuse.py::hoist_approval_decision`). `_TOOL_NAME_ATTR`
+(`apps/api/src/curie_api/langfuse.py::_TOOL_NAME_ATTR`) is
+`SpanAttributeKey.TOOL_NAME.value` and is surfaced as `toolName` on each observation
+node. The remaining leak
 is the three `langfuse.*` writer attributes (`langfuse.trace.name`,
 `langfuse.session.id`, `langfuse.user.id`) and the `/langfuse` URL namespace.
 

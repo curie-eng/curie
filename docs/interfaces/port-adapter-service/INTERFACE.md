@@ -171,12 +171,14 @@ service is material:
   `AgentChannel`, and the channel router validates a scoped token against that
   binding's row id and generation before it enqueues a turn. The route facts
   (`endpoint`, `adapter`) come from the binding row rather than ingress input.
-- **The interactivity return path has no scoped adapter credential.** Approval
-  resolution sits behind the platform-wide key, and the scoped token minted for
-  the sandbox is deliberately rejected everywhere but the state router. A
-  scoped adapter credential for that return path remains a prerequisite of a
-  third-party adapter rather than a follow-up to the first-party HTTP-edge
-  adapters already shipped.
+- **Fixed (#2806, ADR-0154): the interactivity return path has a scoped adapter
+  credential.** `apps/api/src/curie_api/adapter_principal.py` mints an `adp`
+  credential carrying only `channels:token`, `approvals:read`, and
+  `approvals:resolve` for the binding ids it serves. The approval boundary now
+  recognizes the `adapter` kind
+  (`apps/api/src/curie_api/authorizer.py::PrincipalKind`), and an adapter can
+  resolve only routes backed by an explicit user list. It no longer needs the
+  platform-wide key at runtime for the return path.
 - **Packaging, installation, discovery, lifecycle, and conformance remain
   unbuilt.** A binding's configured route is not an adapter registry or an
   install experience, and the generic HTTP edges do not establish a supported
@@ -193,4 +195,4 @@ service is material:
 - **Related seam:** [channel-interaction](../channel-interaction/INTERFACE.md) — the neutral interaction primitives used by the reply edge; they are not a third-party adapter conformance contract.
 - **Epic(s):** #19 — per-turn reply endpoint routing, which the generic egress edge builds on; #158 — multi-tenancy, deliberately out of scope until it settles what a tenant owns
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the standing restraint that no speculative adapter layer is written ahead of a real second implementation; this is not one of the six swap-readiness Jobs, so it is not separately graded
-- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary
+- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md), the scoped credential and authenticated adapter principal; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary

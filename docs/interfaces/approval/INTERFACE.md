@@ -361,7 +361,7 @@ names as unrecognized on purpose, so arming one still trips the existing
 **One authorizer** (`apps/api/src/curie_api/authorizer.py`, pure policy with no Slack in
 it) over **three approver sets** behind the `ApproverSet` port (ADR-0034), after an
 independent authentication boundary resolves one of ADR-0106's `chat`, `console`, or
-`operator` principals. A set answers only "is this actor in the set"; every rule that is
+`operator` principals, or ADR-0154's `adapter` principal. A set answers only "is this actor in the set"; every rule that is
 not membership lives in the authorizer, applied identically whatever the set. Requester
 equality is deliberately not a rule: the selected set is always consulted, so a requester
 who belongs may confirm and one who does not remains denied. A deployment that needs
@@ -400,7 +400,7 @@ Slack feature.
   IDs**: the binding schema rejects anything that is not a Slack `U`/`W`-prefixed ID
   (`apps/api/src/curie_api/schemas.py::_SLACK_USER_ID`), never a handle or a name, so even this
   "Slack-free" set is expressed in Slack-shaped identifiers. It is the only set eligible
-  for `operator` principals; Console principals may use it or a verified user group. The
+  for `operator` and `adapter` principals; Console principals may use it or a verified user group. The
   authenticated subject must appear in the selected set.
 
 Platform-RBAC remains the epic's fourth set and is not built.
@@ -499,6 +499,10 @@ find out. The authorizer fails closed on it, and it is deliberately never collap
 reasons, and telling a clicker the first when the second is true sends them arguing with
 policy over an outage.
 
+`operator_eligible` governs both channel-less principal kinds, `operator` and `adapter`.
+Only `ExplicitUsers` sets it, so neither principal can inherit a channel or user-group
+membership proof.
+
 The two Slack sets are asymmetrical and the port does not hide it. `contains` takes
 `actor_channel` precisely because channel membership proves membership from the authenticated
 card click and performs no lookup, while the user group has no such free evidence and must
@@ -582,3 +586,4 @@ one authenticated member confirmed their own request, not that a second person r
 - **Epic(s):** [#22](https://github.com/curie-eng/curie/issues/22) — approval gates and human-in-the-loop; adds the durable record, `awaiting-approval` status, `canUseTool` gate, and the authorizer interface.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
 - **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. [ADR-0106](../../adr/0106-an-approver-is-an-authenticated-principal.md) — An approver is an authenticated principal (Accepted); removes caller-asserted resolver identity/channel, makes membership the boundary even for the requester, limits operators to explicit users, and lets Console subjects pass through the same membership sets their authenticated identity can satisfy. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
+- **Additional ADR:** [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md): Adapter principal with a scoped credential (Accepted); adds the adapter authentication boundary and restricts adapter principals to explicit-user routes.

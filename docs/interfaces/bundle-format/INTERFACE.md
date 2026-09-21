@@ -276,8 +276,12 @@ The outbound gate covers this unevenly, and the gap is worth naming.
 `examples/tests/test_plugin_compat_coverage.py` pins that each of the six manifest extensions
 appears in at least one discovered example bundle, so the gate cannot cover them vacuously, but it
 checks manifest FIELDS only. `connectors.yaml` is exercised incidentally because the weather bundle
-happens to carry one; **no example bundle carries a `deploy.yaml`**, so nothing asserts that Claude
-Code still tolerates that file, and nothing would fail if the weather connector file were removed.
+happens to carry one. `examples/sre-bot` carries a `deploy.yaml`, so the outbound gate validates a
+bundle directory containing that file and proves Claude Code tolerates it. The separate
+`examples/tests/test_sre_bot_hygiene.py` suite also requires that file and validates its Curie
+semantics, so removing it does fail coverage. The remaining unevenness is that the generic plugin
+compatibility coverage pins manifest fields only: neither Curie-only root file belongs to Claude
+Code's manifest model, and this gate does not prove their presence or semantics across bundles.
 
 The `hooks`
 field is no longer dead: as of #272 it is validated at deploy time (`HookMatcherConfig` /
