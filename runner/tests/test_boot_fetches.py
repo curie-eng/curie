@@ -17,13 +17,15 @@ from typing import Any
 
 import anyio
 import pytest
-from aiohttp import web
+from aci_protocol import ErrorEvent, Final, SessionStatus, parse_ndjson
+from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestServer
 from curie_runner import __main__ as boot
 from curie_runner.config import RunnerConfig
 from curie_runner.history import HistoryError, TurnRecord, build_conversation_replay
 from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
 from curie_runner.memory import MemoryError, MemoryRecord, format_memory_preamble
+from curie_runner.server import create_app
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
@@ -198,7 +200,7 @@ def test_boot_fetches_match_sequential_same_inputs(tmp_path: Path) -> None:
                 history_ref=str(server.make_url("/agents/A/state/transcript/t1")),
             )
             memory_store, memory_preamble = await boot._load_memory(config)
-            history_store, conversation_replay = await boot._load_history(config)
+            history_store, conversation_replay, _capped = await boot._load_history(config)
             capability = await probe_mcp_tool_capability(plugin_dir, {}, None)
             assert concurrent.memory_preamble == memory_preamble
             assert concurrent.conversation_replay == conversation_replay
@@ -267,30 +269,13 @@ def test_boot_fetches_history_failure_fails_loud(
     assert all(sensitive_body not in record.getMessage() for record in caplog.records)
 
 
-def test_boot_summary_capacity_failure_is_fatal_before_runner_construction(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    plugin_dir = _bundle(tmp_path / "bundle", mcp_command=[sys.executable, str(_SERVER)])
-    records = [
-        TurnRecord(
-            user=f"question {index}",
-            assistant="answer " + ("x" * 600),
-            ts=f"2026-07-14T00:00:{index:02d}+00:00",
-        ).to_dict()
-        for index in range(45)
-    ]
-    _replay, summary = build_conversation_replay(
-        [TurnRecord.from_dict(record) for record in records]
-    )
-    assert summary is not None
-    sensitive_body = (
-        "https://state.example.com/agents/A/state/transcript/private-key "
-        "private transcript text token-PLACEHOLDER"
-    )
-    append_attempts: list[dict[str, Any]] = []
-    durable_records = list(records)
+def _capped_history_app(
+    records: list[dict[str, Any]],
+    append_attempts: list[dict[str, Any]],
+    *,
+    append_status: int,
+    body: str,
+) -> web.Application:
     app = web.Application()
 
     async def get_memory(_request: web.Request) -> web.Response:
@@ -303,31 +288,146 @@ def test_boot_summary_capacity_failure_is_fatal_before_runner_construction(
             {
                 "namespace": "transcript",
                 "key": "t1",
-                "value": list(durable_records),
+                "value": list(records),
                 "version": 1,
             }
         )
 
     async def reject_summary(request: web.Request) -> web.Response:
         append_attempts.append(await request.json())
-        return web.Response(status=413, text=sensitive_body)
+        return web.Response(status=append_status, text=body)
 
     app.router.add_get("/agents/A/state/memory", get_memory)
     app.router.add_get("/agents/A/state/transcript/t1", get_history)
     app.router.add_post("/agents/A/state/transcript/t1/append", reject_summary)
+    return app
 
-    constructed: list[object] = []
 
-    def reject_runner_construction(*args: object, **kwargs: object) -> object:
-        constructed.append((args, kwargs))
-        raise AssertionError("runner construction must follow successful boot fetches")
+def _compactable_records() -> list[dict[str, Any]]:
+    records = [
+        TurnRecord(
+            user=f"question {index}",
+            assistant="answer " + ("x" * 600),
+            ts=f"2026-07-14T00:00:{index:02d}+00:00",
+        ).to_dict()
+        for index in range(45)
+    ]
+    _replay, summary = build_conversation_replay(
+        [TurnRecord.from_dict(record) for record in records]
+    )
+    assert summary is not None
+    return records
+
+
+def test_boot_summary_capacity_failure_serves_the_append_path_refusal(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2820: a thread already at the cap must not kill every cold sandbox.
+
+    Boot compaction's 413 used to be collapsed into a flat HistoryError, so the
+    runner died before serving and the worker retried the dropped stream as a
+    retryable runner-error. The runner now boots and answers each turn over the
+    real /v1/event route with the append path's exact non-retryable pair: one
+    history-persistence-error and one CLASSIFIED_FAILURE final.
+    """
+
+    plugin_dir = _bundle(tmp_path / "bundle", mcp_command=[sys.executable, str(_SERVER)])
+    records = _compactable_records()
+    sensitive_body = (
+        "https://state.example.com/agents/A/state/transcript/private-key "
+        "private transcript text token-PLACEHOLDER"
+    )
+    append_attempts: list[dict[str, Any]] = []
+    app = _capped_history_app(
+        records, append_attempts, append_status=413, body=sensitive_body
+    )
 
     async def reject_probe(*args: object, **kwargs: object) -> object:
         raise AssertionError("fake model boot must not start connector tools")
 
-    monkeypatch.setattr(boot, "build_runner", reject_runner_construction)
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", reject_probe)
-    caplog.set_level(logging.ERROR, logger="curie_runner")
+    caplog.set_level(logging.INFO, logger="curie_runner")
+    token = "t" * 40
+
+    async def go() -> list[list[object]]:
+        async with TestServer(app) as state_server:
+            config = _config(
+                plugin_dir,
+                memory_ref=str(state_server.make_url("/agents/A/state/memory")),
+                history_ref=str(state_server.make_url("/agents/A/state/transcript/t1")),
+            )
+            fetches = await boot._load_boot_fetches(config, True, None)
+            assert fetches.history_capacity_exceeded is True
+            runner = boot.build_runner(
+                config,
+                fake_model=True,
+                memory_store=fetches.memory_store,
+                history_store=fetches.history_store,
+                conversation_replay=fetches.conversation_replay,
+                history_capacity_exceeded=fetches.history_capacity_exceeded,
+            )
+            await runner.start()
+            turns: list[list[object]] = []
+            async with TestServer(create_app(runner, token=token)) as runner_server:
+                async with ClientSession() as http:
+                    for ts in ("1", "2"):
+                        async with http.post(
+                            runner_server.make_url("/v1/event"),
+                            json={
+                                "kind": "event",
+                                "type": "message",
+                                "text": "hi",
+                                "user": "U",
+                                "ts": ts,
+                            },
+                            headers={"Authorization": f"Bearer {token}"},
+                        ) as resp:
+                            assert resp.status == 200
+                            turns.append(parse_ndjson(await resp.text()))
+            await runner.close()
+            return turns
+
+    turns = anyio.run(go)
+
+    for events in turns:
+        assert len(events) == 2, events
+        error, final = events
+        assert isinstance(error, ErrorEvent)
+        assert error.classification == "history-persistence-error"
+        assert error.message == "conversation history capacity exceeded"
+        assert sensitive_body not in error.message
+        assert isinstance(final, Final)
+        assert final.status is SessionStatus.CLASSIFIED_FAILURE
+        assert final.text == "run failed: conversation history could not be persisted"
+    # The refusal never appends again: the durable log is left untouched.
+    assert len(append_attempts) == 1
+    assert append_attempts[0]["item"]["type"] == "summary"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "history capacity exceeded at boot" in message and "413" in message
+        for message in messages
+    )
+    assert all(sensitive_body not in message for message in messages)
+    assert all("question 0" not in message for message in messages)
+
+
+def test_boot_summary_non_capacity_failure_stays_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control: only a 413 becomes a served refusal; a 500 still fails boot."""
+
+    plugin_dir = _bundle(tmp_path / "bundle", mcp_command=[sys.executable, str(_SERVER)])
+    append_attempts: list[dict[str, Any]] = []
+    app = _capped_history_app(
+        _compactable_records(), append_attempts, append_status=500, body="boom"
+    )
+
+    async def reject_probe(*args: object, **kwargs: object) -> object:
+        raise AssertionError("fake model boot must not start connector tools")
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", reject_probe)
 
     async def go() -> None:
         async with TestServer(app) as server:
@@ -338,26 +438,12 @@ def test_boot_summary_capacity_failure_is_fatal_before_runner_construction(
             )
             with pytest.raises(BaseExceptionGroup) as caught:
                 await boot._load_boot_fetches(config, True, None)
-            public_error = repr(caught.value)
-            assert "configured structured history could not be loaded" in public_error
-            assert sensitive_body not in public_error
+            assert "configured structured history could not be loaded" in repr(
+                caught.value
+            )
 
     anyio.run(go)
-
-    assert constructed == []
     assert len(append_attempts) == 1
-    assert append_attempts[0]["item"]["type"] == "summary"
-    assert durable_records == records
-    messages = [record.getMessage() for record in caplog.records]
-    assert any(
-        "history load failed" in message
-        and "HistoryCapacityError" in message
-        and "413" in message
-        for message in messages
-    )
-    assert all(sensitive_body not in message for message in messages)
-    assert all("private-key" not in message for message in messages)
-    assert all("question 0" not in message for message in messages)
 
 
 def test_boot_fetches_probe_failure_degrades_independently(tmp_path: Path) -> None:

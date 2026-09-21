@@ -73,8 +73,11 @@ conversation, reconstructed through the selected harness adapter.
   `SummaryRecord`; ordinary appends retain the exact prefix until the next
   boundary. Compaction deliberately drops the old native checkpoint; the first
   turn over the new portable summary writes a fresh one, while later turns append
-  only deltas. A 413 while boot compaction appends its summary is a fatal boot
-  failure before the runner accepts a turn or starts a model or tool. The first
+  only deltas. A 413 while boot compaction appends its summary does not kill
+  boot: the runner serves, and every turn ends with the append path's
+  `history-persistence-error` and one `CLASSIFIED_FAILURE` final before any
+  model or tool starts, so the worker does not retry it. Any other boot
+  compaction failure is still fatal. The first
   resumed terminal result records
   `curie.history.resume.cache_read` with the provider's observed cache-read token
   count and a bounded `cache_hit` attribute.
@@ -90,7 +93,10 @@ One: **`StateApiTranscriptStore`**, backing the transcript as a per-thread
 `transcript/<thread_key>` key over the durable KV/document store landed for
 #23/#248 (`apps/api` `/agents/{agent_id}/state/{namespace}/{key}`, Postgres
 JSONB). `load` GETs the key; `append` POSTs to the key's `/append` endpoint,
-inheriting durability and the per-value/per-namespace size caps.
+inheriting durability and the per-value/per-namespace size caps. A 413 detail
+names the key over the per-value cap, or the largest key in the namespace for
+the per-namespace cap. The transcript key is the thread key, so the refusal
+names the thread to recover even when a sibling thread's append was refused.
 The loader maps rejected appends to typed `HistoryCapacityError` or
 `HistoryAppendError` values and never reads an arbitrary API response body.
 Immediately before either transcript 413, the API increments
@@ -119,13 +125,16 @@ unplanned-restart case needs no special worker/kernel branch.
 - **Capacity recovery accepts history loss.** There is no automatic data
   retention or deletion policy for the stored source. For a value cap, quiesce
   and release the affected thread, export and verify its owned key,
-  including version, digest, and records, then delete it. DELETE has no version
-  precondition, so export, verification, and deletion are not atomic. Starting
+  including version, digest, and records, then delete it with
+  `DELETE .../state/transcript/<thread_key>?expected_version=<exported version>`.
+  The delete returns 409 and keeps the row when anything was appended after the
+  export, so repeat the export instead of losing those turns. Starting
   the same thread on a fresh route accepts the historical reset. A retained
   runner with sticky durability loss needs the existing operator release before
   it can be handed off. For a namespace cap, quiesce the affected agent route,
-  export and verify only owned keys, then remove enough old owned keys to restore
-  space before retrying the target thread.
+  export and verify only owned keys, starting with the largest key the 413
+  names, then remove enough old owned keys with the same versioned delete to
+  restore space before retrying the target thread.
 - **History lives OUTSIDE the sandbox** (ADR-0003) — the store is
   network-reachable and rehydratable, never pod-local state.
 

@@ -1399,3 +1399,139 @@ def test_binding_scoped_route_accepts_the_same_scoped_token_shape_as_the_plain_r
     put = client.put(url, json={"value": {"n": 1}}, headers=headers)
     assert put.status_code == 200, put.text
     assert client.get(url, headers=headers).json()["value"] == {"n": 1}
+
+
+def test_value_cap_refusal_names_the_key_over_the_limit(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820: a transcript key is a thread key, so naming the key names the
+    # thread an operator must recover.
+    aid = _agent(client, auth_headers)
+    settings = get_settings()
+    settings.state_max_value_bytes = 50
+    try:
+        refused = client.post(
+            f"/agents/{aid}/state/transcript/thread-runaway/append",
+            json={"item": {"kind": "message", "text": "x" * 200}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+        assert "'thread-runaway'" in refused.json()["detail"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_namespace_cap_refusal_names_the_largest_thread_not_the_caller(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820: one runaway thread fills the per-agent transcript namespace and
+    # a small sibling's append is refused. The refusal must name the runaway
+    # thread, which is the one to export and delete, not only the caller.
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/transcript"
+    settings = get_settings()
+    settings.state_max_value_bytes = 10_000
+    settings.state_max_namespace_bytes = 400
+    try:
+        runaway = client.post(
+            f"{base}/thread-runaway/append",
+            json={"item": {"kind": "message", "text": "r" * 300}},
+            headers=auth_headers,
+        )
+        assert runaway.status_code == 200, runaway.text
+        small = client.post(
+            f"{base}/thread-small/append",
+            json={"item": {"kind": "message", "text": "s" * 20}},
+            headers=auth_headers,
+        )
+        assert small.status_code == 200, small.text
+
+        refused = client.post(
+            f"{base}/thread-small/append",
+            json={"item": {"kind": "message", "text": "s" * 80}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+        detail = refused.json()["detail"]
+        assert "'thread-runaway'" in detail
+        assert "largest key" in detail
+
+        # Negative control: when the caller's own key is the largest, the
+        # refusal names the caller rather than an innocent sibling.
+        refused_self = client.post(
+            f"{base}/thread-runaway/append",
+            json={"item": {"kind": "message", "text": "r" * 80}},
+            headers=auth_headers,
+        )
+        assert refused_self.status_code == 413, refused_self.text
+        assert "largest key 'thread-runaway'" in refused_self.json()["detail"]
+        assert "'thread-small'" not in refused_self.json()["detail"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_delete_with_expected_version_refuses_a_row_that_moved(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820: the documented capacity recovery exports a transcript, then
+    # deletes it. A DELETE carrying the exported version must refuse when a
+    # turn appended in between, so the recovery never destroys history it did
+    # not export.
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-recover"
+    first = client.post(
+        f"{url}/append", json={"item": {"kind": "message", "text": "one"}},
+        headers=auth_headers,
+    )
+    assert first.status_code == 200, first.text
+    exported_version = client.get(url, headers=auth_headers).json()["version"]
+    moved = client.post(
+        f"{url}/append", json={"item": {"kind": "message", "text": "two"}},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 200, moved.text
+
+    stale = client.delete(
+        url, params={"expected_version": exported_version}, headers=auth_headers
+    )
+    assert stale.status_code == 409, stale.text
+    kept = client.get(url, headers=auth_headers)
+    assert kept.status_code == 200
+    assert len(kept.json()["value"]) == 2
+
+    current = kept.json()["version"]
+    ok = client.delete(url, params={"expected_version": current}, headers=auth_headers)
+    assert ok.status_code == 204, ok.text
+    assert client.get(url, headers=auth_headers).status_code == 404
+
+    # A versioned delete of a row that no longer exists is a conflict, not a
+    # silent success: the exported version is not what is stored.
+    gone = client.delete(url, params={"expected_version": current}, headers=auth_headers)
+    assert gone.status_code == 409, gone.text
+    # The unversioned delete keeps its idempotent 204.
+    assert client.delete(url, headers=auth_headers).status_code == 204
+
+
+def test_binding_scoped_delete_honors_expected_version(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #2820 sibling path: the binding-scoped DELETE shares the versioned
+    # recovery, so a stale version never removes that partition's row.
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/bindings/slack/C000000S01/transcript/thread-b"
+    first = client.put(url, json={"value": [1]}, headers=auth_headers)
+    assert first.status_code == 200, first.text
+    moved = client.put(url, json={"value": [1, 2]}, headers=auth_headers)
+    assert moved.status_code == 200, moved.text
+
+    stale = client.delete(
+        url, params={"expected_version": first.json()["version"]}, headers=auth_headers
+    )
+    assert stale.status_code == 409, stale.text
+    assert client.get(url, headers=auth_headers).json()["value"] == [1, 2]
+
+    ok = client.delete(
+        url, params={"expected_version": moved.json()["version"]}, headers=auth_headers
+    )
+    assert ok.status_code == 204, ok.text
+    assert client.get(url, headers=auth_headers).status_code == 404
