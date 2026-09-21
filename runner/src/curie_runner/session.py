@@ -209,6 +209,26 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
     return final
 
 
+_HISTORY_CAPACITY_FINAL = Final(
+    text="run failed: conversation history could not be persisted",
+    status=SessionStatus.CLASSIFIED_FAILURE,
+)
+
+
+def _history_capacity_lines() -> tuple[str, str]:
+    """The one non-retryable capacity refusal, shared by append and boot (#2820)."""
+
+    return (
+        to_ndjson_line(
+            ErrorEvent(
+                message="conversation history capacity exceeded",
+                classification="history-persistence-error",
+            )
+        ),
+        to_ndjson_line(_HISTORY_CAPACITY_FINAL),
+    )
+
+
 class SessionRunner:
     """Drives one model session, streaming ACI NDJSON for each inbound frame."""
 
@@ -232,6 +252,7 @@ class SessionRunner:
         connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
         connector_reprobe: ConnectorReprobe | None = None,
         connector_availability: ConnectorAvailability | None = None,
+        history_capacity_exceeded: bool = False,
     ) -> None:
         self._factory = session_factory
         self._ceiling = ceiling
@@ -249,6 +270,10 @@ class SessionRunner:
         # write side, appended once per terminal turn so a restarted sandbox
         # rehydrates the thread. NullTranscriptStore when no CURIE_HISTORY_REF.
         self._history: TranscriptStore = history_store or NullTranscriptStore()
+        # Boot compaction was refused by the transcript cap (#2820). The thread
+        # cannot record another turn, so every turn is refused with the append
+        # path's capacity pair before the model is queried.
+        self._history_capacity_exceeded = history_capacity_exceeded
         # The permission gate (#245): the can_use_tool callback records a
         # blocked approval-required call here, and the turn's final is flipped
         # to awaiting-approval on the same override the policy gate uses.
@@ -500,10 +525,7 @@ class SessionRunner:
                 state.approval_display = None
                 state.approval_halt_requested = False
                 self._status = SessionStatus.CLASSIFIED_FAILURE
-                final = Final(
-                    text="run failed: conversation history could not be persisted",
-                    status=SessionStatus.CLASSIFIED_FAILURE,
-                )
+                final = _HISTORY_CAPACITY_FINAL
                 capacity_failure = True
             except TimeoutError:
                 logger.warning(
@@ -748,6 +770,20 @@ class SessionRunner:
                     parent=parent,
                 ) as gen:
                     try:
+                        if self._history_capacity_exceeded:
+                            self._history_loss_observed = True
+                            self._history_durable = False
+                            self._turn_open = False
+                            self._turn_ready = False
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = self._metric_outcome(tracker)
+                            gen.finish_turn(
+                                interrupt_requested=False,
+                                classified_failure=True,
+                            )
+                            for line in _history_capacity_lines():
+                                yield line
+                            return
                         await self._refresh_connector_failures()
                         if self._timeout_requested:
                             # Timed out during recovery: the same terminal as
@@ -1137,13 +1173,8 @@ class SessionRunner:
                         is SessionStatus.AWAITING_APPROVAL,
                     )
                     if capacity_failure:
-                        yield to_ndjson_line(
-                            ErrorEvent(
-                                message="conversation history capacity exceeded",
-                                classification="history-persistence-error",
-                            )
-                        )
-                        yield to_ndjson_line(final)
+                        for line in _history_capacity_lines():
+                            yield line
                     else:
                         yield to_ndjson_line(self._with_connector_notice(final))
                     return
@@ -1202,13 +1233,8 @@ class SessionRunner:
             completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
         )
         if capacity_failure:
-            yield to_ndjson_line(
-                ErrorEvent(
-                    message="conversation history capacity exceeded",
-                    classification="history-persistence-error",
-                )
-            )
-            yield to_ndjson_line(final)
+            for line in _history_capacity_lines():
+                yield line
         else:
             yield to_ndjson_line(self._with_connector_notice(final))
 
