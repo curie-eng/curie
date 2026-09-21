@@ -59,7 +59,12 @@ def test_spawned_process_cmdline_omits_hosted_bearer(
     import curie_runner.adapter  # noqa: F401
 
     fake = tmp_path / "claude"
-    fake.symlink_to("/bin/cat")
+    fake.write_text(
+        "#!/bin/sh\n"
+        "while IFS= read -r _; do :; done\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
     monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
     transport = subprocess_cli.SubprocessCLITransport(
         prompt="",
