@@ -131,6 +131,10 @@ The `self-upgrade` connector continues to publish `upgrade_self()` and
 approval gates. It starts pinned Job templates; it is not part of the general
 Kubernetes connector, and its kubeconfig is never shared with it.
 
+A leaked connector token can still select the platform-upgrader ServiceAccount
+on Job create (PR #2163). Draft ADR-0141 proposes the admission pin; the
+installer does not apply it.
+
 ## Live demo
 
 The six Slack scenarios (read, approved scale, one-shot re-arm, configuration

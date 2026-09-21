@@ -24,9 +24,11 @@
 # token can therefore create a Job that runs as `curie-platform-upgrader`,
 # inheriting that account's namespace-wide platform-upgrade permissions. The
 # connector cannot construct that Job, but a party holding its leaked token can.
-# Mitigations include an admission policy that constrains service-account choice
-# for this requesting identity, separating the wider identity into another
-# namespace, or avoiding a long-lived connector token.
+# Draft ADR-0141 proposes admission that pins the whole Job to the live CronJob
+# template; ServiceAccount-choice-only is not enough. The sketch lives in
+# `upgrade-job-admission.yaml`. Do not kubectl apply it while the ADR is Draft;
+# the installer does not apply it either. If that control is not acceptable,
+# do not install this connector next to the platform-upgrader identity.
 #
 # The connector surface is one tool that takes no arguments
 # and posts the named CronJob's `jobTemplate.spec` verbatim. There is no field a
