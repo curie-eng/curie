@@ -91,16 +91,16 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@v5.0.1
         with:
           version: v3.16.4
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: democache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -111,7 +111,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -122,7 +122,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the ui image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -133,7 +133,7 @@ jobs:
           cache-from: type=gha,scope=ladder-ui
           cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Build the dispatcher image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -144,7 +144,7 @@ jobs:
           cache-from: type=gha,scope=sre-demo-dispatcher
           cache-to: type=gha,mode=max,scope=sre-demo-dispatcher
       - name: Build the runner image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -170,7 +170,7 @@ jobs:
                   protocol: TCP
           EOF
       - name: Create the kind cluster
-        uses: helm/kind-action@v1.14.0
+        uses: helm/kind-action@v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -229,7 +229,7 @@ jobs:
         run: bash cli/scripts/sre-demo-e2e.sh run
       - name: Retain sanitized assertion outcomes
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sre-demo-outcomes
           path: ${{ runner.temp }}/sre-demo-outcomes.jsonl
