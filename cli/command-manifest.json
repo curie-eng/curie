@@ -5538,7 +5538,7 @@
           "name": "e2e-ladder"
         },
         {
-          "about": "Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes MCP server, a CI-only Socket Mode Slack app, a live provider, and an allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`). Missing those CI secrets skip with the reason in the run summary",
+          "about": "Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes MCP server, a live provider, and an allowlisted throwaway repo (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with `curie cluster message`. Approvals resolve through `curie cluster approvals` and an operator principal. Missing the live provider or throwaway repo skips with the reason in the run summary",
           "hidden": false,
           "name": "sre-demo-e2e"
         },

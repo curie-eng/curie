@@ -1,15 +1,21 @@
 name: Nightly SRE demo e2e
 
-# Issue #2246: the six SRE demo assertions (namespaces_list read, approved
-# resources_scale, one-shot re-arm, configuration_view denial, RBAC ceiling,
-# throwaway-repo coding PR) on kind with the pinned kubernetes-mcp-server
+# Issue #2246 / #2854: the six SRE demo assertions (namespaces_list read,
+# approved resources_scale, one-shot re-arm, configuration_view denial, RBAC
+# ceiling, throwaway-repo coding PR) on kind with the pinned
+# kubernetes-mcp-server
 # (sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423),
-# a CI-only Socket Mode Slack app, a live provider, and api.githubRepoAllowlist.
+# a live provider, and api.githubRepoAllowlist. Turns start with
+# `curie cluster message`. Approvals resolve through
+# `curie cluster approvals` and an operator principal on approvers.users
+# routes. No Slack app is required.
 #
 # GitHub fires schedule and workflow_dispatch from the default branch, so a
-# scheduled run checks out next to grade the v0.9.0 train. Missing the CI Slack
-# app, throwaway repo, or live provider blocks required scheduled/dispatch/RC
-# acceptance. Pull requests only inventory readiness without running live work.
+# scheduled run grades that branch's script (the Slack-less cluster-message
+# driver). Checking out next here would pair this workflow with the older
+# Slack script and fail closed. Missing the throwaway repo or live provider
+# blocks required scheduled/dispatch/RC acceptance. Pull requests only
+# inventory readiness without running live work.
 on:
   schedule:
     - cron: "0 5 * * *"   # 05:00 UTC, before the 08:00 graded ladder
@@ -23,7 +29,7 @@ on:
     tags:
       - "v*-rc*"
   pull_request:
-    branches: [next]
+    branches: [main, next]
     paths:
       - ".github/workflows/nightly-sre-demo-e2e.yaml"
       - "cli/scripts/sre-demo-e2e.sh"
@@ -40,7 +46,7 @@ permissions:
 
 jobs:
   prereqs:
-    name: Check CI Slack app, throwaway repo, and live provider
+    name: Check throwaway repo and live provider
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -48,8 +54,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # On schedule, ref: next. GitHub cron fires from the default branch.
-          ref: ${{ github.event_name == 'schedule' && 'next' || github.ref }}
+          # Grade the triggering ref so this Slack-less workflow always runs
+          # the matching script. Checking out next would pair it with the
+          # older Slack driver.
+          ref: ${{ github.ref }}
           persist-credentials: false
       - id: check
         name: Report missing setup and fail required live acceptance
@@ -57,10 +65,6 @@ jobs:
           CURIE_SRE_DEMO_PHASE: prereqs
           CURIE_SRE_DEMO_REQUIRED: ${{ github.event_name != 'pull_request' && '1' || '0' }}
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
-          CI_SLACK_APP_TOKEN: ${{ secrets.CI_SLACK_APP_TOKEN }}
-          CI_SLACK_BOT_TOKEN: ${{ secrets.CI_SLACK_BOT_TOKEN }}
-          CI_SLACK_USER_TOKEN: ${{ secrets.CI_SLACK_USER_TOKEN }}
-          CI_SLACK_CHANNEL_ID: ${{ secrets.CI_SLACK_CHANNEL_ID }}
           CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
         run: bash cli/scripts/sre-demo-e2e.sh prereqs
 
@@ -73,8 +77,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # On schedule, ref: next. GitHub cron fires from the default branch.
-          ref: ${{ github.event_name == 'schedule' && 'next' || github.ref }}
+          # Grade the triggering ref so this Slack-less workflow always runs
+          # the matching script. Checking out next would pair it with the
+          # older Slack driver.
+          ref: ${{ github.ref }}
           persist-credentials: false
       - name: Toolchain
         working-directory: cli
@@ -132,17 +138,6 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-ui
           cache-to: type=gha,mode=max,scope=ladder-ui
-      - name: Build the dispatcher image locally
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: apps/dispatcher/Dockerfile
-          builder: ${{ steps.democache.outputs.name }}
-          tags: curie-dispatcher:local
-          push: false
-          load: true
-          cache-from: type=gha,scope=sre-demo-dispatcher
-          cache-to: type=gha,mode=max,scope=sre-demo-dispatcher
       - name: Build the runner image locally
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -179,11 +174,11 @@ jobs:
       - name: Load images into the kind cluster
         run: |
           set -euo pipefail
-          for img in curie-api:local curie-worker:local curie-ui:local curie-dispatcher:local curie-runner:latest; do
+          for img in curie-api:local curie-worker:local curie-ui:local curie-runner:latest; do
             kind load docker-image "$img" --name curie-sre-demo
           done
           kind load docker-image ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423 --name curie-sre-demo
-      - name: Install the platform (curie cluster up, live, dispatcher on)
+      - name: Install the platform (curie cluster up, live, dispatcher off)
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
@@ -196,11 +191,11 @@ jobs:
             --dev \
             --allow-egress-host openrouter \
             --set security.gvisor.mode=off \
+            --set dispatcher.deploy=false \
             --set "api.githubRepoAllowlist[0]=${CI_THROWAY_REPO}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
-            --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=local --set dispatcher.image.pullPolicy=Never \
             --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
             --set agentSandbox.runner.prewarm.imagePullPolicy=Never
       - name: Wait for the platform to become ready
@@ -209,7 +204,6 @@ jobs:
           kubectl rollout status deploy/curie-api -n curie --timeout=300s
           kubectl rollout status deploy/curie-worker -n curie --timeout=300s
           kubectl rollout status deploy/curie-ui -n curie --timeout=300s
-          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=300s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       - name: Six SRE demo assertions
         env:
@@ -221,10 +215,6 @@ jobs:
           CURIE_SRE_DEMO_ALLOW_LIVE: "1"
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
-          CI_SLACK_APP_TOKEN: ${{ secrets.CI_SLACK_APP_TOKEN }}
-          CI_SLACK_BOT_TOKEN: ${{ secrets.CI_SLACK_BOT_TOKEN }}
-          CI_SLACK_USER_TOKEN: ${{ secrets.CI_SLACK_USER_TOKEN }}
-          CI_SLACK_CHANNEL_ID: ${{ secrets.CI_SLACK_CHANNEL_ID }}
           CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
         run: bash cli/scripts/sre-demo-e2e.sh run
       - name: Retain sanitized assertion outcomes
