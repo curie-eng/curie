@@ -45,5 +45,7 @@ rules:
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []
+    release: []
+    runner/tests/test_repo_toolchain_proof_ci.py: []
     packages/test-support: []
     examples/coder: []
