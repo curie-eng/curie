@@ -214,6 +214,10 @@ fn write_helm_values_stub(dir: &Path, values: &str) {
 case "$*" in
   *"get values"*" -o json"|*"get values"*"-o json"*)
     printf '%s\n' '{values}' ;;
+  history*)
+    printf '%s\n' 'Error: release: not found' >&2
+    exit 1
+    ;;
   *) printf 'unexpected helm invocation: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,

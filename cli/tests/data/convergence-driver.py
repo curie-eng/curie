@@ -124,6 +124,9 @@ def emit(value):
 
 
 if program == "helm":
+    if args[0] == "history":
+        print("Error: release: not found", file=sys.stderr)
+        sys.exit(1)
     if args[:2] == ["get", "values"]:
         emit({"security": {"allowDevDefaults": True}})
     if args[:2] == ["get", "manifest"]:
@@ -143,30 +146,52 @@ if program == "helm":
                 (root / "hung-pid").write_text(str(os.getpid()))
                 time.sleep(30)
             hooks = []
-            if scenario in ["hook-failed", "helm-hook-fails", "foreign-hook"]:
-                hooks = [
-                    {
-                        "name": "acme-bot-migrate",
-                        "kind": "Job",
-                        "events": ["pre-upgrade"],
-                        "last_run": {
-                            "phase": "Succeeded" if scenario == "foreign-hook" else "Failed"
-                        },
-                        "manifest": json.dumps(
-                            {
-                                "kind": "Job",
-                                "metadata": {
-                                    "name": "acme-bot-migrate",
-                                    "namespace": "convergence-test",
-                                },
-                            }
-                        ),
-                    }
-                ]
+            info = {"status": "failed" if scenario == "release-failed" else "deployed"}
+            if scenario in [
+                "hook-failed",
+                "helm-hook-fails",
+                "foreign-hook",
+                "stale-hook-job",
+                "current-hook-job",
+                "stale-job-last-run-failed",
+            ]:
+                hook_name = (
+                    "acme-bot-upgrade-drain"
+                    if scenario
+                    in ["stale-hook-job", "current-hook-job", "stale-job-last-run-failed"]
+                    else "acme-bot-migrate"
+                )
+                hook = {
+                    "name": hook_name,
+                    "kind": "Job",
+                    "events": ["pre-upgrade"],
+                    "manifest": json.dumps(
+                        {
+                            "kind": "Job",
+                            "metadata": {
+                                "name": hook_name,
+                                "namespace": "convergence-test",
+                            },
+                        }
+                    ),
+                }
+                if scenario == "foreign-hook":
+                    hook["last_run"] = {"phase": "Succeeded"}
+                elif scenario in ["hook-failed", "helm-hook-fails", "stale-job-last-run-failed"]:
+                    hook["last_run"] = {"phase": "Failed"}
+                hooks = [hook]
+            if scenario in ["stale-hook-job", "current-hook-job", "stale-job-last-run-failed"]:
+                # Helm v3 status JSON marshals pkg/time.Time as RFC3339Nano.
+                # https://github.com/helm/helm/blob/v3.20.0/pkg/time/time.go
+                info["last_deployed"] = (
+                    "2026-09-21T12:00:00.217175126Z"
+                    if scenario == "current-hook-job"
+                    else "2026-09-21T12:00:00Z"
+                )
             emit(
                 {
                     "version": 2,
-                    "info": {"status": "failed" if scenario == "release-failed" else "deployed"},
+                    "info": info,
                     "hooks": hooks,
                 }
             )
@@ -540,16 +565,38 @@ if program == "kubectl":
         }
     if scenario == "private-pod-reason":
         pods[0]["status"]["reason"] = "PRIVATE_MESSAGE_SENTINEL"
-    jobs = (
-        [
+    jobs = []
+    if scenario in [
+        "hook-failed",
+        "helm-hook-fails",
+        "foreign-hook",
+        "stale-hook-job",
+        "current-hook-job",
+        "stale-job-last-run-failed",
+    ]:
+        job_name = (
+            "acme-bot-upgrade-drain"
+            if scenario in ["stale-hook-job", "current-hook-job", "stale-job-last-run-failed"]
+            else "acme-bot-migrate"
+        )
+        metadata = {
+            "name": job_name,
+            "namespace": "another-managed-namespace"
+            if scenario == "foreign-hook"
+            else "convergence-test",
+        }
+        if scenario in ["stale-hook-job", "stale-job-last-run-failed"]:
+            # Older than the current revision, matching the #2858 reproduction
+            # (the leftover Job was minutes older than the new release pods).
+            metadata["creationTimestamp"] = "2026-09-21T11:53:16Z"
+        elif scenario == "current-hook-job":
+            # Same whole second as a fractional last_deployed: must still count
+            # as this revision, not as leftover.
+            metadata["creationTimestamp"] = "2026-09-21T12:00:00Z"
+        jobs = [
             {
                 "kind": "Job",
-                "metadata": {
-                    "name": "acme-bot-migrate",
-                    "namespace": "another-managed-namespace"
-                    if scenario == "foreign-hook"
-                    else "convergence-test",
-                },
+                "metadata": metadata,
                 "status": {
                     "failed": 1,
                     "conditions": [
@@ -563,9 +610,6 @@ if program == "kubectl":
                 },
             }
         ]
-        if scenario in ["hook-failed", "helm-hook-fails", "foreign-hook"]
-        else []
-    )
     if any(a.startswith("deployment") for a in args):
         if scenario == "missing-workload":
             workloads = [statefulset]

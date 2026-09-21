@@ -327,6 +327,14 @@ Curie prints one standard error line for every inference, including the
 equivalent override. Prepared `apply` and `diff` paths do not infer live
 cluster facts.
 
+A Helm release whose history is only `failed` (no `deployed` or `superseded`
+revision) is not an upgrade. `curie apply` and `curie cluster up` uninstall that
+record, then install. An in-flight status (`pending-install`, `pending-upgrade`,
+`unknown`) is refused at once and names `curie cluster down`. A known-good
+revision is left intact. This is the failed-first-install wedge: Helm would
+otherwise fire the pre-upgrade drain hook against Secrets revision 1 never
+created.
+
 ### `curie cluster status`
 
 ```bash
