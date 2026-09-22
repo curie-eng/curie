@@ -268,6 +268,8 @@ def test_adapter_0045_upgrade_preserves_principal_subject_through_work_items_and
     )
 
     command.upgrade(cfg, "head")
+    # Head moves as expand-only revisions land. The assertions below are what
+    # must survive that move: the adapter audit row and the work-item columns.
     assert current_revision() == HEAD
     assert _sql(
         "SELECT principal_kind, principal_subject "

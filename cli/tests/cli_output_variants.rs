@@ -40,8 +40,8 @@ use curie::api::{
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
-    WorkItemsOutput,
+    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
+    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -293,6 +293,20 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 model: Some("kimi-k2".to_string()),
                 thinking: Some("adaptive".to_string()),
                 changed: true,
+            },
+        ],
+    );
+    m.insert(
+        "PublicationPolicyOutput",
+        samples![
+            "DryRun" => PublicationPolicyOutput::DryRun(plan()),
+            "Done" => PublicationPolicyOutput::Done {
+                agent: "acme-bot".to_string(),
+                publication_policy: "approve".to_string(),
+                publication_policy_version: 1,
+                publication_draft: false,
+                publication_branch_prefix: None,
+                changed: false,
             },
         ],
     );
