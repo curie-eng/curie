@@ -244,6 +244,12 @@
       "version": "1.0"
     },
     {
+      "result": "PublicationPolicyOutput",
+      "kind": "CliOutput",
+      "schema": "publication-policy.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ReleaseAcceptOutput",
       "kind": "CliOutput",
       "schema": "release-accept.schema.json",

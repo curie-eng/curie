@@ -764,6 +764,31 @@
             "title": "Name",
             "type": "string"
           },
+          "publication_branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Branch Prefix"
+          },
+          "publication_draft": {
+            "default": false,
+            "title": "Publication Draft",
+            "type": "boolean"
+          },
+          "publication_policy": {
+            "default": "approve",
+            "enum": [
+              "approve",
+              "auto"
+            ],
+            "title": "Publication Policy",
+            "type": "string"
+          },
           "repo_full_name": {
             "anyOf": [
               {
@@ -917,6 +942,36 @@
             "title": "Name",
             "type": "string"
           },
+          "publication_branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Branch Prefix"
+          },
+          "publication_draft": {
+            "default": false,
+            "title": "Publication Draft",
+            "type": "boolean"
+          },
+          "publication_policy": {
+            "default": "approve",
+            "enum": [
+              "approve",
+              "auto"
+            ],
+            "title": "Publication Policy",
+            "type": "string"
+          },
+          "publication_policy_version": {
+            "default": 1,
+            "title": "Publication Policy Version",
+            "type": "integer"
+          },
           "repo_full_name": {
             "anyOf": [
               {
@@ -1053,6 +1108,43 @@
               }
             ],
             "title": "Model"
+          },
+          "publication_branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Branch Prefix"
+          },
+          "publication_draft": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Draft"
+          },
+          "publication_policy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "approve",
+                  "auto"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Policy"
           },
           "repo_full_name": {
             "anyOf": [
@@ -1262,7 +1354,8 @@
                   "chat",
                   "console",
                   "operator",
-                  "adapter"
+                  "adapter",
+                  "platform"
                 ],
                 "type": "string"
               },
@@ -4476,6 +4569,17 @@
             ],
             "title": "Branch"
           },
+          "branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch Prefix"
+          },
           "changed_paths": {
             "items": {
               "type": "string"
@@ -4580,6 +4684,11 @@
               }
             ],
             "title": "Lineage Version"
+          },
+          "open_as_draft": {
+            "default": false,
+            "title": "Open As Draft",
+            "type": "boolean"
           },
           "pr_number": {
             "anyOf": [

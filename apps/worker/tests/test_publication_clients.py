@@ -335,9 +335,7 @@ async def test_lost_create_response_recognizes_terminal_pull_without_second_post
         requests.append(request)
         if request.url.path == f"/repos/{REPO}":
             return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.raw_path.decode().endswith(
-            "/git/ref/heads/curie%2Fthread-lineage-example"
-        ):
+        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
             return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
         if request.method == "POST":
             raise httpx.ReadError("create response was lost", request=request)
@@ -391,9 +389,7 @@ async def test_lost_create_response_adopts_exact_open_pull_once() -> None:
         requests.append(request)
         if request.url.path == f"/repos/{REPO}":
             return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.raw_path.decode().endswith(
-            "/git/ref/heads/curie%2Fthread-lineage-example"
-        ):
+        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
             return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
         if request.method == "POST":
             raise httpx.ReadError("create response was lost", request=request)
@@ -448,6 +444,58 @@ async def test_lost_create_response_adopts_exact_open_pull_once() -> None:
     )
     assert [request.method for request in requests].count("POST") == 1
     assert pull_queries == 2
+
+
+async def test_draft_recovery_posts_draft_and_refuses_a_non_draft_pull() -> None:
+    posts: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
+            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
+        if request.method == "POST":
+            posts.append(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={
+                    "number": 123,
+                    "html_url": PR_URL,
+                    "state": "open",
+                    "draft": False,
+                    "title": "Update repository",
+                    "body": "Approved platform publication.",
+                    "head": {
+                        "ref": BRANCH,
+                        "sha": REVISION_HEAD,
+                        "repo": {"full_name": REPO},
+                    },
+                    "base": {"ref": "main", "repo": {"full_name": REPO}},
+                },
+            )
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="required draft"):
+            await GitHubPublicationLookup(client).recover_pr_by_head(
+                REPO,
+                BRANCH,
+                "Update repository",
+                "Approved platform publication.",
+                expected_head_sha=REVISION_HEAD,
+                authorization_header="Bearer rotated-installation-token",
+                draft=True,
+            )
+
+    assert posts == [
+        {
+            "title": "Update repository",
+            "head": BRANCH,
+            "base": "main",
+            "body": "Approved platform publication.",
+            "draft": True,
+        }
+    ]
 
 
 async def test_publication_result_is_appended_once_to_the_durable_transcript() -> None:

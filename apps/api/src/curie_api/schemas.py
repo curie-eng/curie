@@ -34,6 +34,7 @@ from . import adapter_principal
 from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
 from .models import GIT_FLOW_CREATED_BY, Environment
+from .publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from .repo_full_name import RepoFullName
 from .source_binding import (
     validate_revision,
@@ -775,6 +776,32 @@ def _reject_retired_update_binding_key(data: Any) -> Any:
     return data
 
 
+def _reject_null_publication_switches(data: Any) -> Any:
+    """Policy and draft are not nullable. Prefix null clears the prefix."""
+
+    if not isinstance(data, dict):
+        return data
+    if "publication_policy" in data and data["publication_policy"] is None:
+        raise ValueError("publication_policy must be approve or auto")
+    if "publication_draft" in data and data["publication_draft"] is None:
+        raise ValueError("publication_draft must be true or false")
+    return data
+
+
+def _validate_publication_policy_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in (POLICY_APPROVE, POLICY_AUTO):
+        raise ValueError("publication_policy must be approve or auto")
+    return value
+
+
+def _validate_publication_branch_prefix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return validate_branch_prefix(value)
+
+
 class ChannelBinding(BaseModel):
     """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
 
@@ -1092,6 +1119,10 @@ class AgentCreate(BaseModel):
     # follow-up). False (the default) matches a single-binding agent's existing
     # behavior exactly, since there is nothing yet to share with.
     memory: bool = False
+    # ADR 0147. Omitted means human approval. A bundle cannot set this.
+    publication_policy: Literal["approve", "auto"] = "approve"
+    publication_draft: bool = False
+    publication_branch_prefix: str | None = None
 
     _check_name = field_validator("name")(_validate_agent_name)
     _check_model = field_validator("model")(_validate_model_override)
@@ -1101,6 +1132,9 @@ class AgentCreate(BaseModel):
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
+    _check_publication_prefix = field_validator("publication_branch_prefix")(
+        _validate_publication_branch_prefix
+    )
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -1157,6 +1191,11 @@ class AgentUpdate(BaseModel):
     repo_full_name: RepoFullName | None = None
     # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
+    # Omitted leaves the current publication policy. Explicit null is refused.
+    # ``publication_branch_prefix`` null clears the prefix.
+    publication_policy: Literal["approve", "auto"] | None = None
+    publication_draft: bool | None = None
+    publication_branch_prefix: str | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
@@ -1165,10 +1204,17 @@ class AgentUpdate(BaseModel):
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
+    _check_publication_policy = field_validator("publication_policy")(
+        _validate_publication_policy_value
+    )
+    _check_publication_prefix = field_validator("publication_branch_prefix")(
+        _validate_publication_branch_prefix
+    )
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
     _reject_retired_channel_key = model_validator(mode="before")(_reject_retired_update_binding_key)
+    _reject_null_publication = model_validator(mode="before")(_reject_null_publication_switches)
 
 
 class AgentOut(BaseModel):
@@ -1200,6 +1246,10 @@ class AgentOut(BaseModel):
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up).
     memory: bool
+    publication_policy: Literal["approve", "auto"] = "approve"
+    publication_policy_version: int = 1
+    publication_draft: bool = False
+    publication_branch_prefix: str | None = None
     created_at: datetime
 
     @field_validator("secrets", mode="before")
@@ -1658,6 +1708,8 @@ class PublicationOut(BaseModel):
     pr_url: str | None
     repo_full_name: str
     status: str
+    open_as_draft: bool = False
+    branch_prefix: str | None = None
     version: int
     base_sha: str
     changed_paths: list[str]
@@ -2106,7 +2158,7 @@ class ApprovalAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
-    principal_kind: Literal["chat", "console", "operator", "adapter"] | None
+    principal_kind: Literal["chat", "console", "operator", "adapter", "platform"] | None
     authenticated: bool
     # The adapter that transported an `adapter` principal's decision
     # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.

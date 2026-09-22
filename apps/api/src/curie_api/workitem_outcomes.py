@@ -203,6 +203,24 @@ def derive_outcome(
         state = "cancellation_requested"
     elif req.status == "waiting":
         state = "waiting"
+    elif req.status == "running" and (
+        (approval is not None and approval.status == "pending") or pending_turn_approval
+    ):
+        # Publication and tool approvals happen while the execution is still
+        # running. Completion is refused until a pull request is open.
+        state = "awaiting_approval"
+    elif (
+        req.status == "running"
+        and publication is not None
+        and publication.status in _PUBLISHING
+    ):
+        state = "publishing"
+    elif (
+        req.status == "running"
+        and publication is not None
+        and publication.status == "denied"
+    ):
+        state = "completed_unpublished"
     elif req.status == "running":
         state = "running"
     elif req.status == "cancelled" or item.cancelled_at is not None:

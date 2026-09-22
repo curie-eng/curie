@@ -6145,6 +6145,10 @@ mod tests {
             model: None,
             thinking: None,
             memory: false,
+            publication_policy: "approve".to_string(),
+            publication_policy_version: 1,
+            publication_draft: false,
+            publication_branch_prefix: None,
         }
     }
 
@@ -7472,6 +7476,10 @@ mod tests {
                 model: None,
                 thinking: None,
                 memory: false,
+                publication_policy: "approve".to_string(),
+                publication_policy_version: 1,
+                publication_draft: false,
+                publication_branch_prefix: None,
             },
             Agent {
                 id: "a2".into(),
@@ -7486,6 +7494,10 @@ mod tests {
                 model: None,
                 thinking: None,
                 memory: false,
+                publication_policy: "approve".to_string(),
+                publication_policy_version: 1,
+                publication_draft: false,
+                publication_branch_prefix: None,
             },
         ];
         // Explicit channel picks the matching agent's id.
