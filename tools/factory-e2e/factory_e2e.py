@@ -20,9 +20,11 @@ another) with the 1800 second execution bound; without it the model is fake.
 
 `curie dev factory-e2e run --scenario <name>` runs one scenario driver after
 the preflight. `issue-to-pr --issue-file <file> [--expect pr|comment|any]`
+(and `--expect-cause CAUSE`, repeatable)
 opens the operator's ticket as the one labelled issue, waits for the run to
 end, and judges the ending: exactly one pull request or one terminus comment,
-no workflow file or credential in the diff, the default branch untouched, and
+an accepted terminus cause, no `.github/` file or credential in the diff,
+the default branch untouched, and
 the run inside its bound. The other scenarios (revision, cancel-waiting,
 cancel-running, evaluation) have no driver yet and refuse before anything is
 installed.
@@ -97,6 +99,25 @@ NEVER_STARTED_CAP_SECONDS = 3600
 ELAPSED_LIMIT_SECONDS = EXECUTION_BOUND_SECONDS + 300
 POLL_SECONDS = 15
 EXPECTATIONS = ("pr", "comment", "any")
+# The terminus causes docs/operations.md documents for a factory comment.
+TERMINUS_CAUSES = (
+    "capacity_wait_expired",
+    "execution_deadline",
+    "issue_cancelled",
+    "owner_lost",
+    "runner_escalated",
+    "runner_failed",
+    "no_pull_request",
+    "publication_denied",
+    "publication_expired",
+    "publication_failed",
+)
+DEFAULT_COMMENT_CAUSES = frozenset({"no_pull_request"})
+DEFAULT_ANY_COMMENT_CAUSES = frozenset({"no_pull_request", "execution_deadline"})
+FINAL_REPLY_LIMIT = 4000
+# Mirrors marker_for and comment_body in apps/api/src/curie_api/factory_notices.py.
+_NOTICE_MARKER = re.compile(r"<!-- curie-execution-request:([0-9a-fA-F-]{36}) -->")
+_NOTICE_CAUSE = re.compile(r"^Cause: (\S+)\s*$", re.MULTILINE)
 ACTIVE_REQUEST_STATUSES = frozenset({"waiting", "running", "cancellation_requested"})
 _CREDENTIAL_PATTERNS = tuple(
     re.compile(pattern)
@@ -480,12 +501,20 @@ def install_values(
     return values
 
 
-def judge_outcome(outcome: Mapping[str, Any], expect: str) -> list[str]:
+def judge_outcome(
+    outcome: Mapping[str, Any],
+    expect: str,
+    *,
+    expect_causes: frozenset[str] | set[str] | None = None,
+) -> list[str]:
     """Every way an issue-to-pr ending falls short. Empty means it passed.
 
     Pure. ``outcome`` carries terminal, pull_requests (each with number,
-    files and diff), terminus_comments (a count), default_branch_moved and
-    elapsed_seconds. A credential match is reported by pattern, never quoted.
+    files and diff), terminus_comments (a count), ending_cause,
+    default_branch_moved and elapsed_seconds. A comment ending passes only
+    when its cause is in ``expect_causes``; the default is no_pull_request for
+    expect "comment" and no_pull_request or execution_deadline for "any".
+    A credential match is reported by pattern, never quoted.
     """
 
     if expect not in EXPECTATIONS:
@@ -503,13 +532,25 @@ def judge_outcome(outcome: Mapping[str, Any], expect: str) -> list[str]:
         failures.append("the run ended with neither a pull request nor a terminus comment")
     if expect == "pr" and not prs:
         failures.append("expected a pull request, none was opened")
+    if comments > 1:
+        failures.append(f"{comments} terminus comments were posted; at most one is allowed")
     if expect == "comment" and (prs or not comments):
         failures.append("expected a terminus comment and no pull request")
+    if comments and not prs and expect != "pr":
+        if expect_causes:
+            allowed = frozenset(expect_causes)
+        elif expect == "comment":
+            allowed = DEFAULT_COMMENT_CAUSES
+        else:
+            allowed = DEFAULT_ANY_COMMENT_CAUSES
+        cause = outcome.get("ending_cause")
+        if cause not in allowed:
+            failures.append(f"the run ended with cause {cause!r}, not one of {sorted(allowed)}")
     for pr in prs:
         number = pr.get("number")
-        workflows = [f for f in pr.get("files") or [] if str(f).startswith(".github/workflows/")]
-        if workflows:
-            failures.append(f"pull request #{number} changes workflow files: {workflows}")
+        github = [f for f in pr.get("files") or [] if str(f).startswith(".github/")]
+        if github:
+            failures.append(f"pull request #{number} changes files under .github/: {github}")
         diff = str(pr.get("diff") or "")
         for pattern in _CREDENTIAL_PATTERNS:
             if pattern.search(diff):
@@ -710,11 +751,13 @@ class Preflight:
         admission_timeout: float,
         issue_spec: tuple[str, str] | None = None,
         expect: str = "any",
+        expect_causes: Sequence[str] = (),
     ) -> None:
         if expect not in EXPECTATIONS:
             raise ConfigError(f"--expect must be one of {EXPECTATIONS}")
         self.issue_spec = issue_spec
         self.expect = expect
+        self.expect_causes = frozenset(expect_causes)
         self.config = config
         self.repo_root = repo_root
         self.candidate = candidate
@@ -1176,6 +1219,11 @@ class Preflight:
             tail = _redact((result.stderr or result.stdout).strip(), secrets)[-1500:]
             raise PreflightFailed(f"curie {' '.join(args[:2])} failed: {tail}")
 
+    def _curie_config_dir(self) -> Path:
+        path = self.workdir / "curie-config"
+        path.mkdir(mode=0o700, exist_ok=True)
+        return path
+
     def deploy_bundle(self) -> None:
         """Deploy the default dark-factory bundle onto the bound agent and let
         the platform resolve its publication approval (policy auto)."""
@@ -1189,6 +1237,9 @@ class Preflight:
             "KUBECONFIG": str(kubeconfig),
             "CURIE_API_KEY": self.api_key,
             "GITHUB_PERSONAL_ACCESS_TOKEN": token,
+            # The secret arrives through the environment; an empty private
+            # config dir keeps the operator's own vault out of this run.
+            "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
         secrets = [token, self.api_key, self.config.model_api_key, self.worker_token]
         common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
@@ -1541,18 +1592,104 @@ class Preflight:
 # --------------------------------------------------------------------------
 
 
-def _app_authored(comment: Mapping[str, Any], mention: str) -> bool:
+def _app_authored(comment: Mapping[str, Any], mention: str, app_id: str) -> bool:
     user = comment.get("user") or {}
-    return bool(
-        comment.get("performed_via_github_app")
-        or user.get("login") == f"{mention}[bot]"
-        or user.get("type") == "Bot"
+    app = comment.get("performed_via_github_app") or {}
+    return user.get("login") == f"{mention}[bot]" or (
+        bool(app_id) and str(app.get("id") or "") == str(app_id)
     )
 
 
-def _terminus_comments(p: Preflight) -> list[str]:
+def match_terminus_comments(
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    mention: str,
+    app_id: str,
+    request_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """The configured App's terminus notices for these execution requests.
+
+    Pure. A comment counts only when the App authored it and it carries the
+    execution request marker for one of ``request_ids``. The cause is parsed
+    from the notice body.
+    """
+
+    wanted = {str(r).lower() for r in request_ids}
+    matched: list[dict[str, Any]] = []
+    for comment in comments:
+        if not _app_authored(comment, mention, app_id):
+            continue
+        body = str(comment.get("body") or "")
+        marker = _NOTICE_MARKER.search(body)
+        if marker is None or marker.group(1).lower() not in wanted:
+            continue
+        cause = _NOTICE_CAUSE.search(body)
+        matched.append(
+            {
+                "body": body,
+                "cause": cause.group(1) if cause else None,
+                "created_at": comment.get("created_at"),
+                "request_id": marker.group(1),
+            }
+        )
+    return matched
+
+
+def _terminus_comments(p: Preflight) -> list[dict[str, Any]]:
     comments = p._paged(f"/repos/{p.config.repo}/issues/{p.issue_number}/comments")
-    return [str(c.get("body") or "") for c in comments if _app_authored(c, p.config.mention)]
+    # The work item detail omits request ids; a label admission has one,
+    # derived and recorded at admission.
+    ids = [str(p.evidence.get("execution_request_id") or "")]
+    return match_terminus_comments(
+        comments, mention=p.config.mention, app_id=p.config.app_id, request_ids=ids
+    )
+
+
+def ending_times(
+    request: Mapping[str, Any], *, labelled_at: float, ended_at: Any
+) -> tuple[float, float | None]:
+    """(elapsed_seconds, execution_seconds) for one run. Pure.
+
+    Elapsed runs from the request's start (or labelling) to the observed
+    ending: the pull request's creation or the terminus comment. Execution
+    runs from start to the request's terminal_at, when both exist.
+    """
+
+    started = _parse_time(request.get("started_at"))
+    terminal = _parse_time(request.get("terminal_at"))
+    ended = _parse_time(ended_at)
+    begin = started.timestamp() if started is not None else labelled_at
+    end = ended.timestamp() if ended is not None else time.time()
+    execution = (terminal - started).total_seconds() if started is not None and terminal else None
+    return end - begin, execution
+
+
+def final_agent_reply(value: Any) -> str | None:
+    """The last turn's assistant text in a transcript value, truncated. Pure."""
+
+    if not isinstance(value, list):
+        return None
+    for record in reversed(value):
+        if isinstance(record, dict) and record.get("type") == "turn":
+            text = str(record.get("assistant") or "")
+            return text[:FINAL_REPLY_LIMIT] if text else None
+    return None
+
+
+def _agent_final_reply(p: Preflight) -> tuple[str | None, str]:
+    # The work item detail does not carry its conversation id, so read the
+    # agent's transcript namespace. The install and agent are this run's own,
+    # so exactly one transcript is expected; anything else is left unjudged.
+    agent_id = p.evidence.get("agent_id")
+    if not agent_id:
+        return None, "no agent id was recorded"
+    path = f"/agents/{agent_id}/state/transcript"
+    status, body = p.api("GET", path, headers={"X-API-Key": p.api_key})
+    if status != 200 or not isinstance(body, list):
+        return None, f"api GET {path} returned HTTP {status}"
+    if len(body) != 1 or not isinstance(body[0], dict):
+        return None, f"api GET {path} returned {len(body)} transcripts, expected one"
+    return final_agent_reply(body[0].get("value")), f"api GET {path}, last turn"
 
 
 def _latest_request(detail: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1591,6 +1728,7 @@ def _scenario_pull_requests(p: Preflight) -> list[dict[str, Any]]:
             {
                 "number": number,
                 "url": item.get("html_url"),
+                "created_at": item.get("created_at"),
                 "files": files,
                 "additions": detail.get("additions"),
                 "deletions": detail.get("deletions"),
@@ -1605,7 +1743,7 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
 
     work_item_id = p.evidence["work_item_id"]
     detail: dict[str, Any] = {}
-    comments: list[str] = []
+    comments: list[dict[str, Any]] = []
     terminal = False
     while True:
         status, body = p.api("GET", f"/work-items/{work_item_id}", headers={"X-API-Key": p.api_key})
@@ -1632,18 +1770,21 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
 
     prs = _scenario_pull_requests(p)
     latest = _latest_request(detail) or {}
-    started = _parse_time(latest.get("started_at"))
-    ended = _parse_time(latest.get("terminal_at"))
-    elapsed = (
-        (ended - started).total_seconds()
-        if started is not None and ended is not None
-        else time.time() - p.labelled_at
-    )
+    if prs:
+        ended_at = min((str(pr.get("created_at") or "") for pr in prs), default=None)
+    elif comments:
+        ended_at = min(str(c.get("created_at") or "") for c in comments)
+    else:
+        ended_at = None
+    elapsed, execution = ending_times(latest, labelled_at=p.labelled_at, ended_at=ended_at)
+    ending_cause = latest.get("terminal_cause") or (comments[-1]["cause"] if comments else None)
+    reply, reply_source = _agent_final_reply(p)
     moved = p.default_branch_head() != p.head_before
     outcome = {
         "terminal": terminal,
         "pull_requests": prs,
         "terminus_comments": len(comments),
+        "ending_cause": ending_cause,
         "default_branch_moved": moved,
         "elapsed_seconds": round(elapsed, 1),
     }
@@ -1663,9 +1804,11 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
             else "fake model; no model spend",
         }
     pr = detail.get("pr") if isinstance(detail.get("pr"), dict) else None
-    failures = judge_outcome(outcome, p.expect)
+    failures = judge_outcome(outcome, p.expect, expect_causes=p.expect_causes)
     result = {
         "expect": p.expect,
+        "expect_causes": sorted(p.expect_causes),
+        "ending_cause": ending_cause,
         "terminal": terminal,
         "work_item_state": detail.get("state"),
         "actionable_cause": detail.get("actionable_cause"),
@@ -1677,6 +1820,9 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         "terminus_comments": comments,
         "default_branch_moved": moved,
         "elapsed_seconds": outcome["elapsed_seconds"],
+        "execution_seconds": round(execution, 1) if execution is not None else None,
+        "agent_final_reply": reply,
+        "agent_final_reply_source": reply_source,
         "model": p.config.model if p.config.model_api_key else "fake",
         "usage": usage,
         "verdict": "passed" if not failures else "failed",
@@ -1735,6 +1881,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="any",
         help="issue-to-pr: the ending the ticket should produce (default any)",
     )
+    scenario.add_argument(
+        "--expect-cause",
+        action="append",
+        choices=TERMINUS_CAUSES,
+        default=[],
+        help="issue-to-pr: a terminus cause a comment ending may carry (repeatable)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1758,6 +1911,7 @@ def main(argv: list[str] | None = None) -> int:
     driver: ScenarioDriver | None = None
     issue_spec: tuple[str, str] | None = None
     expect = "any"
+    expect_causes: list[str] = []
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
@@ -1771,6 +1925,7 @@ def main(argv: list[str] | None = None) -> int:
                     return EXIT_CONFIG
                 issue_spec = parse_issue_file(args.issue_file)
                 expect = args.expect
+                expect_causes = args.expect_cause
         config = load_config(os.environ, context=args.context)
         repo_root = _repo_root()
         candidate = _resolve_candidate(repo_root, args.candidate)
@@ -1794,6 +1949,7 @@ def main(argv: list[str] | None = None) -> int:
         admission_timeout=args.admission_timeout,
         issue_spec=issue_spec,
         expect=expect,
+        expect_causes=expect_causes,
     )
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"

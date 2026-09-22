@@ -570,14 +570,15 @@ def test_expect_pr_requires_a_pr() -> None:
 
 
 def test_expect_comment_requires_a_comment_and_no_pr() -> None:
-    comment = _outcome(pull_requests=[], terminus_comments=1)
+    comment = _outcome(pull_requests=[], terminus_comments=1, ending_cause="no_pull_request")
     assert fe.judge_outcome(comment, "comment") == []
     assert fe.judge_outcome(_outcome(), "comment")
 
 
 def test_expect_any_accepts_either() -> None:
     assert fe.judge_outcome(_outcome(), "any") == []
-    assert fe.judge_outcome(_outcome(pull_requests=[], terminus_comments=1), "any") == []
+    comment = _outcome(pull_requests=[], terminus_comments=1, ending_cause="no_pull_request")
+    assert fe.judge_outcome(comment, "any") == []
 
 
 def test_unknown_expect_raises() -> None:
@@ -626,3 +627,134 @@ def test_issue_to_pr_without_issue_file_refuses_before_any_subprocess(
     monkeypatch.setattr(fe, "_resolve_candidate", refuse)
     assert fe.main(["run", "--scenario", "issue-to-pr"]) == fe.EXIT_CONFIG
     assert "--issue-file" in capsys.readouterr().err
+
+
+# --- review round: cause, uniqueness, .github, notice matching, elapsed ---
+
+
+def _comment_ending(**overrides: Any) -> dict[str, Any]:
+    base = {"pull_requests": [], "terminus_comments": 1, "ending_cause": "no_pull_request"}
+    base.update(overrides)
+    return _outcome(**base)
+
+
+def test_expect_comment_refuses_a_runner_crash() -> None:
+    assert fe.judge_outcome(_comment_ending(ending_cause="runner_failed"), "comment")
+    assert fe.judge_outcome(_comment_ending(), "comment") == []
+
+
+def test_expect_comment_honours_explicit_causes() -> None:
+    crash = _comment_ending(ending_cause="runner_failed")
+    assert fe.judge_outcome(crash, "comment", expect_causes={"runner_failed"}) == []
+    assert fe.judge_outcome(_comment_ending(), "comment", expect_causes={"runner_failed"})
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        "runner_failed",
+        "runner_escalated",
+        "owner_lost",
+        "capacity_wait_expired",
+        "publication_failed",
+    ],
+)
+def test_expect_any_refuses_failure_causes(cause: str) -> None:
+    assert fe.judge_outcome(_comment_ending(ending_cause=cause), "any")
+
+
+def test_expect_any_accepts_refusal_and_deadline() -> None:
+    assert fe.judge_outcome(_comment_ending(), "any") == []
+    assert fe.judge_outcome(_comment_ending(ending_cause="execution_deadline"), "any") == []
+    assert fe.judge_outcome(_comment_ending(ending_cause=None), "any")
+
+
+def test_expect_cause_parses_and_rejects_unknown() -> None:
+    args = fe.parse_args(
+        [
+            "run",
+            "--scenario",
+            "issue-to-pr",
+            "--issue-file",
+            "x.md",
+            "--expect-cause",
+            "runner_failed",
+            "--expect-cause",
+            "no_pull_request",
+        ]
+    )
+    assert set(args.expect_cause) == {"runner_failed", "no_pull_request"}
+    with pytest.raises(SystemExit):
+        fe.parse_args(
+            ["run", "--scenario", "issue-to-pr", "--issue-file", "x.md", "--expect-cause", "x"]
+        )
+
+
+@pytest.mark.parametrize("expect", ["comment", "any"])
+def test_two_terminus_comments_fail(expect: str) -> None:
+    assert fe.judge_outcome(_comment_ending(terminus_comments=2), expect)
+
+
+def test_any_dot_github_path_in_pr_fails() -> None:
+    pr = _pr(files=["src/app.py", ".github/CODEOWNERS"])
+    assert fe.judge_outcome(_outcome(pull_requests=[pr]), "pr")
+
+
+_RID = uuid.UUID("11111111-2222-3333-4444-555555555555")
+
+
+def _notice(cause: str, rid: uuid.UUID = _RID, **overrides: Any) -> dict[str, Any]:
+    comment: dict[str, Any] = {
+        "user": {"login": "factory[bot]", "type": "Bot"},
+        "performed_via_github_app": {"id": 42},
+        "created_at": "2026-01-01T00:10:00Z",
+        "body": f"This factory run cannot continue.\nCause: {cause}\n\n"
+        f"<!-- curie-execution-request:{rid} -->\n",
+    }
+    comment.update(overrides)
+    return comment
+
+
+def test_terminus_matcher_requires_app_author_and_marker() -> None:
+    other_bot = _notice(
+        "no_pull_request",
+        user={"login": "other[bot]", "type": "Bot"},
+        performed_via_github_app=None,
+    )
+    other_app = _notice(
+        "no_pull_request", user={"login": "x", "type": "User"}, performed_via_github_app={"id": 7}
+    )
+    wrong_request = _notice("no_pull_request", rid=uuid.uuid4())
+    no_marker = _notice("no_pull_request", body="This factory run cannot continue.")
+    good = _notice("runner_failed")
+    by_login = _notice("no_pull_request", performed_via_github_app=None)
+    matched = fe.match_terminus_comments(
+        [other_bot, other_app, wrong_request, no_marker, good, by_login],
+        mention="factory",
+        app_id="42",
+        request_ids=[str(_RID)],
+    )
+    assert [m["cause"] for m in matched] == ["runner_failed", "no_pull_request"]
+    assert matched[0]["created_at"] == "2026-01-01T00:10:00Z"
+
+
+def test_elapsed_runs_to_the_observed_ending_not_terminal_at() -> None:
+    request = {
+        "started_at": "2026-01-01T00:00:00Z",
+        "terminal_at": "2026-01-01T00:30:00Z",
+    }
+    elapsed, execution = fe.ending_times(request, labelled_at=0.0, ended_at="2026-01-01T00:38:20Z")
+    assert elapsed == 2300.0
+    assert execution == 1800.0
+    assert fe.judge_outcome(_outcome(elapsed_seconds=elapsed), "pr")
+
+
+def test_final_reply_is_the_last_turn_assistant_text() -> None:
+    value = [
+        {"type": "turn", "assistant": "first"},
+        {"type": "summary", "text": "s"},
+        {"type": "turn", "assistant": "x" * 5000},
+    ]
+    assert fe.final_agent_reply(value) == "x" * 4000
+    assert fe.final_agent_reply([]) is None
+    assert fe.final_agent_reply("junk") is None

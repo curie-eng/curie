@@ -27,8 +27,8 @@ does not enforce it, and a different bundle can choose differently.
 ## What the bundle can reach
 
 - **The checkout.** Curie mounts the issue's repository at `/workspace` and
-  gives every session the built-in file tools. The sandbox has no GitHub
-  credential and no general network access.
+  gives every session the built-in file tools. The sandbox has no general
+  network access, and it holds no push or publication credential.
 - **The issue.** `.mcp.json` declares the GitHub MCP server that the runner
   image preinstalls, authenticated with the bundle's own
   `GITHUB_PERSONAL_ACCESS_TOKEN` (ADR 0145: reading the ticket is the bundle's
@@ -41,8 +41,10 @@ does not enforce it, and a different bundle can choose differently.
 
 Give the bundle a read-only token: a fine-grained token (or a GitHub App
 installation token) limited to the factory repositories with **Issues: Read**
-and nothing else. The tool policy is the first boundary and the token scope
-is the second.
+and nothing else. That token is in the sandbox's environment, so any tool
+in the session can read it. The tool policy limits which GitHub MCP tools the
+agent can call; it does not hide the credential from other tools. The token
+scope is the real bound.
 
 ## Deploy it as the factory agent
 

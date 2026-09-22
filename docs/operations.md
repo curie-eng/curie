@@ -942,14 +942,21 @@ preflight and then one scenario driver: `issue-to-pr`, `revision`,
 `cancel-waiting`, `cancel-running` or `evaluation`. A scenario that has no
 driver yet is refused before anything is installed.
 
-`run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any]`
+`run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]...`
 opens the ticket (first line is the title, the rest the body) as the one
 labelled issue and waits for the run to end. It fails unless the run ended as
 exactly one pull request or one terminus comment, inside the execution bound,
 with no `.github/` file or credential-shaped string in the diff and the default
-branch unmoved, and unless the ending matches `--expect`. The evidence records
-the work item state and cause, the pull request and its changed files, the
-terminus comment, CI, elapsed time, the configured model, and the model spend
+branch unmoved, and unless the ending matches `--expect`. Only a comment the
+App posted with this run's execution request marker counts, and more than one
+fails. A comment ending passes only when its cause is one the run accepts:
+each `--expect-cause` given, or by default `no_pull_request` for `--expect
+comment` and `no_pull_request` or `execution_deadline` for `--expect any`.
+Elapsed time runs from the request's start to the pull request or comment.
+The evidence records the work item state and ending cause, the pull request
+and its changed files, the terminus comment, CI, elapsed and execution time,
+the agent's final reply from its transcript when the api returns exactly one,
+the configured model, and the model spend
 as the OpenRouter key's usage delta (or `unverified`). The key is shared, so
 that delta includes any concurrent use of it.
 
