@@ -218,7 +218,16 @@ pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result
         )
     })?;
 
-    crate::ui::ui().emit(&CheckOutput { report: &report });
+    let ui = crate::ui::ui();
+    ui.emit(&CheckOutput { report: &report });
+    // The runner owns bundle validation. Only report a declared cron after it
+    // confirms that the bundle is structurally valid, while preserving the MCP
+    // verdict as the command's eventual outcome.
+    if report.verdict != "invalid_bundle" {
+        if let Ok(Some(warning)) = cron_trigger_warning_from_bundle(&plugin_dir) {
+            ui.warn(&warning);
+        }
+    }
     check_outcome(&report).map_err(anyhow::Error::from)
 }
 
@@ -4624,6 +4633,9 @@ pub struct PreparedDeploy {
     step: crate::ui::Step,
     tier: DeployTier,
     plugin_dir: PathBuf,
+    /// Advisory derived from the exact archive accepted by the platform. It is
+    /// emitted by the invocation owner so a multi target deploy prints it once.
+    cron_trigger_warning: Option<String>,
 }
 
 fn is_documentation_placeholder_channel(channel: &str) -> bool {
@@ -4665,6 +4677,12 @@ impl PreparedDeploy {
 
     pub fn version_id(&self) -> &str {
         &self.outcome.version.id
+    }
+
+    pub fn emit_cron_trigger_warning(&self) {
+        if let Some(warning) = &self.cron_trigger_warning {
+            crate::ui::ui().warn(warning);
+        }
     }
 }
 
@@ -4774,6 +4792,7 @@ async fn prepare_deploy_with_commit_sha(
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
+    let packed_manifest = read_packed_bundle_manifest(&archive);
     // #2448: the bundle's declared approval routes, read from the PACKED
     // archive -- the exact bytes `pack_tar_gz` just produced and that
     // `deploy_prepared` uploads -- rather than the source tree. A manifest
@@ -4783,7 +4802,13 @@ async fn prepare_deploy_with_commit_sha(
     // would find must be the one judged instead. Fail-open: an unreadable or
     // absent packed policy only warns, and the API's own fail-closed refusal
     // decides.
-    let declared_routes: Option<BTreeSet<String>> = match read_packed_bundle_gates(&archive) {
+    let packed_gates: Result<Vec<(String, String)>> = match &packed_manifest {
+        Ok((location, body)) => {
+            parse_manifest_gates(body, &format!("packed bundle manifest ({location})"))
+        }
+        Err(err) => Err(anyhow::anyhow!("{err:#}")),
+    };
+    let declared_routes: Option<BTreeSet<String>> = match packed_gates {
         Ok(gates) => Some(declared_approval_routes(&gates)),
         Err(err) => {
             ui.warn(&format!(
@@ -4794,6 +4819,10 @@ async fn prepare_deploy_with_commit_sha(
             None
         }
     };
+    let cron_trigger_warning = packed_manifest
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| cron_trigger_warning_from_manifest(body).ok().flatten());
     let commit_sha = match installer_commit_sha {
         Some(commit_sha) => Some(commit_sha.to_string()),
         None => {
@@ -4997,6 +5026,7 @@ async fn prepare_deploy_with_commit_sha(
         step,
         tier: opts.tier,
         plugin_dir,
+        cron_trigger_warning,
     })
 }
 
@@ -5082,6 +5112,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         step,
         tier,
         plugin_dir,
+        cron_trigger_warning: _,
     } = prepared;
     let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
@@ -5218,7 +5249,9 @@ pub(crate) async fn deploy_with_commit_sha(
     opts: DeployOpts,
     installer_commit_sha: Option<&str>,
 ) -> Result<DeployOutput> {
-    deploy_prepared(prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?).await
+    let prepared = prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?;
+    prepared.emit_cron_trigger_warning();
+    deploy_prepared(prepared).await
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment
@@ -7428,6 +7461,84 @@ fn gates_summary_line(gates: &[(String, String)]) -> String {
     }
 }
 
+/// Render the advisory for cron triggers that passed the authoritative bundle
+/// validator. This formatter deliberately does not parse cron expressions: the
+/// declaration validator remains the single authority for accepted syntax.
+fn cron_trigger_warning_from_manifest(body: &str) -> Result<Option<String>> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(body).context("plugin manifest is not valid JSON")?;
+    let Some(triggers) = manifest.get("triggers").and_then(|value| value.as_array()) else {
+        return Ok(None);
+    };
+
+    let identities: Vec<String> = triggers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, trigger)| {
+            if trigger.get("type").and_then(|value| value.as_str()) != Some("cron") {
+                return None;
+            }
+            let schedule = trigger
+                .get("schedule")
+                .and_then(|value| value.as_str())?
+                .trim();
+            if schedule.is_empty() {
+                return None;
+            }
+            let name = trigger
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            Some(match name {
+                Some(name) => {
+                    serde_json::to_string(name).expect("serializing a manifest string cannot fail")
+                }
+                None => format!(
+                    "{} with schedule {}",
+                    index + 1,
+                    serde_json::to_string(schedule)
+                        .expect("serializing a manifest string cannot fail")
+                ),
+            })
+        })
+        .collect();
+
+    let warning = match identities.as_slice() {
+        [] => return Ok(None),
+        [identity] => format!(
+            "cron trigger {identity} is declared, but this platform tier does not yet fire it; follow #268"
+        ),
+        [first, second] => format!(
+            "cron triggers {first} and {second} are declared, but this platform tier does not yet fire them; follow #268"
+        ),
+        many => {
+            let (last, rest) = many.split_last().expect("cron identities are not empty");
+            format!(
+                "cron triggers {}, and {last} are declared, but this platform tier does not yet fire them; follow #268",
+                rest.join(", ")
+            )
+        }
+    };
+    Ok(Some(warning))
+}
+
+fn read_bundle_manifest(plugin_dir: &Path) -> Result<(String, String)> {
+    let manifest_path = MANIFEST_LOCATIONS
+        .iter()
+        .map(|loc| plugin_dir.join(loc))
+        .find(|path| path.is_file())
+        .ok_or_else(|| crate::exit::usage(crate::scaffold::no_manifest_message(plugin_dir)))?;
+    let body = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    Ok((manifest_path.display().to_string(), body))
+}
+
+fn cron_trigger_warning_from_bundle(plugin_dir: &Path) -> Result<Option<String>> {
+    let (_, body) = read_bundle_manifest(plugin_dir)?;
+    cron_trigger_warning_from_manifest(&body)
+}
+
 /// Read the bundle's declared approval gates as `(gate, route)` pairs.
 ///
 /// The manifest is probed at `.claude-plugin/plugin.json` then `plugin.json`,
@@ -7444,19 +7555,13 @@ fn gates_summary_line(gates: &[(String, String)]) -> String {
 /// list, declares no gate: no gates and no error. A bundle with no manifest is a
 /// usage error (the plugin dir is simply wrong).
 fn read_bundle_gates(plugin_dir: &Path) -> Result<Vec<(String, String)>> {
-    let manifest_path = MANIFEST_LOCATIONS
-        .iter()
-        .map(|loc| plugin_dir.join(loc))
-        .find(|path| path.is_file())
-        .ok_or_else(|| crate::exit::usage(crate::scaffold::no_manifest_message(plugin_dir)))?;
-    let body = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading {}", manifest_path.display()))?;
-    parse_manifest_gates(&body, &manifest_path.display().to_string())
+    let (location, body) = read_bundle_manifest(plugin_dir)?;
+    parse_manifest_gates(&body, &location)
 }
 
-/// Read the bundle's declared approval gates from a PACKED tar.gz archive
-/// (#2448), not the source tree -- the same bytes `pack_tar_gz` produces and
-/// `local`/`cluster deploy` upload. A source-tree read can name a manifest a
+/// Read the manifest from a PACKED tar.gz archive, not the source tree. These
+/// are the same bytes `pack_tar_gz` produces and `local`/`cluster deploy`
+/// upload. A source-tree read can name a manifest a
 /// root `.curieignore` (or one of the packer's built-in exclusions) keeps out
 /// of the archive entirely, or miss a manifest the archive packs from a
 /// location the source read never looked at; reading the archive itself is
@@ -7472,7 +7577,7 @@ fn read_bundle_gates(plugin_dir: &Path) -> Result<Vec<(String, String)>> {
 /// unreadable archive, or no manifest found by that resolution) are reported
 /// the same way `read_bundle_gates` reports a missing manifest, and the
 /// caller treats them identically: fail-open, warn, skip the pre-check.
-fn read_packed_bundle_gates(archive: &[u8]) -> Result<Vec<(String, String)>> {
+fn read_packed_bundle_manifest(archive: &[u8]) -> Result<(String, String)> {
     let mut tar_archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let entries = tar_archive
         .entries()
@@ -7543,14 +7648,13 @@ fn read_packed_bundle_gates(archive: &[u8]) -> Result<Vec<(String, String)>> {
             _ => None,
         },
     };
-    let (location, content) = resolved.ok_or_else(|| {
+    resolved.ok_or_else(|| {
         crate::exit::usage(
             "the packed bundle archive contains no plugin manifest \
              (.claude-plugin/plugin.json or plugin.json)"
                 .to_string(),
         )
-    })?;
-    parse_manifest_gates(&content, &format!("packed bundle manifest ({location})"))
+    })
 }
 
 /// Parse the `approvalPolicy` gates out of a plugin-manifest JSON body, mirroring

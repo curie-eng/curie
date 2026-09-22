@@ -1399,6 +1399,7 @@ enum DeployTargetChannels {
 #[derive(Clone, Copy)]
 struct ClusterDeployFixture {
     all_targets: bool,
+    cron_trigger: bool,
     deploy_failure: DeployFixtureFailure,
     connectors: ConnectorFixture,
     kubectl_failure: KubectlFixtureFailure,
@@ -1410,6 +1411,7 @@ impl Default for ClusterDeployFixture {
     fn default() -> Self {
         Self {
             all_targets: true,
+            cron_trigger: false,
             deploy_failure: DeployFixtureFailure::None,
             connectors: ConnectorFixture::Empty,
             kubectl_failure: KubectlFixtureFailure::None,
@@ -1654,6 +1656,23 @@ fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
 fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
     let plugin = tempfile::tempdir().expect("plugin tempdir");
     curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
+    if fixture.cron_trigger {
+        let manifest_path = plugin.path().join(".claude-plugin/plugin.json");
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("read scaffolded manifest"),
+        )
+        .expect("scaffolded manifest is JSON");
+        manifest["triggers"] = json!([{
+            "type": "cron",
+            "name": "acme-nightly",
+            "schedule": "0 2 * * *"
+        }]);
+        fs::write(
+            manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize cron manifest"),
+        )
+        .expect("write cron manifest");
+    }
     let dev_channel = target_config("dev", fixture.target_channels).2;
     let prod_channel = target_config("prod", fixture.target_channels).2;
     fs::write(
@@ -1884,6 +1903,42 @@ fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
             ]
         })
     );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("#268"),
+        "a bundle with no cron trigger must not report #268"
+    );
+}
+
+#[test]
+fn cluster_deploy_cron_warning_is_once_for_single_and_all_targets() {
+    for all_targets in [false, true] {
+        let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+            all_targets,
+            cron_trigger: true,
+            ..ClusterDeployFixture::default()
+        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "cluster deploy failed: {stderr}"
+        );
+        let warnings: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("#268"))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one cluster invocation must emit one cron warning: {stderr}"
+        );
+        assert!(warnings[0].contains("acme-nightly"), "was {stderr}");
+        assert!(
+            warnings[0].contains("this platform tier does not yet fire it"),
+            "was {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -2057,4 +2112,8 @@ fn cluster_deploy_json_single_target_shape_is_unchanged() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(one_stdout_object(&output), expected_deploy("dev"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("#268"),
+        "a bundle with no cron trigger must not report #268"
+    );
 }
