@@ -1093,3 +1093,27 @@ class ConsoleSession(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Tenant(Base):
+    """The platform's first tenant concept (issue #2906).
+
+    No ``tenant_id`` column exists anywhere else in the schema yet; this is
+    only the entity itself plus the self-host auto-provisioned default row
+    (added by the migration's data step, not by application boot logic).
+
+    ``deployment_id`` is an opaque string identifier for the physical
+    self-host appliance. It is deliberately NOT a foreign key to the
+    existing ``deployments`` table -- that table is the unrelated dev/prod
+    binding of an ``AgentVersion`` and predates tenants entirely.
+    """
+
+    __tablename__ = "tenants"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    deployment_id: Mapped[str] = mapped_column()
+    idp_config_ref: Mapped[str | None] = mapped_column(default=None)
+    retention_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    default_provider_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())

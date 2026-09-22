@@ -330,18 +330,24 @@ mod tests {
     }
 
     #[test]
-    fn packaged_n_and_n1_share_this_tree_head_so_rollback_is_compatible() {
+    fn packaged_n_and_n1_share_a_schema_floor_and_start_on_their_heads() {
         let n = window_for("0.9.0").expect("0.9.0 is catalogued for the next-train matrix");
         let n1 = window_for("0.9.1").expect("0.9.1 is catalogued for the next-train matrix");
         assert_eq!(n.schema_min, n1.schema_min);
-        assert_eq!(n.schema_head, n1.schema_head);
         check_target_schema(
             "0.9.0",
             &n,
             &n.schema_head,
             &["0.9.0".to_string(), "0.9.1".to_string()],
         )
-        .expect("N+1 to N is the same schema window");
+        .expect("N starts on its own head");
+        check_target_schema(
+            "0.9.1",
+            &n1,
+            &n1.schema_head,
+            &["0.9.0".to_string(), "0.9.1".to_string()],
+        )
+        .expect("N+1 starts on this tree's head");
         let err = check_target_schema(
             "0.8.7",
             &window_for("0.8.7").expect("0.8.7 window"),
