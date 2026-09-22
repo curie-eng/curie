@@ -23,10 +23,6 @@ class DriverOutcomes(unittest.TestCase):
                 "PATH": os.environ["PATH"],
                 "HOME": directory,
                 "CURIE_CREDENTIALS": "test-placeholder",
-                "CI_SLACK_APP_TOKEN": "test-placeholder",
-                "CI_SLACK_BOT_TOKEN": "test-placeholder",
-                "CI_SLACK_USER_TOKEN": "test-placeholder",
-                "CI_SLACK_CHANNEL_ID": "C0EXAMPLE1",
                 "CI_THROWAY_REPO": "acme-corp/acme-bot",
                 "FIXTURE": str(fixture),
                 "SCRIPT": str(SCRIPT),
@@ -40,56 +36,37 @@ class DriverOutcomes(unittest.TestCase):
                 check=False,
             )
 
-    def reply(self, messages):
+    def parse_turn(self, payload):
         return self.run_function(
-            'BOT_ID=U0EXAMPLE2\nslack_api() { cat "$FIXTURE"; }\n'
-            "sleep() { :; }\nwait_thread_reply 100.000001 1",
-            {"ok": True, "messages": messages},
+            'cat "$FIXTURE" | turn_is_reply',
+            payload,
         )
 
-    def test_placeholder_is_not_a_reply(self):
-        result = self.reply(
-            [
-                {"ts": "100.000001", "user": "U0EXAMPLE1", "text": "request"},
-                {
-                    "ts": "100.000002",
-                    "thread_ts": "100.000001",
-                    "user": "U0EXAMPLE2",
-                    "text": "On it. Working on your request.",
-                },
-            ]
+    def test_timeout_json_is_not_a_reply(self):
+        result = self.parse_turn({"reply": None, "finalized": False, "timed_out": True})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_awaiting_approval_json_is_not_a_finished_reply(self):
+        result = self.parse_turn(
+            {
+                "reply": "waiting on approval",
+                "thread": "100.000001",
+                "finalized": False,
+                "awaiting_approval": True,
+            }
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
-    def test_another_author_is_not_the_target_reply(self):
-        result = self.reply(
-            [
-                {"ts": "100.000001", "user": "U0EXAMPLE1", "text": "request"},
-                {
-                    "ts": "100.000002",
-                    "thread_ts": "100.000001",
-                    "user": "U0EXAMPLE3",
-                    "text": "A complete looking response",
-                },
-            ]
-        )
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-
-    def test_substantive_target_reply_is_returned_without_root_echo(self):
-        result = self.reply(
-            [
-                {"ts": "100.000001", "user": "U0EXAMPLE1", "text": "private-root-sentinel"},
-                {
-                    "ts": "100.000002",
-                    "thread_ts": "100.000001",
-                    "user": "U0EXAMPLE2",
-                    "text": "Verified namespace list",
-                },
-            ]
+    def test_finalized_reply_is_returned(self):
+        result = self.parse_turn(
+            {
+                "reply": "Verified namespace list",
+                "thread": "100.000002",
+                "finalized": True,
+            }
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Verified namespace list", result.stdout)
-        self.assertNotIn("private-root-sentinel", result.stdout)
 
     def test_desired_replicas_without_ready_pods_fail(self):
         result = self.run_function(
@@ -161,116 +138,119 @@ class DriverOutcomes(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), {"row": "read", "status": "FAILED"})
         self.assertNotIn("private-diagnostic-sentinel", result.stdout + result.stderr)
 
-    def progressive_reply(self, later, body):
-        messages = [
-            {
-                "ok": True,
-                "messages": [
-                    {
-                        "ts": "100.000004",
-                        "thread_ts": "100.000001",
-                        "user": "U0EXAMPLE2",
-                        "text": "Working on that now",
-                    }
-                ],
-            },
-            {
-                "ok": True,
-                "messages": [
-                    {
-                        "ts": "100.000004",
-                        "thread_ts": "100.000001",
-                        "user": "U0EXAMPLE2",
-                        "text": later,
-                    }
-                ],
-            },
-        ]
-        return self.run_function(
-            "BOT_ID=U0EXAMPLE2\nslack_api() {\n"
-            ' python3 - "$FIXTURE" "$HOME/cursor" <<\'PYREPLY\'\n'
-            "import json,pathlib,sys\np=pathlib.Path(sys.argv[2])\n"
-            "i=int(p.read_text()) if p.exists() else 0\np.write_text(str(i+1))\n"
-            "print(json.dumps(json.load(open(sys.argv[1]))[min(i,1)]))\nPYREPLY\n}\n"
-            "sleep() { :; }\n" + body,
-            messages,
-        )
-
-    def test_namespace_observation_waits_past_preamble(self):
-        result = self.progressive_reply(
-            "kube-system sre-e2e-example",
-            'EXPECTED_NAMESPACES=\'{"items":[{"metadata":{"name":"sre-e2e-example"}}]}\' '
-            "wait_thread_reply 100.000001 1 100.000003 namespaces",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("sre-e2e-example", result.stdout)
-
-    def test_coding_inspects_off_repo_link_after_preamble(self):
-        result = self.progressive_reply(
-            "https://github.com/acme-corp/another-bot/pull/17",
-            'mention_bot() { echo \'{"ts":"100.000003"}\'; }\n'
-            "READ_THREAD_TS=100.000001\nassert_coding_handoff",
+    def test_coding_inspects_off_repo_link(self):
+        result = self.run_function(
+            'echo "https://github.com/acme-corp/another-bot/pull/17" | pr_number_from_reply'
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("outside the authorized repository", result.stderr)
 
-    def test_operator_resolution_is_not_a_slack_click(self):
-        result = self.run_function("curie_bin() { echo /bin/true; }\napprove example-id")
-        self.assertNotEqual(result.returncode, 0)
+    def test_operator_resolution_uses_cluster_approvals(self):
+        result = self.run_function(
+            """
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+cat > "$HOME/fake-curie" <<'EOF'
+#!/bin/sh
+printf '%s\\n' "$*" > "$HOME/args"
+echo '{"resolved":{"id":"example-id","status":"approved"}}'
+EOF
+chmod +x "$HOME/fake-curie"
+assert_operator_audit() { printf '%s\\n' "$1" > "$HOME/audit"; }
+approve example-id
+grep -q -- 'cluster' "$HOME/args"
+grep -q -- 'approvals' "$HOME/args"
+grep -q -- '--resolve example-id' "$HOME/args"
+test "$(cat "$HOME/audit")" = example-id
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cluster_turn_invokes_cluster_message(self):
+        result = self.run_function(
+            """
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+cat > "$HOME/fake-curie" <<'EOF'
+#!/bin/sh
+printf '%s\\n' "$*" > "$HOME/args"
+echo '{"reply":"ok","thread":"100.000001","finalized":true}'
+EOF
+chmod +x "$HOME/fake-curie"
+cluster_turn "List namespaces"
+grep -q -- 'cluster' "$HOME/args"
+grep -q -- 'message' "$HOME/args"
+grep -q -- 'List namespaces' "$HOME/args"
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bind_operator_route_sets_users(self):
+        result = self.run_function(
+            """
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+cat > "$HOME/fake-curie" <<'EOF'
+#!/bin/sh
+printf '%s\\n' "$*" > "$HOME/args"
+echo '{}'
+EOF
+chmod +x "$HOME/fake-curie"
+bind_operator_route
+grep -q -- '--route-approvers' "$HOME/args"
+grep -q -- 'users:U0EXAMPLE1' "$HOME/args"
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_operator_audit_rejects_a_chat_principal(self):
+        result = self.run_function(
+            """
+export CURIE_SRE_AUDIT_OPERATOR=U0EXAMPLE1
+cat "$FIXTURE" | audit_is_operator
+""",
+            [
+                {
+                    "action": "approved",
+                    "authorized": True,
+                    "actor": "U0EXAMPLE1",
+                    "principal_kind": "chat",
+                }
+            ],
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_operator_audit_accepts_an_operator_principal(self):
+        result = self.run_function(
+            """
+export CURIE_SRE_AUDIT_OPERATOR=U0EXAMPLE1
+cat "$FIXTURE" | audit_is_operator
+""",
+            [
+                {
+                    "action": "approved",
+                    "authorized": True,
+                    "actor": "U0EXAMPLE1",
+                    "principal_kind": "operator",
+                }
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_repo_name_echo_cannot_prove_a_coding_pr(self):
         result = self.run_function(
-            'mention_bot() { echo \'{"ts":"100.000001"}\'; }\n'
-            'wait_thread_reply() { cat "$FIXTURE"; }\n'
-            'gh() { echo "[]"; }\nREAD_THREAD_TS=100.000001\nassert_coding_handoff',
-            {
-                "messages": [
-                    {
-                        "ts": "100.000001",
-                        "user": "U0EXAMPLE1",
-                        "text": "Open a PR in acme-corp/acme-bot",
-                    }
-                ]
-            },
+            'echo "Open a PR in acme-corp/acme-bot" | pr_number_from_reply'
         )
         self.assertNotEqual(result.returncode, 0, result.stderr)
 
-    def test_previous_turn_reply_cannot_satisfy_later_instruction(self):
-        result = self.run_function(
-            'BOT_ID=U0EXAMPLE2\nslack_api() { cat "$FIXTURE"; }\n'
-            "sleep() { :; }\nwait_thread_reply 100.000001 1 100.000003",
-            {
-                "ok": True,
-                "messages": [
-                    {
-                        "ts": "100.000002",
-                        "thread_ts": "100.000001",
-                        "user": "U0EXAMPLE2",
-                        "text": "A substantive answer to the earlier instruction",
-                    }
-                ],
-            },
+    def test_enqueued_json_is_not_a_finished_reply(self):
+        result = self.parse_turn(
+            {"status": "enqueued", "channel": "C0LOCALDEV", "thread": "100.000001"}
         )
         self.assertNotEqual(result.returncode, 0)
 
-    def test_prior_message_edit_does_not_prove_later_instruction_delivery(self):
+    def test_missing_thread_cannot_prove_delivery(self):
         result = self.run_function(
-            'BOT_ID=U0EXAMPLE2\nslack_api() { cat "$FIXTURE"; }\n'
-            "sleep() { :; }\nwait_thread_reply 100.000001 1 100.000003",
-            {
-                "ok": True,
-                "messages": [
-                    {
-                        "ts": "100.000002",
-                        "thread_ts": "100.000001",
-                        "user": "U0EXAMPLE2",
-                        "edited": {"ts": "100.000004", "user": "U0EXAMPLE2"},
-                        "text": "Revised answer after the later instruction",
-                    }
-                ],
-            },
+            'echo \'{"reply":"ok","finalized":true}\' | turn_thread'
         )
-        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
 
     def test_pending_is_scoped_to_exact_conversation(self):
         result = self.run_function(
@@ -288,16 +268,34 @@ class DriverOutcomes(unittest.TestCase):
 
     def test_pending_scale_uses_the_actual_sdk_tool_identity(self):
         result = self.run_function(
-            'thread_pending() { cat "$FIXTURE"; }\nwait_scale_pending 100.000001',
-            [{"id": "ours", "granted_tool": "mcp__kubernetes__resources_scale"}],
+            'list_pending() { cat "$FIXTURE"; }\nwait_scale_pending 1',
+            {
+                "truncated": False,
+                "pending": [
+                    {
+                        "id": "ours",
+                        "status": "pending",
+                        "granted_tool": "mcp__kubernetes__resources_scale",
+                    }
+                ],
+            },
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "ours")
 
     def test_other_pending_tools_cannot_satisfy_scale(self):
         result = self.run_function(
-            'thread_pending() { cat "$FIXTURE"; }\nwait_scale_pending 100.000001',
-            [{"id": "ours", "granted_tool": "other/resources_scale"}],
+            'list_pending() { cat "$FIXTURE"; }\nsleep() { :; }\nwait_scale_pending 1',
+            {
+                "truncated": False,
+                "pending": [
+                    {
+                        "id": "ours",
+                        "status": "pending",
+                        "granted_tool": "other/resources_scale",
+                    }
+                ],
+            },
         )
         self.assertNotEqual(result.returncode, 0)
 
@@ -323,13 +321,15 @@ class DriverOutcomes(unittest.TestCase):
         self.assertIn("scale: BLOCKED", result.stderr)
         self.assertIn("configuration-denial: PASS", result.stderr)
 
-    def test_slack_token_is_not_a_process_argument(self):
-        result = self.run_function(
-            'python3() { [[ "$*" != *test-private-token* '
-            '&& "$CURIE_SRE_SLACK_TOKEN" == test-private-token ]]; }\n'
-            "slack_api test-private-token auth.test",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_script_does_not_name_ci_slack_secrets(self):
+        text = SCRIPT.read_text()
+        for needle in (
+            "CI_SLACK_APP_TOKEN",
+            "CI_SLACK_BOT_TOKEN",
+            "CI_SLACK_USER_TOKEN",
+            "CI_SLACK_CHANNEL_ID",
+        ):
+            self.assertNotIn(needle, text)
 
     def test_platform_repository_is_refused_before_live_work(self):
         for repo in ["curie-eng/curie", "Curie-Eng/AgentOS", "invalid-repo-shape"]:
@@ -388,11 +388,25 @@ class DriverOutcomes(unittest.TestCase):
 
     def test_unavailable_gh_verifier_blocks_only_coding_row(self):
         result = self.run_function(
-            'mention_bot() { echo \'{"ts":"100.000003"}\'; }\n'
-            'wait_thread_reply() { echo "https://github.com/acme-corp/acme-bot/pull/17"; }\n'
-            "gh() { return 77; }\nREAD_THREAD_TS=100.000001\nassert_coding_handoff",
+            """
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+cat > "$HOME/fake-curie" <<'EOF'
+#!/bin/sh
+echo '{"reply":"https://github.com/acme-corp/acme-bot/pull/17","thread":"100.000001","finalized":true}'
+EOF
+chmod +x "$HOME/fake-curie"
+wait_pending_tool() { return 1; }
+gh() { return 77; }
+READ_THREAD_TS=100.000001
+assert_coding_handoff
+"""
         )
         self.assertEqual(result.returncode, 3, result.stderr)
+
+    def test_missing_throwaway_repo_blocks_only_coding_row(self):
+        result = self.run_function("CI_THROWAY_REPO= assert_coding_handoff")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("CI_THROWAY_REPO", result.stderr)
 
     def test_stale_empty_wrong_repo_and_unchecked_prs_fail(self):
         for override in [

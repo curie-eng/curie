@@ -91,10 +91,10 @@ If the App private key already lives in a Secret you manage, use
 instead of `--private-key`.
 
 Name `--workspace` on a followup deploy so the demo matches the documented
-command surface. The installer already bound `U0EXAMPLE1` as an approver, which
-allows that user to approve the Kubernetes gates from the CLI with
-`curie cluster approvals sre-bot --resolve`. Without explicit approvers, only
-members of the bound Slack channel can approve.
+command surface. The fresh install requires `--approvers`, which binds named
+Slack users to approve Kubernetes gates, including with
+`curie cluster approvals sre-bot --resolve`. The command above binds
+`U0EXAMPLE1` and enables that user to resolve approvals from the CLI.
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot --workspace --slack-channel C0EXAMPLE1

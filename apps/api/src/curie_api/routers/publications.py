@@ -25,6 +25,7 @@ from ..models import PublicationReviewReservation, ThreadPublicationLineage
 from ..publication_authority import (
     AuthorityRefused,
     AuthorityUnavailable,
+    PublicationRemoteTerminal,
     verify_publication_identity,
 )
 from ..repo_full_name import repo_url_path
@@ -32,6 +33,7 @@ from ..repository_auth import resolve_repository_credential
 from ..schemas import (
     PublicationCreate,
     PublicationLineageAdvance,
+    PublicationLineageIdentityOut,
     PublicationLineageOut,
     PublicationOut,
     RepositoryCredentialOut,
@@ -383,6 +385,92 @@ async def advance_publication_lineage(
             {"code": exc.code, "message": exc.message},
         ) from exc
     return await _publication_lineage_out(session, lineage)
+
+
+@internal_router.post(
+    "/{publication_id}/lineage/identity",
+    response_model=PublicationLineageIdentityOut,
+    dependencies=[Depends(require_internal_worker_token)],
+)
+async def verify_publication_lineage_identity(
+    publication_id: uuid.UUID,
+    data: PublicationLineageAdvance,
+    session: SessionDep,
+    request: Request,
+) -> PublicationLineageIdentityOut:
+    """Hand the worker one verified identity and write nothing (#2903).
+
+    The worker persists these four values inside the same compare-and-set that
+    first sets `pr_number`, so the two facts can never be observed apart. The
+    App credentials stay here; the worker receives values, never authority.
+    """
+
+    try:
+        publication = await crud.get_publication(session, publication_id)
+        if publication is None or publication.lineage is None:
+            raise LookupError("publication lineage not found")
+        lineage = publication.lineage
+        conflict = crud.publication_lineage_outcome_conflict(publication, lineage, data)
+        if conflict is not None:
+            raise conflict
+        identity = await verify_publication_identity(
+            lineage,
+            data,
+            get_settings(),
+            request.app.state.http_client,
+        )
+        if identity is None:
+            # Not an error: a token-mode install and a pre-App pull request are
+            # both permanently ineligible, and both must answer without failing.
+            return PublicationLineageIdentityOut(lineage_id=lineage.id, eligible=False)
+        # The PATCH sibling runs this recheck inside its write transaction. Here
+        # the API answers and the worker writes, so dropping it would mean
+        # nothing rechecks a revoked workspace or a deactivated deployment.
+        await crud.require_current_lineage_workspace(
+            session,
+            lineage,
+            conflict_code="publication.lineage_stale",
+            conflict_message="publication workspace or deployment is no longer authorized",
+        )
+    except PublicationRemoteTerminal as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.lineage_terminal",
+                "message": (
+                    "the pull request for this thread is merged or closed; start a new thread"
+                ),
+                "observed_state": exc.state,
+            },
+        ) from None
+    except AuthorityUnavailable:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            _GITHUB_UNAVAILABLE_DETAIL,
+        ) from None
+    except AuthorityRefused:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.lineage_stale",
+                "message": "current GitHub publication identity was refused",
+            },
+        ) from None
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except crud.PublicationLineageConflict as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": exc.code, "message": exc.message},
+        ) from exc
+    return PublicationLineageIdentityOut(
+        lineage_id=lineage.id,
+        eligible=True,
+        repository_id=identity.repository_id,
+        installation_id=identity.installation_id,
+        pr_node_id=identity.pr_node_id,
+        base_ref=identity.base_ref,
+    )
 
 
 @router.get("", response_model=list[PublicationOut])

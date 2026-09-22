@@ -580,7 +580,7 @@ fn applied_checkpoint(drain_completed: bool) -> Value {
         &[
             "plan",
             "validate",
-            "drain",
+            "drain_preflight",
             "checkpoint",
             "migrate",
             "apply",
@@ -2272,14 +2272,14 @@ fn skipped_drain_phases_still_report_drained_queues() {
         fresh.argv()
     );
 
-    // Same-version rerun: Drain/Checkpoint/Migrate/Apply are all skipped.
+    // Same-version rerun: DrainPreflight/Checkpoint/Migrate/Apply are all skipped.
     let same = Fixture::new(None);
     let output = same.local("resumed-applied");
     let rerun = json(&output);
     assert_eq!(rerun["unchanged"], true, "{rerun}");
     assert_eq!(
         rerun["convergence"]["queues_drained"], true,
-        "a same-version rerun skips Drain but is not undrained: {rerun}"
+        "a same-version rerun skips DrainPreflight but is not undrained: {rerun}"
     );
     assert_eq!(rerun["convergence"]["exact"], true, "{rerun}");
     assert_eq!(rerun["status"], "succeeded", "{rerun}");
@@ -2303,12 +2303,17 @@ fn skipped_drain_phases_still_report_drained_queues() {
     }
 }
 
-// T20 -- #2639: live Drain must return the worker Deployment probe, not a
-// hardcoded success. A non-NotFound probe failure that stays pending through
-// the phase budget fails Drain, keeps the previous version serving, and never
-// issues helm upgrade.
+// T20 -- #2639: live DrainPreflight must return the worker Deployment probe,
+// not a hardcoded success. A non-NotFound probe failure that stays pending
+// through the phase budget fails the preflight, keeps the previous version
+// serving, and never issues helm upgrade.
+//
+// #2830: the phase's own name and its refusal text must not claim it observed
+// a drain -- it only confirmed the worker Deployment was unreachable. The
+// real #2010 drain gate is the chart's pre-upgrade Helm hook Job, not this
+// probe.
 #[test]
-fn undrained_deploy_fails_drain_before_mutation() {
+fn undrained_deploy_fails_drain_preflight_before_mutation() {
     let fixture = Fixture::new(None);
     let output = fixture.local_env(
         "undrained-deploy",
@@ -2316,24 +2321,28 @@ fn undrained_deploy_fails_drain_before_mutation() {
     );
     let json = json(&output);
     assert_eq!(json["status"], "failed", "{json}");
-    assert_eq!(json["phase"], "drain", "{json}");
+    assert_eq!(json["phase"], "drain_preflight", "{json}");
     assert_eq!(json["previous_serving"], true, "{json}");
     assert!(
         fixture.helm_upgrades().is_empty(),
-        "Drain refusal must precede mutation: {:?}",
+        "DrainPreflight refusal must precede mutation: {:?}",
         fixture.argv()
     );
     assert!(
         fixture.issued(&["kubectl", "get", "deploy", "rel-worker"]),
-        "Drain must probe the worker Deployment: {:?}",
+        "DrainPreflight must probe the worker Deployment: {:?}",
         fixture.argv()
     );
     let reason = json["fail_forward"]["reason"]
         .as_str()
         .unwrap_or_else(|| panic!("no fail_forward reason: {json}"));
     assert!(
-        reason.contains("in flight") || reason.contains("drain"),
-        "fail-forward must mention in-flight work or drain: {reason}"
+        reason.contains("reachable"),
+        "fail-forward must describe the unreachable worker probe: {reason}"
+    );
+    assert!(
+        !reason.contains("in flight"),
+        "fail-forward must not claim it observed in-flight delivery work it never watched: {reason}"
     );
 }
 
@@ -2541,7 +2550,10 @@ fn resumed_upgrade_remigrates_its_own_output_without_change() {
     );
 
     // Resume with Apply still outstanding, so the second run re-reads and
-    // re-migrates the retained (already migrated) overlay.
+    // re-migrates the retained (already migrated) overlay. This deliberately
+    // seeds the pre-#2830 `"drain"` phase name (rather than the current
+    // `"drain_preflight"`) so a full resume through the real binary also pins
+    // that a checkpoint an older binary wrote still resumes correctly.
     fixture.seed_checkpoint(&checkpoint_through(
         &["plan", "validate", "drain", "checkpoint", "migrate"],
         true,

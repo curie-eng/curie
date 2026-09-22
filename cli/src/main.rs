@@ -943,10 +943,8 @@ enum SreBotAction {
         slack_channel: Option<String>,
         /// Slack user IDs allowed to resolve the bot's Kubernetes mutation
         /// gates (route sre-approvals). Comma separated and repeatable.
-        /// Required for operator principals (`curie cluster approvals
-        /// --resolve`) to approve; without it only members of the bound Slack
-        /// channel can approve.
-        #[arg(long, value_name = "USER_IDS")]
+        /// At least one explicit user is required.
+        #[arg(long, value_name = "USER_IDS", required = true)]
         approvers: Vec<String>,
         /// Install the upgrade path: the self-upgrade connector, the platform
         /// upgrade Job, and the two identities behind them.
@@ -997,9 +995,11 @@ enum DevAction {
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
     /// Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes
-    /// MCP server, a CI-only Socket Mode Slack app, a live provider, and an
-    /// allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`).
-    /// Missing those CI secrets skip with the reason in the run summary.
+    /// MCP server, a live provider, and an allowlisted throwaway repo
+    /// (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with
+    /// `curie cluster message`. Approvals resolve through
+    /// `curie cluster approvals` and an operator principal. Missing the live
+    /// provider or throwaway repo skips with the reason in the run summary.
     SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
@@ -2279,11 +2279,14 @@ enum ClusterAction {
     },
     /// Run the resumable cluster upgrade lifecycle to a target version.
     ///
-    /// Plans, validates, drains accepted work, checkpoints, migrates, applies,
-    /// proves exact convergence, runs a target-version canary, and records the
-    /// new known-good revision. The operator does not pass Helm merge flags.
-    /// A failed attempt either leaves the previous known-good version serving
-    /// or returns one fail-forward command. See issue #2301.
+    /// Plans, validates, checks the worker workload is reachable, checkpoints,
+    /// migrates, applies, proves exact convergence, runs a target-version
+    /// canary, and records the new known-good revision. The worker drain gate
+    /// itself is the chart's own pre-upgrade Helm hook, which runs during
+    /// apply and is observed at the convergence step. The operator does not
+    /// pass Helm merge flags. A failed attempt either leaves the previous
+    /// known-good version serving or returns one fail-forward command. See
+    /// issue #2301.
     Upgrade {
         /// Target Curie version (chart/app version) to upgrade to.
         #[arg(long = "to", value_name = "VERSION")]
@@ -5481,6 +5484,70 @@ mod tests {
     #[test]
     fn clap_surface_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    fn message_value_flags(path: &[&str]) -> std::collections::BTreeSet<String> {
+        let root = Cli::command();
+        let mut command = &root;
+        let mut flags = std::collections::BTreeSet::new();
+
+        for (index, name) in path.iter().enumerate() {
+            let is_leaf = index + 1 == path.len();
+            for arg in command.get_arguments() {
+                if (!is_leaf && !arg.is_global_set()) || !arg.get_action().takes_values() {
+                    continue;
+                }
+                if let Some(long) = arg.get_long() {
+                    flags.insert(format!("--{long}"));
+                }
+            }
+            command = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing command path component {name:?}"));
+        }
+
+        for arg in command.get_arguments() {
+            if arg.get_action().takes_values() {
+                if let Some(long) = arg.get_long() {
+                    flags.insert(format!("--{long}"));
+                }
+            }
+        }
+
+        flags
+    }
+
+    fn message_value_flags_from_source() -> std::collections::BTreeSet<String> {
+        let source = include_str!("message.rs");
+        let body = source
+            .split("const MESSAGE_VALUE_FLAGS: &[&str] = &[")
+            .nth(1)
+            .and_then(|rest| rest.split_once("];"))
+            .map(|(body, _)| body)
+            .expect("message.rs must contain MESSAGE_VALUE_FLAGS");
+
+        body.lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|flag| flag.strip_suffix("\","))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn message_preflight_value_flags_match_clap_command_graph() {
+        let mut derived = message_value_flags(&["local", "message"]);
+        derived.extend(message_value_flags(&["cluster", "message"]));
+        let source = message_value_flags_from_source();
+        let missing: Vec<_> = derived.difference(&source).cloned().collect();
+        let stale: Vec<_> = source.difference(&derived).cloned().collect();
+
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "message value flag inventory drifted from clap: missing={missing:?}, stale={stale:?}, derived={derived:?}, source={source:?}"
+        );
     }
 
     /// Serializes the `cluster_connector_bind_values` cases that mutate the

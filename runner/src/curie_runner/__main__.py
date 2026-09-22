@@ -57,6 +57,7 @@ from .history import (
     DEFAULT_REPLAY_MAX_BYTES,
     DEFAULT_REPLAY_MAX_TURNS,
     ConversationReplay,
+    HistoryCapacityError,
     HistoryError,
     StructuredReplayUnsupported,
     TranscriptStore,
@@ -270,6 +271,7 @@ def build_runner(
     workspace_path: Path | None = None,
     attachments_path: Path | None = None,
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
+    history_capacity_exceeded: bool = False,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -388,6 +390,22 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    # Tell the gate whether the platform's own ``curie-state`` tools exist this
+    # session (#2286 adversarial round). The toolPolicy exemption is by exact
+    # live tool name, and a name the platform never published is not ours -- an
+    # ambient project ``.mcp.json`` can mount a server keyed ``curie-state``,
+    # because ``strict_mcp_config`` is off. Set AFTER construction rather than
+    # passed to ``build_approval_gate`` deliberately: the gate is built above at
+    # the three fail-closed approval boot checks, which must raise before any
+    # other boot work happens, and hoisting ``resolve_state_client`` above them
+    # would reorder the boot to suit a field. Both this flag and the conditional
+    # mount below read the same ``state_client`` local, which nothing rebinds in
+    # between, so the exemption and the mount cannot disagree. The mount keeps
+    # its own ``is not None`` because ``build_state_server`` needs the narrowed
+    # client, not the bool.
+    state_mounted = state_client is not None
+    if approval_gate is not None:
+        approval_gate.state_server_mounted = state_mounted
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,
@@ -619,6 +637,7 @@ def build_runner(
             ),
             connector_reprobe=connector_reprobe,
             connector_availability=connector_availability,
+            history_capacity_exceeded=history_capacity_exceeded,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -650,7 +669,9 @@ async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     return store, format_memory_preamble(records)
 
 
-async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationReplay]:
+async def _load_history(
+    config: RunnerConfig,
+) -> tuple[TranscriptStore, ConversationReplay, bool]:
     """Resolve, compact when needed, and load the structured replay prefix.
 
     A configured history ref is continuity-critical. Failure is fatal: silently
@@ -661,6 +682,11 @@ async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, Conversa
     defaults. They arrive through the declared boot env (parsed defensively, so
     a typo degrades to the default rather than failing boot), which is why the
     defaults are applied here rather than read off the process env at this call.
+
+    A 413 on the boot compaction append is the one exception to fatal (#2820):
+    the thread is at the transcript cap, which no cold sandbox can fix, so the
+    runner still boots and the returned flag makes it refuse every turn with the
+    append path's non-retryable capacity event instead of dying unserved.
     """
 
     store = resolve_history(config.history_ref, os.environ)
@@ -674,13 +700,23 @@ async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, Conversa
         if config.history_max_bytes is not None
         else DEFAULT_REPLAY_MAX_BYTES
     )
+    capacity_exceeded = False
     try:
         records = await store.load()
         replay, summary = build_conversation_replay(
             records, max_turns=max_turns, max_bytes=max_bytes
         )
         if summary is not None:
-            await store.append(summary)
+            try:
+                await store.append(summary)
+            except HistoryCapacityError as exc:
+                logger.error(
+                    "history capacity exceeded at boot session=%s status=%d "
+                    "(refusing turns)",
+                    config.session.session_id,
+                    exc.status,
+                )
+                capacity_exceeded = True
     except Exception as exc:  # noqa: BLE001 - translate loader failures consistently
         status = (
             exc.args[0]
@@ -706,9 +742,9 @@ async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, Conversa
         config.session.session_id,
         len(records),
         len(replay.messages),
-        summary is not None,
+        summary is not None and not capacity_exceeded,
     )
-    return store, replay
+    return store, replay, capacity_exceeded
 
 
 @dataclass(frozen=True)
@@ -721,6 +757,7 @@ class _BootFetches:
     conversation_replay: ConversationReplay
     mcp_capability: McpToolCapabilityProbe | None
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
+    history_capacity_exceeded: bool = False
 
 
 async def _load_boot_fetches(
@@ -734,7 +771,7 @@ async def _load_boot_fetches(
     resolve_history(config.history_ref, os.environ)
 
     memory: tuple[MemoryStore, str | None] | None = None
-    history: tuple[TranscriptStore, ConversationReplay] | None = None
+    history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
     capability: McpToolCapabilityProbe | None = None
     derived = derive_mcp_servers(
         config.session.plugin_dir,
@@ -784,6 +821,7 @@ async def _load_boot_fetches(
         conversation_replay=history[1],
         mcp_capability=capability,
         connector_failures=connector_failures,
+        history_capacity_exceeded=history[2],
     )
 
 
@@ -851,6 +889,7 @@ def _serve() -> None:
         workspace_path=workspace_path,
         attachments_path=attachments_path,
         connector_failures=fetches.connector_failures,
+        history_capacity_exceeded=fetches.history_capacity_exceeded,
     )
     def capture_mounted_workspace() -> WorkspaceSnapshot:
         # The sanitized, credential-free origin in /workspace/.git/config is

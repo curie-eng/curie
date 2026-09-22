@@ -437,9 +437,12 @@ command. Success is refused unless convergence is exact and the canary
 passed. After a normal command failure, run the same command to resume only
 when cleanup successfully released ownership.
 
-This composes configuration migration (issue 2299) with the drain gate
-(issue 2010): a resume after a completed drain does not drain accepted
-work again.
+This composes configuration migration (issue 2299) with a `drain_preflight`
+phase that confirms the worker workload is reachable ahead of Apply (issue
+2830): a resume after a completed preflight does not repeat it. That phase is
+not the drain gate itself; the gate (issue 2010) is the chart's own
+pre-upgrade Helm hook Job, which runs during Apply and whose outcome the
+convergence check above reports as the drained-queue gate.
 
 After confirmation, the command claims the namespaced
 `<release>-upgrade-checkpoint` ConfigMap before it reads release snapshots or
@@ -933,10 +936,42 @@ mailAdapter:
     httpsCidrs: [203.0.113.0/24] # placeholder; replace from your provider/proxy
 ```
 
-An empty `mailAdapter.agentmail.httpsCidrs` refuses to render when the adapter is
-enabled. Prefix-0 and prefix-1 routes refuse to render, including IPv4 or IPv6
+In the default `egressMode: cidrs`, an empty `mailAdapter.agentmail.httpsCidrs`
+refuses to render when the adapter is enabled. Prefix-0 and prefix-1 routes refuse to render, including IPv4 or IPv6
 split default routes; surrounding whitespace and expanded IPv6 spelling do not
 bypass that gate. Use narrow current provider or controlled-proxy ranges.
+
+**`/32` pins for AgentMail will break.** `api.agentmail.to` is fronted by
+CloudFront, which moves the name between edge addresses without notice. A list of
+`/32` entries resolved at install time is correct only until the next move; after
+that every HTTPS open from the adapter pod is refused and mail stops (seen on
+2026-09-18, #2824). The same applies to any CDN-fronted API. Pick one of:
+
+- **Published ranges.** Declare the provider's published ranges instead of
+  resolved addresses. For CloudFront that is every `CLOUDFRONT` prefix in
+  <https://ip-ranges.amazonaws.com/ip-ranges.json>, which AWS keeps current;
+  re-render when that file changes. Wide, but still limited to the CDN.
+- **A controlled egress proxy** with a stable address, with
+  `agentmail.baseUrl` pointing at it.
+- **`egressMode: publicHttps`.** The policy admits TCP 443 to any public address
+  and still denies private, loopback, link-local (cloud metadata), CGNAT,
+  multicast, documentation and reserved ranges, plus anything in
+  `publicHttpsExcept`. Pod, Service and node ranges in public address space
+  (dual-stack IPv6 pod and Service CIDRs on EKS, GKE and AKS, GKE public pod
+  ranges, public node IPs) are not denied by default; list them there. The adapter then dials whatever DNS returns. This survives any CDN
+  move. The trade-off is that the credential-bearing mail pod can open HTTPS to
+  any public host, not only AgentMail. `httpsCidrs` must be empty in this mode.
+
+```yaml
+mailAdapter:
+  agentmail:
+    egressMode: publicHttps
+    publicHttpsExcept: [] # add public-space pod, Service and node ranges
+```
+
+NetworkPolicy has no FQDN peer. CNIs that add one (Cilium `toFQDNs`, Calico
+DNS policy) can express "only api.agentmail.to" directly; the chart does not
+render those CRDs, so apply one alongside the release if your CNI supports it.
 
 For a bring-your-own platform API, declare the URL and its NetworkPolicy peer
 independently; the chart cannot safely infer IP ranges from a hostname:
@@ -966,7 +1001,8 @@ mailAdapter:
 | `mailAdapter.channelTokenExistingSecret` / `channelTokenExistingSecretKey` | Source the scoped channel token from an operator-managed Secret instead of the chart Secret (default key `mailChannelToken`). |
 | `mailAdapter.egressSecretExistingSecret` / `egressSecretExistingSecretKey` | Source the adapter's egress credential externally (default key `mailEgressSecret`). This requires `worker.adapterCredentialsExistingSecret` to supply the paired worker map. |
 | `mailAdapter.agentmail.apiKeyExistingSecret` / `apiKeyExistingSecretKey` | Source the AgentMail API key from an operator-managed Secret instead of the chart Secret (default key `mailAgentmailApiKey`). |
-| `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. The adapter dials only addresses these CIDRs admit, pinning to `/32` entries when DNS rotates to an edge outside the list (TLS is still verified against the hostname) -- this is what kept a CDN-fronted provider from being refused when its DNS rotated (#2731). |
+| `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. The adapter dials only addresses these CIDRs admit, pinning to `/32` entries when DNS rotates to an edge outside the list (TLS is still verified against the hostname) -- this is what kept a CDN-fronted provider from being refused when its DNS rotated (#2731). Resolved `/32` pins for a CDN-fronted API still break when the CDN moves; see above (#2824). Must be empty when `egressMode` is `publicHttps`. |
+| `mailAdapter.agentmail.egressMode` / `publicHttpsExcept` | `cidrs` (default) allows TCP 443 only to `httpsCidrs`. `publicHttps` allows TCP 443 to any public address with special-purpose ranges and `publicHttpsExcept` denied, trading provider-only egress for surviving CDN moves. List public-space pod, Service and node ranges in `publicHttpsExcept`. |
 | `mailAdapter.discoveryUnreadyAfterSeconds` | Continuous discovery-failure seconds after which readiness goes `503` (default `120`); liveness is unaffected. The Service still publishes the pod's address while unready, so reply/completion deliveries from the worker keep routing through a discovery outage; readiness going 503 is the operator signal, not a routing cutoff. |
 | `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
 | `mailAdapter.otelEgress.httpsCidrs` / `port` | Required narrow destination peers when the release's effective OTLP endpoint is external (`otelCollector.deploy=false` with `otelCollector.endpoint` set); the render is refused without it. `port` is optional and derives from the endpoint URL. Ignored for the in-chart collector, whose pod selector is used instead. |

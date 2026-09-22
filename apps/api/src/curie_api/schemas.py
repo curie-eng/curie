@@ -1595,6 +1595,20 @@ class PublicationLineageAdvance(BaseModel):
         return value.lower()
 
 
+class PublicationLineageIdentityOut(BaseModel):
+    """One verified immutable GitHub identity, or an explicit refusal to capture."""
+
+    # `lineage_id` is echoed on both answers. The worker asserts it equals the
+    # lineage it is about to write, so no reordered, retried or proxied answer
+    # can ever be persisted onto a different lineage.
+    lineage_id: uuid.UUID
+    eligible: bool
+    repository_id: int | None = None
+    installation_id: int | None = None
+    pr_node_id: str | None = None
+    base_ref: str | None = None
+
+
 class PublicationLineageOut(BaseModel):
     """Credential-free pull-request lineage facts safe for the worker."""
 

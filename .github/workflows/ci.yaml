@@ -5,7 +5,9 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next, "task/**"]
-    types: [opened, synchronize, reopened, edited]
+    # Commit events only. A title or body edit must not cancel an in-flight
+    # run and restart kind shards. Body-edit guards live in their own workflows.
+    types: [opened, synchronize, reopened]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
 # stacking. Keyed per workflow+ref: each PR branch and main have independent
@@ -446,6 +448,8 @@ jobs:
   rust-build:
     name: Build the curie release binary
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true' }}
     defaults:
       run:
         working-directory: cli
@@ -471,6 +475,8 @@ jobs:
   cli-portability:
     name: CLI runs on old glibc (and publishes per-commit binaries)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.cli_release == 'true' }}
     # The release cross-compile path was never exercised before a tag, so a
     # regression in it was undiscoverable until someone tried the artifact on a
     # real host. #1341 shipped exactly that way: both Linux targets inherited
@@ -552,6 +558,8 @@ jobs:
   cli-darwin:
     name: CLI builds for macOS (the fourth release target)
     runs-on: macos-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.cli_release == 'true' }}
     # `aarch64-apple-darwin` ships in the release matrix (release.yaml) and was
     # compiled for the FIRST TIME when a tag was pushed. Anything that breaks it
     # -- a dependency that does not build on macOS, a `cfg(unix)` assumption that
@@ -639,7 +647,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
       - name: Install Node
@@ -727,6 +735,8 @@ jobs:
   images:
     name: Build ${{ matrix.name }} image (no push)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -764,11 +774,11 @@ jobs:
       # native-only build does not need the emulator and does not pay for it.
       - name: Set up QEMU
         if: matrix.platforms
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
       - name: Build (no push)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
@@ -820,17 +830,19 @@ jobs:
   worker-local-image:
     name: Build worker-local overlay image (no push)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the base worker image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -860,17 +872,19 @@ jobs:
   dispatcher-image-smoke:
     name: Dispatcher image imports resolve
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the dispatcher image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -898,17 +912,19 @@ jobs:
   mail-adapter-image-smoke:
     name: Mail adapter image imports resolve
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the mail adapter image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/mail-adapter/Dockerfile
@@ -932,17 +948,19 @@ jobs:
   ui-image-smoke:
     name: UI image response headers are correct
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the UI image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -1242,6 +1260,8 @@ jobs:
   repo-toolchain-proof:
     name: Repository toolchain proof (runner image)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.images == 'true' }}
     env:
       CURIE_REPO_TOOLCHAIN_PROOF: required
     steps:
@@ -1280,11 +1300,11 @@ jobs:
           printf '%s\n' "$output" | grep -F "may not skip"
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1320,7 +1340,8 @@ jobs:
   eval-falsifiability:
     name: Eval falsifiability gate (fake model, offline)
     runs-on: ubuntu-latest
-    needs: rust-build
+    needs: [rust-build, changes]
+    if: ${{ needs.changes.outputs.skill == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1334,11 +1355,11 @@ jobs:
         run: chmod +x cli/target/release/curie
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1537,11 +1558,11 @@ jobs:
       # layers from cache alone (58s -> 15s) after wiping the builder.
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
         id: laddercache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1560,7 +1581,7 @@ jobs:
       # retag its from-source builds over whatever `:latest` meant in the local
       # Docker image store before this job ran.
       - name: Build the api image locally (satisfies curie-api + curie-migrate, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -1571,7 +1592,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker base image locally (satisfies the worker-local overlay's FROM, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -1582,7 +1603,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -1629,11 +1650,11 @@ jobs:
       # documents in full.
       - name: Set up a cache-only buildx builder (named, NOT the default -- #803)
         id: releasecache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1646,7 +1667,7 @@ jobs:
       - name: Retag the runner image for the compose worker (CURIE_RUNNER_IMAGE, no registry auth)
         run: docker tag curie-runner ghcr.io/curie-eng/curie-runner:latest
       - name: Build the api image locally (satisfies curie-api + curie-migrate, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -1657,7 +1678,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker base image locally (satisfies the worker-local overlay's FROM, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -1668,7 +1689,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -1679,7 +1700,7 @@ jobs:
           cache-from: type=gha,scope=ladder-dispatcher
           cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -1760,6 +1781,8 @@ jobs:
       cluster: ${{ steps.filter.outputs.cluster }}
       released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
+      images: ${{ steps.filter.outputs.images }}
+      cli_release: ${{ steps.filter.outputs.cli_release }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1802,7 +1825,7 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@v5.0.1
         with:
           version: v3.16.4
       # GHA-layer-cached builds via a named buildx builder that is NOT made the
@@ -1813,11 +1836,11 @@ jobs:
       # the Langfuse startup regression. The dispatcher is not deployed.
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: clustercache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -1828,7 +1851,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -1839,7 +1862,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the ui image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -1850,7 +1873,7 @@ jobs:
           cache-from: type=gha,scope=ladder-ui
           cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Build the runner image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1861,7 +1884,7 @@ jobs:
           cache-from: type=gha,scope=ladder-runner
           cache-to: type=gha,mode=max,scope=ladder-runner
       - name: Build the delayed Postgres readiness fixture locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: charts/curie/ci
           file: charts/curie/ci/postgres-readiness-delay.Dockerfile
@@ -1907,7 +1930,7 @@ jobs:
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@v1.14.0
+        uses: helm/kind-action@v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -1926,7 +1949,7 @@ jobs:
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@v1.14.0
+        uses: helm/kind-action@v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2137,11 +2160,11 @@ jobs:
           version: v3.16.4
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: upgradecache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the candidate api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -2152,7 +2175,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the candidate dispatcher image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -2163,7 +2186,7 @@ jobs:
           cache-from: type=gha,scope=ladder-dispatcher
           cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Build the candidate worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -2174,7 +2197,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the candidate ui image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -2185,7 +2208,7 @@ jobs:
           cache-from: type=gha,scope=ladder-ui
           cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Build the candidate runner image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -2212,7 +2235,7 @@ jobs:
                   protocol: TCP
           EOF
       - name: Create the disposable kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2557,11 +2580,11 @@ jobs:
           version: v3.16.4
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: upgradecache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the candidate worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -2583,7 +2606,7 @@ jobs:
             - role: control-plane
           EOF
       - name: Create the disposable kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2696,9 +2719,9 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
 
-  # The upgrade matrix runs on every PR as independent shards (issue #2733).
-  # The script owns the shard list and its --self-test proves every scenario
-  # is assigned to exactly one shard, so CI never hardcodes shard ids.
+  # The upgrade matrix is sharded (issue #2733) and change-selected with
+  # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 14 kind
+  # runners. The shard lister stays on every PR so coverage cannot drift.
   e2e-cluster-upgrade-matrix-shards:
     name: E2E cluster upgrade matrix shards
     runs-on: ubuntu-latest
@@ -2727,9 +2750,11 @@ jobs:
     name: E2E cluster upgrade matrix (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [rust-build, e2e-cluster-upgrade-matrix-shards]
+    needs: [rust-build, changes, e2e-cluster-upgrade-matrix-shards]
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}
     steps:
@@ -2749,7 +2774,7 @@ jobs:
           version: v3.16.4
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: matrixcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       # One parallel bake of all five candidate images (#2733); the serial
@@ -2794,7 +2819,7 @@ jobs:
       - name: Create the disposable kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2808,7 +2833,7 @@ jobs:
           sleep 15
       - name: Create the disposable kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2868,6 +2893,12 @@ jobs:
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow-level block, so contents:read
+    # is repeated. actions:read is required to list this run's jobs for the
+    # 20 minute upgrade-matrix wall-clock assertion (#2823).
+    permissions:
+      contents: read
+      actions: read
     needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
@@ -2931,9 +2962,9 @@ jobs:
           if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
             released_upgrade_expected="success"
           fi
-          # Required on every PR, not change-selected. A matrix job reports
-          # success only when every shard succeeded.
-          upgrade_matrix_expected="success"
+          # Same selector as released-upgrade: a matrix job reports success
+          # only when every selected shard succeeded, and skipped otherwise.
+          upgrade_matrix_expected="$released_upgrade_expected"
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
@@ -2971,3 +3002,12 @@ jobs:
           echo "Selected and skipped negative control passed"
 
           echo "E2E required passed"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: ${{ !cancelled() }}
+        with:
+          persist-credentials: false
+      - name: Assert upgrade matrix wall clock
+        if: ${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py

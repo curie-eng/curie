@@ -1100,6 +1100,7 @@
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
+          "/v1/internal/publications/{publication_id}/lineage/identity",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
@@ -1126,7 +1127,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3160
+      "cardinality_bound": 3200
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1213,6 +1214,7 @@
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
+          "/v1/internal/publications/{publication_id}/lineage/identity",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
@@ -1239,7 +1241,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3160
+      "cardinality_bound": 3200
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1326,6 +1328,7 @@
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
+          "/v1/internal/publications/{publication_id}/lineage/identity",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
@@ -1345,7 +1348,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 632
+      "cardinality_bound": 640
     },
     "curie.background.loop": {
       "type": "counter",

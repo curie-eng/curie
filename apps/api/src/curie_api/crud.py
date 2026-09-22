@@ -1349,6 +1349,60 @@ async def mark_publication_lineage_terminal(
     return refreshed
 
 
+def publication_lineage_outcome_conflict(
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    data: PublicationLineageAdvance,
+) -> PublicationLineageConflict | None:
+    """Preconditions one revision outcome must meet before it may claim a lineage.
+
+    Pure, so the advancing writer and the read-only identity endpoint reach the
+    same verdict with the same code rather than drifting apart. The order is
+    load bearing and carried over unchanged: which check fires first decides
+    which conflict code the caller sees, and the worker branches on that code.
+    """
+
+    if lineage.status != "open":
+        return PublicationLineageConflict(
+            "publication.lineage_terminal",
+            "the pull request for this thread is merged or closed; start a new thread",
+        )
+    if publication.revision_number != lineage.latest_revision:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "publication revision is not the current thread lineage revision",
+        )
+    # Case insensitive on both sides: `_validated_pr_url` in the worker accepts
+    # GitHub's own spelling of the repository and preserves it, so a repository
+    # whose GitHub casing differs from `repo_full_name` publishes fine and must
+    # not then take a stable refusal here.
+    canonical = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
+    if data.pr_url.casefold() != canonical.casefold():
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity does not match the publication repository",
+        )
+    if lineage.pr_number is not None and (
+        lineage.pr_number != data.pr_number
+        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
+    ):
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity no longer matches the stored thread lineage",
+        )
+    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage version or expected head is stale",
+        )
+    if publication.status not in ("approved", "launching", "running"):
+        return PublicationLineageConflict(
+            "publication.revision_not_approved",
+            "publication revision must be approved before advancing its lineage",
+        )
+    return None
+
+
 async def advance_publication_lineage(
     session: AsyncSession,
     publication_id: uuid.UUID,
@@ -1382,38 +1436,9 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication thread pull request lineage is absent",
         )
-    if lineage.status != "open":
-        raise PublicationLineageConflict(
-            "publication.lineage_terminal",
-            "the pull request for this thread is merged or closed; start a new thread",
-        )
-    if publication.revision_number != lineage.latest_revision:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "publication revision is not the current thread lineage revision",
-        )
-    if data.pr_url != f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}":
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity does not match the publication repository",
-        )
-    if lineage.pr_number is not None and (
-        lineage.pr_number != data.pr_number or lineage.pr_url != data.pr_url
-    ):
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity no longer matches the stored thread lineage",
-        )
-    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request lineage version or expected head is stale",
-        )
-    if publication.status not in ("approved", "launching", "running"):
-        raise PublicationLineageConflict(
-            "publication.revision_not_approved",
-            "publication revision must be approved before advancing its lineage",
-        )
+    conflict = publication_lineage_outcome_conflict(publication, lineage, data)
+    if conflict is not None:
+        raise conflict
 
     identity_values: dict[str, Any] = {}
     if identity is not None:
@@ -1438,7 +1463,7 @@ async def advance_publication_lineage(
                 "publication.lineage_stale",
                 "immutable GitHub lineage identity changed",
             )
-        await _require_current_lineage_workspace(
+        await require_current_lineage_workspace(
             session,
             lineage,
             conflict_code="publication.lineage_stale",
@@ -2390,7 +2415,7 @@ async def revoke_console_session(
     return row
 
 
-async def _require_current_lineage_workspace(
+async def require_current_lineage_workspace(
     session: AsyncSession,
     lineage: ThreadPublicationLineage,
     *,
@@ -2445,7 +2470,7 @@ async def _require_review_binding(
         if lineage.binding_id
         else None
     )
-    await _require_current_lineage_workspace(
+    await require_current_lineage_workspace(
         session,
         lineage,
         conflict_code="publication.review_ineligible",

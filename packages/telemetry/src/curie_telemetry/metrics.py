@@ -255,6 +255,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/review-reservations",
     "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
     "/v1/internal/publications/{publication_id}/lineage",
+    "/v1/internal/publications/{publication_id}/lineage/identity",
     "/v1/internal/publications/{publication_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/selection",

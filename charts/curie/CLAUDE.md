@@ -128,13 +128,20 @@ component and rail detail in `charts/curie/README.md`.
   copy its liveness shape onto the worker.
 - **Mail-adapter egress is a separate fail-closed rail.** Enabling
   `mailAdapter.deploy` requires at least one
-  `mailAdapter.agentmail.httpsCidrs` entry. One egress-only policy is the
+  `mailAdapter.agentmail.httpsCidrs` entry, unless the operator chooses
+  `mailAdapter.agentmail.egressMode=publicHttps` (#2824): public TCP 443 with
+  private, link-local (metadata), and other special-purpose ranges excepted,
+  because CloudFront-fronted AgentMail outlives any /32 snapshot. That mode is
+  an explicit operator
+  trade, never a default. One egress-only policy is the
   complete list of what that pod may reach, and every destination is a rule
   inside it rather than a second policy object, so one object still shows
   everything a pod holding three credentials can talk to -- read the rules in
   `templates/mail-adapter.yaml` for the current set rather than trusting a count
   here. As written today they are DNS, this release's API pods, those
-  `agentmail.httpsCidrs` on TCP 443, and exactly one collector peer: while
+  `agentmail.httpsCidrs` on TCP 443 (in `publicHttps` mode, `0.0.0.0/0` and
+  `::/0` on TCP 443 with special-purpose ranges and `publicHttpsExcept`
+  excepted), and exactly one collector peer: while
   `otelCollector.deploy` is true, this release's OTel Collector on its gRPC and
   HTTP ports; otherwise the declared `mailAdapter.otelEgress.httpsCidrs` as an
   external ipBlock on `mailAdapter.otelEgress.port`. With
@@ -145,8 +152,10 @@ component and rail detail in `charts/curie/README.md`.
   false and an external `otelCollector.endpoint`, this policy has no peer for
   that address, so the chart requires `mailAdapter.otelEgress.httpsCidrs` and
   refuses the render without it, rather than a broad allow in the chart for an
-  address the chart cannot know. It never selects a runner sandbox and
-  never allows the Kubernetes API. The runtime pod mounts no ServiceAccount
+  address the chart cannot know. It never selects a runner sandbox and has no
+  explicit Kubernetes API carveout. An operator must list a public Kubernetes
+  control plane or node CIDR in `mailAdapter.agentmail.publicHttpsExcept` to
+  exclude it from public HTTPS egress. The runtime pod mounts no ServiceAccount
   token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
   split default routes. Do not turn provider DNS into a broad CIDR or add a
   private-network allow: use current provider ranges or a controlled egress

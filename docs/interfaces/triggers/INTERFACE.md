@@ -1,7 +1,7 @@
 ---
 seam: Triggers
 kind: SOFT
-impls: 4 hardcoded (Slack, GH push, commit poll, generic HMAC hook)
+impls: 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook)
 grade: not separately graded
 epics:
   - "#29"
@@ -13,7 +13,7 @@ order: 17
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 4 hardcoded (Slack, GH push, commit poll, generic HMAC hook) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -21,7 +21,7 @@ order: 17
 ## The black line
 
 A "trigger" is the thing that wakes an agent: an inbound event that gets turned into a
-run. Today there are **four hardcoded triggers** wired directly into their respective
+run. Today there are **five hardcoded triggers** wired directly into their respective
 ingress handlers, with **no shared `Trigger`/`EventSource` port** between them. There
 is no swappable line here yet — each trigger is bespoke code. The open architectural
 question (Epic #29) is whether "trigger" is even a real seam, or whether new triggers
@@ -32,7 +32,7 @@ assert a port that does not exist.
 ## Current contract
 
 There is no cross-trigger contract to satisfy — a new trigger today means adding
-another hardcoded handler. The four that exist:
+another hardcoded handler. The five that exist:
 
 - **Slack mention** — `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`:
   the `@app.event("app_mention")` listener (wired in
@@ -42,7 +42,12 @@ another hardcoded handler. The four that exist:
 - **GitHub push** — `apps/api/src/curie_api/routers/github.py::github_webhook`:
   `@router.post("/webhook")` verifies the HMAC signature, then branches on
   `x_github_event`; a `"push"` event is handed to `process_push(...)`, a `"ping"`
-  is answered `"pong"`, and every other event is `"ignored"`.
+  is answered `"pong"`, and unsupported events are `"ignored"`.
+- **GitHub review feedback**: `apps/api/src/curie_api/routers/github.py::github_webhook`
+  accepts actionable `issue_comment`, `pull_request_review_comment`, and
+  `pull_request_review` deliveries after HMAC verification. It claims the delivery UUID,
+  persists a durable `GitHubReviewFeedback` outbox row, and exposes worker-only provider
+  truth and lineage checks through `apps/api/src/curie_api/routers/github_reviews.py`.
 
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
   a timer in the API asks GitHub whether the deploy branches moved and hands any
@@ -56,8 +61,8 @@ another hardcoded handler. The four that exist:
   is a hardcoded platform ingress, not consumption of a bundle-declared
   `webhook` path.
 
-The four share no abstraction: a Slack Bolt event listener, a FastAPI GitHub
-HMAC route, an asyncio timer, and a FastAPI generic HMAC route. The GitHub push
+The five share no abstraction: a Slack Bolt event listener, two paths through a FastAPI
+GitHub HMAC route, an asyncio timer, and a FastAPI generic HMAC route. The GitHub push
 and commit poll converge one step earlier than the others -- both call
 `process_push`, deliberately, so the two deploy ingresses cannot disagree about
 what a push means.
@@ -98,7 +103,7 @@ wire a live wake-up for that declaration.
 
 ## Implementations today
 
-Four external triggers, all hardcoded, in two different processes:
+Five external triggers, all hardcoded, in two different processes:
 
 1. Slack `app_mention` in the dispatcher (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`).
 2. GitHub `push` webhook in the API (`apps/api/src/curie_api/routers/github.py::github_webhook`).
@@ -107,9 +112,12 @@ Four external triggers, all hardcoded, in two different processes:
    entirely unbuilt: this one is real, though it is a single hardcoded platform timer and
    not the per-agent declared `cron` the trigger DECLARATION surface anticipates.
 4. Generic HMAC hook in the API (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`).
+5. GitHub review feedback in the API
+   (`apps/api/src/curie_api/routers/github.py::github_webhook`), with worker-only
+   provider truth and lineage checks in `apps/api/src/curie_api/routers/github_reviews.py`.
 
 Plus three further wake paths that also enqueue a run without going through any of those
-four: the Slack block-action handler
+five: the Slack block-action handler
 (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action`), the approval-resume
 enqueue (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`), and the CLI's own
 enqueue (`cli/src/message.rs` via `synthetic_turn`/`xadd`/`new_event_id` in
@@ -130,7 +138,10 @@ under a different rule per producer, with nothing enforcing that the rules stay 
 `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` passes Slack's own `event_id`
 through verbatim; `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` synthesizes
 `action-<interaction id>`; `apps/api/src/curie_api/resumequeue.py::resume_event_id` returns a
-deterministic `approval-<id>-resolved`; and the CLI generates a random uuid behind an `EvSIM-`
+deterministic `approval-<id>-resolved`; GitHub review feedback first claims the delivery UUID
+through `apps/api/src/curie_api/github_review_audit.py::claim_review_delivery`, then mints a
+stable `github-feedback-<uuid5>` event id from repository id, event kind, and provider feedback
+id in `apps/api/src/curie_api/github_review_events.py::UnverifiedFeedback.event_id`; and the CLI generates a random uuid behind an `EvSIM-`
 prefix (`cli/src/queue.rs`), chosen expressly so it cannot collide with a real Slack `Ev...` id.
 Idempotency across producers therefore holds by convention, not by contract, and that is the
 first thing a real `Trigger` port would have to take ownership of.

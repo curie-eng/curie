@@ -120,6 +120,7 @@ impl Grader {
 /// `expect_status` asserts the turn's terminal status: default `done`, or
 /// `awaiting-approval` to assert an approval gate blocked the action.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalCase {
     pub id: String,
     pub input: String,
@@ -805,6 +806,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_case_keys() {
+        for (key, value) in [
+            ("requires", "portable"),
+            ("note", "documentation"),
+            ("expect_stauts", "done"),
+        ] {
+            let body = format!(
+                r#"{{"name":"s","cases":[{{"id":"a","input":"b","grader":{{"kind":"contains","expected":"x"}},"{key}":"{value}"}}]}}"#
+            );
+            let (_dir, path) = write(&body);
+            let err = format!("{:#}", load_suite(&path).unwrap_err());
+            assert!(err.contains(key), "{key} was not named in {err}");
+        }
+    }
+
+    #[test]
     fn loads_expect_status_awaiting_approval() {
         let (_dir, path) = write(
             r#"{"name":"s","cases":[{"id":"a","input":"b","grader":{"kind":"contains","expected":"x"},"expect_status":"awaiting-approval"}]}"#,
@@ -1059,7 +1076,6 @@ mod tests {
         let case = &suite.cases[0];
         // Answer matcher: a passing final answer must carry a temperature figure.
         // The trajectory sidecar supplies the separate fetch capability proof.
-        // The loader ignores the documentation-only `note` key on the case.
         assert_eq!(case.id, "reports-a-temperature");
         assert_eq!(case.grader.kind, GraderKind::Regex);
         // #620: the pattern accepts the degree glyph AND the spelled-out unit, so

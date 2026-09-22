@@ -71,8 +71,27 @@ list order or an exact string comparison.
 {{- if and .Values.mailAdapter.egressSecretExistingSecret (not .Values.worker.adapterCredentialsExistingSecret) }}
 {{- fail "mailAdapter.egressSecretExistingSecret requires worker.adapterCredentialsExistingSecret so the adapter and worker source the paired egress credential externally. Set both configuration keys; credential values are not printed." }}
 {{- end }}
+{{- /* #2824: AgentMail is CloudFront-fronted and its edges move, so a /32
+     snapshot goes stale and cuts the adapter off. `cidrs` keeps the narrow
+     snapshot (use published provider ranges, not resolved /32s); `publicHttps`
+     is the operator's explicit trade: any public address on TCP 443, with
+     private, loopback, link-local (metadata), CGNAT, documentation, multicast
+     and reserved ranges excepted, and no pin list for the adapter. Pod,
+     Service or node ranges in public space (dual-stack IPv6, GKE PUPI) are
+     NOT excepted unless listed in publicHttpsExcept. Each mode refuses the other's key rather than ignore it. */}}
+{{- $agentmailMode := .Values.mailAdapter.agentmail.egressMode | default "cidrs" }}
+{{- if not (has $agentmailMode (list "cidrs" "publicHttps")) }}
+{{- fail (printf "mailAdapter.agentmail.egressMode %q is not supported; use cidrs (declared provider ranges in mailAdapter.agentmail.httpsCidrs) or publicHttps (any public address on TCP 443)" $agentmailMode) }}
+{{- end }}
+{{- if eq $agentmailMode "cidrs" }}
 {{- if not .Values.mailAdapter.agentmail.httpsCidrs }}
-{{- fail "mailAdapter.deploy is true: set at least one mailAdapter.agentmail.httpsCidrs entry for AgentMail (or a controlled HTTPS egress proxy); provider egress fails closed" }}
+{{- fail "mailAdapter.deploy is true: set at least one mailAdapter.agentmail.httpsCidrs entry for AgentMail (or a controlled HTTPS egress proxy), or set mailAdapter.agentmail.egressMode=publicHttps; provider egress fails closed" }}
+{{- end }}
+{{- if .Values.mailAdapter.agentmail.publicHttpsExcept }}
+{{- fail "mailAdapter.agentmail.publicHttpsExcept is only read when mailAdapter.agentmail.egressMode is publicHttps; in cidrs mode it would be silently ignored. Clear it or switch the mode." }}
+{{- end }}
+{{- else if .Values.mailAdapter.agentmail.httpsCidrs }}
+{{- fail "mailAdapter.agentmail.httpsCidrs is set, but mailAdapter.agentmail.egressMode is publicHttps, which admits every public address on TCP 443 and never reads that list; it would be silently ignored. Clear httpsCidrs or use egressMode=cidrs." }}
 {{- end }}
 {{- if not (hasPrefix "https://" .Values.mailAdapter.agentmail.baseUrl) }}
 {{- fail "mailAdapter.deploy is true: mailAdapter.agentmail.baseUrl must use https:// because the mail egress policy permits provider traffic only on TCP 443" }}
@@ -109,6 +128,19 @@ list order or an exact string comparison.
 {{- $agentmailCidrs := list }}
 {{- range .Values.mailAdapter.agentmail.httpsCidrs }}
 {{- $agentmailCidrs = append $agentmailCidrs (include "curie.mailAdapter.narrowCidr" (dict "key" "mailAdapter.agentmail.httpsCidrs" "cidr" .) | trim) }}
+{{- end }}
+{{- $publicExcept4 := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.0.0.0/24" "192.0.2.0/24" "192.168.0.0/16" "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "224.0.0.0/4" "240.0.0.0/4" }}
+{{- $publicExcept6 := list "::/128" "::1/128" "64:ff9b:1::/48" "100::/64" "2001:db8::/32" "fc00::/7" "fe80::/10" "ff00::/8" }}
+{{- range .Values.mailAdapter.agentmail.publicHttpsExcept }}
+  {{- $extra := include "curie.mailAdapter.narrowCidr" (dict "key" "mailAdapter.agentmail.publicHttpsExcept" "cidr" .) | trim }}
+  {{- if regexMatch "^(0{0,4}:)+:?ffff:" (lower $extra) }}
+  {{- fail (printf "mailAdapter.agentmail.publicHttpsExcept entry %q is an IPv4-mapped IPv6 range, which the API server refuses in a NetworkPolicy except list; list the IPv4 range instead" $extra) }}
+  {{- end }}
+  {{- if contains ":" $extra }}
+    {{- $publicExcept6 = append $publicExcept6 $extra }}
+  {{- else }}
+    {{- $publicExcept4 = append $publicExcept4 $extra }}
+  {{- end }}
 {{- end }}
 {{- $apiCidrs := list }}
 {{- if not .Values.api.deploy }}
@@ -333,6 +365,8 @@ spec:
             # the adapter can pin to /32 entries when DNS rotates the provider's
             # hostname to an edge outside the policy (TLS is still verified
             # against the hostname).
+            # Empty in publicHttps mode (#2824): every public edge is admitted,
+            # so the adapter dials whatever DNS returns.
             - name: CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS
               value: {{ join "," $agentmailCidrs | quote }}
             # Readiness goes 503 after discovery fails continuously this long;
@@ -443,9 +477,31 @@ spec:
       ports:
         - { protocol: TCP, port: {{ .Values.mailAdapter.apiEgress.port }} }
     {{- end }}
+    {{- if eq $agentmailMode "publicHttps" }}
+    # AgentMail through its CDN (#2824): any public address on TCP 443, so an
+    # edge move cannot cut the adapter off. Private, loopback, link-local
+    # (cloud metadata), CGNAT, documentation, multicast and reserved ranges
+    # plus mailAdapter.agentmail.publicHttpsExcept stay denied.
+    - to:
+        - ipBlock:
+            cidr: "0.0.0.0/0"
+            except:
+              {{- range $publicExcept4 }}
+              - {{ . | quote }}
+              {{- end }}
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              {{- range $publicExcept6 }}
+              - {{ . | quote }}
+              {{- end }}
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- else }}
     # AgentMail, or an operator-controlled HTTPS egress proxy. NetworkPolicy is
     # IP based, so operators must keep these CIDRs aligned with the configured
-    # AGENTMAIL_BASE_URL destination.
+    # AGENTMAIL_BASE_URL destination. Resolved /32 pins for a CDN-fronted API
+    # go stale when the CDN moves (#2824).
     - to:
         {{- range $agentmailCidrs }}
         - ipBlock:
@@ -453,6 +509,7 @@ spec:
         {{- end }}
       ports:
         - { protocol: TCP, port: 443 }
+    {{- end }}
     {{- if and .Values.otelCollector.deploy (not $otelExternal) }}
     # This release's in-chart OTel Collector. The adapter is the only
     # first-party service with an egress policy, so unlike api/dispatcher/worker

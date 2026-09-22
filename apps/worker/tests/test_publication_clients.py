@@ -11,10 +11,14 @@ import pytest
 from channel_protocol import scoped_conversation_id
 from curie_worker.publication_clients import (
     GitHubPublicationLookup,
+    PublicationIdentityClient,
     PublicationTranscriptClient,
 )
 from curie_worker.publication_loop import (
+    PublicationIdentity,
+    PublicationIdentityUnavailable,
     PublicationReconcileError,
+    PublicationRemoteTerminalError,
     PublicationTranscriptPermanentError,
 )
 
@@ -24,6 +28,13 @@ PR_URL = f"https://github.com/{REPO}/pull/123"
 REVISION_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
 PRIOR_HEAD = "a" * 40
 REVISION_HEAD = "b" * 40
+PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
+LINEAGE_ID = uuid.UUID("55555555-5555-4555-8555-555555555555")
+IDENTITY_API_BASE = "https://api.example.com"
+IDENTITY_PATH = f"/v1/internal/publications/{PUBLICATION_ID}/lineage/identity"
+WORKER_TOKEN = "remote-dev-publication-worker-token"
+# The worker's publication_lease_seconds default (curie_worker/config.py).
+LEASE_SECONDS = 60
 
 pytestmark = pytest.mark.anyio
 
@@ -641,4 +652,349 @@ async def test_transcript_capacity_refusal_is_classified_as_permanent() -> None:
                 "1700000000.000100",
                 uuid.UUID("22222222-2222-4222-8222-222222222222"),
                 f"Published the approved changes: {PR_URL}",
+            )
+
+
+# --- T9: the worker-side publication identity client wire contract (#2903) ---
+
+
+def _identity_body(**overrides: object) -> dict[str, object]:
+    """The eligible 200 body the identity endpoint returns by contract."""
+
+    body: dict[str, object] = {
+        "lineage_id": str(LINEAGE_ID),
+        "eligible": True,
+        "repository_id": 9001,
+        "installation_id": 41,
+        "pr_node_id": "PR_example_123",
+        "base_ref": "main",
+    }
+    body.update(overrides)
+    return body
+
+
+async def _verify_identity(
+    handler: object,
+    *,
+    expected_head_sha: str | None = None,
+    lineage_id: uuid.UUID = LINEAGE_ID,
+) -> PublicationIdentity | None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)  # type: ignore[arg-type]
+    ) as http:
+        client = PublicationIdentityClient(
+            api_base_url=IDENTITY_API_BASE,
+            worker_token=WORKER_TOKEN,
+            client=http,
+            lease_seconds=LEASE_SECONDS,
+        )
+        return await client.verify(
+            PUBLICATION_ID,
+            lineage_id=lineage_id,
+            expected_version=1,
+            expected_head_sha=expected_head_sha,
+            pr_number=123,
+            pr_url=PR_URL,
+            head_sha=REVISION_HEAD,
+        )
+
+
+async def test_verified_identity_is_requested_with_worker_auth_and_no_github_secret() -> None:
+    """The worker asks the API for values; it never gains provider authority."""
+
+    requests: list[httpx.Request] = []
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=_identity_body())
+
+    identity = await _verify_identity(handler, expected_head_sha=PRIOR_HEAD)
+
+    assert identity == PublicationIdentity(
+        repository_id=9001,
+        installation_id=41,
+        pr_node_id="PR_example_123",
+        base_ref="main",
+    )
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "POST"
+    assert request.url.path == IDENTITY_PATH
+    assert request.headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+    # The API owns every GitHub credential. Nothing provider-scoped may appear
+    # on this request, in any header or anywhere in the body.
+    assert "authorization" not in {name.lower() for name in request.headers}
+    assert bodies[0] == {
+        "expected_version": 1,
+        "expected_head_sha": PRIOR_HEAD,
+        "state": "open",
+        "pr_number": 123,
+        "pr_url": PR_URL,
+        "head_sha": REVISION_HEAD,
+    }
+
+
+async def test_ineligible_identity_answer_is_a_value_not_a_refusal() -> None:
+    """Token mode and pre-App PRs answer 200 with eligible false, not an error."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "lineage_id": str(LINEAGE_ID),
+                "eligible": False,
+                "repository_id": None,
+                "installation_id": None,
+                "pr_node_id": None,
+                "base_ref": None,
+            },
+        )
+
+    assert await _verify_identity(handler) is None
+
+
+@pytest.mark.parametrize("case", ["http_503", "transport_error"])
+async def test_unavailable_identity_reads_are_never_a_stable_refusal(case: str) -> None:
+    """503 and a lost connection are transient, so they must be uncharged."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if case == "transport_error":
+            raise httpx.ConnectError("identity endpoint unreachable", request=request)
+        return httpx.Response(
+            503,
+            json={
+                "detail": {
+                    "code": "publication.github_unavailable",
+                    "message": "publication GitHub identity could not be verified",
+                }
+            },
+        )
+
+    with pytest.raises(PublicationIdentityUnavailable):
+        await _verify_identity(handler)
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (409, {"detail": {"code": "publication.lineage_stale", "message": "stale"}}),
+        (409, {"detail": {"code": "publication.review_ineligible", "message": "no"}}),
+        (400, {"detail": "bad request"}),
+        (404, {"detail": "publication lineage not found"}),
+        (500, {"detail": "internal"}),
+        (200, {"lineage_id": str(LINEAGE_ID)}),
+    ],
+    ids=["409_stale", "409_ineligible", "400", "404", "500", "200_unusable"],
+)
+async def test_stable_identity_refusals_are_charged_not_treated_as_an_outage(
+    status: int,
+    body: dict[str, object],
+) -> None:
+    """A stable refusal stays bounded; conflating it with 503 loops forever."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json=body)
+
+    with pytest.raises(PublicationReconcileError) as raised:
+        await _verify_identity(handler)
+
+    # PublicationIdentityUnavailable is a subclass, so isinstance is not enough:
+    # the whole cost model turns on these two classes staying distinguishable.
+    assert type(raised.value) is not PublicationIdentityUnavailable
+    assert not isinstance(raised.value, PublicationRemoteTerminalError)
+
+
+@pytest.mark.parametrize("observed_state", ["merged", "closed"])
+async def test_provider_terminal_pull_request_is_its_own_refusal_class(
+    observed_state: str,
+) -> None:
+    """The provider already closed this PR: terminalize, do not retry or fail."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "detail": {
+                    "code": "publication.lineage_terminal",
+                    "message": (
+                        "the pull request for this thread is merged or closed; "
+                        "start a new thread"
+                    ),
+                    "observed_state": observed_state,
+                }
+            },
+        )
+
+    with pytest.raises(PublicationRemoteTerminalError) as raised:
+        await _verify_identity(handler)
+
+    assert raised.value.state == observed_state
+    assert isinstance(raised.value, PublicationReconcileError)
+    assert not isinstance(raised.value, PublicationIdentityUnavailable)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _identity_body(base_ref=None),
+        _identity_body(pr_node_id=None),
+        _identity_body(repository_id=0),
+        _identity_body(repository_id=True),
+        _identity_body(installation_id=0),
+        _identity_body(installation_id=False),
+        _identity_body(pr_node_id="P" * 300),
+        _identity_body(pr_node_id=""),
+        _identity_body(base_ref=""),
+        _identity_body(base_ref="b" * 1100),
+        _identity_body(repository_id="9001"),
+    ],
+    ids=[
+        "absent_base_ref",
+        "absent_node_id",
+        "zero_repository_id",
+        "bool_repository_id",
+        "zero_installation_id",
+        "bool_installation_id",
+        "oversized_node_id",
+        "empty_node_id",
+        "empty_base_ref",
+        "oversized_base_ref",
+        "string_repository_id",
+    ],
+)
+async def test_eligible_identity_bodies_are_validated_before_they_can_be_written(
+    body: dict[str, object],
+) -> None:
+    """The same bounds publication_authority.validated_identity already enforces."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(PublicationReconcileError) as raised:
+        await _verify_identity(handler)
+
+    assert type(raised.value) is not PublicationIdentityUnavailable
+
+
+@pytest.mark.parametrize("eligible", [True, False], ids=["eligible", "ineligible"])
+async def test_identity_answer_without_a_lineage_id_is_unusable(eligible: bool) -> None:
+    """Every 200 echoes its lineage; an answer that does not cannot be persisted."""
+
+    body = _identity_body(eligible=eligible)
+    if not eligible:
+        body.update(
+            repository_id=None, installation_id=None, pr_node_id=None, base_ref=None
+        )
+    body.pop("lineage_id")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(PublicationReconcileError) as raised:
+        await _verify_identity(handler)
+
+    assert type(raised.value) is not PublicationIdentityUnavailable
+
+
+@pytest.mark.parametrize("eligible", [True, False], ids=["eligible", "ineligible"])
+async def test_an_answer_for_another_lineage_is_never_usable(eligible: bool) -> None:
+    """R4: a swapped, reordered or retried answer cannot identify this lineage."""
+
+    body = _identity_body(
+        eligible=eligible,
+        lineage_id=str(uuid.UUID("99999999-9999-4999-8999-999999999999")),
+    )
+    if not eligible:
+        body.update(
+            repository_id=None, installation_id=None, pr_node_id=None, base_ref=None
+        )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(PublicationReconcileError) as raised:
+        await _verify_identity(handler)
+
+    assert type(raised.value) is not PublicationIdentityUnavailable
+
+
+@pytest.mark.parametrize("lease_seconds", [15, 30, 60, 120, 600])
+async def test_identity_request_timeout_always_expires_inside_the_publication_lease(
+    lease_seconds: int,
+) -> None:
+    """The request must die before the lease it is protecting does.
+
+    A successful identity read that outlives ``publication_lease_seconds`` lets
+    another worker claim the publication mid-request. The returning worker then
+    loses its version check in ``_terminal_cas`` and rolls back, and because a
+    SUCCESSFUL read clears the uncharged-escape counter it never charges a
+    durable attempt. A slow success would become an unbounded reclaim loop
+    instead of a bounded failure, so a fixed timeout larger than the default
+    60 second lease is not safe at any number.
+    """
+
+    from curie_worker import publication_clients
+
+    fraction = float(publication_clients._IDENTITY_VERIFY_LEASE_FRACTION)
+    assert 0 < fraction < 1, "the request timeout must be a fraction of the lease"
+
+    observed: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json=_identity_body())
+
+    # A client default deliberately unlike the derived value, so inheriting it
+    # instead of setting the request timeout cannot pass this test.
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), timeout=30.0
+    ) as http:
+        await PublicationIdentityClient(
+            api_base_url=IDENTITY_API_BASE,
+            worker_token=WORKER_TOKEN,
+            client=http,
+            lease_seconds=lease_seconds,
+        ).verify(
+            PUBLICATION_ID,
+            lineage_id=LINEAGE_ID,
+            expected_version=1,
+            expected_head_sha=None,
+            pr_number=123,
+            pr_url=PR_URL,
+            head_sha=REVISION_HEAD,
+        )
+
+    assert len(observed) == 1
+    carried = observed[0]
+    assert isinstance(carried, dict), (
+        "the identity request inherited the shared client timeout"
+    )
+    timeouts = [value for value in carried.values() if value is not None]
+    assert timeouts, "the identity request carried no timeout at all"
+    for value in timeouts:
+        assert value == pytest.approx(lease_seconds * fraction)
+        # Strictly inside the lease, with real headroom, never merely equal.
+        assert value < lease_seconds
+        assert lease_seconds - value >= lease_seconds * 0.1
+
+
+async def test_identity_client_has_no_lease_independent_timeout_constant() -> None:
+    """A fixed timeout cannot stay inside a lease the operator can retune."""
+
+    from curie_worker import publication_clients
+
+    assert not hasattr(publication_clients, "_IDENTITY_VERIFY_TIMEOUT_SECONDS")
+
+
+async def test_identity_client_refuses_construction_without_internal_worker_auth() -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+    async with httpx.AsyncClient(transport=transport) as http:
+        with pytest.raises(ValueError, match="internal worker auth"):
+            PublicationIdentityClient(
+                api_base_url=IDENTITY_API_BASE,
+                worker_token="",
+                client=http,
+                lease_seconds=LEASE_SECONDS,
             )
