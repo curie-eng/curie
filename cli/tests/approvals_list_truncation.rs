@@ -80,8 +80,7 @@ fn pending_fields(out: &ApprovalsOutput) -> (usize, bool) {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the pending list, not a console login-code mint")
         }
-        ApprovalsOutput::IdentityReport { .. }
-        | ApprovalsOutput::Recovered { .. } => {
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
             panic!("expected the pending list, not an administrative recovery result")
         }
     }
@@ -220,8 +219,7 @@ async fn dry_run_plan_reports_the_same_limit_as_the_real_request() {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected a dry-run plan, not a console login-code mint")
         }
-        ApprovalsOutput::IdentityReport { .. }
-        | ApprovalsOutput::Recovered { .. } => {
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
             panic!("expected a dry-run plan, not an administrative recovery result")
         }
     }

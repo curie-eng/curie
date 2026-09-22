@@ -314,16 +314,14 @@ fn recover_refuses_a_missing_recovery_key_before_any_request() {
 #[test]
 fn recovery_verbs_require_the_operator_principal_with_the_mint_hint() {
     let server = no_request_server();
-    for args in [
-        vec![
-            "--recover",
-            APPROVAL_ID,
-            "--reason",
-            REASON,
-            "--recovery-key",
-            RECOVERY_KEY,
-        ],
-    ] {
+    for args in [vec![
+        "--recover",
+        APPROVAL_ID,
+        "--reason",
+        REASON,
+        "--recovery-key",
+        RECOVERY_KEY,
+    ]] {
         let output = run("local", &args, Some(&server), None);
         let combined = text(&output);
         assert_eq!(
