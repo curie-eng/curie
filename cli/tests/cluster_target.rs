@@ -98,6 +98,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["overrides", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "publication-policy",
+            args: &["publication-policy", "acme-bot", "--dry-run"],
+        },
+        ClusterCase {
             name: "surfaces",
             args: &["surfaces", "acme-bot", "--dry-run"],
         },
@@ -401,6 +405,10 @@ fn connection_backed_verbs_discover_the_file_target() {
         ("kill", &["cluster", "kill", "acme-bot", "--yes"]),
         ("resume", &["cluster", "resume", "acme-bot"]),
         ("overrides", &["cluster", "overrides", "acme-bot"]),
+        (
+            "publication-policy",
+            &["cluster", "publication-policy", "acme-bot"],
+        ),
         ("surfaces", &["cluster", "surfaces", "acme-bot"]),
         (
             "channel-token",
