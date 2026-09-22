@@ -20,6 +20,9 @@ OUTPUT_KEYS = {
     "cluster": "cluster",
     "released-upgrade": "released_upgrade",
 }
+# Jobs behind these tiers each boot a kind cluster. Callers omit them when
+# the run should not pay for that.
+KIND_TIERS = frozenset({"cluster", "released-upgrade"})
 
 
 class RegistryError(ValueError):
@@ -244,6 +247,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--push", action="store_true")
+    parser.add_argument(
+        "--omit-kind",
+        action="store_true",
+        help="Drop the cluster and released-upgrade tiers.",
+    )
     return parser
 
 
@@ -271,6 +279,9 @@ def _run() -> None:
         pytest_needed = _needs_pytest(registry, paths)
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
+
+    if args.omit_kind:
+        selected.difference_update(KIND_TIERS)
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
