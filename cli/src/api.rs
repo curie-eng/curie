@@ -396,6 +396,25 @@ pub struct ApprovalRecord {
     pub card_channel: Option<String>,
 }
 
+/// The RECORDED outcome of one administrative recovery: the body of `POST
+/// /approvals/{id}/recover` (`ApprovalRecoveryOut`, #2753).
+///
+/// Deliberately NOT [`ApprovalRecord`]. The recovery route answers with the
+/// administrative outcome read back off the row -- `approval_id` (not `id`),
+/// the recovery key, the operator's reason and the actor -- and carries none of
+/// the conversation fields an ordinary approval record requires. Decoding the
+/// wrong model here failed AFTER the mutation had already committed, telling
+/// the operator a landed recovery had failed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalRecoveryOutcome {
+    pub approval_id: String,
+    pub status: String,
+    pub recovery_key: Option<String>,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+    pub recovered_at: Option<String>,
+}
+
 /// What a deploy did with the agent's Slack channel, for the summary printout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelOutcome {
@@ -2734,6 +2753,67 @@ impl ApiClient {
             .json()
             .await
             .context("decoding resolved approval")
+    }
+
+    /// The installation-wide approval identity report: `GET
+    /// /approvals/identity-report` (#2753).
+    ///
+    /// A pure read of FACTS about approval rows whose card or reply identity
+    /// cannot be reconstructed, plus the declaration skeleton an operator fills
+    /// in. Deliberately decoded as an untyped `Value` and forwarded verbatim:
+    /// the report is diagnostic evidence an operator acts on, so a field this
+    /// CLI does not know about must still reach the terminal rather than be
+    /// dropped by a hand-mirrored struct.
+    pub async fn approval_identity_report(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/approvals/identity-report", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /approvals/identity-report",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading the approval identity report")
+            .await?
+            .json()
+            .await
+            .context("decoding the approval identity report")
+    }
+
+    /// Administratively reject one approval under the installation-wide
+    /// recovery grant: `POST /approvals/{id}/recover` (#2753).
+    ///
+    /// Authorization is the platform key; the operator principal carries
+    /// ATTRIBUTION for the audit row only, exactly as it does for
+    /// [`Self::resolve_approval`]. `recovery_key` is the CALLER's idempotency
+    /// key and is sent unmodified, so a retry of the identical argv is absorbed
+    /// by the server rather than becoming a second administrative act.
+    pub async fn recover_approval(
+        &self,
+        approval_id: &str,
+        reason: &str,
+        recovery_key: &str,
+        principal_token: &str,
+    ) -> Result<ApprovalRecoveryOutcome> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/approvals/{approval_id}/recover", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json(&json!({
+                        "disposition": "rejected",
+                        "reason": reason,
+                        "recovery_key": recovery_key,
+                    })),
+                "POST /approvals/{id}/recover",
+            )
+            .await?;
+        Self::expect_ok(resp, "recovering approval")
+            .await?
+            .json()
+            .await
+            .context("decoding the recorded recovery outcome")
     }
 
     /// Mint a reusable operator approval principal under the platform key.

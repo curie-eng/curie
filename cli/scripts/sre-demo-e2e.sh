@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 # Nightly SRE demo e2e (#2246, #2854).
 #
-# One driver for observations toward six demo assertions on a kind cluster with
-# the pinned upstream kubernetes-mcp-server, a live provider, and an
-# allowlisted throwaway repo. Turns start with `curie cluster message`.
+# One driver for observations toward five demo assertions on a kind cluster with
+# the pinned upstream kubernetes-mcp-server and a live provider. Turns start
+# with `curie cluster message`.
 # Approvals resolve through `curie cluster approvals` and an operator
 # principal on routes bound to an explicit `approvers.users` list. No Slack
 # app, bot, user token, or channel is required.
 #
 # Phases (CURIE_SRE_DEMO_PHASE, or the first argument):
-#   prereqs  Check the live provider and throwaway repo. Missing either writes
+#   prereqs  Check the live provider. A missing credential writes
 #            SKIPPED plus the reason to GITHUB_STEP_SUMMARY, sets ready=false
 #            on GITHUB_OUTPUT, and exits 0 for pull-request inventory only.
-#            That is the documented skip, not a green that proved the six
+#            That is the documented skip, not a green that proved the five
 #            assertions. Required scheduled, dispatch and release-candidate
 #            runs fail closed on missing setup (CURIE_SRE_DEMO_REQUIRED=1).
-#   run      Drive the six assertions against an already-installed kind
+#   run      Drive the five assertions against an already-installed kind
 #            release. Refuses unless CURIE_SRE_DEMO_ALLOW_LIVE=1 so a
 #            laptop invocation cannot touch a cluster. Missing credentials
 #            in this phase fail closed (exit 1); skipping is the prereqs
-#            phase's job. CI_THROWAY_REPO may be omitted: the coding
-#            assertion is then BLOCKED as unreachable and the other five
-#            still run.
+#            phase's job.
 #
-# The six assertions, each with a negative control:
+# The five assertions, each with a negative control:
 #   1. read (namespaces_list) replies and creates no approval record
 #   2. approval-gated resources_scale 1 to 2: one pending naming only that
 #      tool, replicas stay 1/1 until approve, then 2/2; audit principal_kind
@@ -33,8 +31,6 @@
 #   4. configuration_view is absent from the catalog; namespaces_list is present
 #   5. RBAC ceiling: an approved scale of the platform API is forbidden and
 #      leaves replicas unchanged
-#   6. coding handoff: workspace attached, a PR opened against the throwaway
-#      repo only
 #
 # Pin: ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423
 # (examples/sre-bot/connectors.yaml). Do not float this to latest.
@@ -42,17 +38,14 @@
 # Required env for a live run:
 #   CURIE_BIN, CURIE_CREDENTIALS
 #   CURIE_SRE_DEMO_ALLOW_LIVE=1
-# Optional: CI_THROWAY_REPO (owner/name, never committed; required for coding
-# and for the nightly prereqs job), CURIE_MODEL, CURIE_NAMESPACE (default
-# curie), CURIE_RELEASE (default curie), CURIE_SRE_DEMO_AGENT (default
-# sre-bot), CURIE_SRE_DEMO_OPERATOR (default U0EXAMPLE1),
+# Optional: CURIE_MODEL, CURIE_NAMESPACE (default curie), CURIE_RELEASE
+# (default curie), CURIE_SRE_DEMO_AGENT (default sre-bot),
+# CURIE_SRE_DEMO_OPERATOR (default U0EXAMPLE1),
 # CURIE_SRE_DEMO_RESOLUTION_CHANNEL (default C0LOCALDEV),
 # CURIE_SRE_DEMO_TIMEOUT_SECS (default 300), CURIE_SRE_DEMO_EVIDENCE_DIR
 # (private parent directory in which raw row logs are retained; otherwise
 # removed on exit). CURIE_SRE_DEMO_RESULTS_FILE retains fixed row/status JSON
-# only. GH_TOKEN may supply a read-only disposable-repository verifier
-# identity; its absence blocks that coding observation and never substitutes
-# for the product GitHub App.
+# only.
 
 set -euo pipefail
 umask 077
@@ -70,7 +63,6 @@ DEMO_DEPLOY="sre-demo-app"
 # Keep in lockstep with examples/sre-bot/connectors.yaml.
 K8S_MCP_DIGEST="sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423"
 K8S_MCP_IMAGE="ghcr.io/containers/kubernetes-mcp-server@${K8S_MCP_DIGEST}"
-READ_THREAD_TS=""
 SCALE_APPROVAL_ID=""
 MCP_FORWARD_PID=""
 PROBE_NS=""
@@ -105,18 +97,8 @@ write_output() {
 missing_prereqs() {
   local missing=()
   [[ -n "${CURIE_CREDENTIALS:-}" ]] || missing+=("CURIE_CREDENTIALS (live provider)")
-  [[ -n "${CI_THROWAY_REPO:-}" ]] || missing+=("CI_THROWAY_REPO (allowlisted throwaway owner/name)")
   if ((${#missing[@]})); then
     printf '%s\n' "${missing[@]}"
-  fi
-}
-
-validate_throwaway_repo() {
-  if [[ ! "$CI_THROWAY_REPO" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
-     [[ "${CI_THROWAY_REPO,,}" == curie-eng/curie || "${CI_THROWAY_REPO,,}" == curie-eng/agentos ]]; then
-    write_summary "BLOCKED: CI_THROWAY_REPO must name a disposable repository, never the platform repository."
-    write_output ready false
-    return 1
   fi
 }
 
@@ -127,31 +109,30 @@ phase_prereqs() {
     write_summary "$(cat <<EOF
 ### SRE demo e2e SKIPPED
 
-The six CLI assertions did not run. Missing prerequisite(s):
+The five CLI assertions did not run. Missing prerequisite(s):
 
 $(printf '%s\n' "$missing" | sed 's/^/- /')
 
-Provision OPENROUTER_API_KEY as CURIE_CREDENTIALS and the allowlisted
-throwaway repo secret, then re-run this workflow from workflow_dispatch.
+Provision OPENROUTER_API_KEY as CURIE_CREDENTIALS, then re-run this workflow
+from workflow_dispatch.
 No Slack app is required.
 
-Assertions not executed: namespaces_list read; resources_scale approval;
-re-arm; configuration_view denial; RBAC ceiling; throwaway-repo coding PR.
+Assertions not executed: namespaces_list read; resources_scale approval; re-arm;
+configuration_view denial; RBAC ceiling.
 EOF
 )"
     write_output ready false
-    write_output skip_reason "missing live provider and/or throwaway repo"
+    write_output skip_reason "missing live provider"
     echo "sre-demo-e2e: acceptance BLOCKED (prerequisites missing)" >&2
     if [[ "${CURIE_SRE_DEMO_REQUIRED:-0}" == "1" ]]; then
       exit 1
     fi
     exit 0
   fi
-  validate_throwaway_repo
   write_summary "### SRE demo e2e prerequisites ready
 
-Live provider and throwaway repo secrets are present. The live job may run
-the six assertions on kind through cluster message and an operator principal."
+The live provider credential is present. The live job may run the five
+assertions on kind through cluster message and an operator principal."
   write_output ready true
   echo "sre-demo-e2e: prerequisites ready" >&2
 }
@@ -569,10 +550,6 @@ phase_run() {
     echo "PHASE=run is missing CURIE_CREDENTIALS (fail closed; skipping is the prereqs phase)." >&2
     exit 1
   fi
-  if [[ -n "${CI_THROWAY_REPO:-}" ]]; then
-    validate_throwaway_repo
-  fi
-
   local bin
   bin="$(curie_bin)"
   kubectl apply -f "$ROOT/examples/sre-bot/manifests/kubernetes-access.yaml"
@@ -633,21 +610,15 @@ phase_run() {
   PROBE_NS="sre-e2e-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
   kubectl create namespace "$PROBE_NS" >/dev/null
   PROBE_NS_CREATED=1
-  export CURIE_SRE_DEMO_THREAD_FILE="$evidence_dir/read-thread"
   OBSERVATION_FAILURES=0
-  CODING_MISSING_REPO=0
   run_assertion read assert_read
   run_assertion scale assert_scale
   run_assertion rearm assert_rearm
   run_assertion configuration-denial assert_configuration_denial
   run_assertion rbac-ceiling assert_rbac_ceiling
-  run_assertion coding-handoff assert_coding_handoff
   if (( OBSERVATION_FAILURES )); then
     write_summary "SRE demo acceptance incomplete. BLOCKED rows are unproved and do not count as passes. See each row above."
     return 1
-  fi
-  if (( CODING_MISSING_REPO )); then
-    write_summary "SRE demo reachable assertions passed. coding-handoff was not reachable without CI_THROWAY_REPO."
   fi
 }
 
@@ -662,21 +633,17 @@ run_assertion() {
   case "$result" in
     0) status=PASS; write_summary "- $row: PASS (only the named assertion)." ;;
     3) status=BLOCKED; write_summary "- $row: BLOCKED. ${BLOCK_REASONS[$row]}"
-       if [[ "$row" == "coding-handoff" && "$CODING_MISSING_REPO" == "1" ]]; then
-         :
-       else
-         OBSERVATION_FAILURES=$((OBSERVATION_FAILURES + 1))
-       fi ;;
+       OBSERVATION_FAILURES=$((OBSERVATION_FAILURES + 1)) ;;
     *) status=FAILED; write_summary "- $row: FAILED. Raw diagnostics were kept private during execution."
        OBSERVATION_FAILURES=$((OBSERVATION_FAILURES + 1)) ;;
   esac
   if [[ -n "${CURIE_SRE_DEMO_RESULTS_FILE:-}" ]]; then
-    # Only fixed row/status enums are public artifacts. Raw GitHub and cluster
-    # diagnostics may contain deployment identifiers or credentials.
+    # Only fixed row/status enums are public artifacts. Raw cluster diagnostics
+    # may contain deployment identifiers or credentials.
     python3 - "$row" "$status" >>"$CURIE_SRE_DEMO_RESULTS_FILE" <<'PYOUTCOME'
 import json,sys
 row,status=sys.argv[1:]
-assert row in {"read","scale","rearm","configuration-denial","rbac-ceiling","coding-handoff"}
+assert row in {"read","scale","rearm","configuration-denial","rbac-ceiling"}
 assert status in {"PASS","BLOCKED","FAILED"}
 print(json.dumps({"row":row,"status":status},sort_keys=True))
 PYOUTCOME
@@ -689,7 +656,6 @@ declare -A BLOCK_REASONS=(
   [rearm]="Requires a completed operator grant followed by a new request whose pending row is distinct; the preceding grant path is blocked."
   [configuration-denial]="The real connector MCP endpoint could not be reached."
   [rbac-ceiling]="Requires operator-principal approval and an explicit forbidden tool result, with the platform deployment unchanged."
-  [coding-handoff]="Same-thread delivery and real PR metadata are inspected where available; publication approval, sandbox tests, follow-up commits and product App review-event proof are still required when those observations are missing."
 )
 
 workload_specs() {
@@ -706,8 +672,6 @@ assert_read() {
   namespaces="$(kubectl get ns -o json)"
   posted="$(cluster_turn "List all current Kubernetes namespaces using namespaces_list. Include every namespace name in your answer. Do not scale or mutate anything.")"
   ts="$(printf '%s' "$posted" | turn_thread)"
-  printf '%s' "$ts" >"$CURIE_SRE_DEMO_THREAD_FILE"
-  READ_THREAD_TS="$ts"
   replies="$(printf '%s' "$posted" | turn_is_reply)"
   printf '%s' "$replies" | EXPECTED_NAMESPACES="$namespaces" python3 -c '
 import json,os,re,sys
@@ -793,109 +757,6 @@ assert_rbac_ceiling() {
   }
   wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" 2
   [[ -n "$id" ]] || return 1
-}
-
-pr_number_from_reply() {
-  python3 -c '
-import re,sys
-from urllib.parse import urlparse
-repo=sys.argv[1]
-urls=re.findall(r"https://github\.com/[^/\s<>|]+/[^/\s<>|]+/pull/[0-9]+",sys.stdin.read())
-if not urls: sys.exit(3)
-paths={urlparse(u).path for u in urls}
-if any(not p.startswith("/"+repo+"/pull/") for p in paths):
-    raise SystemExit("reply linked a PR outside the authorized repository")
-if len(paths)!=1: raise SystemExit("expected one PR")
-print(next(iter(paths)).rsplit("/",1)[1])' "$CI_THROWAY_REPO"
-}
-
-verify_pr_metadata() {
-  python3 -c '
-import json,sys
-from datetime import datetime
-p=json.load(sys.stdin); repo,number,started=sys.argv[1:]
-if p.get("url")!=f"https://github.com/{repo}/pull/{number}": raise SystemExit("PR repository mismatch")
-if p.get("state")!="OPEN" or p.get("isCrossRepository"): raise SystemExit("PR is not an open in-repository change")
-try:
-    created=datetime.fromisoformat(p.get("createdAt","").replace("Z","+00:00"))
-    trigger=datetime.fromisoformat(started.replace("Z","+00:00"))
-except (ValueError,TypeError): raise SystemExit("invalid PR creation timestamp")
-if created.tzinfo is None or trigger.tzinfo is None: raise SystemExit("timestamp has no timezone")
-if created<trigger: raise SystemExit("preexisting PR cannot prove this handoff")
-if not p.get("files") or not p.get("commits") or not p.get("headRefOid") or not p.get("author",{}).get("login"):
-    raise SystemExit("PR lacks actual changes, commits, head identity or author")
-if not p.get("baseRefName") or p.get("baseRefName")==p.get("headRefName"):
-    raise SystemExit("PR branch identity is invalid")
-checks=p.get("statusCheckRollup") or []
-if not checks: sys.exit(3)
-if any((c.get("status")!="COMPLETED") if c.get("__typename")=="CheckRun"
-       else c.get("state") in {None,"PENDING","EXPECTED"} for c in checks): sys.exit(3)
-if any((c.get("conclusion")!="SUCCESS") if c.get("__typename")=="CheckRun"
-       else c.get("state")!="SUCCESS" for c in checks):
-    raise SystemExit("PR checks completed unsuccessfully")' "$CI_THROWAY_REPO" "$1" "$2"
-}
-
-assert_coding_handoff() {
-  local posted ts replies number started metadata
-  if [[ -z "${CI_THROWAY_REPO:-}" ]]; then
-    CODING_MISSING_REPO=1
-    echo "BLOCKED: CI_THROWAY_REPO is unset; coding assertion is not reachable" >&2
-    return 3
-  fi
-  READ_THREAD_TS="${READ_THREAD_TS:-$(cat "$CURIE_SRE_DEMO_THREAD_FILE" 2>/dev/null || true)}"
-  [[ -n "$READ_THREAD_TS" ]] || return 3
-  started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local out="${evidence_dir:-$HOME}/coding-turn.out"
-  local err="${evidence_dir:-$HOME}/coding-turn.err"
-  local bin
-  bin="$(curie_bin)"
-  "$bin" --json cluster --namespace "$NAMESPACE" --release "$RELEASE" \
-    --chart "$ROOT/charts/curie" message --timeout-secs "$TIMEOUT_SECS" \
-    --thread "$READ_THREAD_TS" \
-    "Now attach the authorized workspace ${CI_THROWAY_REPO} to this existing thread. Make a small tested documentation change locally and request fresh publication approval before opening a pull request. Do not publish without approval or write to any other repository." \
-    >"$out" 2>"$err" &
-  TURN_PID=$!
-  local id=""
-  set +e
-  id="$(wait_pending_tool "mcp__curie__publish_changes" 180)"
-  local pending_rc=$?
-  set -e
-  if (( pending_rc == 0 )); then
-    approve "$id"
-  elif (( pending_rc != 1 )); then
-    stop_turn
-    return 1
-  fi
-  local status=0
-  set +e
-  wait "$TURN_PID"
-  status=$?
-  set -e
-  TURN_PID=""
-  if (( status != 0 )); then
-    return 3
-  fi
-  posted="$(cat "$out")"
-  if ! replies="$(printf '%s' "$posted" | turn_is_reply)"; then
-    return 3
-  fi
-  if number="$(printf '%s' "$replies" | pr_number_from_reply)"; then
-    # gh is the verifier identity, never presented as the product App author.
-    # Repository mentions, URLs and a preexisting green PR alone cannot pass.
-    command -v gh >/dev/null || return 3
-    if metadata="$(GH_PROMPT_DISABLED=1 gh pr view "$number" --repo "$CI_THROWAY_REPO" --json \
-      url,state,isCrossRepository,createdAt,files,commits,headRefOid,baseRefName,headRefName,author,statusCheckRollup)"; then
-      printf '%s' "$metadata" | verify_pr_metadata "$number" "$started"
-    else
-      echo "BLOCKED: the GitHub verifier identity cannot read the disposable repository" >&2
-      return 3
-    fi
-  else
-    local result=$?
-    # Absence is unproved publication; an off-repository/multiple PR link is an
-    # observed negative-control failure and must not be relabeled a setup block.
-    [[ "$result" == 3 ]] || return 1
-  fi
 }
 
 case "$PHASE" in

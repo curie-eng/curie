@@ -94,6 +94,7 @@ api:
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
   COMMIT_POLL_INTERVAL_S: api.commitPollIntervalSeconds
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
+  CURIE_APPROVAL_RECOVERY_ENABLED: api.approvalRecovery.enabled
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
