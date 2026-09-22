@@ -22,8 +22,7 @@
 #                  secrets set` refuses to replace those
 version: 1
 entries:
-  # Identity the worker stamps on durable records. No existingSecret knob yet,
-  # so the chart still renders it from <fullname>-secrets.
+  # Identity the worker stamps on durable records.
   - logical_name: installation-id
     class: stateful
     target: "{release}-curie-installation-id"
@@ -34,6 +33,9 @@ entries:
     store: sm
     chart:
       default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: installation.idExistingSecret
+          key: installation.idExistingSecretKey
 
   # Changing it strands the data directory and every consumer at once.
   - logical_name: postgres-password
@@ -207,6 +209,9 @@ entries:
     store: sm
     chart:
       default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: api.githubWebhookSecretExistingSecret
+          key: api.githubWebhookSecretExistingSecretKey
 
   - logical_name: github-token
     class: external

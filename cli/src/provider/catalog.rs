@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use super::inventory::{InventoryClass, InventoryEntry, RotationOwner, Store, UpdatePolicy};
+use super::inventory::{
+    ChartBinding, ChartKnob, InventoryClass, InventoryEntry, RotationOwner, Store, UpdatePolicy,
+};
 use crate::connector_build::{ConnectorsFileDecl, SecretDecl};
 
 /// The checked-in platform inventory.
@@ -133,14 +135,24 @@ pub fn bundle_entries(decl: &ConnectorsFileDecl, agent: &str) -> Result<Vec<Inve
 
     let mut entries = Vec::new();
     if !sandbox_keys.is_empty() {
-        entries.push(bundle_entry(
+        let mut sandbox = bundle_entry(
             format!("{agent}.sandbox"),
             sandbox_target,
             sandbox_keys.into_iter().collect(),
             vec!["runner".into()],
             RotationOwner::Sm,
             Vec::new(),
-        ));
+        );
+        // The chart's per-agent BYO knob redirects the runner to a Secret the
+        // operator (or ESO) owns; each key keeps its env var name.
+        sandbox.chart = Some(ChartBinding {
+            default_secret: None,
+            knobs: vec![ChartKnob {
+                secret: format!("agentSandbox.connectorExistingSecrets.{agent}.existingSecret"),
+                key: None,
+            }],
+        });
+        entries.push(sandbox);
     }
 
     // consumers -> rotator (None for provider-rotated keys) -> keys
