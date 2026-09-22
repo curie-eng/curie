@@ -1120,6 +1120,8 @@
           "/v1/internal/work-items/requests/{request_id}/defer",
           "/v1/internal/work-items/requests/{request_id}/start",
           "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/running",
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
@@ -1146,7 +1148,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3560
+      "cardinality_bound": 3640
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1243,6 +1245,8 @@
           "/v1/internal/work-items/requests/{request_id}/defer",
           "/v1/internal/work-items/requests/{request_id}/start",
           "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/running",
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
@@ -1269,7 +1273,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3560
+      "cardinality_bound": 3640
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1366,6 +1370,8 @@
           "/v1/internal/work-items/requests/{request_id}/defer",
           "/v1/internal/work-items/requests/{request_id}/start",
           "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/running",
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
@@ -1385,7 +1391,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 712
+      "cardinality_bound": 728
     },
     "curie.background.loop": {
       "type": "counter",
