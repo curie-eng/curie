@@ -361,7 +361,7 @@
       "result": "InstallationFile",
       "kind": "input",
       "schema": "curie-yaml.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     }
   ],
   "raw_emit_sites": {

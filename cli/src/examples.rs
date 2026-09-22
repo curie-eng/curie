@@ -783,6 +783,7 @@ async fn apply_curie_platform(
         platform: crate::installation::Platform::default(),
         credentials: crate::installation::Credentials::default(),
         comms: crate::installation::Comms::default(),
+        secrets: None,
         set: github_repo_allowlist_sets(workspace_repo),
     };
     let local = crate::installation::plan_installation(installation, dry_run)?;

@@ -706,7 +706,11 @@ def test_required_workflows_reach_one_task_branch_without_widening_pushes() -> N
         trigger = _workflow_trigger(_load_workflow(path))
         pull_request = trigger.get("pull_request")
         assert isinstance(pull_request, dict), f"{path.name} must run for pull requests"
-        assert pull_request.get("branches") == ["main", "next", "task/**"], path.name
+        # ci.yaml also accepts epic integration PRs. Push stays main and next.
+        expected_pull = ["main", "next", "task/**"]
+        if path.name == "ci.yaml":
+            expected_pull = ["main", "next", "task/**", "epic/**"]
+        assert pull_request.get("branches") == expected_pull, path.name
 
         push = trigger.get("push")
         if path.name == "pr-body.yaml":
