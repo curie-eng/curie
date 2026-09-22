@@ -111,6 +111,14 @@ fn apply_help_references_shipped_curie_yaml_example() {
         text.contains("examples/curie.yaml"),
         "apply help must reference the shipped example\n{text}"
     );
+    assert!(
+        text.contains("--init"),
+        "apply help must offer a released-binary starter\n{text}"
+    );
+    assert!(
+        text.contains("--context"),
+        "apply help must offer --context\n{text}"
+    );
 }
 
 #[test]

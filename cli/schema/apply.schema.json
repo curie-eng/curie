@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/apply/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/apply/v1.1.json",
   "title": "curie apply --json",
   "description": "The agent-facing payload of `curie apply`: the dry-run plan, or the installation the file converged the cluster to. One object per invocation even though apply drives two underlying verbs.",
   "$defs": {
@@ -51,6 +51,24 @@
         "namespace",
         "release",
         "comms"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "`curie apply --init` wrote a starter installation file and did not touch the cluster.",
+      "properties": {
+        "wrote": {
+          "const": true
+        },
+        "path": {
+          "type": "string",
+          "description": "Path of the starter file that was written."
+        }
+      },
+      "required": [
+        "wrote",
+        "path"
       ]
     }
   ]

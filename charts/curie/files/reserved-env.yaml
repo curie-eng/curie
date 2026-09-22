@@ -104,6 +104,9 @@ api:
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret
   GITHUB_CLONE_BASE: api.githubCloneBase
+  GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
+  GITHUB_FACTORY_LABEL: api.githubFactoryLabel
+  GITHUB_FACTORY_MENTION: api.githubFactoryMention
   GITHUB_REPO_ALLOWLIST: api.githubRepoAllowlist
   GITHUB_REVIEW_INGRESS_ENABLED: api.githubReviewIngressEnabled
   GITHUB_REVIEW_RECONCILER_INTERVAL_S: api.githubReviewReconcilerIntervalSeconds

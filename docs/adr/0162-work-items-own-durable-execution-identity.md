@@ -19,6 +19,9 @@ The realizing paths are `apps/api/src/curie_api/models.py`,
 `apps/api/alembic/versions/0046_work_items.py`, and
 `apps/api/src/curie_api/workitems.py`.
 
+Signed GitHub issue intake that calls this service is
+[ADR 0161](0161-signed-github-issue-events-admit-one-work-item.md).
+
 ## Context
 
 The tracker remains the backlog and the place where people author issue content.
@@ -94,7 +97,7 @@ as a whole. ADR 0149 is not Accepted and supplies no model authority. Fixed
 model selection per agent is the entire model scope for version 0.10. This
 boundary does not reject future model routing under separate authority.
 
-[ADR 0161](0161-the-tracker-owns-dependencies-and-curie-admits-ready-work.md)
+[ADR 0165](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md)
 remains Draft and deferred. This foundation adds no dependency observations,
 dependency admission, readiness checks, stacked publication, prerequisite
 assembly, tracker reconciliation, or fields anticipating those features.
@@ -129,4 +132,4 @@ judgments would create the competing authority that ADR 0145 sought to avoid.
 
 ### Add dependency and stacked publication state now
 
-Rejected. ADR 0161 is Draft and supplies no implementation authority.
+Rejected. ADR 0165 is Draft and supplies no implementation authority.

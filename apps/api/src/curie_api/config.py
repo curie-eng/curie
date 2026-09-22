@@ -132,6 +132,12 @@ class Settings(BaseSettings):
     # form a complete bootable configuration.
     github_review_ingress_enabled: bool = False
     github_review_reconciler_interval_s: float = 5.0
+    # Factory issue intake is separately gated from push and review handling.
+    # The label is the initial admission convention. The mention is the login
+    # an authorized human must name to request another bounded execution.
+    github_factory_ingress_enabled: bool = False
+    github_factory_label: str = ""
+    github_factory_mention: str = ""
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -317,9 +323,7 @@ class Settings(BaseSettings):
     work_item_batch_limit: int = Field(
         default=50,
         gt=0,
-        validation_alias=AliasChoices(
-            "CURIE_WORK_ITEM_BATCH_LIMIT", "WORK_ITEM_BATCH_LIMIT"
-        ),
+        validation_alias=AliasChoices("CURIE_WORK_ITEM_BATCH_LIMIT", "WORK_ITEM_BATCH_LIMIT"),
     )
     work_item_wait_budget_seconds: int = Field(
         default=86400,
@@ -380,9 +384,7 @@ class Settings(BaseSettings):
     runs_consumer_group: str = Field(
         default=WORKER_GROUP_DEFAULT,
         min_length=1,
-        validation_alias=AliasChoices(
-            "CURIE_CONSUMER_GROUP", "RUNS_CONSUMER_GROUP"
-        ),
+        validation_alias=AliasChoices("CURIE_CONSUMER_GROUP", "RUNS_CONSUMER_GROUP"),
     )
 
     # The Slack bot token the API uses for its OWN user-group lookups (#420),
@@ -535,6 +537,42 @@ class Settings(BaseSettings):
         if offenders:
             raise ValueError(
                 "GitHub review ingress (GITHUB_REVIEW_INGRESS_ENABLED) requires "
+                "complete active configuration; "
+                f"set valid values for: {', '.join(offenders)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_github_factory_ingress(self) -> "Settings":
+        if not self.github_factory_ingress_enabled:
+            return self
+        from .github_review_events import valid_github_login
+
+        offenders = []
+        if not self.github_app_id.strip():
+            offenders.append("GITHUB_APP_ID")
+        if not self.github_app_private_key.strip():
+            offenders.append("GITHUB_APP_PRIVATE_KEY")
+        if (
+            not self.github_webhook_secret.strip()
+            or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
+        ):
+            offenders.append("GITHUB_WEBHOOK_SECRET")
+        label = self.github_factory_label
+        if (
+            not label
+            or label != label.strip()
+            or len(label) > 50
+            or any(character.isspace() for character in label)
+        ):
+            offenders.append("GITHUB_FACTORY_LABEL")
+        if not valid_github_login(self.github_factory_mention):
+            offenders.append("GITHUB_FACTORY_MENTION")
+        if not self.github_repo_allowlist:
+            offenders.append("GITHUB_REPO_ALLOWLIST")
+        if offenders:
+            raise ValueError(
+                "GitHub factory ingress (GITHUB_FACTORY_INGRESS_ENABLED) requires "
                 "complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
             )

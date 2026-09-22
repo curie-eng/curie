@@ -5976,7 +5976,7 @@ export const commandManifest = {
       "name": "schema"
     },
     {
-      "about": "Print the committed, versioned JSON Schemas for the `--json` result outputs",
+      "about": "Print the committed, versioned JSON Schemas for `--json` results and the `curie.yaml` installation input (`curie-yaml`)",
       "args": [
         {
           "global": false,
@@ -5987,7 +5987,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Print the committed, versioned JSON Schemas for the `--json` result outputs.\n\nWith no NAME, emits the schema inventory index (`cli/schema/index.json`): every agent-facing result family, the schema file it maps to, and its version. With a NAME (e.g. `kill`, or `kill.schema.json`), emits that schema. The schemas are embedded in the binary, so this works from a released `curie` with no source checkout (issue #634).",
+      "long_about": "Print the committed, versioned JSON Schemas for `--json` results and the `curie.yaml` installation input (`curie-yaml`).\n\nWith no NAME, emits the schema inventory index (`cli/schema/index.json`): every agent-facing result family, the schema file it maps to, and its version. With a NAME (e.g. `kill`, or `kill.schema.json`, or `curie-yaml`), emits that schema. The schemas are embedded in the binary, so this works from a released `curie` with no source checkout (issue #634).",
       "name": "schema-index"
     },
     {
@@ -6010,6 +6010,26 @@ export const commandManifest = {
           "positional": false,
           "required": false,
           "short": "f"
+        },
+        {
+          "global": false,
+          "help": "Write a starter `curie.yaml` from this binary and exit. Refuses to overwrite an existing file",
+          "id": "init",
+          "long": "init",
+          "positional": false,
+          "possible_values": [
+            "true",
+            "false"
+          ],
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Kubernetes context for every helm and kubectl call. Wins over `install.context` in the file. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
         },
         {
           "global": false,
@@ -6057,7 +6077,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.\n\nA worked common installation is available at `examples/curie.yaml` in the Curie repository.",
+      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.\n\nA worked common installation is available at `examples/curie.yaml` in the Curie repository. A released binary writes the same starter with `curie apply --init`.",
       "name": "apply"
     },
     {
@@ -6125,6 +6145,14 @@ export const commandManifest = {
       "args": [
         {
           "global": false,
+          "help": "Kubernetes context for every helm and kubectl call. Wins over `install.context` in `curie.yaml`. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
           "help": "Kubernetes namespace to inspect. Defaults to `curie.yaml`'s `install:` block when one is present in this directory, otherwise `curie`",
           "id": "namespace",
           "long": "namespace",
@@ -6176,6 +6204,14 @@ export const commandManifest = {
           "positional": false,
           "required": false,
           "short": "f"
+        },
+        {
+          "global": false,
+          "help": "Kubernetes context for every helm and kubectl call. Wins over `install.context` in the file. Defaults to the kubeconfig current-context, which is resolved once and pinned. Diff prints the cluster this context names",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
         },
         {
           "global": false,

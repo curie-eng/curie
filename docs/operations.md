@@ -82,8 +82,17 @@ Two things to know:
 ### `curie apply`
 
 Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
-`curie.yaml` and customize it. Credential fields contain credential names, not
-secret values.
+`curie.yaml` and customize it, or write the same starter from a released binary
+with `curie apply --init`. Credential fields contain credential names, not
+secret values. `install.context` (and `curie apply --context` / `curie diff
+--context`, which win over the file) selects the kube context; `curie diff`
+prints the cluster that context names. Shared-cluster singleton opt-outs are
+modeled as `platform.sandbox_controller` and `platform.priority_classes.platform`
+/ `sandbox`. `platform.gvisor` is `auto`, `require`, or `off` and controls
+runner kernel isolation, not those singletons. `set:` values are always strings;
+a boolean or null is refused and the error names the empty string form, except
+for keys that have a modeled field. The input schema is
+`curie schema-index curie-yaml`.
 Before either command, provide values for `ANTHROPIC_API_KEY`,
 `SLACK_APP_TOKEN`, and `SLACK_BOT_TOKEN` in the environment or store them with
 `curie secrets set <NAME>`.
@@ -785,6 +794,31 @@ from that repository are NOT happening (#1309).
 Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
 built artifact without rebuilding.
+
+### Admitting a labelled GitHub issue
+
+Factory intake uses the same signed `POST /github/webhook` endpoint and is off
+until `api.githubFactoryIngressEnabled` is true (environment
+`GITHUB_FACTORY_INGRESS_ENABLED=true`). The API refuses to start with that gate
+on unless the GitHub App id and private key are set, the webhook secret is not
+the development default, `api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a
+single label name, `api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one
+GitHub login, and `api.githubRepoAllowlist` is non-empty.
+
+Bind the agent with a `github` channel whose address is the repository
+`owner/name`. No Slack binding is required. The configured label is only the
+initial admission convention. A later bounded execution requires a new issue
+comment that explicitly mentions that login and whose sender currently has
+write or admin permission. Ordinary comments, edits, and events sent by the
+App do not execute work. Removing that label or closing the issue cancels
+waiting work and requests termination of a running execution. Cancellation
+stays requested until the runtime reports that it stopped. An already linked
+pull request stays linked, and later publication is refused.
+
+Subscribe the App webhook to **Issues** and **Issue comments** in addition to
+the review subscriptions when both gates are on. Give the App **Issues: Read**
+so Curie can re-read the issue and comment, and **Metadata: Read** is already
+implied by repository installation discovery.
 
 ### Factory work items wait for capacity
 

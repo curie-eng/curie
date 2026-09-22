@@ -42,12 +42,17 @@ another hardcoded handler. The five that exist:
 - **GitHub push** — `apps/api/src/curie_api/routers/github.py::github_webhook`:
   `@router.post("/webhook")` verifies the HMAC signature, then branches on
   `x_github_event`; a `"push"` event is handed to `process_push(...)`, a `"ping"`
-  is answered `"pong"`, and unsupported events are `"ignored"`.
+  is answered `"pong"`, review events follow the review ingress when
+  `github_review_ingress_enabled` is on, and `issues` events plus plain issue
+  comments follow signed factory intake when `github_factory_ingress_enabled`
+  is on. Every other event is `"ignored"`.
 - **GitHub review feedback**: `apps/api/src/curie_api/routers/github.py::github_webhook`
   accepts actionable `issue_comment`, `pull_request_review_comment`, and
-  `pull_request_review` deliveries after HMAC verification. It claims the delivery UUID,
-  persists a durable `GitHubReviewFeedback` outbox row, and exposes worker-only provider
-  truth and lineage checks through `apps/api/src/curie_api/routers/github_reviews.py`.
+  `pull_request_review` deliveries after HMAC verification. Plain issue comments
+  take the factory path first when that gate is on. Review ingress claims the
+  delivery UUID, persists a durable `GitHubReviewFeedback` outbox row, and exposes
+  worker-only provider truth and lineage checks through
+  `apps/api/src/curie_api/routers/github_reviews.py`.
 
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
   a timer in the API asks GitHub whether the deploy branches moved and hands any

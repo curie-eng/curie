@@ -284,7 +284,7 @@ fn apply_and_diff_file_errors_name_the_problem_and_give_a_runnable_fix() {
     let unknown = temp.path().join("unknown install.yaml");
     fs::write(
         &unknown,
-        "version: 1\ninstall:\n  namespace: x\n  release: x\n  context: y\n",
+        "version: 1\ninstall:\n  namespace: x\n  release: x\n  cluster: y\n",
     )
     .expect("write installation with an unknown key");
 
@@ -351,13 +351,13 @@ fn apply_and_diff_file_errors_name_the_problem_and_give_a_runnable_fix() {
                     }
                     "unknown" => {
                         assert!(
-                            message.contains("context")
+                            message.contains("cluster")
                                 && message.contains("line 5")
                                 && message.contains("column 3"),
                             "{label} must name the key and exact YAML location: {message}"
                         );
                         assert_eq!(
-                            message.matches("context").count(),
+                            message.matches("cluster").count(),
                             1,
                             "{label} must not duplicate the parser cause: {message}"
                         );
@@ -380,7 +380,7 @@ fn installation_file_debug_output_retains_read_and_parse_causes() {
     let unknown = temp.path().join("unknown.yaml");
     fs::write(
         &unknown,
-        "version: 1\ninstall:\n  namespace: x\n  release: x\n  context: y\n",
+        "version: 1\ninstall:\n  namespace: x\n  release: x\n  cluster: y\n",
     )
     .expect("write installation with an unknown key");
 
@@ -394,7 +394,7 @@ fn installation_file_debug_output_retains_read_and_parse_causes() {
     let unknown_output = run_installation_command(temp.path(), "diff", &unknown, false, true);
     let unknown_stderr = String::from_utf8_lossy(&unknown_output.stderr);
     assert!(
-        unknown_stderr.contains("unknown field `context`")
+        unknown_stderr.contains("unknown field `cluster`")
             && unknown_stderr.contains("line 5 column 3"),
         "debug output must retain the serde cause: {unknown_stderr}"
     );

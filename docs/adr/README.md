@@ -187,6 +187,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0158 | [A custom connector is a bundle built HTTP MCP server that holds its own credential](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md) | Draft |
 | 0159 | [A canary is a weighted second active deployment and every trace carries its version](0159-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
 | 0160 | [A long scheduled sweep stays on one sandbox](0160-a-long-scheduled-sweep-stays-on-one-sandbox.md) | Accepted |
-| 0161 | [The tracker owns dependencies and Curie admits ready work](0161-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
+| 0161 | [Signed GitHub issue events admit one WorkItem](0161-signed-github-issue-events-admit-one-work-item.md) | Accepted |
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
+| 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 <!-- END GENERATED: adr-index -->
