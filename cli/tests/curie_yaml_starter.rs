@@ -69,8 +69,9 @@ fn schema_index_prints_the_installation_input_schema() {
         serde_json::from_slice(&output.stdout).expect("input schema is JSON");
     assert_eq!(
         schema["$id"],
-        "https://schemas.curietech.ai/cli/curie-yaml/v1.json"
+        "https://schemas.curietech.ai/cli/curie-yaml/v1.1.json"
     );
+    assert!(schema["properties"].get("secrets").is_some());
     assert!(schema["properties"]["install"]["properties"]
         .get("context")
         .is_some());
