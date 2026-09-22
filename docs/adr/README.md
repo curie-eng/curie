@@ -186,4 +186,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0157 | [Factory work dispatches from SQL over the runs stream](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md) | Accepted |
 | 0159 | [A canary is a weighted second active deployment and every trace carries its version](0159-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
 | 0160 | [A long scheduled sweep stays on one sandbox](0160-a-long-scheduled-sweep-stays-on-one-sandbox.md) | Accepted |
+| 0161 | [Signed GitHub issue events admit one WorkItem](0161-signed-github-issue-events-admit-one-work-item.md) | Accepted |
 <!-- END GENERATED: adr-index -->

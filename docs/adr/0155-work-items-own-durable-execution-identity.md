@@ -19,6 +19,9 @@ The realizing paths are `apps/api/src/curie_api/models.py`,
 `apps/api/alembic/versions/0045_work_items.py`, and
 `apps/api/src/curie_api/workitems.py`.
 
+Signed GitHub issue intake that calls this service is
+[ADR 0161](0161-signed-github-issue-events-admit-one-work-item.md).
+
 ## Context
 
 The tracker remains the backlog and the place where people author issue content.

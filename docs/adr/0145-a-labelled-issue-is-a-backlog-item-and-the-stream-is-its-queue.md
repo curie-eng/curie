@@ -9,6 +9,10 @@ Partially amended by
 remains the backlog and Curie still does not copy tracker content. The stream no
 longer owns durable admitted execution state.
 
+Partially amended by
+[ADR 0161](0161-signed-github-issue-events-admit-one-work-item.md)
+for the intake clause that routed labelled issues through hook partitions.
+
 Proposed as part of the dark-factory decision set, discussed in
 [discussion #2551](https://github.com/curie-eng/curie/discussions/2551).
 
