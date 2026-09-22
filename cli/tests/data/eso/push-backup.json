@@ -1,0 +1,25 @@
+{
+  "apiVersion": "external-secrets.io/v1alpha1",
+  "kind": "PushSecret",
+  "metadata": {"name": "finance-rotated-backup", "namespace": "curie"},
+  "spec": {
+    "refreshInterval": "10s",
+    "updatePolicy": "Replace",
+    "deletionPolicy": "None",
+    "secretStoreRefs": [{"name": "curie-aws", "kind": "SecretStore"}],
+    "selector": {"secret": {"name": "curie-finance"}},
+    "data": [
+      {
+        "match": {
+          "secretKey": "REFRESH_TOKEN",
+          "remoteRef": {"remoteKey": "curie/test/finance-rotated", "property": "REFRESH_TOKEN"}
+        },
+        "metadata": {
+          "apiVersion": "kubernetes.external-secrets.io/v1alpha1",
+          "kind": "PushSecretMetadata",
+          "spec": {"secretPushFormat": "string"}
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "apiVersion": "external-secrets.io/v1",
+  "kind": "ExternalSecret",
+  "metadata": {"name": "platform", "namespace": "curie"},
+  "spec": {
+    "refreshInterval": "1h",
+    "secretStoreRef": {"name": "curie-aws", "kind": "SecretStore"},
+    "target": {"name": "curie-platform", "creationPolicy": "Owner"},
+    "data": [
+      {"secretKey": "A", "remoteRef": {"key": "curie/test/platform", "property": "A"}},
+      {"secretKey": "B", "remoteRef": {"key": "curie/test/platform", "property": "B"}}
+    ]
+  }
+}
