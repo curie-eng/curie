@@ -655,7 +655,11 @@ pass `--chart <path-or-tgz>` explicitly for now.
 Local secrets are stored in `~/.config/curie/credentials.json` with mode 0600,
 not in the repo, shell history, command argv, `.env`, or Curie state files.
 Curie keeps a separate non-secret index so secret names can be listed without
-opening values.
+opening values. `curie secrets check`, `curie secrets rm`, `curie dev
+secrets-inventory`, and `curie secrets set --expires` are declared for a
+provider install and return not implemented in this build. `set` and `list`
+keep this local store unless `--file` points at a `curie.yaml` that sets
+`secrets.provider`.
 
 ```bash
 curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN

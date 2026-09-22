@@ -35,6 +35,10 @@ pub struct Installation {
     pub credentials: Credentials,
     #[serde(default)]
     pub comms: Comms,
+    /// Optional provider for install credentials. Absent keeps the local store.
+    /// Names only: provider, region, prefix, and role ARN. Never a credential value.
+    #[serde(default)]
+    pub secrets: Option<SecretsBlock>,
     /// Verbatim values emitted as `helm --set-string key=value` for chart settings
     /// this schema does not model yet. Every accepted value remains a string.
     /// Values shaped like booleans or null after trimmed ASCII case normalization
@@ -184,6 +188,97 @@ pub struct Slack {
     pub app_token: String,
     /// NAME of the env var / secret holding the `xoxb-` bot token.
     pub bot_token: String,
+}
+
+/// `secrets.provider`. Only `aws` is accepted. Any other string, including a
+/// different case, is refused by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Aws,
+}
+
+impl<'de> Deserialize<'de> for ProviderKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "aws" => Ok(Self::Aws),
+            other => Err(serde::de::Error::custom(format!(
+                "secrets.provider must be aws, not {other:?}"
+            ))),
+        }
+    }
+}
+
+/// The optional `secrets:` block. All four fields are required when the block
+/// is present. A missing or null block means the local store.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsBlock {
+    pub provider: ProviderKind,
+    pub region: String,
+    pub prefix: String,
+    pub role_arn: String,
+}
+
+fn aws_region(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || !bytes[..2].iter().all(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+    let Some((head, digits)) = value[2..].rsplit_once('-') else {
+        return false;
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if !head.starts_with('-') {
+        return false;
+    }
+    let parts: Vec<&str> = head.split('-').skip(1).collect();
+    !parts.is_empty()
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_lowercase()))
+}
+
+fn secrets_prefix(value: &str) -> bool {
+    if value.is_empty() || value.len() > 200 || value.starts_with('/') || value.ends_with('/') {
+        return false;
+    }
+    value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "/_+=.@-".contains(character))
+}
+
+fn iam_role_arn(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("arn:") else {
+        return false;
+    };
+    let rest = if let Some(rest) = rest.strip_prefix("aws-us-gov:") {
+        rest
+    } else if let Some(rest) = rest.strip_prefix("aws-cn:") {
+        rest
+    } else if let Some(rest) = rest.strip_prefix("aws:") {
+        rest
+    } else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix("iam::") else {
+        return false;
+    };
+    let Some((account, rest)) = rest.split_once(':') else {
+        return false;
+    };
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Some(name) = rest.strip_prefix("role/") else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "+=,.@_/-".contains(character))
 }
 
 /// The only schema version this binary understands.
@@ -390,6 +485,35 @@ impl Installation {
                 &Some(slack.bot_token.clone()),
                 "comms.slack.bot_token",
             )?;
+        }
+        self.validate_secrets()?;
+        Ok(())
+    }
+
+    fn validate_secrets(&self) -> Result<()> {
+        let Some(block) = &self.secrets else {
+            return Ok(());
+        };
+        Self::reject_secret_shaped(&Some(block.region.clone()), "secrets.region")?;
+        Self::reject_secret_shaped(&Some(block.prefix.clone()), "secrets.prefix")?;
+        Self::reject_secret_shaped(&Some(block.role_arn.clone()), "secrets.role_arn")?;
+        if !aws_region(&block.region) {
+            bail!(
+                "secrets.region must be an AWS region name, not {:?}",
+                block.region
+            );
+        }
+        if !secrets_prefix(&block.prefix) {
+            bail!(
+                "secrets.prefix must be a name of at most 200 characters, without a leading or trailing slash, not {:?}",
+                block.prefix
+            );
+        }
+        if !iam_role_arn(&block.role_arn) {
+            bail!(
+                "secrets.role_arn must be an IAM role ARN, not {:?}",
+                block.role_arn
+            );
         }
         Ok(())
     }
