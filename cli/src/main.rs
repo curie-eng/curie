@@ -5943,16 +5943,18 @@ mod tests {
 
     #[test]
     fn message_preflight_value_flags_match_clap_command_graph() {
-        let mut derived = message_value_flags(&["local", "message"]);
-        derived.extend(message_value_flags(&["cluster", "message"]));
-        let source = message_value_flags_from_source();
-        let missing: Vec<_> = derived.difference(&source).cloned().collect();
-        let stale: Vec<_> = source.difference(&derived).cloned().collect();
+        on_parse_stack(|| {
+            let mut derived = message_value_flags(&["local", "message"]);
+            derived.extend(message_value_flags(&["cluster", "message"]));
+            let source = message_value_flags_from_source();
+            let missing: Vec<_> = derived.difference(&source).cloned().collect();
+            let stale: Vec<_> = source.difference(&derived).cloned().collect();
 
-        assert!(
-            missing.is_empty() && stale.is_empty(),
-            "message value flag inventory drifted from clap: missing={missing:?}, stale={stale:?}, derived={derived:?}, source={source:?}"
-        );
+            assert!(
+                missing.is_empty() && stale.is_empty(),
+                "message value flag inventory drifted from clap: missing={missing:?}, stale={stale:?}, derived={derived:?}, source={source:?}"
+            );
+        });
     }
 
     /// Serializes the `cluster_connector_bind_values` cases that mutate the

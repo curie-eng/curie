@@ -1398,6 +1398,12 @@ class ConnectorManifests(BaseModel):
     # Service in `manifests`, so an author never hand-writes a URL that
     # resolves in one tier and not another.
     mcp_entries: dict[str, Any] = Field(default_factory=dict)
+    # The version whose bundle was read. Required: the route always names the
+    # version it was given and does not look up a second deployment.
+    version_id: uuid.UUID
+    # plugin.json triggers as stored. Missing, null, and non-list values are
+    # an empty list. Entries are not validated or rewritten.
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DeploymentCreate(BaseModel):

@@ -1366,3 +1366,38 @@ class ConsoleSession(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class HookRun(Base):
+    """One claimed trigger slot for an agent version."""
+
+    __tablename__ = "hook_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "name",
+            "slot_utc",
+            name="hook_runs_agent_name_slot_key",
+        ),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('ran', 'skipped', 'blocked', 'failed')",
+            name="hook_runs_outcome_ck",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String)
+    slot_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE")
+    )
+    outcome: Mapped[str | None] = mapped_column(String, default=None)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
