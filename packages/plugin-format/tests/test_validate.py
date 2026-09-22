@@ -1,5 +1,8 @@
 import json
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -273,8 +276,8 @@ def test_unparsed_cron_schedule_is_rejected(tmp_path: Path, schedule: str) -> No
 
 @pytest.mark.parametrize(
     "timezone",
-    ["Not/AZone", "", None],
-    ids=["unknown", "blank", "null"],
+    ["Not/AZone", "", None, "localtime", "posixrules", " America/New_York "],
+    ids=["unknown", "blank", "null", "localtime", "posixrules", "padded_iana"],
 )
 def test_unresolved_cron_timezone_is_rejected(tmp_path: Path, timezone: str | None) -> None:
     bundle = _trigger_bundle(
@@ -290,6 +293,38 @@ def test_unresolved_cron_timezone_is_rejected(tmp_path: Path, timezone: str | No
         ],
     )
     assert "triggers.timezone_invalid" in _codes(bundle)
+
+
+def test_packaged_tzdata_accepts_an_iana_zone_without_a_host_database(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "timezone": "America/New_York",
+            }
+        ],
+    )
+    program = "\n".join(
+        [
+            "import sys",
+            "from pathlib import Path",
+            "from plugin_format import validate_bundle",
+            "result = validate_bundle(Path(sys.argv[1]))",
+            "assert result.valid, result.errors",
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(bundle)],
+        env=os.environ | {"PYTHONTZPATH": ""},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -329,7 +364,14 @@ def test_duplicate_trigger_name_after_strip_is_rejected(tmp_path: Path) -> None:
     assert "triggers.duplicate_name" in _codes(bundle)
 
 
-def test_channel_object_target_is_valid(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "target",
+    [{"channel": "C0EXAMPLE1"}, {"channel": "   "}],
+    ids=["nonblank_channel", "blank_channel"],
+)
+def test_channel_object_target_is_structurally_invalid(
+    tmp_path: Path, target: dict[str, str]
+) -> None:
     bundle = _trigger_bundle(
         tmp_path,
         [
@@ -338,28 +380,11 @@ def test_channel_object_target_is_valid(tmp_path: Path) -> None:
                 "name": "weekday-digest",
                 "schedule": "0 9 * * 1-5",
                 "prompt": "Post the daily plan.",
-                "target": {"channel": "C0EXAMPLE1"},
+                "target": target,
             }
         ],
     )
-    result = validate_bundle(bundle)
-    assert result.valid, result.errors
-
-
-def test_blank_channel_object_target_is_rejected(tmp_path: Path) -> None:
-    bundle = _trigger_bundle(
-        tmp_path,
-        [
-            {
-                "type": "cron",
-                "name": "weekday-digest",
-                "schedule": "0 9 * * 1-5",
-                "prompt": "Post the daily plan.",
-                "target": {"channel": "   "},
-            }
-        ],
-    )
-    assert "triggers.target_invalid" in _codes(bundle)
+    assert "triggers.invalid" in _codes(bundle)
 
 
 def test_oversized_cron_number_is_rejected(tmp_path: Path) -> None:
@@ -1964,6 +1989,111 @@ def test_unknown_server_check_stays_silent_when_the_mcp_declaration_is_unreadabl
     codes = {i.code for i in result.errors}
     assert "mcp.invalid_json" in codes
     assert "tool_policy.unknown_server" not in codes
+
+
+# --- platform-owned servers are outside policy scope (#2286) -------------------
+#
+# `curie` and `curie-state` are mounted by the runner and refused to a bundle by
+# RESERVED_CONNECTOR_NAMES, so a pattern naming one can never be made valid by
+# following the unknown_server advice: declaring the server is the one fix the
+# author is not allowed to apply. The runtime exempts these servers from policy
+# outright, so the pattern is also inert. Both halves have to be said at deploy,
+# where the author is still looking.
+
+
+@pytest.mark.parametrize(
+    "pattern", ["curie/request_approval", "curie-state/get"], ids=["curie", "state"]
+)
+def test_a_pattern_naming_a_platform_server_says_so_instead_of_unknown_server(
+    tmp_path: Path, pattern: str
+) -> None:
+    """The authoring trap: the generic advice sends the author in a circle.
+
+    "Fix the server name, declare the server, or use a wildcard" is good advice
+    for a typo and a dead end for a reserved name, because the connector
+    validator refuses the declaration it just asked for. The absence of that
+    sentence is asserted explicitly, not only the presence of a new code.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["' + pattern + '"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    codes = _tool_policy_codes(bundle)
+    assert "tool_policy.platform_server" in codes
+    assert "tool_policy.unknown_server" not in codes
+
+    issue = next(i for i in result.errors if i.code == "tool_policy.platform_server")
+    assert pattern.split("/")[0] in issue.message
+    assert "platform" in issue.message.lower()
+    assert "outside" in issue.message.lower()
+    assert "declare the server" not in issue.message
+
+
+def test_a_bundle_that_declares_its_own_curie_server_keeps_the_pattern_valid(
+    tmp_path: Path,
+) -> None:
+    """The other side of the reserved-name fence, pinned at DEPLOY.
+
+    `RESERVED_CONNECTOR_NAMES` fences a CONNECTOR named `curie`. It does not
+    fence a plugin-mounted `mcpServers` entry by that name, which the SDK
+    namespaces to `mcp__plugin_<bundle>_curie__<tool>` -- a different server
+    from the platform's, fully inside policy scope, and one whose tools a
+    bundle may legitimately restrict.
+
+    The runtime already pins that
+    (`runner/tests/test_tool_policy_enforcement.py::test_a_plugin_mounted_bundle_server_named_curie_stays_inside_policy_scope`),
+    but the deploy validator had no cover for it, and the validator is where the
+    author finds out. The platform-server branch runs only after the
+    declared-server cross-check has already accepted the segment, so a `curie`
+    the bundle DOES declare must reach neither `tool_policy.platform_server`
+    nor `tool_policy.unknown_server`. A branch reordered to fire first would
+    refuse a legal bundle with advice it cannot act on, and nothing else here
+    would redden.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["curie/delete_everything"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"curie": {"command": "curie-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    codes = _tool_policy_codes(bundle)
+    assert "tool_policy.platform_server" not in codes
+    assert "tool_policy.unknown_server" not in codes
+    assert result.valid, [(i.code, i.message) for i in result.errors]
+
+
+def test_a_misspelled_undeclared_server_still_reports_unknown_server(
+    tmp_path: Path,
+) -> None:
+    """The negative control for the branch above: it narrowed nothing.
+
+    A reserved-name branch placed carelessly ahead of the cross-check could
+    swallow every literal segment and leave real typos unreported, which is the
+    inert-rule defect the cross-check was built for in the first place.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["grafanaa/get_datasource"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    codes = _tool_policy_codes(bundle)
+    assert "tool_policy.unknown_server" in codes
+    assert "tool_policy.platform_server" not in codes
+
+    issue = next(i for i in result.errors if i.code == "tool_policy.unknown_server")
+    assert "grafanaa" in issue.message
+    assert "declare the server" in issue.message
 
 
 def test_a_policy_denying_everything_warns_but_still_validates(tmp_path: Path) -> None:

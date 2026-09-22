@@ -47,7 +47,8 @@
     "0045",
     "0046",
     "0047",
-    "0048"
+    "0048",
+    "0049"
   ],
   "windows": {
     "0.8.0": {
@@ -100,13 +101,17 @@
       "schema_min": "0001",
       "schema_head": "0044"
     },
+    "0.9.2": {
+      "schema_min": "0045",
+      "schema_head": "0045"
+    },
     "0.10.0": {
-      "schema_min": "0044",
-      "schema_head": "0048"
+      "schema_min": "0045",
+      "schema_head": "0049"
     },
     "0.10.1": {
-      "schema_min": "0044",
-      "schema_head": "0048"
+      "schema_min": "0045",
+      "schema_head": "0049"
     }
   }
 }

@@ -1,13 +1,16 @@
-//! Issue #2246: the nightly SRE demo e2e workflow is the first automated tier
-//! that exercises the six demo assertions (read, approved scale, re-arm,
-//! configuration denial, RBAC ceiling, coding PR) on kind with the pinned
-//! Kubernetes MCP server, a CI-only Socket Mode Slack app, a live provider,
-//! and an allowlisted throwaway repo.
+//! Issue #2246 / #2854: the nightly SRE demo e2e workflow is the first
+//! automated tier that exercises the six demo assertions (read, approved
+//! scale, re-arm, configuration denial, RBAC ceiling, coding PR) on kind with
+//! the pinned Kubernetes MCP server, a live provider, and an allowlisted
+//! throwaway repo. Turns start with `curie cluster message`. Approvals resolve
+//! through `curie cluster approvals` and an operator principal. No Slack app
+//! is required.
 //!
 //! This file is a text-contract test against the workflow YAML plus an
-//! executing test of the skip script. A missing Slack app or throwaway repo
-//! must skip with the reason in the run summary, never report a green that
-//! proved the six assertions. Secrets must never appear on a `run:` line.
+//! executing test of the skip script. A missing throwaway repo or live
+//! provider must skip with the reason in the run summary, never report a
+//! green that proved the six assertions. Secrets must never appear on a
+//! `run:` line.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -82,10 +85,6 @@ fn run_script(phase: &str, extra_env: &[(&str, &str)], work: &Path) -> std::proc
 fn populated_prereqs() -> Vec<(&'static str, &'static str)> {
     vec![
         ("CURIE_CREDENTIALS", "sk-or-test-not-a-real-key"),
-        ("CI_SLACK_APP_TOKEN", "xapp-test"),
-        ("CI_SLACK_BOT_TOKEN", "xoxb-test"),
-        ("CI_SLACK_USER_TOKEN", "xoxp-test"),
-        ("CI_SLACK_CHANNEL_ID", "C0EXAMPLE1"),
         ("CI_THROWAY_REPO", "acme-corp/sre-demo-throwaway"),
     ]
 }
@@ -108,14 +107,19 @@ fn workflow_declares_dispatch_schedule_and_release_candidate_triggers() {
 }
 
 #[test]
-fn workflow_is_the_next_train_nightly_and_checks_out_next_on_schedule() {
+fn workflow_checks_out_the_triggering_ref_so_script_and_workflow_stay_paired() {
     let text = workflow();
     assert!(
-        text.contains("ref: next")
-            || text.contains("ref: 'next'")
-            || text.contains("ref: \"next\""),
-        "a scheduled run fires from the default branch, so the workflow must \
-         check out next to grade the feature train; file contents:\n{text}"
+        !text.contains("schedule' && 'next")
+            && !text.contains("schedule && 'next")
+            && !text.contains("ref: next"),
+        "checking out next on schedule would pair this Slack-less workflow \
+         with next's older Slack script; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("ref: ${{ github.ref }}"),
+        "the SRE demo workflow must check out github.ref so the script matches \
+         the workflow that invoked it; file contents:\n{text}"
     );
 }
 
@@ -201,9 +205,10 @@ fn workflow_installs_on_kind_with_live_openrouter_and_never_seals() {
          file contents:\n{text}"
     );
     assert!(
-        !text.contains("dispatcher.deploy=false"),
-        "the SRE demo workflow needs a real Socket Mode dispatcher, so it must \
-         not disable dispatcher.deploy; file contents:\n{text}"
+        text.contains("dispatcher.deploy=false"),
+        "the SRE demo workflow drives turns from cluster message with an \
+         operator principal, so it must disable dispatcher.deploy; \
+         file contents:\n{text}"
     );
 }
 
@@ -280,22 +285,22 @@ fn workflow_paths_include_outcome_probe_and_python_tests() {
 fn script_names_all_six_demo_assertions() {
     let text = script();
     for needle in [
-        "namespaces_list",
-        "resources_scale",
-        "re-arm",
-        "configuration_view",
-        "RBAC",
-        "throwaway",
+        "run_assertion read assert_read",
+        "run_assertion scale assert_scale",
+        "run_assertion rearm assert_rearm",
+        "run_assertion configuration-denial assert_configuration_denial",
+        "run_assertion rbac-ceiling assert_rbac_ceiling",
+        "run_assertion coding-handoff assert_coding_handoff",
     ] {
         assert!(
             text.contains(needle),
-            "sre-demo-e2e.sh must name assertion surface {needle}; file contents:\n{text}"
+            "sre-demo-e2e.sh must invoke {needle}; file contents:\n{text}"
         );
     }
 }
 
 #[test]
-fn missing_slack_secret_skips_with_reason_in_the_summary() {
+fn missing_throwaway_or_credentials_skips_with_reason_in_the_summary() {
     let work = tempfile::tempdir().expect("tempdir");
     let output = run_script("prereqs", &[], work.path());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -311,10 +316,19 @@ fn missing_slack_secret_skips_with_reason_in_the_summary() {
         "the run summary must say the demo was skipped; summary:\n{summary}"
     );
     assert!(
-        summary.contains("CI_SLACK_APP_TOKEN")
-            || summary.contains("Slack")
-            || summary.contains("slack"),
-        "the skip reason must name the missing Slack prerequisite; summary:\n{summary}"
+        summary.contains("CI_THROWAY_REPO")
+            || summary.contains("CURIE_CREDENTIALS")
+            || summary.contains("throwaway")
+            || summary.contains("live provider"),
+        "the skip reason must name the missing live-provider or throwaway prerequisite; \
+         summary:\n{summary}"
+    );
+    assert!(
+        !summary.contains("CI_SLACK_APP_TOKEN")
+            && !summary.contains("CI_SLACK_BOT_TOKEN")
+            && !summary.contains("CI_SLACK_USER_TOKEN")
+            && !summary.contains("CI_SLACK_CHANNEL_ID"),
+        "the skip reason must not require a Slack secret; summary:\n{summary}"
     );
     assert!(
         github_output.contains("ready=false"),
@@ -385,7 +399,7 @@ fn run_phase_without_allow_live_refuses_instead_of_touching_a_cluster() {
     assert!(
         !output.status.success(),
         "PHASE=run without CURIE_SRE_DEMO_ALLOW_LIVE=1 must refuse, so a laptop \
-         run cannot touch Slack or a cluster\nstdout:\n{stdout}\nstderr:\n{stderr}"
+         run cannot touch a cluster\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let combined = format!("{stdout}{stderr}");
     assert!(
@@ -409,6 +423,72 @@ fn run_phase_with_missing_prereqs_fails_closed_instead_of_skipping() {
     assert!(
         !github_output.contains("ready=false"),
         "the run phase must not claim a documented skip; output:\n{github_output}"
+    );
+}
+
+#[test]
+fn cli_sre_demo_e2e_help_does_not_require_a_slack_app() {
+    let text = fs::read_to_string(repo_root().join("cli/src/main.rs")).unwrap_or_default();
+    let start = text
+        .find("Nightly SRE demo e2e")
+        .expect("SreDemoE2e help must exist");
+    let rest = &text[start..];
+    let end = rest
+        .find("SreDemoE2e")
+        .map(|idx| start + idx)
+        .unwrap_or(text.len());
+    let window = &text[start..end];
+    assert!(
+        !window.contains("Slack"),
+        "curie dev sre-demo-e2e help must not require a Slack app; window:\n{window}"
+    );
+    assert!(
+        window.contains("operator principal"),
+        "curie dev sre-demo-e2e help must name the operator principal; window:\n{window}"
+    );
+}
+
+#[test]
+fn workflow_and_script_name_no_ci_slack_secrets() {
+    let workflow = workflow();
+    let script = script();
+    for needle in [
+        "CI_SLACK_APP_TOKEN",
+        "CI_SLACK_BOT_TOKEN",
+        "CI_SLACK_USER_TOKEN",
+        "CI_SLACK_CHANNEL_ID",
+    ] {
+        assert!(
+            !workflow.contains(needle),
+            "the SRE demo workflow must not reference {needle}; file contents:\n{workflow}"
+        );
+        assert!(
+            !script.contains(needle),
+            "sre-demo-e2e.sh must not reference {needle}; file contents:\n{script}"
+        );
+    }
+}
+
+#[test]
+fn script_starts_turns_with_cluster_message_and_operator_approvals() {
+    let text = script();
+    assert!(
+        text.contains("message --timeout-secs"),
+        "sre-demo-e2e.sh must start turns with curie cluster message; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("--mint-operator-principal"),
+        "sre-demo-e2e.sh must mint an operator principal; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("--route-approvers") && text.contains("users:"),
+        "sre-demo-e2e.sh must bind approvers.users on the approval route; \
+         file contents:\n{text}"
+    );
+    assert!(
+        text.contains("principal_kind") && text.contains("operator"),
+        "sre-demo-e2e.sh must keep the operator-principal audit check; \
+         file contents:\n{text}"
     );
 }
 

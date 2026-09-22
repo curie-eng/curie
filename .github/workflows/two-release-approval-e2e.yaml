@@ -53,22 +53,22 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@v5.0.1
         with:
           version: v3.16.4
       - name: Install kind and kubectl
-        uses: helm/kind-action@v1.14.0
+        uses: helm/kind-action@v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
           install_only: true
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: tworeleasecache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -79,7 +79,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the dispatcher image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile

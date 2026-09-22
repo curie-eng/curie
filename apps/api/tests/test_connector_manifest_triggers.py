@@ -21,7 +21,7 @@ DAILY_DIGEST = [
         "name": "daily-digest",
         "schedule": "0 9 * * 1-5",
         "timezone": "America/Los_Angeles",
-        "target": {"channel": CHANNEL},
+        "target": CHANNEL,
         "prompt": "Summarize overnight work.",
     }
 ]

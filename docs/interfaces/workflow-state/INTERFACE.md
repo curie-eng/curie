@@ -98,11 +98,16 @@ The worker-side route store is separate. `AffinityStore` at
 route-state contract:
 
 - `get(thread_key) -> RouteRecord | None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.get`)
-- `put_if_absent(thread_key, record, ttl_seconds) -> bool` — atomic acquire, the CAS-shaped primitive (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.put_if_absent`, `SET ... nx=True`)
+- `put_if_absent(thread_key, record, ttl_seconds) -> bool`: atomic acquire (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.put_if_absent`, `SET ... nx=True`)
 - `replace(thread_key, record, ttl_seconds) -> None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace`)
+- `replace_if_generation(...) -> bool`: the CAS primitive, replacing a route only while its claim and generation match (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace_if_generation`)
 - `touch(thread_key, ttl_seconds) -> bool` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.touch`)
 - `delete_if_claim(thread_key, claim_name) -> bool` — guarded delete via a Lua script (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.delete_if_claim`, script at `apps/worker/src/curie_worker/sandbox/affinity.py::_DELETE_IF_CLAIM`)
+- `pressure_get(thread_key) -> RouteRecord | None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_get`)
+- `pressure_candidates(...) -> PressureScanResult` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_candidates`)
+- `detach_if_unchanged(...) -> bool`: atomically detach an exact idle route while its victim lock is owned (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.detach_if_unchanged`)
 - `live_claim_names(...) -> set[str]` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.live_claim_names`)
+- `route_inventory(...) -> dict[RouteState, set[str]]` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.route_inventory`)
 - `mark_suspended(thread_key, history_ref, ttl_seconds) -> RouteRecord` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.mark_suspended`)
 
 The stored value is a `RouteRecord` (`apps/worker/src/curie_worker/sandbox/types.py::RouteRecord`) JSON-serialized. This is route affinity, not general workflow state.
@@ -119,8 +124,10 @@ shapes. First, it is stateless-first: per ADR-0003 a suspend/resume is a cold po
 (the live process never survives), so resume rehydrates from a caller-supplied `history_ref`
 injected as `CURIE_HISTORY_REF` rather than assuming any in-process or cache warmth
 (`apps/worker/src/curie_worker/sandbox/substrate.py::SandboxSubstrate.resume`). Second,
-the route store leans on Valkey TTL-expiry as garbage collection: an idle route record
-simply expires, and the reaper protocol depends on that automatic expiry. A durable
+the route store uses Valkey TTL expiry as its baseline garbage collection: an idle route
+record expires, and the reaper protocol depends on that automatic expiry. Under quota
+pressure, `pressure_candidates` and `detach_if_unchanged` supplement TTL expiry by actively
+detaching an unchanged idle route while its victim lock is owned. A durable
 (non-TTL) backend for a future workflow-state port would have to add its own sweeper to
 reclaim abandoned state, because it cannot inherit Valkey's expiry-as-GC for free.
 

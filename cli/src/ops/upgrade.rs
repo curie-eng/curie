@@ -1,14 +1,21 @@
 //! `curie cluster upgrade`: one resumable lifecycle that plans, validates,
-//! drains, checkpoints, migrates, applies, proves exact convergence, runs a
-//! canary, and records the new known-good version (issue #2301).
+//! checks the worker is reachable, checkpoints, migrates, applies, proves
+//! exact convergence, runs a canary, and records the new known-good version
+//! (issue #2301).
 //!
 //! Sibling slices this module composes and does not reimplement:
 //! - versioned configuration migrations (#2299)
 //! - database compatibility windows (#2300)
 //! - the kind released-install upgrade CI rung (#2097)
 //!
-//! Drain is the existing #2010 gate: one drain per attempt. Resume after a
-//! completed drain must not drain accepted work again.
+//! `DrainPreflight` is NOT the #2010 drain gate and must not be read as one
+//! (issue #2830). It runs before Apply, while the real gate is the chart's
+//! pre-upgrade Helm hook Job and only fires once Apply calls `helm upgrade`.
+//! All this phase can do ahead of that call is confirm the worker workload is
+//! reachable; whether the fleet actually drained is observed afterward, at
+//! Converge, from Helm's own retained hook history (`Facet::Drain`, reported
+//! as `queues_drained`). Resume after a completed preflight must not repeat
+//! it needlessly.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,6 +23,9 @@ use std::time::{Duration, Instant};
 
 use super::command::{mask_secret, plain, require_on_path, run_capture, CommonOpts, OpsCommand};
 
+// These bound the DrainPreflight worker-reachability probe below, not the
+// real #2010 drain gate (that gate's own timeout is
+// `worker.upgradeDrain.timeoutSeconds` in the chart).
 const DRAIN_TIMEOUT_ENV: &str = "CURIE_UPGRADE_DRAIN_TIMEOUT_SECS";
 const DRAIN_TIMEOUT_DEFAULT_SECS: u64 = 30;
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -28,7 +38,11 @@ const TEST_INTERRUPT_AFTER_ENV: &str = "CURIE_UPGRADE_TEST_INTERRUPT_AFTER";
 pub enum UpgradePhase {
     Plan,
     Validate,
-    Drain,
+    /// A worker-reachability check ahead of the real #2010 drain gate, never
+    /// an observation of a drain (issue #2830). The `drain` alias keeps a
+    /// checkpoint a pre-#2830 binary persisted under the old name resumable.
+    #[serde(alias = "drain")]
+    DrainPreflight,
     Checkpoint,
     Migrate,
     Apply,
@@ -41,7 +55,7 @@ impl UpgradePhase {
     pub const ALL: [UpgradePhase; 9] = [
         UpgradePhase::Plan,
         UpgradePhase::Validate,
-        UpgradePhase::Drain,
+        UpgradePhase::DrainPreflight,
         UpgradePhase::Checkpoint,
         UpgradePhase::Migrate,
         UpgradePhase::Apply,
@@ -54,7 +68,7 @@ impl UpgradePhase {
         match self {
             UpgradePhase::Plan => "plan",
             UpgradePhase::Validate => "validate",
-            UpgradePhase::Drain => "drain",
+            UpgradePhase::DrainPreflight => "drain_preflight",
             UpgradePhase::Checkpoint => "checkpoint",
             UpgradePhase::Migrate => "migrate",
             UpgradePhase::Apply => "apply",
@@ -193,6 +207,9 @@ struct UpgradeRecord {
     completed: Vec<UpgradePhase>,
     status: String,
     plan: Vec<String>,
+    /// Whether the DrainPreflight worker-reachability check has already run
+    /// once for this attempt. Not an observation of the real #2010 drain
+    /// gate, which `queues_drained` reports from Converge instead.
     drain_completed: bool,
     convergence: Option<Convergence>,
     canary: Option<Canary>,
@@ -517,7 +534,7 @@ impl UpgradeDriver for FakeUpgradeHost {
     fn refuse_schema(&self) -> bool {
         self.refuse_schema
     }
-    fn drain_once(&mut self) -> Result<bool> {
+    fn drain_preflight_once(&mut self) -> Result<bool> {
         self.drain_calls += 1;
         Ok(self.in_flight.is_empty())
     }
@@ -594,7 +611,7 @@ fn plan_lines(
     let mut lines = vec![
         format!("phase plan: {from} -> {}", opts.to),
         "phase validate: configuration overlay migration and pre-mutation refusals".into(),
-        "phase drain: worker upgrade drain gate (issue 2010)".into(),
+        "phase drain_preflight: confirm the worker workload is reachable; the worker upgrade drain gate itself runs later, inside Apply's Helm pre-upgrade hook (issue 2010)".into(),
         "phase checkpoint: persist recoverable release state".into(),
         // The chart's pre-upgrade hook Job owns schema migration and Apply
         // fires it; this phase is only a resumable checkpoint boundary
@@ -733,7 +750,9 @@ trait UpgradeDriver {
     fn observed_version(&self) -> Option<String> {
         self.current()
     }
-    fn drain_once(&mut self) -> Result<bool>;
+    /// The DrainPreflight worker-reachability check, not an observation of
+    /// the real #2010 drain gate (issue #2830). See `LiveHost::live_drain_preflight`.
+    fn drain_preflight_once(&mut self) -> Result<bool>;
     fn apply_target(&mut self, to: &str) -> Result<()>;
     fn observe_convergence(&self) -> Result<ConvergenceVerdict>;
     fn run_canary(&self) -> Result<Canary>;
@@ -820,7 +839,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         && host.known_good().as_deref() == Some(opts.to.as_str());
 
     // Resume after Validate still honors a freshly computed refusal and
-    // must not replay Drain to reach it.
+    // must not replay DrainPreflight to reach it.
     if host.validate_refusal().is_some() || host.refuse_config() || host.refuse_schema() {
         execute_phase(UpgradePhase::Validate, &opts, host, &mut record)?;
     }
@@ -829,7 +848,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         if same_version
             && matches!(
                 phase,
-                UpgradePhase::Drain
+                UpgradePhase::DrainPreflight
                     | UpgradePhase::Checkpoint
                     | UpgradePhase::Migrate
                     | UpgradePhase::Apply
@@ -839,7 +858,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             host.store_record(record.clone())?;
             continue;
         }
-        if phase == UpgradePhase::Drain && from.is_none() {
+        if phase == UpgradePhase::DrainPreflight && from.is_none() {
             record.completed.push(phase);
             host.store_record(record.clone())?;
             continue;
@@ -923,15 +942,15 @@ fn execute_phase<H: UpgradeDriver>(
             }
             Ok(PhaseOutcome::Continue)
         }
-        UpgradePhase::Drain => {
+        UpgradePhase::DrainPreflight => {
             if record.drain_completed {
                 return Ok(PhaseOutcome::Continue);
             }
-            if !host.drain_once()? {
+            if !host.drain_preflight_once()? {
                 record.fail_forward = Some(fail_forward_for(
                     opts,
                     true,
-                    "accepted work is still in flight; retry once those deliveries settle",
+                    "the worker workload could not be confirmed reachable ahead of the drain gate; retry once the cluster API responds",
                 ));
                 return Ok(PhaseOutcome::Failed);
             }
@@ -1040,8 +1059,9 @@ fn convergence_from(observation: &super::convergence::Observation) -> Convergenc
         hooks_healthy: observation.holds(Facet::Hook),
         // Ruling 13: the #2010 drain gate is a Helm pre-upgrade hook Job that
         // fires during Apply, so Converge is the only phase that can see its
-        // verdict. `record.drain_completed` is the exactly-once flag, not a
-        // convergence fact, and is deliberately not consulted.
+        // verdict; DrainPreflight runs earlier and cannot (issue #2830).
+        // `record.drain_completed` is DrainPreflight's own exactly-once flag,
+        // not a convergence fact, and is deliberately not consulted.
         queues_drained: observation.holds(Facet::Drain),
         manifest_matches: observation.holds(Facet::Manifest),
     }
@@ -2025,12 +2045,14 @@ impl LiveHost {
         })
     }
 
-    fn live_drain(&self) -> Result<bool> {
-        // The chart's pre-upgrade Job is the #2010 gate and fires during Apply.
-        // This phase observes the worker Deployment probe only: success or a
-        // NotFound skip proceeds; any other failure stays pending until the
-        // phase budget expires. Replica counts are not parsed, because the
-        // worker stays scheduled during Drain.
+    /// The DrainPreflight worker-reachability check. The real #2010 drain
+    /// gate is the chart's pre-upgrade Job, which fires during Apply and is
+    /// observed afterward at Converge (issue #2830) -- this method cannot see
+    /// it and does not claim to. It only probes the worker Deployment:
+    /// success or a NotFound skip proceeds; any other failure stays pending
+    /// until the phase budget expires. Replica counts are not parsed, because
+    /// the worker stays scheduled during this preflight.
+    fn live_drain_preflight(&self) -> Result<bool> {
         tokio::task::block_in_place(|| {
             let budget = std::env::var(DRAIN_TIMEOUT_ENV)
                 .ok()
@@ -2059,8 +2081,8 @@ impl LiveHost {
                 let cmd = OpsCommand::new("kubectl", args);
                 let (ok, _, err) = self.run(&cmd)?;
                 probed = true;
-                if let Some(drained) = live_drain_observation(ok, &err) {
-                    return Ok(drained);
+                if let Some(reachable) = drain_preflight_observation(ok, &err) {
+                    return Ok(reachable);
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -2072,12 +2094,14 @@ impl LiveHost {
     }
 }
 
-/// Map one drain probe onto proceed / pending.
+/// Map one worker-reachability probe onto proceed / pending. This is the
+/// DrainPreflight decision, not an observation of the real drain gate
+/// (issue #2830).
 ///
 /// `Some(true)` is a successful get or a NotFound skip (empty cluster).
 /// `None` is still pending, so the caller retries until the phase budget
 /// expires. Probe failure is not a terminal `Some(false)`; budget expiry is.
-fn live_drain_observation(ok: bool, stderr: &str) -> Option<bool> {
+fn drain_preflight_observation(ok: bool, stderr: &str) -> Option<bool> {
     if ok || api_workload_missing(stderr) {
         Some(true)
     } else {
@@ -2127,8 +2151,8 @@ impl UpgradeDriver for LiveHost {
     fn observed_version(&self) -> Option<String> {
         self.inspect_version()
     }
-    fn drain_once(&mut self) -> Result<bool> {
-        self.live_drain()
+    fn drain_preflight_once(&mut self) -> Result<bool> {
+        self.live_drain_preflight()
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
         self.helm_upgrade(to)?;
@@ -2400,5 +2424,71 @@ mod hook_tests {
         let err = test_hook_phase(&opts("acme-2590", "t2590"), TEST_FAIL_AT_ENV)
             .expect_err("unknown phase");
         assert!(format!("{err:#}").contains("unknown upgrade test phase"));
+    }
+}
+
+#[cfg(test)]
+mod drain_preflight_naming_tests {
+    use super::*;
+
+    /// Issue #2830: `live_drain_observation`'s old name and the phase's old
+    /// `"drain"` label both claimed this check observed a drain it never
+    /// watched. Going forward the phase must report its honest name.
+    #[test]
+    fn drain_preflight_serializes_under_its_honest_name() {
+        assert_eq!(UpgradePhase::DrainPreflight.as_str(), "drain_preflight");
+        let json = serde_json::to_string(&UpgradePhase::DrainPreflight).expect("serialize");
+        assert_eq!(json, "\"drain_preflight\"");
+    }
+
+    /// A checkpoint a pre-#2830 binary persisted mid-upgrade carries the old
+    /// `"drain"` phase name in its `completed` list. A binary carrying the
+    /// rename must still resume it rather than fail to parse the checkpoint.
+    #[test]
+    fn upgrade_record_deserializes_legacy_drain_phase_name() {
+        let legacy = serde_json::json!({
+            "target_version": "0.9.0",
+            "from_version": "0.8.6",
+            "known_good_version": "0.8.6",
+            "completed": ["plan", "validate", "drain"],
+            "status": "in_progress",
+            "plan": [],
+            "drain_completed": true,
+            "convergence": null,
+            "canary": null,
+            "fail_forward": null,
+            "resumed": false,
+        });
+        let record: UpgradeRecord =
+            serde_json::from_value(legacy).expect("legacy checkpoint must still deserialize");
+        assert_eq!(
+            record.completed,
+            vec![
+                UpgradePhase::Plan,
+                UpgradePhase::Validate,
+                UpgradePhase::DrainPreflight,
+            ]
+        );
+    }
+
+    /// The pure decision `live_drain_preflight` delegates to: a probe failure
+    /// stays pending (retried) rather than being treated as "not drained",
+    /// since this check never observed drain state to begin with.
+    #[test]
+    fn drain_preflight_observation_treats_probe_failure_as_pending() {
+        assert_eq!(drain_preflight_observation(true, ""), Some(true));
+        assert_eq!(
+            drain_preflight_observation(
+                false,
+                "Error from server (NotFound): deployments.apps \"curie-worker\" not found"
+            ),
+            Some(true),
+            "an absent worker Deployment is an empty-cluster skip"
+        );
+        assert_eq!(
+            drain_preflight_observation(false, "connection refused"),
+            None,
+            "an unreadable API is still pending, not a terminal failure"
+        );
     }
 }
