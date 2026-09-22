@@ -5548,6 +5548,24 @@
           "name": "two-release-approval-e2e"
         },
         {
+          "about": "Drive the dark factory against a disposable install on a named kube context, a real GitHub App and a fixture repository (#2966, `python3 tools/factory-e2e/factory_e2e.py`). `preflight` installs the candidate's published images with factory intake on, tunnels the api webhook, labels one issue, asserts the delivery is accepted and a WorkItem is admitted, then undoes every change and writes JSON evidence. `run --scenario <name>` adds one scenario driver after the preflight. Every identity comes from CURIE_FACTORY_* variables or files",
+          "args": [
+            {
+              "global": false,
+              "help": "`preflight` or `run --scenario <name>`, then driver flags; see `curie dev factory-e2e -- --help`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709551615,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "factory-e2e"
+        },
+        {
           "about": "Select the end to end tiers CI would run for paths or revisions",
           "args": [
             {
