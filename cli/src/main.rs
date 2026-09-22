@@ -1131,7 +1131,7 @@ enum DevAction {
     },
     /// Isolated next-train `cluster upgrade` matrix (#2590,
     /// `bash cli/scripts/cluster-upgrade-matrix.sh`): published v0.8.8 on a
-    /// task-owned kind install, packaged 0.9.0/0.9.1 charts, fail-at and
+    /// task-owned kind install, packaged candidate charts, fail-at and
     /// interrupt-after hooks, migration crash retry, image/object convergence,
     /// and compatible plus published-window rollback. Refuses the permanent
     /// soak. Checkout-only.

@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn packaged_n_and_n1_share_this_tree_head_so_rollback_is_compatible() {
+    fn released_090_and_091_share_0044_for_rollback_compatibility() {
         let n = window_for("0.9.0").expect("0.9.0 is catalogued for the next-train matrix");
         let n1 = window_for("0.9.1").expect("0.9.1 is catalogued for the next-train matrix");
         assert_eq!(n.schema_min, n1.schema_min);
@@ -341,7 +341,7 @@ mod tests {
             &n.schema_head,
             &["0.9.0".to_string(), "0.9.1".to_string()],
         )
-        .expect("N+1 to N is the same schema window");
+        .expect("0.9.1 to 0.9.0 is the same schema window");
         let err = check_target_schema(
             "0.8.7",
             &window_for("0.8.7").expect("0.8.7 window"),
@@ -370,12 +370,18 @@ mod tests {
                     .map(|rest| normalize_app_version(rest.trim().trim_matches('"')))
             })
             .expect("appVersion");
-        let window = window_for(&app_version)
+        let chart_window = window_for(&app_version)
             .unwrap_or_else(|| panic!("catalog missing window for {app_version}"));
         assert!(
-            !window.artifact_identity_ambiguous,
+            !chart_window.artifact_identity_ambiguous,
             "Chart.yaml appVersion {app_version} must have one unambiguous artifact identity"
         );
+
+        let (newest_catalog_version, newest_window) = catalog()
+            .windows
+            .iter()
+            .max_by_key(|(version, _)| version_key(version))
+            .expect("catalog has at least one schema window");
 
         let mut found = Vec::new();
         let mut down_of = Vec::new();
@@ -420,9 +426,9 @@ mod tests {
             "catalog revisions missing this tree's alembic head {tree_head}"
         );
         assert_eq!(
-            window.schema_head,
+            newest_window.schema_head,
             *tree_head,
-            "Chart.yaml appVersion {app_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
+            "newest catalog appVersion {newest_catalog_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
         );
     }
 }

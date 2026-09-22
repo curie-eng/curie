@@ -43,8 +43,8 @@ OWNED_HELM=0
 PUBLISHED_BIN=""
 ASSET_DIR=""
 STARTED_AT=""
-CHART_090=""
-CHART_091=""
+CHART_092=""
+CHART_093=""
 REV_088=""
 REV_089=""
 SENTINEL_ID="acme-2590"
@@ -62,7 +62,7 @@ REL_089="https://github.com/curie-eng/curie/releases/download/v0.8.9"
 PUBLISHED_HEAD="0039"
 TARGET_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["schema_head"])' \
     "$REPO_ROOT/apps/api/src/curie_api/schema_compat.json")"
-SUPPORTED_ROLLBACK_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["windows"]["0.9.0"]["schema_head"])' \
+SUPPORTED_ROLLBACK_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["windows"]["0.9.2"]["schema_head"])' \
     "$REPO_ROOT/cli/src/application_schema_windows.json")"
 
 SCENARIOS_ALL=(
@@ -95,7 +95,7 @@ EXCLUSIVE_KIND_TAG=""
 # Canonical shard manifest: `<id> <setup|nosetup> <scenario>[:<phase>+<phase>]...`.
 # Scenario order inside a shard preserves the serial state chain. `setup`
 # shards start from setup_nonempty_n (published 0.8.8 + sentinel, forward-only
-# upgrade to 0.9.0). --list-shards, --shard and the self-test coverage gate all
+# upgrade to 0.9.2). --list-shards, --shard and the self-test coverage gate all
 # read SHARDS, so CI cannot run a manifest the gate did not check.
 SHARDS_CANONICAL="s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
 s02 setup fail-every-phase:plan+validate+drain_preflight
@@ -359,42 +359,42 @@ run_self_test() {
         log "self-test: mutator must be cluster upgrade"
         failed=1
     fi
-    if awk '/^restore_n\(\)/,/^}/' "$script_path" | grep -q '"$status" == "in_progress" && "$target" == "0.9.0"'; then
-        log "restore_n resumes leftover in_progress 0.9.0"
+    if awk '/^restore_n\(\)/,/^}/' "$script_path" | grep -q '"$status" == "in_progress" && "$target" == "0.9.2"'; then
+        log "restore_n resumes leftover in_progress 0.9.2"
     else
-        log "self-test: restore_n must resume leftover in_progress 0.9.0 instead of skipping"
+        log "self-test: restore_n must resume leftover in_progress 0.9.2 instead of skipping"
         failed=1
     fi
     if awk '/^restore_n\(\)/,/^}/' "$script_path" | awk '
-        /cluster_upgrade "0.9.0"/ { upgraded=1 }
+        /cluster_upgrade "0.9.2"/ { upgraded=1 }
         /clear_upgrade_checkpoint/ { if (upgraded) after=1 }
         END { exit after ? 0 : 1 }
     '; then
-        log "restore_n clears leftover in_progress after restoring 0.9.0"
+        log "restore_n clears leftover in_progress after restoring 0.9.2"
     else
-        log "self-test: restore_n must clear the checkpoint after the 0.9.0 restore"
+        log "self-test: restore_n must clear the checkpoint after the 0.9.2 restore"
         failed=1
     fi
     if awk '/^run_n_to_n1\(\)/,/^}/' "$script_path" | grep -q '^[[:space:]]*restore_n$'; then
-        log "n-to-n1 restores 0.9.0 through restore_n"
+        log "n-to-n1 restores 0.9.2 through restore_n"
     else
-        log "self-test: n-to-n1 must call restore_n so leftover in_progress 0.9.0 cannot refuse 0.9.1"
+        log "self-test: n-to-n1 must call restore_n so leftover in_progress 0.9.2 cannot refuse 0.9.3"
         failed=1
     fi
     if awk '/^restore_n\(\)/,/^}/' "$script_path" | grep -q 'helm_ns rollback'; then
-        log "restore_n rolls back to 0.9.0 when a revision exists"
+        log "restore_n rolls back to 0.9.2 when a revision exists"
     else
-        log "self-test: restore_n must helm rollback to 0.9.0 instead of a full upgrade wait"
+        log "self-test: restore_n must helm rollback to 0.9.2 instead of a full upgrade wait"
         failed=1
     fi
     if awk '/^restore_n\(\)/,/^}/' "$script_path" | awk '
-        /exclusive_kind_tag "0.9.0"/ { if (!rollback) before=1 }
+        /exclusive_kind_tag "0.9.2"/ { if (!rollback) before=1 }
         /helm_ns rollback/ { rollback=1 }
         END { exit (before && rollback) ? 0 : 1 }
     '; then
-        log "restore_n loads exclusive 0.9.0 images before rollback"
+        log "restore_n loads exclusive 0.9.2 images before rollback"
     else
-        log "self-test: restore_n must exclusive_kind_tag 0.9.0 before helm rollback (pullPolicy Never)"
+        log "self-test: restore_n must exclusive_kind_tag 0.9.2 before helm rollback (pullPolicy Never)"
         failed=1
     fi
     if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
@@ -430,10 +430,10 @@ run_self_test() {
         log "self-test: exclusive_kind_tag must untag siblings before and after kind load"
         failed=1
     fi
-    if awk '/^run_compatible_rollback\(\)/,/^}/' "$script_path" | grep -q 'exclusive_kind_tag "0.9.0"'; then
-        log "compatible rollback reloads exclusive 0.9.0 images"
+    if awk '/^run_compatible_rollback\(\)/,/^}/' "$script_path" | grep -q 'exclusive_kind_tag "0.9.2"'; then
+        log "compatible rollback reloads exclusive 0.9.2 images"
     else
-        log "self-test: compatible rollback must exclusive_kind_tag 0.9.0 before helm rollback"
+        log "self-test: compatible rollback must exclusive_kind_tag 0.9.2 before helm rollback"
         failed=1
     fi
     if awk '/^run_rollback_published_088\(\)/,/^}/' "$script_path" | grep -q 'load_tag_images "0.8.8"'; then
@@ -509,7 +509,7 @@ raise SystemExit(0 if ok else 1)
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
-        printf '{"status":"self-test","issue":2590,"published":"0.8.8","n":"0.9.0","n1":"0.9.1"}\n'
+        printf '{"status":"self-test","issue":2590,"published":"0.8.8","n":"0.9.2","n1":"0.9.3"}\n'
     fi
 }
 
@@ -647,16 +647,16 @@ fetch_published() {
 
 package_n_charts() {
     mkdir -p "$WORKDIR/charts"
-    helm package "$REPO_ROOT/charts/curie" --version 0.9.0 --app-version 0.9.0 -d "$WORKDIR/charts" >/dev/null
-    helm package "$REPO_ROOT/charts/curie" --version 0.9.1 --app-version 0.9.1 -d "$WORKDIR/charts" >/dev/null
-    CHART_090="$WORKDIR/charts/curie-0.9.0.tgz"
-    CHART_091="$WORKDIR/charts/curie-0.9.1.tgz"
-    [[ -f "$CHART_090" && -f "$CHART_091" ]] || die "helm package did not write 0.9.0/0.9.1 archives"
-    [[ "$(helm show chart "$CHART_090" | awk '$1 == "version:" {print $2}')" == 0.9.0 ]] \
-        || die "packaged 0.9.0 chart version mismatch"
-    [[ "$(helm show chart "$CHART_091" | awk '$1 == "version:" {print $2}')" == 0.9.1 ]] \
-        || die "packaged 0.9.1 chart version mismatch"
-    log "packaged N=0.9.0 and N+1=0.9.1 from this checkout"
+    helm package "$REPO_ROOT/charts/curie" --version 0.9.2 --app-version 0.9.2 -d "$WORKDIR/charts" >/dev/null
+    helm package "$REPO_ROOT/charts/curie" --version 0.9.3 --app-version 0.9.3 -d "$WORKDIR/charts" >/dev/null
+    CHART_092="$WORKDIR/charts/curie-0.9.2.tgz"
+    CHART_093="$WORKDIR/charts/curie-0.9.3.tgz"
+    [[ -f "$CHART_092" && -f "$CHART_093" ]] || die "helm package did not write 0.9.2/0.9.3 archives"
+    [[ "$(helm show chart "$CHART_092" | awk '$1 == "version:" {print $2}')" == 0.9.2 ]] \
+        || die "packaged 0.9.2 chart version mismatch"
+    [[ "$(helm show chart "$CHART_093" | awk '$1 == "version:" {print $2}')" == 0.9.3 ]] \
+        || die "packaged 0.9.3 chart version mismatch"
+    log "packaged N=0.9.2 and N+1=0.9.3 from this checkout"
 }
 
 kubeconfig_is_named_kind() {
@@ -743,13 +743,13 @@ load_tag_images() {
 
 prepare_candidate_images() {
     local src="${CANDIDATE_TAG:-upgrade-candidate}"
-    retag_candidate_versions "$src" "0.9.0"
+    retag_candidate_versions "$src" "0.9.2"
     load_tag_images "0.8.8"
-    load_tag_images "0.9.0"
-    retag_candidate_versions "0.9.0" "0.9.1" required
-    # Do not load 0.9.0 and 0.9.1 together: they are the same digest in CI,
+    load_tag_images "0.9.2"
+    retag_candidate_versions "0.9.2" "0.9.3" required
+    # Do not load 0.9.2 and 0.9.3 together: they are the same digest in CI,
     # and converge refuses a tagged alias with more than one name.
-    exclusive_kind_tag "0.9.0"
+    exclusive_kind_tag "0.9.2"
 }
 
 kind_node() {
@@ -762,7 +762,7 @@ untag_kind_siblings() {
     node="$(kind_node)"
     [[ -n "$node" ]] || return 0
     for img in "${IMAGES[@]}"; do
-        for tag in 0.9.0 0.9.1 matrix-candidate upgrade-candidate; do
+        for tag in 0.9.2 0.9.3 matrix-candidate upgrade-candidate; do
             [[ "$tag" == "$keep" ]] && continue
             for ref in \
                 "ghcr.io/curie-eng/${img}:${tag}" \
@@ -784,8 +784,8 @@ exclusive_kind_tag() {
     fi
     node="$(kind_node)"
     [[ -n "$node" ]] || return 0
-    # Untag siblings before load. 0.9.0 and 0.9.1 are the same digest in CI;
-    # loading 0.9.1 while 0.9.0 remains makes converge refuse the alias.
+    # Untag siblings before load. 0.9.2 and 0.9.3 are the same digest in CI;
+    # loading 0.9.3 while 0.9.2 remains makes converge refuse the alias.
     untag_kind_siblings "$keep"
     for img in "${IMAGES[@]}"; do
         ref="$(image_for "$img" "$keep")"
@@ -807,7 +807,7 @@ exclusive_kind_tag() {
 image_sets() {
     local pull_policy="$1"
     # Do not override repository or tag: empty tag follows chart appVersion, so
-    # a published 0.8.8 install stays on :0.8.8 and a packaged 0.9.0/0.9.1
+    # a published 0.8.8 install stays on :0.8.8 and a packaged 0.9.2/0.9.3
     # chart supplies those tags. cluster upgrade has no --set, so the overlay
     # must not pin a stale repository/tag.
     cat <<EOF
@@ -1001,7 +1001,7 @@ helm_install_089() {
 cluster_up_n() {
     local chart="$1"
     refuse_soak "$NAMESPACE" "$RELEASE"
-    exclusive_kind_tag "0.9.0"
+    exclusive_kind_tag "0.9.2"
     local sets=()
     local line
     while IFS= read -r line; do
@@ -1024,7 +1024,7 @@ cluster_upgrade() {
     shift 2
     local extra=("$@")
     refuse_soak "$NAMESPACE" "$RELEASE"
-    if [[ "$to" == "0.9.0" || "$to" == "0.9.1" ]]; then
+    if [[ "$to" == "0.9.2" || "$to" == "0.9.3" ]]; then
         exclusive_kind_tag "$to"
     fi
     local out status=0
@@ -1098,12 +1098,12 @@ scenario_wanted() {
 }
 
 run_fresh_n() {
-    cluster_up_n "$CHART_090"
+    cluster_up_n "$CHART_092"
     local ver
     ver="$(helm_version)"
-    [[ "$ver" == "0.9.0" ]] || die "fresh-n helm version is '$ver' not 0.9.0"
+    [[ "$ver" == "0.9.2" ]] || die "fresh-n helm version is '$ver' not 0.9.2"
     wait_rollout
-    log "fresh-n helm version 0.9.0"
+    log "fresh-n helm version 0.9.2"
 }
 
 run_n1_to_n() {
@@ -1113,13 +1113,13 @@ run_n1_to_n() {
     assert_sentinel
     assert_alembic "$PUBLISHED_HEAD"
     local status=0
-    cluster_upgrade "0.9.0" "$CHART_090" --forward-only || status=$?
+    cluster_upgrade "0.9.2" "$CHART_092" --forward-only || status=$?
     record_upgrade_json "n1-to-n"
     [[ "$status" -eq 0 ]] || die "n1-to-n cluster upgrade exited $status"
     assert_upgrade_status "succeeded"
     wait_rollout
     ver="$(helm_version)"
-    [[ "$ver" == "0.9.0" ]] || die "n1-to-n helm version is '$ver' not 0.9.0"
+    [[ "$ver" == "0.9.2" ]] || die "n1-to-n helm version is '$ver' not 0.9.2"
     assert_sentinel
     assert_review_feedback_table
     assert_alembic "$TARGET_HEAD"
@@ -1129,7 +1129,7 @@ run_n1_to_n() {
 run_same_version() {
     local before after status=0
     before="$(helm_revision)"
-    cluster_upgrade "0.9.0" "$CHART_090" || status=$?
+    cluster_upgrade "0.9.2" "$CHART_092" || status=$?
     record_upgrade_json "same-version"
     [[ "$status" -eq 0 ]] || die "same-version cluster upgrade exited $status"
     assert_upgrade_status "succeeded"
@@ -1151,13 +1151,13 @@ run_fail_every_phase() {
     fi
     for phase in "${phases[@]}"; do
         # Later phases (canary/commit) still run converge. Start each row
-        # from healthy 0.9.0 so a leftover 0.9.1 apply cannot fail converge
+        # from healthy 0.9.2 so a leftover 0.9.3 apply cannot fail converge
         # before FAIL_AT is reached.
         restore_n
         log "fail-every-phase FAIL_AT=$phase"
         FAIL_AT_HOOK="$phase"
         set +e
-        cluster_upgrade "0.9.1" "$CHART_091"
+        cluster_upgrade "0.9.3" "$CHART_093"
         status=$?
         set -e
         FAIL_AT_HOOK=""
@@ -1168,13 +1168,13 @@ run_fail_every_phase() {
         assert_upgrade_phase "$phase"
         log "fail-every-phase $phase failed as expected"
     done
-    if [[ "$(helm_version)" == "0.9.1" ]]; then
-        log "fail-every-phase left helm at 0.9.1; retrying to succeed"
-        cluster_upgrade "0.9.1" "$CHART_091" || true
+    if [[ "$(helm_version)" == "0.9.3" ]]; then
+        log "fail-every-phase left helm at 0.9.3; retrying to succeed"
+        cluster_upgrade "0.9.3" "$CHART_093" || true
         wait_rollout || true
-        cluster_upgrade "0.9.0" "$CHART_090" || true
+        cluster_upgrade "0.9.2" "$CHART_092" || true
         wait_rollout || true
-        if [[ "$(helm_version)" == "0.9.1" ]]; then
+        if [[ "$(helm_version)" == "0.9.3" ]]; then
             "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
                 >"$EVIDENCE_DIR/fail-phase-restore.json" || true
             wait_rollout || true
@@ -1239,45 +1239,45 @@ for row in reversed(list(hist)):
 }
 
 restore_n() {
-    # A leftover in_progress 0.9.1 is a foreign record: resume would keep
-    # going to 0.9.1. Delete only that. A leftover in_progress 0.9.0 is
+    # A leftover in_progress 0.9.3 is a foreign record: resume would keep
+    # going to 0.9.3. Delete only that. A leftover in_progress 0.9.2 is
     # resumed below so converge/canary/commit can finish.
     local target status rev
     target="$(checkpoint_field target_version)"
     status="$(checkpoint_field status)"
     recover_helm_lock
-    if [[ "$status" == "in_progress" && "$target" == "0.9.1" ]]; then
+    if [[ "$status" == "in_progress" && "$target" == "0.9.3" ]]; then
         clear_upgrade_checkpoint
         target=""
         status=""
     fi
-    if [[ "$(helm_version)" != "0.9.0" || ( "$status" == "in_progress" && "$target" == "0.9.0" ) ]]; then
-        log "restoring helm 0.9.0 (currently $(helm_version), checkpoint_target=${target:-none} checkpoint_status=${status:-none})"
-        if [[ "$status" == "in_progress" && "$target" == "0.9.0" ]]; then
-            cluster_upgrade "0.9.0" "$CHART_090" || true
+    if [[ "$(helm_version)" != "0.9.2" || ( "$status" == "in_progress" && "$target" == "0.9.2" ) ]]; then
+        log "restoring helm 0.9.2 (currently $(helm_version), checkpoint_target=${target:-none} checkpoint_status=${status:-none})"
+        if [[ "$status" == "in_progress" && "$target" == "0.9.2" ]]; then
+            cluster_upgrade "0.9.2" "$CHART_092" || true
         else
             # A full cluster upgrade --wait can sit on a hook Job for the
-            # whole Helm timeout. Rollback to the last 0.9.0 revision is the
+            # whole Helm timeout. Rollback to the last 0.9.2 revision is the
             # harness restore; it is not the product mutator under test.
-            rev="$(helm_revision_for_version 0.9.0)"
+            rev="$(helm_revision_for_version 0.9.2)"
             if [[ -n "$rev" ]]; then
-                # pullPolicy Never: the node may hold exclusive 0.9.1, so load
-                # 0.9.0 first or the rollback waits out its whole timeout.
-                exclusive_kind_tag "0.9.0"
-                log "rolling back to helm revision $rev (0.9.0)"
+                # pullPolicy Never: the node may hold exclusive 0.9.3, so load
+                # 0.9.2 first or the rollback waits out its whole timeout.
+                exclusive_kind_tag "0.9.2"
+                log "rolling back to helm revision $rev (0.9.2)"
                 helm_ns rollback "$RELEASE" "$rev" --wait --timeout 180s || \
-                    cluster_upgrade "0.9.0" "$CHART_090" || true
+                    cluster_upgrade "0.9.2" "$CHART_092" || true
             else
-                cluster_upgrade "0.9.0" "$CHART_090" || true
+                cluster_upgrade "0.9.2" "$CHART_092" || true
             fi
         fi
         wait_rollout || true
     fi
-    exclusive_kind_tag "0.9.0"
+    exclusive_kind_tag "0.9.2"
     # The restore upgrade itself writes a record. Wipe it so the next
-    # FAIL_AT 0.9.1 cannot be refused as "upgrade to 0.9.0 already in progress".
+    # FAIL_AT 0.9.3 cannot be refused as "upgrade to 0.9.2 already in progress".
     clear_upgrade_checkpoint
-    [[ "$(helm_version)" == "0.9.0" ]] || die "restore_n left helm at $(helm_version)"
+    [[ "$(helm_version)" == "0.9.2" ]] || die "restore_n left helm at $(helm_version)"
 }
 
 run_interrupt_resume() {
@@ -1289,15 +1289,15 @@ run_interrupt_resume() {
         phases=("${INTERRUPT_PHASES[@]}")
     fi
     for phase in "${phases[@]}"; do
-        # A leftover in_progress record for 0.9.1 skips already-completed
+        # A leftover in_progress record for 0.9.3 skips already-completed
         # phases, so INTERRUPT_AFTER=plan can exit 0. Start each row from a
-        # clean 0.9.0 with no checkpoint.
-        log "interrupt-resume restoring 0.9.0 before $phase"
+        # clean 0.9.2 with no checkpoint.
+        log "interrupt-resume restoring 0.9.2 before $phase"
         restore_n
         log "interrupt-resume INTERRUPT_AFTER=$phase"
         INTERRUPT_AFTER_HOOK="$phase"
         set +e
-        cluster_upgrade "0.9.1" "$CHART_091"
+        cluster_upgrade "0.9.3" "$CHART_093"
         status=$?
         set -e
         INTERRUPT_AFTER_HOOK=""
@@ -1305,7 +1305,7 @@ run_interrupt_resume() {
         (( status != 0 )) || die "INTERRUPT_AFTER=$phase exited 0"
         if [[ "$phase" == "checkpoint" ]]; then
             set +e
-            cluster_upgrade "0.9.0" "$CHART_090"
+            cluster_upgrade "0.9.2" "$CHART_092"
             local refuse=$?
             set -e
             record_upgrade_json "interrupt-different-to"
@@ -1313,7 +1313,7 @@ run_interrupt_resume() {
             log "different --to while in_progress refused"
         fi
         set +e
-        cluster_upgrade "0.9.1" "$CHART_091"
+        cluster_upgrade "0.9.3" "$CHART_093"
         status=$?
         set -e
         record_upgrade_json "resume-$phase"
@@ -1327,24 +1327,24 @@ run_interrupt_resume() {
 }
 
 run_n_to_n1() {
-    # interrupt-resume ends on 0.9.1. A leftover in_progress 0.9.0 from a
-    # helm --wait timeout refuses --to 0.9.1. restore_n resumes or clears it.
+    # interrupt-resume ends on 0.9.3. A leftover in_progress 0.9.2 from a
+    # helm --wait timeout refuses --to 0.9.3. restore_n resumes or clears it.
     restore_n
     local status=0
-    cluster_upgrade "0.9.1" "$CHART_091" || status=$?
+    cluster_upgrade "0.9.3" "$CHART_093" || status=$?
     record_upgrade_json "n-to-n1"
     [[ "$status" -eq 0 ]] || die "n-to-n1 exited $status"
     assert_upgrade_status "succeeded"
     wait_rollout
-    [[ "$(helm_version)" == "0.9.1" ]] || die "n-to-n1 helm version is $(helm_version)"
-    log "n-to-n1 helm version 0.9.1"
+    [[ "$(helm_version)" == "0.9.3" ]] || die "n-to-n1 helm version is $(helm_version)"
+    log "n-to-n1 helm version 0.9.3"
 }
 
 run_compatible_rollback() {
     local status=0
-    # n-to-n1 left exclusive 0.9.1 on the node. Rollback to 0.9.0 cannot
+    # n-to-n1 left exclusive 0.9.3 on the node. Rollback to 0.9.2 cannot
     # pull that tag with pullPolicy Never.
-    exclusive_kind_tag "0.9.0"
+    exclusive_kind_tag "0.9.2"
     set +e
     "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
         >"$EVIDENCE_DIR/compatible-rollback.json" 2>"$EVIDENCE_DIR/compatible-rollback.err"
@@ -1352,13 +1352,13 @@ run_compatible_rollback() {
     set -e
     (( status == 0 )) || die "compatible rollback exited $status"
     wait_rollout || die "compatible rollback rollout timed out (helm $(helm_version))"
-    [[ "$(helm_version)" == "0.9.0" ]] || die "compatible rollback helm version is $(helm_version) not 0.9.0"
+    [[ "$(helm_version)" == "0.9.2" ]] || die "compatible rollback helm version is $(helm_version) not 0.9.2"
     kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
         || die "api not Ready after compatible rollback"
     api_health >/dev/null || die "api health failed after compatible rollback"
     assert_sentinel
     assert_alembic "$SUPPORTED_ROLLBACK_HEAD"
-    log "compatible rollback previous version 0.9.0 serves"
+    log "compatible rollback previous version 0.9.2 serves"
 }
 
 helm_history_088() {
@@ -1386,9 +1386,9 @@ run_rollback_published_088() {
         helm_install_088
         insert_sentinel
         local boot=0
-        cluster_upgrade "0.9.0" "$CHART_090" --forward-only || boot=$?
+        cluster_upgrade "0.9.2" "$CHART_092" --forward-only || boot=$?
         record_upgrade_json "rollback-088-bootstrap"
-        [[ "$boot" -eq 0 ]] || die "rollback-088 bootstrap 0.8.8->0.9.0 exited $boot"
+        [[ "$boot" -eq 0 ]] || die "rollback-088 bootstrap 0.8.8->0.9.2 exited $boot"
         wait_rollout
         assert_sentinel
         assert_review_feedback_table
@@ -1432,11 +1432,11 @@ run_rollback_published_089() {
     assert_alembic "$PUBLISHED_HEAD"
 
     local boot=0
-    cluster_upgrade "0.9.0" "$CHART_090" --forward-only || boot=$?
+    cluster_upgrade "0.9.2" "$CHART_092" --forward-only || boot=$?
     record_upgrade_json "rollback-089-bootstrap"
-    [[ "$boot" -eq 0 ]] || die "rollback-089 bootstrap 0.8.9 to 0.9.0 exited $boot"
+    [[ "$boot" -eq 0 ]] || die "rollback-089 bootstrap 0.8.9 to 0.9.2 exited $boot"
     wait_rollout
-    [[ "$(helm_version)" == "0.9.0" ]] || die "rollback-089 bootstrap did not reach 0.9.0"
+    [[ "$(helm_version)" == "0.9.2" ]] || die "rollback-089 bootstrap did not reach 0.9.2"
     assert_sentinel
     assert_alembic "$TARGET_HEAD"
 
@@ -1471,21 +1471,21 @@ run_rollback_published_089() {
     if echo "$err" | grep -F "could not establish" >/dev/null; then
         die "rollback-089 failed identity classification instead of applying the published range: $err"
     fi
-    [[ "$(helm_version)" == "0.9.0" ]] \
-        || die "refused rollback changed helm from 0.9.0 to $(helm_version)"
+    [[ "$(helm_version)" == "0.9.2" ]] \
+        || die "refused rollback changed helm from 0.9.2 to $(helm_version)"
     assert_sentinel
     assert_alembic "$TARGET_HEAD"
     kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
         || die "api has no readyReplicas after refused published 0.8.9 rollback"
     api_health >/dev/null || die "api health failed after refused published 0.8.9 rollback"
-    log "published 0.8.9 refused at schema head $PUBLISHED_HEAD; 0.9.0 and sentinel remain healthy"
+    log "published 0.8.9 refused at schema head $PUBLISHED_HEAD; 0.9.2 and sentinel remain healthy"
 
     local advance=0
-    cluster_upgrade "0.9.1" "$CHART_091" || advance=$?
+    cluster_upgrade "0.9.3" "$CHART_093" || advance=$?
     record_upgrade_json "rollback-089-compatible-setup"
     [[ "$advance" -eq 0 ]] || die "rollback-089 compatible setup exited $advance"
     wait_rollout
-    [[ "$(helm_version)" == "0.9.1" ]] || die "rollback-089 compatible setup did not reach 0.9.1"
+    [[ "$(helm_version)" == "0.9.3" ]] || die "rollback-089 compatible setup did not reach 0.9.3"
     run_compatible_rollback
 }
 
@@ -1505,7 +1505,7 @@ run_migration_crash() {
     insert_sentinel
     local pid status=0
     (
-        cluster_upgrade "0.9.0" "$CHART_090" --forward-only
+        cluster_upgrade "0.9.2" "$CHART_092" --forward-only
     ) >"$EVIDENCE_DIR/migration-crash-upgrade.log" 2>&1 &
     pid=$!
     local deadline=$((SECONDS + 240)) seen=0
@@ -1552,7 +1552,7 @@ run_migration_crash() {
     fi
     log "first migration-crash upgrade exited $status; retrying"
     set +e
-    cluster_upgrade "0.9.0" "$CHART_090" --forward-only
+    cluster_upgrade "0.9.2" "$CHART_092" --forward-only
     status=$?
     set -e
     record_upgrade_json "migration-crash-retry"
@@ -1570,14 +1570,14 @@ run_migration_crash() {
 }
 
 run_converge_negative() {
-    if [[ "$(helm_version)" != "0.9.0" ]]; then
-        cluster_upgrade "0.9.0" "$CHART_090" || true
+    if [[ "$(helm_version)" != "0.9.2" ]]; then
+        cluster_upgrade "0.9.2" "$CHART_092" || true
         wait_rollout || true
     fi
     kubectl_ns set image "deploy/$(fullname)-api" "api=ghcr.io/curie-eng/curie-api:does-not-exist-2590"
     local status=0
     set +e
-    cluster_upgrade "0.9.0" "$CHART_090"
+    cluster_upgrade "0.9.2" "$CHART_092"
     status=$?
     set -e
     record_upgrade_json "converge-negative"
@@ -1594,7 +1594,7 @@ run_converge_negative() {
     kubectl_ns rollout undo "deploy/$(fullname)-api" >/dev/null 2>&1 || true
     wait_rollout || true
     set +e
-    cluster_upgrade "0.9.0" "$CHART_090"
+    cluster_upgrade "0.9.2" "$CHART_092"
     status=$?
     set -e
     record_upgrade_json "converge-positive"
@@ -1604,7 +1604,7 @@ run_converge_negative() {
     [[ "$images" == "true" ]] || die "converge-positive images=$images"
     local live
     live="$(kubectl_ns get pods -l "app.kubernetes.io/component=api" -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}')"
-    echo "$live" | grep -E '0.9.0|curie-api' >/dev/null \
+    echo "$live" | grep -E '0.9.2|curie-api' >/dev/null \
         || die "live api images do not match target tags: $live"
     log "converge-positive images true; live pods $live"
 }
@@ -1633,15 +1633,15 @@ recover_killed_upgrade_ownership() {
 
 run_previous_serves() {
     recover_killed_upgrade_ownership
-    if [[ "$(helm_version)" != "0.9.0" || "$(helm_release_status)" != "deployed" ]]; then
-        cluster_upgrade "0.9.0" "$CHART_090" || true
+    if [[ "$(helm_version)" != "0.9.2" || "$(helm_release_status)" != "deployed" ]]; then
+        cluster_upgrade "0.9.2" "$CHART_092" || true
         wait_rollout || true
     fi
     local pid status=0 seen=0 previous_image
     previous_image="$(kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.spec.template.spec.containers[0].image}')"
     [[ -n "$previous_image" ]] || die "could not read previous api image"
     (
-        cluster_upgrade "0.9.1" "$CHART_091"
+        cluster_upgrade "0.9.3" "$CHART_093"
     ) >"$EVIDENCE_DIR/previous-serves-upgrade.log" 2>&1 &
     pid=$!
     local deadline=$((SECONDS + 180))
@@ -1670,10 +1670,10 @@ run_previous_serves() {
     local helm_ver helm_st
     helm_ver="$(helm_version)"
     helm_st="$(helm_release_status)"
-    # A failed/pending 0.9.1 revision is the apply-side fault. Only a deployed
-    # 0.9.1 means the previous version is gone.
-    if [[ "$helm_ver" == "0.9.1" && "$helm_st" == "deployed" ]]; then
-        die "helm deployed 0.9.1 (status=$helm_st); previous version is not serving"
+    # A failed/pending 0.9.3 revision is the apply-side fault. Only a deployed
+    # 0.9.3 means the previous version is gone.
+    if [[ "$helm_ver" == "0.9.3" && "$helm_st" == "deployed" ]]; then
+        die "helm deployed 0.9.3 (status=$helm_st); previous version is not serving"
     fi
     log "helm after kill version=$helm_ver status=$helm_st"
     local live_image
@@ -1686,7 +1686,7 @@ run_previous_serves() {
     log "previous version still serves after apply-side kill image=$live_image"
     recover_killed_upgrade_ownership
     set +e
-    cluster_upgrade "0.9.1" "$CHART_091"
+    cluster_upgrade "0.9.3" "$CHART_093"
     status=$?
     set -e
     record_upgrade_json "previous-serves-retry"
@@ -1714,8 +1714,8 @@ print(json.dumps(rows))
   "strict_published_rollback": "0.8.9",
   "published_head": "$PUBLISHED_HEAD",
   "target_head": "$TARGET_HEAD",
-  "n": "0.9.0",
-  "n1": "0.9.1",
+  "n": "0.9.2",
+  "n1": "0.9.3",
   "candidate_cli": "$CANDIDATE",
   "candidate_image_tag": "${CANDIDATE_TAG:-}",
   "kind_cluster": "$KIND_CLUSTER",
@@ -1754,7 +1754,7 @@ scenario_fn() {
     esac
 }
 
-# Harness setup for `setup` shards: the nonempty 0.9.0 state the serial chain
+# Harness setup for `setup` shards: the nonempty 0.9.2 state the serial chain
 # reaches after n1-to-n-nonempty. Not a scenario; timed as setup=nonempty-n.
 setup_nonempty_n() {
     uninstall_owned
@@ -1763,17 +1763,17 @@ setup_nonempty_n() {
     assert_sentinel
     assert_alembic "$PUBLISHED_HEAD"
     local status=0 ver
-    cluster_upgrade "0.9.0" "$CHART_090" --forward-only || status=$?
+    cluster_upgrade "0.9.2" "$CHART_092" --forward-only || status=$?
     record_upgrade_json "setup-nonempty-n"
     [[ "$status" -eq 0 ]] || die "setup nonempty-n cluster upgrade exited $status"
     assert_upgrade_status "succeeded"
     wait_rollout
     ver="$(helm_version)"
-    [[ "$ver" == "0.9.0" ]] || die "setup nonempty-n helm version is '$ver' not 0.9.0"
+    [[ "$ver" == "0.9.2" ]] || die "setup nonempty-n helm version is '$ver' not 0.9.2"
     assert_sentinel
     assert_review_feedback_table
     assert_alembic "$TARGET_HEAD"
-    log "setup nonempty-n reached 0.9.0 at $TARGET_HEAD with the sentinel"
+    log "setup nonempty-n reached 0.9.2 at $TARGET_HEAD with the sentinel"
 }
 
 run_shard() {
