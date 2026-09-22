@@ -8,15 +8,18 @@ and avoid attaching unrelated pending work.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
+from .config import get_settings
 from .models import ExecutionRequest, ThreadPublicationLineage, WorkItem
 
 RequestStatus = Literal[
@@ -386,13 +389,15 @@ async def create_execution_request(
     return await _outcome(session, work_item, request)
 
 
-async def start_execution(
+async def _start_execution(
     session: AsyncSession,
     *,
     work_item_id: uuid.UUID,
     request_id: uuid.UUID,
     expected_work_item_version: int,
     expected_request_version: int,
+    extra_where: Sequence[ColumnElement[bool]],
+    extra_values: Mapping[str, Any],
 ) -> WorkItemResult:
     work_item = await _lock_work_item(session, work_item_id)
     if work_item is None:
@@ -426,6 +431,14 @@ async def start_execution(
         return await _conflict(
             session, "waiting_deadline_elapsed", work_item=work_item, request=request
         )
+    values: dict[str, Any] = {
+        "status": "running",
+        "started_at": now,
+        "execution_deadline": now + timedelta(seconds=1800),
+        "version": ExecutionRequest.version + 1,
+        "updated_at": func.clock_timestamp(),
+        **extra_values,
+    }
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -434,14 +447,9 @@ async def start_execution(
             ExecutionRequest.version == expected_request_version,
             ExecutionRequest.status == "waiting",
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
+            *extra_where,
         )
-        .values(
-            status="running",
-            started_at=now,
-            execution_deadline=now + timedelta(seconds=1800),
-            version=ExecutionRequest.version + 1,
-            updated_at=func.clock_timestamp(),
-        )
+        .values(**values)
         .returning(ExecutionRequest.id)
     )
     if changed_id is None:
@@ -456,6 +464,25 @@ async def start_execution(
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
     return await _outcome(session, work_item, request)
+
+
+async def start_execution(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    expected_work_item_version: int,
+    expected_request_version: int,
+) -> WorkItemResult:
+    return await _start_execution(
+        session,
+        work_item_id=work_item_id,
+        request_id=request_id,
+        expected_work_item_version=expected_work_item_version,
+        expected_request_version=expected_request_version,
+        extra_where=(),
+        extra_values={"execution_attempts": 1},
+    )
 
 
 async def expire_waiting(
@@ -678,6 +705,7 @@ async def _terminalize_execution(
     expected_request_version: int,
     status: Literal["completed", "failed"],
     cause: str,
+    extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
     work_item = await _lock_work_item(session, work_item_id)
     if work_item is None:
@@ -718,6 +746,7 @@ async def _terminalize_execution(
             ExecutionRequest.version == expected_request_version,
             ExecutionRequest.status == "running",
             ExecutionRequest.execution_deadline > func.clock_timestamp(),
+            *extra_where,
         )
         .values(
             status=status,
@@ -761,6 +790,7 @@ async def complete_execution(
         expected_request_version=expected_request_version,
         status="completed",
         cause="completed",
+        extra_where=(),
     )
 
 
@@ -781,6 +811,7 @@ async def fail_execution(
         expected_request_version=expected_request_version,
         status="failed",
         cause=cause,
+        extra_where=(),
     )
 
 
@@ -857,7 +888,7 @@ async def request_cancellation(
     elif (
         active is not None
         and active.status == "cancellation_requested"
-        and active.terminal_cause == "execution_deadline"
+        and active.terminal_cause in ("execution_deadline", "owner_lost")
     ):
         await session.execute(
             update(ExecutionRequest)
@@ -940,6 +971,95 @@ async def request_execution_deadline_cancellation(
     return await _outcome(session, work_item, request)
 
 
+async def request_owner_lost_cancellation(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    expected_work_item_version: int,
+    expected_request_version: int,
+) -> WorkItemResult:
+    work_item = await _lock_work_item(session, work_item_id)
+    if work_item is None:
+        return await _conflict(
+            session, "not_found", work_item_id=work_item_id, request_id=request_id
+        )
+    if work_item.cancelled_at is not None:
+        return await _conflict(
+            session, "work_item_cancelled", work_item=work_item, request_id=request_id
+        )
+    if work_item.version != expected_work_item_version:
+        return await _conflict(
+            session, "stale_version", work_item=work_item, request_id=request_id
+        )
+    request = await _lock_request(
+        session, work_item_id=work_item_id, request_id=request_id
+    )
+    if request is None:
+        return await _conflict(
+            session, "not_found", work_item=work_item, request_id=request_id
+        )
+    if request.version != expected_request_version:
+        return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    if request.status != "running":
+        return await _conflict(
+            session, "illegal_transition", work_item=work_item, request=request
+        )
+    now = await _database_now(session)
+    ttl = timedelta(seconds=get_settings().work_item_runtime_ttl_seconds)
+    heartbeat_lapsed = (
+        request.runtime_heartbeat_expires_at is not None
+        and request.runtime_heartbeat_expires_at <= now
+    )
+    owner_absent = (
+        request.runtime_owner is None
+        and request.started_at is not None
+        and request.started_at + ttl <= now
+    )
+    if not heartbeat_lapsed and not owner_absent:
+        return await _conflict(
+            session, "illegal_transition", work_item=work_item, request=request
+        )
+    changed_id: uuid.UUID | None = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request_id,
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.version == expected_request_version,
+            ExecutionRequest.status == "running",
+            (
+                (
+                    ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)
+                    & (
+                        ExecutionRequest.runtime_heartbeat_expires_at
+                        <= func.clock_timestamp()
+                    )
+                )
+                | (
+                    ExecutionRequest.runtime_owner.is_(None)
+                    & ExecutionRequest.started_at.is_not(None)
+                    & (
+                        ExecutionRequest.started_at
+                        <= func.clock_timestamp() - ttl
+                    )
+                )
+            ),
+        )
+        .values(
+            status="cancellation_requested",
+            terminal_cause="owner_lost",
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        request = await _reload_request(session, request_id)
+        return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    request = await _reload_request(session, request_id)
+    return await _outcome(session, work_item, request)
+
+
 async def record_runtime_termination(
     session: AsyncSession,
     *,
@@ -948,6 +1068,27 @@ async def record_runtime_termination(
     termination_observation: str,
     expected_work_item_version: int,
     expected_request_version: int,
+) -> WorkItemResult:
+    return await _record_runtime_termination(
+        session,
+        work_item_id=work_item_id,
+        request_id=request_id,
+        termination_observation=termination_observation,
+        expected_work_item_version=expected_work_item_version,
+        expected_request_version=expected_request_version,
+        extra_where=(),
+    )
+
+
+async def _record_runtime_termination(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    termination_observation: str,
+    expected_work_item_version: int,
+    expected_request_version: int,
+    extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
     work_item = await _lock_work_item(session, work_item_id)
     if work_item is None:
@@ -982,6 +1123,8 @@ async def record_runtime_termination(
         terminal_status = "cancelled"
     elif request.terminal_cause == "execution_deadline":
         terminal_status = "expired"
+    elif request.terminal_cause == "owner_lost":
+        terminal_status = "failed"
     else:
         return await _conflict(
             session, "illegal_transition", work_item=work_item, request=request
@@ -994,6 +1137,7 @@ async def record_runtime_termination(
             ExecutionRequest.work_item_id == work_item_id,
             ExecutionRequest.version == expected_request_version,
             ExecutionRequest.status == "cancellation_requested",
+            *extra_where,
         )
         .values(
             status=terminal_status,

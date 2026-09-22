@@ -41,6 +41,10 @@ from sqlalchemy.sql import text
 # contributor pointing the suite at another store by exporting their own value wins.
 os.environ.setdefault("S3_ACCESS_KEY", "rustfs")
 os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
+# Production enables the work-item reconciler. Suite create_app() must not:
+# a 5s pass races TRUNCATE on the shared engine. Loop tests construct it.
+os.environ.setdefault("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+get_settings.cache_clear()
 # A dedicated placeholder attester key for authenticated chat approval tests.
 # It is intentionally distinct from the platform key: sharing those keys would
 # let any platform-key holder forge the Slack identity/channel proof ADR-0106
@@ -153,7 +157,8 @@ async def _truncate() -> None:
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "TRUNCATE curie.approvals, curie.deployments, "
+                    "TRUNCATE curie.execution_requests, curie.work_items, "
+                    "curie.approvals, curie.deployments, "
                     "curie.agent_versions, curie.agents, "
                     "curie.console_sessions CASCADE"
                 )

@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from aci_protocol import BootEnv
 from curie_worker.sandbox import (
+    THREAD_HASH_LABEL,
     AffinityStore,
     CapacityExhaustedError,
     ClaimTimeoutError,
@@ -2082,3 +2083,119 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
 
     assert docker.created == []
     assert affinity.get("T2739-docker") == RouteRecord(handle=old)
+
+
+def test_terminate_thread_observes_absence_of_labelled_and_sql_names(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    from curie_worker.workitem_dispatch import TerminationObservation
+
+    fake_k8s = _DelayedDeleteClient(claim_gone_after_gets=2, sandbox_gone_after_gets=4)
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+        release_gone_timeout_seconds=2.0,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-terminate")
+    thread_hash = fake_k8s.claims[handle.claim_name].labels[THREAD_HASH_LABEL]
+    fake_k8s.create_claim(
+        "extra-labelled-claim",
+        pool="test-pool",
+        labels={THREAD_HASH_LABEL: thread_hash},
+    )
+    fake_k8s.create_claim("sql-claim", pool="test-pool")
+    sql_claim = "sql-claim"
+    sql_sandbox = fake_k8s.claims[sql_claim].sandbox_name
+
+    observation = substrate.terminate_thread(
+        "T-terminate",
+        claim_name=sql_claim,
+        sandbox_name=sql_sandbox,
+    )
+
+    assert isinstance(observation, TerminationObservation)
+    assert fake_k8s.get_claim(sql_claim, request_timeout_seconds=1.0) is None
+    assert fake_k8s.get_sandbox(sql_sandbox, request_timeout_seconds=1.0) is None
+    assert fake_k8s.get_claim(handle.claim_name, request_timeout_seconds=1.0) is not None
+    assert "extra-labelled-claim" in fake_k8s.claims
+    assert sql_claim in str(observation.claims)
+    assert sql_sandbox in str(observation.sandboxes)
+    assert sql_claim in fake_k8s.deleted
+    assert "extra-labelled-claim" not in fake_k8s.deleted
+
+
+def test_terminate_thread_returns_none_when_a_claim_persists_past_timeout(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    fake_k8s = _DelayedDeleteClient(
+        claim_gone_after_gets=10_000,
+        sandbox_gone_after_gets=10_000,
+    )
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+        release_gone_timeout_seconds=0.05,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-terminate-timeout")
+
+    observation = substrate.terminate_thread(
+        "T-terminate-timeout",
+        claim_name=handle.claim_name,
+        sandbox_name=handle.sandbox_name,
+    )
+
+    assert observation is None
+    assert handle.claim_name in fake_k8s.claims
+    assert handle.sandbox_name in fake_k8s.sandboxes
+
+
+def test_terminate_thread_does_not_succeed_on_an_empty_list_while_sandbox_remains(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    from curie_worker.workitem_dispatch import TerminationObservation
+
+    fake_k8s = _DelayedDeleteClient(
+        claim_gone_after_gets=1,
+        sandbox_gone_after_gets=10_000,
+    )
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+        release_gone_timeout_seconds=0.05,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-terminate-retry")
+    sql_claim = handle.claim_name
+    sql_sandbox = handle.sandbox_name
+    thread_hash = fake_k8s.claims[sql_claim].labels[THREAD_HASH_LABEL]
+
+    first = substrate.terminate_thread(
+        "T-terminate-retry",
+        claim_name=sql_claim,
+        sandbox_name=sql_sandbox,
+    )
+
+    assert first is None
+    assert sql_claim not in fake_k8s.claims
+    assert fake_k8s.list_claims(
+        label_selector=f"{THREAD_HASH_LABEL}={thread_hash}"
+    ) == []
+    assert sql_sandbox in fake_k8s.sandboxes
+
+    fake_k8s.sandbox_gone_after_gets = 1
+    second = substrate.terminate_thread(
+        "T-terminate-retry",
+        claim_name=sql_claim,
+        sandbox_name=sql_sandbox,
+    )
+
+    assert isinstance(second, TerminationObservation)
+    assert fake_k8s.get_claim(sql_claim, request_timeout_seconds=1.0) is None
+    assert fake_k8s.get_sandbox(sql_sandbox, request_timeout_seconds=1.0) is None
+    assert sql_claim in str(second.claims)
+    assert sql_sandbox in str(second.sandboxes)

@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn released_v090_and_v091_remain_at_0044_and_v091_refuses_0045() {
+    fn released_v090_and_v091_remain_at_0044_and_v091_refuses_0046() {
         let v090 = window_for("0.9.0").expect("0.9.0 is catalogued");
         let v091 = window_for("0.9.1").expect("0.9.1 is catalogued");
         assert_eq!(v090.schema_head, "0044");
@@ -339,12 +339,12 @@ mod tests {
         let err = check_target_schema(
             "0.9.1",
             &v091,
-            "0045",
+            "0046",
             &["0.9.1".to_string(), "0.10.0".to_string()],
         )
-        .expect_err("published 0.9.1 must refuse live revision 0045");
+        .expect_err("published 0.9.1 must refuse live revision 0046");
         assert!(err.message.contains("0.9.1"));
-        assert!(err.message.contains("0045"));
+        assert!(err.message.contains("0046"));
         assert!(err.message.contains("0044"));
     }
 
@@ -353,13 +353,13 @@ mod tests {
         let n = window_for("0.10.0").expect("0.10.0 is catalogued for the next train matrix");
         let n1 = window_for("0.10.1").expect("0.10.1 is catalogued for the next train matrix");
         assert_eq!(n.schema_min, "0044");
-        assert_eq!(n.schema_head, "0045");
+        assert_eq!(n.schema_head, "0046");
         assert_eq!(n.schema_min, n1.schema_min);
         assert_eq!(n.schema_head, n1.schema_head);
         check_target_schema(
             "0.10.0",
             &n,
-            "0045",
+            "0046",
             &["0.10.0".to_string(), "0.10.1".to_string()],
         )
         .expect("N+1 to N is the same schema window");
