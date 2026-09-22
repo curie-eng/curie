@@ -155,8 +155,15 @@ async def current_session(
 #: login the attacker started, because the victim's browser never got this
 #: cookie. SameSite=Lax (not Strict) because the callback arrives as a
 #: top-level navigation FROM the IdP's site, and Strict would withhold it.
-OIDC_STATE_COOKIE = "curie_oidc_state"
-_OIDC_COOKIE_PATH = "/console/oidc"
+#:
+#: The ``__Host-`` prefix makes the browser accept the cookie only when it is
+#: Secure, Path=/ and host-only (no Domain). Without it a sibling subdomain or
+#: a plaintext response could plant a state of the attacker's choosing, which
+#: turns the binding back into login CSRF. The callback reads only this name.
+#: Path=/ is also what the prefix requires, and it keeps the cookie reaching
+#: the callback when the API sits behind a path prefix such as ``/api``.
+OIDC_STATE_COOKIE = "__Host-curie_oidc_state"
+_OIDC_COOKIE_PATH = "/"
 _NO_STORE = {"Cache-Control": "no-store"}
 #: The one body every refused callback gets. Never the IdP's `error` or
 #: `error_description`: those are attacker-influenced strings, and echoing
@@ -172,6 +179,9 @@ def _require_oidc_enabled() -> None:
 
 
 def _clear_state_cookie(response: Response) -> None:
+    # Same name, path and flags as the set: a browser only replaces (and so
+    # only deletes) the cookie those match, and it refuses a __Host- cookie
+    # that is not Secure with Path=/.
     response.delete_cookie(
         OIDC_STATE_COOKIE, path=_OIDC_COOKIE_PATH, secure=True, httponly=True, samesite="lax"
     )
@@ -250,7 +260,11 @@ async def oidc_callback(
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
-    state_cookie: Annotated[str | None, Cookie(alias=OIDC_STATE_COOKIE)] = None,
+    # title: keep the schema title the prefix-free name gave it, not the
+    # "  Host-..." pydantic derives from the __Host- alias.
+    state_cookie: Annotated[
+        str | None, Cookie(alias=OIDC_STATE_COOKIE, title="Curie Oidc State")
+    ] = None,
 ) -> Response:
     """Finish an OIDC login and mint a principal console session.
 
