@@ -3,10 +3,18 @@ version: 1
 install:
   namespace: acme-bot
   release: acme-bot
+  # context: k8
 
 platform:
   ui: false
   inference: false
+  # On a cluster that already has agent-sandbox and PriorityClasses:
+  # sandbox_controller: false
+  # priority_classes:
+  #   platform: false
+  #   sandbox: false
+  # gvisor is kernel isolation for runner pods, not a shared-cluster singleton.
+  # auto is the chart default. require fails closed without runsc. off disables it.
   egress:
     - host: anthropic
 
