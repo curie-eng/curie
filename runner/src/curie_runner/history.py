@@ -755,9 +755,16 @@ class StateApiTranscriptStore:
         if isinstance(record, TurnRecord):
             # A lone turn must leave the reserve too, or the first append to an
             # empty key could be refused with nothing to compact.
-            record = bound_turn_record(
-                record, max_value_bytes=HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
-            )
+            try:
+                record = bound_turn_record(
+                    record,
+                    max_value_bytes=HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES,
+                )
+            except HistoryError:
+                # The turn's irreducible structure alone exceeds the reserved
+                # bound: a loud capacity refusal, like compact_transcript_value's
+                # own bound (#2927), not a generic append failure.
+                raise HistoryCapacityError(413) from None
         item = record.to_dict()
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1069,9 +1076,14 @@ def compact_transcript_value(
     markers = [
         dict(item) for item in value if isinstance(item, Mapping) and "publication_id" in item
     ]
-    records = _parse_records(
-        [item for item in value if not (isinstance(item, Mapping) and "publication_id" in item)]
-    )
+    # Parse the full value, publication markers included: each marker also
+    # carries a plain "user"/"assistant" pair, so it parses as an ordinary
+    # TurnRecord and takes its original position among the active turns. Its
+    # raw dict (with publication_id) still lands in ``markers`` above and is
+    # kept verbatim in the rewritten prefix for the worker's idempotency scan;
+    # this parse additionally lets its outcome text reach the new summary (or
+    # the kept tail) instead of being dropped from replay (#2927).
+    records = _parse_records(value)
     latest_summary: SummaryRecord | None = None
     latest_summary_index = -1
     for index, record in enumerate(records):
