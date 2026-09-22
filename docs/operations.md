@@ -953,11 +953,14 @@ fails. A comment ending passes only when its cause is one the run accepts:
 each `--expect-cause` given, or by default `no_pull_request` for `--expect
 comment` and `no_pull_request` or `execution_deadline` for `--expect any`.
 A `no_pull_request` comment also needs the agent's final reply as its stated
-reason: a missing or empty reply fails as unverified, and each
-`--expect-reason` must match it, ignoring case. A rename out of `.github/`
-fails like a change inside it. Known secrets and credential-shaped strings in
-the reply and the comment are recorded as `[REDACTED]`, and any such
-redaction fails the run.
+reason: a missing reply fails as unverified, the reply must contain `Could not
+complete:` followed by an explanation, and each `--expect-reason` must also
+match it, ignoring case. A rename out of `.github/` fails like a change inside
+it. A known secret or credential-shaped string in the pull request's title,
+body, diff or file names fails the run. The reply, the comment and the pull
+request's title, body and file names are recorded with such strings replaced
+by `[REDACTED]`, redacted in full before the reply is cut to 4000 characters,
+and any redaction in agent text fails the run.
 Elapsed time runs from the request's start to the pull request or comment.
 The evidence records the work item state and ending cause, the pull request
 and its changed files, the terminus comment, CI, elapsed and execution time,
