@@ -1123,6 +1123,8 @@
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
+          "/work-items",
+          "/work-items/{work_item_id}",
           "unmatched"
         ],
         "role": [
@@ -1146,7 +1148,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3560
+      "cardinality_bound": 3640
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1246,6 +1248,8 @@
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
+          "/work-items",
+          "/work-items/{work_item_id}",
           "unmatched"
         ],
         "role": [
@@ -1269,7 +1273,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3560
+      "cardinality_bound": 3640
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1369,6 +1373,8 @@
           "/v1/internal/work-items/requests/{request_id}/finish",
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
+          "/work-items",
+          "/work-items/{work_item_id}",
           "unmatched"
         ],
         "role": [
@@ -1385,7 +1391,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 712
+      "cardinality_bound": 728
     },
     "curie.background.loop": {
       "type": "counter",

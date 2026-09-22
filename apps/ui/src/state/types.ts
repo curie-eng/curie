@@ -1,6 +1,7 @@
 export type Nav =
   | "overview"
   | "agents"
+  | "work-items"
   | "evals"
   | "observability"
   | "versions"
