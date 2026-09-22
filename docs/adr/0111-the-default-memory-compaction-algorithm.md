@@ -4,6 +4,13 @@ Date: 2026-08-17
 
 Status: Draft
 
+**Folded into [ADR-0167](0167-two-memory-tiers-written-by-the-agent-capped-by-the-platform-and-policed-by-the-bundle.md). Not proposed for acceptance on its own.** ADR-0167
+decides the write path this document assumed was unnecessary (clause 2) and
+makes compaction the slice after it, to be specified when it is built. The
+from-scratch and opt-in principles here are the starting point for that
+specification. When ADR-0167 is Accepted, this line becomes
+`Status: Superseded by ADR-0167`.
+
 Supersedes in part [ADR-0095](0095-tiered-memory-lifecycle.md) only for its
 incremental compaction mechanism, as narrowed on 2026 08 17. ADR-0095 remains
 current for durable storage and session injection.
