@@ -34,7 +34,11 @@ _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: a boot ValidationError renders the whole env-sourced
+    # input dict as `input_value`, secrets included (CURIE_OIDC_CLIENT_SECRET,
+    # API_KEY, ...), and that message lands in container logs. The validators'
+    # own messages still name the offending variables, never their values.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     # Deploy environment the API boots as, "dev" or "prod" (the chart renders it
     # from api.environment onto the ENVIRONMENT var). "prod" arms the production
