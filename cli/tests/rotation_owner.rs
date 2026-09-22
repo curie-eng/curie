@@ -147,10 +147,6 @@ impl FakeKubectl {
         self.0.lock().unwrap().calls.clone()
     }
 
-    fn stored(&self) -> Option<Value> {
-        self.0.lock().unwrap().secret.clone()
-    }
-
     fn stored_value(&self, key: &str) -> Option<String> {
         let s = self.0.lock().unwrap();
         s.secret.as_ref()?["data"]
@@ -187,15 +183,15 @@ impl Kubectl for FakeKubectl {
             }
             return match &s.secret {
                 Some(v) => ok(v.to_string()),
-                None => fail(
-                    "Error from server (NotFound): secrets \"curie-finance\" not found",
-                ),
+                None => fail("Error from server (NotFound): secrets \"curie-finance\" not found"),
             };
         }
         if has(args, "create") {
             let mut body: Value = serde_json::from_slice(stdin.expect("create stdin")).unwrap();
             if s.secret.is_some() {
-                return fail("Error from server (AlreadyExists): secrets \"curie-finance\" already exists");
+                return fail(
+                    "Error from server (AlreadyExists): secrets \"curie-finance\" already exists",
+                );
             }
             s.rv += 1;
             body["metadata"]["resourceVersion"] = json!(s.rv.to_string());
@@ -204,10 +200,11 @@ impl Kubectl for FakeKubectl {
         }
         if has(args, "replace") {
             let mut body: Value = serde_json::from_slice(stdin.expect("replace stdin")).unwrap();
-            let current_rv = s
-                .secret
-                .as_ref()
-                .and_then(|c| c["metadata"]["resourceVersion"].as_str().map(str::to_string));
+            let current_rv = s.secret.as_ref().and_then(|c| {
+                c["metadata"]["resourceVersion"]
+                    .as_str()
+                    .map(str::to_string)
+            });
             let incoming_rv = body["metadata"]["resourceVersion"]
                 .as_str()
                 .map(str::to_string);
@@ -297,7 +294,9 @@ impl SecretsProvider for FakeProvider {
         }
         match self.backups.lock().unwrap().get(name) {
             Some(body) => Ok(StoredObject {
-                version: ObjectVersion { id: "1".to_string() },
+                version: ObjectVersion {
+                    id: "1".to_string(),
+                },
                 material: SecretMaterial::new(body.clone()),
                 key_names: vec![],
             }),
@@ -371,7 +370,10 @@ fn no_backup_reports_no_backup_and_still_applies() {
         .iter()
         .find(|i| i["kind"] == "ExternalSecret")
         .unwrap();
-    assert_eq!(external["spec"]["target"]["creationPolicy"], "CreateOrMerge");
+    assert_eq!(
+        external["spec"]["target"]["creationPolicy"],
+        "CreateOrMerge"
+    );
 }
 
 #[test]
@@ -551,8 +553,8 @@ fn read_backup_returns_material_by_key() {
 #[test]
 fn read_backup_invalid_json_errors_naming_object_without_material() {
     let provider = FakeProvider::empty().with_backup("curie/test/finance-rotated", "not json");
-    let err = read_backup(&provider, "curie/test/finance-rotated")
-        .expect_err("invalid JSON must error");
+    let err =
+        read_backup(&provider, "curie/test/finance-rotated").expect_err("invalid JSON must error");
     let message = format!("{err:#}");
     assert!(message.contains("curie/test/finance-rotated"), "{message}");
     assert!(!message.contains("not json"), "{message}");
