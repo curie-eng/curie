@@ -581,7 +581,18 @@ fn a_key_knob_covers_a_renamed_byo_key() {
         "githubAppExistingSecret": "acme-gh",
         "githubAppExistingSecretKey": "privateKey"
     }});
-    assert!(uncovered(&refs, &[e], &both, &ctx()).is_empty());
+    assert!(uncovered(&refs, &[e.clone()], &both, &ctx()).is_empty());
+
+    // A BYO name equal to the target pattern must still honour the key knob:
+    // the supplied Secret carries `privateKey`, not the inventory key.
+    let collide = json!({"api": {
+        "githubAppExistingSecret": "inv-curie-github-app",
+        "githubAppExistingSecretKey": "privateKey"
+    }});
+    let stale = [rref("inv-curie-github-app", Some("githubAppPrivateKey"))];
+    assert_eq!(uncovered(&stale, &[e.clone()], &collide, &ctx()).len(), 1);
+    let right = [rref("inv-curie-github-app", Some("privateKey"))];
+    assert!(uncovered(&right, &[e], &collide, &ctx()).is_empty());
 }
 
 #[test]
@@ -751,6 +762,27 @@ secrets:
   - name: unlisted-sa
 imagePullSecrets:
   - name: unlisted-sa-pull
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: planted-pv
+spec:
+  csi:
+    driver: ebs.csi.aws.com
+    volumeHandle: vol-1
+    nodeStageSecretRef:
+      name: unlisted-pv-stage
+      namespace: curie
+    controllerPublishSecretRef:
+      name: unlisted-pv-publish
+      namespace: curie
+    controllerExpandSecretRef:
+      name: unlisted-pv-expand
+      namespace: curie
+    nodeExpandSecretRef:
+      name: unlisted-pv-node-expand
+      namespace: curie
 "#;
     let refs = extract_refs(manifest).expect("parse manifest");
     let mut names: Vec<String> = uncovered(&refs, &entries, &values, &ctx())
@@ -763,6 +795,10 @@ imagePullSecrets:
         vec![
             "unlisted-csi",
             "unlisted-env",
+            "unlisted-pv-expand",
+            "unlisted-pv-node-expand",
+            "unlisted-pv-publish",
+            "unlisted-pv-stage",
             "unlisted-sa",
             "unlisted-sa-pull",
             "unlisted-volume"
@@ -800,7 +836,7 @@ fn a_renamed_key_does_not_also_cover_the_inventory_key() {
 #[test]
 fn external_credentials_a_rebuild_cannot_regenerate_are_provider_held() {
     let entries = platform_inventory().expect("platform");
-    for name in ["image-pull", "grafana-admin"] {
+    for name in ["image-pull", "grafana-admin", "api-ingress-tls"] {
         let e = entries
             .iter()
             .find(|e| e.logical_name == name)
@@ -811,11 +847,9 @@ fn external_credentials_a_rebuild_cannot_regenerate_are_provider_held() {
         .iter()
         .find(|e| e.logical_name == "api-ingress-tls")
         .expect("tls listed");
-    assert_eq!(tls.store, Store::Cluster);
-    assert_eq!(
-        tls.rotation_owner,
-        RotationOwner::Workload("cert-manager".into())
-    );
+    // A supplied certificate has no in-install issuer to recreate it.
+    assert_eq!(tls.store, Store::Sm);
+    assert_eq!(tls.rotation_owner, RotationOwner::Sm);
 }
 
 // --------------------------------------------------------------------------

@@ -204,7 +204,13 @@ fn walk(value: &Value, object: &str, refs: &mut Vec<RenderedRef>) {
                             }
                         }
                     }
-                    "nodePublishSecretRef" => {
+                    // Every CSI Secret reference shape, on a Pod volume or a
+                    // PersistentVolume, names a whole Secret.
+                    "nodePublishSecretRef"
+                    | "nodeStageSecretRef"
+                    | "nodeExpandSecretRef"
+                    | "controllerPublishSecretRef"
+                    | "controllerExpandSecretRef" => {
                         if let Some(name) = child["name"].as_str() {
                             refs.push(whole(name, object));
                         }
@@ -310,22 +316,28 @@ fn covers(
             .as_ref()
             .and_then(|chart| chart.default_secret.as_deref())
             .is_some_and(|pattern| pattern_regex(pattern, ctx).is_match(&reference.name));
-    if by_pattern && reference.key.as_ref().is_none_or(listed) {
-        return true;
-    }
-    let knobs = entry.chart.iter().flat_map(|chart| chart.knobs.iter());
-    knobs
+    let knobs: Vec<_> = entry
+        .chart
+        .iter()
+        .flat_map(|chart| chart.knobs.iter())
         .filter(|knob| knob_names(values, &knob.secret).contains(&reference.name.as_str()))
-        .any(|knob| {
-            let Some(key) = &reference.key else {
-                return true;
-            };
-            match knob.key.as_deref().and_then(|path| lookup(values, path)) {
-                Some(effective) => key == effective,
-                // No key knob, or it is unset: the chart reads its own key.
-                None => listed(key),
-            }
-        })
+        .collect();
+    // A knob that names this Secret decides alone. Otherwise a BYO name that
+    // happens to equal the target pattern would accept the inventory key even
+    // though the key knob says the supplied Secret carries another one.
+    if knobs.is_empty() {
+        return by_pattern && reference.key.as_ref().is_none_or(listed);
+    }
+    knobs.into_iter().any(|knob| {
+        let Some(key) = &reference.key else {
+            return true;
+        };
+        match knob.key.as_deref().and_then(|path| lookup(values, path)) {
+            Some(effective) => key == effective,
+            // No key knob, or it is unset: the chart reads its own key.
+            None => listed(key),
+        }
+    })
 }
 
 /// References no entry lists, given the effective values of the set that
