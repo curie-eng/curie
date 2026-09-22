@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: acme-harness-eso
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: acme-harness-rotation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: acme-harness-rotation
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      - acme-harness-acme-fixture-connector-secrets
+    verbs:
+      - get
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: acme-harness-rotation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: acme-harness-rotation
+subjects:
+  - kind: ServiceAccount
+    name: acme-harness-rotation
