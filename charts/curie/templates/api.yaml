@@ -165,8 +165,7 @@ spec:
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: githubWebhookSecret
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.api.githubWebhookSecretExistingSecret "existingSecretKey" (.Values.api.githubWebhookSecretExistingSecretKey | default "githubWebhookSecret") "defaultKey" "githubWebhookSecret") | nindent 18 }}
             - name: GITHUB_REVIEW_INGRESS_ENABLED
               value: {{ .Values.api.githubReviewIngressEnabled | quote }}
             - name: GITHUB_REVIEW_RECONCILER_INTERVAL_S

@@ -449,6 +449,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sealing-key-assertions.sh
 
+      # Prove the BYO Secret knobs an External Secrets sync feeds (ADR 0163):
+      # installation identity, GitHub webhook secret and per-agent connector
+      # Secrets each rewire every consumer secretKeyRef, and stay put when unset.
+      - name: helm render assertions (BYO secret knobs)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/byo-knob-rewire-assertions.sh
+
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
       # exactly the four kinds the client handles. `create` is load-bearing --
