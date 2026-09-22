@@ -71,6 +71,10 @@ cancellation operation. Waiting work becomes cancelled. Running work becomes
 `cancellation_requested` until a real termination observation arrives. The
 publication link is left in place. Later publication is refused. Cancellation
 is sticky: a later mention or a reapplied label does not open another request.
+Cancellation resolves the stored WorkItem and does not require the channel
+binding to still be present. Admission and cancellation for the same repository
+and issue take one transaction lock before either re-reads GitHub, so a closure
+cannot be recorded as absent while an admission of that issue is in flight.
 
 Duplicate deliveries are claimed in the existing delivery table. They do not
 multiply WorkItems or executions. The runs consumer group is not consulted

@@ -25,11 +25,12 @@ import httpx
 import pytest
 from curie_api.config import get_settings
 from curie_api.github_app import GitHubInstallationRefused
+from curie_api.github_factory import handle_factory_delivery
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 REPO = "acme-corp/acme-bot"
 OTHER_REPO = "attacker/other-bot"
@@ -468,6 +469,120 @@ def test_closure_requests_termination_until_the_runtime_confirms_it(
     assert rows[0]["terminal_cause"] == "issue_cancelled"
     assert rows[0]["publication_lineage_id"] is None
     _assert_publication_refused(rows[0]["work_item_id"])
+
+
+def test_closure_after_the_channel_moves_still_cancels(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    assert (
+        _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL})).json()[
+            "status"
+        ]
+        == "factory_admitted"
+    )
+    agent_id = _rows(
+        "SELECT id FROM curie.agents WHERE repo_full_name = :repo",
+        {"repo": REPO},
+    )[0]["id"]
+    moved = client.patch(
+        f"/agents/{agent_id}/channels",
+        params={"kind": "github", "address": REPO},
+        headers={"X-API-Key": get_settings().api_key},
+        json={"kind": "github", "address": "acme-corp/other-bot"},
+    )
+    assert moved.status_code == 200, moved.text
+    api.issue_state = "closed"
+    closed = _post(client, "issues", _issue_event("closed", number))
+
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["status"] == "factory_cancelled"
+    assert _requests(number)[0]["status"] == "cancelled"
+
+
+class _PermissionGate(httpx.AsyncBaseTransport):
+    """Block the first permission read so a closure can arrive mid-admission."""
+
+    def __init__(self, api: GitHubAPI, entered: asyncio.Event, release: asyncio.Event) -> None:
+        self._api = api
+        self._entered = entered
+        self._release = release
+        self._blocked = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/permission") and not self._blocked:
+            self._blocked = True
+            self._entered.set()
+            await self._release.wait()
+        return self._api.handle(request)
+
+
+def test_closure_during_admission_waits_and_then_cancels(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    _client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    label_delivery = str(uuid.uuid4())
+    close_delivery = str(uuid.uuid4())
+
+    async def go() -> tuple[Any, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with httpx.AsyncClient(
+                transport=_PermissionGate(api, entered, release),
+                base_url="https://api.github.com",
+            ) as http:
+                async with sessions() as admit_session, sessions() as cancel_session:
+                    admit_task = asyncio.create_task(
+                        handle_factory_delivery(
+                            admit_session,
+                            settings=get_settings(),
+                            client=http,
+                            event="issues",
+                            delivery_id=label_delivery,
+                            body=json.dumps(
+                                _issue_event("labeled", number, label={"name": LABEL})
+                            ).encode(),
+                            payload=_issue_event("labeled", number, label={"name": LABEL}),
+                        )
+                    )
+                    await asyncio.wait_for(entered.wait(), timeout=5)
+                    api.issue_state = "closed"
+                    api.labels = []
+                    cancel_task = asyncio.create_task(
+                        handle_factory_delivery(
+                            cancel_session,
+                            settings=get_settings(),
+                            client=http,
+                            event="issues",
+                            delivery_id=close_delivery,
+                            body=json.dumps(_issue_event("closed", number)).encode(),
+                            payload=_issue_event("closed", number),
+                        )
+                    )
+                    done, _pending = await asyncio.wait({cancel_task}, timeout=1)
+                    still_waiting = cancel_task not in done
+                    release.set()
+                    admitted, cancelled = await asyncio.wait_for(
+                        asyncio.gather(admit_task, cancel_task), timeout=10
+                    )
+                    assert still_waiting
+                    return admitted, cancelled
+        finally:
+            release.set()
+            await engine.dispose()
+
+    admitted, cancelled = asyncio.run(go())
+
+    assert admitted.status == "factory_admitted"
+    assert cancelled.status == "factory_cancelled"
+    assert _requests(number)[0]["status"] == "cancelled"
 
 
 def test_pull_request_comment_stays_on_the_review_arm(

@@ -6,6 +6,7 @@ verifier, then calls the generic WorkItem service. It does not read issue
 bodies into the platform and it does not bind Slack.
 """
 
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -202,6 +203,30 @@ async def _verify_current(
     )
 
 
+def _issue_lock_keys(repository_id: int, issue_number: int) -> tuple[int, int]:
+    digest = hashlib.sha256(f"curie-factory:{repository_id}:{issue_number}".encode()).digest()
+    return (
+        int.from_bytes(digest[:4], "big", signed=True),
+        int.from_bytes(digest[4:8], "big", signed=True),
+    )
+
+
+async def _lock_issue(session: AsyncSession, notice: FactoryNotice) -> None:
+    """Hold one issue until this transaction commits.
+
+    Admission and cancellation both re-read GitHub before they touch the
+    WorkItem. Without this lock a closure can be stored as absent, and the
+    admission that was already in flight then creates work the closure will
+    not see again.
+    """
+
+    classid, objid = _issue_lock_keys(notice.repository_id, notice.issue_number)
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
+        {"classid": classid, "objid": objid},
+    )
+
+
 async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
     binding = await session.scalar(
         select(AgentChannel)
@@ -263,9 +288,9 @@ def _admission_result(
 async def _admit(
     session: AsyncSession,
     notice: FactoryNotice,
-    binding: AgentChannel,
     settings: Settings,
 ) -> WebhookResult:
+    binding = await _binding(session, notice)
     if notice.disposition == "mention":
         existing = await _work_item(session, notice)
         if existing is None:
@@ -344,12 +369,12 @@ async def handle_factory_delivery(
         )
         if not repository_is_allowed(notice.repo_full_name, settings.github_repo_allowlist):
             raise FactoryRefused("repository_not_allowed")
+        await _lock_issue(session, notice)
         await _verify_current(notice, settings=settings, client=client)
-        binding = await _binding(session, notice)
         if notice.disposition == "cancel":
             outcome = await _cancel(session, notice)
         else:
-            outcome = await _admit(session, notice, binding, settings)
+            outcome = await _admit(session, notice, settings)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()
