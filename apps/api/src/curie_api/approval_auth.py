@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
 
 from . import adapter_principal, approval_principal, crud
+from .auth import CONSOLE_SESSION_COOKIE as CONSOLE_SESSION_COOKIE
 from .auth import require_api_key
 from .config import get_settings
 from .deps import SessionDep
@@ -25,7 +26,6 @@ from .deps import SessionDep
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
-CONSOLE_SESSION_COOKIE = "__Host-curie_console_session"
 _SAFE_ORIGIN_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
