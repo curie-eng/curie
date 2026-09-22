@@ -4,7 +4,7 @@
 //! force-sync test.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -103,10 +103,10 @@ impl Drop for Namespace {
     }
 }
 
-fn system(kubeconfig: &PathBuf) -> SystemKubectl {
+fn system(kubeconfig: &Path) -> SystemKubectl {
     SystemKubectl {
         context: None,
-        kubeconfig: Some(kubeconfig.clone()),
+        kubeconfig: Some(kubeconfig.to_path_buf()),
     }
 }
 
