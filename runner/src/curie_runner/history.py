@@ -307,7 +307,7 @@ class TurnRecord:
 def _state_value_size(record: Mapping[str, Any]) -> int:
     """Return the state API's encoded size for a one-record transcript."""
 
-    return len(json.dumps([record], separators=(",", ":")).encode("utf-8"))
+    return _value_size([record])
 
 
 def _digest_marker(value: str) -> str:

@@ -407,6 +407,29 @@ async def _get_entry(
     return entry
 
 
+async def _get_entry_locked(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, namespace: str, key: str
+) -> WorkflowStateEntry | None:
+    """Same lookup as ``_get_entry``, row-locked for a read-modify-write (#2927).
+
+    Used by both a CAS put and an append: a plain read let a concurrent write
+    commit between the version check and the write, and the later write then
+    overwrote it.
+    """
+
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
+            WorkflowStateEntry.namespace == namespace,
+            WorkflowStateEntry.key == key,
+        )
+        .with_for_update()
+    )
+    return entry
+
+
 async def _put_state(
     agent_id: uuid.UUID,
     scope: str | None,
@@ -420,19 +443,7 @@ async def _put_state(
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     await _enforce_caps(session, agent_id, scope, namespace, key, data.value)
-    # Lock the row exactly as ``_append_state`` does (#2927): a plain read let a
-    # concurrent append commit between this version check and the write, and the
-    # CAS put then overwrote it.
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.binding_scope == scope,
-            WorkflowStateEntry.namespace == namespace,
-            WorkflowStateEntry.key == key,
-        )
-        .with_for_update()
-    )
+    entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         if data.expected_version is not None:
             # A CAS put that expects a prior version cannot create the entry.
@@ -503,16 +514,7 @@ async def _append_state(
     """
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.binding_scope == scope,
-            WorkflowStateEntry.namespace == namespace,
-            WorkflowStateEntry.key == key,
-        )
-        .with_for_update()
-    )
+    entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         new_value = [data.item]
         await _enforce_caps(
