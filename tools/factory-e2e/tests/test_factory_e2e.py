@@ -17,9 +17,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 import factory_e2e as fe
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 

@@ -1030,6 +1030,20 @@ enum DevAction {
     SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
+    /// Drive the dark factory against a disposable install on a named kube
+    /// context, a real GitHub App and a fixture repository (#2966,
+    /// `python3 tools/factory-e2e/factory_e2e.py`). `preflight` installs the
+    /// candidate's published images with factory intake on, tunnels the api
+    /// webhook, labels one issue, asserts the delivery is accepted and a
+    /// WorkItem is admitted, then undoes every change and writes JSON evidence.
+    /// `run --scenario <name>` adds one scenario driver after the preflight.
+    /// Every identity comes from CURIE_FACTORY_* variables or files.
+    FactoryE2e {
+        /// `preflight` or `run --scenario <name>`, then driver flags; see
+        /// `curie dev factory-e2e -- --help`.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -3659,6 +3673,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
             DevAction::TwoReleaseApprovalE2e => {
                 commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
+            }
+            DevAction::FactoryE2e { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
             }
             DevAction::E2eCiSelection {
                 path,
@@ -6638,6 +6656,22 @@ mod tests {
                 action: DevAction::TwoReleaseApprovalE2e
             })
         ));
+        let cli = try_parse_from([
+            "curie",
+            "dev",
+            "factory-e2e",
+            "run",
+            "--scenario",
+            "revision",
+        ])
+        .expect("dev factory-e2e should pass its mode and flags through");
+        match cli.command {
+            Some(Command::Dev {
+                action: DevAction::FactoryE2e { args },
+            }) => assert_eq!(args, ["run", "--scenario", "revision"]),
+            _ => panic!("dev factory-e2e parsed as another command"),
+        }
+        assert!(try_parse_from(["curie", "dev", "factory-e2e"]).is_err());
         let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
             .expect("dev chart-runtime-e2e should parse");
         assert!(matches!(

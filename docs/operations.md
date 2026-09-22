@@ -854,6 +854,52 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
+### Driving the factory end to end
+
+`curie dev factory-e2e preflight` proves the signed intake loop against a real
+GitHub App and a fixture repository, on a kube context you name. It needs a
+source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
+
+1. Installs the candidate commit's published `sha-<commit>` images from that
+   commit's chart into a namespace it creates (`test-factory-<commit>` by
+   default, or `--namespace test-factory-<slug>`). If the cluster already runs
+   the agent-sandbox controller, the install is consumer mode.
+2. Turns on factory intake, binds one agent to the fixture repository, exposes
+   the api through a temporary cloudflared quick tunnel, and points the App
+   webhook at it with an App JWT.
+3. Resets the fixture repository by closing its issues and pull requests and
+   deleting every branch except the default. It then opens one labelled issue.
+4. Passes when GitHub's delivery log shows that the `issues.labeled` delivery
+   got HTTP 200 and `factory_admitted`, and
+   `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
+
+On every exit it restores the webhook URL, resets the fixture again, stops the
+tunnel, and deletes the namespace and its publication namespace. Each undo is
+verified. The JSON evidence file (default `target/factory-e2e/<namespace>.json`)
+records the candidate commit, namespace, delivery id, WorkItem id and every
+teardown result. Teardown that cannot be verified fails the run.
+
+Every identity is an operator input. Nothing names a specific App or account:
+
+| Variable | Meaning |
+|---|---|
+| `CURIE_FACTORY_KUBE_CONTEXT` | Kube context (or `--context`); required |
+| `CURIE_FACTORY_APP_DIR` | Directory holding `app.json` (`id`, `slug`, `installation_id`, optional `repo`), `app.pem` and `webhook_secret` |
+| `CURIE_FACTORY_APP_ID`, `CURIE_FACTORY_INSTALLATION_ID` | Override `app.json` |
+| `CURIE_FACTORY_APP_PRIVATE_KEY_FILE`, `CURIE_FACTORY_WEBHOOK_SECRET_FILE` | Override the files in the App directory |
+| `CURIE_FACTORY_REPO` | Fixture repository `owner/name` |
+| `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A human account with write access that opens the issue (a `gh` login for the second) |
+| `CURIE_FACTORY_LABEL`, `CURIE_FACTORY_MENTION` | Intake label (default `curie-factory`) and mention login (default the App slug) |
+| `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses instead of creating them |
+| `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start) |
+| `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
+
+A missing input is refused, with every missing name listed, before the cluster
+or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
+preflight and then one scenario driver: `issue-to-pr`, `revision`,
+`cancel-waiting`, `cancel-running` or `evaluation`. A scenario that has no
+driver yet is refused before anything is installed.
+
 ## Talking to your agent
 
 The plugin bundle you just deployed is the agent's backend. There are two
