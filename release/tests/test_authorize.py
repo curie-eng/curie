@@ -1553,6 +1553,10 @@ class TestHelmCiWorkflowTriggers:
         # recorded upgrade boundary, so its subject and its stub driver both
         # live outside charts/, and a PR restoring the YAML 1.2 emitter must
         # still match this filter.
+        # The last three are the credential inventory gate (ADR 0163): it
+        # checks the chart against the inventory the CLI embeds, merges the
+        # sre-bot bundle's connector declarations, and reads their rotation
+        # field, so an inventory or connector-only PR must still run it.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             "examples/sre-bot/observability/**",
@@ -1568,6 +1572,9 @@ class TestHelmCiWorkflowTriggers:
             "compose.dev.yaml",
             "cli/src/ops/upgrade.rs",
             "cli/tests/data/upgrade-driver.py",
+            "cli/src/provider/**",
+            "examples/sre-bot/connectors.yaml",
+            "packages/plugin-format/src/plugin_format/connectors.py",
         ]
 
 
