@@ -384,6 +384,9 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 release: "acme-bot".to_string(),
                 comms: true,
             },
+            "WroteStarter" => ApplyOutput::WroteStarter {
+                path: "curie.yaml".to_string(),
+            },
         ],
     );
     m.insert(
