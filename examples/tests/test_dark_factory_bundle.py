@@ -52,7 +52,9 @@ def _skill_parts() -> tuple[dict, str]:
 
 
 def test_bundle_validates() -> None:
-    result = validate_bundle(BUNDLE)
+    # The platform's deploy path validates with the enforcing contract; a
+    # toolPolicy bundle is refused by the non-enforcing default.
+    result = validate_bundle(BUNDLE, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
     assert result.valid, result.errors
     assert result.errors == []
 
@@ -125,15 +127,63 @@ DISCIPLINE = {
     "acceptance-criteria": r"acceptance criteri",
     "plan-before-editing": r"(written|write (a|the|down)|state (a|the)) plan|plan (before|first)",
     "failing-test-first": r"failing test|test (that )?fails|red test",
-    "runs-repo-checks": r"(run|execute)s? (the )?(repository|repo|project)'?s? (own )?(checks|tests|test suite|linters?)",
-    "self-review-against-every-criterion": r"(review|re-read|reread|check)\w* (the |your |its )?(own )?diff.{0,120}(every|each) acceptance criteri",
+    "runs-repo-checks": (
+        r"(run"
+        r"|execute)s? (the )?(repository"
+        r"|repo"
+        r"|project)'?s? (own )?(checks"
+        r"|tests"
+        r"|test suite"
+        r"|linters?)"
+    ),
+    "self-review-against-every-criterion": (
+        r"(review"
+        r"|re-read"
+        r"|reread"
+        r"|check)\w* (the "
+        r"|your "
+        r"|its )?(own )?diff.{0,120}(every"
+        r"|each) acceptance criteri"
+    ),
     "publishes-through-publish-changes": r"mcp__curie__publish_changes",
-    "ends-with-reason-not-pr": r"(stop|end|finish)\w*.{0,80}(stated |clear |written )?reason|reason.{0,80}instead of (a |opening a )?pull request",
+    "ends-with-reason-not-pr": (
+        r"(stop"
+        r"|end"
+        r"|finish)\w*.{0,80}(stated "
+        r"|clear "
+        r"|written )?reason"
+        r"|reason.{0,80}instead of (a "
+        r"|opening a )?pull request"
+    ),
     "time-budget-1800": r"1800",
     "untrusted-input": r"untrusted",
-    "stop-on-ambiguity": r"ambigu\w*.{0,160}(stop|do not guess|don'?t guess|never guess)|(stop|do not guess|never guess).{0,160}ambigu",
-    "never-git-push": r"(never|do not|don'?t|must not)\s+(run\s+)?`?git push|(never|do not|don'?t|must not) push\w* with git",
-    "no-sub-agents": r"(no|never|do not|don'?t|must not)\s+(use\s+)?(the\s+)?(`?task`?\s+tool|sub-?agents?)",
+    "stop-on-ambiguity": (
+        r"ambigu\w*.{0,160}(stop"
+        r"|do not guess"
+        r"|don'?t guess"
+        r"|never guess)"
+        r"|(stop"
+        r"|do not guess"
+        r"|never guess).{0,160}ambigu"
+    ),
+    "never-git-push": (
+        r"(never"
+        r"|do not"
+        r"|don'?t"
+        r"|must not)\s+(run\s+)?`?git push"
+        r"|(never"
+        r"|do not"
+        r"|don'?t"
+        r"|must not) push\w* with git"
+    ),
+    "no-sub-agents": (
+        r"(no"
+        r"|never"
+        r"|do not"
+        r"|don'?t"
+        r"|must not)\s+(use\s+)?(the\s+)?(`?task`?\s+tool"
+        r"|sub-?agents?)"
+    ),
     "no-workflow-edits": r"\.github/",
 }
 
