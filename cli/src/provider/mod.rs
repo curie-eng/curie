@@ -3,6 +3,7 @@
 //! `get` is the only method that returns material. Errors name the object and,
 //! where relevant, version ids. They do not carry material or backend stderr.
 
+pub mod aws;
 mod catalog;
 pub mod eso;
 mod inventory;

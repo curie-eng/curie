@@ -1,7 +1,7 @@
 //! Installation secrets provider contract.
 //!
-//! The provider types and the new secrets verbs are not implemented yet.
-//! These tests name that API on purpose and fail to compile until it exists.
+//! These tests pin the provider neutral types, installation schema, and CLI
+//! routing while backend round trips live in `aws_provider.rs`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -81,7 +81,10 @@ fn isolated() -> Isolated {
     let bin_dir = root.path().join("bin");
     fs::create_dir(&bin_dir).expect("bin dir");
     let marker = root.path().join("aws-marker");
-    let script = format!("#!/bin/sh\nprintf x > '{}'\nexit 0\n", marker.display());
+    let script = format!(
+        "#!/bin/sh\nif [ \"${{1:-}}\" = '--version' ]; then\n  printf '%s\\n' 'aws-cli/2.31.0 Python/3.13.7 Linux/fixture exe/x86_64'\n  exit 0\nfi\nprintf x > '{}'\ncase \" $* \" in\n  *\" secretsmanager get-secret-value \"*|*\" secretsmanager describe-secret \"*)\n    printf '%s\\n' 'ResourceNotFoundException: fixture object is absent' >&2\n    exit 254\n    ;;\n  *\" secretsmanager create-secret \"*)\n    printf '%s\\n' '{{\"VersionId\":\"00000000-0000-4000-8000-000000000001\"}}'\n    ;;\n  *\" secretsmanager list-secrets \"*)\n    printf '%s\\n' '{{\"SecretList\":[]}}'\n    ;;\n  *)\n    printf '%s\\n' 'unexpected aws fixture invocation' >&2\n    exit 64\n    ;;\nesac\n",
+        marker.display()
+    );
     write_exec(&bin_dir, "aws", &script);
     let mut paths = vec![bin_dir];
     if let Some(current) = std::env::var_os("PATH") {
@@ -128,31 +131,13 @@ fn assert_aws_not_called(env: &Isolated) {
     assert!(!env.marker.exists(), "aws must not be called");
 }
 
-fn assert_not_implemented(env: &Isolated, label: &str, output: &Output) {
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "{label} expected exit 1\n{}",
-        panic_text(output)
-    );
-    let raw = raw_output(output);
-    assert!(
-        raw.contains("not implemented yet"),
-        "{label} missing not-implemented text\n{}",
-        panic_text(output)
-    );
-    assert!(!raw.contains(PLANTED), "{label} leaked material");
-    assert_aws_not_called(env);
-}
-
-fn assert_string_error(output: &Output) {
+fn assert_string_error(output: &Output, needle: &str) {
     let json: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
     assert!(json["error"].is_string(), "error must be a string");
-    assert!(json["fix"].is_string(), "fix must be a string");
     let error = json["error"].as_str().expect("error string");
     assert!(
-        error.contains("not implemented yet"),
-        "error must say not implemented: {}",
+        error.contains(needle),
+        "error must contain {needle}: {}",
         redact(error)
     );
 }
@@ -364,6 +349,7 @@ fn exercise_provider(provider: &dyn SecretsProvider) {
 #[test]
 fn local_secrets_set_and_list_do_not_call_aws() {
     let env = isolated();
+    fs::write(env.config.join("curie.yaml"), BARE_INSTALL).expect("write local install");
     let set = run(
         &env,
         &["secrets", "set", "MODEL_KEY", "--from-env", "HOLD_VALUE"],
@@ -387,7 +373,7 @@ fn local_secrets_set_and_list_do_not_call_aws() {
 }
 
 #[test]
-fn secrets_set_expires_is_not_implemented() {
+fn secrets_set_expires_requires_a_discovered_provider() {
     let env = isolated();
     let output = run(
         &env,
@@ -402,8 +388,14 @@ fn secrets_set_expires_is_not_implemented() {
             "--json",
         ],
     );
-    assert_not_implemented(&env, "set --expires", &output);
-    assert_string_error(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "set --expires without a provider must be usage\n{}",
+        panic_text(&output)
+    );
+    assert_string_error(&output, "requires a curie.yaml secrets provider");
+    assert_aws_not_called(&env);
     assert!(
         !credentials(&env).exists(),
         "expires must not write the local store"
@@ -411,7 +403,7 @@ fn secrets_set_expires_is_not_implemented() {
 }
 
 #[test]
-fn secrets_set_file_with_a_provider_is_not_implemented() {
+fn secrets_set_discovers_the_current_directory_provider() {
     let env = isolated();
     let path = env.config.join("curie.yaml");
     fs::write(&path, aws_install()).expect("write install");
@@ -419,15 +411,22 @@ fn secrets_set_file_with_a_provider_is_not_implemented() {
         .args([
             "secrets",
             "set",
-            "MODEL_KEY",
+            "logical/MODEL_KEY",
             "--from-env",
             "HOLD_VALUE",
-            "--file",
         ])
-        .arg(&path)
         .output()
         .expect("run curie");
-    assert_not_implemented(&env, "set --file", &output);
+    assert!(
+        output.status.success(),
+        "provider set failed\n{}",
+        panic_text(&output)
+    );
+    assert!(env.marker.exists(), "provider set must call aws");
+    assert!(
+        !raw_output(&output).contains(PLANTED),
+        "set leaked material"
+    );
     assert!(
         !credentials(&env).exists(),
         "provider set must not write the local store"
@@ -435,9 +434,36 @@ fn secrets_set_file_with_a_provider_is_not_implemented() {
 }
 
 #[test]
+fn apply_refuses_a_declared_provider_before_any_external_command() {
+    let env = isolated();
+    fs::write(env.config.join("curie.yaml"), aws_install()).expect("write install");
+    let empty_path = env.config.join("no-tools");
+    fs::create_dir(&empty_path).expect("create empty path");
+
+    for args in [
+        vec!["apply", "--json"],
+        vec!["apply", "--dry-run", "--json"],
+    ] {
+        let output = command(&env)
+            .env("PATH", &empty_path)
+            .args(args)
+            .output()
+            .expect("run apply");
+        assert_eq!(output.status.code(), Some(1), "{}", panic_text(&output));
+        assert!(
+            raw_output(&output).contains("cannot yet converge a declared secrets provider"),
+            "apply must refuse before external commands: {}",
+            panic_text(&output)
+        );
+        assert_aws_not_called(&env);
+    }
+}
+
+#[test]
 fn secrets_set_file_without_secrets_stays_local() {
     let env = isolated();
-    let path = env.config.join("curie.yaml");
+    fs::write(env.config.join("curie.yaml"), aws_install()).expect("write discovered install");
+    let path = env.config.join("local.yaml");
     fs::write(&path, BARE_INSTALL).expect("write install");
     let output = command(&env)
         .args([
@@ -492,7 +518,7 @@ fn secrets_set_file_with_invalid_yaml_writes_nothing() {
 }
 
 #[test]
-fn secrets_list_file_with_a_provider_is_not_implemented() {
+fn secrets_list_file_with_a_provider_uses_aws() {
     let env = isolated();
     let path = env.config.join("curie.yaml");
     fs::write(&path, aws_install()).expect("write install");
@@ -501,19 +527,39 @@ fn secrets_list_file_with_a_provider_is_not_implemented() {
         .arg(&path)
         .output()
         .expect("run curie");
-    assert_not_implemented(&env, "list --file", &output);
+    assert!(
+        output.status.success(),
+        "provider list failed\n{}",
+        panic_text(&output)
+    );
+    assert!(env.marker.exists(), "provider list must call aws");
+    assert!(
+        !raw_output(&output).contains(PLANTED),
+        "list leaked material"
+    );
 }
 
 #[test]
-fn secrets_check_and_rm_are_not_implemented() {
+fn provider_only_verbs_require_a_provider() {
     let env = isolated();
-    let invocations: &[(&str, &[&str])] = &[
+    let provider_invocations: &[(&str, &[&str])] = &[
         ("secrets check", &["secrets", "check"]),
-        ("secrets rm", &["secrets", "rm", "MODEL_KEY"]),
+        ("secrets rm", &["secrets", "rm", "logical"]),
     ];
-    for (label, args) in invocations {
+    for (label, args) in provider_invocations {
         let output = run(&env, args);
-        assert_not_implemented(&env, label, &output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{label} without a provider must be usage\n{}",
+            panic_text(&output)
+        );
+        assert!(
+            raw_output(&output).contains("requires a curie.yaml secrets provider"),
+            "{label} must name its provider requirement\n{}",
+            panic_text(&output)
+        );
+        assert_aws_not_called(&env);
     }
 }
 
