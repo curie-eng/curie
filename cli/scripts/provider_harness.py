@@ -1682,103 +1682,127 @@ class HarnessCase:
             log.flush()
             os.fsync(log.fileno())
         targets = self.ledger.cleanup_targets()
-        for target in targets:
-            if target.kind == "secretsmanager":
-                self.aws(
-                    "secretsmanager",
-                    "delete-secret",
-                    "--secret-id",
-                    target.identity,
-                    "--force-delete-without-recovery",
-                    action="delete exact provider entry",
-                    allow_failure=True,
-                )
-                if not self.real_aws:
-                    wait_until(
-                        f"emulator provider deletion {target.identity}",
-                        lambda target=target: self.aws_reports_absent(
-                            "secretsmanager",
-                            "describe-secret",
-                            ["--secret-id", target.identity],
-                            "verify emulator provider entry absent",
-                            ["ResourceNotFoundException"],
-                        ),
-                        timeout=60,
-                    )
-            elif target.kind == "iam_role_policy":
-                role, policy = target.identity.split("/", 1)
-                self.aws(
-                    "iam",
-                    "delete-role-policy",
-                    "--role-name",
-                    role,
-                    "--policy-name",
-                    policy,
-                    action="delete exact IAM role policy",
-                    allow_failure=True,
-                )
-            elif target.kind == "iam_role":
-                self.aws(
-                    "iam",
-                    "delete-role",
-                    "--role-name",
-                    target.identity,
-                    action="delete exact IAM role",
-                    allow_failure=True,
-                )
-            elif target.kind == "iam_oidc_provider" and target.identity.startswith("arn:"):
-                self.aws(
-                    "iam",
-                    "delete-open-id-connect-provider",
-                    "--open-id-connect-provider-arn",
-                    target.identity,
-                    action="delete exact IAM OIDC provider",
-                    allow_failure=True,
-                )
-            elif target.kind == "s3_bucket":
-                for key in (".well-known/openid-configuration", "openid/v1/jwks"):
-                    self.aws(
-                        "s3api",
-                        "delete-object",
-                        "--bucket",
-                        target.identity,
-                        "--key",
-                        key,
-                        action="delete exact OIDC object",
-                        allow_failure=True,
-                    )
-                self.aws(
-                    "s3api",
-                    "delete-bucket-policy",
-                    "--bucket",
-                    target.identity,
-                    action="delete exact OIDC bucket policy",
-                    allow_failure=True,
-                )
-                self.aws(
-                    "s3api",
-                    "delete-bucket",
-                    "--bucket",
-                    target.identity,
-                    action="delete exact OIDC bucket",
-                    allow_failure=True,
-                )
-            elif target.kind == "docker_image":
+        cluster_target = next(
+            (
+                target
+                for target in targets
+                if target.kind == "kind_cluster" and target.identity == self.cluster
+            ),
+            None,
+        )
+        try:
+            if self.real_aws and cluster_target is not None:
+                cluster_name = cluster_target.identity
                 self.runner.run(
-                    ["docker", "image", "rm", "--force", target.identity],
-                    "delete exact candidate image",
-                    allow_failure=True,
-                )
-            elif target.kind == "kind_cluster":
-                self.runner.run(
-                    ["kind", "delete", "cluster", "--name", target.identity],
-                    "delete owned kind cluster",
-                    allow_failure=True,
+                    ["kind", "delete", "cluster", "--name", cluster_name],
+                    "delete owned kind cluster before AWS cleanup",
                     timeout=180,
                 )
-        for process in reversed(self.background):
-            ToolRunner._stop_group(process)
-        self.background.clear()
+                wait_until(
+                    "owned kind cluster deletion before AWS cleanup",
+                    lambda: cluster_name not in self.current_clusters(),
+                    timeout=180,
+                )
+            for target in targets:
+                if target.kind == "secretsmanager":
+                    self.aws(
+                        "secretsmanager",
+                        "delete-secret",
+                        "--secret-id",
+                        target.identity,
+                        "--force-delete-without-recovery",
+                        action="delete exact provider entry",
+                        allow_failure=True,
+                    )
+                    if not self.real_aws:
+                        wait_until(
+                            f"emulator provider deletion {target.identity}",
+                            lambda target=target: self.aws_reports_absent(
+                                "secretsmanager",
+                                "describe-secret",
+                                ["--secret-id", target.identity],
+                                "verify emulator provider entry absent",
+                                ["ResourceNotFoundException"],
+                            ),
+                            timeout=60,
+                        )
+                elif target.kind == "iam_role_policy":
+                    role, policy = target.identity.split("/", 1)
+                    self.aws(
+                        "iam",
+                        "delete-role-policy",
+                        "--role-name",
+                        role,
+                        "--policy-name",
+                        policy,
+                        action="delete exact IAM role policy",
+                        allow_failure=True,
+                    )
+                elif target.kind == "iam_role":
+                    self.aws(
+                        "iam",
+                        "delete-role",
+                        "--role-name",
+                        target.identity,
+                        action="delete exact IAM role",
+                        allow_failure=True,
+                    )
+                elif target.kind == "iam_oidc_provider" and target.identity.startswith("arn:"):
+                    self.aws(
+                        "iam",
+                        "delete-open-id-connect-provider",
+                        "--open-id-connect-provider-arn",
+                        target.identity,
+                        action="delete exact IAM OIDC provider",
+                        allow_failure=True,
+                    )
+                elif target.kind == "s3_bucket":
+                    for key in (".well-known/openid-configuration", "openid/v1/jwks"):
+                        self.aws(
+                            "s3api",
+                            "delete-object",
+                            "--bucket",
+                            target.identity,
+                            "--key",
+                            key,
+                            action="delete exact OIDC object",
+                            allow_failure=True,
+                        )
+                    self.aws(
+                        "s3api",
+                        "delete-bucket-policy",
+                        "--bucket",
+                        target.identity,
+                        action="delete exact OIDC bucket policy",
+                        allow_failure=True,
+                    )
+                    self.aws(
+                        "s3api",
+                        "delete-bucket",
+                        "--bucket",
+                        target.identity,
+                        action="delete exact OIDC bucket",
+                        allow_failure=True,
+                    )
+                elif target.kind == "docker_image":
+                    self.runner.run(
+                        ["docker", "image", "rm", "--force", target.identity],
+                        "delete exact candidate image",
+                        allow_failure=True,
+                    )
+                elif target.kind == "kind_cluster" and not (
+                    self.real_aws and target.identity == self.cluster
+                ):
+                    self.runner.run(
+                        ["kind", "delete", "cluster", "--name", target.identity],
+                        "delete owned kind cluster",
+                        allow_failure=True,
+                        timeout=180,
+                    )
+        finally:
+            for process in reversed(self.background):
+                ToolRunner._stop_group(process)
+            self.background.clear()
         self.verify_cleanup(targets)
         with self.cleanup_log.open("ab") as log:
             log.write(b"cleanup complete\n")
@@ -2064,19 +2088,23 @@ def main() -> int:
     except HarnessError as exc:
         safe_print(str(exc), error=True)
         return 1
-    guard = install_signal_handlers()
+    setup_guard = install_signal_handlers()
     try:
         modes = ["preinstalled", "none"] if args.ci else [args.eso or "preinstalled"]
         for mode in modes:
-            HarnessCase(
-                repo_root,
-                snapshot,
-                commit,
-                seed,
-                mode,
-                args.real_aws,
-                curie_bin,
-            ).run()
+            case_guard = install_signal_handlers()
+            try:
+                HarnessCase(
+                    repo_root,
+                    snapshot,
+                    commit,
+                    seed,
+                    mode,
+                    args.real_aws,
+                    curie_bin,
+                ).run()
+            finally:
+                case_guard.restore()
     except HarnessInterrupted:
         safe_print("provider harness interrupted after cleanup", error=True)
         return INTERRUPTED_EXIT
@@ -2087,7 +2115,7 @@ def main() -> int:
         safe_print("provider harness failed", error=True)
         return 1
     finally:
-        guard.restore()
+        setup_guard.restore()
         snapshot_context.cleanup()
         setup_context.cleanup()
     safe_print("provider harness: all requested modes passed")
