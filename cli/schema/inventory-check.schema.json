@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/inventory-check/v1.json",
+  "title": "curie dev secrets-inventory --json",
+  "description": "The agent-facing result of `curie dev secrets-inventory` (ADR 0163): the inventory entry count, each rendered values set with the Secret references no entry lists, and the entries no set rendered. Names and keys only, never values.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "entries": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "refs_checked": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uncovered": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "object": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "key",
+                "object"
+              ]
+            }
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "refs_checked",
+          "uncovered",
+          "error"
+        ]
+      }
+    },
+    "unmatched_entries": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "entries",
+    "sets",
+    "unmatched_entries"
+  ]
+}
