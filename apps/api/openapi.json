@@ -3798,6 +3798,70 @@
         "title": "PublicationLineageAdvance",
         "type": "object"
       },
+      "PublicationLineageIdentityOut": {
+        "description": "One verified immutable GitHub identity, or an explicit refusal to capture.",
+        "properties": {
+          "base_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Ref"
+          },
+          "eligible": {
+            "title": "Eligible",
+            "type": "boolean"
+          },
+          "installation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installation Id"
+          },
+          "lineage_id": {
+            "format": "uuid",
+            "title": "Lineage Id",
+            "type": "string"
+          },
+          "pr_node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Node Id"
+          },
+          "repository_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repository Id"
+          }
+        },
+        "required": [
+          "lineage_id",
+          "eligible"
+        ],
+        "title": "PublicationLineageIdentityOut",
+        "type": "object"
+      },
       "PublicationLineageOut": {
         "description": "Credential-free pull-request lineage facts safe for the worker.",
         "properties": {
@@ -12077,6 +12141,76 @@
           }
         },
         "summary": "Advance Publication Lineage",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/lineage/identity": {
+      "post": {
+        "description": "Hand the worker one verified identity and write nothing (#2903).\n\nThe worker persists these four values inside the same compare-and-set that\nfirst sets `pr_number`, so the two facts can never be observed apart. The\nApp credentials stay here; the worker receives values, never authority.",
+        "operationId": "verify_publication_lineage_identity_v1_internal_publications__publication_id__lineage_identity_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationLineageAdvance"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationLineageIdentityOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Publication Lineage Identity",
         "tags": [
           "internal-publications"
         ]
