@@ -862,3 +862,23 @@ def test_chart_renders_the_real_model_from_install_values(tmp_path: Path) -> Non
     template = next(d for d in rendered.split("\n---") if "kind: SandboxTemplate" in d)
     assert "CURIE_FAKE_MODEL" not in template
     assert f"- name: CURIE_MODEL\n              value: {json.dumps(config.model)}" in template
+
+
+def test_usage_record_waits_for_the_counter_and_reports_a_positive_delta() -> None:
+    readings = iter([10.0, 10.0, 10.25])
+    record = fe.usage_record(10.0, lambda: next(readings), has_key=True, attempts=3, pause=0)
+    assert record["source"] == "openrouter key usage delta"
+    assert record["usd"] == 0.25
+
+
+def test_usage_record_never_reports_a_zero_delta_as_observed_spend() -> None:
+    record = fe.usage_record(10.0, lambda: 10.0, has_key=True, attempts=2, pause=0)
+    assert record["source"] == "unverified"
+    assert record["usd"] is None
+    assert "did not change" in record["caveat"]
+
+
+def test_usage_record_without_readings_or_key_is_unverified() -> None:
+    assert fe.usage_record(None, lambda: None, has_key=True, attempts=1, pause=0)["usd"] is None
+    fake = fe.usage_record(None, lambda: None, has_key=False, attempts=1, pause=0)
+    assert fake["caveat"] == "fake model; no model spend"
