@@ -283,10 +283,24 @@ serverFiles:
                 curie_http_server_request_total for /channels/token with
                 outcome 5xx increased in the last hour.
           - alert: CurieMailAdapterNotReady
+            # Two terms, because `unavailable > 0` alone cannot see a
+            # Deployment scaled to zero: kube-state-metrics reports
+            # unavailable as spec minus available, which is 0 - 0 there.
+            # The regex is `.*mail-adapter.*` because matchers are fully
+            # anchored and an installation names one adapter per mailbox
+            # with a suffix (`mail-adapter-brand`).
             expr: |
-              kube_deployment_status_replicas_unavailable{
-                deployment=~".*mail-adapter"
-              } > 0
+              (
+                kube_deployment_status_replicas_unavailable{
+                  deployment=~".*mail-adapter.*"
+                } > 0
+              )
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment=~".*mail-adapter.*"
+                } == 0
+              )
             for: 5m
             labels:
               severity: page
@@ -297,6 +311,54 @@ serverFiles:
                 The mail adapter Deployment has unavailable replicas. An
                 expired channel token fails /readyz and surfaces here without
                 inspecting a token value.
+          - alert: CurieConnectorNotReady
+            # A connector is one Deployment per (agent, connector), named
+            # `<release>-<agent>-mcp-<connector>`. Same two terms as the mail
+            # adapter, for the same reason. Nothing else in this file notices
+            # a connector down: its agent still answers, and says it cannot
+            # reach the systems it reads from.
+            expr: |
+              (
+                kube_deployment_status_replicas_unavailable{
+                  deployment=~".*-mcp-.*"
+                } > 0
+              )
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment=~".*-mcp-.*"
+                } == 0
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-connector
+            annotations:
+              summary: A connector Deployment is not serving
+              description: >-
+                A connector has no available replica, or has been scaled to
+                zero. Its agent still answers, and tells the person it cannot
+                reach the systems it reads from.
+          - alert: CurieDispatcherRestartLoop
+            # Pod restarts, not CurieWorkerSupervisedRestartLoop's in-process
+            # counter: a dispatcher that crashes takes its counter with it.
+            # Same window and threshold as that rule so the two read alike.
+            expr: |
+              increase(
+                kube_pod_container_status_restarts_total{
+                  pod=~".*-dispatcher-.*"
+                }[30m]
+              ) >= 3
+            for: 5m
+            labels:
+              severity: page
+              component: curie-dispatcher
+            annotations:
+              summary: The dispatcher is crash-looping
+              description: >-
+                A dispatcher container restarted three or more times in 30
+                minutes. While it is down no Slack message reaches any agent,
+                and every other pod still looks healthy.
           - alert: CurieNodeMemoryHeadroomLow
             expr: |
               100 * (
