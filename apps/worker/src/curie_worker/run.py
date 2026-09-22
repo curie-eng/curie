@@ -44,6 +44,7 @@ from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
+from .hook_runs import HookRunRecorder
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
@@ -483,6 +484,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         approval_reader=approval_client,
         actions=action_client,
         card_store=card_store,
+        hook_runs=HookRunRecorder(engine),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=(
