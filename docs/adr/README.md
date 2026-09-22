@@ -187,4 +187,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0159 | [A canary is a weighted second active deployment and every trace carries its version](0159-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
 | 0160 | [A long scheduled sweep stays on one sandbox](0160-a-long-scheduled-sweep-stays-on-one-sandbox.md) | Accepted |
 | 0161 | [Signed GitHub issue events admit one WorkItem](0161-signed-github-issue-events-admit-one-work-item.md) | Accepted |
+| 0162 | [Tenant boundary and principal identity land together](0162-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
 <!-- END GENERATED: adr-index -->
