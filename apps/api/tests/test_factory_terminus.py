@@ -28,6 +28,7 @@ from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -77,10 +78,18 @@ class _GitHubComments(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         server = self.server
         assert isinstance(server, _CommentServer)
-        path = self.path.split("?", 1)[0]
+        parsed = urlsplit(self.path)
+        path = parsed.path
         server.requests.append(("GET", path, None))
         if server.by_path:
-            self._send(200, list(server.lists.get(path, [])))
+            items = list(server.lists.get(path, []))
+            # Real GitHub pages; a small fixture list is unaffected since page 1
+            # at per_page 100 already covers it.
+            params = parse_qs(parsed.query)
+            page = int(params.get("page", ["1"])[0])
+            per_page = int(params.get("per_page", ["100"])[0])
+            start = (page - 1) * per_page
+            self._send(200, items[start : start + per_page])
             return
         self._send(200, list(server.comments))
 
@@ -100,6 +109,12 @@ class _GitHubComments(BaseHTTPRequestHandler):
             listed = path.rsplit("/", 2)[0] if path.endswith("/replies") else path
             comment = {"id": 8000 + server.posts, "body": payload.get("body", "")}
             server.lists.setdefault(listed, []).append(comment)
+            if path in server.lost_response_paths:
+                # The comment lands, but the caller never sees the response: drop
+                # the connection instead of sending a status line, once.
+                server.lost_response_paths.discard(path)
+                self.close_connection = True
+                return
             self._send(201, comment)
             return
         if server.refuse_status is not None:
@@ -124,6 +139,9 @@ class _CommentServer(ThreadingHTTPServer):
         self.lists: dict[str, list[dict[str, Any]]] = {}
         self.refuse_paths: dict[str, int] = {}
         self.requests: list[tuple[str, str, str | None]] = []
+        # Paths whose next POST response is dropped after the comment is
+        # recorded, simulating a lost response to a successful post.
+        self.lost_response_paths: set[str] = set()
 
 
 @pytest.fixture
@@ -1045,6 +1063,55 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
     assert len(notices) == 1
     assert notices[0]["comment_id"] == 7555
     assert notices[0]["posted_at"] is not None
+
+
+def _scan_page(request_id: uuid.UUID) -> int:
+    return _rows(
+        "SELECT scan_page FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["scan_page"]
+
+
+def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
+    """A thread reply that posts but whose response is lost must not double-post.
+
+    The conversation list holds more than 500 comments, so the first pass
+    exhausts the review list, then advances the cursor past the conversation
+    list's offset without finishing it. A second pass finishes the conversation
+    list and attempts the thread reply, whose response is then lost.
+    """
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    fragment = "discussion_r88109"
+    revision = _insert_revision(
+        first["work_item_id"], number, _revision_objective(pr, fragment)
+    )
+    sink.lists[f"/repos/{REPO}/issues/{pr}/comments"] = [
+        {"id": 9000 + i, "body": f"unrelated comment {i}"} for i in range(550)
+    ]
+    reply_path = f"/repos/{REPO}/pulls/{pr}/comments/88109/replies"
+    sink.lost_response_paths.add(reply_path)
+    _start_running(revision)
+    _attach_revision_publication(first["work_item_id"], revision)
+
+    _reconcile()
+    assert _posts(sink) == []
+    assert _notices(revision)[0]["posted_at"] is None
+    assert _scan_page(revision) > 1_000_000
+
+    _reconcile()
+    assert [path for path, _ in _posts(sink)] == [reply_path]
+    assert _notices(revision)[0]["posted_at"] is None
+    assert _scan_page(revision) == 1
+
+    _reconcile()
+    assert [path for path, _ in _posts(sink)] == [reply_path]
+    notices = _notices(revision)
+    assert notices[0]["posted_at"] is not None
+    assert notices[0]["comment_id"] == 8001
 
 
 def test_an_issue_originated_notice_still_comments_on_the_issue(admitted: Any) -> None:

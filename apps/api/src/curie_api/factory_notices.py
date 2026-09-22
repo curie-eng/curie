@@ -184,8 +184,14 @@ async def _deliver(
             body,
         )
         if replied != _UNPROCESSABLE:
+            if replied is None:
+                # Lost response after a possible success: rescan every list next pass.
+                notice.scan_page = 1
             return replied
     posted = await _post(client, f"{api}{comments_path}", headers, body)
+    if posted is None:
+        # Lost response after a possible success: rescan every list next pass.
+        notice.scan_page = 1
     # A comment GitHub cannot process stays pending, as before #2798.
     return None if posted == _UNPROCESSABLE else posted
 
