@@ -119,6 +119,17 @@ async def _wait_for_blocked_hook_run_update(
     raise AssertionError("hook run update did not wait for the row lock")
 
 
+async def _wait_for_streamed_started_output(
+    updates: list[tuple[str, str, str]],
+) -> None:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if any(text == "started" for _channel, _reply_ref, text in updates):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("kernel did not deliver streamed start output")
+
+
 @pytest.mark.parametrize(
     "status",
     [SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT],
@@ -279,10 +290,7 @@ def test_delivery_deadline_after_cron_start_closes_failed(
             h.runner.default_script = [TextDelta(text="started")]
             event = _event(hook_run=run.ref)
             task = asyncio.create_task(h.kernel.process_event(event, lease=lease))
-            deadline = time.monotonic() + 2.0
-            while not h.runner.turn_active and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
-            assert h.runner.turn_active
+            await _wait_for_streamed_started_output(h.sink.updates)
 
             seconds, microseconds = await h.async_redis.time()
             now_ms = int(seconds) * 1000 + int(microseconds) // 1000
@@ -512,10 +520,7 @@ def test_cancellation_after_cron_start_closes_failed_and_propagates(
             event = _event(hook_run=run.ref)
             task = asyncio.create_task(h.kernel.process_event(event))
             try:
-                deadline = time.monotonic() + 2.0
-                while not h.runner.turn_active and time.monotonic() < deadline:
-                    await asyncio.sleep(0.01)
-                assert h.runner.turn_active
+                await _wait_for_streamed_started_output(h.sink.updates)
 
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -548,10 +553,7 @@ def test_cancellation_survives_second_cancel_and_failed_failure_close(
             event = _event(hook_run=run.ref)
             task = asyncio.create_task(h.kernel.process_event(event))
             try:
-                deadline = time.monotonic() + 2.0
-                while not h.runner.turn_active and time.monotonic() < deadline:
-                    await asyncio.sleep(0.01)
-                assert h.runner.turn_active
+                await _wait_for_streamed_started_output(h.sink.updates)
 
                 async with _reject_hook_run_outcome(
                     run.engine, run.run_id, "failed"
@@ -632,10 +634,7 @@ def test_lost_lease_after_cron_start_leaves_run_open(
             event = _event(hook_run=run.ref)
             task = asyncio.create_task(h.kernel.process_event(event, lease=lease))
             try:
-                deadline = time.monotonic() + 2.0
-                while not h.runner.turn_active and time.monotonic() < deadline:
-                    await asyncio.sleep(0.01)
-                assert h.runner.turn_active
+                await _wait_for_streamed_started_output(h.sink.updates)
 
                 await store.release(
                     h.config.stream,
