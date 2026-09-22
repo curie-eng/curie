@@ -1,0 +1,14 @@
+{
+  "apiVersion": "external-secrets.io/v1",
+  "kind": "ExternalSecret",
+  "metadata": {"name": "finance", "namespace": "curie"},
+  "spec": {
+    "refreshInterval": "1h",
+    "secretStoreRef": {"name": "curie-aws", "kind": "SecretStore"},
+    "target": {"name": "curie-finance", "creationPolicy": "CreateOrMerge"},
+    "data": [
+      {"secretKey": "CLIENT_ID", "remoteRef": {"key": "curie/test/finance", "property": "CLIENT_ID"}},
+      {"secretKey": "CLIENT_SECRET", "remoteRef": {"key": "curie/test/finance", "property": "CLIENT_SECRET"}}
+    ]
+  }
+}
