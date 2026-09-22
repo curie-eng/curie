@@ -10,7 +10,10 @@
 #   (b) With every knob unset the consumers stay on the chart-managed Secret,
 #       and the chart Secret still carries both keys.
 #   (c) A BYO installation id the render cannot read (client-only upgrade)
-#       leaves the drain hook fenced: it is told the identity is unobserved.
+#       leaves the drain hook fenced: it is told the identity is unobserved,
+#       and a render with the knob keys absent (retained values) still works.
+#       The lookup-dependent paths (identity read back, switch refusals, the
+#       legacy bridge) need a cluster and are proven outside this script.
 #   (d) Connector BYO validation fails closed: reserved key names, a missing
 #       Secret name or key list, and an agent named in both maps.
 #
@@ -105,10 +108,13 @@ elif mode == "byo":
         fail("a chart connector Secret rendered for a BYO agent")
     if not any(d.get("kind") == "SandboxWarmPool" and d["metadata"]["name"] == "t-curie-agent-acme-a-runner-pool" for d in docs):
         fail("BYO agent acme-a has no SandboxWarmPool")
-    # The chart-valued agent next to it keeps its own chart Secret.
-    for where, env, ref in refs({"TOKEN_C"}):
-        if ref.get("name") != "t-curie-agent-acme-b-connector-secrets":
-            fail(f"chart-valued agent acme-b reads {ref.get('name')}")
+    # The chart-valued agent next to it keeps its own chart Secret, template and pool.
+    expect("TOKEN_C", "t-curie-agent-acme-b-connector-secrets", "TOKEN_C")
+    for kind, name in (("Secret", "t-curie-agent-acme-b-connector-secrets"),
+                       ("SandboxTemplate", "t-curie-agent-acme-b-runner"),
+                       ("SandboxWarmPool", "t-curie-agent-acme-b-runner-pool")):
+        if not any(d.get("kind") == kind and d["metadata"]["name"] == name for d in docs):
+            fail(f"chart-valued agent acme-b lost its {kind}/{name}")
     print(f"ok: {n} webhook, {m} identity and 2 connector consumer refs rewired")
 elif mode == "unobserved":
     hooks = [d for d in docs if d.get("kind") == "Job" and d["metadata"]["name"].endswith("-upgrade-drain")]
@@ -145,6 +151,17 @@ python_check byo "$TMP/byo.yaml" || FAILED=1
 # -- (c) unreadable BYO identity stays fenced ----------------------------------
 render --is-upgrade --set-string installation.idExistingSecret=sm-identity > "$TMP/unobserved.yaml"
 python_check unobserved "$TMP/unobserved.yaml" && echo "ok: an unreadable BYO identity leaves the drain hook fenced" || FAILED=1
+
+# -- (c2) retained values that predate the knobs -----------------------------
+#
+# `helm upgrade --reuse-values` replays values stored before these keys
+# existed, and a nulled key is deleted by coalescing. Either way the render must
+# fall back to the chart-managed Secret instead of dereferencing a nil map.
+render --set installation=null --set api.githubWebhookSecretExistingSecret=null \
+    --set api.githubWebhookSecretExistingSecretKey=null \
+    --set agentSandbox.connectorExistingSecrets=null > "$TMP/retained.yaml" \
+    || fail "a render with the knob keys absent failed"
+python_check default "$TMP/retained.yaml" && echo "ok: absent knob keys keep every consumer on the chart Secret" || FAILED=1
 
 # -- (d) connector BYO validation fails closed ---------------------------------
 must_fail() {
