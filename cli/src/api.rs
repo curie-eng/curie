@@ -162,6 +162,10 @@ pub struct ConnectorManifests {
     pub owned_secret_keys: Vec<String>,
     #[serde(default)]
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The version whose bundle was read. Required on the wire.
+    pub version_id: String,
+    /// plugin.json triggers as stored. Required on the wire, even when empty.
+    pub triggers: Vec<serde_json::Value>,
 }
 
 /// One of an agent's channel bindings (ADR-0118, #1525): `kind` names the

@@ -1585,7 +1585,9 @@ fn deploy_api_response(
                     "manifests": manifests,
                     "owned_secret_name": owned_secret_name,
                     "owned_secret_keys": owned_secret_keys,
-                    "mcp_entries": {}
+                    "mcp_entries": {},
+                    "version_id": format!("version-{target}"),
+                    "triggers": []
                 }),
             )
         }

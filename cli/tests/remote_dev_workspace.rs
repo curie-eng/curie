@@ -82,7 +82,9 @@ fn deploy_response(req: &support::Request, existing: ExistingAgent) -> Response 
                     "manifests": [],
                     "owned_secret_name": "",
                     "owned_secret_keys": [],
-                    "mcp_entries": {}
+                    "mcp_entries": {},
+                    "version_id": "version-acme-bot",
+                    "triggers": []
                 })
                 .to_string(),
             )
@@ -295,7 +297,10 @@ fn fanout_response(
             .to_string(),
         ),
         ("POST", path) if path.ends_with("/versions") => {
-            let agent = path.trim_start_matches("/agents/").trim_end_matches("/versions").trim_end_matches('/');
+            let agent = path
+                .trim_start_matches("/agents/")
+                .trim_end_matches("/versions")
+                .trim_end_matches('/');
             Response::json(
                 201,
                 &json!({
@@ -336,9 +341,18 @@ fn fanout_response(
             Response::json(201, &response.to_string())
         }
         ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
-            Response::json(200, &json!({
-                "manifests": [], "owned_secret_name": "", "owned_secret_keys": [], "mcp_entries": {}
-            }).to_string())
+            Response::json(
+                200,
+                &json!({
+                    "manifests": [],
+                    "owned_secret_name": "",
+                    "owned_secret_keys": [],
+                    "mcp_entries": {},
+                    "version_id": "version",
+                    "triggers": []
+                })
+                .to_string(),
+            )
         }
         (method, path) => Response::json(500, &format!("unexpected {method} {path}")),
     }

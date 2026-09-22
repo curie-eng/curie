@@ -224,7 +224,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         "the released 0.9.0 head must remain pinned"
     );
     assert_eq!(
-        catalog["windows"]["0.10.0"]["schema_head"], "0046",
+        catalog["windows"]["0.10.0"]["schema_head"], "0047",
         "the candidate 0.10.0 rollback head must match this tree"
     );
     assert!(
@@ -302,7 +302,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
             && scenario.contains("outside its declared schema range")
             && scenario.contains("if echo \"$err\" | grep -F \"could not establish\"")
             && scenario.contains("failed identity classification"),
-        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and candidate head 0046 while rejecting identity failures"
+        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and candidate head 0047 while rejecting identity failures"
     );
     assert!(
         scenario.contains("helm_version") && scenario.contains("0.10.0"),

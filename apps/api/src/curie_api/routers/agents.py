@@ -619,6 +619,8 @@ async def read_version_connectors(
                 # secretKeyRef, and resolving it would defeat the point (#1163).
                 owned_secret_name=secret_name,
                 owned_secret_keys=bundles.owned_secret_keys(declared),
+                version_id=version.id,
+                triggers=bundles.read_manifest_triggers(Path(tmp)),
             )
 
     # `object_name` fails closed on an agent name that forges its `-mcp-` join
