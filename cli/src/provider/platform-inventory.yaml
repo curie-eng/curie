@@ -11,7 +11,9 @@
 #   target         the Secret an install reads the keys from. store: sm rows
 #                  name the NEW Secret ESO writes; ESO never adopts the chart's
 #                  own <fullname>-secrets. Placeholders: {release}, {fullname},
-#                  {agent}, {operator} (any operator-chosen name).
+#                  {agent}, {id} (a runtime-generated hex id). A name the
+#                  operator chooses is never a placeholder; it is covered
+#                  only through the chart knob that sets it.
 #   store          sm (Secrets Manager is the source of truth, ESO syncs) or
 #                  cluster (stays in-cluster, re-minted or re-provisioned)
 #   chart          default_secret: what the chart renders with no knob set;
@@ -400,16 +402,16 @@ entries:
         - secret: grafanaConnector.secretName
           key: grafanaConnector.secretKey
 
-  # Provisioned by whoever installed Grafana, in Grafana's namespace; the
-  # token hook Jobs only read it.
+  # Provisioned by whoever installed Grafana; the token hook Jobs only read
+  # it. A rebuild cannot regenerate it, so Secrets Manager holds it.
   - logical_name: grafana-admin
     class: external
-    target: grafana-admin
+    target: "{release}-curie-grafana-admin"
     keys: [admin-user, admin-password]
     consumers: [grafana-token-updater, grafana-token-cleanup]
-    rotation_owner: workload:grafana
+    rotation_owner: sm
     update_policy: replace
-    store: cluster
+    store: sm
     chart:
       knobs:
         - secret: grafanaConnector.adminSecretName
@@ -432,21 +434,30 @@ entries:
         - secret: otelCollector.headersExistingSecret
           key: otelCollector.headersSecretKey
 
-  # Registry pull credentials are a list of operator-chosen names with no
-  # single knob, so any name matches, but only for this key.
+  # Registry pull credentials. Each workload takes a list of Secret names, so
+  # only the names those lists set are covered. A rebuild cannot regenerate
+  # them, so Secrets Manager holds them.
   - logical_name: image-pull
     class: external
-    target: "{operator}"
+    target: "{release}-curie-image-pull"
     keys: [.dockerconfigjson]
-    consumers: []
+    consumers: [api, dispatcher, mail-adapter, worker, ui, runner]
     rotation_owner: sm
     update_policy: replace
-    store: cluster
+    store: sm
+    chart:
+      knobs:
+        - secret: api.imagePullSecrets
+        - secret: dispatcher.imagePullSecrets
+        - secret: mailAdapter.imagePullSecrets
+        - secret: worker.imagePullSecrets
+        - secret: ui.imagePullSecrets
+        - secret: agentSandbox.runner.imagePullSecrets
 
   # Issued and renewed by cert-manager (or the operator) in-cluster.
   - logical_name: api-ingress-tls
     class: external
-    target: "{operator}"
+    target: "{release}-curie-api-tls"
     keys: [tls.crt, tls.key]
     consumers: [ingress]
     rotation_owner: workload:cert-manager
@@ -460,7 +471,7 @@ entries:
   # rendered by the chart; listed so the inventory is complete.
   - logical_name: publication-credential
     class: throwaway
-    target: "curie-publication-{operator}"
+    target: "curie-publication-{id}"
     keys: [credential]
     consumers: [publication-job]
     rotation_owner: mint:worker

@@ -409,6 +409,20 @@ spec:
                   items:
                     - key: token
                       path: token
+        - name: csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            nodePublishSecretRef:
+              name: csi-creds
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inv-curie-api
+secrets:
+  - name: sa-token
+imagePullSecrets:
+  - name: sa-pull
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -468,6 +482,13 @@ fn extract_refs_walks_every_reference_shape() {
         t("whole-files", None, dep),
         t("projected-src", Some("token"), dep),
         t("regcred", Some(".dockerconfigjson"), dep),
+        t("csi-creds", None, dep),
+        t("sa-token", None, "ServiceAccount/inv-curie-api"),
+        t(
+            "sa-pull",
+            Some(".dockerconfigjson"),
+            "ServiceAccount/inv-curie-api",
+        ),
         t("api-tls", None, "Ingress/inv-curie-api"),
         t(
             "inv-curie-secrets",
@@ -576,19 +597,225 @@ fn an_unlisted_ref_is_returned() {
 }
 
 #[test]
-fn operator_and_agent_placeholders_match() {
-    let mut tls = entry("ingress-tls", "{operator}", &["tls.crt"]);
-    tls.store = Store::Cluster;
+fn an_operator_placeholder_is_refused() {
+    let text = err_text(parse_inventory(&doc(&row(
+        "tls",
+        "{operator}",
+        "[tls.crt]",
+        "sm",
+        "sm",
+        "",
+    ))));
+    assert!(text.contains("operator"), "{text}");
+}
+
+#[test]
+fn the_agent_placeholder_matches_one_agent_name() {
     let agent = entry(
         "agent-connector",
         "{fullname}-agent-{agent}-connector-secrets",
         &["TOKEN"],
     );
+    let refs = [rref(
+        "inv-curie-agent-sre-bot-connector-secrets",
+        Some("TOKEN"),
+    )];
+    assert!(uncovered(&refs, &[agent], &Value::Null, &ctx()).is_empty());
+}
+
+fn tls_entry() -> InventoryEntry {
+    let mut e = entry(
+        "api-ingress-tls",
+        "{release}-curie-api-tls",
+        &["tls.crt", "tls.key"],
+    );
+    e.store = Store::Cluster;
+    e.chart = Some(ChartBinding {
+        default_secret: None,
+        knobs: vec![ChartKnob {
+            secret: "api.ingress.tls.secretName".into(),
+            key: None,
+        }],
+    });
+    e
+}
+
+fn image_pull_entry() -> InventoryEntry {
+    let mut e = entry(
+        "image-pull",
+        "{release}-curie-image-pull",
+        &[".dockerconfigjson"],
+    );
+    e.chart = Some(ChartBinding {
+        default_secret: None,
+        knobs: vec![
+            ChartKnob {
+                secret: "api.imagePullSecrets".into(),
+                key: None,
+            },
+            ChartKnob {
+                secret: "worker.imagePullSecrets".into(),
+                key: None,
+            },
+        ],
+    });
+    e
+}
+
+#[test]
+fn a_knob_covers_only_the_name_it_sets() {
+    let values = json!({"api": {"ingress": {"tls": {"secretName": "acme-tls"}}}});
+    let entries = [tls_entry()];
+    assert!(uncovered(&[rref("acme-tls", None)], &entries, &values, &ctx()).is_empty());
+    assert!(uncovered(
+        &[rref("acme-tls", Some("tls.key"))],
+        &entries,
+        &values,
+        &ctx()
+    )
+    .is_empty());
+    let out = uncovered(
+        &[rref("other-tls", None), rref("other-tls", Some("tls.key"))],
+        &entries,
+        &values,
+        &ctx(),
+    );
+    assert_eq!(out.len(), 2, "{out:?}");
+    // Unset, the knob covers nothing.
+    assert_eq!(
+        uncovered(&[rref("acme-tls", None)], &entries, &json!({}), &ctx()).len(),
+        1
+    );
+}
+
+#[test]
+fn a_list_knob_covers_each_listed_name() {
+    let values = json!({
+        "api": {"imagePullSecrets": [{"name": "reg-a"}, {"name": "reg-b"}]},
+        "worker": {"imagePullSecrets": ["reg-c"]},
+    });
+    let entries = [image_pull_entry()];
     let refs = [
-        rref("anything-the-operator-chose", None),
-        rref("inv-curie-agent-sre-bot-connector-secrets", Some("TOKEN")),
+        rref("reg-a", Some(".dockerconfigjson")),
+        rref("reg-b", Some(".dockerconfigjson")),
+        rref("reg-c", Some(".dockerconfigjson")),
     ];
-    assert!(uncovered(&refs, &[tls, agent], &Value::Null, &ctx()).is_empty());
+    assert!(uncovered(&refs, &entries, &values, &ctx()).is_empty());
+    let out = uncovered(
+        &[
+            rref("reg-unlisted", Some(".dockerconfigjson")),
+            rref("reg-a", Some("token")),
+        ],
+        &entries,
+        &values,
+        &ctx(),
+    );
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(uncovered(&refs, &entries, &json!({}), &ctx()).len() == 3);
+}
+
+#[test]
+fn an_unlisted_whole_secret_ref_is_returned() {
+    // envFrom and an unfiltered volume take the whole Secret; a key-less ref
+    // is not a free pass past a keyed inventory.
+    let values = json!({
+        "api": {"imagePullSecrets": [{"name": "reg-a"}], "ingress": {"tls": {"secretName": "acme-tls"}}}
+    });
+    let entries = [postgres_entry(), tls_entry(), image_pull_entry()];
+    let manifest = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: planted
+spec:
+  containers:
+    - name: c
+      envFrom:
+        - secretRef:
+            name: unlisted-env
+  volumes:
+    - name: whole
+      secret:
+        secretName: unlisted-volume
+    - name: csi
+      csi:
+        driver: secrets-store.csi.k8s.io
+        nodePublishSecretRef:
+          name: unlisted-csi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: planted
+secrets:
+  - name: unlisted-sa
+imagePullSecrets:
+  - name: unlisted-sa-pull
+"#;
+    let refs = extract_refs(manifest).expect("parse manifest");
+    let mut names: Vec<String> = uncovered(&refs, &entries, &values, &ctx())
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "unlisted-csi",
+            "unlisted-env",
+            "unlisted-sa",
+            "unlisted-sa-pull",
+            "unlisted-volume"
+        ]
+    );
+}
+
+#[test]
+fn a_renamed_key_does_not_also_cover_the_inventory_key() {
+    let mut e = entry(
+        "github-app-key",
+        "{release}-curie-github-app",
+        &["githubAppPrivateKey"],
+    );
+    e.chart = Some(ChartBinding {
+        default_secret: Some("{fullname}-secrets".into()),
+        knobs: vec![ChartKnob {
+            secret: "api.githubAppExistingSecret".into(),
+            key: Some("api.githubAppExistingSecretKey".into()),
+        }],
+    });
+    let values = json!({"api": {
+        "githubAppExistingSecret": "byo-github-app",
+        "githubAppExistingSecretKey": "privateKey"
+    }});
+    let out = uncovered(
+        &[rref("byo-github-app", Some("githubAppPrivateKey"))],
+        &[e],
+        &values,
+        &ctx(),
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+}
+
+#[test]
+fn external_credentials_a_rebuild_cannot_regenerate_are_provider_held() {
+    let entries = platform_inventory().expect("platform");
+    for name in ["image-pull", "grafana-admin"] {
+        let e = entries
+            .iter()
+            .find(|e| e.logical_name == name)
+            .unwrap_or_else(|| panic!("{name} listed"));
+        assert_eq!(e.store, Store::Sm, "{name}");
+    }
+    let tls = entries
+        .iter()
+        .find(|e| e.logical_name == "api-ingress-tls")
+        .expect("tls listed");
+    assert_eq!(tls.store, Store::Cluster);
+    assert_eq!(
+        tls.rotation_owner,
+        RotationOwner::Workload("cert-manager".into())
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -653,6 +880,71 @@ fn bundle_entries_carry_workload_rotation() {
     let mut all = platform_inventory().expect("platform");
     all.extend(entries);
     validate_inventory(&all).expect("platform plus bundle validates");
+}
+
+fn shared_bundle(alpha_rotates: bool, beta_rotates: bool) -> String {
+    let rotation = |on: bool| {
+        if on {
+            "    secret_rotation:\n      TOKEN: workload\n"
+        } else {
+            ""
+        }
+    };
+    format!(
+        "connectors:\n  alpha:\n    image: ghcr.io/example/alpha:1.0.0\n    secrets: [TOKEN]\n{}  \
+         beta:\n    image: ghcr.io/example/beta:1.0.0\n    secrets: [TOKEN]\n{}",
+        rotation(alpha_rotates),
+        rotation(beta_rotates)
+    )
+}
+
+fn hosted_token_entry(bundle: &str) -> InventoryEntry {
+    let decl = parse_connectors(bundle).expect("bundle parses");
+    let entries = bundle_entries(&decl, "fin").expect("bundle entries");
+    let hosted: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.target == "{release}-fin-connector-secrets")
+        .collect();
+    assert_eq!(hosted.len(), 1, "{hosted:?}");
+    hosted.into_iter().next().expect("one")
+}
+
+#[test]
+fn a_shared_key_lists_every_consumer() {
+    let e = hosted_token_entry(&shared_bundle(false, false));
+    assert_eq!(e.keys, vec!["TOKEN".to_string()]);
+    assert_eq!(e.consumers, vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(e.rotation_owner, RotationOwner::Sm);
+}
+
+#[test]
+fn a_shared_key_is_owned_by_its_rotator_in_either_order() {
+    for (alpha, beta, owner) in [(true, false, "alpha"), (false, true, "beta")] {
+        let e = hosted_token_entry(&shared_bundle(alpha, beta));
+        assert_eq!(e.consumers, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(e.rotation_owner, RotationOwner::Workload(owner.into()));
+        assert_eq!(e.rotated_keys, vec!["TOKEN".to_string()]);
+    }
+}
+
+#[test]
+fn two_rotators_on_one_key_are_refused_naming_both() {
+    let decl = parse_connectors(&shared_bundle(true, true)).expect("bundle parses");
+    let text = err_text(bundle_entries(&decl, "fin"));
+    assert!(text.contains("alpha") && text.contains("beta"), "{text}");
+}
+
+#[test]
+fn a_rotation_value_other_than_workload_is_refused_at_parse() {
+    let bundle = "\
+connectors:
+  ledger:
+    image: ghcr.io/example/ledger-mcp:1.0.0
+    secrets: [TOKEN]
+    secret_rotation:
+      TOKEN: sm
+";
+    assert!(parse_connectors(bundle).is_err());
 }
 
 // --------------------------------------------------------------------------

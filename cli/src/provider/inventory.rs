@@ -47,7 +47,9 @@ pub struct ChartBinding {
 }
 
 /// One `existingSecret` style knob: the values path naming the Secret and,
-/// when the chart lets the key be renamed too, the path naming the key.
+/// when the chart lets the key be renamed too, the path naming the key. The
+/// secret path may hold one name, or a list of `{name: X}` maps or strings
+/// (an `imagePullSecrets` list), and then covers each listed name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChartKnob {
@@ -58,8 +60,10 @@ pub struct ChartKnob {
 
 /// Placeholders a target or default_secret pattern may use. `{release}` and
 /// `{fullname}` expand from the release; `{agent}` matches one agent name;
-/// `{operator}` matches any name the operator chose.
-pub const PLACEHOLDERS: [&str; 4] = ["release", "fullname", "agent", "operator"];
+/// `{id}` matches one lowercase hex id a workload generates at runtime. A name
+/// an operator chooses is never a placeholder: it resolves through a chart
+/// knob, so only the name the values actually set is covered.
+pub const PLACEHOLDERS: [&str; 4] = ["release", "fullname", "agent", "id"];
 
 /// Who rotates the value. `sm` is the provider. `workload:<name>` is a
 /// consumer that writes the value back. `mint:<name>` is a Curie mint.

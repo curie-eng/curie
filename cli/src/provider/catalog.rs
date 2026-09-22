@@ -80,18 +80,21 @@ pub fn validate_inventory(entries: &[InventoryEntry]) -> Result<()> {
 /// Inventory entries one agent's bundle adds.
 ///
 /// Every connector with Curie-resolved names (bare `secrets` plus
-/// `secret_files` keys) contributes a sandbox entry, the per-agent Secret the
-/// runner template reads. A hosted connector also contributes a hosted entry,
-/// the Secret its Deployment reads, and that is the only Secret a workload can
-/// rotate, so `secret_rotation` lands there. A key two connectors share is
-/// listed once per target, under the first connector; a later connector that
-/// declares rotation on a key it does not own is refused.
+/// `secret_files` keys) contributes to the sandbox entry, the per-agent Secret
+/// the runner template reads. A hosted connector also contributes to the
+/// hosted Secret its Deployment reads, and that is the only Secret a workload
+/// can rotate, so `secret_rotation` lands there.
+///
+/// Keys aggregate by (target, key) before any entry is built: a key's
+/// consumers are every connector declaring it, and a key one of them rotates
+/// is owned by that workload. Two connectors rotating one key is refused. The
+/// result does not depend on the order connectors are read in.
 pub fn bundle_entries(decl: &ConnectorsFileDecl, agent: &str) -> Result<Vec<InventoryEntry>> {
     let sandbox_target = format!("{{fullname}}-agent-{agent}-connector-secrets");
     let hosted_target = format!("{{release}}-{agent}-connector-secrets");
-    let mut sandbox_seen = BTreeSet::new();
-    let mut hosted_seen = BTreeSet::new();
-    let mut entries = Vec::new();
+    let mut sandbox_keys = BTreeSet::new();
+    // key -> (connectors declaring it, connectors rotating it)
+    let mut hosted: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
     for (connector, spec) in &decl.connectors {
         let resolved: Vec<String> = spec
             .secrets
@@ -110,58 +113,90 @@ pub fn bundle_entries(decl: &ConnectorsFileDecl, agent: &str) -> Result<Vec<Inve
                 );
             }
         }
-        let hosted = spec.url.is_none();
-        if !spec.secret_rotation.is_empty() && !hosted {
+        let is_hosted = spec.url.is_none();
+        if !spec.secret_rotation.is_empty() && !is_hosted {
             bail!("agent {agent} connector {connector}: secret_rotation needs a hosted connector");
         }
+        sandbox_keys.extend(resolved.iter().cloned());
+        if !is_hosted {
+            continue;
+        }
+        for key in resolved {
+            let (consumers, rotators) = hosted.entry(key.clone()).or_default();
+            consumers.insert(connector.clone());
+            // Parsing admits only `workload`, so a declared key is a rotated key.
+            if spec.secret_rotation.contains_key(&key) {
+                rotators.insert(connector.clone());
+            }
+        }
+    }
 
-        let sandbox_keys: Vec<String> = resolved
-            .iter()
-            .filter(|key| sandbox_seen.insert((*key).clone()))
-            .cloned()
-            .collect();
-        if !sandbox_keys.is_empty() {
+    let mut entries = Vec::new();
+    if !sandbox_keys.is_empty() {
+        entries.push(bundle_entry(
+            format!("{agent}.sandbox"),
+            sandbox_target,
+            sandbox_keys.into_iter().collect(),
+            vec!["runner".into()],
+            RotationOwner::Sm,
+            Vec::new(),
+        ));
+    }
+
+    // consumers -> rotator (None for provider-rotated keys) -> keys
+    let mut groups: BTreeMap<Vec<String>, BTreeMap<Option<String>, Vec<String>>> = BTreeMap::new();
+    for (key, (consumers, rotators)) in hosted {
+        if rotators.len() > 1 {
+            bail!(
+                "agent {agent}: connectors {} all declare rotation on {key} in {hosted_target}; \
+                 one key has one rotating workload",
+                rotators.into_iter().collect::<Vec<_>>().join(" and ")
+            );
+        }
+        groups
+            .entry(consumers.into_iter().collect())
+            .or_default()
+            .entry(rotators.into_iter().next())
+            .or_default()
+            .push(key);
+    }
+    for (consumers, mut by_rotator) in groups {
+        let base = format!("{agent}.{}.hosted", consumers.join("."));
+        let static_keys = by_rotator.remove(&None).unwrap_or_default();
+        if by_rotator.is_empty() {
             entries.push(bundle_entry(
-                format!("{agent}.{connector}.sandbox"),
-                sandbox_target.clone(),
-                sandbox_keys,
-                vec!["runner".into()],
+                base,
+                hosted_target.clone(),
+                static_keys,
+                consumers,
                 RotationOwner::Sm,
                 Vec::new(),
             ));
-        }
-
-        if !hosted {
             continue;
         }
-        let mut hosted_keys = Vec::new();
-        for key in &resolved {
-            if hosted_seen.insert(key.clone()) {
-                hosted_keys.push(key.clone());
-            } else if spec.secret_rotation.contains_key(key) {
-                bail!(
-                    "agent {agent} connector {connector}: declares rotation on {key}, which \
-                     an earlier connector already lists in {hosted_target}"
-                );
-            }
+        // Keys the provider rotates ride with the first rotating workload's
+        // entry; each further rotator gets an entry of its own.
+        let several = by_rotator.len() > 1;
+        let mut static_keys = Some(static_keys);
+        for (rotator, rotated) in by_rotator {
+            let rotator = rotator.expect("the provider group was removed");
+            let mut keys = static_keys.take().unwrap_or_default();
+            keys.extend(rotated.iter().cloned());
+            keys.sort();
+            let name = if several {
+                format!("{base}.{rotator}")
+            } else {
+                base.clone()
+            };
+            entries.push(bundle_entry(
+                name,
+                hosted_target.clone(),
+                keys,
+                consumers.clone(),
+                RotationOwner::Workload(rotator),
+                rotated,
+            ));
         }
-        if hosted_keys.is_empty() {
-            continue;
-        }
-        let rotated: Vec<String> = spec.secret_rotation.keys().cloned().collect();
-        let owner = if rotated.is_empty() {
-            RotationOwner::Sm
-        } else {
-            RotationOwner::Workload(connector.clone())
-        };
-        entries.push(bundle_entry(
-            format!("{agent}.{connector}.hosted"),
-            hosted_target.clone(),
-            hosted_keys,
-            vec![connector.clone()],
-            owner,
-            rotated,
-        ));
     }
     for entry in &entries {
         entry
