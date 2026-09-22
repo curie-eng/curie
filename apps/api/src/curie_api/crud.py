@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from channel_protocol import scoped_conversation_id
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2937,6 +2937,16 @@ OIDC_LOGIN_TTL = timedelta(minutes=10)
 #: refused (a flood can delay logins, but cannot exhaust the database).
 OIDC_LOGIN_ATTEMPT_CAP = 1000
 
+#: Advisory-lock key serializing the prune/count/insert in
+#: :func:`create_oidc_login_attempt`, so concurrent login starts cannot all
+#: pass the count and overshoot :data:`OIDC_LOGIN_ATTEMPT_CAP`. It is the
+#: TWO-argument ``pg_advisory_xact_lock(int4, int4)`` form, whose lock space is
+#: separate from the one-argument bigint space used elsewhere (including the
+#: test-only write gates); the class is the issue number (#2908), matching the
+#: convention of ``routers/state.py``. One table-wide lock, not a per-row key:
+#: the cap is a single global count. Held only until the transaction ends.
+OIDC_LOGIN_ATTEMPT_LOCK = (2908, 0)
+
 
 class OidcLoginAttemptsExhausted(Exception):
     """Raised instead of creating an attempt when :data:`OIDC_LOGIN_ATTEMPT_CAP` is reached."""
@@ -2973,20 +2983,32 @@ async def create_oidc_login_attempt(session: AsyncSession) -> OidcLoginStart:
     code intercepted on the way back cannot be redeemed without this row.
 
     The route that calls this is unauthenticated, so expired attempts are
-    pruned here, and once :data:`OIDC_LOGIN_ATTEMPT_CAP` live attempts exist
-    this raises :class:`OidcLoginAttemptsExhausted` without writing: the table
-    holds at most the cap, not whatever a flood manages within
-    :data:`OIDC_LOGIN_TTL`. The count is not serialized with the insert, so
-    concurrent starts can overshoot the cap by at most their own number.
+    pruned here, and once :data:`OIDC_LOGIN_ATTEMPT_CAP` unexpired attempts
+    exist this raises :class:`OidcLoginAttemptsExhausted` without writing: the
+    table holds at most the cap, not whatever a flood manages within
+    :data:`OIDC_LOGIN_TTL`.
+
+    Consumed attempts count too. A row stays until it expires whether or not
+    its callback ran, and the callback consumes before it looks at the IdP's
+    answer, so an anonymous ``login -> callback?error=x`` loop consumes rows at
+    will; if consuming freed capacity, that loop would grow the table without
+    bound while every login still succeeded.
+
+    Prune, count and insert run under :data:`OIDC_LOGIN_ATTEMPT_LOCK`, so
+    concurrent starts queue behind one another and each sees the rows the
+    previous one committed: the cap is exact, not overshot by the number of
+    racers. The lock is transaction-scoped and released by the commit on either
+    path.
     """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:cls, :key)"),
+        {"cls": OIDC_LOGIN_ATTEMPT_LOCK[0], "key": OIDC_LOGIN_ATTEMPT_LOCK[1]},
+    )
     await session.execute(delete(OidcLoginAttempt).where(OidcLoginAttempt.expires_at <= func.now()))
     live = await session.scalar(
         select(func.count())
         .select_from(OidcLoginAttempt)
-        .where(
-            OidcLoginAttempt.consumed_at.is_(None),
-            OidcLoginAttempt.expires_at > func.now(),
-        )
+        .where(OidcLoginAttempt.expires_at > func.now())
     )
     if (live or 0) >= OIDC_LOGIN_ATTEMPT_CAP:
         await session.commit()
