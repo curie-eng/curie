@@ -706,3 +706,93 @@ def test_boot_compaction_conflict_reloads_and_replays_the_intervening_record(
     assert state.value is not None
     assert _size(state.value) <= _CAP - _RESERVE
     assert "INJECTED-2927" in json.dumps(state.value)
+
+
+# --- Review P1: a turn irreducible past the reserve bound is a capacity refusal ---
+
+
+def _tiny_tool_calls_script(calls: int) -> list[Any]:
+    """A turn of many tiny tool calls: almost all of it is irreducible structure.
+
+    Every string here is shorter than a digest marker, so bounding cannot shrink
+    it; only roles, ids, and block order remain, and those are never dropped.
+    """
+
+    script: list[Any] = []
+    for i in range(calls):
+        script.append(
+            AssistantMessage(
+                content=[ToolUseBlock(id=f"u{i}", name="Bash", input={"command": "ls"})],
+                model="fake-model",
+            )
+        )
+        script.append(
+            UserMessage(
+                content=[ToolResultBlock(tool_use_id=f"u{i}", content="ok", is_error=False)]
+            )
+        )
+    script.append(AssistantMessage(content=[TextBlock(text="done")], model="fake-model"))
+    script.append(_result("done"))
+    return script
+
+
+class _CapturingStore:
+    """Records the turn the runner hands its store; used only to size the fixture."""
+
+    def __init__(self) -> None:
+        self.records: list[Any] = []
+
+    async def load(self) -> list[Any]:
+        return []
+
+    async def append(self, record: Any) -> None:
+        self.records.append(record)
+
+
+_TINY_CALLS = 290
+
+
+def test_turn_irreducible_past_the_reserve_bound_ends_with_the_capacity_final() -> None:
+    """A turn whose irreducible structure fits 64 KiB but not 64 KiB minus the
+    8 KiB reserve passes the runner's own bound, cannot be stored under the
+    reserve, and must end with the loud capacity refusal rather than DONE."""
+
+    from curie_runner.history import HistoryError, bound_turn_record
+
+    async def probe() -> TurnRecord:
+        capture = _CapturingStore()
+        runner = _runner(
+            capture,  # type: ignore[arg-type]
+            FakeModelSession(lambda: _tiny_tool_calls_script(_TINY_CALLS)),
+        )
+        final = await _run_turn(runner, "TINY-2927: run ls many times", "1")
+        assert final.status is SessionStatus.DONE
+        assert len(capture.records) == 1
+        record = capture.records[0]
+        assert isinstance(record, TurnRecord)
+        return record
+
+    record = anyio.run(probe)
+    # Fixture precondition: the runner-bounded turn fits the whole cap, but its
+    # irreducible structure cannot fit the cap minus the reserve.
+    assert _CAP - _RESERVE < _size([record.to_dict()]) <= _CAP, _size([record.to_dict()])
+    with pytest.raises(HistoryError):
+        bound_turn_record(record, max_value_bytes=_CAP - _RESERVE)
+
+    state = _CappedCasState()
+
+    async def go() -> Final:
+        async with TestServer(state.app()) as server:
+            runner = _runner(
+                StateApiTranscriptStore(str(server.make_url(_KEY)), token=None),
+                FakeModelSession(lambda: _tiny_tool_calls_script(_TINY_CALLS)),
+            )
+            final = await _run_turn(runner, "TINY-2927: run ls many times", "1")
+            assert runner.history_durable is False
+            return final
+
+    final = anyio.run(go)
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE, final
+    assert final.text == "run failed: conversation history could not be persisted"
+    # Nothing was stored.
+    assert state.value is None

@@ -22,6 +22,8 @@ from curie_runner.history import (
     HistoryCapacityError,
     SummaryRecord,
     TurnRecord,
+    _parse_records,
+    build_conversation_replay,
     compact_transcript_value,
 )
 
@@ -187,3 +189,31 @@ def test_markers_alone_over_the_cap_are_irreducible() -> None:
     with pytest.raises(HistoryCapacityError) as caught:
         compact_transcript_value(value)
     assert caught.value.status == 413
+
+
+def test_publication_outcome_stays_visible_in_the_compacted_replay() -> None:
+    """#2927 review P1: compaction keeps the worker's marker AND its outcome text.
+
+    The marker is the publication idempotency record, but its assistant text is
+    also the only place the resumed model learns the pull request was published.
+    After compaction the replay built from the stored value must still carry it.
+    """
+
+    url = "https://github.com/acme-corp/pricing/pull/4"
+    outcome_text = f"Published PR #4 at {url}"
+    marker = {
+        "user": "Platform publication outcome",
+        "assistant": outcome_text,
+        "ts": "2026-09-22T00:00:02Z",
+        "publication_id": "00000000-0000-0000-0000-000000000004",
+    }
+    value = [_turn("older", 20_000), marker, _turn("latest", 20_000)]
+
+    compacted = compact_transcript_value(value)
+
+    # The raw idempotency marker still exists verbatim.
+    assert marker in compacted
+    replay, _summary = build_conversation_replay(_parse_records(compacted))
+    replay_text = json.dumps([message.to_dict() for message in replay.messages])
+    assert outcome_text in replay_text, "the publication outcome vanished from the replay"
+    assert "latest request" in replay_text
