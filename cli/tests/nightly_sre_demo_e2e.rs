@@ -1,15 +1,14 @@
 //! Issue #2246 / #2854: the nightly SRE demo e2e workflow is the first
-//! automated tier that exercises the six demo assertions (read, approved
-//! scale, re-arm, configuration denial, RBAC ceiling, coding PR) on kind with
-//! the pinned Kubernetes MCP server, a live provider, and an allowlisted
-//! throwaway repo. Turns start with `curie cluster message`. Approvals resolve
-//! through `curie cluster approvals` and an operator principal. No Slack app
-//! is required.
+//! automated tier that exercises the five demo assertions (read, approved
+//! scale, re-arm, configuration denial, RBAC ceiling) on kind with the pinned
+//! Kubernetes MCP server and a live provider. Turns start with
+//! `curie cluster message`. Approvals resolve through `curie cluster approvals`
+//! and an operator principal. No Slack app is required.
 //!
-//! This file is a text-contract test against the workflow YAML plus an
-//! executing test of the skip script. A missing throwaway repo or live
-//! provider must skip with the reason in the run summary, never report a
-//! green that proved the six assertions. Secrets must never appear on a
+//! This file is a text contract test against the workflow YAML plus an
+//! executing test of the skip script. A missing live provider must skip with
+//! the reason in the run summary, never report a green that proved the five
+//! assertions. Secrets must never appear on a
 //! `run:` line.
 
 use std::fs;
@@ -83,10 +82,7 @@ fn run_script(phase: &str, extra_env: &[(&str, &str)], work: &Path) -> std::proc
 }
 
 fn populated_prereqs() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("CURIE_CREDENTIALS", "sk-or-test-not-a-real-key"),
-        ("CI_THROWAY_REPO", "acme-corp/sre-demo-throwaway"),
-    ]
+    vec![("CURIE_CREDENTIALS", "sk-or-test-not-a-real-key")]
 }
 
 #[test]
@@ -225,20 +221,6 @@ fn workflow_pins_the_same_kubernetes_mcp_digest_as_sre_bot() {
 }
 
 #[test]
-fn workflow_wires_the_throwaway_repo_allowlist_from_a_secret() {
-    let text = workflow();
-    assert!(
-        text.contains("api.githubRepoAllowlist"),
-        "the SRE demo install must set api.githubRepoAllowlist; file contents:\n{text}"
-    );
-    assert!(
-        text.contains("secrets.CI_THROWAY_REPO") || text.contains("CI_THROWAY_REPO"),
-        "the allowlist value must come from the CI throwaway-repo secret, not a \
-         committed slug; file contents:\n{text}"
-    );
-}
-
-#[test]
 fn workflow_skips_the_live_job_unless_prereqs_are_ready() {
     let text = workflow();
     assert!(
@@ -282,25 +264,27 @@ fn workflow_paths_include_outcome_probe_and_python_tests() {
 }
 
 #[test]
-fn script_names_all_six_demo_assertions() {
+fn script_names_exactly_five_demo_assertions_in_order() {
     let text = script();
-    for needle in [
-        "run_assertion read assert_read",
-        "run_assertion scale assert_scale",
-        "run_assertion rearm assert_rearm",
-        "run_assertion configuration-denial assert_configuration_denial",
-        "run_assertion rbac-ceiling assert_rbac_ceiling",
-        "run_assertion coding-handoff assert_coding_handoff",
-    ] {
-        assert!(
-            text.contains(needle),
-            "sre-demo-e2e.sh must invoke {needle}; file contents:\n{text}"
-        );
-    }
+    let assertions: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("run_assertion "))
+        .collect();
+    assert_eq!(
+        assertions,
+        [
+            "read assert_read",
+            "scale assert_scale",
+            "rearm assert_rearm",
+            "configuration-denial assert_configuration_denial",
+            "rbac-ceiling assert_rbac_ceiling",
+        ],
+        "sre-demo-e2e.sh must invoke exactly the five retained assertions in order"
+    );
 }
 
 #[test]
-fn missing_throwaway_or_credentials_skips_with_reason_in_the_summary() {
+fn missing_credentials_skip_with_reason_in_the_summary() {
     let work = tempfile::tempdir().expect("tempdir");
     let output = run_script("prereqs", &[], work.path());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -316,11 +300,8 @@ fn missing_throwaway_or_credentials_skips_with_reason_in_the_summary() {
         "the run summary must say the demo was skipped; summary:\n{summary}"
     );
     assert!(
-        summary.contains("CI_THROWAY_REPO")
-            || summary.contains("CURIE_CREDENTIALS")
-            || summary.contains("throwaway")
-            || summary.contains("live provider"),
-        "the skip reason must name the missing live-provider or throwaway prerequisite; \
+        summary.contains("CURIE_CREDENTIALS") || summary.contains("live provider"),
+        "the skip reason must name the missing live-provider prerequisite; \
          summary:\n{summary}"
     );
     assert!(
@@ -371,13 +352,15 @@ fn outcome_checks_reject_false_positives_by_execution() {
 #[test]
 fn populated_prereqs_report_ready_without_touching_slack_or_kind() {
     let work = tempfile::tempdir().expect("tempdir");
-    let output = run_script("prereqs", &populated_prereqs(), work.path());
+    let mut prereqs = populated_prereqs();
+    prereqs.push(("CURIE_SRE_DEMO_REQUIRED", "1"));
+    let output = run_script("prereqs", &prereqs, work.path());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let github_output = fs::read_to_string(work.path().join("output.txt")).unwrap_or_default();
     assert!(
         output.status.success(),
-        "populated prereqs must exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "provider credentials alone must make required prereqs ready\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         github_output.contains("ready=true"),

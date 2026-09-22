@@ -297,9 +297,15 @@ def _capped_history_app(
         append_attempts.append(await request.json())
         return web.Response(status=append_status, text=body)
 
+    async def reject_compaction(_request: web.Request) -> web.Response:
+        # #2927: a genuinely irreducible thread. The compaction rewrite is also
+        # over the cap, so boot keeps the #2820 refusal.
+        return web.Response(status=413, text=body)
+
     app.router.add_get("/agents/A/state/memory", get_memory)
     app.router.add_get("/agents/A/state/transcript/t1", get_history)
     app.router.add_post("/agents/A/state/transcript/t1/append", reject_summary)
+    app.router.add_put("/agents/A/state/transcript/t1", reject_compaction)
     return app
 
 

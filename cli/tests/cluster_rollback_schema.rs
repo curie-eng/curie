@@ -15,6 +15,7 @@ use curie::ops::{
     parse_helm_history, rollback, select_rollback_revision, ClusterRollbackOutput, CommonOpts,
     HelmRevision, RollbackOpts,
 };
+use curie::schema_compat::{pending_revisions, plan_upgrade, TargetMetadata};
 use curie::schema_window::{live_in_window, window_for};
 
 fn catalog_marks_artifact_identity_ambiguous(version: &str) -> bool {
@@ -61,20 +62,71 @@ fn v089_published_window_ends_at_0039_and_requires_artifact_identity() {
     assert!(catalog_marks_artifact_identity_ambiguous("0.8.9"));
 }
 
-/// Release v0.9.0 shipped Alembic head 0044. Pin both the accepted live head
-/// and the fail closed boundary for its successor.
+/// The released 0.9.0 and 0.9.1 artifacts stop at Alembic head 0044. Pin the
+/// accepted live head and the boundary before the later 0.9.2 migration.
 #[test]
-fn v090_accepts_0044_and_refuses_0045() {
-    let window = window_for("0.9.0").expect("0.9.0 is catalogued");
-    assert_eq!(window.schema_min, "0001");
-    assert_eq!(window.schema_head, "0044");
-    assert!(live_in_window("0044", &window));
-    assert!(live_in_window("0039", &window));
-    assert!(!live_in_window("0045", &window));
+fn v090_and_v091_accept_0044_and_refuse_0045() {
+    for version in ["0.9.0", "0.9.1"] {
+        let window = window_for(version).unwrap_or_else(|| panic!("{version} is catalogued"));
+        assert_eq!(window.schema_min, "0001", "{version}");
+        assert_eq!(window.schema_head, "0044", "{version}");
+        assert!(live_in_window("0044", &window), "{version}");
+        assert!(live_in_window("0039", &window), "{version}");
+        assert!(!live_in_window("0045", &window), "{version}");
+        assert!(
+            !catalog_marks_artifact_identity_ambiguous(version),
+            "{version} has one unambiguous released artifact identity"
+        );
+    }
+}
+
+/// Released v0.9.2 is a single revision window at 0045. The feature train
+/// chart continues past that window, so this pin is the catalog, not the
+/// packaged 0.10.0 graph.
+#[test]
+fn v092_accepts_0045_and_refuses_outside_its_single_revision_window() {
+    let window = window_for("0.9.2").expect("0.9.2 is catalogued");
+    assert_eq!(window.schema_min, "0045");
+    assert_eq!(window.schema_head, "0045");
+    assert!(!live_in_window("0044", &window));
+    assert!(live_in_window("0045", &window));
+    assert!(!live_in_window("0046", &window));
     assert!(
-        !catalog_marks_artifact_identity_ambiguous("0.9.0"),
-        "0.9.0 has one unambiguous released artifact identity"
+        !catalog_marks_artifact_identity_ambiguous("0.9.2"),
+        "0.9.2 has one unambiguous released artifact identity"
     );
+}
+
+/// Released 0.9.1 reports catalog head 0044. This tree's packaged chart keeps
+/// the 0045 floor and continues through feature train head 0048, so the
+/// pending live migrations are 0045 through 0048 and the upgrade applies.
+#[test]
+fn v091_source_upgrades_through_the_packaged_chart_graph() {
+    let source = window_for("0.9.1").expect("0.9.1 is catalogued");
+    let target: TargetMetadata =
+        serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
+            .expect("packaged chart schema compatibility metadata parses");
+
+    assert_eq!(source.schema_head, "0044");
+    assert_eq!(target.schema_min, "0045");
+    assert_eq!(target.schema_head, "0048");
+
+    let pending =
+        pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
+    let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
+    assert_eq!(revisions, ["0045", "0046", "0047", "0048"]);
+    assert!(pending.iter().all(|step| step.kind == "expand"));
+
+    let decision = plan_upgrade(
+        Some("0044"),
+        &target,
+        &pending,
+        false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(decision.action, "apply");
+    assert_eq!(decision.source_head.as_deref(), Some("0044"));
+    assert_eq!(decision.target_min, "0045");
 }
 
 fn write_exec(dir: &Path, name: &str, body: &str) {

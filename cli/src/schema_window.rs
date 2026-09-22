@@ -419,12 +419,18 @@ mod tests {
                     .map(|rest| normalize_app_version(rest.trim().trim_matches('"')))
             })
             .expect("appVersion");
-        let window = window_for(&app_version)
+        let chart_window = window_for(&app_version)
             .unwrap_or_else(|| panic!("catalog missing window for {app_version}"));
         assert!(
-            !window.artifact_identity_ambiguous,
+            !chart_window.artifact_identity_ambiguous,
             "Chart.yaml appVersion {app_version} must have one unambiguous artifact identity"
         );
+
+        let (newest_catalog_version, newest_window) = catalog()
+            .windows
+            .iter()
+            .max_by_key(|(version, _)| version_key(version))
+            .expect("catalog has at least one schema window");
 
         let mut found = Vec::new();
         let mut down_of = Vec::new();
@@ -469,9 +475,9 @@ mod tests {
             "catalog revisions missing this tree's alembic head {tree_head}"
         );
         assert_eq!(
-            window.schema_head,
+            newest_window.schema_head,
             *tree_head,
-            "Chart.yaml appVersion {app_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
+            "newest catalog appVersion {newest_catalog_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
         );
     }
 }
