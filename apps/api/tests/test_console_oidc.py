@@ -588,6 +588,9 @@ def test_oidc_session_cannot_resolve_an_approval(
     that happens to equal a provider id must NOT gain approval authority.
     """
 
+    # A Slack-shaped ``sub``: agent creation validates approver ids as Slack
+    # user ids, and a collision with one is exactly the case being guarded.
+    idp.subject = "U0IDPUSER1"
     token = _session_token(_login(oidc_client))
 
     route = f"operators-{uuid.uuid4().hex[:8]}"

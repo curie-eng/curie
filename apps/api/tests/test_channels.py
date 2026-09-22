@@ -1283,6 +1283,10 @@ def _other_routes() -> list[tuple[str, str]]:
         "/github/webhook",
         "/console/session",
         "/v1/factory/cards/{token}.svg",
+        # The OIDC login redirect and IdP callback are unauthenticated by design:
+        # the state cookie and the IdP's authorization code are the credential.
+        "/console/oidc/login",
+        "/console/oidc/callback",
     }
     routes: list[tuple[str, str]] = []
     for route in _walk(create_app().routes):
