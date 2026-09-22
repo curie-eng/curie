@@ -2239,9 +2239,15 @@ class StateEntryPut(BaseModel):
 class StateAppendIn(BaseModel):
     """Append ``item`` to a log-shaped (JSON array) state entry (#248). If the
     entry does not exist it is created as a single-element array; if it exists
-    its value must already be an array, else the append is rejected."""
+    its value must already be an array, else the append is rejected.
+
+    ``reserve_bytes`` (#2927) refuses the append with 413 when the new value
+    would leave fewer than that many bytes free under the per-value cap. The
+    runner sets it on transcript appends to keep headroom for the worker's
+    publication outcome append; omitting it keeps the plain cap."""
 
     item: Any
+    reserve_bytes: int | None = Field(default=None, ge=0)
 
 
 class StateEntryOut(BaseModel):

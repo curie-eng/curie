@@ -4983,10 +4983,22 @@
         "type": "object"
       },
       "StateAppendIn": {
-        "description": "Append ``item`` to a log-shaped (JSON array) state entry (#248). If the\nentry does not exist it is created as a single-element array; if it exists\nits value must already be an array, else the append is rejected.",
+        "description": "Append ``item`` to a log-shaped (JSON array) state entry (#248). If the\nentry does not exist it is created as a single-element array; if it exists\nits value must already be an array, else the append is rejected.\n\n``reserve_bytes`` (#2927) refuses the append with 413 when the new value\nwould leave fewer than that many bytes free under the per-value cap. The\nrunner sets it on transcript appends to keep headroom for the worker's\npublication outcome append; omitting it keeps the plain cap.",
         "properties": {
           "item": {
             "title": "Item"
+          },
+          "reserve_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reserve Bytes"
           }
         },
         "required": [
