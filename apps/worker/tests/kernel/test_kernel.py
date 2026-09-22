@@ -258,6 +258,55 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_targetless_cron_is_rejected_before_any_effects(
+    make_harness,
+    make_hook_run,
+) -> None:
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            event = QueuedTurn.model_construct(
+                event_id="targetless-cron",
+                conversation_id="cron-run",
+                author="cron",
+                text="run the nightly report",
+                reply_handle=None,
+                received_at="20260922T030000Z",
+                source=TurnSource.CRON,
+                attachments=[],
+                hook_run=run.ref,
+            )
+
+            async def owned_keys() -> set[str]:
+                return {
+                    key
+                    async for key in h.async_redis.scan_iter(
+                        match=f"{h.config.key_prefix}:*"
+                    )
+                }
+
+            before_keys = await owned_keys()
+            assert await run.state() == (None, None)
+
+            with pytest.raises(
+                ValueError,
+                match="^targetless cron execution is not implemented$",
+            ):
+                await h.kernel.process_event(event)
+
+            assert await run.state() == (None, None)
+            assert await owned_keys() == before_keys
+            assert h.runner.opened == []
+            assert h.sink.events == []
+
+            await h.kernel.notify_turn_not_started(event)
+
+            assert h.sink.events == []
+
+    asyncio.run(go())
+
+
 def test_post_final_stall_does_not_reclassify_or_retry_success(make_harness) -> None:
     async def go() -> None:
         async with make_harness(max_attempts=3) as h:
