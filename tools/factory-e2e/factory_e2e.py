@@ -484,7 +484,9 @@ def public_get_status(url: str, *, timeout: float = 10) -> int:
     if not addresses:
         return 0
     raw = socket.create_connection((addresses[0], 443), timeout=timeout)
-    tls = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    tls = context.wrap_socket(raw, server_hostname=host)
     connection = http.client.HTTPSConnection(host, timeout=timeout)
     connection.sock = tls
     try:
