@@ -655,9 +655,9 @@ pass `--chart <path-or-tgz>` explicitly for now.
 Local secrets are stored in `~/.config/curie/credentials.json` with mode 0600,
 not in the repo, shell history, command argv, `.env`, or Curie state files.
 Curie keeps a separate non-secret index so secret names can be listed without
-opening values. `curie secrets check`, `curie secrets rm`, `curie dev
-secrets-inventory`, and `curie secrets set --expires` are declared for a
-provider install and return not implemented in this build. `set` and `list`
+opening values. `curie secrets check`, `curie secrets rm`, and `curie
+secrets set --expires` are declared for a provider install and return not
+implemented in this build. `set` and `list`
 keep this local store unless `--file` points at a `curie.yaml` that sets
 `secrets.provider`.
 
@@ -749,6 +749,7 @@ release binary has no dev scripts.
 |---|---|
 | `curie dev contracts` | `bash scripts/check-contracts.sh` -- check the frozen contracts. |
 | `curie dev chart-check` | Discover the executable assertion scripts under `charts/curie/ci`, the same set helm-ci runs, run every one, report each result, and return aggregate failure after all scripts finish. |
+| `curie dev secrets-inventory [--chart DIR] [--inventory FILE] [--bundle AGENT=DIR]...` | Render the chart with `helm template` over the stock values files, every `charts/curie/ci/inventory-values/` overlay, and a generated provider set, and fail on any Secret reference the credential inventory (ADR 0163) does not list, or on an inventory that marks a rotation-owned key as ESO-managed. Spawns only `helm`. |
 | `curie dev verify-fix-pin <CHANGE> <SELECTOR>` | Prove that a fix makes the selected test fail when only its product files are reversed. |
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |

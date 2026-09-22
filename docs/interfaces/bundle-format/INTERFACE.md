@@ -82,7 +82,10 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `secrets` is `list[str | SecretRef]`
   (`packages/plugin-format/src/plugin_format/connectors.py::SecretRef`, with
   `name` / `from_secret` / `key`) and `secret_files` is by NAME only; neither form
-  carries a value. Intake refuses any `sealed_secrets` declaration with
+  carries a value. A hosted connector may mark a Curie-resolved name it rotates in place with
+  `secret_rotation: {NAME: workload}` (names only; `connectors.rotation_unknown_secret`,
+  `connectors.rotation_requires_hosted`), which the install inventory (ADR 0163) reads so the
+  provider never overwrites the rotated key. Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
   with `secrets:` declared, the rendered `.mcp.json` entry derives

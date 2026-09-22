@@ -5892,7 +5892,33 @@
           "name": "verb-parity"
         },
         {
-          "about": "Declared inventory check. This build returns not implemented",
+          "about": "Check that every Secret reference the chart renders is listed in the credential inventory (ADR 0163). Renders `helm template` over a fixed list of values sets plus every `charts/curie/ci/inventory-values/` overlay and a generated provider set, and fails on any reference no entry lists, or on an inventory that marks a rotation-owned key as ESO-managed. Offline; spawns only `helm`",
+          "args": [
+            {
+              "global": false,
+              "help": "Chart directory to render. Defaults to `charts/curie` in the checkout",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Inventory file to check instead of the embedded platform inventory",
+              "id": "inventory",
+              "long": "inventory",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "`<agent>=<bundle dir>` whose connectors extend the inventory. Repeatable. Defaults to `sre-bot=examples/sre-bot`",
+              "id": "bundles",
+              "long": "bundle",
+              "positional": false,
+              "required": false
+            }
+          ],
           "hidden": false,
           "name": "secrets-inventory"
         },

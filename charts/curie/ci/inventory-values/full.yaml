@@ -1,0 +1,59 @@
+# Inventory coverage overlay: every optional credential consumer ON.
+#
+# `curie dev secrets-inventory` renders this so each Secret reference the
+# chart CAN render actually renders at least once, and must then be listed by
+# the credential inventory (ADR 0163). Values are placeholders; nothing here
+# is ever installed.
+api:
+  githubToken: placeholder
+  githubAppId: "1"
+  githubAppPrivateKey: placeholder
+  imagePullSecrets:
+    - name: registry-pull
+  ingress:
+    enabled: true
+    host: curie.example.com
+    tls:
+      enabled: true
+      secretName: curie-api-tls
+dispatcher:
+  deploy: true
+  imagePullSecrets:
+    - name: registry-pull
+  slack:
+    appToken: placeholder
+    botToken: placeholder
+    signingSecret: placeholder
+worker:
+  imagePullSecrets:
+    - name: registry-pull
+ui:
+  imagePullSecrets:
+    - name: registry-pull
+sealing:
+  privateKey: placeholder
+  previousPrivateKey: placeholder
+mailAdapter:
+  deploy: true
+  allowedSenders: ["*"]
+  imagePullSecrets:
+    - name: registry-pull
+  agentmail:
+    apiKey: placeholder
+    egressMode: publicHttps
+  channelToken: placeholder
+  egressSecret: placeholder
+otelCollector:
+  headersExistingSecret: otlp-headers
+grafanaConnector:
+  enabled: true
+agentSandbox:
+  runner:
+    credentials: placeholder
+    imagePullSecrets:
+      - name: registry-pull
+  # The sre-bot bundle's Curie-resolved names (examples/sre-bot/connectors.yaml).
+  connectorSecrets:
+    sre-bot:
+      K8S_KUBECONFIG: placeholder
+      SELF_UPGRADE_KUBECONFIG: placeholder

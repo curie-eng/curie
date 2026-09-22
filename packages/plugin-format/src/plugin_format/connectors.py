@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import re
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -220,6 +220,20 @@ class ConnectorSpec(BaseModel):
     # each other; `/tmp` is refused because a server's scratch space is a poor
     # place for a credential and an emptyDir there would shadow the mount.
     secret_files: dict[str, str] = Field(default_factory=dict)
+
+    #   secret_rotation:                      The connector ROTATES this value
+    #     REFRESH_TOKEN: workload             itself and writes it back to its
+    #                                         own Secret (ADR 0163).
+    #
+    # Names only, and only `workload`. A refresh token that the connector
+    # replaces in place must not also be synced from the secrets provider, or
+    # the sync reverts the rotation and the next refresh uses a revoked token.
+    # Declaring the key here tells the install inventory that the workload, not
+    # the provider, owns it. Restricted to names Curie resolves a value for
+    # (`resolved_secrets()`) on a hosted connector: a `from_secret` or sealed
+    # value is not Curie-held, and only a hosted Deployment is a workload that
+    # can write its own Secret.
+    secret_rotation: dict[str, Literal["workload"]] = Field(default_factory=dict)
 
     def secret_names(self) -> list[str]:
         """Env var names this connector needs, any form."""
@@ -711,6 +725,27 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     )
                 )
             seen_secret_names.add(secret_name)
+        resolved = set(spec.resolved_secrets())
+        for rotated in sorted(spec.secret_rotation):
+            if rotated not in resolved:
+                errors.append(
+                    (
+                        "connectors.rotation_unknown_secret",
+                        f"{where}: secret_rotation[{rotated}] is not a name Curie resolves "
+                        "for this connector (a bare `secrets` name or a `secret_files` "
+                        "key). A `from_secret` or sealed value is held elsewhere, so "
+                        "nothing here could hand its rotation to the workload",
+                    )
+                )
+        if spec.secret_rotation and not spec.is_hosted:
+            errors.append(
+                (
+                    "connectors.rotation_requires_hosted",
+                    f"{where}: `secret_rotation` declares a workload that writes its own "
+                    "Secret back, and only a connector Curie runs (`image` or `build`) is "
+                    "such a workload",
+                )
+            )
         if not (1 <= spec.port <= 65535):
             errors.append(("connectors.bad_port", f"{where}: port {spec.port} is out of range"))
         for text in [*spec.args, *spec.env.values()]:

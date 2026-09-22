@@ -902,3 +902,100 @@ def test_bundle_surfaces_an_ambiguous_connector_name(tmp_path: Path) -> None:
     offending = [e for e in result.errors if e.code == "connectors.ambiguous_name"]
     assert offending, [e.code for e in result.errors]
     assert "mcp-grafana" in offending[0].message
+
+
+# --------------------------------------------------------------------------- #
+# secret_rotation -- a hosted connector that rotates its own credential
+#
+# Names only. A key declared here is written back by the connector itself, so
+# the secrets provider must not also sync it or it would revert the rotation.
+# --------------------------------------------------------------------------- #
+def test_rotation_on_a_hosted_bare_secret_is_accepted() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "ledger": {
+                    "image": "x:1",
+                    "secrets": ["TOKEN"],
+                    "secret_rotation": {"TOKEN": "workload"},
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["ledger"].secret_rotation == {"TOKEN": "workload"}
+
+
+def test_rotation_on_a_secret_file_key_is_accepted() -> None:
+    _, errors = validate_connectors(
+        {
+            "connectors": {
+                "ledger": {
+                    "image": "x:1",
+                    "secret_files": {"CERT": "/secrets/cert.pem"},
+                    "secret_rotation": {"CERT": "workload"},
+                }
+            }
+        }
+    )
+    assert errors == []
+
+
+def test_rotation_defaults_to_empty() -> None:
+    parsed, _ = validate_connectors({"connectors": {"g": {"image": "x:1", "secrets": ["T"]}}})
+    assert parsed is not None
+    assert parsed.connectors["g"].secret_rotation == {}
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        # Not declared at all.
+        {"image": "x:1", "secrets": ["TOKEN"], "secret_rotation": {"OTHER": "workload"}},
+        # A from_secret ref is held out of band, not by Curie.
+        {
+            "image": "x:1",
+            "secrets": [{"name": "TOKEN", "from_secret": "s"}],
+            "secret_rotation": {"TOKEN": "workload"},
+        },
+        # A sealed blob is the credential itself; nothing writes it back.
+        {
+            "image": "x:1",
+            "sealed_secrets": {"TOKEN": "blob"},
+            "secret_rotation": {"TOKEN": "workload"},
+        },
+    ],
+    ids=["undeclared", "from_secret", "sealed"],
+)
+def test_rotation_on_a_name_curie_does_not_hold_is_refused(spec: dict) -> None:
+    assert "connectors.rotation_unknown_secret" in _codes({"connectors": {"ledger": spec}})
+
+
+def test_rotation_on_a_url_connector_is_refused() -> None:
+    # Only a hosted Deployment is a workload that can rotate its own Secret.
+    assert "connectors.rotation_requires_hosted" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "url": "https://docs.example.com/mcp",
+                    "secrets": ["TOKEN"],
+                    "secret_rotation": {"TOKEN": "workload"},
+                }
+            }
+        }
+    )
+
+
+def test_rotation_owner_other_than_workload_is_refused() -> None:
+    assert _codes(
+        {
+            "connectors": {
+                "ledger": {
+                    "image": "x:1",
+                    "secrets": ["TOKEN"],
+                    "secret_rotation": {"TOKEN": "sm"},
+                }
+            }
+        }
+    ) == ["connectors.invalid"]
