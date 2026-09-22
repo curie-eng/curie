@@ -202,9 +202,7 @@ impl<'de> Deserialize<'de> for ProviderKind {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "aws" => Ok(Self::Aws),
-            other => Err(serde::de::Error::custom(format!(
-                "secrets.provider must be aws, not {other:?}"
-            ))),
+            _ => Err(serde::de::Error::custom("secrets.provider must be aws")),
         }
     }
 }
@@ -498,22 +496,15 @@ impl Installation {
         Self::reject_secret_shaped(&Some(block.prefix.clone()), "secrets.prefix")?;
         Self::reject_secret_shaped(&Some(block.role_arn.clone()), "secrets.role_arn")?;
         if !aws_region(&block.region) {
-            bail!(
-                "secrets.region must be an AWS region name, not {:?}",
-                block.region
-            );
+            bail!("secrets.region must be an AWS region name");
         }
         if !secrets_prefix(&block.prefix) {
             bail!(
-                "secrets.prefix must be a name of at most 200 characters, without a leading or trailing slash, not {:?}",
-                block.prefix
+                "secrets.prefix must be a name of at most 200 characters without a leading or trailing slash"
             );
         }
         if !iam_role_arn(&block.role_arn) {
-            bail!(
-                "secrets.role_arn must be an IAM role ARN, not {:?}",
-                block.role_arn
-            );
+            bail!("secrets.role_arn must be an IAM role ARN");
         }
         Ok(())
     }
