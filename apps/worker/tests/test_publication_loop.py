@@ -18,7 +18,12 @@ from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig
-from curie_worker.publication_loop import PublicationReconcileError
+from curie_worker.publication_loop import (
+    PublicationIdentityUnavailable,
+    PublicationLineageRefused,
+    PublicationReconcileError,
+    PublicationRemoteTerminalError,
+)
 from curie_worker.publication_store import (
     PostgresPublicationStore,
     PublicationStoreError,
@@ -43,6 +48,10 @@ REVISION_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
 LINEAGE_BRANCH = "curie/thread-lineage-example"
 PRIOR_HEAD = "a" * 40
 REVISION_HEAD = "b" * 40
+REPOSITORY_ID = 9001
+INSTALLATION_ID = 41
+PR_NODE_ID = "PR_example_123"
+BASE_REF = "main"
 _DB_URL = os.environ.get(
     "TEST_DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
@@ -182,7 +191,6 @@ class _Store:
         }
         if outcome in {"published", "failed"}:
             self.cleanup_pending.add(publication_id)
-
     def mark_result_delivered(self, publication_id: uuid.UUID) -> None:
         self.delivered.add(publication_id)
         self.pending.pop(publication_id, None)
@@ -241,8 +249,6 @@ class _Lineage:
         if self.error is not None:
             raise self.error
         self.advances.append({"publication_id": publication_id, **advance})
-
-
 class _Credentials:
     def __init__(self, module: Any) -> None:
         self.module = module
@@ -563,7 +569,12 @@ def _target(kind: str = "slack") -> ReplyTarget:
     )
 
 
-def _work(module: Any, *, decision: str = "approved", kind: str = "slack") -> Any:
+def _work(
+    module: Any,
+    *,
+    decision: str = "approved",
+    kind: str = "slack",
+) -> Any:
     return module.PublicationWork(
         publication_id=PUBLICATION_ID,
         approval_id=APPROVAL_ID,
@@ -652,6 +663,7 @@ def _loop(
     module: Any,
     cards: _Cards | None = None,
     transcript: _Transcript | None | object = _DEFAULT_TRANSCRIPT,
+    lineage: _Lineage | None = None,
 ) -> tuple[Any, _Store, _Credentials, _Cluster, _GitHub, _Replies]:
     k8s = importlib.import_module("curie_worker.publication_k8s")
     store = _Store()
@@ -665,7 +677,7 @@ def _loop(
     loop = module.PublicationReconciler(
         store=store,
         credentials=credentials,
-        lineage=_Lineage(),
+        lineage=lineage if lineage is not None else _Lineage(),
         cluster=cluster,
         github=github,
         replies=replies,
@@ -2460,3 +2472,125 @@ async def test_transient_observe_error_stays_bounded_not_terminal(
     assert "apiserver temporarily unavailable" in store.retries[0][1]
     assert store.completed == {}
     assert replies.events == []
+
+
+# --- API lineage advance and bounded provider failures -------------------------
+
+
+def _uncharged_bound(module: Any) -> int:
+    return int(module._MAX_UNCHARGED_IDENTITY_ESCAPES)
+
+
+def _recovery_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+    github.branch_head = REVISION_HEAD
+    github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+    return _work(module)
+
+
+def _later_revision_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+    github.head_sha = PRIOR_HEAD
+    return _lineage_work(module)
+
+
+async def test_lineage_advance_carries_the_publication_lease_fence(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    assert lineage.advances == [
+        {
+            "publication_id": work.publication_id,
+            "expected_version": work.lineage_version,
+            "expected_head_sha": work.expected_remote_head,
+            "expected_publication_version": work.version,
+            "lease_owner": work.lease_owner,
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": REVISION_HEAD,
+        }
+    ]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_terminal_lineage_response_uses_the_worker_terminal_cas(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    lineage.error = PublicationRemoteTerminalError("merged")
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    assert len(lineage.advances) == 0
+    assert store.lineage_terminals == [
+        {
+            "lineage_id": work.lineage_id,
+            "expected_version": work.lineage_version,
+            "expected_stored_head": work.expected_remote_head,
+            "state": "merged",
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": REVISION_HEAD,
+        }
+    ]
+    assert store.retries == [
+        (PUBLICATION_ID, "pull request lineage is merged; start a new thread")
+    ]
+
+
+@pytest.mark.parametrize(
+    "site",
+    [
+        "normal_completion",
+        "recovery_completion",
+        "later_revision",
+    ],
+)
+async def test_lineage_unavailable_escapes_uncharged_then_charges_on_every_advance_site(
+    publication: Any,
+    site: str,
+) -> None:
+    lineage = _Lineage()
+    lineage.error = PublicationIdentityUnavailable(
+        "publication lineage verification is temporarily unavailable"
+    )
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    if site == "normal_completion":
+        work = _work(publication)
+    elif site == "recovery_completion":
+        work = _recovery_work(publication, cluster, github)
+    else:
+        work = _later_revision_work(publication, cluster, github)
+
+    for _ in range(_uncharged_bound(publication)):
+        with pytest.raises(PublicationIdentityUnavailable):
+            await loop.reconcile(work)
+        assert store.retries == []
+
+    await loop.reconcile(work)
+
+    assert store.retries == [
+        (
+            work.publication_id,
+            "publication lineage verification is temporarily unavailable",
+        )
+    ]
+
+
+async def test_lineage_refusal_is_charged_without_an_uncharged_escape(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    lineage.error = PublicationLineageRefused("publication lineage advance was refused")
+    loop, store, _, _, _, _ = _loop(publication, lineage=lineage)
+
+    await loop.reconcile(_work(publication))
+
+    assert store.retries == [
+        (PUBLICATION_ID, "publication lineage advance was refused")
+    ]

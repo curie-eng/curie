@@ -216,8 +216,16 @@ async def _enforce_caps(
     namespace: str,
     key: str,
     value: Any,
+    *,
+    reserve_bytes: int | None = None,
 ) -> None:
     """Reject a write that breaks the per-value or per-namespace size cap (#248).
+
+    ``reserve_bytes`` (#2927) additionally refuses a value that fits the
+    per-value cap but leaves fewer than that many bytes free under it. The
+    runner's transcript appends set it so the worker's publication outcome
+    append always has room; the refusal is the runner's compaction trigger, not
+    a persistence failure, so it records no failure metric.
 
     The namespace total counts the incoming value plus every *other* key already
     in the namespace (the key being written replaces its own prior size). Both
@@ -242,6 +250,13 @@ async def _enforce_caps(
         raise HTTPException(
             413,
             f"value for key {key!r} is {value_bytes} bytes, over the "
+            f"{settings.state_max_value_bytes}-byte per-value cap",
+        )
+    if reserve_bytes is not None and settings.state_max_value_bytes - value_bytes < reserve_bytes:
+        raise HTTPException(
+            413,
+            f"value for key {key!r} is {value_bytes} bytes, leaving under the "
+            f"{reserve_bytes}-byte reserve of the "
             f"{settings.state_max_value_bytes}-byte per-value cap",
         )
 
@@ -392,6 +407,29 @@ async def _get_entry(
     return entry
 
 
+async def _get_entry_locked(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, namespace: str, key: str
+) -> WorkflowStateEntry | None:
+    """Same lookup as ``_get_entry``, row-locked for a read-modify-write (#2927).
+
+    Used by both a CAS put and an append: a plain read let a concurrent write
+    commit between the version check and the write, and the later write then
+    overwrote it.
+    """
+
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
+            WorkflowStateEntry.namespace == namespace,
+            WorkflowStateEntry.key == key,
+        )
+        .with_for_update()
+    )
+    return entry
+
+
 async def _put_state(
     agent_id: uuid.UUID,
     scope: str | None,
@@ -405,7 +443,7 @@ async def _put_state(
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     await _enforce_caps(session, agent_id, scope, namespace, key, data.value)
-    entry = await _get_entry(session, agent_id, scope, namespace, key)
+    entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         if data.expected_version is not None:
             # A CAS put that expects a prior version cannot create the entry.
@@ -476,19 +514,12 @@ async def _append_state(
     """
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.binding_scope == scope,
-            WorkflowStateEntry.namespace == namespace,
-            WorkflowStateEntry.key == key,
-        )
-        .with_for_update()
-    )
+    entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         new_value = [data.item]
-        await _enforce_caps(session, agent_id, scope, namespace, key, new_value)
+        await _enforce_caps(
+            session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
+        )
         entry = WorkflowStateEntry(
             agent_id=agent_id, binding_scope=scope, namespace=namespace, key=key, value=new_value
         )
@@ -500,7 +531,9 @@ async def _append_state(
                 "cannot append: stored value is not a JSON array",
             )
         new_value = [*entry.value, data.item]
-        await _enforce_caps(session, agent_id, scope, namespace, key, new_value)
+        await _enforce_caps(
+            session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
+        )
         entry.value = new_value
         entry.version += 1
     await session.commit()

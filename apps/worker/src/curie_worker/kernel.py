@@ -43,6 +43,7 @@ from aci_protocol import (
     Event,
     Final,
     GateKind,
+    HookRunRef,
     OutboundEvent,
     QueuedTurn,
     SessionStatus,
@@ -105,6 +106,7 @@ from .behaviorpacks import (
 from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingResolver
 from .config import WorkerConfig
 from .delivery_lease import DeliveryLease, LeaseLostError
+from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
@@ -862,6 +864,38 @@ class _WorkspaceInferenceCarry:
 
 
 @dataclass
+class _HookRunCarry:
+    """One delivery's validated hook run and actual start state."""
+
+    recorder: HookRunRecorder | None = None
+    ref: HookRunRef | None = None
+    agent_id: uuid.UUID | None = None
+    this_attempt_started: bool = False
+    any_attempt_started: bool = False
+
+
+_HOOK_RUN_CARRY: ContextVar[_HookRunCarry | None] = ContextVar(
+    "curie_worker_hook_run_carry", default=None
+)
+
+
+def _hook_success_outcome() -> HookRunOutcome | None:
+    carry = _HOOK_RUN_CARRY.get()
+    if carry is None:
+        return None
+    if carry.this_attempt_started:
+        return "ran"
+    if carry.any_attempt_started:
+        return "failed"
+    return None
+
+
+def _hook_failure_outcome() -> HookRunOutcome | None:
+    carry = _HOOK_RUN_CARRY.get()
+    return "failed" if carry is not None and carry.any_attempt_started else None
+
+
+@dataclass
 class _LockEntry:
     """A per-thread in-process lock plus a holder/waiter refcount so the entry
     can be evicted when idle (otherwise the map grows one entry per thread ever
@@ -1072,6 +1106,7 @@ class Kernel:
         approval_reader: ApprovalReader | None = None,
         actions: ActionRecorder | None = None,
         card_store: ApprovalCardStore | None = None,
+        hook_runs: HookRunRecorder | None = None,
         route_ttl_seconds: int = 3600,
         suspended_route_ttl_seconds: int = 86400,
         work_items: WorkItemDispatchClient | None = None,
@@ -1119,6 +1154,7 @@ class Kernel:
         # EXPIRY can disable it (#419); absent (unwired tests) simply skips the
         # card teardown -- the resolve-click path still heals a card on click.
         self._card_store = card_store
+        self._hook_runs = hook_runs
         self._route_ttl_seconds = route_ttl_seconds
         self._suspended_route_ttl_seconds = suspended_route_ttl_seconds
         self._work_items = work_items
@@ -1367,6 +1403,7 @@ class Kernel:
         """
 
         error: BaseException | None = None
+        hook_token = _HOOK_RUN_CARRY.set(_HookRunCarry())
         # A redelivery must never inherit an earlier delivery's terminal-send mark
         # from this process (#2433).
         self._terminal_reply_attempted.discard(qevent.event_id)
@@ -1388,6 +1425,12 @@ class Kernel:
                     await self._process_event(qevent, lease=lease)
             except asyncio.CancelledError as exc:
                 error = exc
+                await self._close_hook_run_after_error(
+                    qevent,
+                    lease=lease,
+                    original=exc,
+                    shield=True,
+                )
                 _LIFECYCLE_OUTCOME.set("interrupted")
                 span.add_event(
                     "turn.processing.interrupted",
@@ -1395,6 +1438,13 @@ class Kernel:
                 )
             except Exception as exc:
                 error = exc
+                if not isinstance(exc, HookRunRecorderError):
+                    await self._close_hook_run_after_error(
+                        qevent,
+                        lease=lease,
+                        original=exc,
+                        shield=False,
+                    )
                 span.add_event(
                     "turn.processing.failed",
                     {"outcome": "classified_failure", "error.class": type(exc).__name__},
@@ -1424,6 +1474,7 @@ class Kernel:
                 span.add_event("turn.processing.completed", {"outcome": outcome})
                 _LIFECYCLE_OUTCOME.reset(outcome_token)
                 _LIFECYCLE_SPAN.reset(token)
+                _HOOK_RUN_CARRY.reset(hook_token)
         if error is not None:
             raise error
 
@@ -1485,6 +1536,70 @@ class Kernel:
                 # confirmed, which it re-emits from the STORED record.
                 await self._reemit_pending_completion(event_id)
                 return
+
+            if qevent.source is TurnSource.CRON:
+                if self._hook_runs is None or qevent.hook_run is None:
+                    logger.error(
+                        "cron event %s has no hook run recorder or key; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                try:
+                    hook_state = await self._hook_runs.get(qevent.hook_run)
+                except HookRunRecorderError as exc:
+                    if exc.code != "invalid_ref":
+                        raise
+                    logger.error(
+                        "cron event %s has an invalid hook run key; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                if hook_state is None:
+                    logger.error(
+                        "cron event %s has no matching hook run row; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                if hook_state.outcome is not None:
+                    logger.info(
+                        "cron event %s belongs to an already terminal hook run; "
+                        "dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                hook_carry = _HOOK_RUN_CARRY.get()
+                assert hook_carry is not None
+                hook_carry.recorder = self._hook_runs
+                hook_carry.ref = qevent.hook_run
+                hook_carry.agent_id = hook_state.agent_id
 
             parsed_work_item = parse_work_item_event_id(event_id)
             if parsed_work_item is not None and parsed_work_item.kind in {"terminate"}:
@@ -1588,6 +1703,7 @@ class Kernel:
                     "escalated",
                     telemetry_outcome="classified_failure",
                     lease=lease,
+                    hook_outcome="failed",
                 )
                 return
 
@@ -1665,6 +1781,25 @@ class Kernel:
                     endpoint=resolved.endpoint or qevent.reply_handle.endpoint,
                     adapter=resolved.adapter or qevent.reply_handle.adapter,
                 )
+                hook_carry = _HOOK_RUN_CARRY.get()
+                if (
+                    qevent.source is TurnSource.CRON
+                    and hook_carry is not None
+                    and hook_carry.agent_id != resolved.agent_id
+                ):
+                    logger.error(
+                        "cron event %s resolved to a different agent than its "
+                        "hook run key; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
                 if self._killswitch is not None and await self._killswitch.is_killed(
                     resolved.agent_id
                 ):
@@ -1790,6 +1925,9 @@ class Kernel:
             attempt = 0
             while True:
                 attempt += 1
+                hook_carry = _HOOK_RUN_CARRY.get()
+                if hook_carry is not None:
+                    hook_carry.this_attempt_started = False
                 # The delivery's overall deadline gates every attempt, and the
                 # attempts CONSUME it: a retry never restarts it.
                 if lease is not None:
@@ -1825,6 +1963,7 @@ class Kernel:
                             "escalated",
                             telemetry_outcome="deadline_halted",
                             lease=lease,
+                            hook_outcome=_hook_failure_outcome(),
                         )
                         return
                 try:
@@ -1887,6 +2026,7 @@ class Kernel:
                         "awaiting-approval",
                         telemetry_outcome="awaiting_approval",
                         lease=lease,
+                        hook_outcome=_hook_success_outcome(),
                     )
                     return
 
@@ -1901,6 +2041,7 @@ class Kernel:
                             else "done"
                         ),
                         lease=lease,
+                        hook_outcome=_hook_success_outcome(),
                     )
                     return
 
@@ -1924,10 +2065,34 @@ class Kernel:
                         "escalated",
                         telemetry_outcome="side_effect_halted",
                         lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
                     )
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
+                if (
+                    qevent.source is TurnSource.CRON
+                    and retryable
+                    and lease is not None
+                    and lease.remaining_s() <= _MIN_ATTEMPT_BUDGET_S
+                ):
+                    await self._escalate(
+                        qevent,
+                        route,
+                        "The run exceeded its delivery deadline after "
+                        f"{attempt} attempt(s) and was not restarted. "
+                        "Flagging for a human.",
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="deadline_halted",
+                        lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
+                    )
+                    return
+                retryable = retryable and qevent.source is not TurnSource.CRON
                 if not retryable or attempt >= self._config.max_attempts:
                     token = _display_error_classification(outcome.classification)
                     await self._escalate(
@@ -1951,6 +2116,7 @@ class Kernel:
                             else "classified_failure"
                         ),
                         lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
                     )
                     return
 
@@ -2498,6 +2664,56 @@ class Kernel:
             best_effort_unreachable=best_effort_unreachable,
         )
 
+    async def _close_hook_run_after_error(
+        self,
+        qevent: QueuedTurn,
+        *,
+        lease: DeliveryLease | None,
+        original: BaseException,
+        shield: bool,
+    ) -> None:
+        carry = _HOOK_RUN_CARRY.get()
+        if (
+            carry is None
+            or not carry.any_attempt_started
+            or carry.recorder is None
+            or carry.ref is None
+            or (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.lost.is_set()
+            )
+        ):
+            return
+        try:
+            if shield:
+                close_task = asyncio.create_task(
+                    asyncio.wait_for(
+                        carry.recorder.close(carry.ref, "failed"),
+                        timeout=5.0,
+                    )
+                )
+                while not close_task.done():
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        logger.error(
+                            "hook run failure close was cancelled again for event %s; "
+                            "waiting for its bounded cleanup",
+                            qevent.event_id,
+                        )
+                        continue
+                close_task.result()
+            else:
+                await carry.recorder.close(carry.ref, "failed")
+        except BaseException:
+            logger.error(
+                "hook run failure close failed for event %s while preserving %s",
+                qevent.event_id,
+                type(original).__name__,
+                exc_info=True,
+            )
+
     async def _complete(
         self,
         qevent: QueuedTurn,
@@ -2506,8 +2722,11 @@ class Kernel:
         *,
         telemetry_outcome: str,
         lease: DeliveryLease | None = None,
+        hook_outcome: HookRunOutcome | None = None,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
+
+        For a valid cron run, close its Postgres row before these Valkey steps.
 
         1. write the outbox record       -- durable, BEFORE the done marker
         2. mark done + flag the record   -- ONE MULTI, so they cannot diverge
@@ -2574,6 +2793,19 @@ class Kernel:
                     qevent.event_id,
                     exc.code,
                 )
+        hook_carry = _HOOK_RUN_CARRY.get()
+        if (
+            hook_outcome is not None
+            and hook_carry is not None
+            and hook_carry.recorder is not None
+            and hook_carry.ref is not None
+            and not (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.lost.is_set()
+            )
+        ):
+            await hook_carry.recorder.close(hook_carry.ref, hook_outcome)
         event_id = qevent.event_id
         record = CompletionRecord(
             event_id=event_id,
@@ -3061,6 +3293,7 @@ class Kernel:
                             verified_review=verified_review,
                             review_turn=qevent if verified_review is not None else None,
                             workspace_inference=workspace_inference,
+                            approval_resume=self._is_approval_resume(qevent.event_id),
                         )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -3308,6 +3541,10 @@ class Kernel:
             return TurnOutcome(terminal_ok=True, steered=True)
 
         assert routed.handle is not None and routed.turn is not None
+        hook_carry = _HOOK_RUN_CARRY.get()
+        if hook_carry is not None:
+            hook_carry.this_attempt_started = True
+            hook_carry.any_attempt_started = True
         turn = routed.turn
         # Register this owner turn so a kill for its agent interrupts it, then
         # stream; unregister when the turn ends.
@@ -3446,6 +3683,7 @@ class Kernel:
                             ignore_message=(
                                 verified_review is not None
                                 or source is TurnSource.WEBHOOK
+                                or self._is_approval_resume(qevent.event_id)
                             ),
                         )
                         is not None
@@ -3632,6 +3870,9 @@ class Kernel:
                                 review_turn=review_turn,
                                 workspace_inference=workspace_inference,
                                 attachment_fresh_only=True,
+                                approval_resume=self._is_approval_resume(
+                                    qevent.event_id
+                                ),
                             )
                         except RouteChangedError:
                             # Another worker bound a runner after the lookup
@@ -3746,6 +3987,7 @@ class Kernel:
         review_turn: QueuedTurn | None = None,
         workspace_inference: _WorkspaceInferenceCarry,
         attachment_fresh_only: bool = False,
+        approval_resume: bool = False,
     ) -> _RouteResult:
         # A thread that requires a repository must establish (or confirm) it
         # before any platform response path. This deliberately precedes the
@@ -3763,11 +4005,16 @@ class Kernel:
             # workspace. Links in the untrusted review body are context, not a
             # request to select another repository. Webhook jobs (#2572) likewise
             # never parse a GitHub URL from the payload; the operator map is the
-            # only coding target.
+            # only coding target. An approval resume (#2828) is platform text that
+            # quotes the gated tool's arguments, so ``apiVersion: batch/v1`` would
+            # read as a repository; its repository is the thread's existing
+            # selection, which a null request returns.
             repo_fact = trusted_repository_fact(
                 event.text,
                 ignore_message=(
-                    verified_review is not None or source is TurnSource.WEBHOOK
+                    verified_review is not None
+                    or source is TurnSource.WEBHOOK
+                    or approval_resume
                 ),
             )
             if self._workspace is None:

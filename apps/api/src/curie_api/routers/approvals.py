@@ -8,14 +8,17 @@ winner, losers get 409 with who resolved it, and a past-SLA record flips to
 expired (410) instead of resolving.
 
 Administrative and read routes retain platform API-key authentication. The
-resolver instead requires an authenticated chat, console, or operator principal
-and derives the actor and channel evidence from it (ADR-0106). The decision
+resolver instead requires an authenticated chat, console, operator, or adapter
+principal and derives the actor and channel evidence from it (ADR-0106). A
+channel adapter principal (ADR-0154) may also list approvals, but only those
+routed to a binding it serves; the same served predicate gates its resolve. The decision
 point remains here, on the server that owns the record, never in the sandbox.
 """
 
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Annotated
 
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -27,8 +30,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 
-from .. import approval_principal, crud
-from ..approval_auth import ApprovalPrincipalDep
+from .. import adapter_principal, approval_principal, crud
+from ..approval_auth import (
+    ApprovalPrincipalDep,
+    platform_key_or_adapter,
+    require_adapter_principal,
+)
 from ..auth import require_api_key, require_platform_key
 from ..authorizer import authorize_approval
 from ..config import get_settings
@@ -40,6 +47,9 @@ from ..resumequeue import (
     build_resume_turn,
 )
 from ..schemas import (
+    AdapterPrincipalMint,
+    AdapterPrincipalOut,
+    AdapterPrincipalRotate,
     ApprovalAuditOut,
     ApprovalOut,
     ApprovalPrincipalMint,
@@ -97,6 +107,80 @@ async def mint_operator_principal(
     )
 
 
+def _issue_adapter_principal(
+    subject: str, bindings: frozenset[uuid.UUID], ttl_s: int, response: Response
+) -> AdapterPrincipalOut:
+    expires_at = datetime.now(UTC) + timedelta(seconds=ttl_s)
+    token = adapter_principal.mint(
+        get_settings().api_key,
+        subject=subject,
+        bindings=bindings,
+        exp=int(expires_at.timestamp()),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return AdapterPrincipalOut(
+        token=token,
+        subject=subject,
+        binding_ids=sorted(bindings, key=str),
+        scopes=list(adapter_principal.SCOPES),
+        expires_at=expires_at,
+    )
+
+
+@router.post(
+    "/principals/adapter",
+    response_model=AdapterPrincipalOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_platform_key)],
+)
+async def mint_adapter_principal(
+    data: AdapterPrincipalMint, session: SessionDep, response: Response
+) -> AdapterPrincipalOut:
+    """Issue a channel adapter credential (ADR-0154); the platform key
+    authorizes issuance once and the adapter never presents it at runtime.
+
+    Every binding must exist now: a credential naming a row that does not
+    exist would serve nothing, and silently dropping it would hide a typo.
+    """
+
+    requested = frozenset(data.binding_ids)
+    if await crud.existing_channel_binding_ids(session, requested) != requested:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "every binding_id must name an existing channel binding",
+        )
+    return _issue_adapter_principal(data.subject, requested, data.ttl_s, response)
+
+
+@router.post(
+    "/principals/adapter/rotate",
+    response_model=AdapterPrincipalOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def rotate_adapter_principal(
+    session: SessionDep,
+    response: Response,
+    claims: Annotated[adapter_principal.AdapterClaims, Depends(require_adapter_principal)],
+    data: AdapterPrincipalRotate | None = None,
+) -> AdapterPrincipalOut:
+    """Exchange a live adapter credential for the next one, same subject and
+    bindings (ADR-0154), so the platform key never mints at runtime.
+
+    Bindings deleted since issuance are dropped rather than carried forward;
+    an adapter left serving nothing gets 401, as an unusable credential would.
+    """
+
+    remaining = await crud.existing_channel_binding_ids(session, claims.bindings)
+    if not remaining:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "missing or invalid adapter principal",
+            headers={"Cache-Control": "no-store"},
+        )
+    ttl_s = data.ttl_s if data is not None else adapter_principal.DEFAULT_TTL_SECONDS
+    return _issue_adapter_principal(claims.subject, remaining, ttl_s, response)
+
+
 def _expired(approval: Approval) -> bool:
     """True when a pending record's SLA has passed (naive-UTC comparison,
     matching the DateTime columns)."""
@@ -142,21 +226,36 @@ async def create_approval(
     return ApprovalOut.model_validate(approval)
 
 
-@router.get("", response_model=list[ApprovalOut], dependencies=[Depends(require_api_key)])
+@router.get("", response_model=list[ApprovalOut])
 async def list_approvals(
     session: SessionDep,
+    adapter: Annotated[
+        adapter_principal.AdapterClaims | None,
+        Depends(platform_key_or_adapter(adapter_principal.SCOPE_APPROVALS_READ)),
+    ],
     status_filter: str | None = None,
     agent_id: uuid.UUID | None = None,
     conversation_id: str | None = None,
     limit: int = 50,
 ) -> list[ApprovalOut]:
+    """List approvals, newest first. The platform key sees every row; an
+    adapter principal sees only approvals routed to a binding it serves."""
+
     approvals = await crud.list_approvals(
         session,
         status=status_filter,
         agent_id=agent_id,
         conversation_id=conversation_id,
         limit=min(max(limit, 1), 200),
+        served_by=adapter.bindings if adapter is not None else None,
     )
+    if adapter is not None:
+        # ADR-0154: an adapter's approval read is recorded with its subject.
+        logger.info(
+            "approvals listed principal_kind=adapter subject=%s count=%d",
+            adapter.subject,
+            len(approvals),
+        )
     return [ApprovalOut.model_validate(a) for a in approvals]
 
 
@@ -213,6 +312,13 @@ async def resolve_approval(
     approval = await crud.get_approval(session, approval_id)
     if approval is None:
         raise _approval_not_found()
+    # An adapter may resolve only approvals it serves (ADR-0154), by the same
+    # predicate that filters its list. Unserved reads exactly as a missing row,
+    # before any authorization or audit, so it is not an existence oracle.
+    if principal.kind == "adapter" and not await crud.approval_served_by(
+        session, approval, principal.adapter_bindings
+    ):
+        raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
 
     # The route binding is read fresh at resolve time (#420), so revoking an
@@ -247,6 +353,7 @@ async def resolve_approval(
             actor_channel=principal.actor_channel,
             principal_kind=principal.kind,
             authenticated=True,
+            principal_subject=principal.adapter,
             decision=data.decision,
             authorizer=authorizer_name,
             authorized=authorized,

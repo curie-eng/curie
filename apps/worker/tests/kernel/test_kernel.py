@@ -24,6 +24,7 @@ from aci_protocol import (
     Attachment,
     ErrorEvent,
     Final,
+    HookRunRef,
     QueuedTurn,
     ReplyHandle,
     SessionStatus,
@@ -77,6 +78,7 @@ def _qevent(
     adapter: str | None = None,
     source: TurnSource = TurnSource.SLACK,
     attachments: Sequence[Attachment] = (),
+    hook_run: HookRunRef | None = None,
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id=event_id or uuid.uuid4().hex,
@@ -93,6 +95,7 @@ def _qevent(
         received_at="2026-07-05T00:00:00+00:00",
         source=source,
         attachments=list(attachments),
+        hook_run=hook_run,
     )
 
 
@@ -360,9 +363,12 @@ def test_cancellation_during_registered_kill_recheck_releases_runner_response(
 
 def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
     make_harness,
+    make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_harness() as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             runner_hold = asyncio.Event()
             h.runner.hold = runner_hold
             h.runner.default_script = [Final(text="answer", status=DONE)]
@@ -382,6 +388,7 @@ def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
                         thread="tDeferred",
                         placeholder=None,
                         source=TurnSource.CRON,
+                        hook_run=run.ref,
                     )
                 )
             )
@@ -2405,7 +2412,7 @@ def test_placeholder_less_turn_posts_once_then_edits_that_message(make_harness) 
     asyncio.run(go())
 
 
-def test_a_job_never_steers_a_live_session(make_harness) -> None:
+def test_a_job_never_steers_a_live_session(make_harness, make_hook_run) -> None:
     """ADR-0079: jobs are outputs, not steering inputs.
 
     A person's follow-up on a busy thread steers. A job on the same thread must
@@ -2414,10 +2421,15 @@ def test_a_job_never_steers_a_live_session(make_harness) -> None:
     """
 
     async def go() -> None:
-        async with make_harness() as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.turn_active = True
             event = _qevent(
-                "nightly digest", placeholder=None, source=TurnSource.CRON
+                "nightly digest",
+                placeholder=None,
+                source=TurnSource.CRON,
+                hook_run=run.ref,
             )
 
             for _ in range(5):
@@ -2427,29 +2439,40 @@ def test_a_job_never_steers_a_live_session(make_harness) -> None:
             assert h.sink.text_posts == [], "a deferred job left a booting notice"
             assert h.runner.steers == [], "a job steered a live session"
             assert h.runner.opened == [], "a job opened a turn beside a live one"
+            assert await run.state() == (None, None)
 
     asyncio.run(go())
 
 
-def test_a_job_runs_normally_when_the_thread_is_idle(make_harness) -> None:
+def test_a_job_runs_normally_when_the_thread_is_idle(make_harness, make_hook_run) -> None:
     """The deferral is conditional. An idle thread runs the job immediately."""
 
     async def go() -> None:
-        async with make_harness() as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.turn_active = False
             h.runner.default_script = [Final(text="digest", status=DONE)]
 
             await h.kernel.process_event(
-                _qevent("nightly digest", placeholder=None, source=TurnSource.CRON)
+                _qevent(
+                    "nightly digest",
+                    placeholder=None,
+                    source=TurnSource.CRON,
+                    hook_run=run.ref,
+                )
             )
 
             assert h.runner.opened == ["nightly digest"]
             assert h.runner.steers == []
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "ran"
+            assert ended_at is not None
 
     asyncio.run(go())
 
 
-def test_an_unreadable_session_defers_the_job(make_harness) -> None:
+def test_an_unreadable_session_defers_the_job(make_harness, make_hook_run) -> None:
     """The liveness read fails CLOSED.
 
     A runner that cannot answer is not evidence of an idle thread. Reading the
@@ -2460,21 +2483,29 @@ def test_an_unreadable_session_defers_the_job(make_harness) -> None:
     """
 
     async def go() -> None:
-        async with make_harness() as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.turn_active = False
             h.runner.status_fails = True
 
             with pytest.raises(ThreadBusyError):
                 await h.kernel.process_event(
-                    _qevent("digest", placeholder=None, source=TurnSource.CRON)
+                    _qevent(
+                        "digest",
+                        placeholder=None,
+                        source=TurnSource.CRON,
+                        hook_run=run.ref,
+                    )
                 )
 
             assert h.runner.opened == [], "an unreadable session let a job open a turn"
+            assert await run.state() == (None, None)
 
     asyncio.run(go())
 
 
-def test_a_status_without_turn_active_defers_the_job(make_harness) -> None:
+def test_a_status_without_turn_active_defers_the_job(make_harness, make_hook_run) -> None:
     """A 200 that omits the field is as unreadable as a 500.
 
     Separate from the 500 case on purpose: a runner answering successfully with a
@@ -2483,16 +2514,24 @@ def test_a_status_without_turn_active_defers_the_job(make_harness) -> None:
     """
 
     async def go() -> None:
-        async with make_harness() as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.turn_active = False
             h.runner.status_malformed = True
 
             with pytest.raises(ThreadBusyError):
                 await h.kernel.process_event(
-                    _qevent("digest", placeholder=None, source=TurnSource.CRON)
+                    _qevent(
+                        "digest",
+                        placeholder=None,
+                        source=TurnSource.CRON,
+                        hook_run=run.ref,
+                    )
                 )
 
             assert h.runner.opened == []
+            assert await run.state() == (None, None)
 
     asyncio.run(go())
 

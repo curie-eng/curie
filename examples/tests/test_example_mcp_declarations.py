@@ -121,6 +121,8 @@ def test_sre_bot_observability_connectors_ship_self_configured() -> None:
     assert tempo["env"] == {"GRAFANA_URL": expected_url}
     assert grafana["secrets"] == [expected_token_ref]
     assert tempo["secrets"] == [expected_token_ref]
+    assert "bearer_secret" not in grafana
+    assert "bearer_secret" not in tempo
     assert "build" not in kubernetes
     assert "build" not in grafana
 

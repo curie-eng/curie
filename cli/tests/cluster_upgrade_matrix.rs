@@ -219,12 +219,26 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
             .expect("read application schema catalog"),
     )
     .expect("parse application schema catalog");
+    for version in ["0.9.0", "0.9.1"] {
+        assert_eq!(
+            catalog["windows"][version]["schema_min"], "0001",
+            "the released {version} rollback floor must remain pinned"
+        );
+        assert_eq!(
+            catalog["windows"][version]["schema_head"], "0044",
+            "the released {version} rollback head must remain pinned"
+        );
+    }
     assert_eq!(
-        catalog["windows"]["0.9.0"]["schema_head"], "0044",
-        "the released 0.9.0 head must remain pinned"
+        catalog["windows"]["0.9.2"]["schema_min"], "0045",
+        "released 0.9.2 must begin at its schema compatibility floor"
     );
     assert_eq!(
-        catalog["windows"]["0.10.0"]["schema_head"], "0047",
+        catalog["windows"]["0.9.2"]["schema_head"], "0045",
+        "released 0.9.2 must stop at its schema compatibility head"
+    );
+    assert_eq!(
+        catalog["windows"]["0.10.0"]["schema_head"], "0048",
         "the candidate 0.10.0 rollback head must match this tree"
     );
     assert!(
@@ -302,7 +316,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
             && scenario.contains("outside its declared schema range")
             && scenario.contains("if echo \"$err\" | grep -F \"could not establish\"")
             && scenario.contains("failed identity classification"),
-        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and candidate head 0047 while rejecting identity failures"
+        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and candidate head 0048 while rejecting identity failures"
     );
     assert!(
         scenario.contains("helm_version") && scenario.contains("0.10.0"),
@@ -413,7 +427,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         [
             "plan",
             "validate",
-            "drain",
+            "drain_preflight",
             "checkpoint",
             "migrate",
             "apply",
@@ -476,7 +490,7 @@ fn self_test_checks_shard_coverage_and_timing() {
 }
 
 const GOOD_SHARDS: &str = "s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
-s02 setup fail-every-phase:plan+validate+drain
+s02 setup fail-every-phase:plan+validate+drain_preflight
 s03 setup fail-every-phase:checkpoint+migrate+apply
 s04 setup fail-every-phase:converge
 s05 setup fail-every-phase:canary

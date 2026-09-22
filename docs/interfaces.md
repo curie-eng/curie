@@ -15,7 +15,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Substrate / SandboxClient | CLEAN | 2 (k8s, docker) | not separately graded | #86, #44 | [Substrate / SandboxClient](interfaces/substrate/INTERFACE.md) |
 | Harness in-proc / ModelSession | CLEAN | 1 + fake | A- | (folds into #25) | [Harness in-proc / ModelSession](interfaces/harness-modelsession/INTERFACE.md) |
 | ACI producer (frozen protocol) | CLEAN, frozen | 1 + reference | A- | #25, #47 | [ACI producer (frozen protocol)](interfaces/aci-producer/INTERFACE.md) |
-| Channel / ingress | CLEAN | 2 reply adapters behind the `ReplySink` port (Slack, HTTP) + a second wire ingress producer (Rust CLI) | B- | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
+| Channel / ingress | CLEAN | 3 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay) + a second wire ingress producer (Rust CLI) | B- | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
 | Channel interaction message | CLEAN | 2 renderers (Slack, terminal) | not separately graded | ADR-0020 | [Channel interaction message](interfaces/channel-interaction/INTERFACE.md) |
 | Model provider / credentials | SOFT | 2 prefix-routed (Anthropic, OpenRouter) + base-URL-selected provider-native endpoints (Zhipu, Moonshot, DeepSeek, Ollama) | not separately graded | #24, #46 | [Model provider / credentials](interfaces/model-provider/INTERFACE.md) |
 | Telemetry / OTEL | SOFT | 1 | B+ | #47, #1817, #1818, #1819 | [Telemetry / OTEL](interfaces/telemetry-otel/INTERFACE.md) |
@@ -28,7 +28,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
-| Triggers | SOFT | 4 hardcoded (Slack, GH push, commit poll, generic HMAC hook) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
+| Triggers | SOFT | 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
 | CLI output (agent-facing `--json`) | CLEAN | 49 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
 | Harness package (declared contribution) | CLEAN | 1 (built-in Claude) behind the entry-point registry | not separately graded | #844 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |

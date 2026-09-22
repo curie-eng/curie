@@ -163,6 +163,7 @@ const MESSAGE_VALUE_FLAGS: &[&str] = &[
     "--timeout-secs",
     "--api-url",
     "--color",
+    "--context",
 ];
 
 /// Boolean flags that may appear on the message verbs, including globals.

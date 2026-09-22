@@ -12,9 +12,11 @@ import httpx
 
 from .publication_loop import (
     PublicationCredential,
+    PublicationIdentityUnavailable,
     PublicationLineageRefused,
     PublicationPullState,
     PublicationReconcileError,
+    PublicationRemoteTerminalError,
     PublicationTranscriptPermanentError,
 )
 
@@ -228,17 +230,41 @@ class PublicationLineageClient:
                 follow_redirects=False,
             )
         except httpx.HTTPError as exc:
-            raise PublicationReconcileError(
+            raise PublicationIdentityUnavailable(
                 "publication lineage endpoint is unreachable"
             ) from exc
         if response.status_code == 409:
+            terminal = self._remote_terminal_state(response)
+            if terminal is not None:
+                raise PublicationRemoteTerminalError(terminal)
             raise PublicationLineageRefused(
                 f"publication lineage advance was refused: {response.text[:500]}"
+            )
+        if response.status_code == 503:
+            raise PublicationIdentityUnavailable(
+                "publication lineage verification is temporarily unavailable"
             )
         if response.status_code != 200:
             raise PublicationReconcileError(
                 f"publication lineage advance returned HTTP {response.status_code}"
             )
+
+    @staticmethod
+    def _remote_terminal_state(
+        response: httpx.Response,
+    ) -> Literal["merged", "closed"] | None:
+        try:
+            detail = response.json().get("detail")
+        except ValueError:
+            return None
+        if not isinstance(detail, dict):
+            return None
+        if detail.get("code") != "publication.lineage_terminal":
+            return None
+        observed = detail.get("observed_state")
+        if observed not in {"merged", "closed"}:
+            return None
+        return cast(Literal["merged", "closed"], observed)
 
 
 class GitHubPublicationLookup:

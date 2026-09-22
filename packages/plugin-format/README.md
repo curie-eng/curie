@@ -51,9 +51,10 @@ Pydantic models mirroring the Claude Code shapes:
   triggers beyond chat, #273/#270): a list of `{type, ...}`. `type` is `cron`
   or `webhook`. `name`, `timezone`, `target`, and `prompt` are optional.
   `validate_bundle` enforces the ADR-0099 cron shape (non-empty name and prompt,
-  five-field schedule). Timezone is an IANA name, default UTC only when omitted,
-  and only legal with a schedule. Target, when present, is a non-empty channel
-  address string, or an object whose `channel` is one. Schedule is forbidden on other types. A webhook stays `{type, path}`.
+  five-field schedule). Timezone, when present, is an IANA zone name matching an
+  exact key in packaged tzdata, so host only aliases such as `localtime` are rejected. It defaults to UTC
+  only when omitted and is legal only with a schedule. Target, when present, is a
+  non-empty channel address string. Schedule is forbidden on other types. A webhook stays `{type, path}`.
   Declaring triggers in the bundle keeps an agent's full
   wake-up behavior in one reviewable artifact. **Deploy-time validation** rejects
   an unknown type, a cron missing a non-empty name or prompt, a cron whose
@@ -129,17 +130,30 @@ Pydantic models mirroring the Claude Code shapes:
     a typo would become permission *widening*), an unsupported `enforcement` id,
     a malformed pattern, a pattern repeated within one collection, the identical
     pattern string in two collections, and a literal server segment naming a
-    server the bundle declares in neither `mcpServers` nor `connectors.yaml`.
+    server the bundle declares in neither `mcpServers` nor `connectors.yaml`
+    (`tool_policy.unknown_server`). When that undeclared segment names one of
+    Curie's own platform owned servers (`connectors.RESERVED_CONNECTOR_NAMES`,
+    today `curie` and `curie-state`) the code is `tool_policy.platform_server`
+    instead: those servers are outside `toolPolicy` scope, so the pattern is
+    inert and the generic advice to declare it is a dead end, because a
+    connector may not take a reserved name. A bundle that DOES declare its own
+    plugin-mounted `mcpServers` entry by one of those names is unaffected and
+    keeps full policy scope over it.
     Overlapping but *different* globs are legal and resolve by precedence. A
     policy with all three collections empty warns (`tool_policy.denies_everything`)
     but still validates: it denies everything, which is coherent.
-  - **DECLARATION-ONLY today.** Nothing enforces a `toolPolicy` at runtime yet;
-    that lane is a **blocking follow-up**, and **no bundle may ship a `toolPolicy`
-    until it lands**. The residual gap, stated rather than discovered: a platform
-    built before this package version does not model the key at all, and the
-    lenient `PluginManifest` accepts and silently ignores it. Nothing in this
-    package can reach such a platform — the `enforcement` discriminator and the
-    handshake only gate consumers that already parse the field.
+  - **Declared here, enforced by the runner** (#2119). Both of the runner's
+    interception points, the SDK permission callback and the PreToolUse hook,
+    take the decision through one shared
+    `runner/src/curie_runner/approval.py::_decide_gate`, and an unmatched MCP
+    tool is DENIED. Nothing in this package enforces anything: `validate_bundle`
+    and `load_tool_policy` both refuse a policy-bearing bundle unless the caller
+    names `curie/mcp-tool-policy@1`, which is how "declared" and "enforced" are
+    kept from drifting apart. The residual gap, stated rather than discovered: a
+    platform built before this package version does not model the key at all,
+    and the lenient `PluginManifest` accepts and silently ignores it. Nothing in
+    this package can reach such a platform — the `enforcement` discriminator and
+    the handshake only gate consumers that already parse the field.
 - `scripts/` is a directory convention (no manifest schema of its own).
 
 `validate_bundle(path) -> ValidationResult` is the entry point the bundle pipeline calls. It
@@ -170,7 +184,8 @@ Error codes include `bundle.missing`, `manifest.missing`,
 `tool_policy.unenforced`, `tool_policy.invalid`,
 `tool_policy.enforcement_unsupported`, `tool_policy.pattern_invalid`,
 `tool_policy.pattern_duplicate`, `tool_policy.pattern_conflict`,
-`tool_policy.unknown_server`, `scripts.not_a_directory`.
+`tool_policy.unknown_server`, `tool_policy.platform_server`,
+`scripts.not_a_directory`.
 
 `tool_policy.denies_everything` is the one **warning** code in this list, not an
 error: it reports a declared policy whose three collections are all empty, which

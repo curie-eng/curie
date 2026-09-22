@@ -647,7 +647,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
       - name: Install Node
@@ -774,11 +774,11 @@ jobs:
       # native-only build does not need the emulator and does not pay for it.
       - name: Set up QEMU
         if: matrix.platforms
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
       - name: Build (no push)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
@@ -838,11 +838,11 @@ jobs:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the base worker image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -880,11 +880,11 @@ jobs:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the dispatcher image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -920,11 +920,11 @@ jobs:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the mail adapter image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/mail-adapter/Dockerfile
@@ -956,11 +956,11 @@ jobs:
           persist-credentials: false
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the UI image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -1300,11 +1300,11 @@ jobs:
           printf '%s\n' "$output" | grep -F "may not skip"
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1355,11 +1355,11 @@ jobs:
         run: chmod +x cli/target/release/curie
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: buildcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1558,11 +1558,11 @@ jobs:
       # layers from cache alone (58s -> 15s) after wiping the builder.
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
         id: laddercache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1581,7 +1581,7 @@ jobs:
       # retag its from-source builds over whatever `:latest` meant in the local
       # Docker image store before this job ran.
       - name: Build the api image locally (satisfies curie-api + curie-migrate, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -1592,7 +1592,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker base image locally (satisfies the worker-local overlay's FROM, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -1603,7 +1603,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -1650,11 +1650,11 @@ jobs:
       # documents in full.
       - name: Set up a cache-only buildx builder (named, NOT the default -- #803)
         id: releasecache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1667,7 +1667,7 @@ jobs:
       - name: Retag the runner image for the compose worker (CURIE_RUNNER_IMAGE, no registry auth)
         run: docker tag curie-runner ghcr.io/curie-eng/curie-runner:latest
       - name: Build the api image locally (satisfies curie-api + curie-migrate, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -1678,7 +1678,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker base image locally (satisfies the worker-local overlay's FROM, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -1689,7 +1689,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -1700,7 +1700,7 @@ jobs:
           cache-from: type=gha,scope=ladder-dispatcher
           cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -1825,7 +1825,7 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@v5.0.1
         with:
           version: v3.16.4
       # GHA-layer-cached builds via a named buildx builder that is NOT made the
@@ -1836,11 +1836,11 @@ jobs:
       # the Langfuse startup regression. The dispatcher is not deployed.
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: clustercache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -1851,7 +1851,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -1862,7 +1862,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the ui image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -1873,7 +1873,7 @@ jobs:
           cache-from: type=gha,scope=ladder-ui
           cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Build the runner image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -1884,7 +1884,7 @@ jobs:
           cache-from: type=gha,scope=ladder-runner
           cache-to: type=gha,mode=max,scope=ladder-runner
       - name: Build the delayed Postgres readiness fixture locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: charts/curie/ci
           file: charts/curie/ci/postgres-readiness-delay.Dockerfile
@@ -1930,7 +1930,7 @@ jobs:
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@v1.14.0
+        uses: helm/kind-action@v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -1949,7 +1949,7 @@ jobs:
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@v1.14.0
+        uses: helm/kind-action@v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2170,11 +2170,11 @@ jobs:
           version: v3.16.4
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: upgradecache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the candidate api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -2185,7 +2185,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the candidate dispatcher image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/dispatcher/Dockerfile
@@ -2196,7 +2196,7 @@ jobs:
           cache-from: type=gha,scope=ladder-dispatcher
           cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Build the candidate worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -2207,7 +2207,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the candidate ui image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/ui/Dockerfile
@@ -2218,7 +2218,7 @@ jobs:
           cache-from: type=gha,scope=ladder-ui
           cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Build the candidate runner image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: runner/Dockerfile
@@ -2245,7 +2245,7 @@ jobs:
                   protocol: TCP
           EOF
       - name: Create the disposable kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2590,11 +2590,11 @@ jobs:
           version: v3.16.4
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: upgradecache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       - name: Build the candidate worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/worker/Dockerfile
@@ -2616,7 +2616,7 @@ jobs:
             - role: control-plane
           EOF
       - name: Create the disposable kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2784,7 +2784,7 @@ jobs:
           version: v3.16.4
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: matrixcache
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
       # One parallel bake of all five candidate images (#2733); the serial
@@ -2829,7 +2829,7 @@ jobs:
       - name: Create the disposable kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2843,7 +2843,7 @@ jobs:
           sleep 15
       - name: Create the disposable kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93

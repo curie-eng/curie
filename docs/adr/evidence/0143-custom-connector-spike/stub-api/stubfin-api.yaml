@@ -1,0 +1,46 @@
+# The stand-in third-party API. NOT part of the bundle: it plays the external
+# system the connector reaches, so it is applied by hand into the namespace.
+# The script travels as a ConfigMap so the fixture needs no image of its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: stubfin-api
+spec:
+  selector:
+    app: stubfin-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stubfin-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stubfin-api
+  template:
+    metadata:
+      labels:
+        app: stubfin-api
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: api
+          image: python:3.12-slim
+          command: ["python", "-u", "/app/stubfin_api.py"]
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: app
+              mountPath: /app
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+      volumes:
+        - name: app
+          configMap:
+            name: stubfin-api

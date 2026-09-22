@@ -87,11 +87,29 @@ def _load_catalog(path: Path) -> tuple[object, str | None]:
     return payload, None
 
 
+def _semantic_version_key(version: str) -> tuple[int, int, int] | None:
+    normalized = version.strip()
+    if normalized[:1] in {"v", "V"}:
+        normalized = normalized[1:]
+    parts = normalized.split(".")
+    if len(parts) != 3:
+        return None
+    for part in parts:
+        if (
+            not part
+            or not part.isascii()
+            or not part.isdigit()
+            or (len(part) > 1 and part.startswith("0"))
+        ):
+            return None
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate Chart.yaml appVersion schema window against the "
-            "Alembic head and catalog revisions."
+            "Validate the newest catalog schema window against the Alembic "
+            "head and verify that Chart.yaml appVersion is catalogued."
         )
     )
     parser.add_argument(
@@ -158,17 +176,41 @@ def main() -> int:
     if missing:
         return _fail("catalog revisions missing alembic id " + ", ".join(missing))
 
-    window = windows.get(app_version)
-    if not isinstance(window, dict):
+    chart_window = windows.get(app_version)
+    if not isinstance(chart_window, dict):
         return _fail(f"catalog has no window for appVersion {app_version}")
-    schema_head = window.get("schema_head")
+
+    newest_app_version: str | None = None
+    newest_version_key: tuple[int, int, int] | None = None
+    for version in windows:
+        version_key = _semantic_version_key(version)
+        if version_key is None:
+            return _fail(
+                f"catalog window key is not a numeric semantic version: {version!r}"
+            )
+        if newest_version_key is None or version_key > newest_version_key:
+            newest_app_version = version
+            newest_version_key = version_key
+
+    if newest_app_version is None:
+        return _fail("catalog has no schema windows")
+    newest_window = windows[newest_app_version]
+    if not isinstance(newest_window, dict):
+        return _fail(
+            f"catalog window for newest appVersion {newest_app_version} is not an object"
+        )
+    schema_head = newest_window.get("schema_head")
     if schema_head != head:
         return _fail(
-            f"windows[{app_version!r}].schema_head is {schema_head!r} "
+            f"windows[{newest_app_version!r}].schema_head is {schema_head!r} "
             f"but alembic head is {head}"
         )
 
-    print(f"schema-window OK: appVersion {app_version} schema_head {head}")
+    print(
+        "schema-window OK: "
+        f"chart appVersion {app_version} "
+        f"catalog appVersion {newest_app_version} schema_head {head}"
+    )
     return 0
 
 
