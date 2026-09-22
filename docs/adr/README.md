@@ -185,4 +185,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0156 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0156-adapter-principal-with-a-scoped-credential.md) | Accepted |
 | 0157 | [Factory work dispatches from SQL over the runs stream](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md) | Accepted |
 | 0159 | [A canary is a weighted second active deployment and every trace carries its version](0159-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
+| 0160 | [A long scheduled sweep stays on one sandbox](0160-a-long-scheduled-sweep-stays-on-one-sandbox.md) | Accepted |
 <!-- END GENERATED: adr-index -->
