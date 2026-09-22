@@ -17,6 +17,7 @@ const EXPECTED_COMMAND_IDS = [
   "cluster.observability.runs",
   "cluster.reset-thread",
   "cluster.status",
+  "cluster.work-items",
   "init",
   "local.deploy",
   "local.observability.metrics",
@@ -24,6 +25,7 @@ const EXPECTED_COMMAND_IDS = [
   "local.observability.runs",
   "local.reset-thread",
   "local.status",
+  "local.work-items",
 ] as const;
 const EXPECTED_NO_CLI_ACTION_IDS = [
   "behavior-packs-edit",

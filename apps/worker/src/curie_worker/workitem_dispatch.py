@@ -74,6 +74,13 @@ class WorkItemStartGrant:
 
 
 @dataclass(frozen=True)
+class WorkItemRunning:
+    request_id: uuid.UUID
+    runtime_epoch: int
+    execution_deadline: datetime
+
+
+@dataclass(frozen=True)
 class WorkItemHeartbeat:
     status: str
     terminal_cause: str | None
@@ -265,6 +272,40 @@ class WorkItemDispatchClient:
                 "work-item heartbeat returned an unusable body"
             ) from exc
 
+    async def running_for_conversation(self, conversation_id: str) -> WorkItemRunning | None:
+        response = await self._client.get(
+            f"{self._base}/v1/internal/work-items/running",
+            headers=self._headers,
+            params={"conversation_id": conversation_id},
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code == 409 and _conflict_code(response) == "execution_ended":
+            raise WorkItemConflict("execution_ended")
+        if response.status_code >= 500:
+            raise WorkItemTransportError(
+                f"work-item running lookup returned {response.status_code}"
+            )
+        if response.status_code != 200:
+            raise WorkItemConflict(_conflict_code(response))
+        try:
+            body = response.json()
+            return WorkItemRunning(
+                request_id=uuid.UUID(str(body["request_id"])),
+                runtime_epoch=int(body["runtime_epoch"]),
+                execution_deadline=_parse_datetime(body["execution_deadline"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkItemTransportError(
+                "work-item running lookup returned an unusable body"
+            ) from exc
+
+    async def hold_for_approval(self, request_id: uuid.UUID, *, runtime_epoch: int) -> None:
+        await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/hold-approval",
+            {"runtime_epoch": runtime_epoch},
+        )
+
     async def finish(
         self,
         request_id: uuid.UUID,
@@ -407,6 +448,7 @@ class WorkItemRun:
         self.thread_key = thread_key
         self.started = False
         self.finished = False
+        self.held = False
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
@@ -456,6 +498,13 @@ class WorkItemRun:
         if remaining_s is None:
             return left
         return min(remaining_s, left)
+
+    async def hold_for_approval(self) -> None:
+        if self.runtime_epoch is None:
+            raise WorkItemTransportError("work-item hold called before start")
+        await self._client.hold_for_approval(
+            self.request_id, runtime_epoch=self.runtime_epoch
+        )
 
     async def finish(self, *, outcome: str, cause: str) -> None:
         if self.runtime_epoch is None:

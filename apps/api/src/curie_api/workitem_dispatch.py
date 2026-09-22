@@ -45,6 +45,7 @@ RefusalCode = Literal[
     "waiting_deadline_elapsed",
     "binding_missing",
     "repository_not_allowed",
+    "publication_pending",
 ]
 
 DispatchResult = WorkItemOutcome | WorkItemConflict
@@ -726,6 +727,65 @@ async def heartbeat(
     return result
 
 
+async def hold_for_approval(
+    session: AsyncSession, request_id: uuid.UUID, *, runtime_epoch: int
+) -> HeartbeatResult | DispatchConflict:
+    """Keep a suspended approval inside the 1800s execution bound.
+
+    The worker stops refreshing the short runtime lease when the turn suspends.
+    This sets that lease to the execution deadline. It does not finish the request.
+    """
+
+    request = await _lock_request_by_id(session, request_id)
+    if request is None:
+        return await _refuse(session, "not_found", request_id=request_id)
+    if request.status != "running" or request.runtime_epoch != runtime_epoch:
+        return await _refuse(
+            session,
+            "stale_owner",
+            request_id=request.id,
+            status=request.status,
+        )
+    now = await _database_now(session)
+    if request.execution_deadline is None or now >= request.execution_deadline:
+        return await _refuse(
+            session,
+            "not_running",
+            request_id=request.id,
+            status=request.status,
+        )
+    changed_id = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.status == "running",
+            ExecutionRequest.runtime_epoch == runtime_epoch,
+            ExecutionRequest.execution_deadline > func.clock_timestamp(),
+        )
+        .values(
+            runtime_heartbeat_expires_at=ExecutionRequest.execution_deadline,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _refuse(
+            session,
+            "stale_owner",
+            request_id=request.id,
+            status=request.status,
+        )
+    request = await _reload_request(session, request.id)
+    work_item = await session.scalar(select(WorkItem).where(WorkItem.id == request.work_item_id))
+    result = HeartbeatResult(
+        status=request.status,
+        terminal_cause=request.terminal_cause,
+        work_item_cancelled=work_item is not None and work_item.cancelled_at is not None,
+    )
+    await session.commit()
+    return result
+
+
 def _map_finish_conflict(
     result: WorkItemConflict, request: ExecutionRequest | None
 ) -> RefusalCode:
@@ -735,6 +795,8 @@ def _map_finish_conflict(
         return "work_item_cancelled"
     if result.code == "stale_version":
         return "stale_owner"
+    if result.code == "publication_pending":
+        return "publication_pending"
     if request is not None and request.status == "cancellation_requested":
         if request.terminal_cause == "issue_cancelled":
             return "work_item_cancelled"
@@ -892,6 +954,37 @@ async def cancel(
         work_item_id=work_item_id,
         expected_work_item_version=expected_version,
     )
+
+
+async def running_for_conversation(
+    session: AsyncSession, conversation_id: str
+) -> tuple[Literal["absent", "ended", "running"], ExecutionRequest | None]:
+    """The execution whose work item uses this scoped conversation.
+
+    ``absent`` is an ordinary approval with no factory run. ``ended`` means
+    the run already finished, so a resume must not start another turn.
+    ``running`` is the request the continuation still owns.
+    """
+
+    work_item = await session.scalar(
+        select(WorkItem).where(WorkItem.conversation_id == conversation_id)
+    )
+    if work_item is None:
+        return "absent", None
+    running = cast(
+        ExecutionRequest | None,
+        await session.scalar(
+            select(ExecutionRequest).where(
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.status == "running",
+                ExecutionRequest.runtime_epoch.is_not(None),
+                ExecutionRequest.execution_deadline.is_not(None),
+            )
+        ),
+    )
+    if running is None:
+        return "ended", None
+    return "running", running
 
 
 async def get_request(

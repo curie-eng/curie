@@ -84,6 +84,10 @@ export const WIRED_ACTIONS = [
   // internally during a model sweep), so the view renders the honest amber gap.
   { id: "eval-matrix", label: "View the eval matrix", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
 
+  // WiredWorkItems (#2577) — factory outcomes console, env-scoped like status.
+  { id: "work-items-cluster", label: "List factory work items (prod)", mapping: { command: "cluster.work-items" } },
+  { id: "work-items-local", label: "List factory work items (dev)", mapping: { command: "local.work-items" } },
+
   // WiredAgentBehaviorPacks (#870) — view/edit the agent's opt-in behavior packs.
   // No CLI path reads or writes behavior_packs (see cli/api-mirrors.json), so the
   // save action renders the honest amber gap glyph linking to the parity epic.

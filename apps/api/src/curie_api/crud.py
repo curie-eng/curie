@@ -841,7 +841,7 @@ async def _refuse_fenced_work_item(
     conversation_id: str,
     request_id: uuid.UUID | None,
     runtime_epoch: int | None,
-) -> None:
+) -> ExecutionRequest | None:
     work_item = await session.scalar(
         select(WorkItem)
         .where(
@@ -852,7 +852,7 @@ async def _refuse_fenced_work_item(
         .execution_options(populate_existing=True)
     )
     if work_item is None:
-        return
+        return None
     if work_item.cancelled_at is not None:
         raise PublicationLineageConflict(
             "publication.work_item_cancelled",
@@ -868,12 +868,16 @@ async def _refuse_fenced_work_item(
         .execution_options(populate_existing=True)
     )
     if active is None:
-        return
+        return None
     if active.status == "cancellation_requested":
         raise PublicationLineageConflict(
             "publication.work_item_cancelled",
             "this conversation's work item is cancelled",
         )
+    # A resumed approval turn does not carry the execute event id. The only
+    # running request for this conversation owns the publication.
+    if request_id is None and runtime_epoch is None:
+        return active
     if active.status == "running" and (
         request_id != active.id or runtime_epoch != active.runtime_epoch
     ):
@@ -881,6 +885,7 @@ async def _refuse_fenced_work_item(
             "publication.work_item_stale_owner",
             "the publication is not owned by the running work item request",
         )
+    return active
 
 
 async def create_publication(
@@ -917,7 +922,7 @@ async def create_publication(
         conversation_id=workspace_conversation_id,
     )
 
-    await _refuse_fenced_work_item(
+    owned_request = await _refuse_fenced_work_item(
         session,
         agent_id=deployment.agent_id,
         conversation_id=workspace_conversation_id,
@@ -1114,7 +1119,15 @@ async def create_publication(
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
     )
+    if owned_request is not None:
+        publication.execution_request_id = owned_request.id
     session.add(publication)
+    await _bind_running_work_item_lineage(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+        lineage_id=lineage.id,
+    )
     try:
         await session.commit()
     except IntegrityError as exc:
@@ -1132,6 +1145,42 @@ async def create_publication(
     await session.refresh(publication)
     await session.refresh(publication, ["lineage"])
     return publication, True
+
+
+async def _bind_running_work_item_lineage(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    lineage_id: uuid.UUID,
+) -> None:
+    """Point the running factory request at this publication before commit.
+
+    The publication transaction already holds the work item. A conversation
+    with no running request is left alone.
+    """
+
+    await session.execute(
+        update(WorkItem)
+        .where(
+            WorkItem.agent_id == agent_id,
+            WorkItem.conversation_id == conversation_id,
+            WorkItem.cancelled_at.is_(None),
+            WorkItem.publication_lineage_id.is_(None),
+            select(ExecutionRequest.id)
+            .where(
+                ExecutionRequest.work_item_id == WorkItem.id,
+                ExecutionRequest.status == "running",
+                ExecutionRequest.execution_deadline > func.clock_timestamp(),
+            )
+            .exists(),
+        )
+        .values(
+            publication_lineage_id=lineage_id,
+            version=WorkItem.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+    )
 
 
 async def get_publication(session: AsyncSession, publication_id: uuid.UUID) -> Publication | None:
@@ -2036,6 +2085,16 @@ async def claim_approval_resolution(
     # Publication outcomes are reported by the platform worker, never by a
     # resumed model turn. Mark the approval as owing no wake in the same CAS.
     publication = await get_publication_by_approval(session, approval_id)
+    if (
+        publication is not None
+        and publication.execution_request_id is not None
+        and decision == ApprovalStatus.approved
+    ):
+        owning = await session.get(ExecutionRequest, publication.execution_request_id)
+        if owning is None or owning.status != "running":
+            decision = ApprovalStatus.rejected
+            values["status"] = decision
+            values["resolution_note"] = "the factory run already ended"
     if publication is not None:
         values["resumed_at"] = func.now()
 

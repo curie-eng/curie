@@ -816,9 +816,13 @@ stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
-the review subscriptions when both gates are on. Give the App **Issues: Read**
-so Curie can re-read the issue and comment, and **Metadata: Read** is already
+the review subscriptions when both gates are on. Give the App **Issues: Read and write**
+so Curie can re-read the issue and post one terminus comment, and **Metadata: Read** is already
 implied by repository installation discovery.
+
+Give the App **Checks: Read** so the work item detail can report CI for the
+published head. Without it, CI reports `unavailable` / `github_forbidden` and
+nothing else changes.
 
 ### Factory work items wait for capacity
 
@@ -853,6 +857,16 @@ operators raise the delivery budget for factory agents.
 Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
+
+A labelled factory run ends as one pull request or one comment on the
+originating issue. The comment says the run cannot continue and names the
+cause (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
+`owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
+`publication_denied`, `publication_expired`, or `publication_failed`). The
+work item reconciler posts that comment after the terminal row commits. A
+refused post is recorded on the notice and does not change the execution row.
+Waiting for approval is not an ending: the execution deadline stays 1800
+seconds from start and covers that wait.
 
 ### Driving the factory end to end
 
@@ -899,6 +913,55 @@ or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
 preflight and then one scenario driver: `issue-to-pr`, `revision`,
 `cancel-waiting`, `cancel-running` or `evaluation`. A scenario that has no
 driver yet is refused before anything is installed.
+
+### Reading work item outcomes
+
+Operators read factory work through two read-only routes behind the platform
+API key: `GET /work-items` (optional `agent_id`, `limit` 1 to 200, default 50,
+newest update first, with a `truncated` flag) and `GET /work-items/{id}`
+(optional `agent_id`). An unknown id and an id owned by another agent return
+the same 404 body. Both responses carry `Cache-Control: no-store`.
+
+Each item carries its issue link, its pull request (from the conversation's
+publication lineage), its publication and approval status, every execution
+request, a `state` and an `actionable_cause`. The states:
+
+- `waiting`: admitted and waiting for sandbox capacity. The cause names
+  capacity deferrals and says when the waiting deadline has elapsed but the
+  reconciler has not yet expired the request.
+- `running`: started, bounded by the 1800 s execution deadline.
+- `cancellation_requested`: termination requested (`issue_cancelled`,
+  `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
+- `cancelled`: the issue label was removed or the issue was closed. A pull
+  request already opened is kept.
+- `expired`: `capacity_wait_expired` or `execution_deadline`.
+- `failed`: the cause names the terminal cause verbatim. For
+  `deadline_halted`, raise `worker.deliveryBudgetSeconds`.
+- `awaiting_approval`: a publication approval or a tool approval on the same
+  conversation is pending.
+- `publishing`: the publication is approved and in flight.
+- `published`: a pull request is open for the work.
+- `completed_unpublished`: the run completed with no publication, or its
+  publication was denied, expired or failed.
+
+The platform never asserts correctness: every item reports
+`correctness: {"asserted": false, "owner": "bundle"}`. Verification belongs
+to the bundle.
+
+The detail route observes CI live for the pull request head and never stores
+it. `ci.state` is `passing`, `failing`, `pending`, `none` (no check runs),
+`not_applicable` (no pull request) or `unavailable` with a fixed `reason`:
+`no_head_sha`, `app_not_configured`, `installation_refused`,
+`github_unauthorized`, `github_forbidden`,
+`github_not_found`, `github_rate_limited`, `github_error`, `timeout`,
+`malformed_response`, `too_many_check_runs` or `observation_busy` (every
+concurrent credential slot is held by an in-flight mint). The list route reports
+`ci: null` and never calls GitHub.
+
+The CLI reads the same routes: `curie cluster work-items [ID] [--agent
+NAME_OR_ID] [--json]` and `curie local work-items`. Exit codes are 0 on
+success, 1 for not found or refused, 2 for invalid input and 3 when the API
+is unreachable. The skill tier has no work items and exits 4.
 
 ## Talking to your agent
 

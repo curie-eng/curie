@@ -183,6 +183,90 @@ async def _lineage(
     return lineage_id
 
 
+async def _grant_opened_pull_request(
+    session: AsyncSession,
+    outcome: workitems.WorkItemOutcome,
+    *,
+    pr: int,
+) -> workitems.WorkItemOutcome:
+    """Link a succeeded publication so complete_execution can mean a pull request."""
+
+    item = outcome.work_item
+    request = outcome.request
+    assert request is not None
+    lineage_id = await _lineage(
+        session,
+        item.agent_id,
+        conversation=item.conversation_id,
+        repo=item.repo_full_name,
+        pr=pr,
+        github_repository_id=item.github_repository_id,
+        github_installation_id=item.github_installation_id,
+    )
+    deployment_id = await session.scalar(
+        text(
+            "SELECT deployment_id FROM curie.thread_publication_lineages WHERE id = :id"
+        ),
+        {"id": lineage_id},
+    )
+    approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
+    pr_url = f"https://github.com/{item.repo_full_name}/pull/{pr}"
+    await session.execute(
+        text(
+            "INSERT INTO curie.approvals "
+            "(id, agent_id, conversation_id, author, summary, reply_kind, "
+            "reply_channel, dedupe_key, status, purpose) VALUES "
+            "(:id, :agent, :conversation, 'U0REQUEST1', "
+            "'Publish repository changes', 'github', :channel, :dedupe, "
+            "'approved', 'publication')"
+        ),
+        {
+            "id": approval_id,
+            "agent": item.agent_id,
+            "conversation": item.conversation_id,
+            "channel": item.repo_full_name,
+            "dedupe": f"opened-pr-{publication_id.hex}",
+        },
+    )
+    await session.execute(
+        text(
+            "INSERT INTO curie.publications "
+            "(id, approval_id, deployment_id, workspace_conversation_id, "
+            "lineage_id, execution_request_id, revision_number, repo_full_name, "
+            "status, base_sha, changed_paths, title, body, reply_kind, "
+            "reply_channel, result_url) "
+            "VALUES "
+            "(:id, :approval, :deployment, :conversation, :lineage, :request, 1, "
+            ":repo, 'succeeded', :base_sha, CAST('[\"README.md\"]' AS jsonb), "
+            "'Update README', 'Approved platform publication.', 'github', "
+            ":channel, :result_url)"
+        ),
+        {
+            "id": publication_id,
+            "approval": approval_id,
+            "deployment": deployment_id,
+            "conversation": item.conversation_id,
+            "lineage": lineage_id,
+            "request": request.id,
+            "repo": item.repo_full_name,
+            "channel": item.repo_full_name,
+            "base_sha": "0123456789abcdef0123456789abcdef01234567",
+            "result_url": pr_url,
+        },
+    )
+    await session.commit()
+    linked = await workitems.link_publication_lineage(
+        session,
+        work_item_id=item.id,
+        request_id=request.id,
+        publication_lineage_id=lineage_id,
+        expected_work_item_version=item.version,
+        expected_request_version=request.version,
+    )
+    assert isinstance(linked, workitems.WorkItemOutcome), linked
+    return linked
+
+
 async def _elapsed_running(
     session: AsyncSession,
     agent_id: uuid.UUID,
@@ -656,24 +740,26 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
         )
         assert stale.request_version == 2
 
+        opened = await _grant_opened_pull_request(session, running, pr=659)
+        assert opened.request is not None
         completed = await workitems.complete_execution(
             session,
             work_item_id=item.id,
             request_id=request.id,
-            expected_work_item_version=2,
-            expected_request_version=2,
+            expected_work_item_version=opened.work_item.version,
+            expected_request_version=opened.request.version,
         )
         assert isinstance(completed, workitems.WorkItemOutcome), completed
         assert completed.request is not None
         assert (completed.request.status, completed.request.version) == ("completed", 3)
-        assert completed.work_item.version == 2
+        assert completed.work_item.version == opened.work_item.version
         _conflict(
             await workitems.fail_execution(
                 session,
                 work_item_id=item.id,
                 request_id=request.id,
                 cause="rewrite",
-                expected_work_item_version=2,
+                expected_work_item_version=completed.work_item.version,
                 expected_request_version=3,
             ),
             "illegal_transition",
@@ -697,7 +783,7 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
             failed.request.terminal_cause,
             failed.request.version,
             failed.work_item.version,
-        ) == ("failed", 2, "fixture_machine_failure", 3, 3)
+        ) == ("failed", 2, "fixture_machine_failure", 3, 4)
 
         row = (
             await session.execute(
@@ -1040,22 +1126,36 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
 
         terminal = await _start(
             session,
-            await _request(session, (await _item(session, agent_id, issue=2575)).work_item),
+            await _request(
+                session,
+                (
+                    await _item(
+                        session,
+                        agent_id,
+                        issue=2575,
+                        conversation=f"slack:C0EXAMPLE1:{uuid.uuid4().hex[:12]}",
+                    )
+                ).work_item,
+            ),
         )
+        assert terminal.request is not None
+        terminal = await _grant_opened_pull_request(session, terminal, pr=125)
         assert terminal.request is not None
         terminal = await workitems.complete_execution(
             session,
             work_item_id=terminal.work_item.id,
             request_id=terminal.request.id,
-            expected_work_item_version=2,
-            expected_request_version=2,
+            expected_work_item_version=terminal.work_item.version,
+            expected_request_version=terminal.request.version,
         )
         assert isinstance(terminal, workitems.WorkItemOutcome), terminal
         sealed = await workitems.request_cancellation(
-            session, work_item_id=terminal.work_item.id, expected_work_item_version=2
+            session,
+            work_item_id=terminal.work_item.id,
+            expected_work_item_version=terminal.work_item.version,
         )
         assert isinstance(sealed, workitems.WorkItemOutcome), sealed
-        assert sealed.request is None and sealed.work_item.version == 3
+        assert sealed.request is None and sealed.work_item.version == 4
 
         running_item = (await _item(session, agent_id, issue=2576)).work_item
         lineage_id = await _lineage(session, agent_id, pr=126)
@@ -1502,14 +1602,25 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
         session: AsyncSession,
     ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID | None]:
         agent_id = await _agent(session)
-        lineage_id = await _lineage(session, agent_id) if operation == "link" else None
         running = await _start(
             session, await _request(session, (await _item(session, agent_id)).work_item)
         )
         assert running.request is not None
-        return running.work_item.id, running.request.id, lineage_id
+        lineage_id = None
+        if operation == "link":
+            lineage_id = await _lineage(session, agent_id)
+        elif operation == "complete":
+            running = await _grant_opened_pull_request(session, running, pr=4100)
+            assert running.request is not None
+            lineage_id = running.work_item.publication_lineage_id
+        return (
+            running.work_item.id,
+            running.request.id,
+            lineage_id,
+            running.work_item.version,
+        )
 
-    item_id, request_id, lineage_id = with_session(setup)
+    item_id, request_id, lineage_id, work_version = with_session(setup)
 
     async def race() -> list[workitems.WorkItemResult]:
         engine = create_async_engine(get_settings().database_url)
@@ -1520,7 +1631,7 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
                 common = {
                     "work_item_id": item_id,
                     "request_id": request_id,
-                    "expected_work_item_version": 2,
+                    "expected_work_item_version": work_version,
                     "expected_request_version": 2,
                 }
                 if operation == "complete":
@@ -1539,7 +1650,7 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
                 return await workitems.request_cancellation(
                     session,
                     work_item_id=item_id,
-                    expected_work_item_version=2,
+                    expected_work_item_version=work_version,
                 )
 
         try:
@@ -1584,8 +1695,13 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
                 cancellation.work_item.version,
                 cancellation.request.version,
                 cancellation.work_item.publication_lineage_id,
-            ) == (3, 3, None)
-            expected = (3, "cancellation_requested", 3, None)
+            ) == (work_version + 1, 3, lineage_id if operation == "complete" else None)
+            expected = (
+                work_version + 1,
+                "cancellation_requested",
+                3,
+                lineage_id if operation == "complete" else None,
+            )
         else:
             assert operation in {"complete", "fail"}
             assert isinstance(mutation, workitems.WorkItemOutcome), mutation
@@ -1593,8 +1709,13 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
             terminal_status = "completed" if operation == "complete" else "failed"
             assert mutation.request.status == terminal_status
             assert mutation.request.version == 3
-            assert cancellation.work_item.version == 3
-            expected = (3, terminal_status, 3, None)
+            assert cancellation.work_item.version == work_version + 1
+            expected = (
+                work_version + 1,
+                terminal_status,
+                3,
+                lineage_id if operation == "complete" else None,
+            )
 
     async def verify(session: AsyncSession) -> None:
         row = (
@@ -1752,5 +1873,84 @@ def test_start_execution_spends_exactly_one_attempt(clean_db: None) -> None:
         )
         assert started_attempts == 1
         assert running.request.started_at is not None
+
+    with_session(body)
+
+
+def test_an_opened_pull_request_completes_after_the_execution_deadline(
+    clean_db: None,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        lineage_id = await _lineage(session, agent_id, pr=77)
+        item_id, request_id, _, _ = await _elapsed_running(
+            session, agent_id, lineage_id=lineage_id, issue=2924
+        )
+        deployment_id = await session.scalar(
+            text(
+                "SELECT deployment_id FROM curie.thread_publication_lineages "
+                "WHERE id = :id"
+            ),
+            {"id": lineage_id},
+        )
+        approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
+        pr_url = f"https://github.com/{REPO}/pull/77"
+        await session.execute(
+            text(
+                "INSERT INTO curie.approvals "
+                "(id, agent_id, conversation_id, author, summary, reply_kind, "
+                "reply_channel, dedupe_key, status, purpose) VALUES "
+                "(:id, :agent, :conversation, 'U0REQUEST1', "
+                "'Publish repository changes', 'github', :channel, :dedupe, "
+                "'approved', 'publication')"
+            ),
+            {
+                "id": approval_id,
+                "agent": agent_id,
+                "conversation": CONVERSATION,
+                "channel": REPO,
+                "dedupe": f"late-pr-{publication_id.hex}",
+            },
+        )
+        await session.execute(
+            text(
+                "INSERT INTO curie.publications "
+                "(id, approval_id, deployment_id, workspace_conversation_id, "
+                "lineage_id, execution_request_id, revision_number, repo_full_name, "
+                "status, base_sha, changed_paths, title, body, reply_kind, "
+                "reply_channel, result_url) "
+                "VALUES "
+                "(:id, :approval, :deployment, :conversation, :lineage, :request, 1, "
+                ":repo, 'succeeded', :base_sha, CAST('[\"README.md\"]' AS jsonb), "
+                "'Update README', 'Approved platform publication.', 'github', "
+                ":channel, :result_url)"
+            ),
+            {
+                "id": publication_id,
+                "approval": approval_id,
+                "deployment": deployment_id,
+                "conversation": CONVERSATION,
+                "lineage": lineage_id,
+                "request": request_id,
+                "repo": REPO,
+                "channel": REPO,
+                "base_sha": "0123456789abcdef0123456789abcdef01234567",
+                "result_url": pr_url,
+            },
+        )
+        await session.commit()
+        completed = await workitems.complete_execution(
+            session,
+            work_item_id=item_id,
+            request_id=request_id,
+            expected_work_item_version=2,
+            expected_request_version=2,
+        )
+        assert isinstance(completed, workitems.WorkItemOutcome), completed
+        assert completed.request is not None
+        assert (completed.request.status, completed.request.terminal_cause) == (
+            "completed",
+            "completed",
+        )
 
     with_session(body)

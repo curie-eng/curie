@@ -135,10 +135,12 @@ from .sandbox.types import (
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .workitem_dispatch import (
     TerminationObservation,
+    WorkItemAcquireGrant,
     WorkItemConflict,
     WorkItemDispatchClient,
     WorkItemRun,
     WorkItemStartRefused,
+    WorkItemTransportError,
     parse_work_item_event_id,
 )
 from .workspace import (
@@ -799,6 +801,10 @@ class TurnOutcome:
     workspace_inferred_repo: str | None = None
 
 
+class _FactoryExecutionEnded(Exception):
+    """The factory run already ended, so this approval must not resume it."""
+
+
 class _WorkItemDeferred(Exception):
     """The execute wake was deferred in SQL; ACK it and start nothing."""
 
@@ -1161,6 +1167,7 @@ class Kernel:
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
+        self._held_work_items: dict[str, WorkItemRun] = {}
         self._active_work_item_request_id: uuid.UUID | None = None
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
@@ -1478,6 +1485,67 @@ class Kernel:
         if error is not None:
             raise error
 
+    def _run_for_event(self, event_id: str) -> WorkItemRun | None:
+        """The execution bound to this turn, not whichever run started last."""
+
+        for candidate in self._work_item_runs.values():
+            if (
+                candidate.event_id == event_id
+                and candidate.started
+                and not candidate.finished
+            ):
+                return candidate
+        return None
+
+    async def _adopt_resumed_work_item(
+        self, event_id: str, thread_key: str
+    ) -> uuid.UUID | None:
+        """Reattach the execution an approval continuation still owns.
+
+        The execute wake already returned. The same process keeps the run.
+        A restarted worker reads the still-running request by conversation.
+        Either way the continuation finishes that request and bounds the
+        runner by the original execution deadline.
+        """
+
+        held = self._held_work_items.pop(thread_key, None)
+        if held is None and self._work_items is not None:
+            try:
+                found = await self._work_items.running_for_conversation(thread_key)
+            except WorkItemTransportError:
+                raise
+            except WorkItemConflict as exc:
+                if exc.code == "execution_ended":
+                    raise _FactoryExecutionEnded from exc
+                found = None
+            if found is not None:
+                held = WorkItemRun(
+                    client=self._work_items,
+                    request_id=found.request_id,
+                    owner=self._config.consumer_name,
+                    grant=WorkItemAcquireGrant(
+                        generation=0,
+                        work_item_id=found.request_id,
+                        conversation_id=thread_key,
+                        wait_deadline="",
+                    ),
+                    event_id=event_id,
+                    thread_key=thread_key,
+                    on_stop=self._stop_owned_work_item,
+                    on_stale=self._abandon_stale_work_item,
+                )
+                held.started = True
+                held.runtime_epoch = found.runtime_epoch
+                held.execution_deadline = found.execution_deadline
+        if held is None:
+            return None
+        held.held = False
+        held.finished = False
+        held.event_id = event_id
+        self._work_item_runs[held.request_id] = held
+        self._active_work_item_request_id = held.request_id
+        return held.request_id
+
     async def _process_event(
         self, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
     ) -> None:
@@ -1644,6 +1712,14 @@ class Kernel:
                     on_stale=self._abandon_stale_work_item,
                 )
                 owned_work_item_id = parsed_work_item.request_id
+            elif self._is_approval_resume(event_id):
+                try:
+                    owned_work_item_id = await self._adopt_resumed_work_item(
+                        event_id, thread_key
+                    )
+                except _FactoryExecutionEnded:
+                    await self._markers.mark_done(event_id)
+                    return
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
@@ -2138,9 +2214,14 @@ class Kernel:
                 await asyncio.sleep(backoff_s)
         finally:
             if owned_work_item_id is not None:
-                owned_run = self._work_item_runs.pop(owned_work_item_id, None)
-                if owned_run is not None:
-                    await owned_run.close()
+                owned_run = self._work_item_runs.get(owned_work_item_id)
+                if owned_run is not None and owned_run.held:
+                    self._held_work_items[owned_run.thread_key] = owned_run
+                    self._work_item_runs.pop(owned_work_item_id, None)
+                else:
+                    owned_run = self._work_item_runs.pop(owned_work_item_id, None)
+                    if owned_run is not None:
+                        await owned_run.close()
                 if getattr(self, "_active_work_item_request_id", None) == owned_work_item_id:
                     self._active_work_item_request_id = None
             release_order()
@@ -2768,15 +2849,35 @@ class Kernel:
         )
         if run is not None and run.event_id != qevent.event_id:
             run = None
+        if run is None and self._is_approval_resume(qevent.event_id):
+            run = self._run_for_event(qevent.event_id)
         if run is not None and run.started and not run.finished:
-            finish_outcome = (
-                "completed" if outcome in ("delivered", "awaiting-approval") else "failed"
-            )
             try:
-                await run.finish(
-                    outcome=finish_outcome,
-                    cause="completed" if finish_outcome == "completed" else telemetry_outcome,
-                )
+                if outcome == "awaiting-approval":
+                    # Approval is not a terminus. Stop the short lease refresh
+                    # and hold the request until its execution deadline. The
+                    # run stays attached so the resume turn can finish it.
+                    await run.close()
+                    try:
+                        await run.hold_for_approval()
+                    except (WorkItemConflict, WorkItemTransportError):
+                        logger.warning(
+                            "work-item approval hold failed for %s",
+                            qevent.event_id,
+                            exc_info=True,
+                        )
+                    else:
+                        run.held = True
+                elif outcome == "delivered":
+                    try:
+                        await run.finish(outcome="failed", cause="no_pull_request")
+                    except WorkItemConflict as exc:
+                        if exc.code != "publication_pending":
+                            raise
+                elif outcome == "escalated":
+                    await run.finish(outcome="failed", cause="runner_escalated")
+                else:
+                    await run.finish(outcome="failed", cause="runner_failed")
             except WorkItemConflict as exc:
                 logger.warning(
                     "work-item finish refused for %s: %s; writing no marker",
@@ -4350,9 +4451,19 @@ class Kernel:
         # Register before start_turn so a kill during the POST can find this
         # thread. Canned and steered returns above never register. A failed
         # start unregisters so a turn that never opened cannot leak an entry.
-        active_id = getattr(self, "_active_work_item_request_id", None)
-        runs = getattr(self, "_work_item_runs", {})
-        run = runs.get(active_id) if active_id is not None else None
+        run = None
+        for candidate in getattr(self, "_work_item_runs", {}).values():
+            if (
+                candidate.thread_key == thread_key
+                and candidate.started
+                and not candidate.finished
+            ):
+                run = candidate
+                break
+        if run is None:
+            active_id = getattr(self, "_active_work_item_request_id", None)
+            runs = getattr(self, "_work_item_runs", {})
+            run = runs.get(active_id) if active_id is not None else None
         if run is not None and run.finished:
             raise WorkItemStartRefused("work item authority is finished")
         if run is not None and not run.started:

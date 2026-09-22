@@ -1,4 +1,4 @@
-"""Migration 0049 adds curie.tenants and auto-provisions the default tenant."""
+"""Migration 0050 adds curie.tenants and auto-provisions the default tenant."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def _tenants_regclass() -> str | None:
     return None if name is None else str(name)
 
 
-def test_0049_creates_tenants_and_downgrade_drops_it(
+def test_0050_creates_tenants_and_downgrade_drops_it(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
@@ -54,7 +54,7 @@ def test_0049_creates_tenants_and_downgrade_drops_it(
     assert str(rows[0]["id"]) == DEFAULT_TENANT_ID
     assert rows[0]["status"] == "active"
     try:
-        command.downgrade(config, "0048")
+        command.downgrade(config, "0049")
         assert _tenants_regclass() is None
     finally:
         # A failed assertion must not leave this private database below head.

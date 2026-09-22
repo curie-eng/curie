@@ -19,7 +19,7 @@ from redis.exceptions import ResponseError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import workitems
+from . import factory_notices, workitems
 from .config import Settings
 from .models import ExecutionRequest, WorkItem
 from .workitem_dispatch import (
@@ -78,9 +78,11 @@ class WorkItemReconciler:
             raise
 
     async def run_once(self) -> None:
+        await self._settle_publications()
         await self._expire_waiting()
         await self._request_deadline_cancellations()
         await self._request_owner_lost_cancellations()
+        await self._post_terminal_notices()
         async with self._sessionmaker() as session:
             await redispatch_lapsed_acquisitions(session)
         await self._publish_execute_wakes()
@@ -203,6 +205,35 @@ class WorkItemReconciler:
                     expected_work_item_version=row.work_item_version,
                     expected_request_version=row.version,
                 )
+
+    async def _settle_publications(self) -> None:
+        for _ in range(self._settings.work_item_batch_limit):
+            async with self._sessionmaker() as session:
+                settlement = await workitems.claim_publication_settlement(session)
+                if settlement is None:
+                    await session.rollback()
+                    return
+                if settlement.cause == "completed":
+                    await workitems.complete_execution(
+                        session,
+                        work_item_id=settlement.work_item_id,
+                        request_id=settlement.request_id,
+                        expected_work_item_version=settlement.work_item_version,
+                        expected_request_version=settlement.request_version,
+                    )
+                else:
+                    await workitems.fail_execution(
+                        session,
+                        work_item_id=settlement.work_item_id,
+                        request_id=settlement.request_id,
+                        cause=settlement.cause,
+                        expected_work_item_version=settlement.work_item_version,
+                        expected_request_version=settlement.request_version,
+                    )
+
+    async def _post_terminal_notices(self) -> None:
+        async with self._sessionmaker() as session:
+            await factory_notices.post_due_notices(session, self._settings)
 
     async def _publish_execute_wakes(self) -> None:
         async with self._sessionmaker() as session:

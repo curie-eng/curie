@@ -125,6 +125,9 @@ class PublicationWork:
     route: TargetRoute
     version: int
     lease_owner: str
+    # False only when this publication already launched and its execution is
+    # no longer running. New launches stay excluded by the claim query.
+    owner_running: bool = True
 
 
 class PublicationStore(Protocol):
@@ -962,7 +965,7 @@ class PublicationReconciler:
             "publication Job succeeded without complete lineage markers"
         )
 
-    async def reconcile(self, work: PublicationWork) -> None:
+    async def reconcile(self, work: PublicationWork, *, allow_launch: bool = True) -> None:
         names = publication_resource_names(work.publication_id)
         if await _resolve(self._store.is_terminal(work.publication_id)):
             # Terminalized by another lane (denial, expiry, a peer worker);
@@ -1003,6 +1006,15 @@ class PublicationReconciler:
                 await self._bounded_setup_failure(work, exc)
                 return
             if observation.phase in {"pending", "running"}:
+                if not allow_launch:
+                    await _resolve(
+                        self._store.persist_result(
+                            work.publication_id,
+                            outcome="failed",
+                            pr_url=None,
+                            error="the factory run already ended",
+                        )
+                    )
                 return
             marker_url = observation.pr_url or _marker_url(observation.logs)
             marker_number = observation.pr_number or _marker_number(observation.logs)
@@ -1031,6 +1043,17 @@ class PublicationReconciler:
                         raise
                     await self._bounded_setup_failure(work, exc)
                 return
+
+        if not allow_launch:
+            await _resolve(
+                self._store.persist_result(
+                    work.publication_id,
+                    outcome="failed",
+                    pr_url=None,
+                    error="the factory run already ended",
+                )
+            )
+            return
 
         credential: PublicationCredential
         try:
@@ -1342,7 +1365,12 @@ class PublicationReconcileLoop:
                 raise
             if work is not None:
                 try:
-                    await self._reconciler.reconcile(work)
+                    if not work.owner_running:
+                        # Observe a pull request the job already opened.
+                        # Do not launch a new job after the factory run ended.
+                        await self._reconciler.reconcile(work, allow_launch=False)
+                    else:
+                        await self._reconciler.reconcile(work)
                 except Exception:
                     # The lease is intentionally left in place. A worker crash
                     # or ambiguous apiserver response is retried only after it

@@ -298,6 +298,12 @@
       "version": "1.0"
     },
     {
+      "result": "WorkItemsOutput",
+      "kind": "CliOutput",
+      "schema": "work-items.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "all_targets_deploy_failure_json",
       "kind": "builder",
       "schema": "deploy.schema.json",

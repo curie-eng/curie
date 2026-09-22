@@ -6000,6 +6000,434 @@
         "title": "WebhookResult",
         "type": "object"
       },
+      "WorkItemCiOut": {
+        "description": "A live, unpersisted CI observation of the published head.",
+        "properties": {
+          "head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Head Sha"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "passing",
+              "failing",
+              "pending",
+              "none",
+              "unavailable",
+              "not_applicable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "WorkItemCiOut",
+        "type": "object"
+      },
+      "WorkItemCorrectnessOut": {
+        "description": "The platform never asserts correctness; the bundle owns it (ADR 0162).",
+        "properties": {
+          "asserted": {
+            "const": false,
+            "default": false,
+            "title": "Asserted",
+            "type": "boolean"
+          },
+          "owner": {
+            "const": "bundle",
+            "default": "bundle",
+            "title": "Owner",
+            "type": "string"
+          }
+        },
+        "title": "WorkItemCorrectnessOut",
+        "type": "object"
+      },
+      "WorkItemOutcomeList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemOutcomeOut"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "items",
+          "limit",
+          "truncated"
+        ],
+        "title": "WorkItemOutcomeList",
+        "type": "object"
+      },
+      "WorkItemOutcomeOut": {
+        "properties": {
+          "actionable_cause": {
+            "title": "Actionable Cause",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "cancelled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancelled At"
+          },
+          "ci": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemCiOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "correctness": {
+            "$ref": "#/components/schemas/WorkItemCorrectnessOut"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "github_issue_number": {
+            "title": "Github Issue Number",
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "issue_url": {
+            "title": "Issue Url",
+            "type": "string"
+          },
+          "objective": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Objective"
+          },
+          "objective_truncated": {
+            "title": "Objective Truncated",
+            "type": "boolean"
+          },
+          "pr": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemPrOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "publication": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemPublicationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "requester": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requester"
+          },
+          "requests": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemRequestOut"
+            },
+            "title": "Requests",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "waiting",
+              "running",
+              "cancellation_requested",
+              "cancelled",
+              "expired",
+              "failed",
+              "awaiting_approval",
+              "publishing",
+              "published",
+              "completed_unpublished"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "repo_full_name",
+          "github_issue_number",
+          "issue_url",
+          "cancelled_at",
+          "created_at",
+          "updated_at",
+          "state",
+          "actionable_cause",
+          "objective",
+          "objective_truncated",
+          "requester",
+          "pr",
+          "publication",
+          "correctness",
+          "ci",
+          "requests"
+        ],
+        "title": "WorkItemOutcomeOut",
+        "type": "object"
+      },
+      "WorkItemPrOut": {
+        "properties": {
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "number",
+          "url",
+          "status"
+        ],
+        "title": "WorkItemPrOut",
+        "type": "object"
+      },
+      "WorkItemPublicationOut": {
+        "properties": {
+          "approval_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Status"
+          },
+          "revision_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision Number"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "revision_number",
+          "approval_status"
+        ],
+        "title": "WorkItemPublicationOut",
+        "type": "object"
+      },
+      "WorkItemRequestOut": {
+        "description": "Operator view of one ExecutionRequest (#2577). Built from an explicit\nallowlist dict, never from an ORM row, so no runtime-owner field leaks.",
+        "properties": {
+          "capacity_deferrals": {
+            "title": "Capacity Deferrals",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "execution_deadline": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Deadline"
+          },
+          "last_deferral_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Deferral Reason"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terminal_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal At"
+          },
+          "terminal_cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Cause"
+          },
+          "termination_observation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Termination Observation"
+          },
+          "wait_deadline": {
+            "format": "date-time",
+            "title": "Wait Deadline",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sequence",
+          "status",
+          "created_at",
+          "wait_deadline",
+          "started_at",
+          "execution_deadline",
+          "terminal_at",
+          "terminal_cause",
+          "termination_observation",
+          "capacity_deferrals",
+          "last_deferral_reason"
+        ],
+        "title": "WorkItemRequestOut",
+        "type": "object"
+      },
       "WorkspaceCredentialRequest": {
         "properties": {
           "conversation_id": {
@@ -13298,6 +13726,77 @@
         ]
       }
     },
+    "/v1/internal/work-items/requests/{request_id}/hold-approval": {
+      "post": {
+        "operationId": "hold_work_item_for_approval_v1_internal_work_items_requests__request_id__hold_approval_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeartbeatBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Hold Work Item For Approval V1 Internal Work Items Requests  Request Id  Hold Approval Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Hold Work Item For Approval",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
     "/v1/internal/work-items/requests/{request_id}/start": {
       "post": {
         "operationId": "start_work_item_request_v1_internal_work_items_requests__request_id__start_post",
@@ -13511,6 +14010,66 @@
         ]
       }
     },
+    "/v1/internal/work-items/running": {
+      "get": {
+        "operationId": "running_work_item_request_v1_internal_work_items_running_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Running Work Item Request V1 Internal Work Items Running Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Running Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
     "/v1/internal/work-items/{work_item_id}/cancel": {
       "post": {
         "operationId": "cancel_work_item_v1_internal_work_items__work_item_id__cancel_post",
@@ -13718,6 +14277,160 @@
         "summary": "Select Workspace Repository",
         "tags": [
           "internal-workspaces"
+        ]
+      }
+    },
+    "/work-items": {
+      "get": {
+        "operationId": "list_work_items_work_items_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkItemOutcomeList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Work Items",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}": {
+      "get": {
+        "operationId": "get_work_item_work_items__work_item_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkItemOutcomeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Work Item",
+        "tags": [
+          "work-items"
         ]
       }
     }

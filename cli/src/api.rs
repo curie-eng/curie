@@ -804,6 +804,88 @@ pub fn is_agent_lookup_not_found(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<AgentLookupNotFound>().is_some())
 }
 
+/// `GET /work-items` answer (`WorkItemOutcomeList`, #2577).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemList {
+    pub items: Vec<WorkItemOutcome>,
+    pub limit: u64,
+    pub truncated: bool,
+}
+
+/// One factory work item outcome (`WorkItemOutcomeOut`, #2577). `state` and
+/// `actionable_cause` are API-derived strings the CLI renders verbatim.
+/// Unknown API fields are dropped on decode, so the `--json` envelope cannot
+/// grow a field the committed schema does not name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemOutcome {
+    pub id: String,
+    pub agent_id: String,
+    pub repo_full_name: String,
+    pub github_issue_number: u64,
+    pub issue_url: String,
+    pub cancelled_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub state: String,
+    pub actionable_cause: String,
+    pub objective: Option<String>,
+    pub objective_truncated: bool,
+    pub requester: Option<String>,
+    pub pr: Option<WorkItemPr>,
+    pub publication: Option<WorkItemPublication>,
+    pub correctness: WorkItemCorrectness,
+    pub ci: Option<WorkItemCi>,
+    pub requests: Vec<WorkItemRequest>,
+}
+
+/// `WorkItemPrOut`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemPr {
+    pub number: u64,
+    pub url: String,
+    pub status: String,
+}
+
+/// `WorkItemPublicationOut`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemPublication {
+    pub status: String,
+    pub revision_number: Option<u64>,
+    pub approval_status: Option<String>,
+}
+
+/// `WorkItemCorrectnessOut`: the platform never asserts correctness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemCorrectness {
+    pub asserted: bool,
+    pub owner: String,
+}
+
+/// `WorkItemCiOut`: live CI for the published head (detail only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemCi {
+    pub state: String,
+    pub reason: Option<String>,
+    pub head_sha: Option<String>,
+    pub observed_at: Option<String>,
+}
+
+/// `WorkItemRequestOut`: one execution request of a work item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemRequest {
+    pub sequence: u64,
+    pub status: String,
+    pub created_at: String,
+    pub wait_deadline: String,
+    pub started_at: Option<String>,
+    pub execution_deadline: Option<String>,
+    pub terminal_at: Option<String>,
+    pub terminal_cause: Option<String>,
+    pub termination_observation: Option<String>,
+    pub capacity_deferrals: u64,
+    pub last_deferral_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Bundle {
     pub bundle_ref: String,
@@ -2658,6 +2740,102 @@ impl ApiClient {
             .json()
             .await
             .context("decoding created memory entry")
+    }
+
+    /// The server's max page for `GET /work-items` (`limit` maximum 200 in
+    /// `apps/api/openapi.json`), requested explicitly so a truncated answer is
+    /// the API's `truncated` flag, never a silent default page.
+    pub const WORK_ITEMS_LIST_LIMIT: u32 = 200;
+
+    /// Factory work item outcomes: `GET /work-items` (#2577). The API derives
+    /// `state` and `actionable_cause`; this client only carries them.
+    pub async fn list_work_items(
+        &self,
+        agent_id: Option<&str>,
+        limit: u32,
+    ) -> Result<WorkItemList> {
+        let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id.to_string()));
+        }
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/work-items", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query)
+                    .timeout(std::time::Duration::from_secs(30)),
+                "GET /work-items",
+            )
+            .await?;
+        Self::expect_work_items_ok(resp, "listing work items", "agent not found")
+            .await?
+            .json()
+            .await
+            .context("decoding work items")
+    }
+
+    /// One factory work item outcome: `GET /work-items/{id}` (#2577), with
+    /// live CI for the published head. `agent_id` scopes the lookup, so an id
+    /// from another agent answers 404.
+    pub async fn get_work_item(
+        &self,
+        work_item_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<WorkItemOutcome> {
+        let query: Vec<(&str, &str)> = agent_id.map(|id| ("agent_id", id)).into_iter().collect();
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/work-items/{work_item_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query)
+                    .timeout(std::time::Duration::from_secs(30)),
+                "GET /work-items/{id}",
+            )
+            .await?;
+        Self::expect_work_items_ok(resp, "reading the work item", "work item not found")
+            .await?
+            .json()
+            .await
+            .context("decoding the work item")
+    }
+
+    /// Status classes for the work item reads (ADR 0021/0041): 404 is a
+    /// failure (exit 1), 5xx transient (exit 3), 401/403 a failure carrying the
+    /// API key fix, 400/422 usage (exit 2). Bodies are not echoed on auth
+    /// failures so nothing credential-shaped reaches the terminal.
+    async fn expect_work_items_ok(
+        resp: reqwest::Response,
+        what: &str,
+        not_found: &str,
+    ) -> Result<reqwest::Response> {
+        use reqwest::StatusCode;
+        let status = resp.status();
+        let error = match status {
+            StatusCode::NOT_FOUND => crate::exit::CliError::failure(format!("{what}: {not_found}"))
+                .with_fix("run `work-items` without an id to list the known work items"),
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => {
+                crate::exit::CliError::transient(format!("{what} failed with {status}"))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                crate::exit::CliError::failure(format!("{what} failed with {status}"))
+                    .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API")
+            }
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                let body = resp.text().await.unwrap_or_default();
+                crate::exit::CliError::usage(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("pass a work item id and --agent as UUIDs or a known agent name")
+            }
+            _ => return Self::expect_ok(resp, what).await,
+        };
+        Err(anyhow::Error::from(error))
     }
 
     /// The pending approval records for an agent: `GET /approvals?status_filter=

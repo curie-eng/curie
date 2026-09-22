@@ -268,8 +268,8 @@ def test_adapter_0045_upgrade_preserves_principal_subject_through_work_items_and
     )
 
     command.upgrade(cfg, "head")
-    assert HEAD == "0049"
-    assert current_revision() == "0049"
+    assert HEAD == "0050"
+    assert current_revision() == "0050"
     assert _sql(
         "SELECT principal_kind, principal_subject "
         "FROM curie.approval_audit_entries WHERE id = :id",

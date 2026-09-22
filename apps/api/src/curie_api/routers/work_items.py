@@ -105,6 +105,27 @@ async def admit_work_item(
     raise HTTPException(status.HTTP_409_CONFLICT, {"code": "not_found"})
 
 
+@router.get("/running")
+async def running_work_item_request(
+    conversation_id: str, session: SessionDep
+) -> dict[str, Any]:
+    state, row = await workitem_dispatch.running_for_conversation(
+        session, conversation_id
+    )
+    if state == "absent" or row is None or row.runtime_epoch is None:
+        if state == "ended":
+            raise HTTPException(status.HTTP_409_CONFLICT, {"code": "execution_ended"})
+        raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
+    if row.execution_deadline is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "execution_ended"})
+    return {
+        "request_id": str(row.id),
+        "runtime_epoch": row.runtime_epoch,
+        "execution_deadline": row.execution_deadline.isoformat(),
+        "status": row.status,
+    }
+
+
 @router.get("/requests/{request_id}")
 async def get_work_item_request(
     request_id: uuid.UUID, session: SessionDep
@@ -202,6 +223,23 @@ async def heartbeat_work_item_request(
     request_id: uuid.UUID, body: HeartbeatBody, session: SessionDep
 ) -> dict[str, Any]:
     result = await workitem_dispatch.heartbeat(
+        session, request_id, runtime_epoch=body.runtime_epoch
+    )
+    if isinstance(result, DispatchConflict):
+        _raise_conflict(result)
+    assert not isinstance(result, DispatchConflict)
+    return {
+        "status": result.status,
+        "terminal_cause": result.terminal_cause,
+        "work_item_cancelled": result.work_item_cancelled,
+    }
+
+
+@router.post("/requests/{request_id}/hold-approval")
+async def hold_work_item_for_approval(
+    request_id: uuid.UUID, body: HeartbeatBody, session: SessionDep
+) -> dict[str, Any]:
+    result = await workitem_dispatch.hold_for_approval(
         session, request_id, runtime_epoch=body.runtime_epoch
     )
     if isinstance(result, DispatchConflict):

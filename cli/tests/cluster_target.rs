@@ -136,6 +136,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
             name: "approvals",
             args: &["approvals", "acme-bot", "--dry-run"],
         },
+        ClusterCase {
+            name: "work-items",
+            args: &["work-items", "--dry-run"],
+        },
     ]
 }
 
@@ -239,7 +243,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 23);
+    assert_eq!(covered_names.len(), 24);
 }
 
 #[test]

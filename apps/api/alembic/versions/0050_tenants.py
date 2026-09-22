@@ -10,8 +10,8 @@ of an AgentVersion. Each self-host install gets its own random
 is fixed so it is identical across every fresh upgrade/downgrade/upgrade
 cycle.
 
-Revision ID: 0049
-Revises: 0048
+Revision ID: 0050
+Revises: 0049
 Create Date: 2026-09-22
 """
 
@@ -21,8 +21,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0049"
-down_revision: str | None = "0048"
+revision: str = "0050"
+down_revision: str | None = "0049"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

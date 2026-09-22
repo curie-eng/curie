@@ -277,9 +277,13 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/defer",
     "/v1/internal/work-items/requests/{request_id}/start",
     "/v1/internal/work-items/requests/{request_id}/heartbeat",
+    "/v1/internal/work-items/requests/{request_id}/hold-approval",
+    "/v1/internal/work-items/running",
     "/v1/internal/work-items/requests/{request_id}/finish",
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
+    "/work-items",
+    "/work-items/{work_item_id}",
     "unmatched",
 ]
 _HTTP_ATTRIBUTES = {

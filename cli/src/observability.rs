@@ -366,7 +366,7 @@ pub async fn query(
     Ok(output)
 }
 
-fn classify_api_error(error: anyhow::Error, tier: &str) -> anyhow::Error {
+pub(crate) fn classify_api_error(error: anyhow::Error, tier: &str) -> anyhow::Error {
     if !crate::exit::is_transient_reqwest(&error)
         && !crate::api::is_observability_api_unavailable(&error)
     {

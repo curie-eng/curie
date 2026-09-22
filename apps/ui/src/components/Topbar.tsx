@@ -6,6 +6,7 @@ import type { Nav } from "../state/types";
 const CRUMB: Record<Nav, string> = {
   overview: "Overview",
   agents: "Agents",
+  "work-items": "Work items",
   evals: "Evals",
   observability: "Observability",
   versions: "Versions",
