@@ -150,6 +150,7 @@ roleRef:
 {{- define "curie.sandboxTemplate" -}}
 {{- $agent := .agent -}}
 {{- $secrets := .secrets -}}
+{{- $secretNameOverride := .secretName | default "" -}}
 {{- $connectorReservedEnv := dict -}}
 {{- if $agent -}}
 {{- range $name := keys $secrets -}}
@@ -699,7 +700,7 @@ spec:
               value: {{ $runner.hardening.home | quote }}
             {{- end }}
             {{- if $agent }}
-            {{- $secretName := printf "%s-agent-%s-connector-secrets" (include "curie.fullname" .) $agent }}
+            {{- $secretName := $secretNameOverride | default (printf "%s-agent-%s-connector-secrets" (include "curie.fullname" .) $agent) }}
             {{- range $name := keys $secrets | sortAlpha }}
             - name: {{ $name }}
               valueFrom:
@@ -833,7 +834,26 @@ spec:
 {{- end }}
 {{- if .Values.agentSandbox.deploy }}
 {{- $root := . }}
-{{- $connectorSecrets := .Values.agentSandbox.connectorSecrets | default dict }}
+{{- $connectorSecrets := deepCopy (.Values.agentSandbox.connectorSecrets | default dict) }}
+{{- $connectorSecretNames := dict }}
+{{- range $agent, $byo := .Values.agentSandbox.connectorExistingSecrets | default dict }}
+{{- if not $byo.existingSecret }}
+{{- fail (printf "agentSandbox.connectorExistingSecrets.%s.existingSecret is required" $agent) }}
+{{- end }}
+{{- if not $byo.keys }}
+{{- fail (printf "agentSandbox.connectorExistingSecrets.%s.keys must list the Secret keys to deliver" $agent) }}
+{{- end }}
+{{- $reserved := splitList " " (trim (include "curie.reservedConnectorSecretNames" $root)) }}
+{{- $names := dict }}
+{{- range $name := $byo.keys }}
+{{- if or (hasPrefix "CURIE_" $name) (has $name $reserved) }}
+{{- fail (printf "agentSandbox.connectorExistingSecrets.%s.keys has a reserved boot-env name (%q); a connector secret must not shadow a runner-owned model credential, a CURIE_* boot key, or a redirect/capture-capable key (proxy/CA/custom-headers)" $agent $name) }}
+{{- end }}
+{{- $_ := set $names $name "" }}
+{{- end }}
+{{- $_ := set $connectorSecrets $agent $names }}
+{{- $_ := set $connectorSecretNames $agent $byo.existingSecret }}
+{{- end }}
 {{- range $agent := keys $connectorSecrets | sortAlpha }}
 {{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
 {{- fail (printf "agentSandbox.connectorSecrets.%s has an invalid agent name" $agent) }}
@@ -841,6 +861,6 @@ spec:
 {{- end }}
 {{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}
 {{- range $agent := keys $connectorSecrets | sortAlpha }}
-{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent)) | nindent 0 }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent) "secretName" (get $connectorSecretNames $agent)) | nindent 0 }}
 {{- end }}
 {{- end }}

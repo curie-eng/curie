@@ -630,6 +630,18 @@ clickhouse:
 #
 # For durable storage, treat this like any other credential you cannot
 # regenerate and keep it in whatever holds your other irreplaceable secrets.
+# Installation identity: the stable id this release's claim gate and upgrade
+# drain fence on. The chart mints and stores it in its own Secret by default.
+# Set idExistingSecret to a Secret you created yourself (for example one an
+# External Secrets sync owns) and the chart reads it back from there instead and
+# stops storing it; the drain hook still refuses an upgrade whose render could
+# not read the identity. When moving an existing release to a BYO Secret, seed
+# it with the release's current installationId: an upgrade whose BYO identity
+# differs from the stored one fails the render.
+installation:
+  idExistingSecret: ""
+  idExistingSecretKey: installationId
+
 sealing:
   privateKey: ""
   # BYO secret (issue #1759, the same idiom every backing store and
@@ -1115,6 +1127,12 @@ api:
   orgName: Curie
   # HMAC secret the GitHub git-flow webhook authenticates inbound events with.
   githubWebhookSecret: dev-webhook-secret
+  # BYO secret (the same idiom githubAppExistingSecret uses). Name a Secret you
+  # created yourself, for example one an External Secrets sync owns, and the API
+  # reads the webhook HMAC secret from it; the chart Secret then stops carrying
+  # githubWebhookSecret. Wins over githubWebhookSecret when set.
+  githubWebhookSecretExistingSecret: ""
+  githubWebhookSecretExistingSecretKey: githubWebhookSecret
   # GitHub review-feedback ingress is opt-in. When enabled, the API boot gate
   # requires a GitHub App id/private key, a non-default webhook secret, and a
   # positive reconciliation interval.
@@ -2169,6 +2187,17 @@ agentSandbox:
   #       GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
   # Prefer `--set-file`/a sealed values file over inlining a real token.
   connectorSecrets: {}
+  # BYO per-agent connector Secrets: agent name -> the Secret you created
+  # yourself (for example one an External Secrets sync owns) and the keys in it
+  # to deliver, each as an env var of the same name. The chart renders no
+  # connector Secret for such an agent, only its template and pool, which
+  # reference yours by key. An agent may appear here or in connectorSecrets,
+  # not both. Keys pass the same reserved-name guard. Empty by default, e.g.:
+  #   connectorExistingSecrets:
+  #     github-issues:
+  #       existingSecret: github-issues-connector
+  #       keys: [GITHUB_PERSONAL_ACCESS_TOKEN]
+  connectorExistingSecrets: {}
   # Per-agent connector egress (ADR-0009, #1488): agent name -> the CIDR
   # entries that agent's runner pods may reach. Each entry renders as its own
   # NetworkPolicy selecting curietech.ai/agent=<name>, so one agent's connector
