@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use curie::installation::{Installation, ProviderKind};
 use curie::provider::{
     not_implemented, InventoryClass, InventoryEntry, ObjectMetadata, ObjectVersion, ProviderError,
-    PutRequest, RejectedReason, RotationOwner, SecretMaterial, SecretsProvider, StoredObject,
+    PutRequest, RejectedReason, RotationOwner, SecretMaterial, SecretsProvider, Store, StoredObject,
     UpdatePolicy, EXPIRY_TAG,
 };
 use serde_json::{json, Value};
@@ -195,6 +195,10 @@ fn inventory(
         consumers: vec!["api".into()],
         rotation_owner,
         update_policy,
+        // cluster keeps every owner valid, including the workload round trip.
+        store: Store::Cluster,
+        rotated_keys: vec![],
+        chart: None,
     }
 }
 
