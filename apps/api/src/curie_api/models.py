@@ -804,6 +804,64 @@ class ExecutionRequest(Base):
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 
 
+class FactoryTerminalNotice(Base):
+    """One issue comment owed by a non-PR execution terminus.
+
+    Inserted in the same transaction as the terminal UPDATE. The reconciler
+    posts it later. A refusal is recorded here and does not rewrite the request.
+    """
+
+    __tablename__ = "factory_terminal_notices"
+    __table_args__ = (
+        CheckConstraint(
+            "length(btrim(terminal_cause)) > 0",
+            name="factory_terminal_notices_cause_ck",
+        ),
+        CheckConstraint("attempts >= 0", name="factory_terminal_notices_attempts_ck"),
+        CheckConstraint("scan_page >= 1", name="factory_terminal_notices_scan_page_ck"),
+        CheckConstraint(
+            "posted_at IS NULL OR refused_at IS NULL",
+            name="factory_terminal_notices_one_outcome_ck",
+        ),
+        CheckConstraint(
+            "(comment_id IS NULL) = (posted_at IS NULL)",
+            name="factory_terminal_notices_comment_ck",
+        ),
+        CheckConstraint(
+            "(refusal IS NULL) = (refused_at IS NULL)",
+            name="factory_terminal_notices_refusal_ck",
+        ),
+        Index(
+            "ix_factory_terminal_notices_pending",
+            "created_at",
+            postgresql_where=text("posted_at IS NULL AND refused_at IS NULL"),
+        ),
+    )
+
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    terminal_cause: Mapped[str] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
+    posted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    comment_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    refused_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    refusal: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class PublicationReviewReservation(Base):
     """One review origin's claim on the existing publication revision writer."""
 
@@ -1000,6 +1058,10 @@ class Publication(Base):
     workspace_conversation_id: Mapped[str | None] = mapped_column(default=None)
     lineage_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="SET NULL"),
+        default=None,
+    )
+    execution_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="SET NULL"),
         default=None,
     )
     revision_number: Mapped[int | None] = mapped_column(default=None)
