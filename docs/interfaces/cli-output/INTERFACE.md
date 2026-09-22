@@ -124,7 +124,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 50 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 51 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
   against real `to_json()` output across 80 tests in `cli/tests/json_contract.rs`. Those tests
