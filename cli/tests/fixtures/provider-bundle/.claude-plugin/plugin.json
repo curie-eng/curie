@@ -1,0 +1,5 @@
+{
+  "name": "acme-fixture",
+  "version": "0.1.0",
+  "description": "Synthetic connector fixture for the provider security harness."
+}

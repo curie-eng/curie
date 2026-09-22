@@ -85,10 +85,7 @@ class ProviderHarnessContracts(unittest.TestCase):
 
                 ledger.record_intent("secretsmanager", second_identity)
                 ledger.mark_created(first, first_identity)
-                targets = {
-                    (row.kind, row.identity, row.state)
-                    for row in ledger.cleanup_targets()
-                }
+                targets = {(row.kind, row.identity, row.state) for row in ledger.cleanup_targets()}
                 self.assertEqual(
                     targets,
                     {
@@ -128,9 +125,7 @@ class ProviderHarnessContracts(unittest.TestCase):
         self.assertEqual(digest, hashlib.sha256(raw.encode()).hexdigest()[:12])
         self.assertNotIn(raw, digest)
 
-        rendered = provider_harness.format_tool_error(
-            "create provider entry", 17, raw
-        )
+        rendered = provider_harness.format_tool_error("create provider entry", 17, raw)
         self.assertIn("create provider entry", rendered)
         self.assertIn("17", rendered)
         self.assertNotIn(raw, rendered)

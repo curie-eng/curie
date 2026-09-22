@@ -875,6 +875,40 @@ pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Run the AWS Secrets Manager acceptance harness through the stable script
+/// boundary. Values are owned here so their borrowed argument views remain
+/// valid for the complete child process invocation.
+pub async fn dev_secrets_e2e(
+    seed: Option<&Path>,
+    eso: Option<&str>,
+    ci: bool,
+    real_aws: bool,
+) -> Result<()> {
+    let current_exe = std::env::current_exe().context("resolve current curie executable")?;
+    let mut args = vec![
+        "--curie-bin".to_string(),
+        current_exe.to_string_lossy().into_owned(),
+    ];
+    if let Some(path) = seed {
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("seed file is not readable: {}", path.display()))?;
+        args.push("--seed".to_string());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    if let Some(mode) = eso {
+        args.push("--eso".to_string());
+        args.push(mode.to_string());
+    }
+    if ci {
+        args.push("--ci".to_string());
+    }
+    if real_aws {
+        args.push("--real-aws".to_string());
+    }
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    dev_script("cli/scripts/provider-e2e.sh", &borrowed).await
+}
+
 pub async fn dev_e2e_ci_selection(
     paths: &[PathBuf],
     base: Option<&str>,

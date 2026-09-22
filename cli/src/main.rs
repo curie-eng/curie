@@ -1026,6 +1026,21 @@ enum SreBotAction {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SecretsE2eEso {
+    Preinstalled,
+    None,
+}
+
+impl SecretsE2eEso {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Preinstalled => "preinstalled",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum DevAction {
     /// Check the frozen contracts (`bash scripts/check-contracts.sh`).
@@ -1047,6 +1062,22 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
+    /// Prove AWS Secrets Manager sync and rotation through External Secrets on
+    /// an owned kind cluster (`bash cli/scripts/provider-e2e.sh`).
+    SecretsE2e {
+        /// Synthetic seed JSON. Defaults to the checked in harness fixture.
+        #[arg(long, value_name = "PATH")]
+        seed: Option<PathBuf>,
+        /// External Secrets setup for an emulator run.
+        #[arg(long, value_enum)]
+        eso: Option<SecretsE2eEso>,
+        /// Run the emulator once with External Secrets and once without it.
+        #[arg(long, conflicts_with_all = ["real_aws", "eso"])]
+        ci: bool,
+        /// Run against AWS in us-east-1 with profile theconnman.
+        #[arg(long)]
+        real_aws: bool,
+    },
     /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
     /// MCP server and a live provider
     /// (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with
@@ -3743,6 +3774,23 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
+            DevAction::SecretsE2e {
+                seed,
+                eso,
+                ci,
+                real_aws,
+            } => {
+                if real_aws && eso == Some(SecretsE2eEso::None) {
+                    bail!("the argument '--real-aws' cannot be used with '--eso none'");
+                }
+                commands::dev_secrets_e2e(
+                    seed.as_deref(),
+                    eso.map(SecretsE2eEso::as_str),
+                    ci,
+                    real_aws,
+                )
+                .await
+            }
             DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
             DevAction::TwoReleaseApprovalE2e => {
                 commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
