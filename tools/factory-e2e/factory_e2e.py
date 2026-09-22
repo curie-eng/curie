@@ -1784,6 +1784,43 @@ def _scenario_pull_requests(p: Preflight) -> list[dict[str, Any]]:
     return prs
 
 
+def usage_record(
+    before: float | None,
+    read_after: Callable[[], float | None],
+    *,
+    has_key: bool,
+    attempts: int = 12,
+    pause: float = 10,
+) -> dict[str, Any]:
+    """The model spend for one run, or an explicit `unverified`.
+
+    OpenRouter's key usage counter lags a finished request, so the reading is
+    retried until it moves. A delta that never becomes positive is not
+    reported as zero spend: it is unverified.
+    """
+
+    if not has_key:
+        return {"source": "unverified", "usd": None, "caveat": "fake model; no model spend"}
+    after: float | None = None
+    for attempt in range(attempts):
+        after = read_after() if before is not None else None
+        if before is None or after is None or after > before:
+            break
+        if attempt < attempts - 1:
+            time.sleep(pause)
+    if before is None or after is None:
+        caveat = "OpenRouter key usage could not be read before and after the run"
+    elif after <= before:
+        caveat = "the OpenRouter key usage counter did not change after the run"
+    else:
+        return {
+            "source": "openrouter key usage delta",
+            "usd": round(after - before, 6),
+            "caveat": "the key is shared; the delta includes any concurrent use of the same key",
+        }
+    return {"source": "unverified", "usd": None, "caveat": caveat}
+
+
 def issue_to_pr(p: Preflight) -> dict[str, Any]:
     """Wait for the labelled ticket's run to end, then judge its ending."""
 
@@ -1841,21 +1878,7 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         "default_branch_moved": moved,
         "elapsed_seconds": round(elapsed, 1),
     }
-    usage_after = p.model_usage() if p.usage_before is not None else None
-    if p.usage_before is not None and usage_after is not None:
-        usage: dict[str, Any] = {
-            "source": "openrouter key usage delta",
-            "usd": round(usage_after - p.usage_before, 6),
-            "caveat": "the key is shared; the delta includes any concurrent use of the same key",
-        }
-    else:
-        usage = {
-            "source": "unverified",
-            "usd": None,
-            "caveat": "OpenRouter key usage could not be read before and after the run"
-            if p.config.model_api_key
-            else "fake model; no model spend",
-        }
+    usage = usage_record(p.usage_before, p.model_usage, has_key=bool(p.config.model_api_key))
     pr = detail.get("pr") if isinstance(detail.get("pr"), dict) else None
     failures = judge_outcome(
         outcome, p.expect, expect_causes=p.expect_causes, expect_reasons=p.expect_reasons
