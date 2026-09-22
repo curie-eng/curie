@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-_FRAGMENTS = {
+_FRAGMENTS: dict[str, Literal["thread", "pr"]] = {
     "discussion_r": "thread",
     "issuecomment-": "pr",
     "pullrequestreview-": "pr",
@@ -52,5 +52,4 @@ def parse_reply_target(
     pr_number, comment_id = int(match.group(1)), int(match.group(3))
     if pr_number > _MAX_PR or comment_id > _MAX_ID:
         return ISSUE_TARGET
-    kind: Literal["thread", "pr"] = "thread" if _FRAGMENTS[match.group(2)] == "thread" else "pr"
-    return ReplyTarget(kind, pr_number, comment_id, first)
+    return ReplyTarget(_FRAGMENTS[match.group(2)], pr_number, comment_id, first)

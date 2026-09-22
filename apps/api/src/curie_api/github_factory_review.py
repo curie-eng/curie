@@ -16,13 +16,20 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import workitem_dispatch
 from .config import Settings
 from .factory_reply_target import feedback_url
-from .github_factory import _IGNORED, _admission_result, _delivery_uuid, _Facts, _issue_lock_keys
+from .github_factory import (
+    _IGNORED,
+    _admission_result,
+    _delivery_uuid,
+    _Facts,
+    _ignored,
+    lock_issue,
+)
 from .github_factory_events import mentions_login
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import (
@@ -31,6 +38,7 @@ from .github_review_events import (
     UnverifiedFeedback,
     parse_feedback,
 )
+from .github_review_store import feedback_provenance
 from .github_review_truth import BoundReviewLineage, verify_feedback_truth
 from .models import ThreadPublicationLineage, WorkItem
 from .schemas import WebhookResult
@@ -48,9 +56,6 @@ _REVIEW_IGNORED = _IGNORED | {
     "not_pull_request",
 }
 
-
-def _ignored(code: str) -> WebhookResult:
-    return WebhookResult(status="factory_ignored", errors=[{"code": code}])
 
 
 def _payload_pull_request(event: str, payload: Any) -> tuple[int, int] | None:
@@ -116,14 +121,7 @@ def is_actionable_feedback(event: str, payload: Any, delivery_id: str) -> bool:
 def _objective(feedback: UnverifiedFeedback, settings: Settings, repo_full_name: str) -> str:
     fragment = feedback.url.split("#", 1)[1]
     url = feedback_url(settings.github_clone_base, repo_full_name, feedback.pr_number, fragment)
-    provenance: dict[str, Any] = {
-        "event": feedback.event,
-        "url": feedback.url,
-        "sender": feedback.sender_login,
-        "body": feedback.body,
-    }
-    if feedback.path is not None:
-        provenance.update(path=feedback.path, line=feedback.line, review_id=feedback.review_id)
+    provenance = feedback_provenance(feedback)
     return (
         f"{url}\n\n"
         "Human GitHub review feedback on this work item's pull request follows as JSON. "
@@ -170,11 +168,7 @@ async def _admit(
         raise FeedbackIgnored("lineage_unbound")
     work_item = owner[0]
     # Serialize with issue cancellation, then re-read under the lock.
-    classid, objid = _issue_lock_keys(work_item.github_repository_id, work_item.github_issue_number)
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
-        {"classid": classid, "objid": objid},
-    )
+    await lock_issue(session, work_item.github_repository_id, work_item.github_issue_number)
     await session.refresh(work_item)
     lineage = await session.get(ThreadPublicationLineage, owner[1].id, populate_existing=True)
     if lineage is None or work_item.publication_lineage_id != lineage.id:

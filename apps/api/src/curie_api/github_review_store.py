@@ -131,7 +131,8 @@ def feedback_from_row(row: GitHubReviewFeedback) -> UnverifiedFeedback:
         raise FeedbackIgnored("stored_feedback_invalid") from None
 
 
-def review_turn(feedback: UnverifiedFeedback, context: ReviewContext) -> QueuedTurn:
+def feedback_provenance(feedback: UnverifiedFeedback) -> dict[str, Any]:
+    """The reviewer's verified feedback as the model sees it, shared with the factory arm."""
     provenance: dict[str, Any] = {
         "event": feedback.event,
         "url": feedback.url,
@@ -140,6 +141,11 @@ def review_turn(feedback: UnverifiedFeedback, context: ReviewContext) -> QueuedT
     }
     if feedback.path is not None:
         provenance.update(path=feedback.path, line=feedback.line, review_id=feedback.review_id)
+    return provenance
+
+
+def review_turn(feedback: UnverifiedFeedback, context: ReviewContext) -> QueuedTurn:
+    provenance = feedback_provenance(feedback)
     return QueuedTurn(
         event_id=feedback.event_id,
         conversation_id=context.conversation_id,

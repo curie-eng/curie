@@ -212,6 +212,10 @@ def _issue_lock_keys(repository_id: int, issue_number: int) -> tuple[int, int]:
 
 
 async def _lock_issue(session: AsyncSession, notice: FactoryNotice) -> None:
+    await lock_issue(session, notice.repository_id, notice.issue_number)
+
+
+async def lock_issue(session: AsyncSession, repository_id: int, issue_number: int) -> None:
     """Hold one issue until this transaction commits.
 
     Admission and cancellation both re-read GitHub before they touch the
@@ -220,7 +224,7 @@ async def _lock_issue(session: AsyncSession, notice: FactoryNotice) -> None:
     not see again.
     """
 
-    classid, objid = _issue_lock_keys(notice.repository_id, notice.issue_number)
+    classid, objid = _issue_lock_keys(repository_id, issue_number)
     await session.execute(
         text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
         {"classid": classid, "objid": objid},
