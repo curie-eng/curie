@@ -129,6 +129,42 @@ spec:
             {{- include "curie.env.postgres" . | nindent 12 }}
             - name: CURIE_SCHEMA_FORWARD_ONLY
               value: {{ .Values.api.migrate.forwardOnly | default false | quote }}
+            {{- /*
+            The identity fence's bound. The worker is already drained at hook
+            weight -10, so the only remaining contenders are ordinary API
+            requests with sub-second budgets; 15 s outlasts one, and three
+            backoffLimit retries of a wedged fence cost 45 s against this Job's
+            activeDeadlineSeconds of 600.
+            */}}
+            - name: CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS
+              value: {{ .Values.api.migrate.fenceLockTimeoutMs | default 15000 | quote }}
+            {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
+            {{- /*
+            Optional, and a FILE rather than a value, on purpose: `helm get
+            values` would retain an inline declaration in the release forever
+            and re-apply it to every future upgrade, whereas an operator-created
+            Secret can be deleted after the upgrade, which makes the grant
+            single-use by construction. An install that has never been blocked
+            sets nothing here and renders neither the volume nor this env.
+            */}}
+            - name: CURIE_APPROVAL_PROVENANCE_DECLARATIONS
+              value: /etc/curie/provenance/declarations.json
+            {{- end }}
+          {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
+          volumeMounts:
+            - name: provenance-declarations
+              mountPath: /etc/curie/provenance
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
+      volumes:
+        - name: provenance-declarations
+          secret:
+            secretName: {{ . | quote }}
+            items:
+              - key: declarations.json
+                path: declarations.json
+      {{- end }}
 {{- end }}

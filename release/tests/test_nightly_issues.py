@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -181,3 +182,218 @@ class TestNightlyWorkflowFilesIssues:
         assert "release/nightly.py" in joined
         assert "GITHUB_RUN_ID" in joined
         assert "file-issues" in joined or "--run-id" in joined
+
+
+ANSI_DISPATCHER_LOG = (
+    "\x1b[0m\n\x1b[36m########## rung: local-release (compose, generated "
+    "release artifact) ##########\x1b[0m\n"
+    "\x1b[0;31merror: image 'ghcr.io/curie-eng/curie-dispatcher:latest' is "
+    "required by compose.release.yaml's full profile and is not present "
+    "locally.\x1b[0m\n"
+    "\x1b]0;a title sequence\x07"
+    "fix: build and tag the missing image(s) locally\n"
+)
+
+
+class FakeCompleted:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class TestEscapeSequenceLogs:
+    """#2819: gh refuses logs carrying terminal escape sequences."""
+
+    def test_escaped_log_yields_the_same_signature_as_a_clean_log(self) -> None:
+        escaped = nightly.extract_signatures(
+            [
+                {
+                    "name": "local-release",
+                    "conclusion": "failure",
+                    "log": nightly.strip_ansi(ANSI_DISPATCHER_LOG),
+                }
+            ]
+        )
+        clean = nightly.extract_signatures(
+            [{"name": "local-release", "conclusion": "failure", "log": DISPATCHER_LOG}]
+        )
+        assert len(escaped) == 1
+        assert escaped[0].signature_id == clean[0].signature_id
+
+    def test_raw_escaped_log_without_stripping_does_not_match(self) -> None:
+        """Negative control: the stripping is what makes the signature stable."""
+        raw = nightly.extract_signatures(
+            [{"name": "local-release", "conclusion": "failure", "log": ANSI_DISPATCHER_LOG}]
+        )
+        clean = nightly.extract_signatures(
+            [{"name": "local-release", "conclusion": "failure", "log": DISPATCHER_LOG}]
+        )
+        assert raw and raw[0].signature_id != clean[0].signature_id
+
+    def test_colon_separated_sgr_is_stripped(self) -> None:
+        """Truecolor SGR uses colon parameter bytes, not just digits."""
+        log = (
+            "\x1b[38:2::255:0:0merror: connector image missing\x1b[0m\n"
+        )
+        signatures = nightly.extract_signatures(
+            [{"name": "skill", "conclusion": "failure", "log": nightly.strip_ansi(log)}]
+        )
+        assert "\x1b" not in nightly.strip_ansi(log)
+        assert signatures[0].text == "error: connector image missing"
+
+    def test_job_log_fetch_asks_gh_to_allow_escape_sequences(self, monkeypatch) -> None:
+        seen: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            seen.append(list(args))
+            return FakeCompleted(stdout=ANSI_DISPATCHER_LOG)
+
+        monkeypatch.setattr(nightly.subprocess, "run", fake_run)
+        log = nightly.job_log("curie-eng/curie", 1234)
+        assert "--allow-escape-sequences" in seen[0]
+        assert "\x1b" not in log
+        assert "curie-dispatcher:latest" in log
+
+    def test_job_log_fetch_retries_without_the_flag_when_gh_rejects_it(
+        self, monkeypatch
+    ) -> None:
+        seen: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            seen.append(list(args))
+            if "--allow-escape-sequences" in args:
+                raise nightly.subprocess.CalledProcessError(
+                    1, args, output="", stderr="unknown flag: --allow-escape-sequences"
+                )
+            return FakeCompleted(stdout=ANSI_DISPATCHER_LOG)
+
+        monkeypatch.setattr(nightly.subprocess, "run", fake_run)
+        log = nightly.job_log("curie-eng/curie", 1234)
+        assert len(seen) == 2
+        assert "--allow-escape-sequences" not in seen[1]
+        assert "curie-dispatcher:latest" in log
+
+    def test_a_real_gh_refusal_is_not_swallowed(self, monkeypatch) -> None:
+        def fake_run(args, **kwargs):
+            raise nightly.subprocess.CalledProcessError(
+                1,
+                args,
+                output="",
+                stderr=(
+                    "the response contains terminal escape sequences; pass "
+                    "--allow-escape-sequences to output it anyway"
+                ),
+            )
+
+        monkeypatch.setattr(nightly.subprocess, "run", fake_run)
+        try:
+            nightly.job_log("curie-eng/curie", 1234)
+        except nightly.subprocess.CalledProcessError:
+            return
+        raise AssertionError("a non-flag gh failure must propagate")
+
+
+class TestFilingFailsLoudly:
+    """#2819: the filing job must go red when it cannot file."""
+
+    def test_no_signatures_from_a_failed_run_is_an_error_exit(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr(nightly, "_ensure_label", lambda repo: None)
+        monkeypatch.setattr(nightly, "_failed_job_logs", lambda repo, run_id: [])
+        rc = nightly.file_issues("curie-eng/curie", "1", "http://run")
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "::error" in out
+
+    def test_a_gh_failure_while_filing_is_an_error_exit(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(nightly, "_ensure_label", lambda repo: None)
+
+        def boom(repo, run_id):
+            raise nightly.subprocess.CalledProcessError(
+                1, ["gh"], output="", stderr="gh: server error"
+            )
+
+        monkeypatch.setattr(nightly, "_failed_job_logs", boom)
+        rc = nightly.file_issues("curie-eng/curie", "1", "http://run")
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "::error" in out
+        assert "gh: server error" in out
+
+    def test_a_successful_filing_still_exits_zero(self, monkeypatch) -> None:
+        monkeypatch.setattr(nightly, "_ensure_label", lambda repo: None)
+        monkeypatch.setattr(
+            nightly,
+            "_failed_job_logs",
+            lambda repo, run_id: [
+                {"name": "local-release", "conclusion": "failure", "log": DISPATCHER_LOG}
+            ],
+        )
+        monkeypatch.setattr(nightly, "_open_nightly_issues", lambda repo: [])
+        monkeypatch.setattr(nightly, "_gh", lambda args: "")
+        assert nightly.file_issues("curie-eng/curie", "1", "http://run") == 0
+
+    def test_workflow_surfaces_a_filing_failure_in_the_run_summary(self) -> None:
+        workflow = yaml.load(NIGHTLY_YAML.read_text(), Loader=yaml.BaseLoader)
+        job = workflow["jobs"]["file-failures"]
+        steps = job["steps"]
+        assert any(
+            "failure()" in (step.get("if") or "")
+            and "GITHUB_STEP_SUMMARY" in (step.get("run") or "")
+            for step in steps
+        ), "no failure-surfacing step in file-failures"
+        assert all(
+            (step.get("continue-on-error") or "false") == "false" for step in steps
+        )
+
+
+class TestFilingPathWithEscapedLogs:
+    """#2819 AC2: an escaped log drives file_issues end to end."""
+
+    def test_file_issues_files_a_clean_signature_from_an_escaped_log(
+        self, monkeypatch
+    ) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            joined = " ".join(args)
+            if "actions/runs/" in joined and joined.endswith("/jobs"):
+                return FakeCompleted(
+                    stdout=json.dumps(
+                        {"jobs": [{"id": 77, "name": "local-release", "conclusion": "failure"}]}
+                    )
+                )
+            if "/logs" in joined:
+                if "--allow-escape-sequences" not in args:
+                    raise nightly.subprocess.CalledProcessError(
+                        1,
+                        args,
+                        output="",
+                        stderr=(
+                            "the response contains terminal escape sequences; "
+                            "pass --allow-escape-sequences to output it anyway"
+                        ),
+                    )
+                return FakeCompleted(stdout=ANSI_DISPATCHER_LOG)
+            if "label" in args and "list" in args:
+                return FakeCompleted(stdout=json.dumps([{"name": nightly.NIGHTLY_LABEL}]))
+            if "issue" in args and "list" in args:
+                return FakeCompleted(stdout="[]")
+            return FakeCompleted(stdout="")
+
+        monkeypatch.setattr(nightly.subprocess, "run", fake_run)
+        assert nightly.file_issues("curie-eng/curie", "42", "http://run") == 0
+
+        created = [c for c in calls if "issue" in c and "create" in c]
+        assert len(created) == 1, calls
+        body = created[0][created[0].index("--body") + 1]
+        title = created[0][created[0].index("--title") + 1]
+        assert "\x1b" not in body and "\x1b" not in title
+        assert "curie-dispatcher:latest" in title + body
+        expected = nightly.extract_signatures(
+            [{"name": "local-release", "conclusion": "failure", "log": DISPATCHER_LOG}]
+        )[0]
+        assert nightly.signature_marker(expected.signature_id) in body

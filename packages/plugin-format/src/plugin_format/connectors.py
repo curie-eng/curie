@@ -172,11 +172,13 @@ class ConnectorSpec(BaseModel):
     #   bearer_secret: PAT                    The env-var name the derived
     #                                         Authorization: Bearer ${NAME}
     #                                         header expands. Optional. A hosted
-    #                                         connector with exactly one secrets
-    #                                         entry still derives from that name
-    #                                         (the github-mcp-server shape). A
-    #                                         hosted connector with two or more
-    #                                         must set this rather than silently
+    #                                         connector with exactly one
+    #                                         plain-string secrets entry still
+    #                                         derives from that name (the
+    #                                         github-mcp-server shape). A lone
+    #                                         SecretRef does not. A hosted
+    #                                         connector with two or more must
+    #                                         set this rather than silently
     #                                         using secrets[0] (#2559).
     bearer_secret: str | None = None
 
@@ -218,22 +220,6 @@ class ConnectorSpec(BaseModel):
     # each other; `/tmp` is refused because a server's scratch space is a poor
     # place for a credential and an emptyDir there would shadow the mount.
     secret_files: dict[str, str] = Field(default_factory=dict)
-
-    def bearer_secret_name(self) -> str | None:
-        """The secret name the derived Bearer header expands, or None.
-
-        Explicit ``bearer_secret`` wins. Otherwise a single declared secret is
-        that name -- the github-mcp-server shape, so existing one-secret
-        bundles keep working. Two or more without an explicit name is None:
-        validation refuses that document rather than picking ``secrets[0]``.
-        """
-
-        if self.bearer_secret:
-            return self.bearer_secret
-        names = [s if isinstance(s, str) else s.name for s in self.secrets]
-        if len(names) == 1:
-            return names[0]
-        return None
 
     def secret_names(self) -> list[str]:
         """Env var names this connector needs, any form."""

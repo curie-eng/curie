@@ -113,6 +113,16 @@ is a judgement call, not something derivable from the tree.
    `apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`). A second
    engine that honors the models but not this skip-locked claim would serialize
    those loops.
+7. **Partial unique indexes** use the Postgres-only `postgresql_where` dialect
+   argument to enforce active publication invariants. Two indexes on
+   `apps/api/src/curie_api/models.py::ThreadPublicationLineage` permit only one
+   open lineage for each agent conversation and repository, whether that repository
+   is addressed by full name or GitHub repository id. The index on
+   `apps/api/src/curie_api/models.py::PublicationReviewReservation` permits only
+   one reserved review per lineage, and the index on
+   `apps/api/src/curie_api/models.py::Publication` permits only one live
+   publication per lineage. A target without partial unique indexes cannot express
+   those database-level concurrency constraints as written.
 
 Items 1 to 3 are cheap within the Postgres family: any managed Postgres speaks all three
 natively, so the DSN-only swap is unaffected by them. Item 4 is different in kind: it is
@@ -122,12 +132,13 @@ carry it, and a reader looking only at `models.py` would not find it. Item 5 is 
 a database-level contract rather than a model type: it is native on a supported managed
 Postgres, but a pre-15 server cannot represent Curie's singular NULL shared identity.
 Item 6 is a row-claim concurrency primitive: native on Postgres, not on every
-SQLAlchemy target. All six items would need rework for a different RDBMS, which is
+SQLAlchemy target. Item 7 makes publication uniqueness conditional on row status,
+which likewise depends on a Postgres index feature. All seven items would need rework for a different RDBMS, which is
 the marker that a real port should be extracted first.
 
 ## Cross-links
 
-- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 through 6 have no equivalent managed-swap assertion.
+- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 through 7 have no equivalent managed-swap assertion.
 - **Epic(s):** #84 — vision epic for the relational-DB seam (keep the swap a DSN change; extract a port only for a non-Postgres store).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 5 (Relational database), grade A-
 - **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries ("vanilla Postgres" adopted for app state)

@@ -313,7 +313,8 @@ def parse_github_repo_fact(message: str) -> str | None:
 def trusted_repository_fact(message: str, *, ignore_message: bool) -> str | None:
     """Repository facts for workspace selection.
 
-    Job payloads (webhook/cron) and verified-review bodies are untrusted for
+    Job payloads (webhook/cron), verified-review bodies, and approval resume
+    text (#2828, which quotes the gated tool arguments) are untrusted for
     repository selection. A coding target comes from operator mapping or an
     already sticky thread row, never from a URL inside those documents.
     """

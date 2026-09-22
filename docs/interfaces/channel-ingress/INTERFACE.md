@@ -1,7 +1,7 @@
 ---
 seam: Channel / ingress
 kind: CLEAN
-impls: 2 reply adapters behind the `ReplySink` port (Slack, HTTP) + a second wire ingress producer (Rust CLI)
+impls: 3 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay) + a second wire ingress producer (Rust CLI)
 grade: B-
 vision_row: Communication
 epics:
@@ -16,7 +16,7 @@ order: 4
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 2 reply adapters behind the `ReplySink` port (Slack, HTTP) + a second wire ingress producer (Rust CLI) &nbsp;·&nbsp; **Swap-readiness grade:** B-
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 3 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay) + a second wire ingress producer (Rust CLI) &nbsp;·&nbsp; **Swap-readiness grade:** B-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -104,12 +104,19 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
   `render` (`apps/worker/src/curie_worker/blocks.py::render`) and `approval_card`
   (`apps/worker/src/curie_worker/blocks.py::approval_card`).
+  The third sink is the built-in cluster-message relay,
+  `_ClusterMessageReplyAdapter`
+  (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`), selected by
+  `ReplySinkRouter` for the reserved `curie-cluster-message` adapter name.
 - **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
   `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
   Both halves are required, with no address-only fallback, and uniqueness is on the same
   pair. The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a
   second channel binds its agent without a schema change and the same address may belong to
   different adapter kinds.
+  `curie-cluster-message` is reserved for the built-in cluster-message relay
+  (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`) and is refused
+  on an operator binding by `apps/api/src/curie_api/schemas.py::ChannelBindingWrite`.
 
 ## Implementations today
 
@@ -120,7 +127,10 @@ Web API. Discord (`adapters/discord`) and email (`apps/mail-adapter`) join on
 the authenticated HTTP edge: they neither construct a `QueuedTurn` nor implement
 `ReplySink`; the worker delivers through `HttpReplyAdapter`
 (`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) to the
-binding's server-controlled endpoint. The swap proof that the protocol (not just
+binding's server-controlled endpoint. The built-in cluster-message publication path uses
+`_ClusterMessageReplyAdapter`
+(`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`) as the third
+`ReplySink` implementation and relays replies to the API. The swap proof that the protocol (not just
 the service) is the seam: the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact

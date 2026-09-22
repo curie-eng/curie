@@ -2,8 +2,10 @@
 
 ADR-0096 phase 2, Stream C. Two endpoints on a new `/channels` router:
 
-- `POST /channels/token` (platform key only) mints a `chn` token over a binding
-  row's `channel_id` + a bumped `generation` (plan EB-C2, #2379).
+- `POST /channels/token` mints a `chn` token over a binding row's `channel_id`
+  + a bumped `generation` (plan EB-C2, #2379). This file drives it with the
+  platform key only; an adapter principal (ADR-0154, #2806) can also mint for
+  a binding it serves, covered separately in `test_adapter_principal.py`.
 - `POST /channels/turns` (platform key OR a `chn` token) enqueues a `QueuedTurn`
   for the binding named in the BODY. `kind` and `address` are in the body, not
   the path, because an address is an opaque routing key that may contain `@`,
@@ -618,16 +620,15 @@ def test_the_ingress_refuses_an_unroutable_binding_for_the_platform_key_too(
     assert kinds == {"slack", "email"}
 
 
-def test_the_mint_is_platform_key_only_and_refuses_a_channel_token(
+def test_a_chn_token_cannot_mint(
     channels_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     """Scope containment at the sibling endpoint (§6.2's protected set).
 
     A `chn` token does exactly one thing: enqueue for the binding in its claims.
-    Minting is a platform operation (`Depends(require_api_key)`), so a
-    compromised adapter cannot mint itself a fresh token -- which would defeat
-    both the TTL and the generation, the only two things standing in for the
-    revocation list phase 2 deliberately does not build (E12, FU-1).
+    Presenting it back at the mint endpoint is refused; an adapter principal
+    (ADR-0154, #2806) is the separate, narrower credential that CAN mint for a
+    binding it serves, and that path is covered in `test_adapter_principal.py`.
     """
 
     _bind(

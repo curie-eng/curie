@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from urllib.parse import quote
 
@@ -273,6 +273,11 @@ _DELETE_SCHEMA = {
 # rather than letting the exception crash the turn.
 
 
+# One operation's shape, so ``_STATE_TOOL_SPECS`` below can carry its handler in
+# the same row as its name and neither can be added without the other.
+_StateOp = Callable[[StateApiClient, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
 async def op_get(client: StateApiClient, args: dict[str, Any]) -> dict[str, Any]:
     namespace, key = args["namespace"], args["key"]
     if refusal := _validate_namespace(namespace):
@@ -332,6 +337,64 @@ async def op_delete(client: StateApiClient, args: dict[str, Any]) -> dict[str, A
     return _ok({"deleted": True})
 
 
+# Every tool this server publishes, declared ONCE (#2286 adversarial round).
+#
+# One list, three consumers: ``build_state_server`` registers exactly these with
+# the SDK, ``STATE_TOOL_NAMES`` below renders their live ``mcp__curie-state__*``
+# names, and ``approval.py`` exempts those live names from a bundle ``toolPolicy``.
+# Hand-maintaining the exemption set beside the registration is what the first
+# #2286 fix was written to avoid -- publication exempted two literal names and
+# every channel-memory tool added afterwards was denied on arrival -- and a
+# second copy here would reopen it at the next tool. Adding a sixth tool means
+# adding one row, and the exemption follows for free.
+_STATE_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any], _StateOp], ...] = (
+    ("get", "Read a durable state value by namespace and key.", _GET_SCHEMA, op_get),
+    (
+        "set",
+        "Write a durable state value, optionally with a compare-and-set version.",
+        _SET_SCHEMA,
+        op_set,
+    ),
+    (
+        "append",
+        "Append an item to a durable JSON-array state value.",
+        _APPEND_SCHEMA,
+        op_append,
+    ),
+    ("list", "List every key and value in a state namespace.", _LIST_SCHEMA, op_list),
+    ("delete", "Delete a durable state value by namespace and key.", _DELETE_SCHEMA, op_delete),
+)
+
+# The live SDK names the tools above are published under, which is the ONLY form
+# an authorization decision ever sees: the SDK prefixes an in-process server's
+# tools as ``mcp__<server>__<tool>``. ``approval.py`` compares a candidate call
+# against this set by EXACT equality rather than by the ``mcp__curie-state__``
+# prefix, because a prefix match also accepts every tool of an ambient MCP server
+# whose key merely BEGINS ``curie-state__`` (``mcp__curie-state__extra__bar``),
+# and ``strict_mcp_config`` is off so the CLI loads ambient project/user servers
+# beside the ones the runner mounts.
+STATE_TOOL_NAMES: frozenset[str] = frozenset(
+    f"mcp__{STATE_SERVER_NAME}__{tool_name}" for tool_name, _, _, _ in _STATE_TOOL_SPECS
+)
+
+
+def _bind_state_tool(
+    tool_name: str, description: str, schema: dict[str, Any], op: _StateOp, client: StateApiClient
+) -> Any:
+    """Register one spec row as an SDK tool bound to ``client``.
+
+    A function rather than a loop body so each closure captures its OWN ``op``:
+    a late-binding closure over the loop variable would register five tools that
+    all call whichever handler the loop finished on.
+    """
+
+    @tool(tool_name, description, schema)
+    async def state_tool(args: dict[str, Any]) -> dict[str, Any]:
+        return await op(client, args)
+
+    return state_tool
+
+
 def build_state_server(client: StateApiClient) -> McpSdkServerConfig:
     """The in-process ``curie-state`` MCP server bound to ``client``.
 
@@ -341,36 +404,18 @@ def build_state_server(client: StateApiClient) -> McpSdkServerConfig:
     that validates the namespace against the reserved set and turns a
     transport/store failure into an ``is_error`` result the model can recover
     from, rather than crashing the turn.
+
+    The tool list comes from ``_STATE_TOOL_SPECS`` so the names this server
+    actually publishes and the names ``approval.py`` exempts cannot drift.
     """
-
-    @tool("get", "Read a durable state value by namespace and key.", _GET_SCHEMA)
-    async def get_tool(args: dict[str, Any]) -> dict[str, Any]:
-        return await op_get(client, args)
-
-    @tool(
-        "set",
-        "Write a durable state value, optionally with a compare-and-set version.",
-        _SET_SCHEMA,
-    )
-    async def set_tool(args: dict[str, Any]) -> dict[str, Any]:
-        return await op_set(client, args)
-
-    @tool("append", "Append an item to a durable JSON-array state value.", _APPEND_SCHEMA)
-    async def append_tool(args: dict[str, Any]) -> dict[str, Any]:
-        return await op_append(client, args)
-
-    @tool("list", "List every key and value in a state namespace.", _LIST_SCHEMA)
-    async def list_tool(args: dict[str, Any]) -> dict[str, Any]:
-        return await op_list(client, args)
-
-    @tool("delete", "Delete a durable state value by namespace and key.", _DELETE_SCHEMA)
-    async def delete_tool(args: dict[str, Any]) -> dict[str, Any]:
-        return await op_delete(client, args)
 
     return create_sdk_mcp_server(
         name=STATE_SERVER_NAME,
         version="1.0.0",
-        tools=[get_tool, set_tool, append_tool, list_tool, delete_tool],
+        tools=[
+            _bind_state_tool(tool_name, description, schema, op, client)
+            for tool_name, description, schema, op in _STATE_TOOL_SPECS
+        ],
     )
 
 

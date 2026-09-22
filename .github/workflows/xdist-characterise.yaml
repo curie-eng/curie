@@ -133,7 +133,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Download every attempt's report
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: junit-*
           path: reports

@@ -1535,3 +1535,179 @@ def test_binding_scoped_delete_honors_expected_version(
     )
     assert ok.status_code == 204, ok.text
     assert client.get(url, headers=auth_headers).status_code == 404
+
+
+def _hold_row_lock_then_append(
+    aid: str,
+    namespace: str,
+    key: str,
+    item: Any,
+    locked: threading.Event,
+    release: threading.Event,
+    errors: list[Exception],
+) -> None:
+    """A concurrent append from an outside session (#2927).
+
+    Takes the row lock exactly as `_append_state` does (SELECT ... FOR UPDATE),
+    signals, waits for the test's go-ahead, then appends `item` and bumps the
+    version before committing.
+    """
+
+    async def hold() -> None:
+        connection = await asyncpg.connect(_asyncpg_dsn())
+        try:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT id, value
+                    FROM curie.workflow_state_entries
+                    WHERE agent_id = $1 AND binding_scope IS NULL
+                      AND namespace = $2 AND key = $3
+                    FOR UPDATE
+                    """,
+                    uuid.UUID(aid),
+                    namespace,
+                    key,
+                )
+                assert row is not None
+                locked.set()
+                await asyncio.to_thread(release.wait, 10)
+                await connection.execute(
+                    """
+                    UPDATE curie.workflow_state_entries
+                    SET value = $2::jsonb, version = version + 1
+                    WHERE id = $1
+                    """,
+                    row["id"],
+                    json.dumps([*json.loads(row["value"]), item]),
+                )
+        finally:
+            await connection.close()
+
+    try:
+        asyncio.run(hold())
+    except Exception as error:
+        errors.append(error)
+        locked.set()
+
+
+def test_cas_put_behind_a_locked_concurrent_append_is_409_and_keeps_the_append(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#2927: capacity compaction rewrites a transcript with a CAS PUT.
+
+    The PUT read version N; a concurrent append holds the row lock and commits
+    N+1. The PUT must see N+1 under the same row lock and refuse with 409. Before
+    the fix the PUT's plain read raced the lock, passed the version check on the
+    stale N, then waited on the row and overwrote the committed append.
+    """
+    aid = _agent(client, auth_headers)
+    key = "thread-cas-2927"
+    url = f"/agents/{aid}/state/transcript/{key}"
+    seeded = client.post(
+        f"{url}/append", json={"item": {"text": "one"}}, headers=auth_headers
+    )
+    assert seeded.status_code == 200, seeded.text
+    read_version = client.get(url, headers=auth_headers).json()["version"]
+
+    locked = threading.Event()
+    release = threading.Event()
+    errors: list[Exception] = []
+    holder = threading.Thread(
+        target=_hold_row_lock_then_append,
+        args=(aid, "transcript", key, {"text": "two"}, locked, release, errors),
+        daemon=True,
+    )
+    holder.start()
+    try:
+        assert locked.wait(timeout=10), "row lock was not taken"
+        assert not errors, errors
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            put = executor.submit(
+                client.put,
+                url,
+                json={"value": [{"text": "compacted"}], "expected_version": read_version},
+                headers=auth_headers,
+            )
+            try:
+                # The PUT is observed waiting on the append's row lock before the
+                # append is allowed to commit: the interleaving is not timed.
+                asyncio.run(_wait_for_blocked_state_requests(1, [put]))
+            finally:
+                release.set()
+            outcome = _request_result_or_exception(put)
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    assert not holder.is_alive(), "concurrent append did not finish"
+    assert not errors, errors
+    assert not isinstance(outcome, Exception), repr(outcome)
+    assert outcome.status_code == 409, outcome.text
+    stored = client.get(url, headers=auth_headers).json()
+    assert stored["value"] == [{"text": "one"}, {"text": "two"}]
+    assert stored["version"] == read_version + 1
+
+
+def test_append_reserve_refusal_is_413_unchanged_and_not_a_persistence_failure(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """#2927: `reserve_bytes` keeps headroom for the worker's publication append.
+
+    An append that would leave fewer than `reserve_bytes` free under the value
+    cap is refused atomically with 413 and leaves the log as it was. That refusal
+    is the runner's compaction trigger, not a persistence failure, so it does not
+    count toward curie.history.persistence.failure. The same append without a
+    reserve still succeeds, and a real over-the-cap append still counts.
+    """
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-reserve/append"
+    seed = {"kind": "message", "text": "seed"}
+    item = {"kind": "message", "text": "x" * 100}
+    settings = get_settings()
+    # After appending `item` exactly 50 bytes remain free under the cap.
+    settings.state_max_value_bytes = _json_size([seed, item]) + 50
+    try:
+        initial = client.post(url, json={"item": seed}, headers=auth_headers)
+        assert initial.status_code == 200, initial.text
+
+        reserved = client.post(
+            url, json={"item": item, "reserve_bytes": 51}, headers=auth_headers
+        )
+        assert reserved.status_code == 413, reserved.text
+        assert "reserve" in reserved.json()["detail"]
+        stored = client.get(url.removesuffix("/append"), headers=auth_headers).json()
+        assert stored["value"] == [seed]
+        assert stored["version"] == initial.json()["version"]
+        assert _history_failure_points(history_failure_metrics) == []
+
+        plain = client.post(url, json={"item": item}, headers=auth_headers)
+        assert plain.status_code == 200, plain.text
+        assert plain.json()["value"] == [seed, item]
+        assert _history_failure_points(history_failure_metrics) == []
+
+        over_cap = client.post(
+            url,
+            json={"item": {"kind": "message", "text": "y" * 200}, "reserve_bytes": 51},
+            headers=auth_headers,
+        )
+        assert over_cap.status_code == 413, over_cap.text
+        assert client.get(
+            url.removesuffix("/append"), headers=auth_headers
+        ).json()["value"] == [seed, item]
+        assert _history_failure_points(history_failure_metrics) == [
+            (
+                1,
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": "value",
+                },
+            )
+        ]
+    finally:
+        get_settings.cache_clear()

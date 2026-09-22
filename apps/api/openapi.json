@@ -518,6 +518,100 @@
         "title": "ActionUndoOut",
         "type": "object"
       },
+      "AdapterPrincipalMint": {
+        "description": "Administrative request to issue one channel adapter credential (ADR-0154).",
+        "properties": {
+          "binding_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Binding Ids",
+            "type": "array"
+          },
+          "subject": {
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          },
+          "ttl_s": {
+            "default": 86400,
+            "exclusiveMinimum": 0.0,
+            "maximum": 604800.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "subject",
+          "binding_ids"
+        ],
+        "title": "AdapterPrincipalMint",
+        "type": "object"
+      },
+      "AdapterPrincipalOut": {
+        "description": "One-time delivery of a channel adapter credential.",
+        "properties": {
+          "binding_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Binding Ids",
+            "type": "array"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "kind": {
+            "const": "adapter",
+            "default": "adapter",
+            "title": "Kind",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "subject",
+          "binding_ids",
+          "scopes",
+          "expires_at"
+        ],
+        "title": "AdapterPrincipalOut",
+        "type": "object"
+      },
+      "AdapterPrincipalRotate": {
+        "description": "Self-rotation request: only the next credential's lifetime is chosen.",
+        "properties": {
+          "ttl_s": {
+            "default": 86400,
+            "exclusiveMinimum": 0.0,
+            "maximum": 604800.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "title": "AdapterPrincipalRotate",
+        "type": "object"
+      },
       "AdmissionFacts": {
         "properties": {
           "address": {
@@ -1167,7 +1261,8 @@
                 "enum": [
                   "chat",
                   "console",
-                  "operator"
+                  "operator",
+                  "adapter"
                 ],
                 "type": "string"
               },
@@ -1176,6 +1271,17 @@
               }
             ],
             "title": "Principal Kind"
+          },
+          "principal_subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Principal Subject"
           },
           "reason": {
             "anyOf": [
@@ -1197,6 +1303,7 @@
           "actor_channel",
           "principal_kind",
           "authenticated",
+          "principal_subject",
           "decision",
           "authorizer",
           "authorized",
@@ -1205,6 +1312,129 @@
           "created_at"
         ],
         "title": "ApprovalAuditOut",
+        "type": "object"
+      },
+      "ApprovalIdentityFactsOut": {
+        "description": "Per-row FACTS about one pending approval (#2753).\n\nFacts, never verdicts: nothing here says a row cannot be resolved. A route\nwhose approver set is the card channel's membership is a HEALTHY route that\nany attested chat click resolves, and it is reported like any other row.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "card_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Channel"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "facts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Facts",
+            "type": "array"
+          },
+          "has_reply_placeholder": {
+            "title": "Has Reply Placeholder",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_channel": {
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_kind": {
+            "title": "Reply Kind",
+            "type": "string"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "status",
+          "route",
+          "reply_kind",
+          "reply_adapter",
+          "reply_channel",
+          "card_channel",
+          "has_reply_placeholder",
+          "created_at",
+          "facts"
+        ],
+        "title": "ApprovalIdentityFactsOut",
+        "type": "object"
+      },
+      "ApprovalIdentityReportOut": {
+        "description": "A pure read an operator runs on a broken installation.\n\nIt makes no Slack call and reads only ``approvals`` and ``agent_channels``,\nso it still answers against a schema old enough that the fence refuses to\nserve it.",
+        "properties": {
+          "approvals": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalIdentityFactsOut"
+            },
+            "title": "Approvals",
+            "type": "array"
+          },
+          "declarations": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalReplyIdentityDeclaration"
+            },
+            "title": "Declarations",
+            "type": "array"
+          }
+        },
+        "required": [
+          "approvals",
+          "declarations"
+        ],
+        "title": "ApprovalIdentityReportOut",
         "type": "object"
       },
       "ApprovalNotificationTarget": {
@@ -1478,6 +1708,161 @@
           "expires_at"
         ],
         "title": "ApprovalPrincipalOut",
+        "type": "object"
+      },
+      "ApprovalRecover": {
+        "description": "One administrative settlement of a stranded approval.\n\n``rejected`` is the only disposition there is. There is deliberately no\napprove-on-behalf-of: an administrative path that could grant would let a\nplatform-key holder authorize the action a human was asked about, which is\na different power from settling a record nobody can reach.",
+        "properties": {
+          "disposition": {
+            "const": "rejected",
+            "title": "Disposition",
+            "type": "string"
+          },
+          "reason": {
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "recovery_key": {
+            "minLength": 1,
+            "title": "Recovery Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "recovery_key",
+          "disposition"
+        ],
+        "title": "ApprovalRecover",
+        "type": "object"
+      },
+      "ApprovalRecoveryOut": {
+        "description": "The RECORDED outcome of an administrative settlement.\n\nEvery field is read back off the row, so a replay of the same\n``recovery_key`` renders an identical body rather than a fresh one.",
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "recovered_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovered At"
+          },
+          "recovery_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Key"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_id",
+          "status",
+          "recovery_key",
+          "reason",
+          "actor",
+          "recovered_at"
+        ],
+        "title": "ApprovalRecoveryOut",
+        "type": "object"
+      },
+      "ApprovalReplyIdentityDeclaration": {
+        "description": "The skeleton the migration workflow consumes.\n\nEverything but the id is the OPERATOR's to fill in. The report never\npre-fills provenance it does not have: a guessed reply kind is precisely the\nsilent misroute the declaration document exists to prevent.",
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Kind"
+          }
+        },
+        "required": [
+          "approval_id"
+        ],
+        "title": "ApprovalReplyIdentityDeclaration",
         "type": "object"
       },
       "ApprovalRequest": {
@@ -3173,6 +3558,30 @@
         "title": "HookPartitionConfig",
         "type": "object"
       },
+      "HookRunRef": {
+        "description": "Identity of the scheduled hook run that produced a queued turn.\n\n``slot_utc`` is an ISO 8601 timestamp with an explicit UTC offset.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slot_utc": {
+            "title": "Slot Utc",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "name",
+          "slot_utc"
+        ],
+        "title": "HookRunRef",
+        "type": "object"
+      },
       "KillState": {
         "description": "Whether an agent is currently killed (kill switch, L1).",
         "properties": {
@@ -4327,7 +4736,7 @@
         "type": "object"
       },
       "QueuedTurn": {
-        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.",
+        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.",
         "properties": {
           "attachments": {
             "default": [],
@@ -4348,6 +4757,16 @@
           "event_id": {
             "title": "Event Id",
             "type": "string"
+          },
+          "hook_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HookRunRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "received_at": {
             "title": "Received At",
@@ -5080,10 +5499,22 @@
         "type": "object"
       },
       "StateAppendIn": {
-        "description": "Append ``item`` to a log-shaped (JSON array) state entry (#248). If the\nentry does not exist it is created as a single-element array; if it exists\nits value must already be an array, else the append is rejected.",
+        "description": "Append ``item`` to a log-shaped (JSON array) state entry (#248). If the\nentry does not exist it is created as a single-element array; if it exists\nits value must already be an array, else the append is rejected.\n\n``reserve_bytes`` (#2927) refuses the append with 413 when the new value\nwould leave fewer than that many bytes free under the per-value cap. The\nrunner sets it on transcript appends to keep headroom for the worker's\npublication outcome append; omitting it keeps the plain cap.",
         "properties": {
           "item": {
             "title": "Item"
+          },
+          "reserve_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reserve Bytes"
           }
         },
         "required": [
@@ -9089,6 +9520,7 @@
     },
     "/approvals": {
       "get": {
+        "description": "List approvals, newest first. The platform key sees every row; an\nadapter principal sees only approvals routed to a binding it serves.",
         "operationId": "list_approvals_approvals_get",
         "parameters": [
           {
@@ -9164,6 +9596,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
             }
           }
         ],
@@ -9252,6 +9700,199 @@
           }
         },
         "summary": "Create Approval",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/approvals/identity-report": {
+      "get": {
+        "description": "Per-row facts for every pending approval, plus the declaration skeleton.\n\nA pure read, needing only the platform key, making NO Slack call, and\nexcluding nothing: an ordinarily resolvable row appears here with an empty\nfact list rather than being filtered out, because a reporter that quietly\ndropped rows would be answering a question it cannot answer.",
+        "operationId": "identity_report_approvals_identity_report_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalIdentityReportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Identity Report",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/approvals/principals/adapter": {
+      "post": {
+        "description": "Issue a channel adapter credential (ADR-0154); the platform key\nauthorizes issuance once and the adapter never presents it at runtime.\n\nEvery binding must exist now: a credential naming a row that does not\nexist would serve nothing, and silently dropping it would hide a typo.",
+        "operationId": "mint_adapter_principal_approvals_principals_adapter_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdapterPrincipalMint"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterPrincipalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Adapter Principal",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/approvals/principals/adapter/rotate": {
+      "post": {
+        "description": "Exchange a live adapter credential for the next one, same subject and\nbindings (ADR-0154), so the platform key never mints at runtime.\n\nBindings deleted since issuance are dropped rather than carried forward;\nan adapter left serving nothing gets 401, as an unusable credential would.",
+        "operationId": "rotate_adapter_principal_approvals_principals_adapter_rotate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AdapterPrincipalRotate"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterPrincipalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rotate Adapter Principal",
         "tags": [
           "approvals"
         ]
@@ -9440,6 +10081,140 @@
         ]
       }
     },
+    "/approvals/{approval_id}/recover": {
+      "post": {
+        "description": "Settle a stranded approval as ``rejected`` and wake its session.\n\nThe compare-and-set and the audit append are one transaction with one\ncommit, so there is no window in which the status flipped and the row\nexplaining it does not exist. That same audit row carries the\n``recovery_key``, which is what makes a retry a read: a key already recorded\nfor this approval returns the recorded outcome and enqueues nothing. The resume then rides the\nORDINARY path -- the same runs stream every other resolution uses -- because\na break-glass wake that travelled a private route would be the one wake\nnobody could reason about.",
+        "operationId": "recover_approval_approvals__approval_id__recover_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "approval_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Approval Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Actor"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalRecover"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalRecoveryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Approval",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/approvals/{approval_id}/resolve": {
       "post": {
         "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): the route's approvers decide\nwhether the authenticated principal belongs -- an explicit user list, a\nSlack user group, or (declaring none) the card channel's members (#420).\nRequester equality neither grants nor vetoes membership. Then exactly one\nauthorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
@@ -9469,6 +10244,38 @@
                 }
               ],
               "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Actor"
             }
           },
           {
@@ -9528,7 +10335,7 @@
     },
     "/channels/token": {
       "post": {
-        "description": "Mint a `chn` token for one binding (platform key only).\n\nPlatform-key-only on purpose: a `chn` token does exactly one thing, enqueue\nfor the binding in its claims. If it could mint, a compromised adapter would\ndefeat both the TTL and the generation -- the only two things standing in for\na revocation list.\n\nThe token claims the ROW's id and the generation this mint stamps. Minting\nis a rotation write: it bumps the row under `FOR UPDATE` and signs the NEW\nvalue, so a remint revokes the token it replaces (#2379). The token also\ndies when the pair is deleted and recreated (a new row id) and when the\nbinding is re-pointed or merely re-asserted (another bump).",
+        "description": "Mint a `chn` token for one binding (platform key or adapter principal).\n\nNever a `chn` token: it does exactly one thing, enqueue for the binding in\nits claims. If it could mint, a compromised adapter would defeat both the\nTTL and the generation -- the only two things standing in for a revocation\nlist. An adapter principal (ADR-0154) may mint only for a binding in its own\nset, so a compromised adapter renews its own binding's token and nothing\nelse, under the same cap and the same generation bump.\n\nThe token claims the ROW's id and the generation this mint stamps. Minting\nis a rotation write: it bumps the row under `FOR UPDATE` and signs the NEW\nvalue, so a remint revokes the token it replaces (#2379). The token also\ndies when the pair is deleted and recreated (a new row id) and when the\nbinding is re-pointed or merely re-asserted (another bump).",
         "operationId": "mint_channel_token_channels_token_post",
         "parameters": [
           {
@@ -9545,6 +10352,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
             }
           }
         ],

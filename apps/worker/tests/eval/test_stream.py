@@ -66,6 +66,7 @@ from curie_worker.eval import (
     EvalReporter,
     EvalStreamConsumer,
     EvalSuite,
+    ExpectedStatus,
     Grader,
     GraderKind,
     LangfuseEvalRecorder,
@@ -2317,6 +2318,63 @@ def test_committed_fixture_loads_from_bundle_with_name_override(
     assert len(suite.cases) == 1
     assert suite.cases[0].grader.grade("I am the example agent.") is True
     assert suite.cases[0].grader.grade("literally anything") is False
+
+
+@pytest.mark.parametrize("unknown_key", ["requires", "note", "expect_stauts"])
+def test_bundle_loader_refuses_unknown_case_keys(unknown_key: str) -> None:
+    """The platform loader refuses extra case fields instead of dropping them."""
+    payload = json.dumps(
+        {
+            "name": "strict-case-keys",
+            "cases": [
+                {
+                    "id": "c",
+                    "input": "i",
+                    "grader": {"kind": "contains", "expected": "x"},
+                    unknown_key: "portable",
+                }
+            ],
+        }
+    ).encode()
+    bundle = _suite_bundle(
+        EvalSuite(
+            name="strict-case-keys",
+            cases=[EvalCase(id="c", input="i", grader=Grader(kind=CONTAINS, expected="x"))],
+        ),
+        cases_payload=payload,
+    )
+    assert load_suite_from_bundle(bundle, "strict-case-keys") is None
+
+
+def test_bundle_loader_retains_valid_optional_case_fields() -> None:
+    """Strictness leaves the supported case options intact through bundle loading."""
+    payload = json.dumps(
+        {
+            "name": "valid-case-options",
+            "cases": [
+                {
+                    "id": "c",
+                    "input": "i",
+                    "grader": {"kind": "contains", "expected": "x"},
+                    "shared_history": True,
+                    "expect_status": "awaiting-approval",
+                }
+            ],
+        }
+    ).encode()
+    bundle = _suite_bundle(
+        EvalSuite(
+            name="valid-case-options",
+            cases=[EvalCase(id="c", input="i", grader=Grader(kind=CONTAINS, expected="x"))],
+        ),
+        cases_payload=payload,
+    )
+
+    suite = load_suite_from_bundle(bundle, "valid-case-options")
+
+    assert suite is not None
+    assert suite.cases[0].shared_history is True
+    assert suite.cases[0].expect_status is ExpectedStatus.AWAITING_APPROVAL
 
 
 def test_bundle_trajectory_sidecar_scores_observed_calls_instead_of_text(

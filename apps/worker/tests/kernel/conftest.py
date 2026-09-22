@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import socket
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,7 +26,7 @@ from typing import Any
 import aiohttp
 import pytest
 import redis
-from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus
+from aci_protocol import Final, HookRunRef, OutboundEvent, QueuedTurn, SessionStatus
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import OutboundMessage
@@ -65,11 +67,122 @@ from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 # ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
 # prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
 # here AND by ``tests/test_delivery_lease.py``, which drives the lease store
 # directly against the same real Valkey without a full kernel harness.
+
+_DB_URL = os.environ.get(
+    "TEST_DATABASE_URL",
+    os.environ.get(
+        "DATABASE_URL",
+        "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class HookRunSeed:
+    """One exactly owned hook run row and its real Postgres recorder."""
+
+    engine: AsyncEngine
+    agent_id: uuid.UUID
+    version_id: uuid.UUID
+    run_id: uuid.UUID
+    ref: HookRunRef
+
+    def recorder(self) -> object:
+        from curie_worker.hook_runs import HookRunRecorder
+
+        return HookRunRecorder(self.engine)
+
+    async def state(self) -> tuple[str | None, datetime | None] | None:
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT outcome, ended_at FROM curie.hook_runs "
+                        "WHERE id = :run_id"
+                    ),
+                    {"run_id": self.run_id},
+                )
+            ).one_or_none()
+        return None if row is None else (row.outcome, row.ended_at)
+
+
+@pytest.fixture
+def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[HookRunSeed]]:
+    """Seed one migrated hook run and clean only rows owned by that seed."""
+
+    @contextlib.asynccontextmanager
+    async def seed(*, outcome: str | None = None) -> AsyncIterator[HookRunSeed]:
+        engine = create_async_engine(_DB_URL)
+        token = uuid.uuid4().hex
+        agent_id = uuid.uuid4()
+        version_id = uuid.uuid4()
+        run_id = uuid.uuid4()
+        slot = datetime(2026, 9, 22, 3, 0, tzinfo=UTC)
+        ref = HookRunRef(
+            agent_id=str(agent_id),
+            name=f"hook_{token}",
+            slot_utc=slot.isoformat(),
+        )
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+                    {"id": agent_id, "name": f"hook_agent_{token}"},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_versions "
+                        "(id, agent_id, version_label, created_by) "
+                        "VALUES (:id, :agent_id, :label, :created_by)"
+                    ),
+                    {
+                        "id": version_id,
+                        "agent_id": agent_id,
+                        "label": f"hook_version_{token}",
+                        "created_by": "kernel-test",
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.hook_runs "
+                        "(id, agent_id, name, slot_utc, version_id, outcome, "
+                        "started_at, ended_at) VALUES "
+                        "(:id, :agent_id, :name, :slot_utc, :version_id, :outcome, "
+                        "now(), :ended_at)"
+                    ),
+                    {
+                        "id": run_id,
+                        "agent_id": agent_id,
+                        "name": ref.name,
+                        "slot_utc": slot,
+                        "version_id": version_id,
+                        "outcome": outcome,
+                        "ended_at": datetime.now(UTC) if outcome is not None else None,
+                    },
+                )
+            yield HookRunSeed(engine, agent_id, version_id, run_id, ref)
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM curie.hook_runs WHERE id = :id"), {"id": run_id}
+                )
+                await conn.execute(
+                    text("DELETE FROM curie.agent_versions WHERE id = :id"),
+                    {"id": version_id},
+                )
+                await conn.execute(
+                    text("DELETE FROM curie.agents WHERE id = :id"), {"id": agent_id}
+                )
+            await engine.dispose()
+
+    return seed
 
 
 def make_config(names: dict[str, str], **overrides: object) -> WorkerConfig:
@@ -777,6 +890,7 @@ async def kernel_harness(
     sync_redis: redis.Redis,
     *,
     binding: object | None = None,
+    binding_factory: Callable[[WorkerConfig], object] | None = None,
     with_killswitch: bool = False,
     approvals: object | None = None,
     approval_reader: object | None = None,
@@ -787,10 +901,14 @@ async def kernel_harness(
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
     per_sandbox_runners: int = 0,
+    hook_runs: object | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
     config = make_config(names, **config_overrides)
+    if binding_factory is not None:
+        assert binding is None
+        binding = binding_factory(config)
     fake_runner = FakeRunner()
     # Most kernel tests use the deliberately tiny ACI fake above.  The coder
     # publication boundary test supplies the real runner app, still with its
@@ -893,6 +1011,7 @@ async def kernel_harness(
             workspace_factory(substrate) if workspace_factory else None
         ),  # type: ignore[arg-type]
         card_store=card_store,
+        **({"hook_runs": hook_runs} if hook_runs is not None else {}),
     )
     killswitch = None
     if with_killswitch:

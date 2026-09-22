@@ -1411,6 +1411,68 @@ async def mark_publication_lineage_terminal(
     return refreshed
 
 
+def publication_lineage_outcome_conflict(
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    data: PublicationLineageAdvance,
+) -> PublicationLineageConflict | None:
+    """Preconditions one revision outcome must meet before it may claim a lineage.
+
+    Pure, so the route can reject a stale outcome before it contacts GitHub and
+    the advancing writer can repeat the same verdict under its row locks. The
+    order is load bearing and carried over unchanged. Which check fires first
+    decides which conflict code the caller sees, and the worker branches on it.
+    """
+
+    if lineage.status != "open":
+        return PublicationLineageConflict(
+            "publication.lineage_terminal",
+            "the pull request for this thread is merged or closed; start a new thread",
+        )
+    if publication.revision_number != lineage.latest_revision:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "publication revision is not the current thread lineage revision",
+        )
+    # Case insensitive on both sides: `_validated_pr_url` in the worker accepts
+    # GitHub's own spelling of the repository and preserves it, so a repository
+    # whose GitHub casing differs from `repo_full_name` publishes fine and must
+    # not then take a stable refusal here.
+    canonical = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
+    if data.pr_url.casefold() != canonical.casefold():
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity does not match the publication repository",
+        )
+    if lineage.pr_number is not None and (
+        lineage.pr_number != data.pr_number
+        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
+    ):
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity no longer matches the stored thread lineage",
+        )
+    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage version or expected head is stale",
+        )
+    if (
+        publication.version != data.expected_publication_version
+        or publication.lease_owner != data.lease_owner
+    ):
+        return PublicationLineageConflict(
+            "publication.lease_lost",
+            "publication lease is no longer held by this worker",
+        )
+    if publication.status not in ("approved", "launching", "running"):
+        return PublicationLineageConflict(
+            "publication.revision_not_approved",
+            "publication revision must be approved before advancing its lineage",
+        )
+    return None
+
+
 async def advance_publication_lineage(
     session: AsyncSession,
     publication_id: uuid.UUID,
@@ -1444,50 +1506,9 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication thread pull request lineage is absent",
         )
-    if lineage.status != "open":
-        raise PublicationLineageConflict(
-            "publication.lineage_terminal",
-            "the pull request for this thread is merged or closed; start a new thread",
-        )
-    if publication.revision_number != lineage.latest_revision:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "publication revision is not the current thread lineage revision",
-        )
-    # GitHub repository owner and name are case-insensitive; the worker and the
-    # identity verifier already compare them with casefold.
-    expected_url = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
-    if data.pr_url.casefold() != expected_url.casefold():
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity does not match the publication repository",
-        )
-    if lineage.pr_number is not None and (
-        lineage.pr_number != data.pr_number
-        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
-    ):
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity no longer matches the stored thread lineage",
-        )
-    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request lineage version or expected head is stale",
-        )
-    if (
-        publication.version != data.expected_publication_version
-        or publication.lease_owner != data.lease_owner
-    ):
-        raise PublicationLineageConflict(
-            "publication.lease_lost",
-            "publication lease is no longer held by this worker",
-        )
-    if publication.status not in ("approved", "launching", "running"):
-        raise PublicationLineageConflict(
-            "publication.revision_not_approved",
-            "publication revision must be approved before advancing its lineage",
-        )
+    conflict = publication_lineage_outcome_conflict(publication, lineage, data)
+    if conflict is not None:
+        raise conflict
 
     identity_values: dict[str, Any] = {}
     if identity is not None:
@@ -1512,7 +1533,7 @@ async def advance_publication_lineage(
                 "publication.lineage_stale",
                 "immutable GitHub lineage identity changed",
             )
-        await _require_current_lineage_workspace(
+        await require_current_lineage_workspace(
             session,
             lineage,
             conflict_code="publication.lineage_stale",
@@ -1854,6 +1875,89 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
     return result
 
 
+# Per served agent: its approval route map, read fresh, and the (kind, address)
+# pairs of the adapter's bindings that belong to that agent.
+_ServedTargets = dict[uuid.UUID, tuple[Any, frozenset[tuple[str, str]]]]
+
+
+async def _adapter_served_targets(
+    session: AsyncSession, bindings: frozenset[uuid.UUID]
+) -> _ServedTargets:
+    """What an adapter serving ``bindings`` can reach, keyed by agent id.
+
+    Read fresh on every call, like ``get_approval_route_binding``: a binding
+    deleted or a route re-pointed after the credential was issued narrows what
+    the adapter sees immediately.
+    """
+
+    if not bindings:
+        return {}
+    rows = await session.execute(
+        select(
+            AgentChannel.agent_id,
+            AgentChannel.kind,
+            AgentChannel.address,
+            Agent.approval_routes,
+        )
+        .join(Agent, Agent.id == AgentChannel.agent_id)
+        .where(AgentChannel.id.in_(bindings))
+    )
+    pairs: dict[uuid.UUID, set[tuple[str, str]]] = {}
+    routes: dict[uuid.UUID, Any] = {}
+    for agent_id, kind, address, approval_routes in rows:
+        pairs.setdefault(agent_id, set()).add((kind, address))
+        routes[agent_id] = approval_routes
+    return {agent_id: (routes[agent_id], frozenset(p)) for agent_id, p in pairs.items()}
+
+
+def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
+    """THE served predicate (ADR-0154), shared by the list and the resolver.
+
+    An approval is served when it names an agent and a route, and that agent's
+    route resolves to the ``(kind, address)`` of one of the adapter's bindings
+    ON THE SAME AGENT. A routeless approval, or a route whose resolution is
+    missing or malformed, is served by no adapter: fail closed.
+    """
+
+    if approval.agent_id is None or not approval.route:
+        return False
+    target = targets.get(approval.agent_id)
+    if target is None:
+        return False
+    approval_routes, pairs = target
+    if not isinstance(approval_routes, dict):
+        return False
+    binding = approval_routes.get(approval.route)
+    if not isinstance(binding, dict):
+        return False
+    resolution = binding.get("resolution")
+    if not isinstance(resolution, dict):
+        return False
+    kind, address = resolution.get("kind"), resolution.get("address")
+    if not isinstance(kind, str) or not isinstance(address, str):
+        return False
+    return (kind, address) in pairs
+
+
+async def approval_served_by(
+    session: AsyncSession, approval: Approval, bindings: frozenset[uuid.UUID]
+) -> bool:
+    """Whether an adapter serving ``bindings`` may see and resolve ``approval``."""
+
+    return _approval_served(approval, await _adapter_served_targets(session, bindings))
+
+
+async def existing_channel_binding_ids(
+    session: AsyncSession, binding_ids: frozenset[uuid.UUID]
+) -> frozenset[uuid.UUID]:
+    """The subset of ``binding_ids`` that still name an ``agent_channels`` row."""
+
+    if not binding_ids:
+        return frozenset()
+    result = await session.scalars(select(AgentChannel.id).where(AgentChannel.id.in_(binding_ids)))
+    return frozenset(result)
+
+
 async def list_approvals(
     session: AsyncSession,
     *,
@@ -1861,16 +1965,36 @@ async def list_approvals(
     agent_id: uuid.UUID | None = None,
     conversation_id: str | None = None,
     limit: int = 50,
+    served_by: frozenset[uuid.UUID] | None = None,
 ) -> list[Approval]:
-    stmt = select(Approval).order_by(Approval.created_at.desc()).limit(limit)
+    """Newest first. ``served_by`` (an adapter principal's bindings) narrows the
+    result to approvals that adapter serves, BEFORE ``limit`` applies, so an
+    adapter never gets a short page because unserved rows took the slots."""
+
+    stmt = select(Approval).order_by(Approval.created_at.desc())
     if status is not None:
         stmt = stmt.where(Approval.status == status)
     if agent_id is not None:
         stmt = stmt.where(Approval.agent_id == agent_id)
     if conversation_id is not None:
         stmt = stmt.where(Approval.conversation_id == conversation_id)
-    result = await session.scalars(stmt)
-    return list(result)
+    if served_by is None:
+        result = await session.scalars(stmt.limit(limit))
+        return list(result)
+    targets = await _adapter_served_targets(session, served_by)
+    if not targets:
+        return []
+    # Narrow in SQL to the served agents' routed rows, then apply the one
+    # predicate the resolver also uses; the route map is JSONB, so the
+    # resolution match itself stays in Python. The SQL side still needs its
+    # own bound: `_approval_served` can only drop rows, never keep more than
+    # it's given, so a hard cap here (well above `limit`) keeps a busy agent's
+    # adapter listing from materializing every routed approval it has.
+    stmt = stmt.where(Approval.agent_id.in_(targets), Approval.route.is_not(None)).limit(
+        max(limit, 1000)
+    )
+    served = [a for a in await session.scalars(stmt) if _approval_served(a, targets)]
+    return served[:limit]
 
 
 async def pending_approval_inventory(
@@ -2167,11 +2291,14 @@ async def append_approval_audit(
     evidence: dict[str, Any] | None = None,
     principal_kind: str | None = None,
     authenticated: bool = False,
+    principal_subject: str | None = None,
 ) -> ApprovalAuditEntry:
     """Append one audit row (#247). Append-only by design; never updated.
 
     ``evidence`` (#420) is the membership snapshot the authorizer decided on;
-    None for writers that made no membership decision.
+    None for writers that made no membership decision. ``principal_subject``
+    names the adapter that transported an ``adapter`` principal's decision
+    (ADR-0154); None for every other kind.
     """
 
     entry = ApprovalAuditEntry(
@@ -2181,6 +2308,7 @@ async def append_approval_audit(
         actor_channel=actor_channel,
         principal_kind=principal_kind,
         authenticated=authenticated,
+        principal_subject=principal_subject,
         decision=decision,
         authorizer=authorizer,
         authorized=authorized,
@@ -2191,6 +2319,197 @@ async def append_approval_audit(
     await session.commit()
     await session.refresh(entry)
     return entry
+
+
+# --- break-glass recovery (#2753) --------------------------------------------
+#
+# ONE transaction, ONE commit, per operation. ``claim_approval_resolution``
+# commits internally, and so does ``append_approval_audit``; composing the two
+# leaves a crash window in which the status flipped and the audit row that
+# explains it never existed. For a path whose whole justification is that every
+# use is reviewable afterwards, that window is the failure, so recovery does
+# the compare-and-set and the audit append inside a single ``session.begin()``
+# block instead of calling either.
+#
+# Idempotency is keyed on that audit row, not on a column: the caller's
+# ``recovery_key`` is recorded in the row's evidence, and because the row
+# commits with the CAS, a key with no row means no effect landed.
+#
+# The audit row is built from the module-level ``ApprovalAuditEntry``, exactly
+# as ``append_approval_audit`` does. That is deliberate and load-bearing: the
+# seam between the CAS and the audit append has to be the same one the existing
+# writer exposes, so a test can interrupt precisely there. A Core ``insert()``
+# here would move the seam.
+
+#: Everything the caller must supply about WHO acted. Recovery takes its actor
+#: from the ADR-0106 operator principal for attribution only; no membership is
+#: consulted and nothing widens.
+_RECOVERY_AUTHORIZER = "approval_recovery"
+
+
+class PublicationSettlementConflict(Exception):
+    """The recovered approval's publication moved under the recovery.
+
+    Raised INSIDE the recovery transaction so the whole administrative act --
+    the approval CAS, the publication settlement and the audit row -- rolls back
+    together. A recovery that settled the approval and left the publication
+    pending would be exactly the stranded effect this path exists to remove.
+    """
+
+
+async def reread_approval(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
+    """Read an approval back from the database, not from the identity map.
+
+    An ORM-enabled Core UPDATE expires the columns it touched on any instance
+    already in the session, so a plain ``session.get`` hands back an object
+    whose next attribute access is a lazy load -- which under the async session
+    is a ``MissingGreenlet``, not a refresh. ``claim_approval_resolution``
+    refreshes for the same reason.
+    """
+
+    approval = await session.get(Approval, approval_id)
+    if approval is not None:
+        await session.refresh(approval)
+    return approval
+
+
+#: The audit model as the replay lookup reads it. A separate name on purpose:
+#: ``recover_approval_atomic`` builds its row from the module-level
+#: ``ApprovalAuditEntry`` so a test can interrupt exactly between the CAS and
+#: the audit append, and the lookup must not be caught by that interruption.
+_RecoveryAuditEntry = ApprovalAuditEntry
+
+#: The audit action every administrative recovery writes. Its evidence carries
+#: the caller's ``recovery_key``, which is what a replay is matched on.
+RECOVERY_AUDIT_ACTION = "administratively_recovered"
+
+
+async def find_recovery_audit(
+    session: AsyncSession, recovery_key: str
+) -> ApprovalAuditEntry | None:
+    """The recovery audit row recorded under ``recovery_key``, on any approval.
+
+    A key names one administrative act installation-wide, so the lookup is not
+    scoped to an approval: the caller compares the row's ``approval_id`` to tell
+    a replay from a key reused for a different approval.
+    """
+
+    result = await session.execute(
+        select(_RecoveryAuditEntry)
+        .where(
+            _RecoveryAuditEntry.action == RECOVERY_AUDIT_ACTION,
+            _RecoveryAuditEntry.evidence["recovery_key"].astext == recovery_key,
+        )
+        .order_by(_RecoveryAuditEntry.created_at)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def recover_approval_atomic(
+    session: AsyncSession,
+    approval_id: uuid.UUID,
+    *,
+    reason: str,
+    recovery_key: str,
+    actor: str,
+    actor_channel: str | None,
+    principal_kind: str | None,
+    facts: list[str],
+) -> Approval | None:
+    """Administratively settle a pending approval as ``rejected``, atomically.
+
+    The CAS is guarded on ``status = 'pending'`` exactly as the ordinary
+    resolve-once claim is, so an approval is settled at most once. Returns None
+    when the CAS matched nothing; the caller looks the key up with
+    ``find_recovery_audit`` to tell a replay (return the recorded outcome) from
+    a genuine conflict.
+
+    ``facts`` are the reporter's OBSERVATIONS, recorded as evidence. They state
+    what was seen about the row. They never assert that the ordinary path was
+    unavailable -- nothing here is in a position to know that.
+    """
+
+    recovered: uuid.UUID | None
+    async with session.begin():
+        # The associated publication, read inside the SAME transaction that
+        # settles the approval. ``claim_approval_resolution`` settles it too,
+        # but it commits internally, so it cannot be reused here: composing it
+        # would put the publication's fate in a second transaction and reopen
+        # the crash window this whole function exists to close.
+        publication = await get_publication_by_approval(session, approval_id)
+        values: dict[str, Any] = {
+            "status": ApprovalStatus.rejected,
+            "resolved_by": actor,
+            "resolution_note": reason,
+            "resolved_at": func.now(),
+        }
+        if publication is not None:
+            # A publication outcome is reported by the platform worker through
+            # the stored reply route, never by a resumed model turn. Mark the
+            # wake as owing nothing in the same CAS, exactly as the ordinary
+            # resolve path does, so the reconciler never picks the row up for a
+            # resume the router deliberately does not enqueue.
+            values["resumed_at"] = func.now()
+        result = await session.execute(
+            update(Approval)
+            .where(
+                Approval.id == approval_id,
+                Approval.status == ApprovalStatus.pending,
+            )
+            .values(**values)
+            .returning(Approval.id)
+        )
+        recovered = result.scalar_one_or_none()
+        if recovered is None:
+            return None
+        if publication is not None:
+            # The same denial the ordinary reject performs, under the same
+            # version check: status denied, the patch dropped, the terminal
+            # instant recorded. Without it the recovered approval is settled and
+            # its publication waits forever -- the expiry sweeper no longer
+            # selects a rejected approval, and no resume is enqueued to repair
+            # it, so nothing else in the system would ever touch it again.
+            changed = await session.execute(
+                update(Publication)
+                .where(
+                    Publication.id == publication.id,
+                    Publication.status == "pending",
+                    Publication.version == publication.version,
+                )
+                .values(
+                    status="denied",
+                    version=Publication.version + 1,
+                    updated_at=func.now(),
+                    terminal_at=func.now(),
+                    patch_bytes=None,
+                )
+                .returning(Publication.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                raise PublicationSettlementConflict(
+                    "the approval's publication is no longer pending at the "
+                    "version this recovery read; nothing was changed"
+                )
+        entry = ApprovalAuditEntry(
+            approval_id=approval_id,
+            action=RECOVERY_AUDIT_ACTION,
+            actor=actor,
+            actor_channel=actor_channel,
+            principal_kind=principal_kind,
+            authenticated=True,
+            decision=ApprovalStatus.rejected,
+            authorizer=_RECOVERY_AUTHORIZER,
+            authorized=True,
+            reason=reason,
+            evidence={
+                "kind": "administrative_recovery",
+                "recovery_key": recovery_key,
+                "facts": facts,
+            },
+        )
+        session.add(entry)
+    return await reread_approval(session, approval_id)
 
 
 async def list_approval_audit(
@@ -2362,7 +2681,7 @@ async def revoke_console_session(
     return row
 
 
-async def _require_current_lineage_workspace(
+async def require_current_lineage_workspace(
     session: AsyncSession,
     lineage: ThreadPublicationLineage,
     *,
@@ -2389,9 +2708,7 @@ async def _require_current_lineage_workspace(
     if (
         workspace is None
         or workspace.repo_full_name.casefold() != lineage.repo_full_name.casefold()
-        or not repository_is_allowed(
-            lineage.repo_full_name, get_settings().github_repo_allowlist
-        )
+        or not repository_is_allowed(lineage.repo_full_name, get_settings().github_repo_allowlist)
         or deployment is None
         or deployment.agent_id != lineage.agent_id
         or deployment.status != "active"
@@ -2417,7 +2734,7 @@ async def _require_review_binding(
         if lineage.binding_id
         else None
     )
-    await _require_current_lineage_workspace(
+    await require_current_lineage_workspace(
         session,
         lineage,
         conflict_code="publication.review_ineligible",

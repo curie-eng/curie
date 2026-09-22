@@ -69,6 +69,10 @@ class HistoryCapacityError(HistoryAppendError):
     """The state API refused a transcript append because a byte cap was reached."""
 
 
+class HistoryConflictError(HistoryAppendError):
+    """A compaction rewrite lost its compare-and-set race to a concurrent write."""
+
+
 class StructuredReplayUnsupported(HistoryError):
     """The selected harness cannot consume a recovered structured prefix."""
 
@@ -81,6 +85,14 @@ JsonContent = str | list[dict[str, Any]]
 # bound prevents a single large first turn from being rejected before any
 # durable conversation exists.
 HISTORY_VALUE_MAX_BYTES = 65_536
+
+# Headroom every runner transcript write leaves free under the value cap (#2927).
+# The worker appends a publication outcome to the same key without a reserve;
+# that record's text is capped near 2000 characters, so one always fits.
+HISTORY_APPEND_RESERVE_BYTES = 8_192
+
+# Compare-and-set attempts for one capacity compaction before giving up.
+_COMPACTION_ATTEMPTS = 3
 
 _STRUCTURAL_BLOCK_FIELDS = {
     "type",
@@ -295,7 +307,7 @@ class TurnRecord:
 def _state_value_size(record: Mapping[str, Any]) -> int:
     """Return the state API's encoded size for a one-record transcript."""
 
-    return len(json.dumps([record], separators=(",", ":")).encode("utf-8"))
+    return _value_size([record])
 
 
 def _digest_marker(value: str) -> str:
@@ -631,7 +643,8 @@ class TranscriptStore(Protocol):
 
     Deliberately narrow -- no query language and no in-place rewrite. A concrete
     store dereferences a ``history_ref`` to a durable, rehydratable backing that
-    lives outside the sandbox; compaction is itself an append-only summary.
+    lives outside the sandbox; replay compaction is itself an append-only
+    summary. Only a store with a byte cap rewrites, and only at that cap (#2927).
     """
 
     async def load(self) -> list[HistoryRecord]:
@@ -656,6 +669,26 @@ class NullTranscriptStore:
     async def append(self, record: HistoryRecord) -> None:  # noqa: ARG002 - null sink
         return None
 
+    async def compact(self) -> None:
+        """Nothing is stored, so there is nothing to compact."""
+        return None
+
+
+def _parse_records(value: Sequence[Any]) -> list[HistoryRecord]:
+    """Parse a stored transcript array into history records, oldest first."""
+
+    records: list[HistoryRecord] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HistoryError("invalid transcript record: expected a JSON object")
+        if item.get("type") == "summary":
+            records.append(SummaryRecord.from_dict(item))
+        elif "user" in item:
+            records.append(TurnRecord.from_dict(item))
+        else:
+            raise HistoryError("invalid transcript record: unknown record shape")
+    return records
+
 
 class StateApiTranscriptStore:
     """Transcript backed by the durable state store (#23/#248/#264), the default.
@@ -665,56 +698,130 @@ class StateApiTranscriptStore:
     key; append is a POST to the key's ``/append`` endpoint. The state API
     enforces the size caps and the Postgres JSONB backing gives durability across
     an unplanned restart for free.
+
+    Every append asks the API to keep ``HISTORY_APPEND_RESERVE_BYTES`` free under
+    the value cap (#2927). When a turn append is refused at that bound, the store
+    rewrites the key with a compare-and-set PUT to ``compact_transcript_value`` of
+    the fresh value plus the turn. ``compact`` does the same for boot against the
+    value its last ``load`` saw.
     """
 
     def __init__(self, key_url: str, token: str | None) -> None:
         # Normalize to no trailing slash so the /append URL composes cleanly.
         self._key_url = key_url.rstrip("/")
         self._token = token
+        # The raw value and version the last load() saw, for boot compaction.
+        self._snapshot: tuple[list[Any], int] | None = None
 
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self._token} if self._token else {}
 
-    async def load(self) -> list[HistoryRecord]:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(self._key_url, headers=self._headers()) as resp:
-                if resp.status == 404:
-                    # No transcript written yet -- a fresh thread, not an error.
-                    return []
-                if resp.status != 200:
-                    raise HistoryError(resp.status)
-                payload = await resp.json()
+    async def _fetch(self, session: aiohttp.ClientSession) -> tuple[list[Any], int] | None:
+        async with session.get(self._key_url, headers=self._headers()) as resp:
+            if resp.status == 404:
+                # No transcript written yet -- a fresh thread, not an error.
+                return None
+            if resp.status != 200:
+                raise HistoryError(resp.status)
+            payload = await resp.json()
         value = payload.get("value")
         if not isinstance(value, list):
             raise HistoryError("transcript log is not a JSON array")
-        records: list[HistoryRecord] = []
-        for item in value:
-            if not isinstance(item, Mapping):
-                raise HistoryError("invalid transcript record: expected a JSON object")
-            if item.get("type") == "summary":
-                records.append(SummaryRecord.from_dict(item))
-            elif "user" in item:
-                records.append(TurnRecord.from_dict(item))
-            else:
-                raise HistoryError("invalid transcript record: unknown record shape")
-        return records
+        return value, int(payload.get("version", 0))
+
+    async def _post(self, session: aiohttp.ClientSession, item: dict[str, Any]) -> int:
+        body = json.dumps({"item": item, "reserve_bytes": HISTORY_APPEND_RESERVE_BYTES})
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        async with session.post(f"{self._key_url}/append", data=body, headers=headers) as resp:
+            return resp.status
+
+    async def _put(
+        self, session: aiohttp.ClientSession, value: list[dict[str, Any]], version: int
+    ) -> int:
+        body = json.dumps({"value": value, "expected_version": version})
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        async with session.put(self._key_url, data=body, headers=headers) as resp:
+            return resp.status
+
+    async def load(self) -> list[HistoryRecord]:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            self._snapshot = await self._fetch(session)
+        if self._snapshot is None:
+            return []
+        return _parse_records(self._snapshot[0])
 
     async def append(self, record: HistoryRecord) -> None:
+        if isinstance(record, TurnRecord):
+            # A lone turn must leave the reserve too, or the first append to an
+            # empty key could be refused with nothing to compact.
+            try:
+                record = bound_turn_record(
+                    record,
+                    max_value_bytes=HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES,
+                )
+            except HistoryError:
+                # The turn's irreducible structure alone exceeds the reserved
+                # bound: a loud capacity refusal, like compact_transcript_value's
+                # own bound (#2927), not a generic append failure.
+                raise HistoryCapacityError(413) from None
+        item = record.to_dict()
         timeout = aiohttp.ClientTimeout(total=15)
-        body = json.dumps({"item": record.to_dict()})
-        headers = {**self._headers(), "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{self._key_url}/append", data=body, headers=headers
-            ) as resp:
-                if resp.status not in (200, 201):
-                    if resp.status == 413:
-                        raise HistoryCapacityError(resp.status)
-                    raise HistoryAppendError(resp.status)
+            status = await self._post(session, item)
+            if status in (200, 201):
+                return
+            if status != 413:
+                raise HistoryAppendError(status)
+            if isinstance(record, SummaryRecord):
+                # Boot owns summary capacity: it compacts against what it loaded.
+                raise HistoryCapacityError(status)
+            for _attempt in range(_COMPACTION_ATTEMPTS):
+                snapshot = await self._fetch(session)
+                if snapshot is None:
+                    # The turn was bounded to leave the reserve, so a refusal on
+                    # an empty key is the cap itself, not something to compact.
+                    raise HistoryCapacityError(413)
+                value, version = snapshot
+                status = await self._put(
+                    session, compact_transcript_value([*value, item]), version
+                )
+                if status in (200, 201):
+                    return
+                if status == 409:
+                    continue
+                if status == 413:
+                    raise HistoryCapacityError(status)
+                raise HistoryAppendError(status)
+        raise HistoryAppendError(409)
+
+    async def compact(self) -> None:
+        """Rewrite the value the last ``load`` saw, compare-and-set on its version.
+
+        A write since that load is a ``HistoryConflictError``: the caller reloads
+        rather than compacting (or summarizing) a stale view over it.
+        """
+
+        if self._snapshot is None:
+            raise HistoryError("no loaded transcript to compact")
+        value, version = self._snapshot
+        compacted = compact_transcript_value(value)
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            status = await self._put(session, compacted, version)
+        self._snapshot = None
+        if status in (200, 201):
+            return
+        if status == 409:
+            raise HistoryConflictError(status)
+        if status == 413:
+            raise HistoryCapacityError(status)
+        raise HistoryAppendError(status)
 
 
-def resolve_history(history_ref: str | None, env: Mapping[str, str]) -> TranscriptStore:
+def resolve_history(
+    history_ref: str | None, env: Mapping[str, str]
+) -> NullTranscriptStore | StateApiTranscriptStore:
     """Resolve ``CURIE_HISTORY_REF`` to a concrete ``TranscriptStore`` at boot.
 
     An absent ref yields the ``NullTranscriptStore`` (history is optional). An
@@ -822,12 +929,19 @@ def _make_summary(
     content = "\n\n".join(sections)
     # The summary is written once at this explicit boundary. Bounding it here is
     # stable: later appends never rewrite it; only a later compaction creates a
-    # new record. The digest keeps omitted material falsifiable.
+    # new record. The digest keeps omitted material falsifiable. When the content
+    # overflows the budget, keep the most recent bytes (the marker first, then the
+    # UTF-8-safe suffix that fits) rather than the oldest: the newest compacted
+    # material -- e.g. a just-recorded publication outcome -- must survive even
+    # once the prior summary has saturated the budget.
     budget = max(512, (max_bytes // 2) if max_bytes is not None else 8_000)
     encoded = content.encode("utf-8")
     if len(encoded) > budget:
-        prefix = encoded[: max(0, budget - 96)].decode("utf-8", errors="ignore")
-        content = f"{prefix}\n\n[older detail summarized; digest={digest}]"
+        marker = f"[older detail summarized; digest={digest}]\n\n"
+        marker_bytes = marker.encode("utf-8")
+        suffix_budget = max(0, budget - len(marker_bytes))
+        suffix = encoded[-suffix_budget:].decode("utf-8", errors="ignore") if suffix_budget else ""
+        content = f"{marker}{suffix}"
     source_turns = (prior.source_turns if prior is not None else 0) + len(compacted)
     through_ts = compacted[-1].ts if compacted else (prior.through_ts if prior else "")
     return SummaryRecord(
@@ -887,7 +1001,10 @@ def build_conversation_replay(
 
     over_turns = max_turns is not None and len(active_turns) > max_turns
     over_bytes = max_bytes is not None and _replay_bytes(current_messages) > max_bytes
-    if not over_turns and not over_bytes:
+    # A summary needs at least one turn to compact and one to keep (#2927). With
+    # one active turn it would compact nothing and re-embed that turn in its
+    # tail, doubling the stored transcript, so that replay stays plain.
+    if (not over_turns and not over_bytes) or len(active_turns) <= 1:
         # A summary changes the portable prefix. Native state from its embedded
         # tail still represents the pre-summary conversation and is unusable;
         # only a post-summary turn's fresh checkpoint may restore that shape.
@@ -902,8 +1019,6 @@ def build_conversation_replay(
             None,
         )
 
-    if not active_turns:
-        return ConversationReplay(), None
     keep_count = max(
         1,
         min(len(active_turns), (max_turns or len(active_turns)) // 2),
@@ -942,6 +1057,82 @@ def build_conversation_replay(
 # ordinary appends never move or rewrite the already-cached prefix.
 DEFAULT_REPLAY_MAX_TURNS = 40
 DEFAULT_REPLAY_MAX_BYTES = 16_000
+
+
+def _value_size(value: Sequence[Any]) -> int:
+    return len(json.dumps(list(value), separators=(",", ":")).encode("utf-8"))
+
+
+def compact_transcript_value(
+    value: Sequence[Any],
+    *,
+    max_value_bytes: int = HISTORY_VALUE_MAX_BYTES,
+    reserve_bytes: int = HISTORY_APPEND_RESERVE_BYTES,
+) -> list[dict[str, Any]]:
+    """Rewrite a stored transcript array to fit the cap with the reserve free (#2927).
+
+    Items carrying ``publication_id`` are the worker's idempotency markers and
+    are kept verbatim, first; replay ignores records before the latest summary.
+    Every active turn but the latest is folded into one new summary, and the
+    latest turn is kept without native replay state, bounded to what is left.
+    Tool output and turn detail beyond the summary line are what is lost. A
+    result that still cannot fit is a ``HistoryCapacityError``.
+    """
+
+    limit = max_value_bytes - reserve_bytes
+    markers = [
+        dict(item) for item in value if isinstance(item, Mapping) and "publication_id" in item
+    ]
+    # Parse the full value, publication markers included: each marker also
+    # carries a plain "user"/"assistant" pair, so it parses as an ordinary
+    # TurnRecord and takes its original position among the active turns. Its
+    # raw dict (with publication_id) still lands in ``markers`` above and is
+    # kept verbatim in the rewritten prefix for the worker's idempotency scan;
+    # this parse additionally lets its outcome text reach the new summary (or
+    # the kept tail) instead of being dropped from replay (#2927).
+    records = _parse_records(value)
+    latest_summary: SummaryRecord | None = None
+    latest_summary_index = -1
+    for index, record in enumerate(records):
+        if isinstance(record, SummaryRecord):
+            latest_summary = record
+            latest_summary_index = index
+    active_turns = [
+        *(latest_summary.tail if latest_summary is not None else ()),
+        *(
+            record
+            for record in records[latest_summary_index + 1 :]
+            if isinstance(record, TurnRecord)
+        ),
+    ]
+
+    prefix: list[dict[str, Any]] = list(markers)
+    if active_turns[:-1] or latest_summary is not None:
+        prefix.append(
+            _make_summary(
+                latest_summary,
+                active_turns[:-1],
+                (),
+                max_bytes=DEFAULT_REPLAY_MAX_BYTES,
+            ).to_dict()
+        )
+    compacted = list(prefix)
+    if active_turns:
+        # Joining the kept turn to a non-empty prefix costs one comma and drops
+        # the kept turn's own array brackets from the one-record bound.
+        budget = limit - (_value_size(prefix) - 1 if prefix else 0)
+        if budget <= 2:
+            raise HistoryCapacityError(413)
+        try:
+            kept = bound_turn_record(
+                replace(active_turns[-1], harness_replay=None), max_value_bytes=budget
+            )
+        except HistoryError:
+            raise HistoryCapacityError(413) from None
+        compacted.append(kept.to_dict())
+    if _value_size(compacted) > limit:
+        raise HistoryCapacityError(413)
+    return compacted
 
 
 def utcnow_iso() -> str:

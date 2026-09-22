@@ -51,5 +51,5 @@ grafanaConnector:
   secretName: curie-grafana-connector
   secretKey: GRAFANA_SERVICE_ACCOUNT_TOKEN
   restartDeploymentNames:
-    - curie-sre-bot-grafana
-    - curie-sre-bot-tempo
+    - curie-sre-bot-mcp-grafana
+    - curie-sre-bot-mcp-tempo

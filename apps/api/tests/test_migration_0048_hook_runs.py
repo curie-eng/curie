@@ -1,4 +1,4 @@
-"""Migration 0047 adds curie.hook_runs and the slot claim."""
+"""Migration 0048 adds curie.hook_runs and the slot claim."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
+BELOW = "0047"
+REVISION = "0048"
 SLOT = datetime(2026, 9, 22, 16, 0, tzinfo=UTC)
 STARTED = datetime(2026, 9, 22, 16, 0, 5, tzinfo=UTC)
 
@@ -100,26 +102,26 @@ def _hook_run_count() -> int:
     return int(rows[0]["n"])
 
 
-def test_0047_creates_hook_runs_and_downgrade_drops_it(
+def test_0048_creates_hook_runs_and_downgrade_drops_it(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
-    command.upgrade(config, "head")
+    command.upgrade(config, REVISION)
     assert _hook_runs_regclass() is not None
     try:
-        command.downgrade(config, "0046")
+        command.downgrade(config, BELOW)
         assert _hook_runs_regclass() is None
-        command.upgrade(config, "head")
+        command.upgrade(config, REVISION)
         assert _hook_runs_regclass() is not None
     finally:
         # A failed assertion must not leave this private database below head.
-        command.upgrade(config, "head")
+        command.upgrade(config, REVISION)
 
 
-def test_0047_rejects_a_duplicate_slot_and_accepts_another(
+def test_0048_rejects_a_duplicate_slot_and_accepts_another(
     isolated_migration_db: None,
 ) -> None:
-    command.upgrade(_config(), "head")
+    command.upgrade(_config(), REVISION)
     agent_id, version_id = _seed_agent_version()
     _insert_hook_run(agent_id, version_id, SLOT, None)
     with pytest.raises(IntegrityError) as excinfo:
@@ -130,8 +132,8 @@ def test_0047_rejects_a_duplicate_slot_and_accepts_another(
     assert _hook_run_count() == 2
 
 
-def test_0047_rejects_deferred_outcome(isolated_migration_db: None) -> None:
-    command.upgrade(_config(), "head")
+def test_0048_rejects_deferred_outcome(isolated_migration_db: None) -> None:
+    command.upgrade(_config(), REVISION)
     agent_id, version_id = _seed_agent_version()
     with pytest.raises(IntegrityError) as excinfo:
         _insert_hook_run(agent_id, version_id, SLOT, "deferred")

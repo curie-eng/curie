@@ -1,4 +1,4 @@
-"""Migration 0045 makes work item execution identity durable in PostgreSQL."""
+"""Migration 0046 makes work item execution identity durable in PostgreSQL."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
-BELOW = "0044"
-REVISION = "0045"
+BELOW = "0045"
+REVISION = "0046"
 REPO = "acme-corp/acme-bot"
 CONVERSATION = "slack:C0EXAMPLE1:1700000000.000100"
 STAMP = datetime(2026, 9, 18, 12, tzinfo=UTC)
@@ -213,7 +213,7 @@ def _constraint_definitions(table_name: str) -> list[str]:
     ]
 
 
-def test_0045_catalog_contract_and_round_trip(
+def test_0046_catalog_contract_and_round_trip(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
@@ -425,7 +425,7 @@ def test_0045_catalog_contract_and_round_trip(
     ]
 
 
-def test_0045_work_item_constraints_and_immutable_fields(
+def test_0046_work_item_constraints_and_immutable_fields(
     isolated_migration_db: None,
 ) -> None:
     command.upgrade(_config(), REVISION)
@@ -513,7 +513,7 @@ def test_0045_work_item_constraints_and_immutable_fields(
         )
 
 
-def test_0045_lineage_is_unique_restricted_and_write_once(
+def test_0046_lineage_is_unique_restricted_and_write_once(
     isolated_migration_db: None,
 ) -> None:
     command.upgrade(_config(), REVISION)
@@ -571,7 +571,7 @@ def test_0045_lineage_is_unique_restricted_and_write_once(
     ) == [{"lineage_id": str(other_lineage_id)}]
 
 
-def test_0045_request_identity_active_uniqueness_and_cascade(
+def test_0046_request_identity_active_uniqueness_and_cascade(
     isolated_migration_db: None,
 ) -> None:
     command.upgrade(_config(), REVISION)
@@ -698,7 +698,7 @@ def test_0045_request_identity_active_uniqueness_and_cascade(
         ),
     ],
 )
-def test_0045_rejects_invalid_request_state_shapes(
+def test_0046_rejects_invalid_request_state_shapes(
     isolated_migration_db: None,
     status: str,
     overrides: dict[str, Any],
@@ -708,7 +708,7 @@ def test_0045_rejects_invalid_request_state_shapes(
     _reject_request(work_item_id, status=status, **overrides)
 
 
-def test_0045_deadline_arithmetic_and_request_fields_are_write_once(
+def test_0046_deadline_arithmetic_and_request_fields_are_write_once(
     isolated_migration_db: None,
 ) -> None:
     command.upgrade(_config(), REVISION)

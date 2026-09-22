@@ -10,7 +10,7 @@ The tracker remains the backlog. Curie still does not copy issue bodies.
 Intake is not the generic hook partition.
 
 Realizes the intake boundary deferred by
-[ADR 0155](0155-work-items-own-durable-execution-identity.md).
+[ADR 0162](0162-work-items-own-durable-execution-identity.md).
 Does not amend
 [ADR 0146](0146-headless-capacity-is-a-wait-not-a-reply.md),
 [ADR 0147](0147-publication-approval-is-a-per-agent-operator-policy.md),
@@ -29,7 +29,7 @@ The realizing paths are `apps/api/src/curie_api/routers/github.py`,
 ## Context
 
 ADR 0145 sent labelled issue events through the generic hook ingress and treated
-the runs stream as the queue. ADR 0155 replaced that queue with one WorkItem per
+the runs stream as the queue. ADR 0162 replaced that queue with one WorkItem per
 canonical GitHub repository and issue, and left the trusted intake boundary to
 issue 2574. The review ingress already verifies webhook signatures, delivery
 identity, installation, repository allowlist, and current write or admin
@@ -92,14 +92,14 @@ stay on the WorkItem service.
 
 ## Alternatives considered
 
-**Keep routing issues through the generic hook ingress.** Rejected. ADR 0155
+**Keep routing issues through the generic hook ingress.** Rejected. ADR 0162
 already made the stream the wrong durable identity, and the hook path does not
 enforce installation, allowlist, or sender permission.
 
 **Treat every comment as a new execution.** Rejected. Ordinary discussion would
 spend executions, and App comments would loop.
 
-**Cancel by deleting the pull request.** Rejected. ADR 0155 retains the
+**Cancel by deleting the pull request.** Rejected. ADR 0162 retains the
 publication link. Cancellation stops execution; it does not erase the PR.
 
 ## Realizing code path

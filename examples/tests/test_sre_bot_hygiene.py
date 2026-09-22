@@ -43,6 +43,62 @@ UPGRADE_SCRIPT = BUNDLE / "platform-upgrade" / "upgrade.sh"
 PLACEHOLDER_CHANNELS = frozenset({"C0EXAMPLE1", "C0EXAMPLE2"})
 
 
+def _markdown_section(text: str, heading: str) -> str:
+    start = text.index(heading) + len(heading)
+    end = text.find("\n## ", start)
+    return text[start:] if end == -1 else text[start:end]
+
+
+def _first_bash_block(text: str) -> str:
+    marker = "```bash\n"
+    start = text.index(marker) + len(marker)
+    end = text.index("\n```", start)
+    return text[start:end]
+
+
+def _live_command_index(text: str, prefix: str) -> int:
+    for index, line in enumerate(text.splitlines()):
+        if line.startswith(prefix) and "--dry-run" not in line:
+            return index
+    raise AssertionError(f"missing live command beginning with {prefix!r}")
+
+
+def test_demo_fresh_install_prepares_the_example_before_cluster_up() -> None:
+    text = (BUNDLE / "DEMO.md").read_text(encoding="utf-8")
+    fresh_install = _markdown_section(text, "## Fresh install")
+
+    installer = _live_command_index(
+        fresh_install, "curie example sre-bot install"
+    )
+    cluster_up = _live_command_index(fresh_install, "curie cluster up")
+
+    assert installer < cluster_up, (
+        "examples/sre-bot/DEMO.md must run the example installer before "
+        "credentialed cluster up on a fresh install"
+    )
+
+
+def test_readme_first_install_block_names_the_safe_fresh_install_sequence() -> None:
+    text = (BUNDLE / "README.md").read_text(encoding="utf-8")
+    install = _markdown_section(text, "## Install")
+    first_block = _first_bash_block(install)
+
+    if "curie cluster up" in first_block:
+        installer = _live_command_index(
+            first_block, "curie example sre-bot install"
+        )
+        cluster_up = _live_command_index(first_block, "curie cluster up")
+        assert installer < cluster_up, (
+            "the first README install block must prepare the example before "
+            "credentialed cluster up"
+        )
+    else:
+        assert "(DEMO.md#fresh-install)" in install, (
+            "the first README install block must show the safe command order "
+            "or link to DEMO.md#fresh-install"
+        )
+
+
 def test_staging_deploy_doc_names_what_the_tree_installs_today() -> None:
     """The reproduction doc must describe the installer that exists, including
     the two upgrade paths it currently never mentioned."""

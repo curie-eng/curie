@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "v0.9.1",
+  "defaultVersion": "product-altitude",
   "versions": [
     {
       "id": "v0.7.1",
@@ -121,6 +121,22 @@
       "date": "2026-09-18",
       "branch": "main",
       "commit": "cc5019504be48fca0ecae824d8b7d91a33c1715d"
+    },
+    {
+      "id": "product-altitude",
+      "label": "Current + product altitude",
+      "file": "snapshots/product-altitude.json",
+      "date": "2026-09-21",
+      "branch": "main",
+      "commit": "cc5019504be48fca0ecae824d8b7d91a33c1715d"
+    },
+    {
+      "id": "v0.9.2",
+      "label": "v0.9.2",
+      "file": "snapshots/v0.9.2.json",
+      "date": "2026-09-22",
+      "branch": "main",
+      "commit": "d92a31f8e4352921f4b4dcbbbc147b30f7c5743f"
     }
   ]
 }

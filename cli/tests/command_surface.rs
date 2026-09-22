@@ -313,9 +313,10 @@ fn process_dev_help_lists_the_plugin_compat_gate() {
     );
 }
 
-/// `curie dev sre-demo-e2e` is the operator-facing name of the #2246 nightly
-/// SRE demo assertions. If the verb stops being reachable, the workflow still
-/// calls the script but nobody can run the skip/prereq check locally.
+/// `curie dev sre-demo-e2e` is the operator-facing name of the #2246 / #2854
+/// nightly SRE demo assertions. If the verb stops being reachable, the
+/// workflow still calls the script but nobody can run the skip/prereq check
+/// locally.
 #[test]
 fn process_dev_help_lists_sre_demo_e2e() {
     let output = run_help(&["dev"]);

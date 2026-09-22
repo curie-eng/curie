@@ -158,6 +158,17 @@ class Attachment(_AciModel):
     size_bytes: int | None = None
 
 
+class HookRunRef(_AciModel):
+    """Identity of the scheduled hook run that produced a queued turn.
+
+    ``slot_utc`` is an ISO 8601 timestamp with an explicit UTC offset.
+    """
+
+    agent_id: str
+    name: str
+    slot_utc: str
+
+
 class QueuedTurn(_AciModel):
     """A normalized inbound turn ready for the worker to route and run.
 
@@ -185,6 +196,10 @@ class QueuedTurn(_AciModel):
     channel reported no files" and "this producer predates the field" are
     deliberately the same value, because nothing downstream acts differently on
     the two.
+
+    ``hook_run`` carries the scheduled hook identity when a hook produced the
+    turn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep
+    decoding unchanged.
     """
 
     event_id: str
@@ -195,3 +210,4 @@ class QueuedTurn(_AciModel):
     received_at: str
     source: TurnSource = TurnSource.SLACK
     attachments: list[Attachment] = []
+    hook_run: HookRunRef | None = None

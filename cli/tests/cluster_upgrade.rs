@@ -6,8 +6,10 @@
 //! - #2300 database compatibility windows
 //! - #2097 the kind released-install upgrade CI rung
 //!
-//! Drain reuse is the #2010 gate: one drain per attempt, resume after drain
-//! does not drain accepted work again.
+//! DrainPreflight reuse: one worker-reachability check per attempt, resume
+//! after it does not repeat it. It is a preflight, not the #2010 drain gate
+//! itself (issue #2830); that gate is the chart's pre-upgrade Helm hook Job,
+//! observed at Converge.
 
 use curie::ops::{
     run_lifecycle, ClusterUpgradeOutput, CommonOpts, FakeUpgradeHost, UpgradeChart, UpgradeOpts,
@@ -182,10 +184,11 @@ async fn config_refuse_does_not_begin_mutation() {
 
 #[tokio::test]
 async fn sequential_same_target_resume_does_not_redrain() {
-    let mut host = FakeUpgradeHost::installed("0.8.6").interrupt_after(UpgradePhase::Drain);
+    let mut host =
+        FakeUpgradeHost::installed("0.8.6").interrupt_after(UpgradePhase::DrainPreflight);
     let err = run_lifecycle(opts("0.9.0"), &mut host)
         .await
-        .expect_err("interrupted after drain");
+        .expect_err("interrupted after drain preflight");
     assert!(format!("{err:#}").contains("interrupted"));
     assert_eq!(host.drain_calls, 1);
 
@@ -198,7 +201,7 @@ async fn sequential_same_target_resume_does_not_redrain() {
     assert_eq!(json["resumed"], true);
     assert_eq!(
         host.drain_calls, 1,
-        "resume after drain must not drain accepted work again"
+        "resume after drain preflight must not repeat it"
     );
 }
 
@@ -324,10 +327,10 @@ async fn in_flight_drain_refusal_does_not_mutate() {
     let mut host = FakeUpgradeHost::installed("0.8.6").in_flight(&["runs/curie/1-0"]);
     let out = run_lifecycle(opts("0.9.0"), &mut host)
         .await
-        .expect("drain refusal");
+        .expect("drain preflight refusal");
     let json = output_json(&out);
     assert_eq!(json["status"], "failed");
-    assert_eq!(json["phase"], "drain");
+    assert_eq!(json["phase"], "drain_preflight");
     assert_eq!(json["previous_serving"], true);
     assert_eq!(host.mutate_calls, 0);
     assert_eq!(host.current_version(), "0.8.6");

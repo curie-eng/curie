@@ -19,7 +19,7 @@
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "2.1"
+      "version": "2.2"
     },
     {
       "result": "BudgetOutput",

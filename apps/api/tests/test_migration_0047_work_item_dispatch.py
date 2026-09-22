@@ -1,4 +1,4 @@
-"""Migration 0046 adds WorkItem dispatch, ownership, and snapshot columns."""
+"""Migration 0047 adds WorkItem dispatch, ownership, and snapshot columns."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
-BELOW = "0045"
-REVISION = "0046"
+BELOW = "0046"
+REVISION = "0047"
 REPO = "acme-corp/acme-bot"
 CONVERSATION = "slack:C0EXAMPLE1:1700000000.000100"
 STAMP = datetime(2026, 9, 18, 12, tzinfo=UTC)
@@ -217,7 +217,7 @@ def _function_body() -> str:
     return str(rows[0]["function_body"]).lower()
 
 
-def test_0046_adds_dispatch_columns_checks_indexes_and_trigger_rules(
+def test_0047_adds_dispatch_columns_checks_indexes_and_trigger_rules(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
@@ -309,7 +309,7 @@ def test_0046_adds_dispatch_columns_checks_indexes_and_trigger_rules(
         assert token in body
 
 
-def test_0046_rejects_invalid_attempts_generations_snapshots_and_causes(
+def test_0047_rejects_invalid_attempts_generations_snapshots_and_causes(
     isolated_migration_db: None,
 ) -> None:
     command.upgrade(_config(), REVISION)
@@ -410,7 +410,7 @@ def test_0046_rejects_invalid_attempts_generations_snapshots_and_causes(
     )
 
 
-def test_0046_downgrade_refuses_owner_lost_and_round_trips_when_clean(
+def test_0047_downgrade_refuses_owner_lost_and_round_trips_when_clean(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
@@ -459,4 +459,3 @@ def test_0046_downgrade_refuses_owner_lost_and_round_trips_when_clean(
     ]
     assert "ix_execution_requests_dispatch_due" in indexes
     assert "ix_execution_requests_runtime_liveness" in indexes
-

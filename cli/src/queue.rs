@@ -161,6 +161,7 @@ pub fn synthetic_turn(
         // no attachment REFERENCES to carry (#2567). Empty, and said out loud
         // for the same reason `source` is.
         attachments: Vec::new(),
+        hook_run: None,
     }
 }
 
@@ -577,6 +578,7 @@ mod tests {
                 "author",
                 "conversation_id",
                 "event_id",
+                "hook_run",
                 "received_at",
                 "reply_handle",
                 // ADR-0079: what STARTED this turn, as distinct from where its
@@ -587,6 +589,7 @@ mod tests {
             ]
         );
         assert_eq!(object["source"], "slack");
+        assert!(object["hook_run"].is_null());
         // channel and placeholder are nested in the channel-neutral reply_handle.
         assert_eq!(object["reply_handle"]["channel"], "C-SIM-x");
         assert_eq!(object["reply_handle"]["placeholder"], "1720000000.000200");
@@ -671,6 +674,7 @@ mod tests {
             received_at: "2026-07-21T00:00:00Z".into(),
             source: TurnSource::Slack,
             attachments: Vec::new(),
+            hook_run: None,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

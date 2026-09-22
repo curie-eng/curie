@@ -46,6 +46,31 @@ impl TierDefaults for LocalTier {
 /// The local tier correctly defaults to the compose stack on localhost; the
 /// cluster tier discovers its connection from the release instead (see
 /// [`ClusterAgentTarget`] / [`ClusterConn`], #524), so it no longer shares this.
+/// The administrative approval recovery verbs (#2753), flattened into each
+/// tier's `approvals` so their parse runs in its own frame.
+#[derive(Args, Debug, Clone, Default)]
+struct ApprovalRecoveryArgs {
+    /// Report installation-wide approval identity FACTS, plus the
+    /// declaration skeleton to fill in and feed back to the upgrade. A pure
+    /// read: no agent lookup, no principal, nothing mutated.
+    #[arg(long)]
+    report_identity: bool,
+    /// Administratively reject this approval under the installation-wide
+    /// recovery grant (`api.approvalRecovery.enabled`). Requires --reason
+    /// and --recovery-key; every use is audited.
+    #[arg(long, value_name = "APPROVAL_ID")]
+    recover: Option<String>,
+    /// Why this administrative recovery is being performed. Written
+    /// verbatim to the durable audit row. Required by --recover.
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+    /// The caller-chosen idempotency key for --recover.
+    /// Retrying the identical command with the same key is absorbed by the
+    /// server as one act; the CLI never generates or decorates it.
+    #[arg(long = "recovery-key", value_name = "KEY")]
+    recovery_key: Option<String>,
+}
+
 #[derive(Args, Debug, Clone)]
 struct AgentTarget<T: TierDefaults> {
     /// Agent name or id.
@@ -1022,13 +1047,29 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
-    /// Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes
-    /// MCP server, a CI-only Socket Mode Slack app, a live provider, and an
-    /// allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`).
-    /// Missing those CI secrets skip with the reason in the run summary.
+    /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
+    /// MCP server and a live provider
+    /// (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with
+    /// `curie cluster message`. Approvals resolve through
+    /// `curie cluster approvals` and an operator principal. Missing the live
+    /// provider skips with the reason in the run summary.
     SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
+    /// Drive the dark factory against a disposable install on a named kube
+    /// context, a real GitHub App and a fixture repository (#2966,
+    /// `python3 tools/factory-e2e/factory_e2e.py`). `preflight` installs the
+    /// candidate's published images with factory intake on, tunnels the api
+    /// webhook, labels one issue, asserts the delivery is accepted and a
+    /// WorkItem is admitted, then undoes every change and writes JSON evidence.
+    /// `run --scenario <name>` adds one scenario driver after the preflight.
+    /// Every identity comes from CURIE_FACTORY_* variables or files.
+    FactoryE2e {
+        /// `preflight` or `run --scenario <name>`, then driver flags; see
+        /// `curie dev factory-e2e -- --help`.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -1159,7 +1200,7 @@ enum DevAction {
     },
     /// Isolated next-train `cluster upgrade` matrix (#2590,
     /// `bash cli/scripts/cluster-upgrade-matrix.sh`): published v0.8.8 on a
-    /// task-owned kind install, packaged 0.9.0/0.9.1 charts, fail-at and
+    /// task-owned kind install, packaged candidate charts, fail-at and
     /// interrupt-after hooks, migration crash retry, image/object convergence,
     /// and compatible plus published-window rollback. Refuses the permanent
     /// soak. Checkout-only.
@@ -1461,6 +1502,8 @@ enum SkillAction {
         /// as --route-resolution.
         #[arg(long)]
         clear_routes: bool,
+        #[command(flatten)]
+        recovery: ApprovalRecoveryArgs,
     },
     // The about text is composed from the same consts the runtime `{error, fix}`
     // payload uses, so the discovery surface cannot drift from the answer
@@ -2012,6 +2055,8 @@ enum LocalAction {
         /// Remove every approval route binding on the agent.
         #[arg(long)]
         clear_routes: bool,
+        #[command(flatten)]
+        recovery: ApprovalRecoveryArgs,
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
@@ -2336,11 +2381,14 @@ enum ClusterAction {
     },
     /// Run the resumable cluster upgrade lifecycle to a target version.
     ///
-    /// Plans, validates, drains accepted work, checkpoints, migrates, applies,
-    /// proves exact convergence, runs a target-version canary, and records the
-    /// new known-good revision. The operator does not pass Helm merge flags.
-    /// A failed attempt either leaves the previous known-good version serving
-    /// or returns one fail-forward command. See issue #2301.
+    /// Plans, validates, checks the worker workload is reachable, checkpoints,
+    /// migrates, applies, proves exact convergence, runs a target-version
+    /// canary, and records the new known-good revision. The worker drain gate
+    /// itself is the chart's own pre-upgrade Helm hook, which runs during
+    /// apply and is observed at the convergence step. The operator does not
+    /// pass Helm merge flags. A failed attempt either leaves the previous
+    /// known-good version serving or returns one fail-forward command. See
+    /// issue #2301.
     Upgrade {
         /// Target Curie version (chart/app version) to upgrade to.
         #[arg(long = "to", value_name = "VERSION")]
@@ -3013,6 +3061,8 @@ enum ClusterAction {
         /// Remove every approval route binding on the agent.
         #[arg(long)]
         clear_routes: bool,
+        #[command(flatten)]
+        recovery: ApprovalRecoveryArgs,
     },
 }
 
@@ -3697,6 +3747,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::TwoReleaseApprovalE2e => {
                 commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
             }
+            DevAction::FactoryE2e { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
+            }
             DevAction::E2eCiSelection {
                 path,
                 base,
@@ -3921,6 +3975,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                recovery:
+                    ApprovalRecoveryArgs {
+                        report_identity,
+                        recover,
+                        ..
+                    },
                 ..
             } => {
                 // Answered, not absent (ADR-0041, ADR-0077): the durable
@@ -3937,7 +3997,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                     || routes_from.is_some()
                     || list_routes
                     || clear_routes;
-                if routes_asked {
+                //
+                // The recovery verbs decline FIRST and with their own reason
+                // (#2753): they address the durable store's administrative
+                // surface, and answering them with the route or list reason
+                // would point the operator at the wrong absent thing.
+                if report_identity || recover.is_some() {
+                    Err(commands::skill_approvals_recovery_unavailable())
+                } else if routes_asked {
                     Err(commands::skill_approval_routes_unavailable())
                 } else if list || resolve.is_some() {
                     Err(commands::skill_approvals_list_unavailable())
@@ -4281,6 +4348,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                recovery:
+                    ApprovalRecoveryArgs {
+                        report_identity,
+                        recover,
+                        reason,
+                        recovery_key,
+                    },
             } => emit(
                 commands::approvals(
                     target.into(),
@@ -4298,6 +4372,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                         routes_from,
                         list_routes,
                         clear_routes,
+                        report_identity,
+                        recover,
+                        reason,
+                        recovery_key,
                     },
                 )
                 .await?,
@@ -5237,6 +5315,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                         prepared_targets.push((target, prepared_deploy, prepared_connectors));
                     }
 
+                    // Every target uploads the same packed bundle. The first
+                    // prepared result carries its validated cron advisory, so
+                    // the invocation reports it once before activation begins.
+                    if let Some((_, prepared_deploy, _)) = prepared_targets.first() {
+                        prepared_deploy.emit_cron_trigger_warning();
+                    }
+
                     // Activate and reconcile in the API's declared target order.
                     let mut completed = Vec::new();
                     for (target, prepared_deploy, prepared_connectors) in prepared_targets {
@@ -5585,6 +5670,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                recovery:
+                    ApprovalRecoveryArgs {
+                        report_identity,
+                        recover,
+                        reason,
+                        recovery_key,
+                    },
             } => {
                 let ClusterAgentTarget {
                     agent,
@@ -5615,6 +5707,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                             routes_from,
                             list_routes,
                             clear_routes,
+                            report_identity,
+                            recover,
+                            reason,
+                            recovery_key,
                         },
                     )
                     .await?,
@@ -5927,6 +6023,72 @@ mod tests {
         T: Into<std::ffi::OsString> + Clone + Send + 'static,
     {
         on_parse_stack(move || Cli::try_parse_from(args))
+    }
+
+    fn message_value_flags(path: &[&str]) -> std::collections::BTreeSet<String> {
+        let root = Cli::command();
+        let mut command = &root;
+        let mut flags = std::collections::BTreeSet::new();
+
+        for (index, name) in path.iter().enumerate() {
+            let is_leaf = index + 1 == path.len();
+            for arg in command.get_arguments() {
+                if (!is_leaf && !arg.is_global_set()) || !arg.get_action().takes_values() {
+                    continue;
+                }
+                if let Some(long) = arg.get_long() {
+                    flags.insert(format!("--{long}"));
+                }
+            }
+            command = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing command path component {name:?}"));
+        }
+
+        for arg in command.get_arguments() {
+            if arg.get_action().takes_values() {
+                if let Some(long) = arg.get_long() {
+                    flags.insert(format!("--{long}"));
+                }
+            }
+        }
+
+        flags
+    }
+
+    fn message_value_flags_from_source() -> std::collections::BTreeSet<String> {
+        let source = include_str!("message.rs");
+        let body = source
+            .split("const MESSAGE_VALUE_FLAGS: &[&str] = &[")
+            .nth(1)
+            .and_then(|rest| rest.split_once("];"))
+            .map(|(body, _)| body)
+            .expect("message.rs must contain MESSAGE_VALUE_FLAGS");
+
+        body.lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|flag| flag.strip_suffix("\","))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn message_preflight_value_flags_match_clap_command_graph() {
+        on_parse_stack(|| {
+            let mut derived = message_value_flags(&["local", "message"]);
+            derived.extend(message_value_flags(&["cluster", "message"]));
+            let source = message_value_flags_from_source();
+            let missing: Vec<_> = derived.difference(&source).cloned().collect();
+            let stale: Vec<_> = source.difference(&derived).cloned().collect();
+
+            assert!(
+                missing.is_empty() && stale.is_empty(),
+                "message value flag inventory drifted from clap: missing={missing:?}, stale={stale:?}, derived={derived:?}, source={source:?}"
+            );
+        });
     }
 
     /// Serializes the `cluster_connector_bind_values` cases that mutate the
@@ -6603,6 +6765,22 @@ mod tests {
                 action: DevAction::TwoReleaseApprovalE2e
             })
         ));
+        let cli = try_parse_from([
+            "curie",
+            "dev",
+            "factory-e2e",
+            "run",
+            "--scenario",
+            "revision",
+        ])
+        .expect("dev factory-e2e should pass its mode and flags through");
+        match cli.command {
+            Some(Command::Dev {
+                action: DevAction::FactoryE2e { args },
+            }) => assert_eq!(args, ["run", "--scenario", "revision"]),
+            _ => panic!("dev factory-e2e parsed as another command"),
+        }
+        assert!(try_parse_from(["curie", "dev", "factory-e2e"]).is_err());
         let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
             .expect("dev chart-runtime-e2e should parse");
         assert!(matches!(

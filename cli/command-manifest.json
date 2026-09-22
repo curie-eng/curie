@@ -417,6 +417,42 @@
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Report installation-wide approval identity FACTS, plus the declaration skeleton to fill in and feed back to the upgrade. A pure read: no agent lookup, no principal, nothing mutated",
+              "id": "report_identity",
+              "long": "report-identity",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively reject this approval under the installation-wide recovery grant (`api.approvalRecovery.enabled`). Requires --reason and --recovery-key; every use is audited",
+              "id": "recover",
+              "long": "recover",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Why this administrative recovery is being performed. Written verbatim to the durable audit row. Required by --recover",
+              "id": "reason",
+              "long": "reason",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The caller-chosen idempotency key for --recover. Retrying the identical command with the same key is absorbed by the server as one act; the CLI never generates or decorates it",
+              "id": "recovery_key",
+              "long": "recovery-key",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -1863,6 +1899,42 @@
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Report installation-wide approval identity FACTS, plus the declaration skeleton to fill in and feed back to the upgrade. A pure read: no agent lookup, no principal, nothing mutated",
+              "id": "report_identity",
+              "long": "report-identity",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively reject this approval under the installation-wide recovery grant (`api.approvalRecovery.enabled`). Requires --reason and --recovery-key; every use is audited",
+              "id": "recover",
+              "long": "recover",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Why this administrative recovery is being performed. Written verbatim to the durable audit row. Required by --recover",
+              "id": "reason",
+              "long": "reason",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The caller-chosen idempotency key for --recover. Retrying the identical command with the same key is absorbed by the server as one act; the CLI never generates or decorates it",
+              "id": "recovery_key",
+              "long": "recovery-key",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -2933,7 +3005,7 @@
             }
           ],
           "hidden": false,
-          "long_about": "Run the resumable cluster upgrade lifecycle to a target version.\n\nPlans, validates, drains accepted work, checkpoints, migrates, applies, proves exact convergence, runs a target-version canary, and records the new known-good revision. The operator does not pass Helm merge flags. A failed attempt either leaves the previous known-good version serving or returns one fail-forward command. See issue #2301.",
+          "long_about": "Run the resumable cluster upgrade lifecycle to a target version.\n\nPlans, validates, checks the worker workload is reachable, checkpoints, migrates, applies, proves exact convergence, runs a target-version canary, and records the new known-good revision. The worker drain gate itself is the chart's own pre-upgrade Helm hook, which runs during apply and is observed at the convergence step. The operator does not pass Helm merge flags. A failed attempt either leaves the previous known-good version serving or returns one fail-forward command. See issue #2301.",
           "name": "upgrade"
         },
         {
@@ -5084,6 +5156,42 @@
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Report installation-wide approval identity FACTS, plus the declaration skeleton to fill in and feed back to the upgrade. A pure read: no agent lookup, no principal, nothing mutated",
+              "id": "report_identity",
+              "long": "report-identity",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively reject this approval under the installation-wide recovery grant (`api.approvalRecovery.enabled`). Requires --reason and --recovery-key; every use is audited",
+              "id": "recover",
+              "long": "recover",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Why this administrative recovery is being performed. Written verbatim to the durable audit row. Required by --recover",
+              "id": "reason",
+              "long": "reason",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The caller-chosen idempotency key for --recover. Retrying the identical command with the same key is absorbed by the server as one act; the CLI never generates or decorates it",
+              "id": "recovery_key",
+              "long": "recovery-key",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -5608,7 +5716,7 @@
           "name": "e2e-ladder"
         },
         {
-          "about": "Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes MCP server, a CI-only Socket Mode Slack app, a live provider, and an allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`). Missing those CI secrets skip with the reason in the run summary",
+          "about": "Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes MCP server and a live provider (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with `curie cluster message`. Approvals resolve through `curie cluster approvals` and an operator principal. Missing the live provider skips with the reason in the run summary",
           "hidden": false,
           "name": "sre-demo-e2e"
         },
@@ -5616,6 +5724,24 @@
           "about": "Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`)",
           "hidden": false,
           "name": "two-release-approval-e2e"
+        },
+        {
+          "about": "Drive the dark factory against a disposable install on a named kube context, a real GitHub App and a fixture repository (#2966, `python3 tools/factory-e2e/factory_e2e.py`). `preflight` installs the candidate's published images with factory intake on, tunnels the api webhook, labels one issue, asserts the delivery is accepted and a WorkItem is admitted, then undoes every change and writes JSON evidence. `run --scenario <name>` adds one scenario driver after the preflight. Every identity comes from CURIE_FACTORY_* variables or files",
+          "args": [
+            {
+              "global": false,
+              "help": "`preflight` or `run --scenario <name>`, then driver flags; see `curie dev factory-e2e -- --help`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709551615,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "factory-e2e"
         },
         {
           "about": "Select the end to end tiers CI would run for paths or revisions",
@@ -5886,7 +6012,7 @@
           "name": "upgrade-drill"
         },
         {
-          "about": "Isolated next-train `cluster upgrade` matrix (#2590, `bash cli/scripts/cluster-upgrade-matrix.sh`): published v0.8.8 on a task-owned kind install, packaged 0.9.0/0.9.1 charts, fail-at and interrupt-after hooks, migration crash retry, image/object convergence, and compatible plus published-window rollback. Refuses the permanent soak. Checkout-only",
+          "about": "Isolated next-train `cluster upgrade` matrix (#2590, `bash cli/scripts/cluster-upgrade-matrix.sh`): published v0.8.8 on a task-owned kind install, packaged candidate charts, fail-at and interrupt-after hooks, migration crash retry, image/object convergence, and compatible plus published-window rollback. Refuses the permanent soak. Checkout-only",
           "args": [
             {
               "default_values": [

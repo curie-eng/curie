@@ -36,6 +36,19 @@ _PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$",
 _PR_NUMBER_MARKER = re.compile(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", re.MULTILINE)
 _COMMIT_MARKER = re.compile(r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", re.MULTILINE)
 _PR_STATE_MARKER = re.compile(r"^CURIE_PR_STATE=(closed|merged)$", re.MULTILINE)
+# How many CONSECUTIVE unavailable identity reads one publication may escape
+# reconcile() uncharged before it falls back to the ordinary bounded path.
+# publication_authority.py maps 401, 403, 404, 429 and every 5xx onto
+# AuthorityUnavailable, so a permanent condition (repository deleted, App
+# uninstalled, App rate limited) is indistinguishable at the wire from a GitHub
+# incident. Escaping uncharged forever would re-mint an installation token every
+# lease and, on the lost-Job recovery path, redeem another write credential and
+# append another credential_redemption_audit_entries row every lease, with no
+# bound; before #2903 those conditions dead-lettered at reconcile_max_attempts.
+# The uncharged retry is paced by publication_lease_seconds (60s default), so
+# ten escapes give a real outage roughly ten minutes of free retries and still
+# converge a permanent one onto a visible failed publication naming the reason.
+_MAX_UNCHARGED_IDENTITY_ESCAPES = 10
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +58,20 @@ class PublicationReconcileError(RuntimeError):
 
 class PublicationTranscriptPermanentError(PublicationReconcileError):
     """A transcript result cannot be recorded by retrying the same payload."""
+
+
+class PublicationIdentityUnavailable(PublicationReconcileError):
+    """The verified identity could not be read; the refusal is not stable."""
+
+
+class PublicationRemoteTerminalError(PublicationReconcileError):
+    """Provider truth says this pull request is already merged or closed."""
+
+    state: Literal["merged", "closed"]
+
+    def __init__(self, state: Literal["merged", "closed"]) -> None:
+        super().__init__(f"pull request lineage is {state}; start a new thread")
+        self.state = state
 
 
 @dataclass(frozen=True)
@@ -331,6 +358,12 @@ class PublicationReconciler:
         self._card_store = card_store
         self._transcript = transcript
         self._retained_card_refs: dict[str, ApprovalCardRef] = {}
+        # Consecutive uncharged identity escapes per publication, bounded by
+        # _MAX_UNCHARGED_IDENTITY_ESCAPES. In-process on purpose: a restart
+        # restores the full allowance, which is the right bias, because a worker
+        # that just started has no evidence the condition is permanent and the
+        # durable reconcile_attempts counter still bounds the publication.
+        self._identity_escapes: dict[uuid.UUID, int] = {}
         if transcript is None:
             logger.error(
                 "publication transcript recording is not configured; "
@@ -458,6 +491,9 @@ class PublicationReconciler:
                 error=error,
             )
         )
+        # Terminal: this publication is never reconciled again, so its escape
+        # count would otherwise sit in a long-lived worker forever.
+        self._identity_escapes.pop(work.publication_id, None)
 
     async def _cleanup_credentials(self, names: PublicationResourceNames) -> None:
         await _cluster_call(self._cluster.cleanup_credentials, names)
@@ -714,10 +750,21 @@ class PublicationReconciler:
                     head_sha=new_head,
                 )
             )
+        except PublicationRemoteTerminalError as terminal:
+            await self._mark_lineage_terminal(
+                work,
+                terminal.state,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                head_sha=new_head,
+            )
+            raise PublicationReconcileError(str(terminal)) from None
         except PublicationLineageRefused:
             # A replay after a lost response finds its own settled outcome.
             if not await _resolve(self._store.is_terminal(work.publication_id)):
                 raise
+        else:
+            self._identity_escapes.pop(work.publication_id, None)
 
     async def _mark_lineage_terminal(
         self,
@@ -740,6 +787,33 @@ class PublicationReconciler:
             )
         )
 
+    async def _identity_unavailable(
+        self,
+        work: PublicationWork,
+        exc: PublicationIdentityUnavailable,
+    ) -> None:
+        """Escape reconcile() uncharged, or bound a condition that is not transient.
+
+        Re-raising leaves the lease in place for an uncharged lease-expiry retry,
+        which is the right cost for a GitHub incident and the wrong cost for a
+        deleted repository. At the bound the escape stops and this method charges
+        the attempt itself through the ordinary bounded path, so the publication
+        converges on a visible failure carrying the provider's reason (#2903).
+        """
+
+        escapes = self._identity_escapes.get(work.publication_id, 0) + 1
+        self._identity_escapes[work.publication_id] = escapes
+        if escapes <= _MAX_UNCHARGED_IDENTITY_ESCAPES:
+            raise exc
+        logger.warning(
+            "publication identity has been unavailable for %d consecutive leases; "
+            "charging a bounded reconcile attempt publication_id=%s reason=%s",
+            escapes,
+            work.publication_id,
+            exc,
+        )
+        await self._bounded_setup_failure(work, exc)
+
     async def _bounded_setup_failure(
         self,
         work: PublicationWork,
@@ -749,6 +823,16 @@ class PublicationReconciler:
         await _resolve(self._store.retry(work.publication_id, error=error))
         # retry() terminalizes at its durable cap. If it did, drain the newly
         # available cleanup and result outboxes; otherwise these are no-ops.
+        # The dict membership test comes first on purpose: is_terminal() is a
+        # database round trip, this is the common failure path for every
+        # publication, and the only thing its answer decides here is whether to
+        # pop an escape count that almost never exists.
+        if work.publication_id in self._identity_escapes and await _resolve(
+            self._store.is_terminal(work.publication_id)
+        ):
+            # Dead-lettered inside the store, so _persist_result never ran and
+            # nothing else would ever drop this publication's escape count.
+            self._identity_escapes.pop(work.publication_id, None)
         await self.deliver_pending_cleanup()
         await self.deliver_pending_result(work.publication_id)
 
@@ -881,6 +965,9 @@ class PublicationReconciler:
     async def reconcile(self, work: PublicationWork) -> None:
         names = publication_resource_names(work.publication_id)
         if await _resolve(self._store.is_terminal(work.publication_id)):
+            # Terminalized by another lane (denial, expiry, a peer worker);
+            # drop any escape count so it cannot outlive the publication.
+            self._identity_escapes.pop(work.publication_id, None)
             return
 
         # Pending, expired, and unknown states are never authority. Expiry is
@@ -934,6 +1021,11 @@ class PublicationReconciler:
                     await self._finish_observation(
                         work, observation, probe_resources.names
                     )
+                except PublicationIdentityUnavailable as identity_exc:
+                    # A transient lineage verification failure must never consume
+                    # a reconcile attempt. Lease expiry retries it uncharged,
+                    # bounded so a permanent failure still converges.
+                    await self._identity_unavailable(work, identity_exc)
                 except Exception as exc:
                     if await _resolve(self._store.is_terminal(work.publication_id)):
                         raise
@@ -1070,6 +1162,9 @@ class PublicationReconciler:
                     raise PublicationReconcileError(
                         "pull request head no longer matches the stored lineage head"
                     ) from exc
+        except PublicationIdentityUnavailable as identity_exc:
+            await self._identity_unavailable(work, identity_exc)
+            return
         except Exception as exc:
             await self._bounded_setup_failure(work, exc)
             return
@@ -1088,6 +1183,9 @@ class PublicationReconciler:
                     pr_number=pull.number,
                     new_head=pull.head_sha,
                 )
+            except PublicationIdentityUnavailable as identity_exc:
+                await self._identity_unavailable(work, identity_exc)
+                return
             except Exception as exc:
                 await self._bounded_setup_failure(work, exc)
                 return
@@ -1167,6 +1265,9 @@ class PublicationReconciler:
                     work, observation, resources.names
                 ):
                     return
+            except PublicationIdentityUnavailable as identity_exc:
+                await self._identity_unavailable(work, identity_exc)
+                return
             except Exception as recovery_exc:
                 if await _resolve(self._store.is_terminal(work.publication_id)):
                     raise
@@ -1185,6 +1286,9 @@ class PublicationReconciler:
                 self._cluster.observe, resources.names.job
             )
             await self._finish_observation(work, observation, resources.names)
+        except PublicationIdentityUnavailable as identity_exc:
+            await self._identity_unavailable(work, identity_exc)
+            return
         except Exception as exc:
             if await _resolve(self._store.is_terminal(work.publication_id)):
                 raise
@@ -1255,6 +1359,7 @@ class PublicationReconcileLoop:
 
 __all__ = [
     "PublicationCredential",
+    "PublicationIdentityUnavailable",
     "PublicationJobObservation",
     "PublicationLineageAuthority",
     "PublicationLineageRefused",
@@ -1262,6 +1367,7 @@ __all__ = [
     "PublicationReconcileError",
     "PublicationReconciler",
     "PublicationReconcileLoop",
+    "PublicationRemoteTerminalError",
     "PublicationTranscriptPermanentError",
     "PublicationWork",
     "deterministic_publication_branch",

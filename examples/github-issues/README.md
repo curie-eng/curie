@@ -82,10 +82,10 @@ curie skill eval
 The cases are written to be **falsifiable** (a broken agent fails them) and
 robust to changing issue data by anchoring on a **closed** issue whose facts do
 not churn (#7 — title about `aci-protocol`, state closed): one case reads its
-content, one reads its state. A third case asserts the agent returns real
-issue-number-shaped output (`#\d+`); its `note` field flags that a fake-model
-agent inventing a number would still pass, which only the tool-call grader
-(ADR-0022 Phase 1) fully closes. If the repo is ever restructured so an anchor no
+content, one reads its state. A third case asserts the agent returns real issue
+number shaped output (`#\d+`); a fake model agent inventing a number would still
+pass, which only the `tool_called` grader (ADR-0022 Phase 1) fully closes. If the
+repo is ever restructured so an anchor no
 longer holds, update the `expected` here — a case that starts failing is the
 grader catching a real change, which is the point.
 

@@ -1,0 +1,58 @@
+{
+  "comment": "The derived Bearer name for a hosted connector. Python owns the rule in packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers; the Rust CLI hand-mirrors it as bearer_secret_name in cli/src/connector_build.rs. The two cannot share code across languages, so the cases are frozen here. Each vector is a connectors.yaml document with one hosted connector named gh. expected_name is the secret the derived Authorization: Bearer ${NAME} header expands, or null when no header is derived. Python asserts mcp_entry headers match; Rust asserts bearer_secret_name matches. Changing one language without this file fails that language; editing this file without the other language fails the other suite. Both lanes reject unknown vector keys so a key added for one side cannot pass vacuously on the other.",
+  "vectors": [
+    {
+      "name": "explicit-bearer-secret",
+      "why": "explicit bearer_secret wins even when several secrets are declared",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": ["POD_ONLY", "PAT"],
+            "bearer_secret": "PAT"
+          }
+        }
+      },
+      "expected_name": "PAT"
+    },
+    {
+      "name": "single-plain-string-secret",
+      "why": "the github-mcp-server shape: one plain string secret is the Bearer name",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": ["PAT"]
+          }
+        }
+      },
+      "expected_name": "PAT"
+    },
+    {
+      "name": "single-secret-ref",
+      "why": "an implicit lone SecretRef does not derive a Bearer header; its value never reaches the sandbox",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": [{"name": "PAT", "from_secret": "gh-pat"}]
+          }
+        }
+      },
+      "expected_name": null
+    },
+    {
+      "name": "two-secrets",
+      "why": "two secrets and no bearer_secret derive nothing rather than picking secrets[0]; validation already refuses this with connectors.bearer_secret_required, so this pins the defense-in-depth answer",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": ["POD_ONLY", "PAT"]
+          }
+        }
+      },
+      "expected_name": null
+    }
+  ]
+}

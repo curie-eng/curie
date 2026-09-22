@@ -123,7 +123,6 @@ server:
   persistentVolume:
     enabled: true
     size: 8Gi
-    storageClass: local-path
   resources:
     requests:
       cpu: 100m

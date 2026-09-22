@@ -1,7 +1,7 @@
 """WorkItem dispatch, ownership, and reply snapshot columns.
 
-Revision ID: 0046
-Revises: 0045
+Revision ID: 0047
+Revises: 0046
 Create Date: 2026-09-19
 """
 
@@ -10,14 +10,14 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0046"
-down_revision: str | None = "0045"
+revision: str = "0047"
+down_revision: str | None = "0046"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 SCHEMA = "curie"
 
-_STATE_SHAPE_0045 = """\
+_STATE_SHAPE_0046 = """\
 ((status = 'waiting' AND started_at IS NULL \
 AND execution_deadline IS NULL AND terminal_at IS NULL \
 AND terminal_cause IS NULL AND termination_observation IS NULL) \
@@ -54,7 +54,7 @@ AND termination_observation IS NULL) OR \
 AND termination_observation IS NOT NULL)))) IS TRUE\
 """
 
-_STATE_SHAPE_0046 = """\
+_STATE_SHAPE_0047 = """\
 ((status = 'waiting' AND started_at IS NULL \
 AND execution_deadline IS NULL AND terminal_at IS NULL \
 AND terminal_cause IS NULL AND termination_observation IS NULL) \
@@ -93,7 +93,7 @@ AND termination_observation IS NULL) OR \
 AND termination_observation IS NOT NULL)))) IS TRUE\
 """
 
-_FUNCTION_0045 = """
+_FUNCTION_0046 = """
         CREATE OR REPLACE FUNCTION curie.enforce_execution_requests_update_invariants()
         RETURNS trigger
         LANGUAGE plpgsql
@@ -131,7 +131,7 @@ _FUNCTION_0045 = """
         $$
 """
 
-_FUNCTION_0046 = """
+_FUNCTION_0047 = """
         CREATE OR REPLACE FUNCTION curie.enforce_execution_requests_update_invariants()
         RETURNS trigger
         LANGUAGE plpgsql
@@ -411,7 +411,7 @@ def upgrade() -> None:
     op.create_check_constraint(
         "execution_requests_state_shape_ck",
         "execution_requests",
-        _STATE_SHAPE_0046,
+        _STATE_SHAPE_0047,
         schema=SCHEMA,
     )
     for name, sql in _NEW_CHECK_CONSTRAINTS:
@@ -438,7 +438,7 @@ def upgrade() -> None:
             "status IN ('running','cancellation_requested')"
         ),
     )
-    op.execute(_FUNCTION_0046)
+    op.execute(_FUNCTION_0047)
 
 
 def downgrade() -> None:
@@ -451,13 +451,13 @@ def downgrade() -> None:
                 WHERE terminal_cause = 'owner_lost'
             ) THEN
                 RAISE EXCEPTION
-                    'cannot downgrade 0046 while owner_lost rows exist';
+                    'cannot downgrade 0047 while owner_lost rows exist';
             END IF;
         END
         $$;
         """
     )
-    op.execute(_FUNCTION_0045)
+    op.execute(_FUNCTION_0046)
     op.drop_constraint(
         "execution_requests_state_shape_ck",
         "execution_requests",
@@ -467,7 +467,7 @@ def downgrade() -> None:
     op.create_check_constraint(
         "execution_requests_state_shape_ck",
         "execution_requests",
-        _STATE_SHAPE_0045,
+        _STATE_SHAPE_0046,
         schema=SCHEMA,
     )
     for name, _sql in _NEW_CHECK_CONSTRAINTS:

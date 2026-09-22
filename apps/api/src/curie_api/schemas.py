@@ -30,6 +30,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import adapter_principal
 from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
 from .models import GIT_FLOW_CREATED_BY, Environment
@@ -1698,6 +1699,109 @@ class ApprovalResolve(BaseModel):
         return data
 
 
+class _RecoveryRequest(BaseModel):
+    """Shared shape of a break-glass request (#2753).
+
+    ``reason`` is the ENTIRE after-the-fact review surface for an operation that
+    bypasses the ordinary approver set, so a blank one is refused rather than
+    stored: an unexplained administrative rejection is exactly the thing the
+    accepted blast radius relies on being reviewable.
+
+    ``recovery_key`` is caller-supplied and makes the operation idempotent. A
+    retried request carrying the same key is a READ of the recorded outcome; a
+    different key against an already-recovered record is a second intent and a
+    conflict.
+    """
+
+    reason: str = Field(min_length=1)
+    recovery_key: str = Field(min_length=1)
+
+    @field_validator("reason", "recovery_key")
+    @classmethod
+    def _nonblank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class ApprovalRecover(_RecoveryRequest):
+    """One administrative settlement of a stranded approval.
+
+    ``rejected`` is the only disposition there is. There is deliberately no
+    approve-on-behalf-of: an administrative path that could grant would let a
+    platform-key holder authorize the action a human was asked about, which is
+    a different power from settling a record nobody can reach.
+    """
+
+    disposition: Literal["rejected"]
+
+
+class ApprovalRecoveryOut(BaseModel):
+    """The RECORDED outcome of an administrative settlement.
+
+    Every field is read back off the row, so a replay of the same
+    ``recovery_key`` renders an identical body rather than a fresh one.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    approval_id: uuid.UUID
+    status: str
+    recovery_key: str | None
+    reason: str | None
+    actor: str | None
+    recovered_at: datetime | None
+
+
+class ApprovalIdentityFactsOut(BaseModel):
+    """Per-row FACTS about one pending approval (#2753).
+
+    Facts, never verdicts: nothing here says a row cannot be resolved. A route
+    whose approver set is the card channel's membership is a HEALTHY route that
+    any attested chat click resolves, and it is reported like any other row.
+    """
+
+    id: uuid.UUID
+    agent_id: uuid.UUID | None
+    status: str
+    route: str | None
+    reply_kind: str
+    reply_adapter: str | None
+    reply_channel: str
+    card_channel: str | None
+    has_reply_placeholder: bool
+    created_at: datetime
+    facts: list[str]
+
+
+class ApprovalReplyIdentityDeclaration(BaseModel):
+    """The skeleton the migration workflow consumes.
+
+    Everything but the id is the OPERATOR's to fill in. The report never
+    pre-fills provenance it does not have: a guessed reply kind is precisely the
+    silent misroute the declaration document exists to prevent.
+    """
+
+    approval_id: uuid.UUID
+    reply_kind: str | None = None
+    reply_adapter: str | None = None
+    actor: str | None = None
+    reason: str | None = None
+
+
+class ApprovalIdentityReportOut(BaseModel):
+    """A pure read an operator runs on a broken installation.
+
+    It makes no Slack call and reads only ``approvals`` and ``agent_channels``,
+    so it still answers against a schema old enough that the fence refuses to
+    serve it.
+    """
+
+    approvals: list[ApprovalIdentityFactsOut]
+    declarations: list[ApprovalReplyIdentityDeclaration]
+
+
 class ApprovalPrincipalMint(BaseModel):
     """Administrative request to mint one operator approval credential."""
 
@@ -1717,6 +1821,46 @@ class ApprovalPrincipalOut(BaseModel):
     token: str
     subject: str
     kind: Literal["operator"] = "operator"
+    expires_at: datetime
+
+
+class AdapterPrincipalMint(BaseModel):
+    """Administrative request to issue one channel adapter credential (ADR-0154)."""
+
+    subject: str = Field(min_length=1)
+    binding_ids: list[uuid.UUID] = Field(min_length=1)
+    ttl_s: int = Field(
+        default=adapter_principal.DEFAULT_TTL_SECONDS,
+        gt=0,
+        le=adapter_principal.MAX_TTL_SECONDS,
+    )
+
+    @field_validator("subject")
+    @classmethod
+    def _nonblank_subject(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("subject must not be blank")
+        return value
+
+
+class AdapterPrincipalRotate(BaseModel):
+    """Self-rotation request: only the next credential's lifetime is chosen."""
+
+    ttl_s: int = Field(
+        default=adapter_principal.DEFAULT_TTL_SECONDS,
+        gt=0,
+        le=adapter_principal.MAX_TTL_SECONDS,
+    )
+
+
+class AdapterPrincipalOut(BaseModel):
+    """One-time delivery of a channel adapter credential."""
+
+    token: str
+    subject: str
+    kind: Literal["adapter"] = "adapter"
+    binding_ids: list[uuid.UUID]
+    scopes: list[str]
     expires_at: datetime
 
 
@@ -1872,8 +2016,11 @@ class ApprovalAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
-    principal_kind: Literal["chat", "console", "operator"] | None
+    principal_kind: Literal["chat", "console", "operator", "adapter"] | None
     authenticated: bool
+    # The adapter that transported an `adapter` principal's decision
+    # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.
+    principal_subject: str | None
     decision: str
     authorizer: str
     authorized: bool
@@ -2193,9 +2340,15 @@ class StateEntryPut(BaseModel):
 class StateAppendIn(BaseModel):
     """Append ``item`` to a log-shaped (JSON array) state entry (#248). If the
     entry does not exist it is created as a single-element array; if it exists
-    its value must already be an array, else the append is rejected."""
+    its value must already be an array, else the append is rejected.
+
+    ``reserve_bytes`` (#2927) refuses the append with 413 when the new value
+    would leave fewer than that many bytes free under the per-value cap. The
+    runner sets it on transcript appends to keep headroom for the worker's
+    publication outcome append; omitting it keeps the plain cap."""
 
     item: Any
+    reserve_bytes: int | None = Field(default=None, ge=0)
 
 
 class StateEntryOut(BaseModel):

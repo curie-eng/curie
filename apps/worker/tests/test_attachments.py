@@ -31,6 +31,7 @@ import importlib
 import json
 import sys
 import threading
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -206,18 +207,154 @@ def test_discarding_an_older_prepared_set_preserves_a_newer_set_and_its_ledger(
     files = FakeSlackFiles({"F1": [b"older_bytes"], "F2": [b"newer_bytes"]})
     coordinator, objects = _coordinator(attachments, files)
     older = _resolve(coordinator, [_ref("F1", "older.csv")], generation="older")
+    older_owners = set(_owner_keys(attachments, objects))
     newer = _resolve(coordinator, [_ref("F2", "newer.csv")], generation="newer")
-    (ledger_key,) = tuple(objects.list_keys(attachments.ATTACHMENT_LEDGER_PREFIX))
-    newer_ledger = objects.objects[ledger_key]
+    owners = set(_owner_keys(attachments, objects))
+    assert len(owners) == 2, "each resolve owns its own immutable record"
+    (newer_key,) = owners - older_owners
+    newer_owner = objects.objects[newer_key]
 
     coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=older)
 
     assert all(key not in objects.objects for key in older.object_keys)
     assert all(objects.objects[key] == b"newer_bytes" for key in newer.object_keys)
-    assert objects.objects[ledger_key] == newer_ledger
+    assert set(_owner_keys(attachments, objects)) == {newer_key}
+    assert objects.objects[newer_key] == newer_owner
     current = coordinator.current(THREAD_KEY)
     assert current is not None
     assert current.object_keys == newer.object_keys
+
+
+def _owner_keys(module: Any, objects: RetainingObjectStore) -> list[str]:
+    """Every retention owner record, through the store's real listing."""
+
+    return list(objects.list_keys(module.ATTACHMENT_LEDGER_PREFIX))
+
+
+@pytest.mark.parametrize("discarded", ["first", "second"])
+def test_discarding_either_overlapping_set_preserves_the_other_and_its_keys(
+    attachments: Any, discarded: str
+) -> None:
+    """Exact discard, both orders, with ownership genuinely shared (#2737, AC4).
+
+    A fixed ``generation`` is what makes this the real case rather than two
+    unrelated sets: both resolves park under the same agent/generation prefix, so
+    the second set's only key is a key the first set also names. Discarding
+    either one may remove only what NO remaining owner still names -- the other
+    set's owner record survives untouched, and so does every object key it
+    names, including the shared one. A discard that deletes its own object keys
+    unconditionally destroys bytes a live turn is about to install.
+
+    Driven straight at the coordinator because the kernel mints a fresh
+    generation per resolve and so can never produce the overlap.
+    """
+
+    files = FakeSlackFiles({"F1": [b"one_bytes"], "F2": [b"two_bytes"]})
+    coordinator, objects = _coordinator(attachments, files)
+    first = _resolve(
+        coordinator, [_ref("F1", "one.csv"), _ref("F2", "two.csv")], generation="shared"
+    )
+    first_owners = set(_owner_keys(attachments, objects))
+    second = _resolve(coordinator, [_ref("F1", "one-again.csv")], generation="shared")
+    owners = set(_owner_keys(attachments, objects))
+
+    assert len(owners) == 2, "two resolves must leave two distinct owner records"
+    (first_key,) = first_owners
+    (second_key,) = owners - first_owners
+    shared_key = second.object_keys[0]
+    assert shared_key in first.object_keys, "the fixed generation must overlap the key"
+
+    if discarded == "first":
+        coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=first)
+        survivor, surviving_set = second_key, second
+        # Only the discarded set ever named its second key, so that one goes.
+        assert first.object_keys[1] not in objects.objects
+    else:
+        coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=second)
+        survivor, surviving_set = first_key, first
+        assert all(key in objects.objects for key in first.object_keys)
+
+    assert set(_owner_keys(attachments, objects)) == {survivor}
+    assert all(key in objects.objects for key in surviving_set.object_keys)
+    assert shared_key in objects.objects, "a key the surviving owner names must stay"
+    current = coordinator.current(THREAD_KEY)
+    assert current is not None
+    assert current.object_keys == surviving_set.object_keys
+
+
+class _FailingScanStore(RetainingObjectStore):
+    """The store, plus one transient listing outage of the retention ledger.
+
+    An object store is a network service, so a listing can time out for reasons
+    that have nothing to do with this thread and will be gone on the next call.
+    ``armed`` is flipped off again the moment it fires, so the rest of the test
+    drives the real store: the point is what survives ONE failure, not what a
+    permanently broken store does.
+    """
+
+    def __init__(self, ledger_prefix: str) -> None:
+        super().__init__()
+        self.ledger_prefix = ledger_prefix
+        #: Armed by the test AFTER its setup listings, so the outage lands on
+        #: the discard's own scan and on nothing else.
+        self.armed = False
+
+    def list_keys(self, prefix: str) -> Iterator[str]:
+        if self.armed and prefix == self.ledger_prefix:
+            self.armed = False
+            raise TimeoutError("object listing timed out")
+        yield from super().list_keys(prefix)
+
+
+def test_a_failed_owner_scan_during_discard_leaves_the_bytes_owned_and_reapable(
+    attachments: Any,
+) -> None:
+    """A discard that cannot finish must not drop the durable cleanup obligation.
+
+    ``discard_prepared`` has to consult the remaining owners before it removes
+    any object, because a concurrent resolve on the same generation parks under
+    the same keys. That consultation is a store call and store calls fail. If
+    this resolve's own owner record is already gone when the scan raises, the
+    bytes are left in the bucket named by nothing: ``Kernel._discard_prepared_
+    attachments`` logs the failure and does not retry, and no retention sweep
+    can reach an object no ledger record mentions, so it outlives retention
+    forever. Keeping the record until the work depending on it has succeeded is
+    what makes the failure merely a deferral -- the expiry sweep still owns the
+    bytes and collects them on its own clock, which is exactly what the second
+    half of this test drives.
+    """
+
+    objects = _FailingScanStore(attachments.ATTACHMENT_LEDGER_PREFIX)
+    clock = MovableClock()
+    files = FakeSlackFiles({"F1": [b"still_owned_bytes"]})
+    coordinator, _store = _coordinator(
+        attachments,
+        files,
+        objects=objects,
+        bounds=limits(attachments, retention_ttl_seconds=600),
+        clock=clock,
+    )
+    prepared = _resolve(coordinator, [_ref("F1")], generation="abandoned")
+    (owner_key,) = _owner_keys(attachments, objects)
+    objects.armed = True
+
+    with pytest.raises(TimeoutError):
+        coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=prepared)
+
+    assert objects.armed is False, "the discard must have reached the owner scan"
+    assert owner_key in objects.objects, (
+        "the owner record must survive a failed discard, or nothing names the bytes"
+    )
+
+    clock.advance(601)
+    assert coordinator.enumerate_expired() == [THREAD_KEY]
+    candidate = coordinator.begin_expired_reap(THREAD_KEY)
+    assert candidate is not None
+    assert coordinator.finish_expired_reap(candidate) is True
+
+    assert list(objects.list_keys(attachments.ATTACHMENT_OBJECT_PREFIX)) == []
+    assert list(objects.list_keys(attachments.ATTACHMENT_LEDGER_PREFIX)) == []
+    assert coordinator.current(THREAD_KEY) is None
 
 
 def test_the_minted_reference_is_a_short_lived_signed_one_object_capability(

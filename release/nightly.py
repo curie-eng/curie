@@ -27,6 +27,11 @@ NIGHTLY_LABEL = "nightly-ladder"
 ALLOW_RED_TOKEN = "--allow-red-nightly"
 SIGNATURE_MARKER_PREFIX = "nightly-ladder-signature:"
 
+# CSI/OSC and single-character escapes GitHub runners emit into job logs.
+_ANSI_ESCAPE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]"
+)
+
 _ERROR_LINE = re.compile(
     r"(?:^|\n)(?:error: |AssertionError: |cluster: |local: |skill: ).+",
     re.IGNORECASE,
@@ -295,6 +300,30 @@ def _ensure_label(repo: str) -> None:
     )
 
 
+def strip_ansi(text: str) -> str:
+    """Drop terminal escape sequences so signatures stay stable (#2819)."""
+    return _ANSI_ESCAPE.sub("", text)
+
+
+def job_log(repo: str, job_id: object) -> str:
+    """One failed job's log, with terminal escape sequences removed.
+
+    Since gh 2.76 the CLI refuses to print a response carrying terminal
+    escape sequences unless `--allow-escape-sequences` is passed, which
+    killed nightly issue filing from 2026-09-03 (#2819). Ask for the raw
+    bytes, fall back when an older gh does not know the flag, and strip
+    the escapes ourselves either way.
+    """
+    endpoint = ["api", "-X", "GET", f"repos/{repo}/actions/jobs/{job_id}/logs"]
+    try:
+        raw = _gh([*endpoint, "--allow-escape-sequences"])
+    except subprocess.CalledProcessError as exc:
+        if "unknown flag" not in (exc.stderr or ""):
+            raise
+        raw = _gh(endpoint)
+    return strip_ansi(raw)
+
+
 def _failed_job_logs(repo: str, run_id: str) -> list[dict[str, object]]:
     payload = json.loads(
         _gh(["api", "-X", "GET", f"repos/{repo}/actions/runs/{run_id}/jobs"])
@@ -303,15 +332,7 @@ def _failed_job_logs(repo: str, run_id: str) -> list[dict[str, object]]:
     for job in payload.get("jobs") or []:
         if job.get("conclusion") != "failure":
             continue
-        job_id = job.get("id")
-        log = _gh(
-            [
-                "api",
-                "-X",
-                "GET",
-                f"repos/{repo}/actions/jobs/{job_id}/logs",
-            ]
-        )
+        log = job_log(repo, job.get("id"))
         jobs.append(
             {
                 "name": job.get("name") or "job",
@@ -343,12 +364,31 @@ def _open_nightly_issues(repo: str) -> list[dict[str, object]]:
     return payload if isinstance(payload, list) else []
 
 
+def _filing_error(message: str) -> int:
+    """Annotate and fail so a run nobody watches still shows red (#2819)."""
+    print(f"::error title=nightly-ladder issue filing failed::{message}")
+    return 1
+
+
 def file_issues(repo: str, run_id: str, run_url: str) -> int:
+    try:
+        return _file_issues(repo, run_id, run_url)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip() or str(exc)
+        return _filing_error(
+            f"gh failed while filing nightly-ladder issues for run {run_id}: "
+            f"{detail}"
+        )
+
+
+def _file_issues(repo: str, run_id: str, run_url: str) -> int:
     _ensure_label(repo)
     signatures = extract_signatures(_failed_job_logs(repo, run_id))
     if not signatures:
-        print("no failure signatures extracted; nothing to file")
-        return 0
+        return _filing_error(
+            f"run {run_id} failed but no failed job produced a signature; "
+            "no nightly-ladder issue was filed"
+        )
     actions = plan_issue_actions(
         signatures, _open_nightly_issues(repo), run_url=run_url
     )

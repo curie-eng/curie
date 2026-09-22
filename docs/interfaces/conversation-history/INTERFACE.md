@@ -65,7 +65,14 @@ conversation, reconstructed through the selected harness adapter.
   Classified failures, budget/auth halts, idle outcomes, and synthetic
   incomplete fallback finals are not recorded. Best effort applies only to
   ordinary persistence failures: they retain the candidate final while marking
-  history durability lost. A state API 413 is the narrow exception. It becomes
+  history durability lost. Every runner append sends `reserve_bytes` (8192), so
+  the state API refuses with 413 any append that would leave less than that free
+  under the value cap. The reserve keeps room for the worker's publication
+  outcome append, which sends no reserve. A 413 on a turn append is not a
+  failure yet: the store reads the key and its version, rewrites it with a
+  compare-and-set `PUT` to the compacted value (see Capacity recovery), and
+  retries a version conflict with a fresh read, three attempts in all. A 413
+  that survives compaction is the narrow exception. It becomes
   `HistoryCapacityError`, discards the candidate record and approval state,
   emits `history-persistence-error`, and ends with one `CLASSIFIED_FAILURE`
   final. The worker does not retry that classified failure.
@@ -73,8 +80,14 @@ conversation, reconstructed through the selected harness adapter.
   `SummaryRecord`; ordinary appends retain the exact prefix until the next
   boundary. Compaction deliberately drops the old native checkpoint; the first
   turn over the new portable summary writes a fresh one, while later turns append
-  only deltas. A 413 while boot compaction appends its summary does not kill
-  boot: the runner serves, and every turn ends with the append path's
+  only deltas. One active turn never makes a summary: there is nothing to
+  compact, so its replay stays plain however large it is. A 413 while boot
+  appends its summary makes boot rewrite the value it loaded with a
+  compare-and-set `PUT` to the compacted value, then reload and rebuild the
+  replay from what is stored. A write after that load returns 409 and boot
+  reloads instead of writing a stale view, for at most three passes. Only when
+  the compacted value still cannot fit, or the passes never settle, does boot
+  refuse: the runner serves, and every turn ends with the append path's
   `history-persistence-error` and one `CLASSIFIED_FAILURE` final before any
   model or tool starts, so the worker does not retry it. Any other boot
   compaction failure is still fatal. The first
@@ -102,7 +115,9 @@ The loader maps rejected appends to typed `HistoryCapacityError` or
 Immediately before either transcript 413, the API increments
 `curie_history_persistence_failure_total` with fixed `service.name=curie-api`,
 `source=state-api`, `outcome=capacity`, and `limit=value` or `limit=namespace`
-attributes. Both limit series initialize to zero during API startup. Health and
+attributes. A refusal for the append's optional `reserve_bytes` headroom is also
+a 413, with a detail naming the reserve, but it does not increment the counter:
+it is the runner's compaction trigger, not a persistence failure. Both limit series initialize to zero during API startup. Health and
 readiness remain healthy because capacity is data state, not process
 availability. Operational consumers can use the counter to identify a capacity
 refusal without treating it as an API health failure.
@@ -122,8 +137,21 @@ unplanned-restart case needs no special worker/kernel branch.
   agent-bound, HMAC-signed `state` token minted per turn, accepted only by the
   state router and bound to this agent's namespace, so the sandbox credential can
   no longer resolve approvals or reach another agent's state.
-- **Capacity recovery accepts history loss.** There is no automatic data
-  retention or deletion policy for the stored source. For a value cap, quiesce
+- **Capacity recovery accepts history loss.** At the value cap the runner
+  rewrites the key to worker publication markers (records with a
+  `publication_id`, kept verbatim and first), then one new summary of every
+  active turn but the latest, then that latest turn without its native
+  checkpoint, bounded so the reserve stays free. What is lost is the older
+  turns' messages beyond their summary lines, which keep the user and assistant
+  text, tool names, and the first 300 characters of each tool result (the
+  summary itself is cut near 8 KB, with the digest of what it covers), plus any
+  tool output the bound replaces with a digest marker. The rewrite is
+  `compact_transcript_value`, and the `PUT` carries `expected_version`, which
+  the state API checks under the same row lock an append takes, so a concurrent
+  append is never overwritten. The runner still refuses when publication
+  markers and the summary alone leave no room for the latest turn. There is no
+  other automatic data retention or deletion policy for the stored source. For
+  a value cap the runner cannot recover, quiesce
   and release the affected thread, export and verify its owned key,
   including version, digest, and records, then delete it with
   `DELETE .../state/transcript/<thread_key>?expected_version=<exported version>`.

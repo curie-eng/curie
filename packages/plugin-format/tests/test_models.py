@@ -124,6 +124,19 @@ def test_trigger_declaration_keeps_cron_fields_optional() -> None:
     assert "prompt" in schema["properties"]
 
 
+def test_trigger_declaration_rejects_an_object_target() -> None:
+    with pytest.raises(ValidationError):
+        TriggerDeclaration.model_validate(
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "target": {"channel": "C0EXAMPLE1"},
+                "prompt": "Post the daily plan.",
+            }
+        )
+
+
 def test_approval_gate_grantable_via_policy_field() -> None:
     """The operator opt-in ``grantableViaPolicy`` round-trips on ApprovalGate (#558).
 

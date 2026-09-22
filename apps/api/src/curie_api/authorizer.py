@@ -17,7 +17,10 @@ the authorization boundary, so an authenticated requester who belongs to it may
 confirm their own action and an unlisted requester remains denied.
 
 Channel-less principals have one additional eligibility rule. An ``operator``
-can be evaluated only by an explicit-user set. A subject-bound ``console``
+or an ``adapter`` (ADR-0154) can be evaluated only by an explicit-user set: an
+adapter vouches for a sender it authenticated at ingress, but it carries no
+provider channel evidence, so a channel-membership or Slack group set cannot
+judge that sender. A subject-bound ``console``
 principal may also be checked by a server-side user-group lookup, but neither
 kind may manufacture Slack channel evidence.
 
@@ -39,7 +42,7 @@ from typing import Any, Literal
 from .approvers import ApproverSet
 from .models import Approval
 
-PrincipalKind = Literal["chat", "console", "operator"]
+PrincipalKind = Literal["chat", "console", "operator", "adapter"]
 
 
 @dataclass(frozen=True)
@@ -76,7 +79,7 @@ async def authorize_approval(
 
     name = approver_set.audit_name
 
-    if principal_kind == "operator" and not approver_set.operator_eligible:
+    if principal_kind in ("operator", "adapter") and not approver_set.operator_eligible:
         return name, AuthzDecision(
             allowed=False,
             reason=(

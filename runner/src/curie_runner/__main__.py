@@ -58,6 +58,7 @@ from .history import (
     DEFAULT_REPLAY_MAX_TURNS,
     ConversationReplay,
     HistoryCapacityError,
+    HistoryConflictError,
     HistoryError,
     StructuredReplayUnsupported,
     TranscriptStore,
@@ -390,6 +391,22 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    # Tell the gate whether the platform's own ``curie-state`` tools exist this
+    # session (#2286 adversarial round). The toolPolicy exemption is by exact
+    # live tool name, and a name the platform never published is not ours -- an
+    # ambient project ``.mcp.json`` can mount a server keyed ``curie-state``,
+    # because ``strict_mcp_config`` is off. Set AFTER construction rather than
+    # passed to ``build_approval_gate`` deliberately: the gate is built above at
+    # the three fail-closed approval boot checks, which must raise before any
+    # other boot work happens, and hoisting ``resolve_state_client`` above them
+    # would reorder the boot to suit a field. Both this flag and the conditional
+    # mount below read the same ``state_client`` local, which nothing rebinds in
+    # between, so the exemption and the mount cannot disagree. The mount keeps
+    # its own ``is not None`` because ``build_state_server`` needs the narrowed
+    # client, not the bool.
+    state_mounted = state_client is not None
+    if approval_gate is not None:
+        approval_gate.state_server_mounted = state_mounted
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,
@@ -653,6 +670,11 @@ async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     return store, format_memory_preamble(records)
 
 
+# Boot compaction passes (#2927): each is a compare-and-set rewrite of the value
+# boot loaded, retried on a concurrent write with a fresh load.
+_BOOT_COMPACTION_PASSES = 3
+
+
 async def _load_history(
     config: RunnerConfig,
 ) -> tuple[TranscriptStore, ConversationReplay, bool]:
@@ -667,10 +689,16 @@ async def _load_history(
     a typo degrades to the default rather than failing boot), which is why the
     defaults are applied here rather than read off the process env at this call.
 
-    A 413 on the boot compaction append is the one exception to fatal (#2820):
-    the thread is at the transcript cap, which no cold sandbox can fix, so the
-    runner still boots and the returned flag makes it refuse every turn with the
-    append path's non-retryable capacity event instead of dying unserved.
+    When the boot summary append is refused at the transcript cap (or its
+    headroom reserve), boot compacts the stored value it loaded with a
+    compare-and-set rewrite, then reloads and rebuilds the replay from what is
+    stored (#2927). A write since that load conflicts, and the next pass reloads
+    instead of writing a stale view over it; there are at most three passes.
+
+    A compaction that still cannot fit (or three passes that never settle) is
+    the one exception to fatal (#2820): no cold sandbox can fix that thread, so
+    the runner still boots and the returned flag makes it refuse every turn with
+    the append path's non-retryable capacity event instead of dying unserved.
     """
 
     store = resolve_history(config.history_ref, os.environ)
@@ -685,14 +713,39 @@ async def _load_history(
         else DEFAULT_REPLAY_MAX_BYTES
     )
     capacity_exceeded = False
+    compacted = False
     try:
         records = await store.load()
         replay, summary = build_conversation_replay(
             records, max_turns=max_turns, max_bytes=max_bytes
         )
-        if summary is not None:
+        passes = 0
+        while summary is not None:
             try:
                 await store.append(summary)
+                compacted = True
+                break
+            except HistoryCapacityError as exc:
+                if passes == _BOOT_COMPACTION_PASSES:
+                    logger.error(
+                        "history capacity exceeded at boot session=%s status=%d "
+                        "passes=%d (refusing turns)",
+                        config.session.session_id,
+                        exc.status,
+                        passes,
+                    )
+                    capacity_exceeded = True
+                    break
+            passes += 1
+            try:
+                await store.compact()
+                compacted = True
+            except HistoryConflictError:
+                logger.warning(
+                    "history compaction conflicted at boot session=%s pass=%d (reloading)",
+                    config.session.session_id,
+                    passes,
+                )
             except HistoryCapacityError as exc:
                 logger.error(
                     "history capacity exceeded at boot session=%s status=%d "
@@ -701,6 +754,11 @@ async def _load_history(
                     exc.status,
                 )
                 capacity_exceeded = True
+                break
+            records = await store.load()
+            replay, summary = build_conversation_replay(
+                records, max_turns=max_turns, max_bytes=max_bytes
+            )
     except Exception as exc:  # noqa: BLE001 - translate loader failures consistently
         status = (
             exc.args[0]
@@ -726,7 +784,7 @@ async def _load_history(
         config.session.session_id,
         len(records),
         len(replay.messages),
-        summary is not None and not capacity_exceeded,
+        compacted and not capacity_exceeded,
     )
     return store, replay, capacity_exceeded
 

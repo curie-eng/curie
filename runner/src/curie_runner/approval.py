@@ -72,6 +72,8 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .state import STATE_TOOL_NAMES
+
 logger = logging.getLogger(__name__)
 
 # Best-effort only (#712): NOT authoritative, NOT used for any gating
@@ -221,6 +223,38 @@ APPROVAL_SERVER_NAME = "curie"
 _TOOL_NAME = "request_approval"
 # The fully qualified tool identifier as it appears on ToolUseBlock.name.
 APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
+
+# Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
+# (#2286). The runner mounts both itself and a bundle cannot declare either:
+# plugin_format's ``connectors.RESERVED_CONNECTOR_NAMES`` refuses the names at
+# deploy, so a bundle can never express a toolPolicy over them. ADR-0139 settles
+# what that means -- bundle configuration may add restrictions but may not
+# hollow out operator or platform controls -- so the tools these servers publish
+# are outside toolPolicy scope entirely rather than classified against a policy
+# they cannot appear in.
+#
+# There is deliberately NO server-set constant here. RESERVED_CONNECTOR_NAMES is
+# the one list of these names (runner depends on plugin_format and never the
+# reverse), and a mirror of it in this module would be a second copy that only a
+# test ever read. The runtime exemption is decided on exact live TOOL names, not
+# on a server set: see ``is_platform_owned_tool``, which is where the first
+# #2286 fix went wrong by matching the server prefix instead.
+
+# The live tool names the ``curie`` server publishes, enumerated from the two
+# constants that already own them rather than respelled: ``APPROVAL_TOOL_NAME``
+# is built from ``_TOOL_NAME`` above and ``PLATFORM_PUBLISH_TOOL_NAME`` is
+# plugin_format's, which is also the literal the worker recognizes. Spelling
+# either again here is the #453/#1495 drift trap: a second copy can stop
+# matching the name the SDK actually puts on the wire, and the exemption would
+# then silently arm nothing (or, worse, arm something else).
+#
+# Both are always exempt even though ``request_approval`` is omitted when a
+# permission gate already pages (#2657): an omitted tool is not callable, so
+# exempting its name costs nothing, and making the exemption depend on the
+# pager decision would add a second way for the two to disagree.
+_APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
+    {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME}
+)
 
 # Platform-owned remote-development publication gate.  This is deliberately
 # mounted beside the policy tool rather than shipped by a bundle: a bundle is
@@ -657,6 +691,18 @@ class ApprovalGate:
     bundle_name: str | None = None
     mcp_servers: set[str] | None = None
     connector_servers: set[str] | None = None
+    # Whether THIS session actually mounted the ``curie-state`` MCP server
+    # (#2286 adversarial round). The runner mounts it only when
+    # ``resolve_state_client`` returns a client, so the platform's own
+    # ``mcp__curie-state__*`` tools exist only then, and only then may those
+    # names be exempted from a bundle's toolPolicy. ``__main__`` sets this from
+    # the same expression that decides the mount.
+    #
+    # Default False because that is the SAFE direction, not the historical one:
+    # a gate built without stating the fact exempts nothing named after the
+    # state server, so a forgotten wiring costs an over-refusal a human can see
+    # rather than a silent bypass nobody can.
+    state_server_mounted: bool = False
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -838,15 +884,89 @@ def canonical_tool_name(
     return None
 
 
+def platform_tool_names(*, state_server_mounted: bool) -> frozenset[str]:
+    """The live tool names Curie's own in-process servers mounted THIS session.
+
+    Always the two ``curie`` server tools; the five ``curie-state`` tools only
+    when the runner actually mounted that server, which it does solely when
+    ``resolve_state_client`` returned a client (``CURIE_STATE_URL`` is set). With
+    no state URL the platform publishes no ``mcp__curie-state__*`` tool at all,
+    so anything wearing that name came from somewhere else and must land on the
+    fail-closed default rather than collect an exemption for a server this
+    session never mounted.
+
+    The state names come from ``state.STATE_TOOL_NAMES``, which is rendered from
+    the SAME spec list ``build_state_server`` registers, so a sixth state tool
+    cannot be published without being exempted (#2286).
+    """
+
+    if state_server_mounted:
+        return _APPROVAL_SERVER_TOOL_NAMES | STATE_TOOL_NAMES
+    return _APPROVAL_SERVER_TOOL_NAMES
+
+
+def is_platform_owned_tool(live_tool_name: str, *, state_server_mounted: bool) -> bool:
+    """Whether a live SDK name is one Curie's own servers published (#2286).
+
+    EXACT membership in ``platform_tool_names``, and the exactness is the whole
+    point. The first #2286 fix asked whether the name carried the
+    ``mcp__<platform server>__`` PREFIX, which also answers yes for every tool
+    of a DIFFERENT server whose key merely begins ``curie__`` or
+    ``curie-state__``: ``mcp__curie__extra__foo`` and
+    ``mcp__curie-state__extra__bar`` both matched, and both were handed a bundle
+    toolPolicy bypass. That is reachable, not theoretical --
+    ``ClaudeAgentOptions.strict_mcp_config`` defaults to False and
+    ``adapter.build_options`` never sets it, so the CLI loads project
+    ``.mcp.json``, user settings and plugin servers BESIDE the ``--mcp-config``
+    dict ``build_mcp_servers`` controls (``check.py::evaluate`` already treats
+    those ambient servers as real). A mounted workspace is the session cwd, it is
+    writable, and it survives across sandboxes, so a ``.mcp.json`` sitting there
+    is bundle-influenced input. A connector cannot do it (a connector name may
+    not contain ``_``), an ambient project server can.
+
+    The residual this does NOT close, stated rather than hidden: when the
+    platform HAS mounted a server, an impostor publishing a name-identical tool
+    is exempt too, because the live name is the entire thing this gate sees --
+    ``mcp__curie-state__get`` from an ambient server and from Curie's own server
+    are the same string. Closing that needs ``strict_mcp_config`` or an
+    ambient-server policy, which is a separate change and out of scope here. The
+    class this closes is the one the prefix match invented: every name on a
+    platform-shaped prefix that the platform does not itself publish.
+
+    A bare ``mcp__curie__`` names no tool and is in no set, so it falls through
+    to the fail-closed default, as does a bundle's own plugin-mounted server
+    named ``curie`` (its live names carry the ``plugin_<bundle>_`` infix).
+    """
+
+    return live_tool_name in platform_tool_names(state_server_mounted=state_server_mounted)
+
+
 def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecision | None:
     """Classify one live tool, preserving built-ins outside MCP policy."""
 
     if gate.tool_policy is None or not is_mcp_tool(tool_name):
         return None
-    # These exact tools belong to the platform-owned approval server, not to
-    # the bundle or one of its connectors.  Leave them to their existing
-    # permission/in-process gates; every other MCP name remains fail-closed.
-    if tool_name == APPROVAL_TOOL_NAME or tool_name == PLATFORM_PUBLISH_TOOL_NAME:
+    # The tools Curie's own platform-owned servers published THIS session are
+    # outside toolPolicy scope entirely (ADR-0139, #2286): a bundle cannot
+    # declare those servers, so it cannot express a policy over them, and per
+    # that ADR bundle configuration may not hollow out a platform control. Leave
+    # them to their existing permission/in-process gate. Taken BEFORE
+    # classify_tool deliberately: a wildcarded server segment such as
+    # `deny: ["*/get"]` is the one pattern shape the deploy validator never
+    # cross-checks, and returning here is what makes it inert rather than a way
+    # to fence the approval path.
+    #
+    # By exact published name, never by server prefix: a prefix match also
+    # exempts an ambient MCP server keyed `curie__extra` or `curie-state__extra`,
+    # which is the widening the adversarial round on #2286 found and proved.
+    # `gate.state_server_mounted` is what keeps the state half honest -- with no
+    # state URL the platform mounts nothing named `curie-state`, so nothing
+    # wearing that name is ours.
+    #
+    # Outside policy scope is not permission to run. Returning None means the
+    # policy has no opinion; `_decide_gate` still applies gate.required, the
+    # operator gates, and the publication special case below.
+    if is_platform_owned_tool(tool_name, state_server_mounted=gate.state_server_mounted):
         return None
     canonical = canonical_tool_name(
         tool_name,
@@ -854,6 +974,13 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
         mcp_servers=gate.mcp_servers,
         connector_servers=gate.connector_servers,
     )
+    # LOAD BEARING, do not relax (#2119, #453/#544). An MCP name that maps to no
+    # declared server is refused, not waved through: this unmatched-is-DENY
+    # default is the property that actually defends the surface, and the
+    # exemption above widened what precedes it. Turning this into `return None`
+    # is the fail-open, and it is what
+    # test_a_tool_from_an_undeclared_server_is_refused_at_both_interception_points
+    # exists to redden.
     if canonical is None:
         return ToolPolicyDecision.DENY
     return classify_tool(gate.tool_policy, canonical)

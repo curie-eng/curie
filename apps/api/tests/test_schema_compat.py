@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
-REVIEW_SCHEMA_MIN = "0044"
+REVIEW_SCHEMA_MIN = "0045"
 PREV = "0040"
 
 
@@ -197,7 +197,7 @@ def _prepare_schema_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("revision", ("0041", "0042"))
+@pytest.mark.parametrize("revision", ("0041", "0042", "0044"))
 def test_api_lifespan_refuses_schema_missing_required_consumers(
     isolated_migration_db: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -228,6 +228,65 @@ def test_api_lifespan_serves_current_schema_head(
         get_settings.cache_clear()
 
 
+def test_adapter_0045_upgrade_preserves_principal_subject_through_work_items_and_dispatch(
+    isolated_migration_db: None,
+) -> None:
+    """The stable adapter schema upgrades into the candidate WorkItems train."""
+    cfg = _alembic_config()
+    command.upgrade(cfg, "0045")
+    assert current_revision() == "0045"
+
+    approval_id = uuid.uuid4()
+    audit_id = uuid.uuid4()
+    _exec(
+        "INSERT INTO curie.approvals (id, conversation_id, author, summary, "
+        "reply_kind, reply_channel, reply_placeholder, dedupe_key, status) "
+        "VALUES (:id, :conversation_id, :author, :summary, :reply_kind, "
+        ":reply_channel, :reply_placeholder, :dedupe_key, 'pending')",
+        {
+            "id": approval_id,
+            "conversation_id": "th-stable-0045-upgrade",
+            "author": "U0EXAMPLE1",
+            "summary": "seeded adapter audit",
+            "reply_kind": "slack",
+            "reply_channel": "C0EXAMPLE1",
+            "reply_placeholder": None,
+            "dedupe_key": uuid.uuid4().hex,
+        },
+    )
+    _exec(
+        "INSERT INTO curie.approval_audit_entries "
+        "(id, approval_id, action, actor, decision, authorizer, authorized, "
+        "principal_kind, principal_subject, authenticated) "
+        "VALUES (:id, :approval_id, 'resolved', 'U0EXAMPLE1', 'approved', "
+        "'ExplicitUserListAuthorizer', true, 'adapter', :principal_subject, true)",
+        {
+            "id": audit_id,
+            "approval_id": approval_id,
+            "principal_subject": "mail-adapter",
+        },
+    )
+
+    command.upgrade(cfg, "head")
+    assert HEAD == "0048"
+    assert current_revision() == "0048"
+    assert _sql(
+        "SELECT principal_kind, principal_subject "
+        "FROM curie.approval_audit_entries WHERE id = :id",
+        {"id": audit_id},
+    ) == [("adapter", "mail-adapter")]
+    assert _sql(
+        "SELECT to_regclass('curie.work_items')::text, "
+        "to_regclass('curie.execution_requests')::text"
+    ) == [("curie.work_items", "curie.execution_requests")]
+    assert _sql(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'curie' AND table_name = 'execution_requests' "
+        "AND column_name IN ('dispatch_generation', 'dispatch_owner') "
+        "ORDER BY column_name"
+    ) == [("dispatch_generation",), ("dispatch_owner",)]
+
+
 def test_n_minus_one_can_serve_an_unknown_newer_expand() -> None:
     future_expand = "future-expand"
     window = AppWindow(schema_min=CONTRACT, schema_head=HEAD)
@@ -239,7 +298,7 @@ def test_n_minus_one_can_serve_an_unknown_newer_expand() -> None:
     assert can_serve(None, window, known) is False
 
 
-@pytest.mark.parametrize("future_expand", ("0042", "0043", "0044"))
+@pytest.mark.parametrize("future_expand", ("0042", "0043", "0044", "0045"))
 def test_0041_image_accepts_review_schema_expands_it_does_not_know(
     future_expand: str,
 ) -> None:

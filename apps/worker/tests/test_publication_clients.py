@@ -11,10 +11,14 @@ import pytest
 from channel_protocol import scoped_conversation_id
 from curie_worker.publication_clients import (
     GitHubPublicationLookup,
+    PublicationLineageClient,
     PublicationTranscriptClient,
 )
 from curie_worker.publication_loop import (
+    PublicationIdentityUnavailable,
+    PublicationLineageRefused,
     PublicationReconcileError,
+    PublicationRemoteTerminalError,
     PublicationTranscriptPermanentError,
 )
 
@@ -24,6 +28,11 @@ PR_URL = f"https://github.com/{REPO}/pull/123"
 REVISION_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
 PRIOR_HEAD = "a" * 40
 REVISION_HEAD = "b" * 40
+PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
+LINEAGE_ID = uuid.UUID("55555555-5555-4555-8555-555555555555")
+LINEAGE_API_BASE = "https://api.example.com"
+LINEAGE_PATH = f"/v1/internal/publications/{PUBLICATION_ID}/lineage"
+WORKER_TOKEN = "remote-dev-publication-worker-token"
 
 pytestmark = pytest.mark.anyio
 
@@ -641,4 +650,128 @@ async def test_transcript_capacity_refusal_is_classified_as_permanent() -> None:
                 "1700000000.000100",
                 uuid.UUID("22222222-2222-4222-8222-222222222222"),
                 f"Published the approved changes: {PR_URL}",
+            )
+
+
+# --- T9: the worker-side publication identity client wire contract (#2903) ---
+
+
+async def _advance_lineage(handler: object) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)  # type: ignore[arg-type]
+    ) as http:
+        client = PublicationLineageClient(
+            api_base_url=LINEAGE_API_BASE,
+            worker_token=WORKER_TOKEN,
+            client=http,
+        )
+        await client.advance(
+            PUBLICATION_ID,
+            expected_version=1,
+            expected_head_sha=PRIOR_HEAD,
+            expected_publication_version=7,
+            lease_owner="publication-worker-a",
+            pr_number=123,
+            pr_url=PR_URL,
+            head_sha=REVISION_HEAD,
+        )
+
+
+async def test_lineage_advance_is_requested_with_worker_auth_and_no_github_secret() -> None:
+    requests: list[httpx.Request] = []
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    await _advance_lineage(handler)
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "PATCH"
+    assert request.url.path == LINEAGE_PATH
+    assert request.headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+    assert "authorization" not in {name.lower() for name in request.headers}
+    assert bodies == [
+        {
+            "expected_version": 1,
+            "expected_head_sha": PRIOR_HEAD,
+            "expected_publication_version": 7,
+            "lease_owner": "publication-worker-a",
+            "state": "open",
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": REVISION_HEAD,
+        }
+    ]
+
+
+@pytest.mark.parametrize("case", ["http_503", "transport_error"])
+async def test_lineage_unavailable_is_not_a_stable_refusal(case: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if case == "transport_error":
+            raise httpx.ConnectError("lineage endpoint unreachable", request=request)
+        return httpx.Response(503, json={"detail": {"code": "publication.github_unavailable"}})
+
+    with pytest.raises(PublicationIdentityUnavailable):
+        await _advance_lineage(handler)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"detail": {"code": "publication.lineage_stale", "message": "stale"}},
+        {"detail": {"code": "publication.lease_lost", "message": "lease lost"}},
+        {"detail": {"code": "publication.lineage_terminal"}},
+        {
+            "detail": {
+                "code": "publication.lineage_terminal",
+                "observed_state": "open",
+            }
+        },
+    ],
+    ids=["stale", "lease_lost", "terminal_missing_state", "terminal_invalid_state"],
+)
+async def test_lineage_refusals_remain_charged(body: dict[str, object]) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json=body)
+
+    with pytest.raises(PublicationLineageRefused) as raised:
+        await _advance_lineage(handler)
+
+    assert type(raised.value) is not PublicationIdentityUnavailable
+    assert not isinstance(raised.value, PublicationRemoteTerminalError)
+
+
+@pytest.mark.parametrize("observed_state", ["merged", "closed"])
+async def test_terminal_lineage_response_maps_to_worker_terminal_cas(
+    observed_state: str,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "detail": {
+                    "code": "publication.lineage_terminal",
+                    "observed_state": observed_state,
+                }
+            },
+        )
+
+    with pytest.raises(PublicationRemoteTerminalError) as raised:
+        await _advance_lineage(handler)
+
+    assert raised.value.state == observed_state
+
+
+async def test_lineage_client_refuses_construction_without_internal_worker_auth() -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+    async with httpx.AsyncClient(transport=transport) as http:
+        with pytest.raises(ValueError, match="internal worker auth"):
+            PublicationLineageClient(
+                api_base_url=LINEAGE_API_BASE,
+                worker_token="",
+                client=http,
             )
