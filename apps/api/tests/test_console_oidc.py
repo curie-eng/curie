@@ -692,17 +692,63 @@ def test_expired_attempts_do_not_count_toward_the_cap(
     assert STATE_COOKIE in _set_cookies(response)
 
 
-def test_consumed_attempts_do_not_count_toward_the_cap(
+def _assert_refused_at_cap(response: httpx.Response) -> None:
+    assert response.status_code == 503, response.text
+    assert response.headers.get("cache-control") == "no-store"
+    assert "location" not in response.headers
+    assert STATE_COOKIE not in _set_cookies(response)
+    assert LEGACY_STATE_COOKIE not in _set_cookies(response)
+
+
+def test_consumed_attempts_still_count_toward_the_cap(
     oidc_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A consumed row stays until it expires, so consuming frees no capacity.
     _cap_at(monkeypatch, 3)
     for _ in range(3):
         _session_token(_login(oidc_client))
+    consumed = _sql(
+        "SELECT id FROM curie.oidc_login_attempts WHERE consumed_at IS NOT NULL"
+    )
+    assert len(consumed) == 3
 
     response = oidc_client.get("/console/oidc/login", follow_redirects=False)
 
-    assert response.status_code == 302, response.text
-    assert STATE_COOKIE in _set_cookies(response)
+    _assert_refused_at_cap(response)
+    assert _attempt_count() == 3
+
+
+def test_idp_error_callbacks_cannot_recycle_cap_capacity(
+    oidc_client: TestClient, idp: TestIdP, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anonymous login -> callback?error=x loop must still hit the cap."""
+
+    _cap_at(monkeypatch, 3)
+    callback_path = urllib.parse.urlsplit(REDIRECT_URI).path
+    for _ in range(3):
+        login = oidc_client.get("/console/oidc/login", follow_redirects=False)
+        assert login.status_code == 302, login.text
+        state = dict(
+            urllib.parse.parse_qsl(urllib.parse.urlsplit(login.headers["location"]).query)
+        )["state"]
+        cookie = _set_cookies(login)[STATE_COOKIE].value
+        oidc_client.cookies.clear()
+        query = urllib.parse.urlencode({"error": "x", "state": state})
+        _assert_refused(
+            oidc_client.get(
+                f"{callback_path}?{query}",
+                headers=_cookie(STATE_COOKIE, cookie),
+                follow_redirects=False,
+            )
+        )
+        oidc_client.cookies.clear()
+    assert _attempt_count() == 3
+
+    refused = oidc_client.get("/console/oidc/login", follow_redirects=False)
+
+    _assert_refused_at_cap(refused)
+    assert _attempt_count() == 3
+    assert idp.token_requests == []
 
 
 # --- principal and tenant status ----------------------------------------------
