@@ -20,7 +20,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from .config import get_settings
-from .models import ExecutionRequest, ThreadPublicationLineage, WorkItem
+from .models import (
+    ExecutionRequest,
+    FactoryTerminalNotice,
+    Publication,
+    ThreadPublicationLineage,
+    WorkItem,
+)
 
 RequestStatus = Literal[
     "waiting",
@@ -44,6 +50,7 @@ ConflictCode = Literal[
     "lineage_mismatch",
     "lineage_already_owned",
     "publication_ineligible",
+    "publication_pending",
     "termination_observation_required",
 ]
 
@@ -170,6 +177,58 @@ async def _conflict(
 async def _database_now(session: AsyncSession) -> datetime:
     value = await session.scalar(select(func.clock_timestamp()))
     return cast(datetime, value)
+
+
+def _queue_notice(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+) -> None:
+    """Stage the owed comment in the terminal transaction. The caller commits."""
+
+    if request.status == "completed" or request.terminal_at is None:
+        return
+    cause = request.terminal_cause
+    if cause is None or not cause.strip():
+        return
+    session.add(
+        FactoryTerminalNotice(
+            execution_request_id=request.id,
+            work_item_id=work_item.id,
+            terminal_cause=cause.strip(),
+        )
+    )
+
+
+async def _opened_pull_request(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+) -> bool:
+    if work_item.publication_lineage_id is None:
+        return False
+    pr_url = await session.scalar(
+        select(ThreadPublicationLineage.pr_url).where(
+            ThreadPublicationLineage.id == work_item.publication_lineage_id
+        )
+    )
+    if not isinstance(pr_url, str) or not pr_url.strip():
+        return False
+    succeeded = await session.scalar(
+        select(Publication.id).where(
+            Publication.execution_request_id == request.id,
+            Publication.lineage_id == work_item.publication_lineage_id,
+            Publication.status == "succeeded",
+        )
+    )
+    return succeeded is not None
+
+
+async def _publication_owns_terminus(session: AsyncSession, work_item: WorkItem) -> bool:
+    if work_item.publication_lineage_id is not None:
+        return True
+    found = await session.scalar(
+        select(Publication.id)
+        .where(Publication.workspace_conversation_id == work_item.conversation_id)
+        .limit(1)
+    )
+    return found is not None
 
 
 async def _lock_work_item(
@@ -545,6 +604,7 @@ async def expire_waiting(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
+    _queue_notice(session, work_item, request)
     return await _outcome(session, work_item, request)
 
 
@@ -734,10 +794,35 @@ async def _terminalize_execution(
             session, "illegal_transition", work_item=work_item, request=request
         )
     now = await _database_now(session)
-    if request.execution_deadline is None or now >= request.execution_deadline:
+    opened = status == "completed" and await _opened_pull_request(
+        session, work_item, request
+    )
+    deadline_elapsed = (
+        request.execution_deadline is None or now >= request.execution_deadline
+    )
+    # A pull request that already opened is the terminus even if reconciliation
+    # notices it after the execution deadline.
+    if deadline_elapsed and not opened:
         return await _conflict(
             session, "execution_deadline_elapsed", work_item=work_item, request=request
         )
+    if status == "completed" and not opened:
+        return await _conflict(
+            session, "illegal_transition", work_item=work_item, request=request
+        )
+    if status == "failed" and cause.strip() == "no_pull_request":
+        if await _publication_owns_terminus(session, work_item):
+            return await _conflict(
+                session, "publication_pending", work_item=work_item, request=request
+            )
+    # The Python check above allows a pull request that already opened to
+    # complete after the deadline. The UPDATE has to use the same exception,
+    # or the deadline predicate rejects the row and the next pass cancels it.
+    deadline_guard = (
+        ()
+        if opened
+        else (ExecutionRequest.execution_deadline > func.clock_timestamp(),)
+    )
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -745,7 +830,7 @@ async def _terminalize_execution(
             ExecutionRequest.work_item_id == work_item_id,
             ExecutionRequest.version == expected_request_version,
             ExecutionRequest.status == "running",
-            ExecutionRequest.execution_deadline > func.clock_timestamp(),
+            *deadline_guard,
             *extra_where,
         )
         .values(
@@ -759,7 +844,7 @@ async def _terminalize_execution(
     )
     if changed_id is None:
         request = await _reload_request(session, request_id)
-        if (
+        if not opened and (
             request.execution_deadline is None
             or await _database_now(session) >= request.execution_deadline
         ):
@@ -771,6 +856,8 @@ async def _terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
+    if status != "completed":
+        _queue_notice(session, work_item, request)
     return await _outcome(session, work_item, request)
 
 
@@ -868,6 +955,7 @@ async def request_cancellation(
             )
         )
         active = await _reload_request(session, active.id)
+        _queue_notice(session, work_item, active)
     elif active is not None and active.status == "running":
         await session.execute(
             update(ExecutionRequest)
@@ -1152,4 +1240,84 @@ async def _record_runtime_termination(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
+    _queue_notice(session, work_item, request)
     return await _outcome(session, work_item, request)
+
+
+_PUBLICATION_CAUSES = {
+    "denied": "publication_denied",
+    "expired": "publication_expired",
+    "failed": "publication_failed",
+}
+
+
+@dataclass(frozen=True)
+class PublicationSettlement:
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    work_item_version: int
+    request_version: int
+    cause: str
+
+
+async def claim_publication_settlement(
+    session: AsyncSession,
+) -> PublicationSettlement | None:
+    """The only reader that decides a linked publication's execution terminus.
+
+    Callers then use ``complete_execution`` or ``fail_execution``. This function
+    does not commit and does not write the request.
+    """
+
+    rows = (
+        await session.execute(
+            select(
+                ExecutionRequest,
+                WorkItem,
+                Publication,
+                ThreadPublicationLineage.pr_url,
+            )
+            .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
+            .join(Publication, Publication.execution_request_id == ExecutionRequest.id)
+            .join(
+                ThreadPublicationLineage,
+                ThreadPublicationLineage.id == Publication.lineage_id,
+            )
+            .where(
+                ExecutionRequest.status == "running",
+                Publication.status.in_(("denied", "expired", "failed", "succeeded")),
+            )
+            .order_by(ExecutionRequest.updated_at, Publication.revision_number.desc())
+            .limit(20)
+            .with_for_update(skip_locked=True, of=ExecutionRequest)
+        )
+    ).all()
+    seen: set[uuid.UUID] = set()
+    for request, work_item, publication, pr_url in rows:
+        if request.id in seen:
+            continue
+        seen.add(request.id)
+        active = await session.scalar(
+            select(Publication.id).where(
+                Publication.execution_request_id == request.id,
+                Publication.status.in_(("pending", "approved", "launching", "running")),
+            )
+        )
+        if active is not None:
+            continue
+        if publication.status == "succeeded":
+            if not isinstance(pr_url, str) or not pr_url.strip():
+                continue
+            cause = "completed"
+        elif publication.status in _PUBLICATION_CAUSES:
+            cause = _PUBLICATION_CAUSES[publication.status]
+        else:
+            continue
+        return PublicationSettlement(
+            work_item_id=work_item.id,
+            request_id=request.id,
+            work_item_version=work_item.version,
+            request_version=request.version,
+            cause=cause,
+        )
+    return None

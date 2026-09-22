@@ -13726,6 +13726,77 @@
         ]
       }
     },
+    "/v1/internal/work-items/requests/{request_id}/hold-approval": {
+      "post": {
+        "operationId": "hold_work_item_for_approval_v1_internal_work_items_requests__request_id__hold_approval_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeartbeatBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Hold Work Item For Approval V1 Internal Work Items Requests  Request Id  Hold Approval Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Hold Work Item For Approval",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
     "/v1/internal/work-items/requests/{request_id}/start": {
       "post": {
         "operationId": "start_work_item_request_v1_internal_work_items_requests__request_id__start_post",
@@ -13934,6 +14005,66 @@
           }
         },
         "summary": "Claim Work Item Termination",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/running": {
+      "get": {
+        "operationId": "running_work_item_request_v1_internal_work_items_running_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Running Work Item Request V1 Internal Work Items Running Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Running Work Item Request",
         "tags": [
           "internal-work-items"
         ]

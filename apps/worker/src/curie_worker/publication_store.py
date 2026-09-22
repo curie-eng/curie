@@ -85,6 +85,7 @@ class PostgresPublicationStore:
             raise ValueError("publication attempt limits must be positive")
         self._engine = engine
         self._table = f'"{schema}".publications'
+        self._requests = f'"{schema}".execution_requests'
         self._approvals = f'"{schema}".approvals'
         self._lineages = f'"{schema}".thread_publication_lineages'
         self._lease_owner = lease_owner
@@ -338,7 +339,15 @@ class PostgresPublicationStore:
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
                    l.pr_url, l.head_sha,
-                   a.conversation_id
+                   a.conversation_id,
+                   (
+                     p.execution_request_id IS NULL
+                     OR EXISTS (
+                        SELECT 1 FROM {self._requests} e
+                         WHERE e.id = p.execution_request_id
+                           AND e.status = 'running'
+                     )
+                   ) AS owner_running
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
               JOIN {self._lineages} l ON l.id = p.lineage_id
@@ -348,6 +357,15 @@ class PostgresPublicationStore:
                AND p.reconcile_attempts < :max_attempts
                AND p.reconcile_dead_lettered_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
+               AND (
+                    p.execution_request_id IS NULL
+                    OR EXISTS (
+                        SELECT 1 FROM {self._requests} e
+                         WHERE e.id = p.execution_request_id
+                           AND e.status = 'running'
+                    )
+                    OR p.status IN ('launching', 'running')
+               )
              ORDER BY p.created_at, p.id
              FOR UPDATE OF p SKIP LOCKED
              LIMIT 1
@@ -432,6 +450,7 @@ class PostgresPublicationStore:
             ),
             version=version,
             lease_owner=self._lease_owner,
+            owner_running=bool(row["owner_running"]),
         )
 
     async def is_terminal(self, publication_id: uuid.UUID) -> bool:

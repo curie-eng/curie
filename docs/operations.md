@@ -816,8 +816,8 @@ stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
-the review subscriptions when both gates are on. Give the App **Issues: Read**
-so Curie can re-read the issue and comment, and **Metadata: Read** is already
+the review subscriptions when both gates are on. Give the App **Issues: Read and write**
+so Curie can re-read the issue and post one terminus comment, and **Metadata: Read** is already
 implied by repository installation discovery.
 
 Give the App **Checks: Read** so the work item detail can report CI for the
@@ -857,6 +857,16 @@ operators raise the delivery budget for factory agents.
 Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
+
+A labelled factory run ends as one pull request or one comment on the
+originating issue. The comment says the run cannot continue and names the
+cause (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
+`owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
+`publication_denied`, `publication_expired`, or `publication_failed`). The
+work item reconciler posts that comment after the terminal row commits. A
+refused post is recorded on the notice and does not change the execution row.
+Waiting for approval is not an ending: the execution deadline stays 1800
+seconds from start and covers that wait.
 
 ### Driving the factory end to end
 
