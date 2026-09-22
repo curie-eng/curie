@@ -44,6 +44,59 @@ def _objs(
     )
 
 
+_VECTORS = Path(__file__).resolve().parents[3] / "tests" / "vectors"
+_DERIVED_BEARER = json.loads(
+    (_VECTORS / "connector-derived-bearer.json").read_text(encoding="utf-8")
+)
+_DERIVED_BEARER_KEYS = {"name", "why", "document", "expected_name"}
+
+
+def test_shipped_sre_bot_connector_names_and_secret_refs_match_renderer() -> None:
+    root = Path(__file__).resolve().parents[3]
+    bundle = root / "examples" / "sre-bot"
+    connectors_data = yaml.safe_load((bundle / "connectors.yaml").read_text(encoding="utf-8"))
+    values = yaml.safe_load(
+        (bundle / "observability" / "curie-values.yaml").read_text(encoding="utf-8")
+    )
+    parsed, errors = validate_connectors(connectors_data)
+    assert errors == []
+    assert parsed is not None
+
+    connector_names = ("grafana", "tempo")
+    grafana_values = values["grafanaConnector"]
+    expected_names = {r.object_name("curie", "sre-bot", name) for name in connector_names}
+    assert set(grafana_values["restartDeploymentNames"]) == expected_names
+
+    for name in connector_names:
+        spec = parsed.connectors[name]
+        expected_name = r.object_name("curie", "sre-bot", name)
+        secret_refs = [item for item in spec.secrets if isinstance(item, SecretRef)]
+        assert len(secret_refs) == 1
+        secret_ref = secret_refs[0]
+        assert secret_ref.from_secret == grafana_values["secretName"]
+        assert secret_ref.secret_key() == grafana_values["secretKey"]
+
+        deployment = r.render_deployment(
+            "curie",
+            "sre-bot",
+            "curie",
+            name,
+            spec.model_copy(update={"image": "example.invalid/mcp:unit"}),
+            grafana_values["secretName"],
+        )
+        assert deployment["metadata"]["name"] == expected_name
+        entry = next(
+            item
+            for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            if item["name"] == grafana_values["secretKey"]
+        )
+        assert entry["valueFrom"]["secretKeyRef"] == {
+            "name": grafana_values["secretName"],
+            "key": grafana_values["secretKey"],
+            "optional": False,
+        }
+
+
 # Two NetworkPolicies ship per connector now, so selecting "the NetworkPolicy"
 # by kind picks whichever happens to be first and silently tests the wrong
 # object. Select by direction.
@@ -1477,9 +1530,9 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
 # <PAT>` on every request, and an unauthenticated `GET /mcp` is a 401. Until
 # now the hosted entry carried a URL and nothing else, so the probe failed and
 # the agent simply listed no `mcp__github__*` tools -- a silent no-tools, not
-# an error. The header is DERIVED from ``bearer_secret`` (or the single
-# declared secret) for the same reason the URL is derived (ADR-0086): the
-# author writes neither.
+# an error. The header is DERIVED from ``bearer_secret`` or one plain string
+# secret for the same reason the URL is derived (ADR-0086): the author writes
+# neither.
 # --------------------------------------------------------------------------- #
 GITHUB = ConnectorSpec(
     image="ghcr.io/github/github-mcp-server:v0.20.1",
@@ -1502,16 +1555,29 @@ def test_a_hosted_connector_carries_a_bearer_header_for_its_declared_secret() ->
     )
 
 
-def test_a_secret_ref_contributes_its_env_var_name_not_the_secret_it_points_at() -> None:
-    # `secrets:` is `list[str | SecretRef]`. The header names the ENV VAR the
-    # MCP client expands, which for a SecretRef is `.name` -- `from_secret` is
-    # a Kubernetes Secret name and would expand to nothing in the sandbox.
+def test_an_implicit_secret_ref_stays_in_the_connector_pod() -> None:
+    # A SecretRef is delivered only to the connector pod. Its value does not
+    # exist in the sandbox, so an implicit Bearer placeholder would make the
+    # runner report a missing credential and hide the connector tools.
     spec = ConnectorSpec(
         image="ghcr.io/github/github-mcp-server:v0.20.1",
-        secrets=[SecretRef(name="GITHUB_PERSONAL_ACCESS_TOKEN", from_secret="gh-pat")],
+        secrets=[
+            SecretRef(
+                name="GITHUB_PERSONAL_ACCESS_TOKEN",
+                from_secret="gh-pat",
+                key="token",
+            )
+        ],
     )
-    assert _github_entry(spec)["headers"] == {
-        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert "headers" not in _github_entry(spec)
+
+    deployment = next(obj for obj in _objs(spec=spec) if obj["kind"] == "Deployment")
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    credential = next(item for item in env if item["name"] == "GITHUB_PERSONAL_ACCESS_TOKEN")
+    assert credential["valueFrom"]["secretKeyRef"] == {
+        "name": "gh-pat",
+        "key": "token",
+        "optional": False,
     }
 
 
@@ -1562,6 +1628,17 @@ def test_bearer_secret_names_the_header_when_several_secrets_are_declared() -> N
     }
 
 
+def test_an_explicit_secret_ref_bearer_keeps_its_header() -> None:
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=[SecretRef(name="GITHUB_PERSONAL_ACCESS_TOKEN", from_secret="gh-pat")],
+        bearer_secret="GITHUB_PERSONAL_ACCESS_TOKEN",
+    )
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+
+
 def test_a_single_declared_secret_still_derives_the_header_without_bearer_secret() -> None:
     # The github-mcp-server shape. Requiring the new field on every existing
     # one-secret bundle would be a break for no security gain: there is only
@@ -1574,3 +1651,31 @@ def test_a_single_declared_secret_still_derives_the_header_without_bearer_secret
     assert _github_entry(spec)["headers"] == {
         "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
     }
+
+
+def test_derived_bearer_vector_keys_are_known() -> None:
+    # A key added for the Rust lane alone would pass vacuously here.
+    assert set(_DERIVED_BEARER) == {"comment", "vectors"}
+    for vector in _DERIVED_BEARER["vectors"]:
+        assert set(vector) == _DERIVED_BEARER_KEYS, vector["name"]
+
+
+@pytest.mark.parametrize(
+    "vector",
+    _DERIVED_BEARER["vectors"],
+    ids=lambda v: v["name"],
+)
+def test_derived_bearer_header_matches_the_frozen_vector(vector: dict) -> None:
+    # Cross-language pin: the renderer and the CLI bearer_secret_name helper
+    # must name the same secret, including the SecretRef case that used to
+    # diverge.
+    connectors = vector["document"]["connectors"]
+    assert list(connectors) == ["gh"], vector["name"]
+    spec = ConnectorSpec.model_validate(connectors["gh"])
+    entry = r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "gh", spec)
+    authorization = (entry.get("headers") or {}).get("Authorization")
+    expected = vector["expected_name"]
+    if expected is None:
+        assert authorization is None, vector["name"]
+    else:
+        assert authorization == f"Bearer ${{{expected}}}", vector["name"]

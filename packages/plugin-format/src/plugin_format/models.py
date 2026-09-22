@@ -76,9 +76,10 @@ class PluginManifest(BaseModel):
     # Curie authoring extension: the vanilla MCP tool policy. Tri-state glob
     # collections over CANONICAL ``"<server>/<tool>"`` tool names -- server
     # qualified and transport-independent, deliberately NOT the SDK's live
-    # ``mcp__...`` name (see ``tool_policy``'s module docstring). DECLARATION-ONLY
-    # today: nothing enforces it at runtime yet, that lane is a BLOCKING
-    # follow-up, and no bundle may ship a real policy until it lands.
+    # ``mcp__...`` name (see ``tool_policy``'s module docstring). Declared here and
+    # ENFORCED BY THE RUNNER (#2119), at both of its interception points through
+    # ``runner/src/curie_runner/approval.py::_decide_gate``; nothing in this
+    # package enforces it, which is why the handshake below exists.
     # ``tool_policy.load_tool_policy`` is the only supported reader -- it refuses
     # to hand a policy to a caller that does not name the enforcement contract,
     # and ``validate_bundle`` rejects a policy-bearing bundle whose caller does

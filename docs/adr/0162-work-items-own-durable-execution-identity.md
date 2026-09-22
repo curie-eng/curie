@@ -1,4 +1,4 @@
-# 155. WorkItems own durable execution identity
+# 162. WorkItems own durable execution identity
 
 Date: 2026-09-18
 
@@ -16,7 +16,7 @@ This ADR is Accepted with explicit maintainer approval recorded on September 18,
 coordinated acceptance follows
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
 The realizing paths are `apps/api/src/curie_api/models.py`,
-`apps/api/alembic/versions/0045_work_items.py`, and
+`apps/api/alembic/versions/0046_work_items.py`, and
 `apps/api/src/curie_api/workitems.py`.
 
 Signed GitHub issue intake that calls this service is
@@ -97,7 +97,7 @@ as a whole. ADR 0149 is not Accepted and supplies no model authority. Fixed
 model selection per agent is the entire model scope for version 0.10. This
 boundary does not reject future model routing under separate authority.
 
-[ADR 0154](0154-the-tracker-owns-dependencies-and-curie-admits-ready-work.md)
+[ADR 0165](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md)
 remains Draft and deferred. This foundation adds no dependency observations,
 dependency admission, readiness checks, stacked publication, prerequisite
 assembly, tracker reconciliation, or fields anticipating those features.
@@ -132,4 +132,4 @@ judgments would create the competing authority that ADR 0145 sought to avoid.
 
 ### Add dependency and stacked publication state now
 
-Rejected. ADR 0154 is Draft and supplies no implementation authority.
+Rejected. ADR 0165 is Draft and supplies no implementation authority.

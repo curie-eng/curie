@@ -13,14 +13,15 @@
 // carries no `Connector*` `$defs` at all -- the connector structs are declared
 // in `cli/plugin-format-mirrors.json`'s `non_mirrors` array and the field
 // comparison is a no-op for them today. This file is the seam instead: it reads
-// the same five corpora the Python suite reads, so a change made in one
+// the same six corpora the Python suite reads, so a change made in one
 // language and not the other fails that language's suite.
 //
-//   tests/vectors/connector-build-decl.json    the `build:` declaration
-//   tests/vectors/connector-lock.json          connectors.lock.yaml + apply_lock
-//   tests/vectors/connector-fields.json        the exact field-name sets
-//   tests/vectors/connector-service-dns.json   object_name / service_dns
-//   tests/vectors/connector-source-digest.json source_digest_of
+//   tests/vectors/connector-build-decl.json      the `build:` declaration
+//   tests/vectors/connector-lock.json            connectors.lock.yaml + apply_lock
+//   tests/vectors/connector-fields.json          the exact field-name sets
+//   tests/vectors/connector-service-dns.json     object_name / service_dns
+//   tests/vectors/connector-source-digest.json   source_digest_of
+//   tests/vectors/connector-derived-bearer.json  derived Authorization Bearer name
 //
 // Same mechanism as `tests/vectors/approval-action-ids.json` for the
 // dispatcher-versus-CLI action ids.
@@ -623,4 +624,58 @@ fn a_symlink_inside_the_context_is_neither_followed_nor_hashed() {
         connector_build::source_digest_of(&plain, &build).expect("hash the plain context"),
         "a symlink is never followed and never hashed, on both sides of the seam"
     );
+}
+
+// ─── derived Bearer name ─────────────────────────────────────────────────────
+
+const DERIVED_BEARER_KEYS: &[&str] = &["name", "why", "document", "expected_name"];
+
+#[test]
+fn derived_bearer_vector_keys_are_known() {
+    // A key added for the Python lane alone would pass vacuously here.
+    let file = vector_file("connector-derived-bearer.json");
+    let keys: BTreeSet<&str> = file
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, BTreeSet::from(["comment", "vectors"]));
+    for vector in vectors("connector-derived-bearer.json") {
+        let keys: BTreeSet<&str> = vector
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            DERIVED_BEARER_KEYS.iter().copied().collect(),
+            "{}",
+            name_of(&vector)
+        );
+    }
+}
+
+#[test]
+fn derived_bearer_name_matches_the_frozen_vector() {
+    // Cross-language pin: bearer_secret_name must agree with the renderer's
+    // derived Authorization header, including the SecretRef case that used
+    // to flatten a lone Ref into a Bearer name the renderer would not emit.
+    for vector in vectors("connector-derived-bearer.json") {
+        let document = serde_norway::to_string(&vector["document"]).expect("serialize document");
+        let parsed = connector_build::parse_connectors(&document)
+            .unwrap_or_else(|error| panic!("{} must parse, got {error}", name_of(&vector)));
+        let spec = parsed
+            .connectors
+            .get("gh")
+            .unwrap_or_else(|| panic!("{} has connector gh", name_of(&vector)));
+        let expected = vector["expected_name"].as_str().map(str::to_string);
+        assert_eq!(
+            connector_build::bearer_secret_name(spec),
+            expected,
+            "{}",
+            name_of(&vector)
+        );
+    }
 }

@@ -128,6 +128,7 @@ assert mutation in {
     "scrape-source-label-inert",
     "scrape-source-label-conditional",
     "scrape-namespace-names",
+    "storage-class",
     "tempo-envelope",
 }, f"unknown mutation {mutation!r}"
 
@@ -234,15 +235,19 @@ def hook_annotations(doc):
     return str(doc.get("metadata", {}).get("annotations", {}).get("helm.sh/hook", ""))
 
 
-def storage_requests(docs):
-    requests = []
+def claim_specs(docs):
+    specs = []
     for doc in docs:
         if doc.get("kind") == "PersistentVolumeClaim":
-            requests.append(at(doc, "spec", "resources", "requests", "storage"))
+            specs.append(at(doc, "spec"))
         if doc.get("kind") == "StatefulSet":
             for claim in doc.get("spec", {}).get("volumeClaimTemplates", []):
-                requests.append(at(claim, "spec", "resources", "requests", "storage"))
-    return requests
+                specs.append(at(claim, "spec"))
+    return specs
+
+
+def storage_requests(docs):
+    return [at(spec, "resources", "requests", "storage") for spec in claim_specs(docs)]
 
 
 grafana_values = load_one(assets / "grafana-values.yaml")
@@ -257,7 +262,9 @@ assert at(grafana_values, "admin", "userKey") == "admin-user"
 assert at(grafana_values, "admin", "passwordKey") == "admin-password"
 assert at(grafana_values, "persistence", "enabled") is True
 assert_quantity(at(grafana_values, "persistence", "size"), "2Gi", "Grafana PVC")
-assert at(grafana_values, "persistence", "storageClassName") == "local-path"
+assert "storageClassName" not in at(grafana_values, "persistence"), (
+    "Grafana must defer storage class selection to the cluster default"
+)
 assert at(grafana_values, "testFramework", "enabled") is False
 
 assert at(loki_values, "deploymentMode") == "SingleBinary"
@@ -271,7 +278,9 @@ assert at(loki_values, "write", "replicas") == 0
 assert at(loki_values, "backend", "replicas") == 0
 assert at(loki_values, "loki", "storage", "type") == "filesystem"
 assert_quantity(at(loki_values, "singleBinary", "persistence", "size"), "10Gi", "Loki PVC")
-assert at(loki_values, "singleBinary", "persistence", "storageClass") == "local-path"
+assert "storageClass" not in at(loki_values, "singleBinary", "persistence"), (
+    "Loki must defer storage class selection to the cluster default"
+)
 assert at(loki_values, "loki", "ingester", "wal", "replay_memory_ceiling") == "512MB"
 disk_threshold = at(loki_values, "loki", "ingester", "wal", "disk_full_threshold")
 assert disk_threshold, "Loki 3.7 disk_full_threshold must be set"
@@ -291,7 +300,9 @@ assert at(prometheus_values, "alertmanager", "enabled") is False
 assert at(prometheus_values, "prometheus-pushgateway", "enabled") is False
 assert at(prometheus_values, "configmapReload", "prometheus", "enabled") is False
 assert_quantity(at(prometheus_values, "server", "persistentVolume", "size"), "8Gi", "Prometheus PVC")
-assert at(prometheus_values, "server", "persistentVolume", "storageClass") == "local-path"
+assert "storageClass" not in at(prometheus_values, "server", "persistentVolume"), (
+    "Prometheus must defer storage class selection to the cluster default"
+)
 
 grafana_docs = load_docs(grafana_path)
 loki_docs = load_docs(loki_path)
@@ -346,6 +357,23 @@ assert grafana_pvcs, "Grafana must render a persistent PVC"
 assert any(at(doc, "spec", "resources", "requests", "storage") == "2Gi" for doc in grafana_pvcs)
 assert "10Gi" in storage_requests(loki_docs), "Loki must render a 10Gi persistent claim"
 assert "8Gi" in storage_requests(prometheus_docs), "Prometheus must render an 8Gi persistent claim"
+assert "5Gi" in storage_requests(tempo_docs), "Tempo must render a 5Gi persistent claim"
+
+rendered_storage = {
+    "Grafana": grafana_docs,
+    "Loki": loki_docs,
+    "Prometheus": prometheus_docs,
+    "Tempo": tempo_docs,
+}
+if mutation == "storage-class":
+    grafana_pvcs[0]["spec"]["storageClassName"] = ""
+for label, docs in rendered_storage.items():
+    claims = claim_specs(docs)
+    assert claims, f"{label} must render persistent storage"
+    assert all("storageClassName" not in claim for claim in claims), (
+        f"{label} must leave rendered storageClassName absent so the cluster "
+        "default provisioner can select the class"
+    )
 
 # ---------------------------------------------------------------------------
 # The scrape source boundary (issue #2060).
@@ -1104,7 +1132,7 @@ roles = [doc for doc in curie_install_docs if doc.get("kind") == "Role"
          and doc.get("metadata", {}).get("name") == role_name]
 assert len(roles) == 1
 restart_deployments = set(at(curie_values, "grafanaConnector", "restartDeploymentNames"))
-assert restart_deployments == {"curie-sre-bot-grafana", "curie-sre-bot-tempo"}
+assert restart_deployments == {"curie-sre-bot-mcp-grafana", "curie-sre-bot-mcp-tempo"}
 if mutation == "restart-scope":
     for rule in roles[0].get("rules", []):
         if "deployments" in rule.get("resources", []):

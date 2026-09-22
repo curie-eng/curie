@@ -25,6 +25,7 @@ from ..models import PublicationReviewReservation, ThreadPublicationLineage
 from ..publication_authority import (
     AuthorityRefused,
     AuthorityUnavailable,
+    PublicationRemoteTerminal,
     verify_publication_identity,
 )
 from ..repo_full_name import repo_url_path
@@ -341,6 +342,11 @@ async def advance_publication_lineage(
         publication = await crud.get_publication(session, publication_id)
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
+        conflict = crud.publication_lineage_outcome_conflict(
+            publication, publication.lineage, data
+        )
+        if conflict is not None:
+            raise conflict
         identity = await verify_publication_identity(
             publication.lineage,
             data,
@@ -353,6 +359,17 @@ async def advance_publication_lineage(
             data,
             identity=identity,
         )
+    except PublicationRemoteTerminal as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.lineage_terminal",
+                "message": (
+                    "the pull request for this thread is merged or closed; start a new thread"
+                ),
+                "observed_state": exc.state,
+            },
+        ) from None
     except AuthorityUnavailable:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,

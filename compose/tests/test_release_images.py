@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -304,7 +305,35 @@ def test_ladder_local_release_rung_calls_the_shared_checker() -> None:
     start = text.index("rung_local_release() {")
     end = text.index('assert_bundle_identity "local-release"', start)
     body = text[start:end]
+    resolved = "$resolved_release_compose"
+    render = re.search(
+        r'(?P<command>[^\n]*release_config_args\[@\][^\n]*config)\s*>\s*'
+        r'"\$resolved_release_compose"',
+        body,
+    )
+    assert render is not None, (
+        "the local release rung must render the generated release file and every "
+        "private overlay into one resolved compose artifact before preflight"
+    )
+    before_render = body[: render.start()]
+    assert '-f "$release_compose"' in before_render
+    assert '${COMPOSE_FILES[$extra_i]}' in before_render
+
     assert "compose/release_images.py" in body
     assert "--check" in body
+    release_check = body.index("compose/release_images.py")
+    release_call = body[release_check : release_check + 350]
+    assert f'--compose "{resolved}"' in release_call
+
+    helper_check = body.index("compose/ensure_release_images.py")
+    helper_call = body[helper_check : helper_check + 350]
+    assert f'--compose-file "{resolved}"' in helper_call
+    assert render.start() < release_check < helper_check
+
+    inspect = body.index('docker image inspect "$image"')
+    refusal = body.index("if (( missing )); then", helper_check)
+    assert render.start() < release_check < inspect < helper_check < refusal
+    assert "error: image '$image'" in body[inspect:helper_check]
+    assert "return 1" in body[refusal : refusal + 350]
     assert "docker pull" not in body
     assert "curie-dispatcher:latest" not in body

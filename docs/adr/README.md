@@ -180,11 +180,14 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
 | 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
 | 0153 | [A channel-port turn carries its attachments, and the worker fetches them from the adapter that produced them](0153-a-channel-port-turn-carries-its-attachments.md) | Accepted |
-| 0154 | [The tracker owns dependencies and Curie admits ready work](0154-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
-| 0155 | [WorkItems own durable execution identity](0155-work-items-own-durable-execution-identity.md) | Accepted |
+| 0154 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0154-adapter-principal-with-a-scoped-credential.md) | Accepted |
+| 0155 | [Tenant boundary and principal identity land together](0155-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
 | 0156 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0156-adapter-principal-with-a-scoped-credential.md) | Accepted |
 | 0157 | [Factory work dispatches from SQL over the runs stream](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md) | Accepted |
+| 0158 | [A custom connector is a bundle built HTTP MCP server that holds its own credential](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md) | Draft |
 | 0159 | [A canary is a weighted second active deployment and every trace carries its version](0159-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
 | 0160 | [A long scheduled sweep stays on one sandbox](0160-a-long-scheduled-sweep-stays-on-one-sandbox.md) | Accepted |
 | 0161 | [Signed GitHub issue events admit one WorkItem](0161-signed-github-issue-events-admit-one-work-item.md) | Accepted |
+| 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
+| 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 <!-- END GENERATED: adr-index -->

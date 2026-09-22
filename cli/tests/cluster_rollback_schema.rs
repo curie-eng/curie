@@ -61,10 +61,10 @@ fn v089_published_window_ends_at_0039_and_requires_artifact_identity() {
     assert!(catalog_marks_artifact_identity_ambiguous("0.8.9"));
 }
 
-/// Release v0.9.0 carries Alembic head 0044. Pin both the accepted live head
-/// and the fail-closed boundary for an unknown successor.
+/// Release v0.9.0 shipped Alembic head 0044. Pin both the accepted live head
+/// and the fail closed boundary for its successor.
 #[test]
-fn v090_accepts_0044_and_refuses_an_unknown_newer_revision() {
+fn v090_accepts_0044_and_refuses_0045() {
     let window = window_for("0.9.0").expect("0.9.0 is catalogued");
     assert_eq!(window.schema_min, "0001");
     assert_eq!(window.schema_head, "0044");
