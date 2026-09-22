@@ -20294,7 +20294,7 @@
           },
           {
             "in": "cookie",
-            "name": "curie_oidc_state",
+            "name": "__Host-curie_oidc_state",
             "required": false,
             "schema": {
               "anyOf": [
