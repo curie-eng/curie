@@ -1,0 +1,14 @@
+{
+  "apiVersion": "external-secrets.io/v1",
+  "kind": "SecretStore",
+  "metadata": {"name": "curie-aws", "namespace": "curie"},
+  "spec": {
+    "provider": {
+      "aws": {
+        "service": "SecretsManager",
+        "region": "us-east-1",
+        "auth": {"jwt": {"serviceAccountRef": {"name": "curie-eso"}}}
+      }
+    }
+  }
+}
