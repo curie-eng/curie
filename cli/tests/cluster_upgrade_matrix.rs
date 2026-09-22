@@ -219,9 +219,23 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
             .expect("read application schema catalog"),
     )
     .expect("parse application schema catalog");
+    for version in ["0.9.0", "0.9.1"] {
+        assert_eq!(
+            catalog["windows"][version]["schema_min"], "0001",
+            "the released {version} rollback floor must remain pinned"
+        );
+        assert_eq!(
+            catalog["windows"][version]["schema_head"], "0044",
+            "the released {version} rollback head must remain pinned"
+        );
+    }
     assert_eq!(
-        catalog["windows"]["0.9.0"]["schema_head"], "0045",
-        "the supported 0.9.0 rollback head must remain pinned"
+        catalog["windows"]["0.9.2"]["schema_min"], "0045",
+        "0.9.2 must begin at the chart schema compatibility floor"
+    );
+    assert_eq!(
+        catalog["windows"]["0.9.2"]["schema_head"], "0045",
+        "0.9.2 must stop at the chart schema compatibility head"
     );
     assert!(
         source.contains("rollback-published-089"),
