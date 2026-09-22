@@ -4,7 +4,7 @@ The flow is driven the way a browser drives it, against a real in-process IdP
 (``oidc_test_idp``) on a real socket:
 
 1. ``GET /console/oidc/login`` on the TestClient, redirects NOT followed: a 302
-   to the IdP's authorize endpoint plus a ``curie_oidc_state`` cookie.
+   to the IdP's authorize endpoint plus a ``__Host-curie_oidc_state`` cookie.
 2. The authorize URL is fetched with a plain ``httpx`` client (the IdP is not the
    ASGI app); the auto-approving IdP answers 302 to the registered redirect URI,
    ``http://testserver/console/oidc/callback?code=...&state=...``.
@@ -23,6 +23,7 @@ which credential it presents.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import urllib.parse
 import uuid
@@ -51,7 +52,10 @@ from oidc_test_idp import (  # noqa: E402
     oidc_env,
 )
 
-STATE_COOKIE = "curie_oidc_state"
+# ``__Host-``: the browser only accepts it Secure, Path=/ and host-only, so a
+# sibling subdomain or a plaintext response cannot plant a state of its own.
+STATE_COOKIE = "__Host-curie_oidc_state"
+LEGACY_STATE_COOKIE = "curie_oidc_state"
 SESSION_COOKIE = "curie_console_session"
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
@@ -199,20 +203,72 @@ def oidc_client(
     ``approvals_client`` does.
     """
 
+    with _booted_app(enabled_env(idp)) as client:
+        yield client
+
+
+@contextlib.contextmanager
+def _booted_app(
+    env: dict[str, str | None], *, raise_server_exceptions: bool = True
+) -> Iterator[TestClient]:
+    """Boot the app under ``env`` on a clean principal / login-attempt table."""
+
     # clean_db truncates console_sessions; principals are ours to reset. CASCADE
     # reaches principal_teams and (post-0052) console_sessions.principal_id.
     _sql("TRUNCATE curie.principals CASCADE")
-    with oidc_env(enabled_env(idp)):
+    _sql("TRUNCATE curie.oidc_login_attempts")
+    with oidc_env(env):
         from curie_api import oidc
         from curie_api.main import create_app
 
         oidc.reset_caches()
         try:
-            with TestClient(create_app()) as client:
+            with TestClient(
+                create_app(), raise_server_exceptions=raise_server_exceptions
+            ) as client:
                 yield client
         finally:
             oidc.reset_caches()
             _sql("TRUNCATE curie.principals CASCADE")
+            _sql("TRUNCATE curie.oidc_login_attempts")
+
+
+@pytest.fixture
+def lenient_oidc_client(
+    _disposable_db: Any, clean_db: None, runs_stream: str, idp: TestIdP
+) -> Iterator[TestClient]:
+    """``oidc_client``, but an escaped exception is a 500 response, not a raise.
+
+    A misbehaving IdP must never produce a 500; answering one (rather than
+    re-raising into the test) lets the malformed-response tests assert on the
+    response the browser would actually get.
+    """
+
+    with _booted_app(enabled_env(idp), raise_server_exceptions=False) as client:
+        yield client
+
+
+@pytest.fixture
+def public_idp() -> Iterator[TestIdP]:
+    """An IdP that registers Curie as a public client: no secret at all."""
+
+    with TestIdP(
+        client_id=AUDIENCE,
+        client_secret=None,
+        redirect_uri=REDIRECT_URI,
+        token_auth_methods=["none"],
+    ) as server:
+        yield server
+
+
+@pytest.fixture
+def public_oidc_client(
+    _disposable_db: Any, clean_db: None, runs_stream: str, public_idp: TestIdP
+) -> Iterator[TestClient]:
+    """The app configured with an EMPTY ``CURIE_OIDC_CLIENT_SECRET``."""
+
+    with _booted_app({**enabled_env(public_idp), "CURIE_OIDC_CLIENT_SECRET": ""}) as client:
+        yield client
 
 
 # --- login redirect ------------------------------------------------------------
@@ -243,7 +299,16 @@ def test_login_redirects_to_idp_with_pkce_state_and_nonce(
     assert morsel["httponly"]
     assert morsel["secure"]
     assert morsel["samesite"].lower() == "lax"
-    assert morsel["path"] == "/console/oidc"
+    # __Host- rules: Path=/ and host-only (no Domain attribute).
+    assert morsel["path"] == "/"
+    assert morsel["domain"] == ""
+    raw = next(
+        header
+        for header in response.headers.get_list("set-cookie")
+        if header.startswith(f"{STATE_COOKIE}=")
+    )
+    assert "domain=" not in raw.lower(), raw
+    assert LEGACY_STATE_COOKIE not in _set_cookies(response)
 
 
 def test_each_login_mints_fresh_state_nonce_and_challenge(oidc_client: TestClient) -> None:
@@ -427,6 +492,23 @@ def test_missing_state_cookie_is_refused(oidc_client: TestClient, idp: TestIdP) 
     assert _principal_rows() == []
 
 
+def test_legacy_state_cookie_name_is_not_accepted(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    # Only the __Host- name binds the callback: a plain-named cookie is exactly
+    # what a sibling subdomain or plaintext response could plant.
+    callback = _begin_login(oidc_client)
+    response = oidc_client.get(
+        f"{callback.path}?{urllib.parse.urlencode(callback.params)}",
+        headers=_cookie(LEGACY_STATE_COOKIE, str(callback.state_cookie)),
+        follow_redirects=False,
+    )
+    oidc_client.cookies.clear()
+    _assert_refused(response)
+    assert idp.token_requests == []
+    assert _principal_rows() == []
+
+
 def test_forged_state_matching_its_own_cookie_is_refused(oidc_client: TestClient) -> None:
     # An attacker who controls both the query and the cookie still needs a
     # server-side attempt for that state.
@@ -490,6 +572,137 @@ def test_failures_share_one_detail(oidc_client: TestClient, idp: TestIdP) -> Non
     bad_token = _login(oidc_client)
     assert mismatch.status_code == bad_token.status_code == 401
     assert mismatch.json() == bad_token.json()
+
+
+# --- a misbehaving IdP ---------------------------------------------------------
+
+
+def _refusal_body(client: TestClient) -> Any:
+    """The body of an ordinary callback refusal (no attempt, no cookie)."""
+
+    response = client.get("/console/oidc/callback?code=x&state=y", follow_redirects=False)
+    client.cookies.clear()
+    assert response.status_code == 401, response.text
+    return response.json()
+
+
+_MALFORMED_IDP = {
+    # httpx raises InvalidURL (not an HTTPError) for these at request time.
+    "token-endpoint-unparseable-host": lambda idp: idp.discovery_overrides.update(
+        token_endpoint="http://[::1"
+    ),
+    "token-endpoint-nul": lambda idp: idp.discovery_overrides.update(
+        token_endpoint="https://idp.example/tok\x00en"
+    ),
+    # Under the 64 KiB cap, far past the recursion limit: RecursionError.
+    "token-deeply-nested-json": lambda idp: setattr(idp, "token_raw_body", b"[" * 60000),
+    "token-not-json": lambda idp: setattr(idp, "token_raw_body", b"<html>oops</html>"),
+    "token-not-utf8": lambda idp: setattr(idp, "token_raw_body", b"\xff\xfe\xfd"),
+    "token-json-array": lambda idp: setattr(idp, "token_raw_body", b"[1, 2]"),
+    "id-token-integer": lambda idp: idp.token_response_overrides.update(id_token=12345),
+    "id-token-object": lambda idp: idp.token_response_overrides.update(id_token={"a": 1}),
+    "id-token-missing": lambda idp: idp.token_response_overrides.update(id_token=None),
+    # Signed by the real key, so these reach claim validation: OverflowError.
+    "exp-infinity": lambda idp: idp.token_claim_overrides.update(exp=float("inf")),
+    # ... and TypeError.
+    "exp-list": lambda idp: idp.token_claim_overrides.update(exp=[1]),
+    "exp-object": lambda idp: idp.token_claim_overrides.update(exp={"at": 1}),
+    "iat-list": lambda idp: idp.token_claim_overrides.update(iat=[1]),
+    "nbf-object": lambda idp: idp.token_claim_overrides.update(nbf={"at": 1}),
+    "exp-string": lambda idp: idp.token_claim_overrides.update(exp="soon"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_MALFORMED_IDP))
+def test_malformed_idp_response_is_the_one_refusal(
+    lenient_oidc_client: TestClient, idp: TestIdP, case: str
+) -> None:
+    """Whatever shape of garbage the IdP returns, the browser sees the one 401.
+
+    Never a 500: that would skip clearing the state cookie and tell a prober
+    which step failed (the module contract in ``curie_api.oidc``).
+    """
+
+    expected = _refusal_body(lenient_oidc_client)
+    _MALFORMED_IDP[case](idp)
+
+    response = _login(lenient_oidc_client)
+
+    _assert_refused(response)
+    assert response.json() == expected
+    assert _principal_rows() == []
+    assert _sql("SELECT id FROM curie.console_sessions") == []
+
+
+# --- bounded login attempts ------------------------------------------------------
+
+
+def _attempt_count() -> int:
+    return int(_sql("SELECT count(*) AS n FROM curie.oidc_login_attempts")[0]["n"])
+
+
+def _cap_at(monkeypatch: pytest.MonkeyPatch, cap: int) -> None:
+    from curie_api import crud
+
+    # raising=False so a missing constant fails on behavior, not on setup.
+    monkeypatch.setattr(crud, "OIDC_LOGIN_ATTEMPT_CAP", cap, raising=False)
+
+
+def test_login_attempt_cap_is_a_positive_int() -> None:
+    from curie_api import crud
+
+    cap = getattr(crud, "OIDC_LOGIN_ATTEMPT_CAP", None)
+    assert isinstance(cap, int) and not isinstance(cap, bool), cap
+    assert cap > 0
+
+
+def test_login_is_refused_at_the_live_attempt_cap(
+    oidc_client: TestClient, idp: TestIdP, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cap_at(monkeypatch, 3)
+    for _ in range(3):
+        started = oidc_client.get("/console/oidc/login", follow_redirects=False)
+        assert started.status_code == 302, started.text
+    oidc_client.cookies.clear()
+    assert _attempt_count() == 3
+
+    refused = oidc_client.get("/console/oidc/login", follow_redirects=False)
+
+    assert refused.status_code == 503, refused.text
+    assert refused.headers.get("cache-control") == "no-store"
+    assert "location" not in refused.headers
+    assert STATE_COOKIE not in _set_cookies(refused)
+    assert LEGACY_STATE_COOKIE not in _set_cookies(refused)
+    assert _attempt_count() == 3
+    assert idp.authorize_requests == []
+
+
+def test_expired_attempts_do_not_count_toward_the_cap(
+    oidc_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cap_at(monkeypatch, 3)
+    for _ in range(3):
+        assert oidc_client.get("/console/oidc/login", follow_redirects=False).status_code == 302
+    oidc_client.cookies.clear()
+    _sql("UPDATE curie.oidc_login_attempts SET expires_at = now() - interval '1 minute'")
+
+    response = oidc_client.get("/console/oidc/login", follow_redirects=False)
+
+    assert response.status_code == 302, response.text
+    assert STATE_COOKIE in _set_cookies(response)
+
+
+def test_consumed_attempts_do_not_count_toward_the_cap(
+    oidc_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cap_at(monkeypatch, 3)
+    for _ in range(3):
+        _session_token(_login(oidc_client))
+
+    response = oidc_client.get("/console/oidc/login", follow_redirects=False)
+
+    assert response.status_code == 302, response.text
+    assert STATE_COOKIE in _set_cookies(response)
 
 
 # --- principal and tenant status ----------------------------------------------
@@ -683,13 +896,31 @@ def test_full_oidc_settings_load() -> None:
     assert settings.oidc_client_secret == "s"
 
 
-def test_client_secret_is_optional() -> None:
-    from curie_api.config import Settings
+def test_client_secret_is_optional_and_the_public_client_logs_in(
+    public_oidc_client: TestClient, public_idp: TestIdP
+) -> None:
+    """An empty secret makes Curie a public client that still completes a login.
 
-    with oidc_env(dict(_FULL)):
-        settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    assert settings.oidc_issuer == _FULL["CURIE_OIDC_ISSUER"]
-    assert not settings.oidc_client_secret
+    The token request carries the bare ``client_id`` in the form body and no
+    client authentication at all -- no Basic header and no ``client_secret`` --
+    with the PKCE verifier as the only proof it started this login.
+    """
+
+    assert get_settings().oidc_client_secret == ""
+
+    token = _session_token(_login(public_oidc_client))
+
+    (token_request,) = public_idp.token_requests
+    assert token_request["auth_method"] == "none"
+    assert token_request["authorization"] is None
+    assert token_request["form"]["client_id"] == AUDIENCE
+    assert "client_secret" not in token_request["form"]
+    assert token_request["form"].get("code_verifier")
+    principal = public_oidc_client.get(
+        "/console/principal", headers=_cookie(SESSION_COOKIE, token)
+    )
+    assert principal.status_code == 200, principal.text
+    assert principal.json()["idp_subject"] == public_idp.subject
 
 
 def test_no_oidc_settings_is_disabled() -> None:
@@ -720,3 +951,49 @@ def test_partial_oidc_settings_refuse_to_load(missing: tuple[str, ...]) -> None:
     partial = {name: value for name, value in _FULL.items() if name not in missing}
     with oidc_env(partial), pytest.raises(ValidationError):
         Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+# Short on purpose: pydantic keeps the head and tail of a long repr, and a
+# short secret at the end of the input dict survives the elision whole.
+_SECRET_SENTINEL = "Xq7Zk2Wp"
+
+
+@pytest.mark.parametrize(
+    "present",
+    [
+        ("CURIE_OIDC_ISSUER",),
+        ("CURIE_OIDC_ISSUER", "CURIE_OIDC_AUDIENCE", "CURIE_OIDC_JWKS_URL"),
+    ],
+    ids=["issuer-only", "missing-redirect"],
+)
+def test_partial_oidc_settings_error_does_not_print_the_client_secret(
+    present: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boot error lands in container logs; the client secret must not.
+
+    The rest of the environment is emptied first: pydantic elides the middle
+    of a long ``input_value`` repr, so on a busy test environment a leak could
+    hide behind the ellipsis. A small config is where it prints verbatim.
+    """
+
+    import os
+
+    from curie_api.config import Settings
+    from pydantic import ValidationError
+
+    for name in list(os.environ):
+        monkeypatch.delenv(name, raising=False)
+
+    partial = {name: _FULL[name] for name in present}
+    missing = [name for name in _FULL if name not in present]
+    with (
+        oidc_env({**partial, "CURIE_OIDC_CLIENT_SECRET": _SECRET_SENTINEL}),
+        pytest.raises(ValidationError) as caught,
+    ):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+    message = str(caught.value)
+    assert _SECRET_SENTINEL not in message
+    assert _SECRET_SENTINEL not in repr(caught.value)
+    for name in missing:
+        assert name in message, (name, message)

@@ -16,6 +16,11 @@ exchange and JWKS fetches all cross a real socket.
   post with a secret, or a bare ``client_id`` for a public client).
 - ``GET /jwks`` -- the current signing key(s).
 
+Misbehaving-IdP knobs (:attr:`TestIdP.discovery_overrides`,
+:attr:`TestIdP.token_claim_overrides`, :attr:`TestIdP.token_response_overrides`,
+:attr:`TestIdP.token_raw_body`) let the login tests feed the API malformed
+discovery documents, token responses and ID token claims.
+
 ID tokens are RS256-signed with a generated key. :attr:`TestIdP.token_variant`
 makes ``/token`` hand out a deliberately bad token, and :meth:`TestIdP.mint_id_token`
 mints any variant directly for validator unit tests.
@@ -133,6 +138,15 @@ class TestIdP:
     authorize_error: str | None = None
     #: What ``/token`` signs into the ID token.
     token_variant: str = "good"
+    #: Merged over the discovery document (e.g. a malformed ``token_endpoint``).
+    discovery_overrides: dict[str, Any] = field(default_factory=dict)
+    #: Merged over the claims ``/token`` signs into the ID token.
+    token_claim_overrides: dict[str, Any] = field(default_factory=dict)
+    #: Merged over the ``/token`` JSON response (e.g. a non-string ``id_token``).
+    token_response_overrides: dict[str, Any] = field(default_factory=dict)
+    #: When set, ``/token`` answers a successful exchange with exactly these
+    #: bytes (status 200, ``application/json``) instead of a JSON document.
+    token_raw_body: bytes | None = None
     subject: str = "idp-user-1"
     email: str | None = "alice@example.com"
     name: str | None = "Alice Example"
@@ -325,7 +339,7 @@ class TestIdP:
     # --- HTTP --------------------------------------------------------------
 
     def _discovery(self) -> dict[str, Any]:
-        return {
+        document = {
             "issuer": self.discovery_issuer or self.issuer,
             "authorization_endpoint": self.authorization_endpoint,
             "token_endpoint": self.token_endpoint,
@@ -337,6 +351,8 @@ class TestIdP:
             "token_endpoint_auth_methods_supported": list(self.token_auth_methods),
             "code_challenge_methods_supported": ["S256"],
         }
+        document.update(self.discovery_overrides)
+        return document
 
     def _handle(self, req: BaseHTTPRequestHandler, method: str) -> None:
         parsed = urllib.parse.urlsplit(req.path)
@@ -437,7 +453,13 @@ class TestIdP:
         form = dict(urllib.parse.parse_qsl(raw))
         method = self._client_auth_method(req, form)
         with self._lock:
-            self.token_requests.append({"form": dict(form), "auth_method": method})
+            self.token_requests.append(
+                {
+                    "form": dict(form),
+                    "auth_method": method,
+                    "authorization": req.headers.get("Authorization"),
+                }
+            )
 
         if method is None:
             _send_json(req, 401, {"error": "invalid_client"})
@@ -464,18 +486,21 @@ class TestIdP:
             _send_json(req, 400, {"error": "invalid_grant", "detail": "pkce"})
             return
 
-        id_token = self.mint_id_token(nonce=grant.nonce, variant=self.token_variant)
-        _send_json(
-            req,
-            200,
-            {
-                "access_token": secrets.token_urlsafe(16),
-                "refresh_token": secrets.token_urlsafe(16),
-                "token_type": "Bearer",
-                "expires_in": 300,
-                "id_token": id_token,
-            },
+        if self.token_raw_body is not None:
+            _send_raw(req, 200, self.token_raw_body)
+            return
+        id_token = self.mint_id_token(
+            nonce=grant.nonce, variant=self.token_variant, **self.token_claim_overrides
         )
+        body: dict[str, Any] = {
+            "access_token": secrets.token_urlsafe(16),
+            "refresh_token": secrets.token_urlsafe(16),
+            "token_type": "Bearer",
+            "expires_in": 300,
+            "id_token": id_token,
+        }
+        body.update(self.token_response_overrides)
+        _send_json(req, 200, body)
 
 
 def _hand_signed(header: dict[str, Any], claims: dict[str, Any], sign: Any) -> str:
@@ -487,7 +512,10 @@ def _hand_signed(header: dict[str, Any], claims: dict[str, Any], sign: Any) -> s
 
 
 def _send_json(req: BaseHTTPRequestHandler, status: int, body: dict[str, Any]) -> None:
-    payload = json.dumps(body).encode("utf-8")
+    _send_raw(req, status, json.dumps(body).encode("utf-8"))
+
+
+def _send_raw(req: BaseHTTPRequestHandler, status: int, payload: bytes) -> None:
     req.send_response(status)
     req.send_header("Content-Type", "application/json")
     req.send_header("Cache-Control", "no-store")
