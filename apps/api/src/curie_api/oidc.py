@@ -74,6 +74,32 @@ _ALG_KEY_TYPES = {
 #: The curve each ECDSA algorithm is defined over (RFC 7518 3.4).
 _EC_CURVES = {"ES256": "P-256", "ES384": "P-384", "ES512": "P-521"}
 
+#: Everything httpx raises for a request it could not make or finish.
+#: ``InvalidURL`` (an unparseable or NUL-bearing endpoint the IdP named),
+#: ``CookieConflict`` and ``StreamError`` sit outside ``HTTPError``, so catching
+#: only the latter let a malformed discovered endpoint escape as a 500.
+_HTTPX_FAILURES: tuple[type[Exception], ...] = (
+    httpx.HTTPError,
+    httpx.InvalidURL,
+    httpx.CookieConflict,
+    httpx.StreamError,
+)
+#: What parsing an IdP-supplied JSON body can raise. ``ValueError`` covers bad
+#: JSON and bad UTF-8; ``RecursionError`` is a deeply nested body, well under
+#: :data:`MAX_RESPONSE_BYTES`, that exhausts the parser's stack.
+_JSON_FAILURES: tuple[type[Exception], ...] = (ValueError, RecursionError)
+#: What PyJWT can raise on a token whose signature checks out but whose claims
+#: are the wrong shape. Besides ``PyJWTError`` it lets bare ``TypeError`` out
+#: for a list- or object-valued ``exp``/``iat``/``nbf``/``iss``,
+#: ``OverflowError`` for ``exp: Infinity``, and the JSON failures above for the
+#: header or payload segments.
+_JWT_FAILURES: tuple[type[Exception], ...] = (
+    jwt.PyJWTError,
+    TypeError,
+    OverflowError,
+    *_JSON_FAILURES,
+)
+
 
 class OidcError(Exception):
     """Any failure in discovery, code exchange or ID token validation.
@@ -168,11 +194,11 @@ async def _request_json(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
                 body.extend(chunk)
                 if len(body) > MAX_RESPONSE_BYTES:
                     raise OidcError(f"{method} {url} response exceeds {MAX_RESPONSE_BYTES} bytes")
-    except httpx.HTTPError as exc:
+    except _HTTPX_FAILURES as exc:
         raise OidcError(f"{method} {url} failed: {type(exc).__name__}") from exc
     try:
         parsed = json.loads(bytes(body))
-    except ValueError as exc:
+    except _JSON_FAILURES as exc:
         raise OidcError(f"{method} {url} did not return JSON") from exc
     if not isinstance(parsed, dict):
         raise OidcError(f"{method} {url} did not return a JSON object")
@@ -400,7 +426,7 @@ async def validate_id_token(token: str, *, nonce: str) -> OidcClaims:
 
     try:
         header = jwt.get_unverified_header(token)
-    except jwt.PyJWTError as exc:
+    except _JWT_FAILURES as exc:
         raise OidcError("ID token is not a JWS") from exc
     alg = header.get("alg")
     if not isinstance(alg, str) or alg not in _ALG_KEY_TYPES:
@@ -420,7 +446,7 @@ async def validate_id_token(token: str, *, nonce: str) -> OidcClaims:
             leeway=LEEWAY_S,
             options={"require": ["exp", "iat", "iss", "aud", "sub"]},
         )
-    except jwt.PyJWTError as exc:
+    except _JWT_FAILURES as exc:
         raise OidcError(f"ID token rejected: {type(exc).__name__}") from exc
 
     aud = claims.get("aud")
