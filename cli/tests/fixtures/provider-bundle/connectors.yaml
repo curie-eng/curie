@@ -1,0 +1,11 @@
+connectors:
+  digest:
+    build:
+      context: connectors/digest
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    secrets:
+      - STATIC_KEY
+      - ROTATED_KEY
+    bearer_secret: STATIC_KEY
