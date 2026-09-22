@@ -454,15 +454,16 @@ entries:
         - secret: ui.imagePullSecrets
         - secret: agentSandbox.runner.imagePullSecrets
 
-  # Issued and renewed by cert-manager (or the operator) in-cluster.
+  # The chart takes a supplied certificate by name and configures no issuer,
+  # so nothing in the install can recreate it after cluster loss.
   - logical_name: api-ingress-tls
     class: external
     target: "{release}-curie-api-tls"
     keys: [tls.crt, tls.key]
     consumers: [ingress]
-    rotation_owner: workload:cert-manager
+    rotation_owner: sm
     update_policy: replace
-    store: cluster
+    store: sm
     chart:
       knobs:
         - secret: api.ingress.tls.secretName
