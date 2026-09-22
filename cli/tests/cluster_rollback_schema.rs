@@ -114,7 +114,10 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
-    assert_eq!(revisions, ["0045", "0046", "0047", "0048", "0049", "0050", "0051"]);
+    assert_eq!(
+        revisions,
+        ["0045", "0046", "0047", "0048", "0049", "0050", "0051"]
+    );
     assert!(pending.iter().all(|step| step.kind == "expand"));
 
     let decision = plan_upgrade(
