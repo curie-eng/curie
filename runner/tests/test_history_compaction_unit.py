@@ -216,4 +216,46 @@ def test_publication_outcome_stays_visible_in_the_compacted_replay() -> None:
     replay, _summary = build_conversation_replay(_parse_records(compacted))
     replay_text = json.dumps([message.to_dict() for message in replay.messages])
     assert outcome_text in replay_text, "the publication outcome vanished from the replay"
+
+
+def test_publication_outcome_survives_a_saturated_prior_summary() -> None:
+    """#2927 review P1: a prior summary already at the ``_make_summary`` budget
+    must not crowd out a newly recorded publication outcome.
+
+    Compaction folds the marker's turn into a fresh summary alongside the prior
+    summary's content. If that fresh summary is bounded by keeping the OLDEST
+    bytes (the prior content) rather than the newest, the just-added outcome
+    text is discarded entirely: the resumed model can never see it, even though
+    the raw marker survives verbatim ahead of the summary (where replay ignores
+    it, per ``build_conversation_replay``'s docstring).
+    """
+
+    url = "https://github.com/o/r/pull/4"
+    outcome_text = f"Published PR #4 at {url}"
+    saturated_prior = SummaryRecord(
+        content="OLDER-SUMMARY " + ("x" * 8_000),
+        digest="a" * 64,
+        source_turns=6,
+        through_ts="2026-09-21T00:00:00Z",
+        tail=(),
+        ts="2026-09-21T00:00:00Z",
+    ).to_dict()
+    marker = {
+        "user": "Platform publication outcome",
+        "assistant": outcome_text,
+        "ts": "2026-09-22T00:00:02Z",
+        "publication_id": "00000000-0000-0000-0000-000000000004",
+    }
+    value = [saturated_prior, marker, _turn("latest", 20_000)]
+
+    compacted = compact_transcript_value(value)
+
+    # The raw idempotency marker still exists verbatim, ahead of the summary --
+    # but replay ignores anything before the latest summary, so this alone does
+    # not make the outcome visible to the resumed model.
+    assert marker in compacted
+
+    replay, _summary = build_conversation_replay(_parse_records(compacted))
+    replay_text = json.dumps([message.to_dict() for message in replay.messages])
+    assert outcome_text in replay_text, "the publication outcome vanished from the replay"
     assert "latest request" in replay_text
