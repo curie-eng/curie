@@ -2928,6 +2928,18 @@ async def revoke_console_session(
 #: a person to type a password and pass MFA, short enough that an abandoned
 #: attempt stops being redeemable soon after.
 OIDC_LOGIN_TTL = timedelta(minutes=10)
+#: Most live (unconsumed, unexpired) login attempts that may exist at once. The
+#: login start is unauthenticated and writes a row, so expiry alone bounds the
+#: table only by time: an anonymous flood would grow it by (rate x TTL). A
+#: fixed cap bounds it by count instead. 1000 is far above any real appliance's
+#: concurrent logins in a ten-minute window, and small enough that counting and
+#: pruning stay cheap on the ``expires_at`` index. At the cap new logins are
+#: refused (a flood can delay logins, but cannot exhaust the database).
+OIDC_LOGIN_ATTEMPT_CAP = 1000
+
+
+class OidcLoginAttemptsExhausted(Exception):
+    """Raised instead of creating an attempt when :data:`OIDC_LOGIN_ATTEMPT_CAP` is reached."""
 
 #: The single-tenant appliance's tenant, provisioned by migration 0050 at this
 #: fixed id. Every OIDC principal lands here until issuer-to-tenant mapping
@@ -2961,13 +2973,27 @@ async def create_oidc_login_attempt(session: AsyncSession) -> OidcLoginStart:
     code intercepted on the way back cannot be redeemed without this row.
 
     The route that calls this is unauthenticated, so expired attempts are
-    pruned here: the table then holds at most the attempts of the last
-    :data:`OIDC_LOGIN_TTL`, not every login ever started.
+    pruned here, and once :data:`OIDC_LOGIN_ATTEMPT_CAP` live attempts exist
+    this raises :class:`OidcLoginAttemptsExhausted` without writing: the table
+    holds at most the cap, not whatever a flood manages within
+    :data:`OIDC_LOGIN_TTL`. The count is not serialized with the insert, so
+    concurrent starts can overshoot the cap by at most their own number.
     """
+    await session.execute(delete(OidcLoginAttempt).where(OidcLoginAttempt.expires_at <= func.now()))
+    live = await session.scalar(
+        select(func.count())
+        .select_from(OidcLoginAttempt)
+        .where(
+            OidcLoginAttempt.consumed_at.is_(None),
+            OidcLoginAttempt.expires_at > func.now(),
+        )
+    )
+    if (live or 0) >= OIDC_LOGIN_ATTEMPT_CAP:
+        await session.commit()
+        raise OidcLoginAttemptsExhausted
     state = new_state()
     nonce = new_nonce()
     verifier = new_code_verifier()
-    await session.execute(delete(OidcLoginAttempt).where(OidcLoginAttempt.expires_at <= func.now()))
     session.add(
         OidcLoginAttempt(
             state_hash=hash_console_credential(state),

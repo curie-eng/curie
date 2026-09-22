@@ -207,7 +207,16 @@ async def oidc_login(session: SessionDep) -> RedirectResponse:
             detail="identity provider unavailable",
             headers=_NO_STORE,
         ) from None
-    start = await crud.create_oidc_login_attempt(session)
+    try:
+        start = await crud.create_oidc_login_attempt(session)
+    except crud.OidcLoginAttemptsExhausted:
+        # No row, no state cookie: a refused start leaves nothing behind.
+        logger.warning("oidc login refused: live login attempt cap reached")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="too many logins in progress; try again shortly",
+            headers=_NO_STORE,
+        ) from None
     response = RedirectResponse(
         oidc.authorization_url(
             metadata,

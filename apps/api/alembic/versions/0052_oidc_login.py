@@ -12,6 +12,8 @@
   unchanged.
 - ``oidc_login_attempts`` holds the short-lived, single-use server side of an
   in-flight authorization-code login (hashed state, nonce, PKCE verifier).
+  ``expires_at`` is indexed: the unauthenticated login start prunes expired
+  attempts and counts live ones on every request, and must not scan the table.
 
 Expand: the release before this one never reads any of it.
 
@@ -36,6 +38,7 @@ OLD_KEY = "principals_tenant_idp_subject_key"
 NEW_KEY = "principals_tenant_issuer_subject_key"
 SESSION_FK = "console_sessions_principal_id_fkey"
 SESSION_INDEX = "ix_console_sessions_principal_id"
+ATTEMPT_EXPIRY_INDEX = "ix_oidc_login_attempts_expires_at"
 
 
 def upgrade() -> None:
@@ -87,9 +90,13 @@ def upgrade() -> None:
         sa.UniqueConstraint("state_hash", name="oidc_login_attempts_state_hash_key"),
         schema=SCHEMA,
     )
+    op.create_index(
+        ATTEMPT_EXPIRY_INDEX, "oidc_login_attempts", ["expires_at"], schema=SCHEMA
+    )
 
 
 def downgrade() -> None:
+    op.drop_index(ATTEMPT_EXPIRY_INDEX, table_name="oidc_login_attempts", schema=SCHEMA)
     op.drop_table("oidc_login_attempts", schema=SCHEMA)
 
     op.drop_index(SESSION_INDEX, table_name="console_sessions", schema=SCHEMA)

@@ -1882,6 +1882,9 @@ class OidcLoginAttempt(Base):
     __tablename__ = "oidc_login_attempts"
     __table_args__ = (
         UniqueConstraint("state_hash", name="oidc_login_attempts_state_hash_key"),
+        # The unauthenticated login start prunes and counts by expiry; without
+        # this both scan every live attempt, so a flood makes each request dearer.
+        Index("ix_oidc_login_attempts_expires_at", "expires_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
