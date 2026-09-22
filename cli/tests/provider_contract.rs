@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use curie::installation::{Installation, ProviderKind};
 use curie::provider::{
     not_implemented, InventoryClass, InventoryEntry, ObjectMetadata, ObjectVersion, ProviderError,
-    PutRequest, RejectedReason, RotationOwner, SecretMaterial, SecretsProvider, Store, StoredObject,
-    UpdatePolicy, EXPIRY_TAG,
+    PutRequest, RejectedReason, RotationOwner, SecretMaterial, SecretsProvider, Store,
+    StoredObject, UpdatePolicy, EXPIRY_TAG,
 };
 use serde_json::{json, Value};
 
@@ -505,12 +505,11 @@ fn secrets_list_file_with_a_provider_is_not_implemented() {
 }
 
 #[test]
-fn secrets_check_rm_and_inventory_are_not_implemented() {
+fn secrets_check_and_rm_are_not_implemented() {
     let env = isolated();
     let invocations: &[(&str, &[&str])] = &[
         ("secrets check", &["secrets", "check"]),
         ("secrets rm", &["secrets", "rm", "MODEL_KEY"]),
-        ("dev secrets-inventory", &["dev", "secrets-inventory"]),
     ];
     for (label, args) in invocations {
         let output = run(&env, args);

@@ -86,7 +86,12 @@ fn values_bound_to_persisted_data_are_immutable_and_provider_held() {
         let found = entries_with_key(&entries, key);
         assert!(!found.is_empty(), "{key} is not in the inventory");
         for e in found {
-            assert_eq!(e.update_policy, UpdatePolicy::Immutable, "{key} in {}", e.logical_name);
+            assert_eq!(
+                e.update_policy,
+                UpdatePolicy::Immutable,
+                "{key} in {}",
+                e.logical_name
+            );
             assert_eq!(e.store, Store::Sm, "{key} in {}", e.logical_name);
         }
     }
@@ -174,7 +179,7 @@ fn doc(body: &str) -> String {
 
 const ROW: &str = "  - logical_name: {name}
     class: external
-    target: {target}
+    target: \"{target}\"
     keys: {keys}
     consumers: [api]
     rotation_owner: {owner}
@@ -325,8 +330,14 @@ fn new_fields_round_trip() {
     assert_eq!(value["store"], "sm");
     assert_eq!(value["rotated_keys"], json!(["refreshToken"]));
     assert_eq!(value["chart"]["default_secret"], "{fullname}-secrets");
-    assert_eq!(value["chart"]["knobs"][0]["secret"], "ledger.existingSecret");
-    assert_eq!(value["chart"]["knobs"][0]["key"], "ledger.existingSecretKey");
+    assert_eq!(
+        value["chart"]["knobs"][0]["secret"],
+        "ledger.existingSecret"
+    );
+    assert_eq!(
+        value["chart"]["knobs"][0]["key"],
+        "ledger.existingSecretKey"
+    );
     let back: InventoryEntry = serde_json::from_value(value).expect("deserialize");
     assert_eq!(back, e);
 }
@@ -458,9 +469,21 @@ fn extract_refs_walks_every_reference_shape() {
         t("projected-src", Some("token"), dep),
         t("regcred", Some(".dockerconfigjson"), dep),
         t("api-tls", None, "Ingress/inv-curie-api"),
-        t("inv-curie-secrets", Some("apiKey"), "Secret/inv-curie-secrets"),
-        t("inv-curie-secrets", Some("apiSalt"), "Secret/inv-curie-secrets"),
-        t("deep-secret", Some("deepKey"), "SandboxTemplate/inv-curie-runner"),
+        t(
+            "inv-curie-secrets",
+            Some("apiKey"),
+            "Secret/inv-curie-secrets",
+        ),
+        t(
+            "inv-curie-secrets",
+            Some("apiSalt"),
+            "Secret/inv-curie-secrets",
+        ),
+        t(
+            "deep-secret",
+            Some("deepKey"),
+            "SandboxTemplate/inv-curie-runner",
+        ),
     ];
     want.sort();
     assert_eq!(triples(&refs), want);
@@ -486,7 +509,11 @@ fn rref(name: &str, key: Option<&str>) -> RenderedRef {
 }
 
 fn postgres_entry() -> InventoryEntry {
-    let mut e = entry("postgres-password", "{release}-curie-postgres", &["postgresPassword"]);
+    let mut e = entry(
+        "postgres-password",
+        "{release}-curie-postgres",
+        &["postgresPassword"],
+    );
     e.chart = Some(ChartBinding {
         default_secret: Some("{fullname}-secrets".into()),
         knobs: vec![ChartKnob {
@@ -514,7 +541,11 @@ fn an_existing_secret_knob_covers_only_when_set() {
 
 #[test]
 fn a_key_knob_covers_a_renamed_byo_key() {
-    let mut e = entry("github-app-key", "{release}-curie-github-app", &["githubAppPrivateKey"]);
+    let mut e = entry(
+        "github-app-key",
+        "{release}-curie-github-app",
+        &["githubAppPrivateKey"],
+    );
     e.chart = Some(ChartBinding {
         default_secret: Some("{fullname}-secrets".into()),
         knobs: vec![ChartKnob {
@@ -588,8 +619,14 @@ fn bundle_entries_carry_workload_rotation() {
     assert_eq!(hosted.len(), 1, "{entries:?}");
     let hosted = hosted[0];
     assert!(hosted.keys.contains(&"LEDGER_REFRESH_TOKEN".to_string()));
-    assert_eq!(hosted.rotation_owner, RotationOwner::Workload("ledger".into()));
-    assert_eq!(hosted.rotated_keys, vec!["LEDGER_REFRESH_TOKEN".to_string()]);
+    assert_eq!(
+        hosted.rotation_owner,
+        RotationOwner::Workload("ledger".into())
+    );
+    assert_eq!(
+        hosted.rotated_keys,
+        vec!["LEDGER_REFRESH_TOKEN".to_string()]
+    );
     assert_eq!(hosted.store, Store::Sm);
 
     let sandbox_target = "{fullname}-agent-fin-connector-secrets";
@@ -607,7 +644,10 @@ fn bundle_entries_carry_workload_rotation() {
     for e in docs {
         assert_eq!(e.rotation_owner, RotationOwner::Sm);
         assert!(e.rotated_keys.is_empty());
-        assert_eq!(e.target, sandbox_target, "a url connector has no hosted Secret");
+        assert_eq!(
+            e.target, sandbox_target,
+            "a url connector has no hosted Secret"
+        );
     }
 
     let mut all = platform_inventory().expect("platform");
@@ -686,7 +726,11 @@ fn the_real_chart_is_fully_covered() {
         .map(|s| (s.name.clone(), triples(&s.uncovered)))
         .collect();
     assert!(report.passed(), "uncovered: {failing:?}");
-    assert!(report.sets.len() >= 8, "only {} values sets", report.sets.len());
+    assert!(
+        report.sets.len() >= 8,
+        "only {} values sets",
+        report.sets.len()
+    );
     for set in &report.sets {
         assert!(set.refs_checked > 0, "{} checked no refs", set.name);
     }
@@ -727,7 +771,10 @@ fn flipped_inventory() -> String {
             flipped += 1;
         }
     }
-    assert!(flipped > 0, "no minted store: cluster Grafana token entry to flip");
+    assert!(
+        flipped > 0,
+        "no minted store: cluster Grafana token entry to flip"
+    );
     serde_norway::to_string(&doc).expect("yaml")
 }
 

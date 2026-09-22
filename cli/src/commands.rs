@@ -1157,6 +1157,112 @@ pub async fn dev_chart_check() -> Result<()> {
     Ok(())
 }
 
+/// The result of a passing `curie dev secrets-inventory` run.
+struct SecretsInventoryOutput(crate::provider::render_check::CheckReport);
+
+impl crate::ui::CliOutput for SecretsInventoryOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.0).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        ui.success(&format!(
+            "every Secret reference in {} values sets is listed by the {} inventory entries",
+            self.0.sets.len(),
+            self.0.entries
+        ));
+    }
+}
+
+/// `curie dev secrets-inventory`: the render coverage check (ADR 0163).
+///
+/// Prints PASS or FAIL per values set and one line per reference no entry
+/// lists, then exits non-zero when any set failed. The chart and the default
+/// `sre-bot` bundle resolve from the checkout; an explicit `--chart` and
+/// `--bundle` work from anywhere.
+pub fn dev_secrets_inventory(
+    chart: Option<PathBuf>,
+    inventory: Option<PathBuf>,
+    bundles: &[String],
+) -> Result<()> {
+    use crate::provider::render_check::{run_check, CheckOptions};
+
+    let ui = crate::ui::ui();
+    let root = find_repo_root();
+    let need_root = || {
+        root.clone().context(
+            "runner/Dockerfile not found here or in any parent directory. Run `curie dev \
+             secrets-inventory` from a curie source checkout, or pass --chart and --bundle.",
+        )
+    };
+    let chart = match chart {
+        Some(chart) => chart,
+        None => need_root()?.join("charts/curie"),
+    };
+    let mut parsed = Vec::new();
+    for bundle in bundles {
+        let Some((agent, dir)) = bundle.split_once('=') else {
+            bail!("--bundle {bundle:?} must be <agent>=<dir>");
+        };
+        parsed.push((agent.to_string(), PathBuf::from(dir)));
+    }
+    if parsed.is_empty() {
+        parsed.push(("sre-bot".to_string(), need_root()?.join("examples/sre-bot")));
+    }
+    let repo_root = match root {
+        Some(root) => root,
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    let report = run_check(&CheckOptions {
+        chart,
+        inventory,
+        bundles: parsed,
+        repo_root,
+    })?;
+
+    for set in &report.sets {
+        let mark = if set.passed() { "PASS" } else { "FAIL" };
+        ui.note(&format!(
+            "{mark}  {} ({} refs checked)",
+            set.name, set.refs_checked
+        ));
+        if let Some(error) = &set.error {
+            ui.note(&format!("{}: failed to render: {error}", set.name));
+        }
+        for reference in &set.uncovered {
+            ui.note(&format!(
+                "{}: {} references Secret {} key {}, which no inventory entry lists",
+                set.name,
+                reference.object,
+                reference.name,
+                reference.key.as_deref().unwrap_or("(whole Secret)")
+            ));
+        }
+    }
+    if !report.unmatched_entries.is_empty() {
+        ui.note(&format!(
+            "note: no values set renders a reference for: {}",
+            report.unmatched_entries.join(", ")
+        ));
+    }
+    let failed: Vec<&str> = report
+        .sets
+        .iter()
+        .filter(|set| !set.passed())
+        .map(|set| set.name.as_str())
+        .collect();
+    if !failed.is_empty() {
+        bail!(
+            "{} of {} values sets reference Secrets the inventory does not list: {}",
+            failed.len(),
+            report.sets.len(),
+            failed.join(", ")
+        );
+    }
+    ui.emit(&SecretsInventoryOutput(report));
+    Ok(())
+}
+
 /// `curie list-agents`: list the plugin bundles under `agents/`, a personal,
 /// gitignored directory (sibling of `examples/`) for in-progress agent
 /// projects ready to hand to `curie deploy-local <folder>`. A release binary has
