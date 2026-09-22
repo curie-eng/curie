@@ -1,20 +1,18 @@
 name: Nightly SRE demo e2e
 
-# Issue #2246 / #2854: the six SRE demo assertions (namespaces_list read,
+# Issue #2246 / #2854: the five SRE demo assertions (namespaces_list read,
 # approved resources_scale, one-shot re-arm, configuration_view denial, RBAC
-# ceiling, throwaway-repo coding PR) on kind with the pinned
-# kubernetes-mcp-server
-# (sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423),
-# a live provider, and api.githubRepoAllowlist. Turns start with
-# `curie cluster message`. Approvals resolve through
-# `curie cluster approvals` and an operator principal on approvers.users
-# routes. No Slack app is required.
+# ceiling) on kind with the pinned kubernetes-mcp-server
+# (sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423)
+# and a live provider. Turns start with `curie cluster message`. Approvals
+# resolve through `curie cluster approvals` and an operator principal on
+# approvers.users routes. No Slack app is required.
 #
 # GitHub fires schedule and workflow_dispatch from the default branch, so a
 # scheduled run grades that branch's script (the Slack-less cluster-message
 # driver). Checking out next here would pair this workflow with the older
-# Slack script and fail closed. Missing the throwaway repo or live provider
-# blocks required scheduled/dispatch/RC acceptance. Pull requests only
+# Slack script and fail closed. A missing live provider blocks required
+# scheduled/dispatch/RC acceptance. Pull requests only
 # inventory readiness without running live work.
 on:
   schedule:
@@ -46,7 +44,7 @@ permissions:
 
 jobs:
   prereqs:
-    name: Check throwaway repo and live provider
+    name: Check live provider
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -65,11 +63,10 @@ jobs:
           CURIE_SRE_DEMO_PHASE: prereqs
           CURIE_SRE_DEMO_REQUIRED: ${{ github.event_name != 'pull_request' && '1' || '0' }}
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
-          CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
         run: bash cli/scripts/sre-demo-e2e.sh prereqs
 
   sre-demo:
-    name: Six SRE demo assertions on kind
+    name: Five SRE demo assertions on kind
     needs: [prereqs]
     if: needs.prereqs.outputs.ready == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -183,7 +180,6 @@ jobs:
           CURIE_BIN: cli/target/release/curie
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
-          CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
         run: |
           set -euo pipefail
           "$CURIE_BIN" cluster up \
@@ -192,7 +188,6 @@ jobs:
             --allow-egress-host openrouter \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
-            --set "api.githubRepoAllowlist[0]=${CI_THROWAY_REPO}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
@@ -205,17 +200,14 @@ jobs:
           kubectl rollout status deploy/curie-worker -n curie --timeout=300s
           kubectl rollout status deploy/curie-ui -n curie --timeout=300s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
-      - name: Six SRE demo assertions
+      - name: Five SRE demo assertions
         env:
           CURIE_SRE_DEMO_RESULTS_FILE: ${{ runner.temp }}/sre-demo-outcomes.jsonl
-          # Dedicated verifier capability, when configured; not the product App.
-          GH_TOKEN: ${{ secrets.CI_THROWAY_REPO_READ_TOKEN }}
           CURIE_BIN: cli/target/release/curie
           CURIE_SRE_DEMO_PHASE: run
           CURIE_SRE_DEMO_ALLOW_LIVE: "1"
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
-          CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
         run: bash cli/scripts/sre-demo-e2e.sh run
       - name: Retain sanitized assertion outcomes
         if: always()

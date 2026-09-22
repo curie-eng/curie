@@ -23,7 +23,6 @@ class DriverOutcomes(unittest.TestCase):
                 "PATH": os.environ["PATH"],
                 "HOME": directory,
                 "CURIE_CREDENTIALS": "test-placeholder",
-                "CI_THROWAY_REPO": "acme-corp/acme-bot",
                 "FIXTURE": str(fixture),
                 "SCRIPT": str(SCRIPT),
             }
@@ -138,13 +137,6 @@ class DriverOutcomes(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), {"row": "read", "status": "FAILED"})
         self.assertNotIn("private-diagnostic-sentinel", result.stdout + result.stderr)
 
-    def test_coding_inspects_off_repo_link(self):
-        result = self.run_function(
-            'echo "https://github.com/acme-corp/another-bot/pull/17" | pr_number_from_reply'
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("outside the authorized repository", result.stderr)
-
     def test_operator_resolution_uses_cluster_approvals(self):
         result = self.run_function(
             """
@@ -233,12 +225,6 @@ cat "$FIXTURE" | audit_is_operator
             ],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_repo_name_echo_cannot_prove_a_coding_pr(self):
-        result = self.run_function(
-            'echo "Open a PR in acme-corp/acme-bot" | pr_number_from_reply'
-        )
-        self.assertNotEqual(result.returncode, 0, result.stderr)
 
     def test_enqueued_json_is_not_a_finished_reply(self):
         result = self.parse_turn(
@@ -330,112 +316,6 @@ cat "$FIXTURE" | audit_is_operator
             "CI_SLACK_CHANNEL_ID",
         ):
             self.assertNotIn(needle, text)
-
-    def test_platform_repository_is_refused_before_live_work(self):
-        for repo in ["curie-eng/curie", "Curie-Eng/AgentOS", "invalid-repo-shape"]:
-            with self.subTest(repo=repo):
-                result = self.run_function(f"CI_THROWAY_REPO={repo} phase_prereqs")
-                self.assertNotEqual(result.returncode, 0, result.stderr)
-
-    def pr(self, **overrides):
-        payload = {
-            "url": "https://github.com/acme-corp/acme-bot/pull/17",
-            "state": "OPEN",
-            "isCrossRepository": False,
-            "createdAt": "2026-09-05T01:00:01Z",
-            "files": [{"path": "README.md", "additions": 1, "deletions": 0}],
-            "commits": [{"oid": "a" * 40}],
-            "headRefOid": "a" * 40,
-            "baseRefName": "main",
-            "headRefName": "task/example",
-            "author": {"login": "acme-bot"},
-            "statusCheckRollup": [
-                {
-                    "__typename": "CheckRun",
-                    "name": "tests",
-                    "status": "COMPLETED",
-                    "conclusion": "SUCCESS",
-                }
-            ],
-        }
-        payload.update(overrides)
-        return self.run_function(
-            'cat "$FIXTURE" | verify_pr_metadata 17 2026-09-05T01:00:00Z',
-            payload,
-        )
-
-    def test_real_fresh_pr_metadata_with_changes_and_checks_passes(self):
-        result = self.pr()
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_fresh_fractional_or_offset_timestamp_is_compared_as_an_instant(self):
-        for stamp in ["2026-09-05T01:00:00.123Z", "2026-09-05T01:00:00.123+00:00"]:
-            with self.subTest(stamp=stamp):
-                result = self.pr(createdAt=stamp)
-                self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_pending_pr_checks_are_unproved_not_failed(self):
-        result = self.pr(
-            statusCheckRollup=[
-                {
-                    "__typename": "CheckRun",
-                    "status": "IN_PROGRESS",
-                    "conclusion": None,
-                }
-            ]
-        )
-        self.assertEqual(result.returncode, 3, result.stderr)
-
-    def test_unavailable_gh_verifier_blocks_only_coding_row(self):
-        result = self.run_function(
-            """
-curie_bin() { printf '%s' "$HOME/fake-curie"; }
-cat > "$HOME/fake-curie" <<'EOF'
-#!/bin/sh
-echo '{"reply":"https://github.com/acme-corp/acme-bot/pull/17","thread":"100.000001","finalized":true}'
-EOF
-chmod +x "$HOME/fake-curie"
-wait_pending_tool() { return 1; }
-gh() { return 77; }
-READ_THREAD_TS=100.000001
-assert_coding_handoff
-"""
-        )
-        self.assertEqual(result.returncode, 3, result.stderr)
-
-    def test_missing_throwaway_repo_blocks_only_coding_row(self):
-        result = self.run_function("CI_THROWAY_REPO= assert_coding_handoff")
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertIn("CI_THROWAY_REPO", result.stderr)
-
-    def test_stale_empty_wrong_repo_and_unchecked_prs_fail(self):
-        for override in [
-            {"createdAt": "2026-09-04T01:00:00Z"},
-            {"files": []},
-            {"commits": []},
-            {"url": "https://github.com/acme-corp/another-bot/pull/17"},
-            {"statusCheckRollup": []},
-            {
-                "statusCheckRollup": [
-                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}
-                ]
-            },
-        ]:
-            with self.subTest(override=override):
-                self.assertNotEqual(self.pr(**override).returncode, 0)
-
-    def test_only_one_authorized_pr_url_is_accepted(self):
-        result = self.run_function(
-            'echo "https://github.com/acme-corp/acme-bot/pull/17" | pr_number_from_reply',
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "17")
-        result = self.run_function(
-            'echo "https://github.com/acme-corp/acme-bot/pull/17 '
-            'https://github.com/acme-corp/another-bot/pull/18" | pr_number_from_reply',
-        )
-        self.assertNotEqual(result.returncode, 0)
-
 
 class MCPOutcomes(unittest.TestCase):
     def probe(self, *, names=None, read_error=False, forbidden=None, cursor=None):

@@ -994,12 +994,12 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
-    /// Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes
-    /// MCP server, a live provider, and an allowlisted throwaway repo
+    /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
+    /// MCP server and a live provider
     /// (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with
     /// `curie cluster message`. Approvals resolve through
     /// `curie cluster approvals` and an operator principal. Missing the live
-    /// provider or throwaway repo skips with the reason in the run summary.
+    /// provider skips with the reason in the run summary.
     SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
