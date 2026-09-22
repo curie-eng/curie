@@ -1,9 +1,12 @@
 """Focused contracts for the provider harness safety boundary."""
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import pathlib
+import shutil
 import signal
 import sqlite3
 import stat
@@ -21,6 +24,96 @@ SPEC.loader.exec_module(provider_harness)
 
 
 class ProviderHarnessContracts(unittest.TestCase):
+    def test_generated_cluster_node_and_aws_names_fit_provider_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            case = provider_harness.HarnessCase(
+                repo_root=root,
+                snapshot=snapshot,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="none",
+                real_aws=True,
+                curie_bin=root / "curie",
+            )
+            work = case.work
+            try:
+                # The kind node ceiling reproduces the observed Docker sethostname failure.
+                # AWS limits:
+                # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html
+                # https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
+                # https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html
+                limits = {
+                    "kind cluster": (case.cluster, 1, 63),
+                    "kind control plane node": (f"{case.cluster}-control-plane", 1, 63),
+                    "Secrets Manager primary": (case.primary_name, 1, 512),
+                    "Secrets Manager backup": (case.backup_name, 1, 512),
+                    "IAM role": (case.role_name, 1, 64),
+                    "IAM inline policy": (case.policy_name, 1, 128),
+                    "S3 bucket": (case.bucket_name, 3, 63),
+                }
+                for resource, (name, minimum, maximum) in limits.items():
+                    with self.subTest(resource=resource, name=name):
+                        self.assertGreaterEqual(len(name), minimum)
+                        self.assertLessEqual(len(name), maximum)
+            finally:
+                shutil.rmtree(work)
+            self.assertFalse(work.exists())
+
+    def test_run_retains_private_diagnostics_on_failure_and_removes_them_on_success(self):
+        class SuccessfulCase(provider_harness.HarnessCase):
+            def _run(self):
+                provider_harness.write_private_file(self.work / "diagnostic.log", "safe")
+
+        class FailingCase(provider_harness.HarnessCase):
+            def _run(self):
+                provider_harness.write_private_file(self.work / "diagnostic.log", "safe")
+                raise provider_harness.HarnessError("controlled failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            arguments = {
+                "repo_root": root,
+                "snapshot": snapshot,
+                "commit": "a" * 40,
+                "seed": {
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                "mode": "none",
+                "real_aws": False,
+                "curie_bin": root / "curie",
+            }
+
+            failing = FailingCase(**arguments)
+            failed_work = failing.work
+            try:
+                diagnostics = io.StringIO()
+                with contextlib.redirect_stderr(diagnostics):
+                    with self.assertRaisesRegex(
+                        provider_harness.HarnessError, "controlled failure"
+                    ):
+                        failing.run()
+                diagnostic_file = failed_work / "diagnostic.log"
+                self.assertTrue(failed_work.is_dir())
+                self.assertEqual(stat.S_IMODE(failed_work.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(diagnostic_file.stat().st_mode), 0o600)
+                self.assertIn(str(failed_work), diagnostics.getvalue())
+            finally:
+                shutil.rmtree(failed_work)
+
+            successful = SuccessfulCase(**arguments)
+            successful_work = successful.work
+            successful.run()
+            self.assertFalse(successful_work.exists())
+
     def test_seed_shape_and_owned_resource_names_are_validated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

@@ -403,7 +403,7 @@ class HarnessCase:
         curie_bin: pathlib.Path,
     ):
         stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S")
-        suffix = f"{stamp}-{os.getpid()}-{secrets.token_hex(3)}"
+        suffix = f"{stamp}-{secrets.token_hex(3)}"
         self.repo_root = repo_root
         self.snapshot = snapshot
         self.commit = commit
@@ -419,8 +419,7 @@ class HarnessCase:
         self.role_name = require_owned_name(f"{OWNED_PREFIX}{suffix}-eso")
         self.policy_name = require_owned_name(f"{OWNED_PREFIX}{suffix}-sm")
         self.bucket_name = require_owned_name(f"{OWNED_PREFIX}{suffix}-oidc")
-        self.work_context = tempfile.TemporaryDirectory(prefix="curie-provider-harness-")
-        self.work = pathlib.Path(self.work_context.name)
+        self.work = pathlib.Path(tempfile.mkdtemp(prefix="curie-provider-harness-"))
         os.chmod(self.work, 0o700)
         evidence_root = repo_root / ".projects/aws-secrets/evidence/aws-sec-harness" / suffix
         evidence_root.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -576,6 +575,15 @@ class HarnessCase:
                 )
 
     def run(self) -> None:
+        try:
+            self._run()
+        except BaseException:
+            safe_print(f"provider-harness-private-diagnostics: {self.work}", error=True)
+            raise
+        else:
+            shutil.rmtree(self.work)
+
+    def _run(self) -> None:
         self.preflight()
         orchestrator_status = "failed"
         cleanup_status = "failed"
@@ -603,7 +611,6 @@ class HarnessCase:
                 ledger.record_completion(orchestrator_status, cleanup_status)
                 self.write_evidence(orchestrator_status, cleanup_status)
         self.ledger = None
-        self.work_context.cleanup()
         if pending is not None:
             raise pending
 
@@ -1127,8 +1134,7 @@ class HarnessCase:
                             "Condition": {
                                 "StringEquals": {
                                     f"{issuer_host}:sub": (
-                                        "system:serviceaccount:"
-                                        f"{NAMESPACE}:{ESO_SERVICE_ACCOUNT}"
+                                        f"system:serviceaccount:{NAMESPACE}:{ESO_SERVICE_ACCOUNT}"
                                     ),
                                     f"{issuer_host}:aud": "sts.amazonaws.com",
                                 }
@@ -2093,7 +2099,7 @@ def main() -> int:
         safe_print(str(exc), error=True)
         return 1
     except Exception:
-        safe_print("provider harness failed; private diagnostics were retained", error=True)
+        safe_print("provider harness failed", error=True)
         return 1
     finally:
         guard.restore()
