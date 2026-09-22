@@ -715,6 +715,24 @@ else:
             with self.assertRaises(ValueError, msg=rejected):
                 provider_harness.require_owned_secret_path(rejected)
 
+    def test_sampling_blind_stretch_bounds_a_steady_reader(self):
+        samples = [(t * 0.25, t * 0.25 + 0.1, "0" * 64) for t in range(41)]
+        blind = provider_harness.max_sampling_blind_seconds(samples, 0.0, 10.1)
+        self.assertLessEqual(blind, provider_harness.ROTATION_MAX_BLIND_SECONDS)
+
+    def test_sampling_blind_stretch_fails_a_stalled_reader(self):
+        stalled = [(0.0, 45.0, "0" * 64)]
+        self.assertGreater(
+            provider_harness.max_sampling_blind_seconds(stalled, 0.0, 45.0),
+            provider_harness.ROTATION_MAX_BLIND_SECONDS,
+        )
+        gap = [(0.0, 0.1, "0" * 64), (5.0, 5.1, "0" * 64)]
+        self.assertGreater(
+            provider_harness.max_sampling_blind_seconds(gap, 0.0, 5.1),
+            provider_harness.ROTATION_MAX_BLIND_SECONDS,
+        )
+        self.assertEqual(provider_harness.max_sampling_blind_seconds([], 0.0, 3.0), 3.0)
+
     def test_rotation_sample_evaluation_passes_a_clean_phase(self):
         r0, r1, r2 = "0" * 64, "1" * 64, "2" * 64
         rotations = [(3.0, 3.4, r1), (6.0, 6.3, r2)]

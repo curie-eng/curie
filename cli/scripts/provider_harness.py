@@ -57,6 +57,7 @@ STATIC_KEY = "STATIC_KEY"
 ROTATED_KEY = "ROTATED_KEY"
 INTERRUPTED_EXIT = 75
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+ROTATION_MAX_BLIND_SECONDS = 1.0
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
 ROTATION_NAMESPACE = "curie-aws-secrets-e2e-rotation"
 ROTATION_LOGICAL_NAME = "acme-harness-fixture"
@@ -181,6 +182,24 @@ def first_rotation_sample_violation(
                 "allowed": sorted(value[:12] for value in allowed),
             }
     return None
+
+
+def max_sampling_blind_seconds(
+    samples: Sequence[tuple[float, float, str | None]], phase_start: float, phase_end: float
+) -> float:
+    """Longest stretch of the phase no bounded read observed.
+
+    A read only pins the value somewhere inside its own span, so a long read
+    counts as blind for its full duration, as do the gaps before the first
+    read, between read starts, and after the last read ends.
+    """
+    if not samples:
+        return phase_end - phase_start
+    begins = [began for began, _, _ in samples]
+    blind = [begins[0] - phase_start, phase_end - samples[-1][1]]
+    blind.extend(ended - began for began, ended, _ in samples)
+    blind.extend(later - earlier for earlier, later in zip(begins, begins[1:], strict=False))
+    return max(blind)
 
 
 def parse_rotation_report(stdout: bytes, expected_keys: Sequence[str]) -> dict[str, str]:
@@ -2044,6 +2063,13 @@ class HarnessCase:
             "min_start_spacing_seconds": round(min(spacing, default=0.0), 3),
             "max_start_spacing_seconds": round(max(spacing, default=0.0), 3),
         }
+        blind = max_sampling_blind_seconds(samples, t0, time.monotonic())
+        report["sampling"]["max_blind_seconds"] = round(blind, 3)
+        self.record_assertion(
+            f"sampling left no blind stretch over {ROTATION_MAX_BLIND_SECONDS} s",
+            blind <= ROTATION_MAX_BLIND_SECONDS,
+            f"max blind {blind:.3f}s",
+        )
         self.record_assertion(
             "no rotation was reverted across the continuous sample",
             bool(samples) and violation is None,
