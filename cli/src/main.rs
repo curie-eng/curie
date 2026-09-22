@@ -23,6 +23,7 @@ use curie::github_app as crate_github_app;
 use curie::local::{self, LocalDownOpts, LocalOpts};
 use curie::message::{self, MessageOpts};
 use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts, UpgradeChart, UpgradeOpts};
+use curie::provider::{self, StoreRoute};
 use curie::secrets;
 use curie::state::{apply_continue, load_turn, CliTurnArgs, TurnVerb};
 use curie::ui::{self, ColorFlag, Ui};
@@ -1090,6 +1091,8 @@ enum DevAction {
     /// the skill, local, and cluster tiers (#1666,
     /// `bash cli/scripts/check-verb-parity.sh`). Offline, no credential.
     VerbParity,
+    /// Declared inventory check. This build returns not implemented.
+    SecretsInventory,
     /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
     /// Refuses when a schema changed shape without a version bump.
     SchemaBaseline,
@@ -1259,9 +1262,22 @@ enum SecretsAction {
         /// replace an existing cluster-scoped secret.
         #[arg(long)]
         expected_version: Option<u64>,
+        /// Installation file. When it declares `secrets.provider`, set uses the
+        /// provider. This build returns not implemented on that path.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Expiry timestamp for a provider tag. This build returns not
+        /// implemented when the flag is set and does not write the local store.
+        #[arg(long, value_name = "TIMESTAMP")]
+        expires: Option<String>,
     },
     /// List saved Curie secret names. Values are never printed.
-    List,
+    List {
+        /// Installation file. When it declares `secrets.provider`, list uses
+        /// the provider. This build returns not implemented on that path.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
     /// Remove a saved secret.
     Unset {
         /// Environment-variable-style secret name.
@@ -1276,6 +1292,22 @@ enum SecretsAction {
         /// Kubernetes namespace of the scoped entry to remove.
         #[arg(long)]
         namespace: Option<String>,
+    },
+    /// Declared provider check. This build returns not implemented.
+    Check {
+        /// Object name. Omit to check the whole install once the backend exists.
+        name: Option<String>,
+        /// Installation file. Accepted and ignored until the backend exists.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+    /// Declared provider remove. This build returns not implemented.
+    Rm {
+        /// Logical name to remove.
+        name: String,
+        /// Installation file. Accepted and ignored until the backend exists.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
     },
 }
 
@@ -3618,15 +3650,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                 release,
                 namespace,
                 expected_version,
-            } => secrets::set(secrets::SetSecretOpts {
-                name,
-                from_env,
-                cluster_identity,
-                namespace,
-                release,
-                expected_version,
-            }),
-            SecretsAction::List => secrets::list(),
+                file,
+                expires,
+            } => match provider::route_set(file.as_deref(), expires.as_deref())? {
+                StoreRoute::Provider => provider::not_implemented("curie secrets set"),
+                StoreRoute::Local => secrets::set(secrets::SetSecretOpts {
+                    name,
+                    from_env,
+                    cluster_identity,
+                    namespace,
+                    release,
+                    expected_version,
+                }),
+            },
+            SecretsAction::List { file } => match provider::route_list(file.as_deref())? {
+                StoreRoute::Provider => provider::not_implemented("curie secrets list"),
+                StoreRoute::Local => secrets::list(),
+            },
             SecretsAction::Unset {
                 name,
                 cluster_identity,
@@ -3638,6 +3678,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 namespace,
                 release,
             }),
+            SecretsAction::Check { .. } => provider::not_implemented("curie secrets check"),
+            SecretsAction::Rm { .. } => provider::not_implemented("curie secrets rm"),
         },
         Some(Command::Dev { action }) => match action {
             DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh", &[]).await,
@@ -3775,6 +3817,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::VerbParity => {
                 commands::dev_script("cli/scripts/check-verb-parity.sh", &[]).await
             }
+            DevAction::SecretsInventory => provider::not_implemented("curie dev secrets-inventory"),
             DevAction::SchemaBaseline => {
                 commands::dev_script("cli/scripts/refresh-schema-baseline.sh", &[]).await
             }
@@ -6447,7 +6490,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Secrets {
-                action: SecretsAction::List
+                action: SecretsAction::List { .. }
             })
         ));
         let cli = try_parse_from(["curie", "secrets", "unset", "GITHUB_TOKEN"])
