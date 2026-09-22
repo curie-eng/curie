@@ -1699,8 +1699,11 @@ each rewires every consumer and stops the chart templating that key:
 The installation identity keeps its upgrade fence on the BYO path: a render
 that cannot read the Secret tells the drain hook the identity is unobserved, so
 the upgrade refuses before touching Valkey, and an upgrade whose BYO identity
-differs from the one the release already stores fails the render. Seed the BYO
-Secret with the current `installationId` before switching an existing release.
+differs from the one the release already uses fails the render. The chart
+Secret keeps only a sha256 of a BYO identity (annotation
+`curietech.ai/installation-id-sha256`), so a later switch to another BYO Secret,
+or unsetting the knob, is refused too. Seed the BYO Secret with the current
+`installationId` before switching an existing release.
 An agent may appear in `connectorSecrets` or `connectorExistingSecrets`, not
 both, and its BYO keys pass the same reserved-name guard. The CLI does not yet
 preserve these three across a plain `curie cluster up`.

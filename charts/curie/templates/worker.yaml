@@ -323,7 +323,7 @@ spec:
             # name is knowable only here.
             - name: CURIE_RELEASE
               value: {{ .Release.Name | quote }}
-            {{- if .Values.installation.idExistingSecret }}
+            {{- if include "curie.installation.idSecretName" . }}
             # Stable identity for this Helm installation's claim gate, read from
             # the BYO Secret installation.idExistingSecret names.
             {{- else }}
@@ -334,7 +334,7 @@ spec:
             - name: CURIE_INSTALLATION_ID
               valueFrom:
                 secretKeyRef:
-                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.installation.idExistingSecret "existingSecretKey" .Values.installation.idExistingSecretKey "defaultKey" "installationId") | nindent 18 }}
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" (include "curie.installation.idSecretName" .) "existingSecretKey" (include "curie.installation.idSecretKey" .) "defaultKey" "installationId") | nindent 18 }}
                   optional: false
 {{- if .Values.worker.connectorReconciler.enabled }}
             # Connector reconciler (ADR-0090, #1184). It reuses CURIE_NAMESPACE
