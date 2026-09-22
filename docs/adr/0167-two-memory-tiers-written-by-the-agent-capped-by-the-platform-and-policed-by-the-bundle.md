@@ -66,44 +66,55 @@ direct message is a place whose address is the person, so private chats get
 their own memory with no extra mechanism. A bundle that needs another tier can
 declare one; this needs to be possible, not visible.
 
-**B. The agent gets a `remember` / `recall` tool, bound to the current place.**
-The tool writes only to the place the message came from. If the model passes a
-place name, it is ignored. The tool is mounted only when memory is turned on
-for the deployment; an agent without memory sees no tool, rather than a tool
-that fails.
+**B. The bundle declares what kinds of fact the agent may save.**
+The agent cannot save whatever it wants. A bundle lists the kinds of fact it
+remembers, for example "who approves which form" or "a deadline", each with a
+one-line description and the tier it belongs to. The agent can only save
+facts of those kinds. A bundle that declares no kinds gets no save tool; its
+memory comes only from operators.
 
-**C. Saves are silent unless the person asked.**
+**C. The agent gets a `remember` / `recall` tool, bound to the current place.**
+Every `remember` call names one of the declared kinds. The platform refuses a
+call whose kind is not declared. The declared kinds and their descriptions
+are the tool's instructions, so the model sees exactly what it may save. The
+tool writes only to the place the message came from; if the model passes a
+place name, it is ignored. The tool is mounted only when memory is turned on
+for the deployment and the bundle declares at least one kind.
+
+**D. Saves are silent unless the person asked.**
 When someone explicitly says "remember this" or "forget that," the reply
 confirms it. Otherwise the agent does not announce saves. Never an approval
-card.
+card. An explicit request still has to fit a declared kind; if it does not,
+the agent says it cannot remember that kind of thing.
 
-**D. The platform fills in the author.**
+**E. The platform fills in the author.**
 Every entry has an author field, separate from its text. The platform sets it
 from whoever sent the message. The tool has no author argument, so the model
 cannot label its own inference with a person's name. A turn with no person
 behind it (a scheduled job, an eval) gets a marker no caller can type.
 
-**E. One id, many dated versions. Entries are never edited.**
+**F. One id, many dated versions. Entries are never edited.**
 An entry has an id, a date, an author, and text. A correction adds a new
 version under the same id. Boot and `recall` show only the latest version of
 each id. Older versions stay in the database and can be read. Saving the exact
 same text again is refused.
 
-**F. Anyone in a place can correct any fact there.**
+**G. Anyone in a place can correct any fact there.**
 The new version records who made the correction. Accountability comes from
 the author field, not from permissions.
 
-**G. Content rules belong to the bundle, not the runner.**
-The runner does not decide what can go in memory. A bundle declares its own
-rule (for example, "never store figures") and the runner enforces it. A
-bundle that declares no rule gets whatever the model chooses to save; the
-safeguards are the author field and open correction.
+**H. What may be saved is the bundle's decision, not the runner's.**
+The runner has no content rules of its own. What it enforces is the bundle's
+list of kinds (B), plus any exclusion the bundle adds (for example, "never
+store figures"). The platform can check mechanically that a save names a
+declared kind. It cannot check that the text really is that kind of fact;
+that stays a model judgment, backed by the author field and open correction.
 
-**H. Refused saves are reported as refused.**
+**I. Refused saves are reported as refused.**
 The tool call is marked failed in the trace, and the reply does not claim the
 fact was saved.
 
-**I. Operators seed from a file. No seeding from channel history.**
+**J. Operators seed from a file. No seeding from channel history.**
 `curie` writes either tier's document from a file, addressed by agent name.
 An agent with no channel binding is refused a place-tier write and told why.
 [ADR-0095](0095-tiered-memory-lifecycle.md)'s plan to read a channel's history
@@ -111,26 +122,26 @@ to build starting memory is dropped: it needs new Slack permissions and a
 re-consent in every workspace, and channel history is the least trustworthy
 input available. A place starts empty.
 
-**J. A hard size cap per tier, enforced by the API.**
+**K. A hard size cap per tier, enforced by the API.**
 Writes over the cap are refused with the limit named. It lives in the API so
 operator and agent writes hit the same check.
 
-**K. Deleted entries stay deleted.**
+**L. Deleted entries stay deleted.**
 Otherwise the agent re-saves the fact on the next turn, because the message
 that produced it is still in the conversation. The store has to remember what
 was removed; the agent has no way to know.
 
-**L. Compaction is the next slice, not this one.**
+**M. Compaction is the next slice, not this one.**
 Compaction folds entries into the tier's document on a schedule. It needs
 [ADR-0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md)
-(scheduled turns) first. Until then, the cap (J) and deletion (K) keep the
+(scheduled turns) first. Until then, the cap (K) and deletion (L) keep the
 store bounded.
 
-**M. In a live session, use `recall` for current state.**
+**N. In a live session, use `recall` for current state.**
 Boot memory is a snapshot. If someone asks the agent to check the current
 record, it calls `recall` rather than answering from what it booted with.
 
-**N. Boots log what they loaded.**
+**O. Boots log what they loaded.**
 "Found agent tier," "found place tier," or "found nothing," distinguishably.
 Without this, a tier that was never written and a tier the runner cannot read
 look the same.
@@ -140,10 +151,14 @@ look the same.
 - **A per-person tier.** No. It splits facts a channel should share, and
   facts keyed to a person tend to be facts about that person, which then
   follow them around. DMs already get their own memory via the place tier.
+- **Let the agent save anything, with the bundle listing only exclusions.**
+  No. The agent then decides on its own what is worth keeping, and anything
+  the bundle author did not think to forbid gets stored. An allow-list of
+  kinds means the default is "not saved".
 - **A platform-wide content rule** ("never store comments about people").
   No. The code can't judge whether a sentence is about a person, and a rule
   enforced only by a prompt isn't enforced.
-- **Seeding from channel history.** No, see I.
+- **Seeding from channel history.** No, see J.
 - **An operator instructions layer above memory**
   ([ADR-0095](0095-tiered-memory-lifecycle.md)). Not included. The bundle's
   `systemPrompt` already does this job.
@@ -151,10 +166,10 @@ look the same.
   ([ADR-0100](0100-agents-search-their-own-surface-through-the-channel-port.md)).
   Not needed here. Left as is.
 - **Compaction now**
-  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). Not yet, see L.
+  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). Not yet, see M.
 - **Model supplies the author.** No. The writer should not control the field
   that says who asserted a fact.
-- **Only the author can correct a fact.** No, see F.
+- **Only the author can correct a fact.** No, see G.
 - **Vector database or knowledge graph.** No. One bounded document per tier
   fits in context, and an index is a second copy with no clean delete.
 
@@ -169,8 +184,10 @@ look the same.
   shared code.
 - The existing `log` row becomes the agent tier's entries. Rename, not
   rewrite.
-- Whether a bundle gets memory stays a deployment setting. No new manifest
-  field.
+- The declared kinds are a new field in the bundle manifest, which is a
+  frozen contract. It gets its own issue before any code, like the
+  `boot_env` change. Whether a deployment turns memory on at all stays a
+  deployment setting.
 - [ADR-0095](0095-tiered-memory-lifecycle.md) and
   [ADR-0111](0111-the-default-memory-compaction-algorithm.md) are marked as
   folded into this one. The acceptance PR sets them to
@@ -182,15 +199,17 @@ look the same.
 
 1. A fact saved in thread A shows up in a new thread B in the same place, and
    not in another place.
-2. A bundle without memory is refused on write.
-3. Writer and reader keys match for addresses with `@`, `:`, `/`, spaces, and
+2. A bundle without memory is refused on write, and a bundle that declares
+   no kinds has no save tool.
+3. A save naming an undeclared kind is refused, and reported as refused.
+4. Writer and reader keys match for addresses with `@`, `:`, `/`, spaces, and
    non-ASCII.
-4. A refused save is reported as refused, with the trace marked failed.
-5. Unit tests for the size cap and the compare-and-set conflict path.
-6. A deleted entry stays deleted on the next turn.
-7. A correction creates a second version under the same id; only the latest
+5. A refused save is reported as refused, with the trace marked failed.
+6. Unit tests for the size cap and the compare-and-set conflict path.
+7. A deleted entry stays deleted on the next turn.
+8. A correction creates a second version under the same id; only the latest
    is loaded; both are readable.
-8. A planted instruction disguised as memory is saved as an entry, shows its
+9. A planted instruction disguised as memory is saved as an entry, shows its
    author in the console, and does not affect any approval.
 
 ## Related ADRs
