@@ -2076,6 +2076,35 @@ enum LocalAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read or set one agent's publication policy (`PATCH /agents/{id}`).
+    ///
+    /// With no change flags this inspects. `approve` is the default and keeps
+    /// the human gate. `auto` lets the platform resolve that same approval.
+    PublicationPolicy {
+        /// Agent name or id.
+        agent: String,
+        /// `approve` or `auto`.
+        #[arg(long, value_parser = ["approve", "auto"])]
+        policy: Option<String>,
+        /// Open the pull request as a draft. Only applied while policy is auto.
+        #[arg(long, conflicts_with = "no_draft")]
+        draft: bool,
+        /// Open the pull request ready for review.
+        #[arg(long)]
+        no_draft: bool,
+        /// Required branch prefix, ending in `/`.
+        #[arg(long, conflicts_with = "clear_branch_prefix")]
+        branch_prefix: Option<String>,
+        /// Remove the branch prefix.
+        #[arg(long)]
+        clear_branch_prefix: bool,
+        #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
+        api_url: String,
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List, add, or remove an agent's surfaces
     /// (`/agents/{id}/channels`).
     ///
@@ -2884,6 +2913,34 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read or set one agent's publication policy (`PATCH /agents/{id}`).
+    ///
+    /// With no change flags this inspects. `approve` is the default and keeps
+    /// the human gate. `auto` lets the platform resolve that same approval.
+    PublicationPolicy {
+        /// Agent name or id.
+        agent: String,
+        /// `approve` or `auto`.
+        #[arg(long, value_parser = ["approve", "auto"])]
+        policy: Option<String>,
+        /// Open the pull request as a draft. Only applied while policy is auto.
+        #[arg(long, conflicts_with = "no_draft")]
+        draft: bool,
+        /// Open the pull request ready for review.
+        #[arg(long)]
+        no_draft: bool,
+        /// Required branch prefix, ending in `/`.
+        #[arg(long, conflicts_with = "clear_branch_prefix")]
+        branch_prefix: Option<String>,
+        /// Remove the branch prefix.
+        #[arg(long)]
+        clear_branch_prefix: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List, add, or remove an agent's surfaces
     /// (`/agents/{id}/channels`).
     ///
@@ -3153,6 +3210,7 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         ClusterAction::Kill { conn, .. }
         | ClusterAction::Resume { conn, .. }
         | ClusterAction::Overrides { conn, .. }
+        | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
@@ -3250,6 +3308,7 @@ fn retarget_cluster_action(
         ClusterAction::Kill { conn, .. }
         | ClusterAction::Resume { conn, .. }
         | ClusterAction::Overrides { conn, .. }
+        | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
@@ -4433,6 +4492,32 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
                 .await?,
             ),
+            LocalAction::PublicationPolicy {
+                agent,
+                policy,
+                draft,
+                no_draft,
+                branch_prefix,
+                clear_branch_prefix,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit(
+                commands::publication_policy(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    policy,
+                    draft,
+                    no_draft,
+                    branch_prefix,
+                    clear_branch_prefix,
+                )
+                .await?,
+            ),
             LocalAction::Surfaces {
                 target,
                 add,
@@ -5515,6 +5600,34 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         model,
                         thinking,
+                    )
+                    .await?,
+                )
+            }
+            ClusterAction::PublicationPolicy {
+                agent,
+                policy,
+                draft,
+                no_draft,
+                branch_prefix,
+                clear_branch_prefix,
+                conn,
+                dry_run,
+            } => {
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::publication_policy(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        policy,
+                        draft,
+                        no_draft,
+                        branch_prefix,
+                        clear_branch_prefix,
                     )
                     .await?,
                 )

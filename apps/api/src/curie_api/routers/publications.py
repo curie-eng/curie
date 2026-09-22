@@ -28,6 +28,7 @@ from ..publication_authority import (
     PublicationRemoteTerminal,
     verify_publication_identity,
 )
+from ..publication_policy import policy_still_authorizes
 from ..repo_full_name import repo_url_path
 from ..repository_auth import resolve_repository_credential
 from ..schemas import (
@@ -416,6 +417,20 @@ async def get_publication(publication_id: uuid.UUID, session: SessionDep) -> Pub
     return PublicationOut.model_validate(publication)
 
 
+def _credential_issue_detail(settings: Any, approval: Any) -> str:
+    """Name the credential mode, and the policy when the platform resolved it."""
+
+    detail = "server-derived repository credential issued via " + credential_mode(
+        app_id=settings.github_app_id,
+        app_private_key=settings.github_app_private_key,
+        token=settings.github_token,
+    )
+    identity = getattr(approval, "policy_identity", None)
+    if identity:
+        detail += f" under {identity} version {approval.policy_version} by {approval.resolved_by}"
+    return detail
+
+
 @internal_router.post(
     "/{publication_id}/credential",
     response_model=RepositoryCredentialOut,
@@ -495,6 +510,25 @@ async def redeem_publication_credential(
             status.HTTP_403_FORBIDDEN,
             "publication repository is no longer authorized for this thread",
         )
+    agent = await crud.get_agent(session, deployment.agent_id)
+    if not policy_still_authorizes(agent, approval):
+        await refused(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.policy_revoked",
+                "message": "publication policy no longer authorizes this approval",
+            },
+        )
+    cancelled = await crud.publication_cancellation_conflict(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+    )
+    if cancelled is not None:
+        await refused(
+            status.HTTP_409_CONFLICT,
+            {"code": cancelled.code, "message": cancelled.message},
+        )
     try:
         clone_url, authorization_header = await run_in_threadpool(
             resolve_repository_credential, repo, settings
@@ -521,14 +555,7 @@ async def redeem_publication_credential(
         deployment_id=publication.deployment_id,
         publication_id=publication.id,
         repo_full_name=repo,
-        detail=(
-            "server-derived repository credential issued via "
-            + credential_mode(
-                app_id=settings.github_app_id,
-                app_private_key=settings.github_app_private_key,
-                token=settings.github_token,
-            )
-        ),
+        detail=_credential_issue_detail(settings, approval),
     )
     return RepositoryCredentialOut(
         repo_full_name=repo,

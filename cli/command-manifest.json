@@ -2247,6 +2247,110 @@
           "name": "overrides"
         },
         {
+          "about": "Read or set one agent's publication policy (`PATCH /agents/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "`approve` or `auto`",
+              "id": "policy",
+              "long": "policy",
+              "positional": false,
+              "possible_values": [
+                "approve",
+                "auto"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request as a draft. Only applied while policy is auto",
+              "id": "draft",
+              "long": "draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request ready for review",
+              "id": "no_draft",
+              "long": "no-draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Required branch prefix, ending in `/`",
+              "id": "branch_prefix",
+              "long": "branch-prefix",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the branch prefix",
+              "id": "clear_branch_prefix",
+              "long": "clear-branch-prefix",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set one agent's publication policy (`PATCH /agents/{id}`).\n\nWith no change flags this inspects. `approve` is the default and keeps the human gate. `auto` lets the platform resolve that same approval.",
+          "name": "publication-policy"
+        },
+        {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
           "args": [
             {
@@ -4456,6 +4560,130 @@
           "hidden": false,
           "long_about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`).\n\nWith no flags this inspects. Both fields are nullable operator overrides of a platform default, so clearing is `--clear-<field>` (which sends JSON null) and never an empty value, which would skip the platform default rather than restore it.",
           "name": "overrides"
+        },
+        {
+          "about": "Read or set one agent's publication policy (`PATCH /agents/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "`approve` or `auto`",
+              "id": "policy",
+              "long": "policy",
+              "positional": false,
+              "possible_values": [
+                "approve",
+                "auto"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request as a draft. Only applied while policy is auto",
+              "id": "draft",
+              "long": "draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request ready for review",
+              "id": "no_draft",
+              "long": "no-draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Required branch prefix, ending in `/`",
+              "id": "branch_prefix",
+              "long": "branch-prefix",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the branch prefix",
+              "id": "clear_branch_prefix",
+              "long": "clear-branch-prefix",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set one agent's publication policy (`PATCH /agents/{id}`).\n\nWith no change flags this inspects. `approve` is the default and keeps the human gate. `auto` lets the platform resolve that same approval.",
+          "name": "publication-policy"
         },
         {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",

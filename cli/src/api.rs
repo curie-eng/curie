@@ -227,6 +227,23 @@ pub struct Agent {
     /// is the separate, explicit toggle for whether those surfaces share
     /// cross-turn state.
     pub memory: bool,
+    /// Who resolves publication approval. Missing responses stay on human approval.
+    #[serde(default = "default_publication_policy")]
+    pub publication_policy: String,
+    #[serde(default = "default_publication_policy_version")]
+    pub publication_policy_version: i64,
+    #[serde(default)]
+    pub publication_draft: bool,
+    #[serde(default)]
+    pub publication_branch_prefix: Option<String>,
+}
+
+fn default_publication_policy() -> String {
+    "approve".to_string()
+}
+
+fn default_publication_policy_version() -> i64 {
+    1
 }
 
 /// One route's display-only binding, mirroring `ApprovalRouteBindingOut`.

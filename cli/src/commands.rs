@@ -11930,6 +11930,192 @@ pub async fn overrides(
     })
 }
 
+/// Output of `<tier> publication-policy`.
+#[derive(Debug)]
+pub enum PublicationPolicyOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        publication_policy: String,
+        publication_policy_version: i64,
+        publication_draft: bool,
+        publication_branch_prefix: Option<String>,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for PublicationPolicyOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            PublicationPolicyOutput::DryRun(plan) => plan.to_json(),
+            PublicationPolicyOutput::Done {
+                agent,
+                publication_policy,
+                publication_policy_version,
+                publication_draft,
+                publication_branch_prefix,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                "publication_policy": publication_policy,
+                "publication_policy_version": publication_policy_version,
+                "publication_draft": publication_draft,
+                "publication_branch_prefix": publication_branch_prefix,
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            PublicationPolicyOutput::DryRun(plan) => plan.render(ui),
+            PublicationPolicyOutput::Done {
+                agent,
+                publication_policy,
+                publication_policy_version,
+                publication_draft,
+                publication_branch_prefix,
+                changed,
+            } => {
+                let prefix = publication_branch_prefix
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string());
+                let verb = if *changed { " now" } else { "" };
+                ui.payload(&format!(
+                    "publication policy for {agent}{verb}: {publication_policy} version {publication_policy_version}, draft {publication_draft}, branch prefix {prefix}"
+                ));
+            }
+        }
+    }
+}
+
+/// The PATCH body for publication policy, or None when this invocation only inspects.
+pub fn publication_policy_patch_body(
+    policy: &Option<String>,
+    draft: bool,
+    no_draft: bool,
+    branch_prefix: &Option<String>,
+    clear_branch_prefix: bool,
+) -> Option<serde_json::Value> {
+    let mut body = serde_json::Map::new();
+    if let Some(policy) = policy {
+        body.insert(
+            "publication_policy".to_string(),
+            serde_json::Value::String(policy.clone()),
+        );
+    }
+    if draft {
+        body.insert(
+            "publication_draft".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    } else if no_draft {
+        body.insert(
+            "publication_draft".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    if clear_branch_prefix {
+        body.insert(
+            "publication_branch_prefix".to_string(),
+            serde_json::Value::Null,
+        );
+    } else if let Some(prefix) = branch_prefix {
+        body.insert(
+            "publication_branch_prefix".to_string(),
+            serde_json::Value::String(prefix.clone()),
+        );
+    }
+    if body.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(body))
+    }
+}
+
+pub async fn publication_policy(
+    opts: AgentActionOpts,
+    policy: Option<String>,
+    draft: bool,
+    no_draft: bool,
+    branch_prefix: Option<String>,
+    clear_branch_prefix: bool,
+) -> Result<PublicationPolicyOutput> {
+    let ui = crate::ui::ui();
+    let body = publication_policy_patch_body(
+        &policy,
+        draft,
+        no_draft,
+        &branch_prefix,
+        clear_branch_prefix,
+    );
+    if opts.dry_run {
+        let plan = match &body {
+            Some(b) => format!(
+                "PATCH {}/agents/<id>  {b}  (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            ),
+            None => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print its publication policy)",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(PublicationPolicyOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let Some(body) = body else {
+        return Ok(done_policy(&agent, false));
+    };
+    let cl = ui.checklist();
+    let step = cl.step(&format!("updating publication policy for {}", agent.name));
+    let saved = match client.update_agent(&agent.id, &body).await {
+        Ok(saved) => {
+            step.done("updated");
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    Ok(done_policy(&saved, true))
+}
+
+#[cfg(test)]
+mod publication_policy_tests {
+    use super::publication_policy_patch_body;
+
+    #[test]
+    fn an_inspect_sends_no_patch_body() {
+        assert!(publication_policy_patch_body(&None, false, false, &None, false).is_none());
+    }
+
+    #[test]
+    fn auto_draft_and_a_cleared_prefix_are_one_patch() {
+        let body =
+            publication_policy_patch_body(&Some("auto".to_string()), true, false, &None, true)
+                .expect("a write");
+        assert_eq!(body["publication_policy"], "auto");
+        assert_eq!(body["publication_draft"], true);
+        assert!(body["publication_branch_prefix"].is_null());
+        assert!(body.get("model").is_none());
+    }
+}
+
+fn done_policy(agent: &crate::api::Agent, changed: bool) -> PublicationPolicyOutput {
+    PublicationPolicyOutput::Done {
+        agent: agent.name.clone(),
+        publication_policy: agent.publication_policy.clone(),
+        publication_policy_version: agent.publication_policy_version,
+        publication_draft: agent.publication_draft,
+        publication_branch_prefix: agent.publication_branch_prefix.clone(),
+        changed,
+    }
+}
+
 #[cfg(test)]
 mod overrides_tests {
     use super::{overrides_patch_body, OverrideChange};

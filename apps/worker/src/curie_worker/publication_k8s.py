@@ -89,6 +89,8 @@ class PublicationPayload:
     pr_url: str | None
     title: str
     body: str
+    open_as_draft: bool = False
+    branch_prefix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,10 @@ def publication_resource_names(publication_id: uuid.UUID) -> PublicationResource
 _PUBLISH_SCRIPT = r"""#!/bin/bash
 set -euo pipefail
 umask 077
+if [[ -n "${PUBLICATION_BRANCH_PREFIX:-}" && "$BRANCH" != "${PUBLICATION_BRANCH_PREFIX}"* ]]; then
+  echo "publication branch does not carry the required prefix" >&2
+  exit 1
+fi
 
 redact() {
   # Credentials are never deliberately logged. This filter is defence in depth
@@ -300,6 +306,8 @@ def validate_pull(
         raise SystemExit(
             "GitHub pull request does not match the approved publication contract"
         )
+    if os.environ.get("PUBLICATION_OPEN_AS_DRAFT") == "true" and row.get("draft") is not True:
+        raise SystemExit("GitHub pull request is not the required draft")
     if any(
         not isinstance(actual[field], str)
         or actual[field].casefold() != expected[field].casefold()
@@ -422,12 +430,15 @@ else:
     pull = existing(default_base)
     if not pull:
         try:
-            created = request("POST", api, {
+            pull_body = {
                 "title": os.environ["PR_TITLE"],
                 "head": branch,
                 "base": default_base,
                 "body": os.environ["PR_BODY"],
-            })
+            }
+            if os.environ.get("PUBLICATION_OPEN_AS_DRAFT") == "true":
+                pull_body["draft"] = True
+            created = request("POST", api, pull_body)
             pull = validate_pull(created, default_base, require_metadata=True)
         except (HTTPError, URLError):
             pull = existing(default_base)
@@ -464,6 +475,46 @@ def _owner_reference(settings: PublicationJobSettings, owner_uid: str) -> list[d
     ]
 
 
+def publication_branch_is_valid(branch: str, branch_prefix: str | None) -> bool:
+    """Accept a stored lineage branch without renaming it.
+
+    Historical branches stay under ``curie/``. A platform-named automatic
+    branch (``<prefix>publication-<hex>``) stays valid after the operator
+    clears that prefix. An optional prefix, when still recorded, must match.
+    Components that git itself rejects (``.lock``, a trailing dot, ``..``)
+    never pass.
+    """
+
+    if (
+        ".." in branch
+        or branch.startswith(("/", "."))
+        or "//" in branch
+        or branch.endswith("/")
+    ):
+        return False
+    parts = branch.split("/")
+    if any(not part or part.endswith(".lock") or part.endswith(".") for part in parts):
+        return False
+    if branch_prefix:
+        rest = branch.removeprefix(branch_prefix)
+        if not (
+            branch.startswith(branch_prefix)
+            and rest != ""
+            and re.fullmatch(r"[A-Za-z0-9._/-]+", rest) is not None
+        ):
+            return False
+    historical = re.fullmatch(r"curie/[A-Za-z0-9._/-]+", branch) is not None
+    named = (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}/publication-[0-9a-f]+", branch)
+        is not None
+    )
+    return historical or named
+
+
+def _valid_publication_branch(payload: PublicationPayload) -> bool:
+    return publication_branch_is_valid(payload.branch, payload.branch_prefix)
+
+
 def build_publication_resources(
     payload: PublicationPayload,
     *,
@@ -474,7 +525,7 @@ def build_publication_resources(
         raise PublicationResourceError(
             f"publication patch exceeds the {MAX_PATCH_BYTES} raw-byte limit"
         )
-    if not re.fullmatch(r"curie/[A-Za-z0-9._/-]+", payload.branch):
+    if not _valid_publication_branch(payload):
         raise PublicationResourceError("publication branch is not a valid stored lineage branch")
     if re.fullmatch(r"[0-9a-f]{40,64}", payload.base_sha) is None:
         raise PublicationResourceError(
@@ -539,6 +590,8 @@ def build_publication_resources(
         "pr_url": payload.pr_url,
         "title": payload.title,
         "body": payload.body,
+        "open_as_draft": payload.open_as_draft,
+        "branch_prefix": payload.branch_prefix,
         "runner_image": settings.runner_image,
         "service_account_name": settings.service_account_name,
         "active_deadline_seconds": settings.active_deadline_seconds,
@@ -588,6 +641,11 @@ def build_publication_resources(
         {"name": "PR_URL", "value": payload.pr_url or ""},
         {"name": "PR_TITLE", "value": payload.title},
         {"name": "PR_BODY", "value": payload.body},
+        {
+            "name": "PUBLICATION_OPEN_AS_DRAFT",
+            "value": "true" if payload.open_as_draft else "false",
+        },
+        {"name": "PUBLICATION_BRANCH_PREFIX", "value": payload.branch_prefix or ""},
         {"name": "GIT_USER_NAME", "value": settings.git_user_name},
         {"name": "GIT_USER_EMAIL", "value": settings.git_user_email},
         {"name": "GIT_TIMEOUT_SECONDS", "value": str(settings.git_timeout_seconds)},

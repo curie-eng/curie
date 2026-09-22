@@ -80,7 +80,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `ApprovalsOutput`,
-  `SkillApprovalsOutput`, `OverridesOutput`, `ChannelsOutput`,
+  `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `ChannelsOutput`,
   `ConnectorBuildOutput`. The last is
   the `curie build --plugin-dir` receipt for connector source builds (ADR-0113):
   it emits one object even when the bundle declares nothing to build, because
