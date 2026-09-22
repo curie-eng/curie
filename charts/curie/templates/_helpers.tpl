@@ -843,6 +843,22 @@ Secret is memoized separately from its data so callers can reuse generated
 credentials without losing access to the Secret UID used by the legacy-upgrade
 bridge.
 
+When installation.idExistingSecret names a BYO Secret (for example one an
+External Secrets sync owns), the identity is read from that Secret instead and
+the chart stops storing it. A render that cannot read it (a client-only render,
+or the Secret not yet synced) marks the identity unobserved, so the upgrade hook
+still refuses before contacting Valkey, exactly as for the managed path. An
+upgrade whose BYO identity disagrees with the one the release already uses
+fails the render rather than silently re-keying the claim fence. The chart
+Secret records only a sha256 of a BYO identity (annotation
+curietech.ai/installation-id-sha256), so a later switch to another BYO Secret,
+or back to the managed path, is checked against it too. Adopting a BYO identity
+on a release that predates installationId keeps the legacy quiesce bridge; the
+annotation curietech.ai/installation-id-source=byo marks every BYO release, even
+one first rendered before its Secret synced, so it is never mistaken for that
+legacy case and can never fall back to the managed path. Such a release whose
+first render had no identity records the hash at its first observed upgrade.
+
 Fresh installs always mint a new identity, including adoption of a retained
 Secret. Upgrades reuse the stored identity; the first upgrade from a chart that
 predates installationId adopts the live Secret UID and enables the one-release
@@ -858,7 +874,47 @@ before contacting Valkey.
 {{- $installationId := "" -}}
 {{- $observed := true -}}
 {{- $legacy := false -}}
-{{- if .Release.IsInstall -}}
+{{- $byoName := include "curie.installation.idSecretName" . -}}
+{{- $byoKey := include "curie.installation.idSecretKey" . -}}
+{{- $managedMetadata := get $managedSecret "metadata" | default dict -}}
+{{- $managedAnnotations := get $managedMetadata "annotations" | default dict -}}
+{{- $priorHash := get $managedAnnotations "curietech.ai/installation-id-sha256" | default "" -}}
+{{- $priorByo := eq (get $managedAnnotations "curietech.ai/installation-id-source" | default "") "byo" -}}
+{{- $managedEncoded := get $managedSecretData "installationId" | default "" -}}
+{{- $idHash := "" -}}
+{{- if $byoName -}}
+{{- $byoSecret := lookup "v1" "Secret" .Release.Namespace $byoName | default dict -}}
+{{- $byoEncoded := get (get $byoSecret "data" | default dict) $byoKey | default "" -}}
+{{- $byoDecoded := "" -}}
+{{- if ne (trim (toString $byoEncoded)) "" -}}
+{{- $byoDecoded = $byoEncoded | b64dec -}}
+{{- end -}}
+{{- if ne (trim $byoDecoded) "" -}}
+{{- $installationId = $byoDecoded -}}
+{{- $idHash = sha256sum $byoDecoded -}}
+{{- if .Release.IsUpgrade -}}
+{{- $mismatch := false -}}
+{{- if ne (trim (toString $managedEncoded)) "" -}}
+{{- $mismatch = ne ($managedEncoded | b64dec) $byoDecoded -}}
+{{- else if $priorHash -}}
+{{- $mismatch = ne $priorHash $idHash -}}
+{{- else if and (not $priorByo) (ne (trim (toString (get $managedMetadata "uid" | default ""))) "") -}}
+{{- /* A release that predates installationId adopting a BYO identity: keep
+       the one-release legacy bridge so older workers observe the quiesce. */ -}}
+{{- $legacy = true -}}
+{{- end -}}
+{{- if $mismatch -}}
+{{- fail (printf "installation.idExistingSecret %q key %q holds a different installation identity than the one this release already uses. Switching the identity would unfence in-flight claims during the upgrade; seed the Secret with the release's current installationId first. Neither value is printed." $byoName $byoKey) -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $installationId = randAlphaNum 32 -}}
+{{- $observed = false -}}
+{{- $idHash = $priorHash -}}
+{{- end -}}
+{{- else if and .Release.IsUpgrade (or $priorHash $priorByo) (eq (trim (toString $managedEncoded)) "") -}}
+{{- fail "this release reads its installation identity from a BYO Secret (installation.idExistingSecret), and the chart Secret holds no copy of it. Unsetting the knob would mint a new identity and unfence in-flight claims; keep installation.idExistingSecret set." -}}
+{{- else if .Release.IsInstall -}}
 {{- $installationId = randAlphaNum 32 -}}
 {{- else if .Release.IsUpgrade -}}
 {{- $encodedId := get $managedSecretData "installationId" | default "" -}}
@@ -885,7 +941,21 @@ before contacting Valkey.
 {{- $_ = set . "_curieInstallationId" $installationId -}}
 {{- $_ = set . "_curieInstallationIdObserved" $observed -}}
 {{- $_ = set . "_curieUpgradeLegacyQuiesce" $legacy -}}
+{{- $_ = set . "_curieInstallationIdHash" $idHash -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "curie.installation.idSecretName" -}}
+{{- (.Values.installation | default dict).idExistingSecret | default "" -}}
+{{- end -}}
+
+{{- define "curie.installation.idSecretKey" -}}
+{{- (.Values.installation | default dict).idExistingSecretKey | default "installationId" -}}
+{{- end -}}
+
+{{- define "curie.installationIdHash" -}}
+{{- include "curie.installationIdentity.init" . -}}
+{{- get . "_curieInstallationIdHash" -}}
 {{- end -}}
 
 {{- define "curie.installationId" -}}
