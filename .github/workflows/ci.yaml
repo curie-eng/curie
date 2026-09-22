@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, next]
   pull_request:
-    branches: [main, next, "task/**"]
+    branches: [main, next, "task/**", "epic/**"]
     # Commit events only. A title or body edit must not cancel an in-flight
     # run and restart kind shards. Body-edit guards live in their own workflows.
     types: [opened, synchronize, reopened]
