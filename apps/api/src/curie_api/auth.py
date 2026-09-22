@@ -3,16 +3,25 @@
 The platform key in the `X-API-Key` header is checked first, with no database
 read. A live console session is accepted only after that check fails. J1
 replaces this with GitHub-App-scoped identities.
+
+`require_principal_session` (#2908, ADR 0155) is a separate, stricter
+dependency: it accepts only a session bound to a principal (a person), never a
+bare login-code session, and no route guarded by it widens through the
+``require_api_key`` fallback above.
 """
 
 import hmac
 from typing import Annotated
 
-from fastapi import Header, HTTPException, Request, status
+from fastapi import Cookie, Header, HTTPException, Request, status
 
 from .config import get_settings
+from .deps import SessionDep
+from .models import Principal
 
 API_KEY_HEADER = "X-API-Key"
+#: The console session cookie (ADR-0083). Defined here rather than beside its
+#: approval consumer so this module can read it without an import cycle.
 CONSOLE_SESSION_COOKIE = "__Host-curie_console_session"
 
 
@@ -109,3 +118,30 @@ async def require_internal_adapter_secret(
             detail="missing or invalid internal adapter secret",
             headers={"Cache-Control": "no-store"},
         )
+
+
+async def require_principal_session(
+    session: SessionDep,
+    console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
+) -> Principal:
+    """Authenticate a person by their OIDC console session; return the principal.
+
+    Accepts only a live console session bound to a principal that is active in
+    an active tenant. Re-checked on every request, so revoking the session,
+    disabling the principal or suspending the tenant ends access at once rather
+    than at session expiry. A login-code session (no principal) and the
+    platform key are both refused: neither identifies a person.
+
+    Every refusal is the same 401, so the response does not tell a caller
+    whether the cookie was unknown, expired, or valid for someone disabled.
+    """
+    from .crud import console as crud_console
+
+    principal = await crud_console.live_principal_session(session, console_session or "")
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing, invalid, or expired principal session",
+            headers={"Cache-Control": "no-store"},
+        )
+    return principal
