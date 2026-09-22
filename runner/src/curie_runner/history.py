@@ -929,12 +929,19 @@ def _make_summary(
     content = "\n\n".join(sections)
     # The summary is written once at this explicit boundary. Bounding it here is
     # stable: later appends never rewrite it; only a later compaction creates a
-    # new record. The digest keeps omitted material falsifiable.
+    # new record. The digest keeps omitted material falsifiable. When the content
+    # overflows the budget, keep the most recent bytes (the marker first, then the
+    # UTF-8-safe suffix that fits) rather than the oldest: the newest compacted
+    # material -- e.g. a just-recorded publication outcome -- must survive even
+    # once the prior summary has saturated the budget.
     budget = max(512, (max_bytes // 2) if max_bytes is not None else 8_000)
     encoded = content.encode("utf-8")
     if len(encoded) > budget:
-        prefix = encoded[: max(0, budget - 96)].decode("utf-8", errors="ignore")
-        content = f"{prefix}\n\n[older detail summarized; digest={digest}]"
+        marker = f"[older detail summarized; digest={digest}]\n\n"
+        marker_bytes = marker.encode("utf-8")
+        suffix_budget = max(0, budget - len(marker_bytes))
+        suffix = encoded[-suffix_budget:].decode("utf-8", errors="ignore") if suffix_budget else ""
+        content = f"{marker}{suffix}"
     source_turns = (prior.source_turns if prior is not None else 0) + len(compacted)
     through_ts = compacted[-1].ts if compacted else (prior.through_ts if prior else "")
     return SummaryRecord(
