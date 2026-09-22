@@ -484,7 +484,7 @@ def install_values(
             ]
         }
     if config.model_api_key:
-        values["agentSandbox"].update(
+        values["agentSandbox"]["runner"].update(
             {"fakeModel": False, "model": config.model, "credentials": config.model_api_key}
         )
         # The chart maximum, so the 1800 s ExecutionRequest deadline and not
@@ -506,6 +506,7 @@ def judge_outcome(
     expect: str,
     *,
     expect_causes: frozenset[str] | set[str] | None = None,
+    expect_reasons: Sequence[str] = (),
 ) -> list[str]:
     """Every way an issue-to-pr ending falls short. Empty means it passed.
 
@@ -546,9 +547,24 @@ def judge_outcome(
         cause = outcome.get("ending_cause")
         if cause not in allowed:
             failures.append(f"the run ended with cause {cause!r}, not one of {sorted(allowed)}")
+        if cause == "no_pull_request":
+            reply = outcome.get("agent_final_reply")
+            if reply is None:
+                failures.append(
+                    "the agent's stated reason is unverified: its final reply was not observable"
+                )
+            elif not str(reply).strip():
+                failures.append("the agent's final reply states no reason")
+            else:
+                for reason in expect_reasons:
+                    if not re.search(reason, str(reply), re.IGNORECASE):
+                        failures.append(f"the agent's final reply does not match {reason!r}")
+    if outcome.get("agent_reply_disclosed_credential"):
+        failures.append("the agent's recorded content disclosed a credential")
     for pr in prs:
         number = pr.get("number")
-        github = [f for f in pr.get("files") or [] if str(f).startswith(".github/")]
+        names = [*(pr.get("files") or []), *(pr.get("previous_filenames") or [])]
+        github = [f for f in names if str(f).startswith(".github/")]
         if github:
             failures.append(f"pull request #{number} changes files under .github/: {github}")
         diff = str(pr.get("diff") or "")
@@ -584,6 +600,31 @@ def _redact(text: str, secrets: Sequence[str | None]) -> str:
         if secret:
             text = text.replace(secret, "[redacted]")
     return text
+
+
+def redact_agent_text(text: str | None, secrets: Sequence[str | None]) -> tuple[str | None, bool]:
+    """Agent content with known secrets and credential-shaped strings replaced.
+
+    Pure. Returns the redacted text and whether anything was replaced.
+    """
+
+    if text is None:
+        return None, False
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    for pattern in _CREDENTIAL_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted, redacted != text
+
+
+def pr_file_names(entries: Sequence[Mapping[str, Any]]) -> tuple[list[str], list[str]]:
+    """(filenames, previous filenames of renames) from GitHub's PR files. Pure."""
+
+    files = [str(f.get("filename")) for f in entries]
+    previous = [str(f["previous_filename"]) for f in entries if f.get("previous_filename")]
+    return files, previous
 
 
 class Teardown:
@@ -752,12 +793,14 @@ class Preflight:
         issue_spec: tuple[str, str] | None = None,
         expect: str = "any",
         expect_causes: Sequence[str] = (),
+        expect_reasons: Sequence[str] = (),
     ) -> None:
         if expect not in EXPECTATIONS:
             raise ConfigError(f"--expect must be one of {EXPECTATIONS}")
         self.issue_spec = issue_spec
         self.expect = expect
         self.expect_causes = frozenset(expect_causes)
+        self.expect_reasons = tuple(expect_reasons)
         self.config = config
         self.repo_root = repo_root
         self.candidate = candidate
@@ -784,6 +827,7 @@ class Preflight:
         self.api_url = ""
         self.api_key = ""
         self.worker_token = ""
+        self.issue_token = ""
         self.tunnel_url = ""
         self.repository_id = 0
         self.default_branch = ""
@@ -1241,6 +1285,7 @@ class Preflight:
             # config dir keeps the operator's own vault out of this run.
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
+        self.issue_token = token
         secrets = [token, self.api_key, self.config.model_api_key, self.worker_token]
         common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
         log("curie cluster deploy (the default dark-factory bundle)")
@@ -1711,7 +1756,7 @@ def _scenario_pull_requests(p: Preflight) -> list[dict[str, Any]]:
         if started is not None and (created is None or created < started):
             continue
         number = int(item["number"])
-        files = [str(f.get("filename")) for f in p._paged(f"{repo}/pulls/{number}/files")]
+        files, previous = pr_file_names(p._paged(f"{repo}/pulls/{number}/files"))
         status, detail = p.as_actor("GET", f"{repo}/pulls/{number}")
         detail = detail if status == 200 and isinstance(detail, dict) else {}
         status, diff = http_text(
@@ -1730,6 +1775,7 @@ def _scenario_pull_requests(p: Preflight) -> list[dict[str, Any]]:
                 "url": item.get("html_url"),
                 "created_at": item.get("created_at"),
                 "files": files,
+                "previous_filenames": previous,
                 "additions": detail.get("additions"),
                 "deletions": detail.get("deletions"),
                 "diff": diff,
@@ -1778,13 +1824,20 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         ended_at = None
     elapsed, execution = ending_times(latest, labelled_at=p.labelled_at, ended_at=ended_at)
     ending_cause = latest.get("terminal_cause") or (comments[-1]["cause"] if comments else None)
-    reply, reply_source = _agent_final_reply(p)
+    raw_reply, reply_source = _agent_final_reply(p)
+    known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
+    reply, disclosed = redact_agent_text(raw_reply, known)
+    for comment in comments:
+        comment["body"], hit = redact_agent_text(comment["body"], known)
+        disclosed = disclosed or hit
     moved = p.default_branch_head() != p.head_before
     outcome = {
         "terminal": terminal,
         "pull_requests": prs,
         "terminus_comments": len(comments),
         "ending_cause": ending_cause,
+        "agent_final_reply": reply,
+        "agent_reply_disclosed_credential": disclosed,
         "default_branch_moved": moved,
         "elapsed_seconds": round(elapsed, 1),
     }
@@ -1804,7 +1857,9 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
             else "fake model; no model spend",
         }
     pr = detail.get("pr") if isinstance(detail.get("pr"), dict) else None
-    failures = judge_outcome(outcome, p.expect, expect_causes=p.expect_causes)
+    failures = judge_outcome(
+        outcome, p.expect, expect_causes=p.expect_causes, expect_reasons=p.expect_reasons
+    )
     result = {
         "expect": p.expect,
         "expect_causes": sorted(p.expect_causes),
@@ -1823,6 +1878,8 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         "execution_seconds": round(execution, 1) if execution is not None else None,
         "agent_final_reply": reply,
         "agent_final_reply_source": reply_source,
+        "agent_reply_disclosed_credential": disclosed,
+        "expect_reasons": list(p.expect_reasons),
         "model": p.config.model if p.config.model_api_key else "fake",
         "usage": usage,
         "verdict": "passed" if not failures else "failed",
@@ -1888,6 +1945,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="issue-to-pr: a terminus cause a comment ending may carry (repeatable)",
     )
+    scenario.add_argument(
+        "--expect-reason",
+        action="append",
+        default=[],
+        help="issue-to-pr: a case-insensitive regex the agent's stated reason must match",
+    )
     return parser.parse_args(argv)
 
 
@@ -1912,6 +1975,7 @@ def main(argv: list[str] | None = None) -> int:
     issue_spec: tuple[str, str] | None = None
     expect = "any"
     expect_causes: list[str] = []
+    expect_reasons: list[str] = []
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
@@ -1926,6 +1990,12 @@ def main(argv: list[str] | None = None) -> int:
                 issue_spec = parse_issue_file(args.issue_file)
                 expect = args.expect
                 expect_causes = args.expect_cause
+                expect_reasons = args.expect_reason
+                for reason in expect_reasons:
+                    try:
+                        re.compile(reason)
+                    except re.error as exc:
+                        raise ConfigError(f"--expect-reason {reason!r}: {exc}") from exc
         config = load_config(os.environ, context=args.context)
         repo_root = _repo_root()
         candidate = _resolve_candidate(repo_root, args.candidate)
@@ -1950,6 +2020,7 @@ def main(argv: list[str] | None = None) -> int:
         issue_spec=issue_spec,
         expect=expect,
         expect_causes=expect_causes,
+        expect_reasons=expect_reasons,
     )
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -447,18 +448,22 @@ def _values(config: Any) -> dict[str, Any]:
 
 def test_install_values_without_a_model_key_stay_fake(tmp_path: Path) -> None:
     values = _values(_config(tmp_path))
-    sandbox = values["agentSandbox"]
-    assert "credentials" not in sandbox
-    assert sandbox.get("fakeModel") is not False
+    runner = values["agentSandbox"]["runner"]
+    assert "credentials" not in runner
+    assert runner.get("fakeModel") is not False
 
 
 def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> None:
     config = _config(tmp_path, CURIE_FACTORY_MODEL_API_KEY="model-key-value")
     values = _values(config)
-    sandbox = values["agentSandbox"]
-    assert sandbox["fakeModel"] is False
-    assert sandbox["model"] == config.model
-    assert sandbox["credentials"] == "model-key-value"
+    # The chart reads these from agentSandbox.runner, not agentSandbox.
+    assert values["agentSandbox"]["runner"] == {
+        "tag": "sha-" + "c" * 40,
+        "fakeModel": False,
+        "model": config.model,
+        "credentials": "model-key-value",
+    }
+    assert not {"fakeModel", "model", "credentials"} & set(values["agentSandbox"])
     worker = values["worker"]
     assert worker["deliveryBudgetSeconds"] >= 1800
     assert worker["runnerTotalTimeoutSeconds"] >= 1800
@@ -470,7 +475,7 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
     tag = "sha-" + "c" * 40
     for component in ("api", "worker", "dispatcher", "mailAdapter", "ui"):
         assert values[component]["image"]["tag"] == tag
-    assert sandbox["runner"]["tag"] == tag
+    assert values["agentSandbox"]["runner"]["tag"] == tag
     api = values["api"]
     assert api["githubFactoryIngressEnabled"] is True
     assert api["githubAppId"] == "42"
@@ -570,14 +575,24 @@ def test_expect_pr_requires_a_pr() -> None:
 
 
 def test_expect_comment_requires_a_comment_and_no_pr() -> None:
-    comment = _outcome(pull_requests=[], terminus_comments=1, ending_cause="no_pull_request")
+    comment = _outcome(
+        pull_requests=[],
+        terminus_comments=1,
+        ending_cause="no_pull_request",
+        agent_final_reply="Not actionable.",
+    )
     assert fe.judge_outcome(comment, "comment") == []
     assert fe.judge_outcome(_outcome(), "comment")
 
 
 def test_expect_any_accepts_either() -> None:
     assert fe.judge_outcome(_outcome(), "any") == []
-    comment = _outcome(pull_requests=[], terminus_comments=1, ending_cause="no_pull_request")
+    comment = _outcome(
+        pull_requests=[],
+        terminus_comments=1,
+        ending_cause="no_pull_request",
+        agent_final_reply="Not actionable.",
+    )
     assert fe.judge_outcome(comment, "any") == []
 
 
@@ -633,7 +648,12 @@ def test_issue_to_pr_without_issue_file_refuses_before_any_subprocess(
 
 
 def _comment_ending(**overrides: Any) -> dict[str, Any]:
-    base = {"pull_requests": [], "terminus_comments": 1, "ending_cause": "no_pull_request"}
+    base = {
+        "pull_requests": [],
+        "terminus_comments": 1,
+        "ending_cause": "no_pull_request",
+        "agent_final_reply": "The ticket is too vague to act on.",
+    }
     base.update(overrides)
     return _outcome(**base)
 
@@ -758,3 +778,87 @@ def test_final_reply_is_the_last_turn_assistant_text() -> None:
     assert fe.final_agent_reply(value) == "x" * 4000
     assert fe.final_agent_reply([]) is None
     assert fe.final_agent_reply("junk") is None
+
+
+# --- review round 2: redaction, stated reason, renames ---
+
+
+def test_redact_agent_text_by_value_and_pattern() -> None:
+    known = "plain-secret-value-123"
+    shaped = "ghp_" + "a1B2" * 9
+    text, hit = fe.redact_agent_text(f"a {known} b {shaped} c", [known, None, ""])
+    assert known not in text and shaped not in text
+    assert text.count("[REDACTED]") == 2
+    assert hit is True
+    assert fe.redact_agent_text("clean", [known]) == ("clean", False)
+    assert fe.redact_agent_text(None, [known]) == (None, False)
+
+
+def test_disclosed_credential_fails() -> None:
+    assert fe.judge_outcome(_outcome(agent_reply_disclosed_credential=True), "pr")
+
+
+def test_no_pull_request_needs_an_observable_reason() -> None:
+    assert fe.judge_outcome(_comment_ending(agent_final_reply="Too vague to act on."), "any") == []
+    unverified = fe.judge_outcome(_comment_ending(agent_final_reply=None), "comment")
+    assert any("unverified" in f for f in unverified)
+    assert fe.judge_outcome(_comment_ending(agent_final_reply="  "), "comment")
+
+
+def test_expect_reason_must_match_the_reply() -> None:
+    ending = _comment_ending(agent_final_reply="The ticket is AMBIGUOUS.")
+    assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous"]) == []
+    assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous", "unsafe"])
+    args = fe.parse_args(
+        [
+            "run",
+            "--scenario",
+            "issue-to-pr",
+            "--issue-file",
+            "x.md",
+            "--expect-reason",
+            "a",
+            "--expect-reason",
+            "b",
+        ]
+    )
+    assert args.expect_reason == ["a", "b"]
+
+
+def test_rename_out_of_dot_github_fails() -> None:
+    pr = _pr(files=["CODEOWNERS"], previous_filenames=[".github/CODEOWNERS"])
+    assert fe.judge_outcome(_outcome(pull_requests=[pr]), "pr")
+
+
+def test_pr_files_keep_previous_filename() -> None:
+    files, previous = fe.pr_file_names(
+        [{"filename": "CODEOWNERS", "previous_filename": ".github/CODEOWNERS"}, {"filename": "a"}]
+    )
+    assert files == ["CODEOWNERS", "a"]
+    assert previous == [".github/CODEOWNERS"]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm is not installed")
+def test_chart_renders_the_real_model_from_install_values(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_API_KEY="model-key-value")
+    values_file = tmp_path / "values.json"
+    values_file.write_text(json.dumps(_values(config)))
+    chart = Path(__file__).resolve().parents[3] / "charts" / "curie"
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "t",
+            str(chart),
+            "-f",
+            str(values_file),
+            "--show-only",
+            "templates/agent-sandbox.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    template = next(d for d in rendered.split("\n---") if "kind: SandboxTemplate" in d)
+    assert "CURIE_FAKE_MODEL" not in template
+    assert f"- name: CURIE_MODEL\n              value: {json.dumps(config.model)}" in template
