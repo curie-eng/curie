@@ -4,7 +4,7 @@
 //! can script it. Secret values travel on stdin only and never appear in argv,
 //! errors, or logs.
 
-use std::io::Write;
+use std::io::{Read as _, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -255,6 +255,16 @@ impl Kubectl for SystemKubectl {
             }
             _ => None,
         };
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let stdout_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            stderr_pipe.read_to_end(&mut buf).map(|_| buf)
+        });
         if let Some(limit) = self.call_timeout {
             let give_up = Instant::now() + limit;
             loop {
@@ -271,6 +281,8 @@ impl Kubectl for SystemKubectl {
                     if let Some(writer) = writer {
                         let _ = writer.join();
                     }
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     let verb = args
                         .iter()
                         .find(|a| !a.starts_with('-') && !is_flag_value(args, a))
@@ -284,17 +296,25 @@ impl Kubectl for SystemKubectl {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        let output = child.wait_with_output().context("kubectl did not finish")?;
+        let status = child.wait().context("kubectl did not finish")?;
         if let Some(writer) = writer {
             writer
                 .join()
                 .map_err(|_| anyhow!("kubectl stdin writer panicked"))?
                 .context("could not write kubectl stdin")?;
         }
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| anyhow!("kubectl stdout reader panicked"))?
+            .context("could not read kubectl stdout")?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow!("kubectl stderr reader panicked"))?
+            .context("could not read kubectl stderr")?;
         Ok(KubectlOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            success: status.success(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 }
