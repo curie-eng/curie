@@ -105,7 +105,7 @@ struct ClusterConn {
     #[arg(long, env = "CURIE_API_URL")]
     api_url: Option<String>,
     /// Platform API key. Omit to read the release's `api.apiKey` from its Secret.
-    #[arg(long, env = "CURIE_API_KEY")]
+    #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
     /// Kubernetes namespace of the release. Default: curie.
     #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
@@ -1488,6 +1488,16 @@ enum SkillAction {
     Memory,
     #[command(about = format!(
         "Not available at this tier: {}; {}",
+        commands::WORK_ITEMS_REASON, commands::WORK_ITEMS_ALT,
+    ))]
+    WorkItems {
+        /// Accepts any arguments so every form reaches the exit-4 capability
+        /// refusal instead of a clap usage error (#2577, like #1955).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _rest: Vec<String>,
+    },
+    #[command(about = format!(
+        "Not available at this tier: {}; {}",
         commands::OBSERVABILITY_REASON, commands::OBSERVABILITY_ALT,
     ))]
     Observability {
@@ -2149,6 +2159,27 @@ enum LocalAction {
         /// Confirm the action; it interrupts any live turn on the thread.
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List factory work item outcomes (`GET /work-items`), or read one with
+    /// its live CI (`GET /work-items/{id}`).
+    WorkItems {
+        /// Work item id to read. Omit to list.
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        /// Scope to one agent (name or id).
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
         #[arg(long)]
         dry_run: bool,
     },
@@ -2958,6 +2989,21 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List factory work item outcomes (`GET /work-items`), or read one with
+    /// its live CI (`GET /work-items/{id}`).
+    WorkItems {
+        /// Work item id to read. Omit to list.
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        /// Scope to one agent (name or id).
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
         #[command(flatten)]
@@ -3111,6 +3157,7 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
+        | ClusterAction::WorkItems { conn, .. }
         | ClusterAction::Delete { conn, .. } => {
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
@@ -3207,6 +3254,7 @@ fn retarget_cluster_action(
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
+        | ClusterAction::WorkItems { conn, .. }
         | ClusterAction::Delete { conn, .. } => {
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);
@@ -3973,6 +4021,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             // the verb reports why and exits 4 (issue #459, ADR-0041).
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
+            SkillAction::WorkItems { .. } => Err(commands::skill_work_items_unavailable()),
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
@@ -4286,6 +4335,24 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
             }
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
+            LocalAction::WorkItems {
+                id,
+                agent,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit({
+                let id = commands::validated_work_item_id(id)?;
+                commands::work_items(commands::WorkItemsOpts {
+                    api_url,
+                    api_key,
+                    id,
+                    agent,
+                    dry_run,
+                    tier: "local",
+                })
+                .await?
+            }),
             LocalAction::Memory { target, add } => match add {
                 None => emit(commands::memory(target.into()).await?),
                 Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
@@ -5551,6 +5618,31 @@ async fn run(command: Option<Command>) -> Result<()> {
                         thread_key,
                         yes,
                     )
+                    .await?,
+                )
+            }
+            ClusterAction::WorkItems {
+                id,
+                agent,
+                conn,
+                dry_run,
+            } => {
+                // Validate before any network access, through the centralized
+                // structured error path (cli/CLAUDE.md error contract).
+                let id = commands::validated_work_item_id(id)?;
+                // `_cluster_api_pf` is the port-forward guard; it must live for
+                // the whole call.
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::work_items(commands::WorkItemsOpts {
+                        api_url,
+                        api_key,
+                        id,
+                        agent,
+                        dry_run,
+                        tier: "cluster",
+                    })
                     .await?,
                 )
             }

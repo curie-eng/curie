@@ -18,6 +18,9 @@ const WiredAgents = lazy(() =>
 const WiredAgentDetail = lazy(() =>
   import("./views/wired/WiredAgentDetail").then((m) => ({ default: m.WiredAgentDetail })),
 );
+const WiredWorkItems = lazy(() =>
+  import("./views/wired/WiredWorkItems").then((m) => ({ default: m.WiredWorkItems })),
+);
 const WiredConnections = lazy(() =>
   import("./views/wired/WiredStubs").then((m) => ({ default: m.WiredConnections })),
 );
@@ -44,6 +47,8 @@ function Main() {
       return <WiredOverview />;
     case "agents":
       return <WiredAgents />;
+    case "work-items":
+      return <WiredWorkItems />;
     case "evals":
       return <WiredEvals />;
     case "observability":

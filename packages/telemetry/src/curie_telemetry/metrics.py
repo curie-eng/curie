@@ -280,6 +280,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/finish",
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
+    "/work-items",
+    "/work-items/{work_item_id}",
     "unmatched",
 ]
 _HTTP_ATTRIBUTES = {

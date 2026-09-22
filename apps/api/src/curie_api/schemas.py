@@ -1675,6 +1675,96 @@ class PublicationOut(BaseModel):
     terminal_at: datetime | None
 
 
+WorkItemOutcomeState = Literal[
+    "waiting",
+    "running",
+    "cancellation_requested",
+    "cancelled",
+    "expired",
+    "failed",
+    "awaiting_approval",
+    "publishing",
+    "published",
+    "completed_unpublished",
+]
+WorkItemCiState = Literal[
+    "passing", "failing", "pending", "none", "unavailable", "not_applicable"
+]
+
+
+class WorkItemRequestOut(BaseModel):
+    """Operator view of one ExecutionRequest (#2577). Built from an explicit
+    allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
+
+    sequence: int
+    status: str
+    created_at: datetime
+    wait_deadline: datetime
+    started_at: datetime | None
+    execution_deadline: datetime | None
+    terminal_at: datetime | None
+    terminal_cause: str | None
+    termination_observation: str | None
+    capacity_deferrals: int
+    last_deferral_reason: str | None
+
+
+class WorkItemPrOut(BaseModel):
+    number: int
+    url: str
+    status: str
+
+
+class WorkItemPublicationOut(BaseModel):
+    status: str
+    revision_number: int | None
+    approval_status: str | None
+
+
+class WorkItemCorrectnessOut(BaseModel):
+    """The platform never asserts correctness; the bundle owns it (ADR 0162)."""
+
+    asserted: Literal[False] = False
+    owner: Literal["bundle"] = "bundle"
+
+
+class WorkItemCiOut(BaseModel):
+    """A live, unpersisted CI observation of the published head."""
+
+    state: WorkItemCiState
+    reason: str | None = None
+    head_sha: str | None = None
+    observed_at: datetime | None = None
+
+
+class WorkItemOutcomeOut(BaseModel):
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    repo_full_name: str
+    github_issue_number: int
+    issue_url: str
+    cancelled_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    state: WorkItemOutcomeState
+    actionable_cause: str
+    objective: str | None
+    objective_truncated: bool
+    requester: str | None
+    pr: WorkItemPrOut | None
+    publication: WorkItemPublicationOut | None
+    correctness: WorkItemCorrectnessOut
+    # Null on the list route: CI is observed live on the detail route only.
+    ci: WorkItemCiOut | None
+    requests: list[WorkItemRequestOut]
+
+
+class WorkItemOutcomeList(BaseModel):
+    items: list[WorkItemOutcomeOut]
+    limit: int
+    truncated: bool
+
+
 class ApprovalResolve(BaseModel):
     """One resolution attempt. Exactly one attempt wins (compare-and-set), and
     the server-side authorizer decides whether the authenticated principal may

@@ -8445,6 +8445,213 @@ pub fn skill_memory_unavailable() -> anyhow::Error {
     crate::exit::unsupported("memory", MEMORY_REASON, MEMORY_ALT)
 }
 
+/// Why `skill work-items` cannot be answered at this tier.
+pub const WORK_ITEMS_REASON: &str =
+    "the skill tier runs one bundle against a local runner and admits no factory work items; there is no platform API here to own them";
+/// Where to read factory work items instead.
+pub const WORK_ITEMS_ALT: &str =
+    "use `curie local work-items` or `curie cluster work-items` against a platform API";
+
+/// `skill work-items`: understood, but unavailable at this tier (#2577,
+/// ADR-0041). Work items are admitted and owned by the platform API.
+pub fn skill_work_items_unavailable() -> anyhow::Error {
+    crate::exit::unsupported("work-items", WORK_ITEMS_REASON, WORK_ITEMS_ALT)
+}
+
+/// A work item ID must be a UUID. Refused locally as a usage error (exit 2)
+/// before any request is made, through the centralized error path so `--json`
+/// still gets the structured `{error, ...}` payload.
+pub fn validated_work_item_id(id: Option<String>) -> Result<Option<String>> {
+    match id {
+        None => Ok(None),
+        Some(raw) => match uuid::Uuid::parse_str(&raw) {
+            Ok(_) => Ok(Some(raw)),
+            Err(_) => Err(crate::exit::usage(format!(
+                "work item ID must be a UUID, got {raw:?}"
+            ))),
+        },
+    }
+}
+
+/// Inputs for `<tier> work-items [ID] [--agent NAME_OR_ID]` (#2577).
+pub struct WorkItemsOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub id: Option<String>,
+    pub agent: Option<String>,
+    pub dry_run: bool,
+    /// "local" or "cluster", for the transient-error remediation hint.
+    pub tier: &'static str,
+}
+
+/// Output of `<tier> work-items`. The list and detail carry the API payload
+/// through typed mirrors under a stable envelope; `state` and
+/// `actionable_cause` are the API's strings, never recomputed here.
+pub enum WorkItemsOutput {
+    List {
+        list: crate::api::WorkItemList,
+    },
+    Detail {
+        item: Box<crate::api::WorkItemOutcome>,
+    },
+    DryRun(crate::ui::DryRunPlan),
+}
+
+fn work_item_pr_cell(item: &crate::api::WorkItemOutcome) -> String {
+    item.pr
+        .as_ref()
+        .map(|pr| format!("#{} {}", pr.number, pr.status))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+impl crate::ui::CliOutput for WorkItemsOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            WorkItemsOutput::List { list } => serde_json::to_value(list).unwrap_or_default(),
+            WorkItemsOutput::Detail { item } => serde_json::json!({ "item": item }),
+            WorkItemsOutput::DryRun(plan) => plan.to_json(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            WorkItemsOutput::DryRun(plan) => plan.render(ui),
+            WorkItemsOutput::List { list } => {
+                if list.items.is_empty() {
+                    ui.payload("no work items");
+                    return;
+                }
+                let rows: Vec<Vec<String>> = list
+                    .items
+                    .iter()
+                    .map(|item| {
+                        vec![
+                            item.id.clone(),
+                            format!("{}#{}", item.repo_full_name, item.github_issue_number),
+                            item.state.clone(),
+                            work_item_pr_cell(item),
+                            item.actionable_cause.clone(),
+                        ]
+                    })
+                    .collect();
+                // The last column is never padded: a long cause must not
+                // trail every row with spaces out to the widest cause.
+                let table = crate::ui::table(&["ID", "ISSUE", "STATE", "PR", "CAUSE"], &rows, &[]);
+                let trimmed: Vec<&str> = table.lines().map(str::trim_end).collect();
+                ui.payload_plain(&trimmed.join("\n"));
+                if list.truncated {
+                    ui.payload_plain(&format!(
+                        "(showing the first {} work items; more exist)",
+                        list.limit
+                    ));
+                }
+            }
+            WorkItemsOutput::Detail { item } => {
+                let line = |key: &str, value: &str| ui.payload_plain(&format!("{key:<12} {value}"));
+                line("id", &item.id);
+                line(
+                    "issue",
+                    &format!("{}#{}", item.repo_full_name, item.github_issue_number),
+                );
+                line("state", &item.state);
+                line("cause", &item.actionable_cause);
+                line(
+                    "pr",
+                    &item
+                        .pr
+                        .as_ref()
+                        .map(|pr| format!("#{} {} {}", pr.number, pr.status, pr.url))
+                        .unwrap_or_else(|| "-".into()),
+                );
+                if let Some(publication) = &item.publication {
+                    line(
+                        "publication",
+                        &format!(
+                            "{} (approval {})",
+                            publication.status,
+                            publication.approval_status.as_deref().unwrap_or("-")
+                        ),
+                    );
+                }
+                match &item.ci {
+                    Some(ci) => line(
+                        "ci",
+                        &match ci.reason.as_deref() {
+                            Some(reason) => format!("{} ({reason})", ci.state),
+                            None => ci.state.clone(),
+                        },
+                    ),
+                    None => line("ci", "-"),
+                }
+                line(
+                    "correctness",
+                    "not asserted by the platform (owned by the bundle)",
+                );
+                if let Some(objective) = &item.objective {
+                    line("objective", objective);
+                }
+                for request in &item.requests {
+                    line(
+                        "request",
+                        &format!(
+                            "#{} {} {}",
+                            request.sequence,
+                            request.status,
+                            request.terminal_cause.as_deref().unwrap_or("")
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `<tier> work-items [ID]`: list or read factory work item outcomes
+/// (`GET /work-items`, `GET /work-items/{id}`, #2577). An `--agent` that
+/// matches no agent is a failure (exit 1) and never falls back to the
+/// unfiltered list.
+pub async fn work_items(opts: WorkItemsOpts) -> Result<WorkItemsOutput> {
+    if opts.dry_run {
+        let path = match &opts.id {
+            Some(id) => format!("GET {}/work-items/{id}", opts.api_url),
+            None => format!(
+                "GET {}/work-items?limit={}",
+                opts.api_url,
+                ApiClient::WORK_ITEMS_LIST_LIMIT
+            ),
+        };
+        let mut lines = vec![path];
+        if let Some(agent) = &opts.agent {
+            lines.push(format!("(would resolve agent {agent:?} to its id first)"));
+        }
+        return Ok(WorkItemsOutput::DryRun(crate::ui::DryRunPlan { lines }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent_id = match &opts.agent {
+        // The observability-classified lookup (#1948): a 5xx/unreachable/hang
+        // on `GET /agents` must exit 3 (transient) and never fall through to
+        // an unfiltered `/work-items` call (#2577).
+        Some(agent) => Some(
+            client
+                .find_agent_observability(agent)
+                .await
+                .map_err(|error| crate::observability::classify_api_error(error, opts.tier))?
+                .id,
+        ),
+        None => None,
+    };
+    match opts.id {
+        Some(id) => Ok(WorkItemsOutput::Detail {
+            item: Box::new(client.get_work_item(&id, agent_id.as_deref()).await?),
+        }),
+        None => Ok(WorkItemsOutput::List {
+            list: client
+                .list_work_items(agent_id.as_deref(), ApiClient::WORK_ITEMS_LIST_LIMIT)
+                .await?,
+        }),
+    }
+}
+
 /// `skill observability runs|run|metrics`: understood, but unavailable here.
 ///
 /// A skill runner can emit OTLP when explicitly wired, but it does not host the
