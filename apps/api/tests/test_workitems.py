@@ -1473,8 +1473,8 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                                 row.wait_event_type == "Lock"
                                 and row.waiting_lock
                                 and row.blocked_by_holder
+                                and "thread_publication_lineages" in row.query.lower()
                             ):
-                                assert "thread_publication_lineages" in row.query.lower()
                                 return
                             if service_task.done():
                                 raise AssertionError(

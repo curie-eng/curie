@@ -28,6 +28,7 @@ from .publication_k8s import (
     PublicationResourceNames,
     build_publication_resources,
     deterministic_publication_branch,
+    publication_branch_is_valid,
     publication_resource_names,
 )
 from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
@@ -128,6 +129,8 @@ class PublicationWork:
     # False only when this publication already launched and its execution is
     # no longer running. New launches stay excluded by the claim query.
     owner_running: bool = True
+    open_as_draft: bool = False
+    branch_prefix: str | None = None
 
 
 class PublicationStore(Protocol):
@@ -270,6 +273,7 @@ class PublicationGitHub(Protocol):
         *,
         expected_head_sha: str,
         authorization_header: str,
+        draft: bool = False,
     ) -> PublicationPullState | None | Awaitable[PublicationPullState | None]: ...
 
 
@@ -856,6 +860,8 @@ class PublicationReconciler:
             pr_url=work.pr_url,
             title=work.title,
             body=work.body,
+            open_as_draft=work.open_as_draft,
+            branch_prefix=work.branch_prefix,
         )
 
     async def _read_stored_pull(
@@ -978,6 +984,17 @@ class PublicationReconciler:
         # cluster or GitHub side effect here.
         if work.decision != "approved":
             return
+        if not publication_branch_is_valid(work.branch, work.branch_prefix):
+            await self._bounded_setup_failure(
+                work,
+                PublicationReconcileError(
+                    "publication branch does not carry the required prefix"
+                    if work.branch_prefix
+                    and not work.branch.startswith(work.branch_prefix)
+                    else "publication branch is not a valid stored lineage branch"
+                ),
+            )
+            return
 
         try:
             observation = await _cluster_call(self._cluster.observe, names.job)
@@ -1091,6 +1108,7 @@ class PublicationReconciler:
                             work.body,
                             expected_head_sha=branch_head,
                             authorization_header=credential.authorization_header,
+                            draft=work.open_as_draft,
                         )
                     )
                     if recovered is None:

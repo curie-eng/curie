@@ -67,6 +67,25 @@ class ActionStatus(enum.StrEnum):
 
 class Agent(Base):
     __tablename__ = "agents"
+    __table_args__ = (
+        CheckConstraint(
+            "publication_policy IN ('approve', 'auto')",
+            name="agents_publication_policy_ck",
+        ),
+        CheckConstraint(
+            "publication_policy_version >= 1",
+            name="agents_publication_policy_version_ck",
+        ),
+        CheckConstraint(
+            "publication_branch_prefix IS NULL OR ("
+            "char_length(publication_branch_prefix) BETWEEN 2 AND 64 "
+            "AND publication_branch_prefix ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}/$' "
+            "AND publication_branch_prefix NOT LIKE '%..%' "
+            "AND publication_branch_prefix NOT LIKE '%.lock/' "
+            "AND publication_branch_prefix NOT LIKE '%./')",
+            name="agents_publication_branch_prefix_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(unique=True)
@@ -167,6 +186,17 @@ class Agent(Base):
     # revision}}}``. NULL means no hook on this agent selects a coding target
     # from a delivery: investigation may still run, coding does not guess a repo.
     source_bindings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Who resolves a publication approval (ADR 0147). ``approve`` is today's
+    # human gate and the value every pre-existing row receives. ``auto`` makes
+    # the platform resolve the same approval row under the recorded policy.
+    # The version increments when the operator changes the policy or its bounds,
+    # so an in-flight auto approval cannot redeem after that change.
+    publication_policy: Mapped[str] = mapped_column(
+        default="approve", server_default="approve"
+    )
+    publication_policy_version: Mapped[int] = mapped_column(default=1, server_default="1")
+    publication_draft: Mapped[bool] = mapped_column(default=False, server_default="false")
+    publication_branch_prefix: Mapped[str | None] = mapped_column(default=None)
     # Whether this agent's bindings share one workflow-state namespace or each
     # get their own (#1525 follow-up). Cardinality alone (ADR-0118 decision 2)
     # governs routing and agent-scoped controls (budget, kill state, bundle
@@ -348,7 +378,7 @@ class ThreadWorkspace(Base):
 
 
 class Approval(Base):
-    """A durable human-approval request (#244, ADR-0010).
+    """A durable approval request (#244, ADR-0010).
 
     Created by the worker when a run ends ``awaiting-approval``; the session is
     suspended while this row is pending, so the record must carry everything a
@@ -362,6 +392,13 @@ class Approval(Base):
     """
 
     __tablename__ = "approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "(policy_identity IS NULL AND policy_version IS NULL) OR "
+            "(policy_identity = 'publication:auto' AND policy_version >= 1)",
+            name="approvals_policy_identity_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Nullable: a run without a deployment binding (the generic/dev path) can
@@ -437,6 +474,10 @@ class Approval(Base):
     # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
     # requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
+    # Set only when the platform resolved this row under ADR 0147. Human
+    # resolutions leave both NULL so they stay distinguishable in the audit.
+    policy_identity: Mapped[str | None] = mapped_column(default=None)
+    policy_version: Mapped[int | None] = mapped_column(default=None)
 
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
 
@@ -1042,6 +1083,15 @@ class Publication(Base):
             "result_delivery_dead_lettered_at",
             "lease_expires_at",
         ),
+        CheckConstraint(
+            "branch_prefix IS NULL OR ("
+            "char_length(branch_prefix) BETWEEN 2 AND 64 "
+            "AND branch_prefix ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}/$' "
+            "AND branch_prefix NOT LIKE '%..%' "
+            "AND branch_prefix NOT LIKE '%.lock/' "
+            "AND branch_prefix NOT LIKE '%./')",
+            name="publications_branch_prefix_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1068,6 +1118,10 @@ class Publication(Base):
     expected_prior_head: Mapped[str | None] = mapped_column(default=None)
     repo_full_name: Mapped[str]
     status: Mapped[str] = mapped_column(server_default="pending")
+    # Snapshotted from the agent policy at creation. Human policy stores false
+    # and NULL. The worker enforces these bounds and does not reread the agent.
+    open_as_draft: Mapped[bool] = mapped_column(default=False, server_default="false")
+    branch_prefix: Mapped[str | None] = mapped_column(default=None)
     version: Mapped[int] = mapped_column(server_default="1", default=1)
     base_sha: Mapped[str]
     # Deliberately excluded from every public DTO. Terminal retention clears
@@ -1189,7 +1243,7 @@ class ApprovalAuditEntry(Base):
     __table_args__ = (
         CheckConstraint(
             "principal_kind IS NULL OR principal_kind IN "
-            "('chat', 'console', 'operator', 'adapter')",
+            "('chat', 'console', 'operator', 'adapter', 'platform')",
             name="approval_audit_principal_kind_ck",
         ),
     )

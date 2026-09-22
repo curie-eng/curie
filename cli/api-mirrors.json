@@ -405,6 +405,22 @@
         {
           "field": "memory",
           "why": "Same reason as `channels`: whether an agent's bindings share workflow state (#1525 follow-up, ADR-0118) is a separate concern from the model/thinking pair this verb reads and writes, and it has no CLI surface of its own yet -- emitting it here would imply this verb can change it."
+        },
+        {
+          "field": "publication_policy",
+          "why": "Publication policy has its own verb. Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "publication_policy_version",
+          "why": "Publication policy has its own verb. Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "publication_draft",
+          "why": "Publication policy has its own verb. Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "publication_branch_prefix",
+          "why": "Publication policy has its own verb. Emitting it from overrides would imply that verb can change it."
         }
       ]
     }

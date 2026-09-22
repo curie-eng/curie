@@ -347,7 +347,8 @@ class PostgresPublicationStore:
                          WHERE e.id = p.execution_request_id
                            AND e.status = 'running'
                      )
-                   ) AS owner_running
+                   ) AS owner_running,
+                   p.open_as_draft, p.branch_prefix
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
               JOIN {self._lineages} l ON l.id = p.lineage_id
@@ -451,6 +452,10 @@ class PostgresPublicationStore:
             version=version,
             lease_owner=self._lease_owner,
             owner_running=bool(row["owner_running"]),
+            open_as_draft=bool(row["open_as_draft"]),
+            branch_prefix=(
+                str(row["branch_prefix"]) if row["branch_prefix"] is not None else None
+            ),
         )
 
     async def is_terminal(self, publication_id: uuid.UUID) -> bool:

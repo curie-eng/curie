@@ -412,6 +412,7 @@ class GitHubPublicationLookup:
         *,
         expected_head_sha: str,
         authorization_header: str,
+        draft: bool = False,
     ) -> PublicationPullState | None:
         """Adopt a PR, or create it only when its deterministic branch exists."""
 
@@ -435,6 +436,7 @@ class GitHubPublicationLookup:
             base=default_branch,
             expected_head_sha=expected_head_sha,
             authorization_header=authorization_header,
+            draft=draft,
         )
         if existing is not None:
             return existing
@@ -480,6 +482,7 @@ class GitHubPublicationLookup:
                     "head": branch,
                     "base": default_branch,
                     "body": body,
+                    **({"draft": True} if draft else {}),
                 },
                 follow_redirects=False,
             )
@@ -494,6 +497,7 @@ class GitHubPublicationLookup:
                 body=body,
                 base=default_branch,
                 expected_head_sha=expected_head_sha,
+                draft=draft,
             )
 
         # A lost POST response or a concurrent reconciler is ambiguous. Query
@@ -506,6 +510,7 @@ class GitHubPublicationLookup:
             base=default_branch,
             expected_head_sha=expected_head_sha,
             authorization_header=authorization_header,
+            draft=draft,
         )
         if recovered is not None:
             return recovered
@@ -561,6 +566,7 @@ class GitHubPublicationLookup:
         body: str,
         base: str,
         expected_head_sha: str,
+        draft: bool = False,
     ) -> PublicationPullState:
         try:
             payload = response.json()
@@ -617,6 +623,8 @@ class GitHubPublicationLookup:
             raise PublicationReconcileError(
                 "GitHub pull request does not match the approved publication contract"
             )
+        if draft and payload.get("draft") is not True:
+            raise PublicationReconcileError("GitHub pull request is not the required draft")
         head_sha = actual["head_sha"]
         if (
             not isinstance(head_sha, str)
@@ -667,6 +675,7 @@ class GitHubPublicationLookup:
         base: str,
         expected_head_sha: str,
         authorization_header: str,
+        draft: bool = False,
     ) -> PublicationPullState | None:
         owner = repo_full_name.split("/", 1)[0]
         try:
@@ -704,4 +713,5 @@ class GitHubPublicationLookup:
             body=body,
             base=base,
             expected_head_sha=expected_head_sha,
+            draft=draft,
         )
