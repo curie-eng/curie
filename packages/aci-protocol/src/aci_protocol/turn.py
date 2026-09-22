@@ -30,6 +30,8 @@ stays outside this package, in the dispatcher's queue module.
 
 from enum import StrEnum
 
+from pydantic import model_validator
+
 from .events import _AciModel
 
 
@@ -200,14 +202,38 @@ class QueuedTurn(_AciModel):
     ``hook_run`` carries the scheduled hook identity when a hook produced the
     turn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep
     decoding unchanged.
+
+    ``reply_handle`` is absent only for a targetless cron turn. That turn must
+    carry a complete, nonblank ``hook_run`` so the worker has explicit agent and
+    scheduled run identity without inventing a reply route. Every targeted turn,
+    including cron, keeps the existing reply handle contract unchanged.
     """
 
     event_id: str
     conversation_id: str
     author: str
     text: str
-    reply_handle: ReplyHandle
+    reply_handle: ReplyHandle | None = None
     received_at: str
     source: TurnSource = TurnSource.SLACK
     attachments: list[Attachment] = []
     hook_run: HookRunRef | None = None
+
+    @model_validator(mode="after")
+    def _validate_targetless_cron_identity(self) -> "QueuedTurn":
+        if self.reply_handle is not None:
+            return self
+        if self.source is not TurnSource.CRON:
+            raise ValueError("only a cron turn may omit reply_handle")
+        if self.hook_run is None:
+            raise ValueError("a targetless cron turn requires hook_run identity")
+        if not all(
+            value.strip()
+            for value in (
+                self.hook_run.agent_id,
+                self.hook_run.name,
+                self.hook_run.slot_utc,
+            )
+        ):
+            raise ValueError("targetless cron hook_run identity must be nonblank")
+        return self

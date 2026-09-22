@@ -451,13 +451,11 @@ def test_a_targetless_cron_turn_round_trips_with_complete_identity(
 
 
 @pytest.mark.parametrize("reader", ["constructor", "consumer"])
-@pytest.mark.parametrize("hook_run", [pytest.param(None, id="null")])
 def test_a_targetless_cron_turn_without_run_identity_is_rejected(
-    hook_run: None,
     reader: str,
 ) -> None:
     payload = _targetless_cron_payload()
-    payload["hook_run"] = hook_run
+    payload["hook_run"] = None
 
     with pytest.raises(ValidationError):
         _construct_or_parse_targetless(payload, reader)

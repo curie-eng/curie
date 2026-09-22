@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.4.8";
+pub const PROTOCOL_VERSION: &str = "0.5.0";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -278,7 +278,8 @@ pub struct QueuedTurn {
     pub conversation_id: String,
     pub author: String,
     pub text: String,
-    pub reply_handle: ReplyHandle,
+    #[serde(default)]
+    pub reply_handle: Option<ReplyHandle>,
     pub received_at: String,
     #[serde(default)]
     pub source: TurnSource,
@@ -510,19 +511,19 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_near_version() {
-        let raw = r#"{"type":"final","version":"0.5.0","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.6.0","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.4.9","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.1","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.4.8","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.0","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }
