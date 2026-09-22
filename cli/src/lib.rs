@@ -40,6 +40,7 @@ pub mod modelpin;
 pub mod ndjson;
 pub mod observability;
 pub mod ops;
+pub mod provider;
 pub mod queue;
 pub mod recipes;
 pub mod release_accept;

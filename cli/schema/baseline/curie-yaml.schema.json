@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/curie-yaml/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/curie-yaml/v1.1.json",
   "title": "curie.yaml installation file",
   "description": "Input schema for the installation file `curie apply` and `curie diff` parse. Secret fields are NAMES of environment variables or `curie secrets` entries, never values. Unknown keys are an error.",
   "type": "object",
@@ -131,6 +131,34 @@
               "minLength": 1
             }
           }
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional provider. Absent keeps the local store. Names only, never credential values.",
+      "required": [
+        "provider",
+        "region",
+        "prefix",
+        "role_arn"
+      ],
+      "properties": {
+        "provider": {
+          "const": "aws"
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role_arn": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },

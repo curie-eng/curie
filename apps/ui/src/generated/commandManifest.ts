@@ -5443,6 +5443,22 @@ export const commandManifest = {
               "long": "expected-version",
               "positional": false,
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Installation file. When it declares `secrets.provider`, set uses the provider. This build returns not implemented on that path",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Expiry timestamp for a provider tag. This build returns not implemented when the flag is set and does not write the local store",
+              "id": "expires",
+              "long": "expires",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -5450,6 +5466,16 @@ export const commandManifest = {
         },
         {
           "about": "List saved Curie secret names. Values are never printed",
+          "args": [
+            {
+              "global": false,
+              "help": "Installation file. When it declares `secrets.provider`, list uses the provider. This build returns not implemented on that path",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false
+            }
+          ],
           "hidden": false,
           "name": "list"
         },
@@ -5490,6 +5516,50 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "unset"
+        },
+        {
+          "about": "Declared provider check. This build returns not implemented",
+          "args": [
+            {
+              "global": false,
+              "help": "Object name. Omit to check the whole install once the backend exists",
+              "id": "name",
+              "positional": true,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Installation file. Accepted and ignored until the backend exists",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "check"
+        },
+        {
+          "about": "Declared provider remove. This build returns not implemented",
+          "args": [
+            {
+              "global": false,
+              "help": "Logical name to remove",
+              "id": "name",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Installation file. Accepted and ignored until the backend exists",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "rm"
         }
       ]
     },
@@ -5646,6 +5716,11 @@ export const commandManifest = {
           "about": "Assert sibling CLI verbs expose matching conversation controls across the skill, local, and cluster tiers (#1666, `bash cli/scripts/check-verb-parity.sh`). Offline, no credential",
           "hidden": false,
           "name": "verb-parity"
+        },
+        {
+          "about": "Declared inventory check. This build returns not implemented",
+          "hidden": false,
+          "name": "secrets-inventory"
         },
         {
           "about": "Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/). Refuses when a schema changed shape without a version bump",

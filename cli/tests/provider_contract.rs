@@ -28,8 +28,7 @@ install:
   release: a
 ";
 
-const SECRET_LINES: &str = "\
-  provider: aws
+const SECRET_LINES: &str = "  provider: aws
   region: us-east-1
   prefix: tenant/platform
   role_arn: arn:aws:iam::000000000000:role/curie-sync
