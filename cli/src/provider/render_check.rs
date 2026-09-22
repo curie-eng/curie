@@ -562,6 +562,10 @@ pub fn run_check(options: &CheckOptions) -> Result<CheckReport> {
             .map_err(|error| anyhow!("bundle {agent} at {}: {error:#}", dir.display()))?;
         bundles.extend(bundle_entries(&decl, agent)?);
     }
+    // The provider set redirects platform knobs only. A per-agent BYO knob
+    // also needs its key list and excludes the agent's connectorSecrets, which
+    // is deploy's routing to make; byo.yaml renders that knob instead.
+    let platform_for_provider = platform.clone();
     let entries = merge(platform, bundles).map_err(|error| anyhow!("{error:#}"))?;
 
     let mut sets = values_sets(&options.chart)?;
@@ -578,7 +582,11 @@ pub fn run_check(options: &CheckOptions) -> Result<CheckReport> {
     let provider_path = scratch.path().join("provider-values.yaml");
     std::fs::write(
         &provider_path,
-        serde_norway::to_string(&provider_values(&entries, &base, &base_values))?,
+        serde_norway::to_string(&provider_values(
+            &platform_for_provider,
+            &base,
+            &base_values,
+        ))?,
     )
     .context("write provider values")?;
     provider_files.push(provider_path);

@@ -14,6 +14,9 @@ rustfs:
   existingSecret: byo-object-store
 langfuse:
   existingSecret: byo-langfuse
+installation:
+  idExistingSecret: byo-installation
+  idExistingSecretKey: id
 sealing:
   privateKeyExistingSecret: byo-sealing
   privateKeyExistingSecretKey: current
@@ -25,6 +28,8 @@ api:
   githubAppId: "1"
   githubAppExistingSecret: byo-github-app
   githubAppExistingSecretKey: privateKey
+  githubWebhookSecretExistingSecret: byo-github-webhook
+  githubWebhookSecretExistingSecretKey: hmac
 dispatcher:
   deploy: true
   slack:
@@ -54,6 +59,11 @@ agentSandbox:
   runner:
     credentialsExistingSecret: byo-runner
     credentialsExistingSecretKey: credentials
+  # The sre-bot bundle's sandbox names, read from an operator-owned Secret.
+  connectorExistingSecrets:
+    sre-bot:
+      existingSecret: byo-sre-bot-connector
+      keys: [K8S_KUBECONFIG, SELF_UPGRADE_KUBECONFIG]
 # An external collector, so workloads read OTLP headers from a Secret.
 otelCollector:
   deploy: false
