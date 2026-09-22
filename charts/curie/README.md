@@ -1684,6 +1684,27 @@ As with `githubAppExistingSecret`, a Secret missing the referenced key fails
 that one pod at `CreateContainerConfigError` rather than the chart silently
 falling back to an empty credential.
 
+### BYO Secrets for generated and per-agent credentials
+
+ADR 0163 has an External Secrets sync own some credentials the chart would
+otherwise generate or template itself. Three knobs let such a Secret feed them;
+each rewires every consumer and stops the chart templating that key:
+
+| Credential | BYO fields | Consumers |
+|---|---|---|
+| Installation identity | `installation.idExistingSecret` / `idExistingSecretKey` (default key `installationId`) | worker `CURIE_INSTALLATION_ID`, and the upgrade-drain hook, which reads the value back with `lookup` |
+| GitHub webhook HMAC secret | `api.githubWebhookSecretExistingSecret` / `githubWebhookSecretExistingSecretKey` (default key `githubWebhookSecret`) | api `GITHUB_WEBHOOK_SECRET` |
+| Per-agent connector Secret | `agentSandbox.connectorExistingSecrets.<agent>.existingSecret` plus `.keys` (the env names to deliver) | that agent's SandboxTemplate; no `<fullname>-agent-<agent>-connector-secrets` renders |
+
+The installation identity keeps its upgrade fence on the BYO path: a render
+that cannot read the Secret tells the drain hook the identity is unobserved, so
+the upgrade refuses before touching Valkey, and an upgrade whose BYO identity
+differs from the one the release already stores fails the render. Seed the BYO
+Secret with the current `installationId` before switching an existing release.
+An agent may appear in `connectorSecrets` or `connectorExistingSecrets`, not
+both, and its BYO keys pass the same reserved-name guard. The CLI does not yet
+preserve these three across a plain `curie cluster up`.
+
 The CLI preservation mechanism covers all eight pairs outside the mail surface
 tracked by #1801. The three mail pairs were already retained with the mail
 surface and its paired worker credential source. A plain `curie cluster up`

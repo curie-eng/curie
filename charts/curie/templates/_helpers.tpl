@@ -843,6 +843,14 @@ Secret is memoized separately from its data so callers can reuse generated
 credentials without losing access to the Secret UID used by the legacy-upgrade
 bridge.
 
+When installation.idExistingSecret names a BYO Secret (for example one an
+External Secrets sync owns), the identity is read from that Secret instead and
+the chart stops storing it. A render that cannot read it (a client-only render,
+or the Secret not yet synced) marks the identity unobserved, so the upgrade hook
+still refuses before contacting Valkey, exactly as for the managed path. An
+upgrade whose BYO identity disagrees with the one the release already stores
+fails the render rather than silently re-keying the claim fence.
+
 Fresh installs always mint a new identity, including adoption of a retained
 Secret. Upgrades reuse the stored identity; the first upgrade from a chart that
 predates installationId adopts the live Secret UID and enables the one-release
@@ -858,7 +866,25 @@ before contacting Valkey.
 {{- $installationId := "" -}}
 {{- $observed := true -}}
 {{- $legacy := false -}}
-{{- if .Release.IsInstall -}}
+{{- $byoName := .Values.installation.idExistingSecret | default "" -}}
+{{- if $byoName -}}
+{{- $byoSecret := lookup "v1" "Secret" .Release.Namespace $byoName | default dict -}}
+{{- $byoEncoded := get (get $byoSecret "data" | default dict) .Values.installation.idExistingSecretKey | default "" -}}
+{{- $byoDecoded := "" -}}
+{{- if ne (trim (toString $byoEncoded)) "" -}}
+{{- $byoDecoded = $byoEncoded | b64dec -}}
+{{- end -}}
+{{- if ne (trim $byoDecoded) "" -}}
+{{- $installationId = $byoDecoded -}}
+{{- $managedEncoded := get $managedSecretData "installationId" | default "" -}}
+{{- if and .Release.IsUpgrade (ne (trim (toString $managedEncoded)) "") (ne ($managedEncoded | b64dec) $byoDecoded) -}}
+{{- fail (printf "installation.idExistingSecret %q key %q holds a different installation identity than the one this release already stores. Switching the identity would unfence in-flight claims during the upgrade; seed the existing Secret with the release's current installationId first. Neither value is printed." $byoName .Values.installation.idExistingSecretKey) -}}
+{{- end -}}
+{{- else -}}
+{{- $installationId = randAlphaNum 32 -}}
+{{- $observed = false -}}
+{{- end -}}
+{{- else if .Release.IsInstall -}}
 {{- $installationId = randAlphaNum 32 -}}
 {{- else if .Release.IsUpgrade -}}
 {{- $encodedId := get $managedSecretData "installationId" | default "" -}}
