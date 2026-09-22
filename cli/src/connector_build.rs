@@ -89,6 +89,10 @@ pub struct ConnectorSpecDecl {
     pub sealed_secrets: BTreeMap<String, String>,
     #[serde(default)]
     pub secret_files: BTreeMap<String, String>,
+    /// Keys the connector rotates in place (`workload` is the only value the
+    /// Python validator accepts). Carried through for the install inventory.
+    #[serde(default)]
+    pub secret_rotation: BTreeMap<String, String>,
 }
 
 /// A declared secret: a bare env var name, or a reference to a Secret someone
@@ -144,6 +148,7 @@ impl Default for ConnectorSpecDecl {
             bearer_secret: None,
             sealed_secrets: BTreeMap::new(),
             secret_files: BTreeMap::new(),
+            secret_rotation: BTreeMap::new(),
         }
     }
 }

@@ -48,6 +48,14 @@ on:
       # and the gate that exists to catch exactly that revert never runs.
       - "cli/src/ops/upgrade.rs"
       - "cli/tests/data/upgrade-driver.py"
+      # Fourth obligation: the credential inventory gate below reads the
+      # inventory and the render check from cli/src/provider, merges the
+      # sre-bot connector declaration, and depends on the connector model's
+      # secret_rotation rules. An edit to any of them can break the gate
+      # without touching charts/.
+      - "cli/src/provider/**"
+      - "examples/sre-bot/connectors.yaml"
+      - "packages/plugin-format/src/plugin_format/connectors.py"
 
 permissions:
   contents: read
@@ -498,6 +506,20 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/upgrade-retained-scalar-assertions.sh
+
+      # Every Secret reference the chart renders must be listed by the
+      # credential inventory (ADR 0163). An AWS install syncs the inventory's
+      # provider-held rows and points the chart's existingSecret knobs at them,
+      # so a credential the inventory misses has no provider-held value on a
+      # rebuild, and a rotating key marked provider-held is reverted by ESO
+      # after every rotation. Both are silent at install time. The script runs
+      # the check over every values set plus two planted negative controls,
+      # so a check that stopped looking fails too. Builds the CLI; spawns only
+      # helm.
+      - name: helm render assertions (credential inventory coverage)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/inventory-render-assertions.sh
 
       # Schema migrations run in one hook Job (#2300). Prove the Job is the
       # migrator, the API init only waits, and forward-only is opt-in.

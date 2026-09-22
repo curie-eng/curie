@@ -1,0 +1,468 @@
+# The platform credential inventory (ADR 0163 decision 4).
+#
+# One entry per credential, split where the update policy differs inside one
+# Secret. Names and keys only, never values. `curie dev secrets-inventory`
+# fails when the rendered chart references a Secret key no entry lists, so a
+# new credential in charts/curie must land here in the same change.
+#
+# Fields:
+#   class          external (third party), stateful (bound to persisted data
+#                  or another party), throwaway (regenerated with consumers)
+#   target         the Secret an install reads the keys from. store: sm rows
+#                  name the NEW Secret ESO writes; ESO never adopts the chart's
+#                  own <fullname>-secrets. Placeholders: {release}, {fullname},
+#                  {agent}, {operator} (any operator-chosen name).
+#   store          sm (Secrets Manager is the source of truth, ESO syncs) or
+#                  cluster (stays in-cluster, re-minted or re-provisioned)
+#   chart          default_secret: what the chart renders with no knob set;
+#                  knobs: the existingSecret values paths that redirect it
+#   update_policy  immutable for values bound to persisted state; `curie
+#                  secrets set` refuses to replace those
+version: 1
+entries:
+  # Identity the worker stamps on durable records. No existingSecret knob yet,
+  # so the chart still renders it from <fullname>-secrets.
+  - logical_name: installation-id
+    class: stateful
+    target: "{release}-curie-installation-id"
+    keys: [installationId]
+    consumers: [worker, upgrade-drain]
+    rotation_owner: sm
+    update_policy: immutable
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+
+  # Changing it strands the data directory and every consumer at once.
+  - logical_name: postgres-password
+    class: stateful
+    target: "{release}-curie-postgres"
+    keys: [postgresPassword]
+    consumers: [postgres, api, worker, schema-migrate, langfuse-web, langfuse-worker]
+    rotation_owner: sm
+    update_policy: immutable
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: postgres.existingSecret
+
+  - logical_name: valkey-password
+    class: stateful
+    target: "{release}-curie-valkey"
+    keys: [valkeyPassword]
+    consumers: [valkey, api, worker, dispatcher, upgrade-drain, langfuse-web, langfuse-worker]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: valkey.existingSecret
+
+  - logical_name: clickhouse-password
+    class: stateful
+    target: "{release}-curie-clickhouse"
+    keys: [clickhousePassword]
+    consumers: [clickhouse, langfuse-web, langfuse-worker]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: clickhouse.existingSecret
+
+  # The in-chart RustFS secret key, or an external S3 secret key under BYO.
+  - logical_name: object-store-secret-key
+    class: stateful
+    target: "{release}-curie-object-store"
+    keys: [rustfsSecretKey]
+    consumers: [rustfs, rustfs-init, api, worker, runner, langfuse-web, langfuse-worker]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: rustfs.existingSecret
+
+  # Salt and encryption key protect rows Langfuse already wrote; a new value
+  # makes them unreadable.
+  - logical_name: langfuse-data-keys
+    class: stateful
+    target: "{release}-curie-langfuse"
+    keys: [langfuseSalt, langfuseEncryptionKey]
+    consumers: [langfuse-web, langfuse-worker]
+    rotation_owner: sm
+    update_policy: immutable
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: langfuse.existingSecret
+
+  # The rest of the Langfuse Secret is replaceable: a new session secret logs
+  # users out, and the bootstrap identity can be re-issued.
+  - logical_name: langfuse-nextauth-secret
+    class: stateful
+    target: "{release}-curie-langfuse"
+    keys: [langfuseNextauthSecret]
+    consumers: [langfuse-web]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: langfuse.existingSecret
+
+  - logical_name: langfuse-init-project-secret-key
+    class: stateful
+    target: "{release}-curie-langfuse"
+    keys: [langfuseInitProjectSecretKey]
+    consumers: [langfuse-web, api, worker, langfuse-model-pricing]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: langfuse.existingSecret
+
+  - logical_name: langfuse-init-user-password
+    class: stateful
+    target: "{release}-curie-langfuse"
+    keys: [langfuseInitUserPassword]
+    consumers: [langfuse-web]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: langfuse.existingSecret
+
+  # Derived from the project keys by the chart; under langfuse.existingSecret
+  # the operator supplies it beside them.
+  - logical_name: otlp-auth-header
+    class: stateful
+    target: "{release}-curie-langfuse"
+    keys: [otlpAuthHeader]
+    consumers: [otel-collector]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: langfuse.existingSecret
+
+  # The three throwaways stay in the chart Secret (ADR 0163 decision 5): the
+  # chart mints them and every consumer is re-rolled with them.
+  - logical_name: api-key
+    class: throwaway
+    target: "{fullname}-secrets"
+    keys: [apiKey]
+    consumers: [api, worker, dispatcher]
+    rotation_owner: mint:chart
+    update_policy: replace
+    store: cluster
+    chart:
+      default_secret: "{fullname}-secrets"
+
+  - logical_name: approval-chat-attester-secret
+    class: throwaway
+    target: "{fullname}-secrets"
+    keys: [approvalChatAttesterSecret]
+    consumers: [api, dispatcher]
+    rotation_owner: mint:chart
+    update_policy: replace
+    store: cluster
+    chart:
+      default_secret: "{fullname}-secrets"
+
+  - logical_name: internal-worker-token
+    class: throwaway
+    target: "{fullname}-secrets"
+    keys: [internalWorkerToken]
+    consumers: [api, worker]
+    rotation_owner: mint:chart
+    update_policy: replace
+    store: cluster
+    chart:
+      default_secret: "{fullname}-secrets"
+
+  # Generated by the chart but shared with GitHub's webhook configuration, so
+  # a rebuild cannot re-mint it alone.
+  - logical_name: github-webhook-secret
+    class: stateful
+    target: "{release}-curie-github-webhook"
+    keys: [githubWebhookSecret]
+    consumers: [api]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+
+  - logical_name: github-token
+    class: external
+    target: "{release}-curie-github-token"
+    keys: [githubToken]
+    consumers: [api]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: api.githubTokenExistingSecret
+          key: api.githubTokenExistingSecretKey
+
+  # The BYO key name defaults to privateKey, not the chart's own key name, so
+  # a BYO reference is matched through the key knob.
+  - logical_name: github-app-private-key
+    class: external
+    target: "{release}-curie-github-app"
+    keys: [githubAppPrivateKey]
+    consumers: [api]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: api.githubAppExistingSecret
+          key: api.githubAppExistingSecretKey
+
+  # Sealing keys decrypt blobs already committed to bundles; a lost or
+  # replaced key strands every blob sealed to it.
+  - logical_name: sealing-private-key
+    class: stateful
+    target: "{release}-curie-sealing"
+    keys: [sealingPrivateKey]
+    consumers: [worker]
+    rotation_owner: sm
+    update_policy: immutable
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: sealing.privateKeyExistingSecret
+          key: sealing.privateKeyExistingSecretKey
+
+  - logical_name: sealing-previous-private-key
+    class: stateful
+    target: "{release}-curie-sealing"
+    keys: [sealingPreviousPrivateKey]
+    consumers: [worker]
+    rotation_owner: sm
+    update_policy: immutable
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: sealing.previousPrivateKeyExistingSecret
+          key: sealing.previousPrivateKeyExistingSecretKey
+
+  # The runner's model credential.
+  - logical_name: runner-model-credentials
+    class: external
+    target: "{release}-curie-runner-credentials"
+    keys: [agentCredentials]
+    consumers: [worker, runner]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: agentSandbox.runner.credentialsExistingSecret
+          key: agentSandbox.runner.credentialsExistingSecretKey
+
+  # Channel adapter credentials the worker presents; paired with the adapters
+  # that hold the other half (the mail egress secret is copied in here).
+  - logical_name: adapter-credentials
+    class: stateful
+    target: "{release}-curie-adapter-credentials"
+    keys: [adapterCredentials]
+    consumers: [worker]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: worker.adapterCredentialsExistingSecret
+          key: worker.adapterCredentialsExistingSecretKey
+
+  - logical_name: slack-app-token
+    class: external
+    target: "{release}-curie-slack"
+    keys: [slackAppToken]
+    consumers: [dispatcher]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: dispatcher.slack.appTokenExistingSecret
+          key: dispatcher.slack.appTokenExistingSecretKey
+
+  - logical_name: slack-bot-token
+    class: external
+    target: "{release}-curie-slack"
+    keys: [slackBotToken]
+    consumers: [dispatcher, api, worker]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: dispatcher.slack.botTokenExistingSecret
+          key: dispatcher.slack.botTokenExistingSecretKey
+
+  - logical_name: slack-signing-secret
+    class: external
+    target: "{release}-curie-slack"
+    keys: [slackSigningSecret]
+    consumers: [dispatcher]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: dispatcher.slack.signingSecretExistingSecret
+          key: dispatcher.slack.signingSecretExistingSecretKey
+
+  - logical_name: mail-agentmail-api-key
+    class: external
+    target: "{release}-curie-mail"
+    keys: [mailAgentmailApiKey]
+    consumers: [mail-adapter]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: mailAdapter.agentmail.apiKeyExistingSecret
+          key: mailAdapter.agentmail.apiKeyExistingSecretKey
+
+  # Curie mints this channel token and it expires within days, so the provider
+  # must not hold it: a sync would revert every re-mint (ADR 0163 decision 2).
+  - logical_name: mail-channel-token
+    class: stateful
+    target: "{fullname}-secrets"
+    keys: [mailChannelToken]
+    consumers: [mail-adapter]
+    rotation_owner: mint:mail-channel-token
+    update_policy: replace
+    store: cluster
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: mailAdapter.channelTokenExistingSecret
+          key: mailAdapter.channelTokenExistingSecretKey
+
+  # Shared between the mail adapter and the worker's adapter credentials, so
+  # re-minting one side alone breaks egress.
+  - logical_name: mail-egress-secret
+    class: stateful
+    target: "{release}-curie-mail"
+    keys: [mailEgressSecret]
+    consumers: [mail-adapter, worker]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      default_secret: "{fullname}-secrets"
+      knobs:
+        - secret: mailAdapter.egressSecretExistingSecret
+          key: mailAdapter.egressSecretExistingSecretKey
+
+  # The chart renders this Secret empty and a hook Job mints the token on every
+  # upgrade. Its readers are bundle connectors, which roll with their bundle.
+  - logical_name: grafana-connector-token
+    class: throwaway
+    target: curie-grafana-connector
+    keys: [GRAFANA_SERVICE_ACCOUNT_TOKEN]
+    consumers: []
+    rotation_owner: mint:grafana-connector
+    update_policy: replace
+    store: cluster
+    chart:
+      knobs:
+        - secret: grafanaConnector.secretName
+          key: grafanaConnector.secretKey
+
+  # Provisioned by whoever installed Grafana, in Grafana's namespace; the
+  # token hook Jobs only read it.
+  - logical_name: grafana-admin
+    class: external
+    target: grafana-admin
+    keys: [admin-user, admin-password]
+    consumers: [grafana-token-updater, grafana-token-cleanup]
+    rotation_owner: workload:grafana
+    update_policy: replace
+    store: cluster
+    chart:
+      knobs:
+        - secret: grafanaConnector.adminSecretName
+          key: grafanaConnector.adminUserKey
+        - secret: grafanaConnector.adminSecretName
+          key: grafanaConnector.adminPasswordKey
+
+  # Headers for an external OTLP collector, read only when the chart does not
+  # deploy its own.
+  - logical_name: otlp-headers
+    class: external
+    target: "{release}-curie-otlp-headers"
+    keys: [headers]
+    consumers: [api, worker, dispatcher, mail-adapter, runner]
+    rotation_owner: sm
+    update_policy: replace
+    store: sm
+    chart:
+      knobs:
+        - secret: otelCollector.headersExistingSecret
+          key: otelCollector.headersSecretKey
+
+  # Registry pull credentials are a list of operator-chosen names with no
+  # single knob, so any name matches, but only for this key.
+  - logical_name: image-pull
+    class: external
+    target: "{operator}"
+    keys: [.dockerconfigjson]
+    consumers: []
+    rotation_owner: sm
+    update_policy: replace
+    store: cluster
+
+  # Issued and renewed by cert-manager (or the operator) in-cluster.
+  - logical_name: api-ingress-tls
+    class: external
+    target: "{operator}"
+    keys: [tls.crt, tls.key]
+    consumers: [ingress]
+    rotation_owner: workload:cert-manager
+    update_policy: replace
+    store: cluster
+    chart:
+      knobs:
+        - secret: api.ingress.tls.secretName
+
+  # Short-lived credential the worker writes for one publication Job. Not
+  # rendered by the chart; listed so the inventory is complete.
+  - logical_name: publication-credential
+    class: throwaway
+    target: "curie-publication-{operator}"
+    keys: [credential]
+    consumers: [publication-job]
+    rotation_owner: mint:worker
+    update_policy: replace
+    store: cluster

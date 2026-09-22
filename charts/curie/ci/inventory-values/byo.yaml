@@ -1,0 +1,74 @@
+# Inventory coverage overlay: every existingSecret knob pointed at an
+# operator-chosen Secret name, with the consumers that read them turned on.
+#
+# `curie dev secrets-inventory` renders this so a reference redirected through
+# a knob must still be claimed by an inventory entry's chart.knobs (ADR 0163).
+# Names are arbitrary; nothing here is ever installed.
+postgres:
+  existingSecret: byo-postgres
+valkey:
+  existingSecret: byo-valkey
+clickhouse:
+  existingSecret: byo-clickhouse
+rustfs:
+  existingSecret: byo-object-store
+langfuse:
+  existingSecret: byo-langfuse
+sealing:
+  privateKeyExistingSecret: byo-sealing
+  privateKeyExistingSecretKey: current
+  previousPrivateKeyExistingSecret: byo-sealing
+  previousPrivateKeyExistingSecretKey: previous
+api:
+  githubTokenExistingSecret: byo-github-token
+  githubTokenExistingSecretKey: token
+  githubAppId: "1"
+  githubAppExistingSecret: byo-github-app
+  githubAppExistingSecretKey: privateKey
+dispatcher:
+  deploy: true
+  slack:
+    appTokenExistingSecret: byo-slack
+    appTokenExistingSecretKey: app
+    botTokenExistingSecret: byo-slack
+    botTokenExistingSecretKey: bot
+    signingSecretExistingSecret: byo-slack
+    signingSecretExistingSecretKey: signing
+mailAdapter:
+  deploy: true
+  allowedSenders: ["*"]
+  agentmail:
+    egressMode: publicHttps
+    apiKeyExistingSecret: byo-mail
+    apiKeyExistingSecretKey: agentmail
+  otelEgress:
+    httpsCidrs: [203.0.113.10/32]
+  channelTokenExistingSecret: byo-mail-channel
+  channelTokenExistingSecretKey: token
+  egressSecretExistingSecret: byo-mail
+  egressSecretExistingSecretKey: egress
+worker:
+  adapterCredentialsExistingSecret: byo-adapter
+  adapterCredentialsExistingSecretKey: credentials
+agentSandbox:
+  runner:
+    credentialsExistingSecret: byo-runner
+    credentialsExistingSecretKey: credentials
+# An external collector, so workloads read OTLP headers from a Secret.
+otelCollector:
+  deploy: false
+  endpoint: https://otlp.example.com
+  egress:
+    - cidr: 203.0.113.10/32
+      ports:
+        - port: 443
+          protocol: TCP
+  headersExistingSecret: byo-otlp
+  headersSecretKey: authorization
+grafanaConnector:
+  enabled: true
+  adminSecretName: byo-grafana-admin
+  adminUserKey: user
+  adminPasswordKey: password
+  secretName: byo-grafana-connector
+  secretKey: TOKEN
