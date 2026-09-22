@@ -92,8 +92,9 @@ the same `curie:runs` stream, and a truthful inventory names them:
 `triggers` declarations (`TriggerDeclaration` in `packages/plugin-format`, `triggers.*` validation
 codes), so an agent's non-chat wake-ups ship in one reviewable artifact and a malformed declaration
 is rejected at deploy. A cron declaration needs a unique non-empty name, a non-empty prompt, and a
-five-field schedule; timezone is an IANA name, default UTC only when omitted, and only legal with a
-schedule; target, when present, is a non-empty channel address string or an object with a non-empty channel; schedule is forbidden on other
+five-field schedule; timezone, when present, is an IANA zone name matching an exact key in packaged
+tzdata, so host only aliases such as `localtime` are rejected; it defaults to UTC only when omitted and is legal only with a
+schedule; target, when present, is a non-empty channel address string; schedule is forbidden on other
 types; webhook `{type, path}` is unchanged. This is the *declaration*
 surface only. A generic HMAC hook ingress is shipped (`ingest_hook` above); bundle-declared
 `cron` / `webhook` *consumption* -- a per-agent scheduler that fires a declared schedule, or a
