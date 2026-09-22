@@ -1,0 +1,29 @@
+name: Nightly kind on next
+
+# Kind jobs (cluster rung, released chart upgrade, upgrade matrix) are not
+# selected for next pull requests or for pushes to next. This schedule puts
+# them back once a day by dispatching CI on next.
+#
+# The schedule has to live on the default branch. A cron in a workflow that
+# exists only on next never fires. CI on next treats workflow_dispatch as a
+# full run, so this dispatch selects kind again.
+
+on:
+  schedule:
+    # 09:30 UTC. Off the hour, and after the 08:00 graded ladder.
+    - cron: "30 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch kind CI on next
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch the CI workflow on next
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run CI --ref next
