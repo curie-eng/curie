@@ -715,12 +715,56 @@ else:
             with self.assertRaises(ValueError, msg=rejected):
                 provider_harness.require_owned_secret_path(rejected)
 
-    def test_first_revert_index_flags_any_sample_off_the_live_rotation(self):
-        live = "a" * 64
-        self.assertIsNone(provider_harness.first_revert_index([live, live, live], live))
-        self.assertIsNone(provider_harness.first_revert_index([], live))
-        self.assertEqual(provider_harness.first_revert_index([live, "b" * 64, live], live), 1)
-        self.assertEqual(provider_harness.first_revert_index([None, live], live), 0)
+    def test_rotation_sample_evaluation_passes_a_clean_phase(self):
+        r0, r1, r2 = "0" * 64, "1" * 64, "2" * 64
+        rotations = [(3.0, 3.4, r1), (6.0, 6.3, r2)]
+        samples = [(0.0, 0.1, r0), (2.9, 3.05, r0), (3.5, 3.6, r1), (6.4, 6.5, r2)]
+        self.assertIsNone(
+            provider_harness.first_rotation_sample_violation(samples, r0, rotations)
+        )
+
+    def test_rotation_sample_evaluation_flags_a_revert_between_rotations(self):
+        r0, r1, r2 = "0" * 64, "1" * 64, "2" * 64
+        rotations = [(3.0, 3.4, r1), (6.0, 6.3, r2)]
+        samples = [(3.5, 3.6, r1), (4.0, 4.1, r0), (6.4, 6.5, r2)]
+        violation = provider_harness.first_rotation_sample_violation(samples, r0, rotations)
+        self.assertEqual(violation["sample_index"], 1)
+        self.assertEqual(violation["allowed"], [r1[:12]])
+        missing = provider_harness.first_rotation_sample_violation(
+            [(4.0, 4.1, None)], r0, rotations
+        )
+        self.assertEqual(missing["sample_index"], 0)
+
+    def test_rotation_sample_evaluation_allows_either_side_of_an_in_flight_write(self):
+        r0, r1, r2 = "0" * 64, "1" * 64, "2" * 64
+        rotations = [(3.0, 3.4, r1), (6.0, 6.3, r2)]
+        for seen in (r1, r2):
+            self.assertIsNone(
+                provider_harness.first_rotation_sample_violation(
+                    [(6.1, 6.2, seen)], r0, rotations
+                )
+            )
+        self.assertIsNotNone(
+            provider_harness.first_rotation_sample_violation([(6.1, 6.2, r0)], r0, rotations)
+        )
+
+    def test_sensitive_tool_run_leaves_no_stdout_on_disk(self):
+        with tempfile.TemporaryDirectory() as raw:
+            private = pathlib.Path(raw)
+            commands: list[str] = []
+            runner = provider_harness.ToolRunner(private, commands)
+            marker = "synthetic-secret-marker-7f3a"
+            result = runner.run(
+                [sys.executable, "-c", f"print({marker!r})"], "print marker", sensitive=True
+            )
+            self.assertEqual(result.stdout.decode().strip(), marker)
+            self.assertEqual(len(commands), 1)
+            self.assertFalse(list(private.glob("*.stdout")))
+            for path in private.iterdir():
+                self.assertNotIn(marker.encode(), path.read_bytes())
+            plain = runner.run([sys.executable, "-c", "print('x')"], "print plain")
+            self.assertEqual(plain.stdout.strip(), b"x")
+            self.assertEqual(len(list(private.glob("*.stdout"))), 1)
 
     def test_rotation_report_parser_accepts_known_outcomes_only(self):
         good = json.dumps(

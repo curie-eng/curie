@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -146,11 +148,38 @@ def require_owned_secret_path(name: str) -> str:
     return name
 
 
-def first_revert_index(samples: Sequence[str | None], expected: str) -> int | None:
-    """Return the index of the first sample whose digest is not the live rotation."""
-    for index, sample in enumerate(samples):
-        if sample != expected:
-            return index
+ROTATION_SLOT_TOLERANCE_SECONDS = 1.0
+
+
+def first_rotation_sample_violation(
+    samples: Sequence[tuple[float, float, str | None]],
+    initial: str,
+    rotations: Sequence[tuple[float, float, str]],
+) -> dict[str, Any] | None:
+    """Return the first sample that saw a value other than the live rotation.
+
+    ``samples`` are (read_began, read_ended, digest) from a continuous reader;
+    ``rotations`` are (write_began, write_returned, digest) in order, with
+    ``initial`` live before the first write. Value r_k can be live from the
+    start of write k until write k+1 returns, so a read whose span overlaps an
+    in-flight write may see either side; any other digest is a revert.
+    """
+    starts = [float("-inf")] + [began for began, _, _ in rotations]
+    ends = [returned for _, returned, _ in rotations] + [float("inf")]
+    digests = [initial] + [digest for _, _, digest in rotations]
+    for index, (began, ended, digest) in enumerate(samples):
+        allowed = {
+            digests[k]
+            for k in range(len(digests))
+            if starts[k] <= ended and began <= ends[k]
+        }
+        if digest not in allowed:
+            return {
+                "sample_index": index,
+                "at": began,
+                "observed": None if digest is None else digest[:12],
+                "allowed": sorted(value[:12] for value in allowed),
+            }
     return None
 
 
@@ -335,6 +364,7 @@ class ToolRunner:
         self.private_dir = private_dir
         self.evidence_commands = evidence_commands
         self.counter = 0
+        self._lock = threading.Lock()
 
     def _command_for_evidence(self, argv: Sequence[str]) -> str:
         rendered: list[str] = []
@@ -356,31 +386,46 @@ class ToolRunner:
         env: dict[str, str] | None = None,
         timeout: int = 300,
         allow_failure: bool = False,
+        sensitive: bool = False,
     ) -> ToolResult:
-        self.counter += 1
-        stdout_path = self.private_dir / f"tool-{self.counter:04d}.stdout"
-        stderr_path = self.private_dir / f"tool-{self.counter:04d}.stderr"
-        write_private_file(stdout_path, b"")
+        """Run a tool, recording the command for evidence.
+
+        ``sensitive`` keeps stdout in memory only: nothing the tool prints is
+        written under the private directory, so a retained diagnostics
+        directory cannot hold Secret values read through this path.
+        """
+        with self._lock:
+            self.counter += 1
+            number = self.counter
+            self.evidence_commands.append(self._command_for_evidence(argv))
+        stdout_path = self.private_dir / f"tool-{number:04d}.stdout"
+        stderr_path = self.private_dir / f"tool-{number:04d}.stderr"
+        if not sensitive:
+            write_private_file(stdout_path, b"")
         write_private_file(stderr_path, b"")
-        self.evidence_commands.append(self._command_for_evidence(argv))
-        with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
+        captured: bytes | None = None
+        with contextlib.ExitStack() as stack:
+            stderr_stream = stack.enter_context(stderr_path.open("wb"))
+            stdout_target: Any = (
+                subprocess.PIPE if sensitive else stack.enter_context(stdout_path.open("wb"))
+            )
             process = subprocess.Popen(
                 list(argv),
                 stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
-                stdout=stdout_stream,
+                stdout=stdout_target,
                 stderr=stderr_stream,
                 env=env,
                 start_new_session=True,
             )
             try:
-                process.communicate(input=input_data, timeout=timeout)
+                captured, _ = process.communicate(input=input_data, timeout=timeout)
             except subprocess.TimeoutExpired:
                 self._stop_group(process)
                 raise HarnessError(format_tool_error(action, 124)) from None
             except BaseException:
                 self._stop_group(process)
                 raise
-        stdout = stdout_path.read_bytes()
+        stdout = (captured or b"") if sensitive else stdout_path.read_bytes()
         result = ToolResult(process.returncode, stdout, stderr_path)
         if process.returncode != 0 and not allow_failure:
             raise HarnessError(format_tool_error(action, process.returncode))
@@ -402,6 +447,46 @@ class ToolRunner:
             except ProcessLookupError:
                 pass
             process.wait(timeout=10)
+
+
+class RotationSampler:
+    """Background reader of the rotation Secret for the 15 rotation phase."""
+
+    def __init__(self, harness: Any, static_digest: str) -> None:
+        self.harness = harness
+        self.static_digest = static_digest
+        self.samples: list[tuple[float, float, str | None]] = []
+        self.static_ok = True
+        self.error: BaseException | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="rotation-sampler", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=120)
+        if self._thread.is_alive():
+            raise HarnessError("rotation sampler did not stop")
+        if self.error is not None:
+            raise HarnessError("rotation sampler failed") from self.error
+
+    def _loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                began = time.monotonic()
+                document = self.harness.secret_document(TARGET_SECRET, ROTATION_NAMESPACE)
+                ended = time.monotonic()
+                rotated = decoded_document_key(document, ROTATED_KEY)
+                static = decoded_document_key(document, STATIC_KEY)
+                digest = None if rotated is None else full_digest(rotated)
+                self.samples.append((began, ended, digest))
+                if static is None or full_digest(static) != self.static_digest:
+                    self.static_ok = False
+                self._stop.wait(max(0.0, ROTATION_SAMPLE_INTERVAL - (ended - began)))
+        except BaseException as exc:  # surfaced by stop()
+            self.error = exc
 
 
 def safe_print(message: str, *, error: bool = False) -> None:
@@ -549,6 +634,7 @@ class HarnessCase:
         input_data: bytes | None = None,
         allow_failure: bool = False,
         timeout: int = 180,
+        sensitive: bool = False,
     ) -> ToolResult:
         return self.runner.run(
             self.kargs(*args),
@@ -556,6 +642,7 @@ class HarnessCase:
             input_data=input_data,
             timeout=timeout,
             allow_failure=allow_failure,
+            sensitive=sensitive,
         )
 
     def aws(
@@ -566,6 +653,7 @@ class HarnessCase:
         action: str,
         allow_failure: bool = False,
         timeout: int = 180,
+        sensitive: bool = False,
     ) -> ToolResult:
         if not self.real_aws and self.aws_endpoint is None:
             raise HarnessError("emulator AWS endpoint is unavailable")
@@ -587,6 +675,7 @@ class HarnessCase:
             env=self.aws_env,
             timeout=timeout,
             allow_failure=allow_failure,
+            sensitive=sensitive,
         )
 
     def apply(self, manifest: bytes, action: str, namespace: str | None = NAMESPACE) -> None:
@@ -1504,6 +1593,7 @@ class HarnessCase:
             "json",
             action="read owned Secret",
             allow_failure=True,
+            sensitive=True,
         )
         if result.status != 0:
             return None
@@ -1742,6 +1832,7 @@ class HarnessCase:
                 "json",
                 action="read rotated backup",
                 allow_failure=True,
+                sensitive=True,
             )
             if result.status != 0:
                 return None
@@ -1873,65 +1964,99 @@ class HarnessCase:
         self.ledger.mark_created(backup_row, backup)
         report["r0"] = r0_digest[:12]
 
-        # 2. Fifteen rotations, sampled between writes, with the primary entry
-        # deleted for rotations 6 to 10 and a library re-apply at rotation 12.
-        current = r0_digest
-        last_return = time.monotonic()
-        for index in range(1, ROTATION_COUNT + 1):
-            record: dict[str, Any] = {"index": index}
-            if index == 6:
-                self.delete_rotation_primary(primary)
-                record["primary_entry"] = "deleted"
-            if index == 11:
-                self.write_rotation_primary(primary, {STATIC_KEY: static_value}, create=True)
-                record["primary_entry"] = "recreated"
-            if index == 12:
-                reapply_file = self.rotation_backup_file(backup, "backup-reapply.json")
-                reapply = self.run_rotation_apply(binary, prefix, reapply_file)
-                record["reapply"] = reapply
-                self.record_assertion(
-                    "re-apply at rotation 12 reports already_present",
-                    all(outcome == "already_present" for outcome in reapply.values()),
+        # 2. Fifteen rotations on a fixed 3 s schedule while a background reader
+        # samples the Secret continuously. The primary entry is deleted for
+        # rotations 6 to 10 and the library re-applied at rotation 12; that
+        # maintenance runs inside each slot so it never pauses the reader.
+        sampler = RotationSampler(self, static_digest)
+        rotations: list[tuple[float, float, str]] = []
+        max_drift = 0.0
+        slots_ok = True
+        t0 = time.monotonic() + ROTATION_SPACING_SECONDS
+        sampler.start()
+        try:
+            for index in range(1, ROTATION_COUNT + 1):
+                record: dict[str, Any] = {"index": index}
+                if index == 6:
+                    self.delete_rotation_primary(primary)
+                    record["primary_entry"] = "deleted"
+                if index == 11:
+                    self.write_rotation_primary(primary, {STATIC_KEY: static_value}, create=True)
+                    record["primary_entry"] = "recreated"
+                if index == 12:
+                    reapply_file = self.rotation_backup_file(backup, "backup-reapply.json")
+                    reapply = self.run_rotation_apply(binary, prefix, reapply_file)
+                    record["reapply"] = reapply
+                    self.record_assertion(
+                        "re-apply at rotation 12 reports already_present",
+                        all(outcome == "already_present" for outcome in reapply.values()),
+                    )
+                self.kubectl(
+                    "-n",
+                    ROTATION_NAMESPACE,
+                    "annotate",
+                    "externalsecret",
+                    ROTATION_LOGICAL_NAME,
+                    f"force-sync={self.suffix}-{index}-{secrets.token_hex(4)}",
+                    "--overwrite",
+                    action="force ExternalSecret reconcile",
                 )
-            self.kubectl(
-                "-n",
-                ROTATION_NAMESPACE,
-                "annotate",
-                "externalsecret",
-                ROTATION_LOGICAL_NAME,
-                f"force-sync={self.suffix}-{index}-{secrets.token_hex(4)}",
-                "--overwrite",
-                action="force ExternalSecret reconcile",
-            )
-            wait = ROTATION_SPACING_SECONDS - (time.monotonic() - last_return)
-            if wait > 0:
-                time.sleep(wait)
-            value_path, expected = self.rotation_value(f"rotation-r{index}.value")
-            self.exec_rotator(value_path, expected)
-            last_return = time.monotonic()
-            current = expected
-            samples, gaps, static_ok = self.sample_rotated_key(
-                ROTATION_SPACING_SECONDS, check_static=static_digest if 6 <= index <= 10 else None
-            )
-            revert = first_revert_index(samples, current)
-            record.update(
-                {
-                    "digest": current[:12],
-                    "samples": len(samples),
-                    "max_sample_gap_seconds": round(max(gaps, default=0.0), 3),
-                    "first_revert_index": revert,
-                }
-            )
-            report["rotations"].append(record)
-            self.record_assertion(
-                f"rotation {index} was never reverted",
-                bool(samples) and revert is None,
-                current[:12],
-            )
-            if static_ok is not None:
-                self.record_assertion(
-                    f"static key kept while primary entry deleted (rotation {index})", static_ok
+                value_path, expected = self.rotation_value(f"rotation-r{index}.value")
+                slot = t0 + ROTATION_SPACING_SECONDS * (index - 1)
+                wait = slot - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                began = time.monotonic()
+                self.exec_rotator(value_path, expected)
+                returned = time.monotonic()
+                rotations.append((began, returned, expected))
+                drift = began - slot
+                max_drift = max(max_drift, abs(drift))
+                if abs(drift) > ROTATION_SLOT_TOLERANCE_SECONDS:
+                    slots_ok = False
+                current = expected
+                record.update(
+                    {
+                        "digest": current[:12],
+                        "start_offset_seconds": round(began - t0, 3),
+                        "slot_drift_seconds": round(drift, 3),
+                        "write_seconds": round(returned - began, 3),
+                    }
                 )
+                report["rotations"].append(record)
+            last_return = rotations[-1][1]
+            hold = last_return + ROTATION_SPACING_SECONDS - time.monotonic()
+            if hold > 0:
+                time.sleep(hold)
+        finally:
+            sampler.stop()
+        samples = sampler.samples
+        begins = [began for began, _, _ in samples]
+        gaps = [later - earlier for earlier, later in zip(begins, begins[1:], strict=False)]
+        violation = first_rotation_sample_violation(samples, r0_digest, rotations)
+        starts = [began for began, _, _ in rotations]
+        spacing = [later - earlier for earlier, later in zip(starts, starts[1:], strict=False)]
+        report["sampling"] = {
+            "samples": len(samples),
+            "max_sample_gap_seconds": round(max(gaps, default=0.0), 3),
+            "first_violation": violation,
+            "max_slot_drift_seconds": round(max_drift, 3),
+            "min_start_spacing_seconds": round(min(spacing, default=0.0), 3),
+            "max_start_spacing_seconds": round(max(spacing, default=0.0), 3),
+        }
+        self.record_assertion(
+            "no rotation was reverted across the continuous sample",
+            bool(samples) and violation is None,
+            "" if violation is None else f"sample {violation['sample_index']}",
+        )
+        self.record_assertion(
+            "rotations started on the 3 s schedule within 1 s",
+            slots_ok,
+            f"max drift {max_drift:.3f}s",
+        )
+        self.record_assertion(
+            "static key kept for the whole rotation phase", sampler.static_ok
+        )
         r15_digest = current
 
         # 3. Backup convergence after the final rotation.
@@ -2038,6 +2163,7 @@ class HarnessCase:
             "import hashlib,os;"
             f"print(hashlib.sha256(os.environ['{ROTATED_KEY}'].encode()).hexdigest())",
             action="read workload rotated key digest",
+            sensitive=True,
         ).stdout.decode("ascii", "strict").strip()
         report["workload_digest"] = observed[:12]
         self.record_assertion("rebuilt workload reads final rotation", observed == r15_digest)
@@ -2239,6 +2365,7 @@ class HarnessCase:
             "json",
             action="read rotation backup",
             allow_failure=True,
+            sensitive=True,
         )
         if result.status != 0:
             if tool_error_has_code(result, "ResourceNotFoundException"):
@@ -2325,6 +2452,7 @@ class HarnessCase:
         result = self.kubectl(
             *arguments,
             action="run long lived rotation",
+            sensitive=True,
             input_data=require_private_file(value_path).read_bytes(),
             timeout=60,
         )
@@ -2339,33 +2467,6 @@ class HarnessCase:
     def wait_rotation_key(self, key: str, expected: str, action: str) -> None:
         wait_until(action, lambda: self.rotation_key_digest(key) == expected, timeout=180)
         self.record_assertion(action, True, expected[:12])
-
-    def sample_rotated_key(
-        self, window: float, *, check_static: str | None
-    ) -> tuple[list[str | None], list[float], bool | None]:
-        samples: list[str | None] = []
-        gaps: list[float] = []
-        static_ok: bool | None = None if check_static is None else True
-        start = time.monotonic()
-        previous = start
-        while True:
-            began = time.monotonic()
-            if began - start >= window:
-                break
-            document = self.secret_document(TARGET_SECRET, ROTATION_NAMESPACE)
-            rotated = decoded_document_key(document, ROTATED_KEY)
-            samples.append(None if rotated is None else full_digest(rotated))
-            if check_static is not None:
-                static = decoded_document_key(document, STATIC_KEY)
-                if static is None or full_digest(static) != check_static:
-                    static_ok = False
-            now = time.monotonic()
-            gaps.append(now - previous)
-            previous = now
-            remaining = ROTATION_SAMPLE_INTERVAL - (now - began)
-            if remaining > 0:
-                time.sleep(remaining)
-        return samples, gaps, static_ok
 
     def deploy_rotation_workload(self) -> None:
         image = self.image_records["connector"]["tag"]
@@ -2892,6 +2993,9 @@ def main() -> int:
     tools = {"git", "docker", "kind", "kubectl", "uv"}
     if args.real_aws or args.eso != "none" or args.ci:
         tools.update({"aws", "helm"})
+    if args.eso != "none" and not args.real_aws:
+        # The emulator run drives the rotation suite, which builds a Rust example.
+        tools.add("cargo")
     try:
         require_tools(tools)
         setup_context = tempfile.TemporaryDirectory(prefix="curie-provider-setup-")
