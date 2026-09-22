@@ -325,3 +325,72 @@ def test_a_turn_built_with_no_attachments_round_trips_as_empty() -> None:
 
     assert turn.attachments == []
     assert parse_queued_turn(turn.model_dump_json()) == turn
+
+
+def test_a_noncron_turn_can_omit_hook_run() -> None:
+    turn = QueuedTurn(
+        event_id="e1",
+        conversation_id="c1",
+        author="u1",
+        text="hi",
+        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="1.0"),
+        received_at="20260101T000000Z",
+        source=TurnSource.SLACK,
+    )
+
+    assert turn.hook_run is None
+
+
+def test_a_complete_hook_run_round_trips_through_the_queue_wire() -> None:
+    hook_run = {
+        "agent_id": "00000000000040008000000000000001",
+        "name": "acme_nightly",
+        "slot_utc": "20260922T030000Z",
+    }
+    turn = QueuedTurn(
+        event_id="e1",
+        conversation_id="c1",
+        author="u1",
+        text="hi",
+        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="1.0"),
+        received_at="20260922T030000Z",
+        source=TurnSource.CRON,
+        hook_run=hook_run,
+    )
+
+    encoded = turn.model_dump_json()
+    assert json.loads(encoded)["hook_run"] == hook_run
+
+    restored = parse_queued_turn(encoded)
+    assert restored == turn
+    assert restored.hook_run is not None
+    assert restored.hook_run.agent_id == hook_run["agent_id"]
+    assert restored.hook_run.name == hook_run["name"]
+    assert restored.hook_run.slot_utc == hook_run["slot_utc"]
+
+
+@pytest.mark.parametrize("missing_field", ["agent_id", "name", "slot_utc"])
+def test_a_partial_hook_run_is_rejected(missing_field: str) -> None:
+    hook_run = {
+        "agent_id": "00000000000040008000000000000001",
+        "name": "acme_nightly",
+        "slot_utc": "20260922T030000Z",
+    }
+    del hook_run[missing_field]
+
+    with pytest.raises(ValidationError) as exc_info:
+        QueuedTurn(
+            event_id="e1",
+            conversation_id="c1",
+            author="u1",
+            text="hi",
+            reply_handle=ReplyHandle(
+                kind="slack", channel="C1", placeholder="1.0"
+            ),
+            received_at="20260922T030000Z",
+            source=TurnSource.CRON,
+            hook_run=hook_run,
+        )
+
+    locations = {tuple(error["loc"]) for error in exc_info.value.errors()}
+    assert ("hook_run", missing_field) in locations

@@ -1954,9 +1954,7 @@ async def existing_channel_binding_ids(
 
     if not binding_ids:
         return frozenset()
-    result = await session.scalars(
-        select(AgentChannel.id).where(AgentChannel.id.in_(binding_ids))
-    )
+    result = await session.scalars(select(AgentChannel.id).where(AgentChannel.id.in_(binding_ids)))
     return frozenset(result)
 
 
@@ -2323,6 +2321,197 @@ async def append_approval_audit(
     return entry
 
 
+# --- break-glass recovery (#2753) --------------------------------------------
+#
+# ONE transaction, ONE commit, per operation. ``claim_approval_resolution``
+# commits internally, and so does ``append_approval_audit``; composing the two
+# leaves a crash window in which the status flipped and the audit row that
+# explains it never existed. For a path whose whole justification is that every
+# use is reviewable afterwards, that window is the failure, so recovery does
+# the compare-and-set and the audit append inside a single ``session.begin()``
+# block instead of calling either.
+#
+# Idempotency is keyed on that audit row, not on a column: the caller's
+# ``recovery_key`` is recorded in the row's evidence, and because the row
+# commits with the CAS, a key with no row means no effect landed.
+#
+# The audit row is built from the module-level ``ApprovalAuditEntry``, exactly
+# as ``append_approval_audit`` does. That is deliberate and load-bearing: the
+# seam between the CAS and the audit append has to be the same one the existing
+# writer exposes, so a test can interrupt precisely there. A Core ``insert()``
+# here would move the seam.
+
+#: Everything the caller must supply about WHO acted. Recovery takes its actor
+#: from the ADR-0106 operator principal for attribution only; no membership is
+#: consulted and nothing widens.
+_RECOVERY_AUTHORIZER = "approval_recovery"
+
+
+class PublicationSettlementConflict(Exception):
+    """The recovered approval's publication moved under the recovery.
+
+    Raised INSIDE the recovery transaction so the whole administrative act --
+    the approval CAS, the publication settlement and the audit row -- rolls back
+    together. A recovery that settled the approval and left the publication
+    pending would be exactly the stranded effect this path exists to remove.
+    """
+
+
+async def reread_approval(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
+    """Read an approval back from the database, not from the identity map.
+
+    An ORM-enabled Core UPDATE expires the columns it touched on any instance
+    already in the session, so a plain ``session.get`` hands back an object
+    whose next attribute access is a lazy load -- which under the async session
+    is a ``MissingGreenlet``, not a refresh. ``claim_approval_resolution``
+    refreshes for the same reason.
+    """
+
+    approval = await session.get(Approval, approval_id)
+    if approval is not None:
+        await session.refresh(approval)
+    return approval
+
+
+#: The audit model as the replay lookup reads it. A separate name on purpose:
+#: ``recover_approval_atomic`` builds its row from the module-level
+#: ``ApprovalAuditEntry`` so a test can interrupt exactly between the CAS and
+#: the audit append, and the lookup must not be caught by that interruption.
+_RecoveryAuditEntry = ApprovalAuditEntry
+
+#: The audit action every administrative recovery writes. Its evidence carries
+#: the caller's ``recovery_key``, which is what a replay is matched on.
+RECOVERY_AUDIT_ACTION = "administratively_recovered"
+
+
+async def find_recovery_audit(
+    session: AsyncSession, recovery_key: str
+) -> ApprovalAuditEntry | None:
+    """The recovery audit row recorded under ``recovery_key``, on any approval.
+
+    A key names one administrative act installation-wide, so the lookup is not
+    scoped to an approval: the caller compares the row's ``approval_id`` to tell
+    a replay from a key reused for a different approval.
+    """
+
+    result = await session.execute(
+        select(_RecoveryAuditEntry)
+        .where(
+            _RecoveryAuditEntry.action == RECOVERY_AUDIT_ACTION,
+            _RecoveryAuditEntry.evidence["recovery_key"].astext == recovery_key,
+        )
+        .order_by(_RecoveryAuditEntry.created_at)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def recover_approval_atomic(
+    session: AsyncSession,
+    approval_id: uuid.UUID,
+    *,
+    reason: str,
+    recovery_key: str,
+    actor: str,
+    actor_channel: str | None,
+    principal_kind: str | None,
+    facts: list[str],
+) -> Approval | None:
+    """Administratively settle a pending approval as ``rejected``, atomically.
+
+    The CAS is guarded on ``status = 'pending'`` exactly as the ordinary
+    resolve-once claim is, so an approval is settled at most once. Returns None
+    when the CAS matched nothing; the caller looks the key up with
+    ``find_recovery_audit`` to tell a replay (return the recorded outcome) from
+    a genuine conflict.
+
+    ``facts`` are the reporter's OBSERVATIONS, recorded as evidence. They state
+    what was seen about the row. They never assert that the ordinary path was
+    unavailable -- nothing here is in a position to know that.
+    """
+
+    recovered: uuid.UUID | None
+    async with session.begin():
+        # The associated publication, read inside the SAME transaction that
+        # settles the approval. ``claim_approval_resolution`` settles it too,
+        # but it commits internally, so it cannot be reused here: composing it
+        # would put the publication's fate in a second transaction and reopen
+        # the crash window this whole function exists to close.
+        publication = await get_publication_by_approval(session, approval_id)
+        values: dict[str, Any] = {
+            "status": ApprovalStatus.rejected,
+            "resolved_by": actor,
+            "resolution_note": reason,
+            "resolved_at": func.now(),
+        }
+        if publication is not None:
+            # A publication outcome is reported by the platform worker through
+            # the stored reply route, never by a resumed model turn. Mark the
+            # wake as owing nothing in the same CAS, exactly as the ordinary
+            # resolve path does, so the reconciler never picks the row up for a
+            # resume the router deliberately does not enqueue.
+            values["resumed_at"] = func.now()
+        result = await session.execute(
+            update(Approval)
+            .where(
+                Approval.id == approval_id,
+                Approval.status == ApprovalStatus.pending,
+            )
+            .values(**values)
+            .returning(Approval.id)
+        )
+        recovered = result.scalar_one_or_none()
+        if recovered is None:
+            return None
+        if publication is not None:
+            # The same denial the ordinary reject performs, under the same
+            # version check: status denied, the patch dropped, the terminal
+            # instant recorded. Without it the recovered approval is settled and
+            # its publication waits forever -- the expiry sweeper no longer
+            # selects a rejected approval, and no resume is enqueued to repair
+            # it, so nothing else in the system would ever touch it again.
+            changed = await session.execute(
+                update(Publication)
+                .where(
+                    Publication.id == publication.id,
+                    Publication.status == "pending",
+                    Publication.version == publication.version,
+                )
+                .values(
+                    status="denied",
+                    version=Publication.version + 1,
+                    updated_at=func.now(),
+                    terminal_at=func.now(),
+                    patch_bytes=None,
+                )
+                .returning(Publication.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                raise PublicationSettlementConflict(
+                    "the approval's publication is no longer pending at the "
+                    "version this recovery read; nothing was changed"
+                )
+        entry = ApprovalAuditEntry(
+            approval_id=approval_id,
+            action=RECOVERY_AUDIT_ACTION,
+            actor=actor,
+            actor_channel=actor_channel,
+            principal_kind=principal_kind,
+            authenticated=True,
+            decision=ApprovalStatus.rejected,
+            authorizer=_RECOVERY_AUTHORIZER,
+            authorized=True,
+            reason=reason,
+            evidence={
+                "kind": "administrative_recovery",
+                "recovery_key": recovery_key,
+                "facts": facts,
+            },
+        )
+        session.add(entry)
+    return await reread_approval(session, approval_id)
+
+
 async def list_approval_audit(
     session: AsyncSession, approval_id: uuid.UUID
 ) -> list[ApprovalAuditEntry]:
@@ -2519,9 +2708,7 @@ async def require_current_lineage_workspace(
     if (
         workspace is None
         or workspace.repo_full_name.casefold() != lineage.repo_full_name.casefold()
-        or not repository_is_allowed(
-            lineage.repo_full_name, get_settings().github_repo_allowlist
-        )
+        or not repository_is_allowed(lineage.repo_full_name, get_settings().github_repo_allowlist)
         or deployment is None
         or deployment.agent_id != lineage.agent_id
         or deployment.status != "active"

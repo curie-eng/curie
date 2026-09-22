@@ -190,4 +190,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0161 | [Signed GitHub issue events admit one WorkItem](0161-signed-github-issue-events-admit-one-work-item.md) | Accepted |
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
 | 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
+| 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
 <!-- END GENERATED: adr-index -->

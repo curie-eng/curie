@@ -53,18 +53,18 @@ def _write_catalog(
     repo_root: Path,
     *,
     revisions: list[str],
-    schema_head: str,
-    window_version: str = "0.8.8",
+    window_heads: dict[str, str],
 ) -> None:
     catalog_dir = repo_root / "cli" / "src"
     catalog_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "revisions": revisions,
         "windows": {
-            window_version: {
+            version: {
                 "schema_min": "0001",
-                "schema_head": schema_head,
+                "schema_head": head,
             }
+            for version, head in window_heads.items()
         },
     }
     (catalog_dir / "application_schema_windows.json").write_text(
@@ -97,17 +97,22 @@ def test_real_tree_window_matches_alembic_head() -> None:
     catalog = json.loads(
         (REPO_ROOT / "cli" / "src" / "application_schema_windows.json").read_text()
     )
-    schema_head = catalog["windows"][app_version]["schema_head"]
     result = _run_gate()
 
     assert result.returncode == 0, result.stderr
-    assert schema_head in result.stdout
+    assert app_version in catalog["windows"]
     assert f"appVersion {app_version}" in result.stdout
+    assert "catalog appVersion" in result.stdout
+    assert "schema_head" in result.stdout
 
 
-def test_migration_without_window_move_fails(tmp_path: Path) -> None:
-    _write_chart(tmp_path)
-    _write_catalog(tmp_path, revisions=["0001", "0002"], schema_head="0001")
+def test_tree_head_without_newer_catalog_window_fails(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.9.0")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.9.0": "0001"},
+    )
     _write_linear_migrations(tmp_path)
 
     result = _run_gate(tmp_path)
@@ -118,9 +123,34 @@ def test_migration_without_window_move_fails(tmp_path: Path) -> None:
     assert "schema_head" in err or "window" in err
 
 
+def test_older_chart_version_uses_newest_numeric_catalog_window(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.9.0")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={
+            "0.9.10": "0002",
+            "0.9.9": "0001",
+            "0.9.0": "0001",
+        },
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "chart appVersion 0.9.0" in result.stdout
+    assert "catalog appVersion 0.9.10" in result.stdout
+    assert "schema_head 0002" in result.stdout
+
+
 def test_migration_with_matching_window_passes(tmp_path: Path) -> None:
     _write_chart(tmp_path)
-    _write_catalog(tmp_path, revisions=["0001", "0002"], schema_head="0002")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.8.8": "0002"},
+    )
     _write_linear_migrations(tmp_path)
 
     result = _run_gate(tmp_path)
@@ -131,7 +161,11 @@ def test_migration_with_matching_window_passes(tmp_path: Path) -> None:
 
 def test_catalog_missing_alembic_revision_fails(tmp_path: Path) -> None:
     _write_chart(tmp_path)
-    _write_catalog(tmp_path, revisions=["0001"], schema_head="0002")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001"],
+        window_heads={"0.8.8": "0002"},
+    )
     _write_linear_migrations(tmp_path)
 
     result = _run_gate(tmp_path)
@@ -142,7 +176,11 @@ def test_catalog_missing_alembic_revision_fails(tmp_path: Path) -> None:
 
 def test_catalog_missing_app_version_window_fails(tmp_path: Path) -> None:
     _write_chart(tmp_path, app_version="0.9.9")
-    _write_catalog(tmp_path, revisions=["0001", "0002"], schema_head="0002")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.8.8": "0002"},
+    )
     _write_linear_migrations(tmp_path)
 
     result = _run_gate(tmp_path)

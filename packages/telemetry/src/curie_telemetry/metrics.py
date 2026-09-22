@@ -225,6 +225,9 @@ _HTTP_OPERATIONS = [
     "/approvals/{approval_id}",
     "/approvals/{approval_id}/audit",
     "/approvals/{approval_id}/resolve",
+    # Break-glass recovery (#2753).
+    "/approvals/identity-report",
+    "/approvals/{approval_id}/recover",
     "/channels/token",
     "/channels/turns",
     "/cluster-message-replies/{reply_ref}",

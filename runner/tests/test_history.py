@@ -22,6 +22,7 @@ from curie_runner.history import (
     HistoryError,
     NullTranscriptStore,
     StateApiTranscriptStore,
+    SummaryRecord,
     TranscriptStore,
     TurnRecord,
     build_conversation_replay,
@@ -394,6 +395,94 @@ def test_replay_folds_native_checkpoint_and_deltas_but_drops_them_at_compaction(
     )
     assert summary is not None
     assert compacted.harness_replay is None
+
+
+def _over_bound_turn(tag: str, harness_replay: HarnessReplayState | None = None) -> TurnRecord:
+    """One coding-shaped turn whose messages alone exceed the 16 KB replay bound."""
+
+    return TurnRecord(
+        user=f"{tag} request",
+        assistant=f"{tag} answer",
+        ts="2026-09-22T00:00:00Z",
+        messages=(
+            ConversationMessage(role="user", content=f"{tag} request"),
+            ConversationMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": f"{tag}-1",
+                        "name": "Read",
+                        "input": {"path": "a.py"},
+                    }
+                ],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    {"type": "tool_result", "tool_use_id": f"{tag}-1", "content": "r" * 30_000}
+                ],
+            ),
+            ConversationMessage(
+                role="assistant", content=[{"type": "text", "text": f"{tag} answer"}]
+            ),
+        ),
+        harness_replay=harness_replay,
+    )
+
+
+def test_single_over_bound_turn_replays_plainly_without_a_summary() -> None:
+    """#2927: one turn cannot be compacted, so crossing the bound makes no summary.
+
+    The old path built a SummaryRecord that compacted nothing and re-embedded
+    the whole turn in its tail, doubling the stored transcript at boot.
+    """
+
+    checkpoint = HarnessReplayState(
+        harness="claude", kind="checkpoint", entries=({"uuid": "only"},)
+    )
+    turn = _over_bound_turn("only", checkpoint)
+
+    replay, summary = build_conversation_replay([turn], max_turns=40, max_bytes=16_000)
+
+    assert summary is None
+    assert replay.messages == turn.messages
+    assert replay.summary_digest is None
+    # No summary boundary, so the turn's native checkpoint stays usable.
+    assert replay.harness_replay == checkpoint
+
+
+def test_prior_summary_plus_one_over_bound_turn_makes_no_new_summary() -> None:
+    prior = SummaryRecord(
+        content="earlier work summarized",
+        digest="d" * 64,
+        source_turns=3,
+        through_ts="2026-09-21T00:00:00Z",
+    )
+    turn = _over_bound_turn("after-summary")
+
+    replay, summary = build_conversation_replay(
+        [prior, turn], max_turns=40, max_bytes=16_000
+    )
+
+    assert summary is None
+    assert replay.messages == prior.messages + turn.messages
+    assert replay.summary_digest == prior.digest
+
+
+def test_summary_with_no_turns_over_the_bound_replays_the_summary_not_nothing() -> None:
+    prior = SummaryRecord(
+        content="long summary " + ("s" * 20_000),
+        digest="e" * 64,
+        source_turns=5,
+        through_ts="2026-09-21T00:00:00Z",
+    )
+
+    replay, summary = build_conversation_replay([prior], max_turns=40, max_bytes=16_000)
+
+    assert summary is None
+    assert replay.present is True
+    assert replay.messages == prior.messages
 
 
 def test_resolve_absent_ref_is_null_store() -> None:
