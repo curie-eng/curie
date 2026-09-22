@@ -39,10 +39,7 @@ fn validate_agent_resource_name(agent: &str) -> Result<()> {
 pub fn resolve_named_secrets(names: &[String]) -> Result<BTreeMap<String, String>> {
     let mut secrets = BTreeMap::new();
     for name in names {
-        let value = std::env::var(name)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or(crate::secrets::get_value(name)?);
+        let value = crate::secrets::resolve_env_or_saved(name)?;
         match value {
             Some(v) => {
                 secrets.insert(name.clone(), v);
