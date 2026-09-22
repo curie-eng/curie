@@ -120,6 +120,13 @@ pub fn extract_refs(manifest: &str) -> Result<Vec<RenderedRef>> {
             }
             continue;
         }
+        if kind == "ServiceAccount" {
+            for item in doc["secrets"].as_array().into_iter().flatten() {
+                if let Some(secret) = item["name"].as_str() {
+                    refs.push(whole(secret, &object));
+                }
+            }
+        }
         if kind == "Ingress" {
             if let Some(tls) = doc["spec"]["tls"].as_array() {
                 for item in tls {
@@ -197,6 +204,11 @@ fn walk(value: &Value, object: &str, refs: &mut Vec<RenderedRef>) {
                             }
                         }
                     }
+                    "nodePublishSecretRef" => {
+                        if let Some(name) = child["name"].as_str() {
+                            refs.push(whole(name, object));
+                        }
+                    }
                     "secret" if child.is_object() => secret_source(child, object, refs),
                     _ => walk(child, object, refs),
                 }
@@ -227,8 +239,10 @@ fn pattern_regex(pattern: &str, ctx: &NameContext) -> Regex {
             "release" => regex::escape(&ctx.release),
             "fullname" => regex::escape(&ctx.fullname),
             "agent" => "[a-z0-9]([a-z0-9-]*[a-z0-9])?".to_string(),
-            // Validation refuses any other placeholder; `operator` is any name.
-            _ => ".+".to_string(),
+            "id" => "[a-f0-9]+".to_string(),
+            // Validation refuses any other placeholder, so this never widens
+            // a pattern; an unknown one matches nothing.
+            _ => "[^\\s\\S]".to_string(),
         });
         rest = after.get(close + 1..).unwrap_or("");
     }
@@ -237,9 +251,9 @@ fn pattern_regex(pattern: &str, ctx: &NameContext) -> Regex {
     Regex::new(&out).expect("an escaped pattern is a valid regex")
 }
 
-/// Expand a pattern with no `{agent}` or `{operator}` into one name.
+/// Expand a pattern with no `{agent}` or `{id}` into one name.
 fn expand(pattern: &str, ctx: &NameContext) -> Option<String> {
-    if pattern.contains("{agent}") || pattern.contains("{operator}") {
+    if pattern.contains("{agent}") || pattern.contains("{id}") {
         return None;
     }
     Some(
@@ -249,43 +263,68 @@ fn expand(pattern: &str, ctx: &NameContext) -> Option<String> {
     )
 }
 
-/// The non-empty string at a dotted values path.
-fn lookup<'a>(values: &'a Value, path: &str) -> Option<&'a str> {
+/// The value at a dotted values path.
+fn node<'a>(values: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.')
         .try_fold(values, |node, segment| node.get(segment))
+}
+
+/// The non-empty string at a dotted values path.
+fn lookup<'a>(values: &'a Value, path: &str) -> Option<&'a str> {
+    node(values, path)
         .and_then(Value::as_str)
         .filter(|found| !found.is_empty())
 }
 
+/// Every Secret name a knob's values path sets: one string, or each entry of
+/// a list of `{name: X}` maps or strings.
+fn knob_names<'a>(values: &'a Value, path: &str) -> Vec<&'a str> {
+    match node(values, path) {
+        Some(Value::String(name)) if !name.is_empty() => vec![name.as_str()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().or_else(|| item["name"].as_str()))
+            .filter(|name| !name.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `entry` lists `reference`.
+///
+/// A name matched through the entry's own patterns needs its key among the
+/// entry's keys. A name matched through a knob with a key path needs the key
+/// that path sets, and only that key: the Secret an operator supplies need not
+/// carry the inventory's own key name. A whole-Secret reference is covered by
+/// whichever match names it exactly.
 fn covers(
     entry: &InventoryEntry,
     reference: &RenderedRef,
     values: &Value,
     ctx: &NameContext,
 ) -> bool {
-    let key_listed = reference
-        .key
-        .as_ref()
-        .is_none_or(|key| entry.keys.contains(key));
+    let listed = |key: &String| entry.keys.contains(key);
     let by_pattern = pattern_regex(&entry.target, ctx).is_match(&reference.name)
         || entry
             .chart
             .as_ref()
             .and_then(|chart| chart.default_secret.as_deref())
             .is_some_and(|pattern| pattern_regex(pattern, ctx).is_match(&reference.name));
-    if by_pattern && key_listed {
+    if by_pattern && reference.key.as_ref().is_none_or(listed) {
         return true;
     }
     let knobs = entry.chart.iter().flat_map(|chart| chart.knobs.iter());
     knobs
-        .filter(|knob| lookup(values, &knob.secret) == Some(reference.name.as_str()))
+        .filter(|knob| knob_names(values, &knob.secret).contains(&reference.name.as_str()))
         .any(|knob| {
-            key_listed
-                || knob
-                    .key
-                    .as_deref()
-                    .and_then(|path| lookup(values, path))
-                    .is_some_and(|key| reference.key.as_deref() == Some(key))
+            let Some(key) = &reference.key else {
+                return true;
+            };
+            match knob.key.as_deref().and_then(|path| lookup(values, path)) {
+                Some(effective) => key == effective,
+                // No key knob, or it is unset: the chart reads its own key.
+                None => listed(key),
+            }
         })
 }
 
@@ -362,7 +401,10 @@ fn values_sets(chart: &Path) -> Result<Vec<ValuesSet>> {
 /// The values an ESO-backed install would set: every `store: sm` entry's
 /// knobs pointed at its expanded target, and a knob's key path at the key
 /// when the entry has exactly one.
-pub fn provider_values(entries: &[InventoryEntry], ctx: &NameContext) -> Value {
+///
+/// A knob whose path holds a list in `base` (an `imagePullSecrets` list) is
+/// set to a one-item list naming the target.
+pub fn provider_values(entries: &[InventoryEntry], ctx: &NameContext, base: &Value) -> Value {
     let mut values = json!({});
     for entry in entries.iter().filter(|e| e.store == Store::Sm) {
         let Some(chart) = &entry.chart else { continue };
@@ -370,7 +412,12 @@ pub fn provider_values(entries: &[InventoryEntry], ctx: &NameContext) -> Value {
             continue;
         };
         for knob in &chart.knobs {
-            set_path(&mut values, &knob.secret, Value::String(target.clone()));
+            let name = if node(base, &knob.secret).is_some_and(Value::is_array) {
+                json!([{ "name": target }])
+            } else {
+                Value::String(target.clone())
+            };
+            set_path(&mut values, &knob.secret, name);
             if let (Some(path), [key]) = (&knob.key, entry.keys.as_slice()) {
                 set_path(&mut values, path, Value::String(key.clone()));
             }
@@ -514,11 +561,12 @@ pub fn run_check(options: &CheckOptions) -> Result<CheckReport> {
         .find(|set| set.name == "overlay:full")
         .map(|set| set.files.clone())
         .unwrap_or_default();
-    let base = name_context(&effective_values(&options.chart, &provider_files)?);
+    let base_values = effective_values(&options.chart, &provider_files)?;
+    let base = name_context(&base_values);
     let provider_path = scratch.path().join("provider-values.yaml");
     std::fs::write(
         &provider_path,
-        serde_norway::to_string(&provider_values(&entries, &base))?,
+        serde_norway::to_string(&provider_values(&entries, &base, &base_values))?,
     )
     .context("write provider values")?;
     provider_files.push(provider_path);

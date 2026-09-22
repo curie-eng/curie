@@ -89,10 +89,18 @@ pub struct ConnectorSpecDecl {
     pub sealed_secrets: BTreeMap<String, String>,
     #[serde(default)]
     pub secret_files: BTreeMap<String, String>,
-    /// Keys the connector rotates in place (`workload` is the only value the
-    /// Python validator accepts). Carried through for the install inventory.
+    /// Keys the connector rotates in place. Carried through for the install
+    /// inventory.
     #[serde(default)]
-    pub secret_rotation: BTreeMap<String, String>,
+    pub secret_rotation: BTreeMap<String, SecretRotation>,
+}
+
+/// Who rotates a declared key. `workload` is the only value the Python
+/// validator accepts, so any other value is refused at parse time here too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretRotation {
+    Workload,
 }
 
 /// A declared secret: a bare env var name, or a reference to a Secret someone
