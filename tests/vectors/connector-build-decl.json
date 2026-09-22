@@ -278,6 +278,21 @@
       "codes": ["connectors.invalid"]
     },
     {
+      "name": "a_secret_rotation_value_other_than_workload_is_rejected",
+      "why": "`workload` is the only rotation owner a connector can declare (ADR 0163). A reader that carried any string through would turn `sm` into workload ownership and drop the key from ESO management, so both readers refuse it at parse time.",
+      "document": {
+        "connectors": {
+          "ledger": {
+            "image": "ghcr.io/example/ledger-mcp:1.0.0",
+            "secrets": ["LEDGER_TOKEN"],
+            "secret_rotation": { "LEDGER_TOKEN": "sm" }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.invalid"]
+    },
+    {
       "name": "an_existing_image_connector_is_untouched",
       "why": "REGRESSION. Every hosted connector bundle in the wild uses this form, and ADR 0113 requires the schema change be compatible. A three-way exclusion written as an if/elif chain is the natural way to break it.",
       "document": {

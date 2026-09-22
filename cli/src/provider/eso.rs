@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use super::{InventoryEntry, RotationOwner, SecretMaterial};
+use super::{InventoryEntry, SecretMaterial, Store};
 
 pub const ESO_VERSION: &str = "2.11.0";
 pub const EXTERNAL_SECRET_API: &str = "external-secrets.io/v1";
@@ -78,34 +78,18 @@ pub struct SyncEntry {
 }
 
 impl SyncEntry {
-    /// A workload owner needs rotated keys drawn from `keys`; any other owner
-    /// needs none.
-    pub fn from_inventory(
-        entry: &InventoryEntry,
-        prefix: &str,
-        rotated_keys: &[String],
-    ) -> Result<Self> {
+    /// Only a provider-held (`store: sm`) entry syncs. Its rotated keys come
+    /// from the entry, whose validation already requires them to be drawn
+    /// from `keys` under a workload owner.
+    pub fn from_inventory(entry: &InventoryEntry, prefix: &str) -> Result<Self> {
         entry
             .validate()
             .with_context(|| format!("inventory entry {}", entry.logical_name))?;
         let name = &entry.logical_name;
-        match &entry.rotation_owner {
-            RotationOwner::Workload(_) => {
-                if rotated_keys.is_empty() {
-                    bail!("inventory entry {name} has a workload owner but no rotated keys");
-                }
-                for key in rotated_keys {
-                    if !entry.keys.contains(key) {
-                        bail!("inventory entry {name} rotated key {key} is not one of its keys");
-                    }
-                }
-            }
-            RotationOwner::Sm | RotationOwner::Mint(_) => {
-                if !rotated_keys.is_empty() {
-                    bail!("inventory entry {name} has rotated keys but no workload owner");
-                }
-            }
+        if entry.store != Store::Sm {
+            bail!("inventory entry {name} stays in the cluster (store: cluster); ESO does not sync it");
         }
+        let rotated_keys = &entry.rotated_keys;
         let static_keys = entry
             .keys
             .iter()

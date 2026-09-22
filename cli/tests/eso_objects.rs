@@ -14,7 +14,7 @@ use curie::provider::eso::{
     Kubectl, KubectlOutput, SeedOutcome, StoreSpec, SyncEntry,
 };
 use curie::provider::{
-    InventoryClass, InventoryEntry, RotationOwner, SecretMaterial, UpdatePolicy,
+    InventoryClass, InventoryEntry, RotationOwner, SecretMaterial, Store, UpdatePolicy,
 };
 
 const NS: &str = "curie";
@@ -41,7 +41,13 @@ fn store_spec() -> StoreSpec {
     }
 }
 
-fn entry(logical: &str, target: &str, keys: &[&str], owner: RotationOwner) -> InventoryEntry {
+fn entry(
+    logical: &str,
+    target: &str,
+    keys: &[&str],
+    owner: RotationOwner,
+    rotated: &[&str],
+) -> InventoryEntry {
     InventoryEntry {
         logical_name: logical.to_string(),
         class: InventoryClass::External,
@@ -50,6 +56,9 @@ fn entry(logical: &str, target: &str, keys: &[&str], owner: RotationOwner) -> In
         consumers: vec!["curie-api".to_string()],
         rotation_owner: owner,
         update_policy: UpdatePolicy::Replace,
+        store: Store::Sm,
+        rotated_keys: strings(rotated),
+        chart: None,
     }
 }
 
@@ -59,9 +68,14 @@ fn strings(values: &[&str]) -> Vec<String> {
 
 fn static_entry() -> SyncEntry {
     SyncEntry::from_inventory(
-        &entry("platform", "curie-platform", &["A", "B"], RotationOwner::Sm),
+        &entry(
+            "platform",
+            "curie-platform",
+            &["A", "B"],
+            RotationOwner::Sm,
+            &[],
+        ),
         PREFIX,
-        &[],
     )
     .expect("static entry")
 }
@@ -73,9 +87,9 @@ fn split_entry() -> SyncEntry {
             "curie-finance",
             &["CLIENT_ID", "CLIENT_SECRET", "REFRESH_TOKEN"],
             RotationOwner::Workload("finance-agent".to_string()),
+            &["REFRESH_TOKEN"],
         ),
         PREFIX,
-        &strings(&["REFRESH_TOKEN"]),
     )
     .expect("split entry")
 }
@@ -139,8 +153,9 @@ fn from_inventory_rejects_workload_without_rotated_keys() {
         "curie-finance",
         &["A", "B"],
         RotationOwner::Workload("w".into()),
+        &[],
     );
-    assert!(SyncEntry::from_inventory(&e, PREFIX, &[]).is_err());
+    assert!(SyncEntry::from_inventory(&e, PREFIX).is_err());
 }
 
 #[test]
@@ -150,14 +165,35 @@ fn from_inventory_rejects_rotated_key_not_in_keys() {
         "curie-finance",
         &["A", "B"],
         RotationOwner::Workload("w".into()),
+        &["C"],
     );
-    assert!(SyncEntry::from_inventory(&e, PREFIX, &strings(&["C"])).is_err());
+    assert!(SyncEntry::from_inventory(&e, PREFIX).is_err());
 }
 
 #[test]
 fn from_inventory_rejects_sm_owner_with_rotated_keys() {
-    let e = entry("platform", "curie-platform", &["A", "B"], RotationOwner::Sm);
-    assert!(SyncEntry::from_inventory(&e, PREFIX, &strings(&["A"])).is_err());
+    let e = entry(
+        "platform",
+        "curie-platform",
+        &["A", "B"],
+        RotationOwner::Sm,
+        &["A"],
+    );
+    assert!(SyncEntry::from_inventory(&e, PREFIX).is_err());
+}
+
+#[test]
+fn from_inventory_rejects_an_in_cluster_entry() {
+    let mut e = entry(
+        "api-key",
+        "curie-api-key",
+        &["apiKey"],
+        RotationOwner::Sm,
+        &[],
+    );
+    e.store = Store::Cluster;
+    let err = SyncEntry::from_inventory(&e, PREFIX).expect_err("cluster entry must not sync");
+    assert!(format!("{err:#}").contains("store: cluster"), "{err:#}");
 }
 
 // ---------------------------------------------------------------- fake kubectl

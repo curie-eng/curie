@@ -11,6 +11,7 @@
       "port",
       "sealed_secrets",
       "secret_files",
+      "secret_rotation",
       "secrets",
       "unhosted_url",
       "url"

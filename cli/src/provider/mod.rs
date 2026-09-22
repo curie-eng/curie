@@ -3,10 +3,15 @@
 //! `get` is the only method that returns material. Errors name the object and,
 //! where relevant, version ids. They do not carry material or backend stderr.
 
+mod catalog;
 pub mod eso;
 mod inventory;
+pub mod render_check;
 
-pub use inventory::{InventoryClass, InventoryEntry, RotationOwner, UpdatePolicy};
+pub use catalog::{bundle_entries, merge, parse_inventory, platform_inventory, validate_inventory};
+pub use inventory::{
+    ChartBinding, ChartKnob, InventoryClass, InventoryEntry, RotationOwner, Store, UpdatePolicy,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;

@@ -1164,8 +1164,24 @@ enum DevAction {
     /// the skill, local, and cluster tiers (#1666,
     /// `bash cli/scripts/check-verb-parity.sh`). Offline, no credential.
     VerbParity,
-    /// Declared inventory check. This build returns not implemented.
-    SecretsInventory,
+    /// Check that every Secret reference the chart renders is listed in the
+    /// credential inventory (ADR 0163). Renders `helm template` over a fixed
+    /// list of values sets plus every `charts/curie/ci/inventory-values/`
+    /// overlay and a generated provider set, and fails on any reference no
+    /// entry lists, or on an inventory that marks a rotation-owned key as
+    /// ESO-managed. Offline; spawns only `helm`.
+    SecretsInventory {
+        /// Chart directory to render. Defaults to `charts/curie` in the checkout.
+        #[arg(long)]
+        chart: Option<PathBuf>,
+        /// Inventory file to check instead of the embedded platform inventory.
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// `<agent>=<bundle dir>` whose connectors extend the inventory.
+        /// Repeatable. Defaults to `sre-bot=examples/sre-bot`.
+        #[arg(long = "bundle", value_name = "AGENT=DIR")]
+        bundles: Vec<String>,
+    },
     /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
     /// Refuses when a schema changed shape without a version bump.
     SchemaBaseline,
@@ -3934,7 +3950,11 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::VerbParity => {
                 commands::dev_script("cli/scripts/check-verb-parity.sh", &[]).await
             }
-            DevAction::SecretsInventory => provider::not_implemented("curie dev secrets-inventory"),
+            DevAction::SecretsInventory {
+                chart,
+                inventory,
+                bundles,
+            } => commands::dev_secrets_inventory(chart, inventory, &bundles),
             DevAction::SchemaBaseline => {
                 commands::dev_script("cli/scripts/refresh-schema-baseline.sh", &[]).await
             }
