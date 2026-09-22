@@ -8,6 +8,8 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
+from curie_api.bundles import read_manifest_triggers
+
 RELEASE = "acme-rel"
 NAMESPACE = "acme-ns"
 APP_NAME = "curie"
@@ -123,12 +125,38 @@ def test_connectors_returns_an_empty_trigger_list_when_the_key_is_absent(
     assert body["version_id"] == version_id
 
 
-def test_connectors_returns_a_two_field_cron_unchanged(
+def test_two_field_cron_is_rejected_at_upload_and_unread_on_disk(
     tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # Equality fails if a reader rewrites this two-field cron into a longer shape.
-    agent_id, version_id = _publish(
-        client, auth_headers, _archive(_bundle(tmp_path, TWO_FIELD_CRON)), "acme-bot-legacy"
+    # Upload rejects the legacy shape. The reader still returns that list
+    # unchanged when the file is already on disk, and does not add fields.
+    root = _bundle(tmp_path, TWO_FIELD_CRON)
+    assert read_manifest_triggers(root / "b") == TWO_FIELD_CRON
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "acme-bot-legacy",
+            "channel": {"kind": "slack", "address": CHANNEL},
+        },
+        headers=auth_headers,
     )
-    body = _connectors(client, auth_headers, agent_id, version_id)
-    assert body["triggers"] == TWO_FIELD_CRON
+    assert agent.status_code == 201, agent.text
+    agent_id = agent.json()["id"]
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "acme"},
+        headers=auth_headers,
+    )
+    assert version.status_code == 201, version.text
+    version_id = version.json()["id"]
+    upload = client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("acme-bot.tar.gz", _archive(root))},
+        headers=auth_headers,
+    )
+    assert upload.status_code == 422, upload.text
+    detail = upload.json()["detail"]
+    assert detail["detail"] == "bundle failed validation"
+    codes = {item["code"] for item in detail["errors"]}
+    assert "triggers.cron_missing_name" in codes
+    assert "triggers.cron_missing_prompt" in codes

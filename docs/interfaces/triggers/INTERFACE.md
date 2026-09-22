@@ -93,7 +93,7 @@ the same `curie:runs` stream, and a truthful inventory names them:
 codes), so an agent's non-chat wake-ups ship in one reviewable artifact and a malformed declaration
 is rejected at deploy. A cron declaration needs a unique non-empty name, a non-empty prompt, and a
 five-field schedule; timezone is an IANA name, default UTC only when omitted, and only legal with a
-schedule; target, when present, is a non-empty channel address; schedule is forbidden on other
+schedule; target, when present, is a non-empty channel address string or an object with a non-empty channel; schedule is forbidden on other
 types; webhook `{type, path}` is unchanged. This is the *declaration*
 surface only. A generic HMAC hook ingress is shipped (`ingest_hook` above); bundle-declared
 `cron` / `webhook` *consumption* -- a per-agent scheduler that fires a declared schedule, or a

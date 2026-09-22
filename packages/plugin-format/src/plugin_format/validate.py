@@ -855,7 +855,14 @@ def _stripped(value: object) -> str:
 
 def _cron_bound(token: str, low: int, high: int, names: Mapping[str, int] | None) -> int | None:
     if token.isdigit():
-        value = int(token)
+        # Cron fields are at most two digits. A longer digit string is not a
+        # field, and int() raises ValueError past the interpreter digit cap.
+        if len(token) > 4:
+            return None
+        try:
+            value = int(token)
+        except ValueError:
+            return None
     elif names is None:
         return None
     else:
@@ -873,8 +880,15 @@ def _cron_part_ok(part: str, low: int, high: int, names: Mapping[str, int] | Non
     if match is None:
         return False
     step_text = match.group("step")
-    if step_text is not None and int(step_text) < 1:
-        return False
+    if step_text is not None:
+        if len(step_text) > 4:
+            return False
+        try:
+            step = int(step_text)
+        except ValueError:
+            return False
+        if step < 1:
+            return False
     start_text = match.group("start")
     if start_text is None:
         return True
@@ -907,6 +921,17 @@ def _five_field_cron(expression: str) -> bool:
     )
 
 
+def _target_acceptable(value: object) -> bool:
+    """A channel address string, or an object whose ``channel`` is one."""
+
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        channel = value.get("channel")
+        return isinstance(channel, str) and bool(channel.strip())
+    return False
+
+
 def _iana_timezone(value: object) -> bool:
     name = _stripped(value)
     if not name:
@@ -925,7 +950,8 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
     ``webhook``. A ``cron`` trigger needs a non-empty ``name``, a non-empty
     ``prompt``, and a five-field ``schedule`` (ADR-0099). ``timezone`` is an
     IANA name and is legal only with a non-empty schedule; a missing key means
-    UTC and is not written back. ``target``, when present, must be non-empty.
+    UTC and is not written back. ``target``, when present, is a non-empty
+    channel address string or an object with a non-empty ``channel``.
     ``schedule`` on any other known type is forbidden. A ``webhook`` still needs
     a non-empty ``path``. Presence is raw key membership, so an explicit JSON
     null is present. The parsed model collapses an omitted key and null to
@@ -1008,10 +1034,11 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
                     "a 'cron' trigger 'timezone' must be an IANA time zone name",
                     loc,
                 )
-        if "target" in raw_item and not _stripped(trigger.target):
+        if "target" in raw_item and not _target_acceptable(trigger.target):
             c.error(
                 "triggers.target_invalid",
-                "a trigger 'target', when set, must be non-empty",
+                "a trigger 'target', when set, must be a non-empty channel address "
+                "or an object with a non-empty 'channel'",
                 loc,
             )
         if trigger.type == "webhook" and not _stripped(trigger.path):

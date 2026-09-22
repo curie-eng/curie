@@ -317,7 +317,7 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   runs at deploy, but no runtime scheduler/ingress consumes a declared trigger yet (Epic #29).
   A cron declaration needs a unique non-empty name, a non-empty prompt, and a five-field schedule;
   timezone is an IANA name, default UTC only when omitted, and only legal with a schedule; target,
-  when present, is a non-empty channel address; schedule is forbidden on other types; webhook
+  when present, is a non-empty channel address string or an object with a non-empty channel; schedule is forbidden on other types; webhook
   `{type, path}` is unchanged.
 - `toolPolicy` (`{enforcement, allow, approvalRequired, deny}` glob collections over canonical
   `"<server>/<tool>"` MCP tool names,

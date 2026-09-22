@@ -53,7 +53,7 @@ Pydantic models mirroring the Claude Code shapes:
   `validate_bundle` enforces the ADR-0099 cron shape (non-empty name and prompt,
   five-field schedule). Timezone is an IANA name, default UTC only when omitted,
   and only legal with a schedule. Target, when present, is a non-empty channel
-  address. Schedule is forbidden on other types. A webhook stays `{type, path}`.
+  address string, or an object whose `channel` is one. Schedule is forbidden on other types. A webhook stays `{type, path}`.
   Declaring triggers in the bundle keeps an agent's full
   wake-up behavior in one reviewable artifact. **Deploy-time validation** rejects
   an unknown type, a cron missing a non-empty name or prompt, a cron whose

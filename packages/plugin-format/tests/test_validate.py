@@ -329,6 +329,55 @@ def test_duplicate_trigger_name_after_strip_is_rejected(tmp_path: Path) -> None:
     assert "triggers.duplicate_name" in _codes(bundle)
 
 
+def test_channel_object_target_is_valid(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "target": {"channel": "C0EXAMPLE1"},
+            }
+        ],
+    )
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+def test_blank_channel_object_target_is_rejected(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "target": {"channel": "   "},
+            }
+        ],
+    )
+    assert "triggers.target_invalid" in _codes(bundle)
+
+
+def test_oversized_cron_number_is_rejected(tmp_path: Path) -> None:
+    # Longer than the interpreter digit cap. Must be a named error, not a raise.
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": ("1" * 4301) + " 9 * * 1",
+                "prompt": "Post the daily plan.",
+            }
+        ],
+    )
+    assert "triggers.cron_invalid_schedule" in _codes(bundle)
+
+
 def test_whitespace_cron_target_is_rejected(tmp_path: Path) -> None:
     bundle = _trigger_bundle(
         tmp_path,
