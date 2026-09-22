@@ -39,7 +39,7 @@ short of an operator deleting it, and no way to scope memory to a channel.
 
 ### Already decided, not up for debate
 
-1. Storage is the Postgres state store
+1. We're using Postgres for storage
    ([ADR-0025](0025-memory-port-and-first-loader.md)).
 2. Memory is loaded at boot and the bundle's own prompt goes last, so what a
    person wrote outranks what the agent learned
@@ -58,6 +58,7 @@ short of an operator deleting it, and no way to scope memory to a channel.
 What we add or change.
 
 **A. Two tiers by default: agent and place. Bundles can add more.**
+There are two memory tiers: a *per agent* memory and a *per place* memory.
 The agent tier belongs to the agent and goes everywhere it goes. The place
 tier belongs to the agent plus one channel binding, `(kind, address)`, treated
 as an opaque string. No key, API or runner code names a specific surface. A
