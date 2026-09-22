@@ -178,6 +178,12 @@ enum SyncScript {
     Never,
     ReadyChanged,
     NotReadyChanged,
+    /// Every post-annotate read first reports an older in-flight reconcile
+    /// (Ready, hash of the pre-annotate metadata plus another label change);
+    /// `stale_reads` of those, then the correct hash.
+    StaleThenCorrect,
+    /// Post-annotate `get` sleeps `slow_get` and then returns a correct Ready.
+    SlowCorrect,
 }
 
 struct State {
@@ -189,6 +195,11 @@ struct State {
     external: Value,
     sync_script: SyncScript,
     sync_counter: u32,
+    annotated: bool,
+    stale_reads: u32,
+    stale_served: u32,
+    pre_annotate_metadata: Value,
+    slow_get: Duration,
 }
 
 #[derive(Clone)]
@@ -254,6 +265,11 @@ impl FakeKubectl {
             external: json!({}),
             sync_script: SyncScript::Never,
             sync_counter: 0,
+            annotated: false,
+            stale_reads: 0,
+            stale_served: 0,
+            pre_annotate_metadata: json!({}),
+            slow_get: Duration::ZERO,
         };
         if let Some(s) = secret {
             state.rv += 1;
@@ -275,6 +291,16 @@ impl FakeKubectl {
             s.external = external;
             s.sync_script = script;
         }
+        self
+    }
+
+    fn with_stale_reads(self, n: u32) -> Self {
+        self.0.lock().unwrap().stale_reads = n;
+        self
+    }
+
+    fn with_slow_get(self, d: Duration) -> Self {
+        self.0.lock().unwrap().slow_get = d;
         self
     }
 
@@ -332,17 +358,42 @@ impl Kubectl for FakeKubectl {
         }
         if has(args, "annotate") || (has(args, "patch") && mentions_external(args)) {
             s.sync_counter += 1;
-            let n = s.sync_counter;
-            let (ready, change) = match s.sync_script {
-                SyncScript::Never => (None, false),
-                SyncScript::ReadyChanged => (Some("True"), true),
-                SyncScript::NotReadyChanged => (Some("False"), true),
+            s.pre_annotate_metadata = s.external["metadata"].clone();
+            // Record the force-sync annotation in metadata, as the apiserver does.
+            let prefix = format!("{}=", eso::FORCE_SYNC_ANNOTATION);
+            let mut value = args
+                .iter()
+                .find_map(|a| a.strip_prefix(&prefix).map(str::to_string));
+            if value.is_none() {
+                if let Some(b) = patch_body(args, &stdin.map(<[u8]>::to_vec)) {
+                    value = b["metadata"]["annotations"][eso::FORCE_SYNC_ANNOTATION]
+                        .as_str()
+                        .map(str::to_string);
+                }
+            }
+            let value = value.expect("force-sync annotation value in annotate call");
+            if !s.external["metadata"]["annotations"].is_object() {
+                s.external["metadata"]["annotations"] = json!({});
+            }
+            s.external["metadata"]["annotations"][eso::FORCE_SYNC_ANNOTATION] = json!(value);
+            s.annotated = true;
+            s.stale_served = 0;
+            let ready = match s.sync_script {
+                SyncScript::Never => None,
+                SyncScript::NotReadyChanged => Some("False"),
+                _ => Some("True"),
             };
-            if change {
-                s.external["status"]["syncedResourceVersion"] = json!(format!("{}-changed", n + 1));
+            if let Some(ready) = ready {
+                if matches!(
+                    s.sync_script,
+                    SyncScript::ReadyChanged | SyncScript::NotReadyChanged
+                ) {
+                    let synced = eso::synced_version(&s.external["metadata"]);
+                    s.external["status"]["syncedResourceVersion"] = json!(synced);
+                }
                 s.external["status"]["refreshTime"] = json!("2026-09-22T00:00:00Z");
                 s.external["status"]["conditions"] =
-                    json!([{"type": "Ready", "status": ready.unwrap(), "reason": "x"}]);
+                    json!([{"type": "Ready", "status": ready, "reason": "x"}]);
             }
             return ok("externalsecret annotated\n");
         }
@@ -355,6 +406,33 @@ impl Kubectl for FakeKubectl {
         }
         if has(args, "get") {
             if mentions_external(args) {
+                if s.annotated {
+                    match s.sync_script {
+                        SyncScript::StaleThenCorrect => {
+                            let synced = if s.stale_served < s.stale_reads {
+                                s.stale_served += 1;
+                                // An older reconcile that started before our
+                                // annotate, over another writer's label change.
+                                let mut older = s.pre_annotate_metadata.clone();
+                                older["labels"]["other-writer"] = json!("x");
+                                eso::synced_version(&older)
+                            } else {
+                                eso::synced_version(&s.external["metadata"])
+                            };
+                            s.external["status"]["syncedResourceVersion"] = json!(synced);
+                        }
+                        SyncScript::SlowCorrect => {
+                            let d = s.slow_get;
+                            s.external["status"]["syncedResourceVersion"] =
+                                json!(eso::synced_version(&s.external["metadata"]));
+                            let out = s.external.to_string();
+                            drop(s);
+                            std::thread::sleep(d);
+                            return ok(out);
+                        }
+                        _ => {}
+                    }
+                }
                 return ok(s.external.to_string());
             }
             return match &s.secret {
@@ -600,6 +678,70 @@ fn force_sync_uses_distinct_annotation_values() {
         "{marks:?}"
     );
     assert_ne!(marks[0], marks[1]);
+}
+
+#[test]
+fn synced_version_matches_live_eso_probe() {
+    let meta = golden("synced-version-probe.json");
+    assert_eq!(
+        eso::synced_version(&meta),
+        "1-51ed6f9f417d350db50794445de96046d372e51e8b3951b5369ac4b7"
+    );
+}
+
+#[test]
+fn synced_version_changes_with_labels_and_annotations() {
+    let meta = golden("synced-version-probe.json");
+    let base = eso::synced_version(&meta);
+    let mut labelled = meta.clone();
+    labelled["labels"]["extra"] = json!("y");
+    let mut annotated = meta.clone();
+    annotated["annotations"]["extra"] = json!("y");
+    assert_ne!(eso::synced_version(&labelled), base);
+    assert_ne!(eso::synced_version(&annotated), base);
+    assert_ne!(
+        eso::synced_version(&labelled),
+        eso::synced_version(&annotated)
+    );
+    let bare = json!({"generation": 3});
+    assert!(eso::synced_version(&bare).starts_with("3-"));
+}
+
+#[test]
+fn force_sync_rejects_in_flight_older_reconcile() {
+    // Only stale (older-reconcile) Ready reads: never Ok, even though the
+    // version changed and Ready=True.
+    let fake = FakeKubectl::new(None)
+        .with_external(external("True", "1-aaa"), SyncScript::StaleThenCorrect)
+        .with_stale_reads(u32::MAX);
+    assert!(
+        force(&fake, 300).is_err(),
+        "older reconcile must not satisfy"
+    );
+}
+
+#[test]
+fn force_sync_waits_past_in_flight_reconcile_then_succeeds() {
+    let fake = FakeKubectl::new(None)
+        .with_external(external("True", "1-aaa"), SyncScript::StaleThenCorrect)
+        .with_stale_reads(2);
+    force(&fake, 2000).expect("correct hash after the stale reads");
+    let s = fake.0.lock().unwrap();
+    assert_eq!(
+        s.stale_served, 2,
+        "stale reads must have been observed and rejected"
+    );
+}
+
+#[test]
+fn force_sync_late_success_after_deadline_is_timeout() {
+    let fake = FakeKubectl::new(None)
+        .with_external(external("True", "1-aaa"), SyncScript::SlowCorrect)
+        .with_slow_get(Duration::from_millis(500));
+    let start = Instant::now();
+    let err = force(&fake, 100).expect_err("success observed after the deadline must be Err");
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(format!("{err:#}").contains("platform"), "{err:#}");
 }
 
 #[test]

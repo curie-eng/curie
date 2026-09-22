@@ -107,6 +107,7 @@ fn system(kubeconfig: &Path) -> SystemKubectl {
     SystemKubectl {
         context: None,
         kubeconfig: Some(kubeconfig.to_path_buf()),
+        call_timeout: Some(Duration::from_secs(60)),
     }
 }
 

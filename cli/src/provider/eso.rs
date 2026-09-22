@@ -225,6 +225,8 @@ pub trait Kubectl {
 pub struct SystemKubectl {
     pub context: Option<String>,
     pub kubeconfig: Option<PathBuf>,
+    /// Per-call ceiling. An overdue kubectl child is killed.
+    pub call_timeout: Option<Duration>,
 }
 
 impl Kubectl for SystemKubectl {
@@ -253,6 +255,35 @@ impl Kubectl for SystemKubectl {
             }
             _ => None,
         };
+        if let Some(limit) = self.call_timeout {
+            let give_up = Instant::now() + limit;
+            loop {
+                if child
+                    .try_wait()
+                    .context("kubectl did not finish")?
+                    .is_some()
+                {
+                    break;
+                }
+                if Instant::now() >= give_up {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(writer) = writer {
+                        let _ = writer.join();
+                    }
+                    let verb = args
+                        .iter()
+                        .find(|a| !a.starts_with('-') && !is_flag_value(args, a))
+                        .map(String::as_str)
+                        .unwrap_or("command");
+                    bail!(
+                        "kubectl {verb} did not finish within {}s",
+                        limit.as_secs_f64()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         let output = child.wait_with_output().context("kubectl did not finish")?;
         if let Some(writer) = writer {
             writer
@@ -266,6 +297,15 @@ impl Kubectl for SystemKubectl {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
+}
+
+/// True when `arg` is the value of a preceding `-n`/`--namespace`/`--context`.
+fn is_flag_value(args: &[String], arg: &String) -> bool {
+    args.iter()
+        .position(|a| std::ptr::eq(a, arg))
+        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| args.get(i))
+        .is_some_and(|prev| matches!(prev.as_str(), "-n" | "--namespace" | "--context"))
 }
 
 fn argv(parts: &[&str]) -> Vec<String> {
@@ -323,11 +363,39 @@ fn read_external(k: &dyn Kubectl, namespace: &str, name: &str) -> Result<Value> 
         .with_context(|| format!("ExternalSecret {namespace}/{name} returned invalid JSON"))
 }
 
-fn synced_version(external: &Value) -> Option<String> {
-    external["status"]["syncedResourceVersion"]
-        .as_str()
-        .filter(|version| !version.is_empty())
-        .map(str::to_string)
+fn go_map(map: &Value) -> String {
+    let mut pairs: Vec<(String, String)> = map
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+                    (k.clone(), v)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    pairs.sort();
+    let body: Vec<String> = pairs.into_iter().map(|(k, v)| format!("{k}:{v}")).collect();
+    format!("map[{}]", body.join(" "))
+}
+
+/// The `status.syncedResourceVersion` ESO would record for `metadata`.
+///
+/// Pinned to ESO 2.11.0 (`pkg/controllers/util/util.go` and
+/// `runtime/esutils/utils.go`): `"{generation}-{hex sha3_224(text)}"`, where
+/// `text` is Go's `%+v` of `{Annotations, Labels}`. Re-check on an ESO upgrade.
+pub fn synced_version(metadata: &Value) -> String {
+    use sha3::{Digest, Sha3_224};
+    let generation = metadata["generation"].as_i64().unwrap_or(0);
+    let text = format!(
+        "{{annotations:{} labels:{}}}",
+        go_map(&metadata["annotations"]),
+        go_map(&metadata["labels"])
+    );
+    let digest = Sha3_224::digest(text.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{generation}-{hex}")
 }
 
 fn is_ready(external: &Value) -> bool {
@@ -340,8 +408,11 @@ fn is_ready(external: &Value) -> bool {
         })
 }
 
-/// Annotate a unique force-sync value and wait until ESO reconciled it: Ready
-/// and a `syncedResourceVersion` different from the one read before.
+/// Annotate a unique force-sync value and wait until ESO reconciled exactly
+/// that metadata: Ready and `syncedResourceVersion` equal to
+/// [`synced_version`] of the current metadata, which must still carry our
+/// annotation value. A reconcile that started before the annotate hashes
+/// older metadata and never matches. The deadline bounds the whole call.
 pub fn force_sync_and_wait(
     k: &dyn Kubectl,
     namespace: &str,
@@ -350,8 +421,14 @@ pub fn force_sync_and_wait(
     poll: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    let before = synced_version(&read_external(k, namespace, external_secret)?);
-    let mark = format!("{FORCE_SYNC_ANNOTATION}={}", unique_mark());
+    let timed_out = || {
+        anyhow!(
+            "ExternalSecret {namespace}/{external_secret} did not sync within {}s",
+            timeout.as_secs_f64()
+        )
+    };
+    let value = unique_mark();
+    let mark = format!("{FORCE_SYNC_ANNOTATION}={value}");
     let args = argv(&[
         "-n",
         namespace,
@@ -369,17 +446,28 @@ pub fn force_sync_and_wait(
         );
     }
     loop {
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
         let current = read_external(k, namespace, external_secret)?;
-        let synced = synced_version(&current);
-        if is_ready(&current) && synced.is_some() && synced != before {
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        let metadata = &current["metadata"];
+        if metadata["annotations"][FORCE_SYNC_ANNOTATION].as_str() != Some(value.as_str()) {
+            bail!(
+                "ExternalSecret {namespace}/{external_secret}: another writer replaced the \
+                 force-sync annotation"
+            );
+        }
+        let expected = synced_version(metadata);
+        let synced = current["status"]["syncedResourceVersion"].as_str();
+        if is_ready(&current) && synced == Some(expected.as_str()) {
             return Ok(());
         }
         let now = Instant::now();
         if now >= deadline {
-            bail!(
-                "ExternalSecret {namespace}/{external_secret} did not sync within {}s",
-                timeout.as_secs_f64()
-            );
+            return Err(timed_out());
         }
         std::thread::sleep(poll.min(deadline - now));
     }

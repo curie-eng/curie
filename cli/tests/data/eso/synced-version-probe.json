@@ -1,0 +1,12 @@
+{
+  "generation": 1,
+  "labels": {
+    "a.b/c": "d",
+    "app": "x"
+  },
+  "annotations": {
+    "force-sync": "123 456",
+    "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"external-secrets.io/v1\",\"kind\":\"ExternalSecret\",\"metadata\":{\"annotations\":{\"force-sync\":\"123 456\",\"z\":\"1\"},\"labels\":{\"a.b/c\":\"d\",\"app\":\"x\"},\"name\":\"es\",\"namespace\":\"hashprobe\"},\"spec\":{\"data\":[{\"remoteRef\":{\"key\":\"k\"},\"secretKey\":\"K\"}],\"refreshInterval\":\"1h\",\"secretStoreRef\":{\"kind\":\"SecretStore\",\"name\":\"fake\"},\"target\":{\"name\":\"out\"}}}\n",
+    "z": "1"
+  }
+}
