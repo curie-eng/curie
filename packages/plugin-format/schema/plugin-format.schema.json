@@ -577,8 +577,20 @@
     },
     "TriggerDeclaration": {
       "additionalProperties": true,
-      "description": "One trigger that can wake the agent, declared in the bundle (#273/#270).\n\n``type`` is ``\"cron\"`` (requires a ``schedule`` cron expression) or\n``\"webhook\"`` (requires a ``path`` the webhook ingress routes to). Declaring\ntriggers in the bundle keeps an agent's full behavior in one reviewable\nartifact; the kernel/ingress consumes them (not built here \u2014 deploy-time\nvalidation only, so a malformed declaration is rejected before ship).",
+      "description": "One trigger that can wake the agent, declared in the bundle (#273/#270).\n\n``type`` is ``cron`` or ``webhook``. ``name``, ``timezone``, ``target``, and\n``prompt`` are optional. ``validate_bundle`` enforces the ADR-0099 cron shape\n(non-empty name and prompt, five-field schedule) while a webhook stays\n``{type, path}``.",
       "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
         "path": {
           "anyOf": [
             {
@@ -591,6 +603,18 @@
           "default": null,
           "title": "Path"
         },
+        "prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt"
+        },
         "schedule": {
           "anyOf": [
             {
@@ -602,6 +626,30 @@
           ],
           "default": null,
           "title": "Schedule"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target"
+        },
+        "timezone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timezone"
         },
         "type": {
           "title": "Type",

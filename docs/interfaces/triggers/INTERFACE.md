@@ -89,9 +89,12 @@ the same `curie:runs` stream, and a truthful inventory names them:
   recorded below.
 
 **Declaration vs. consumption (#273/#270).** The bundle manifest now carries deploy-time-validated
-`triggers` declarations (`cron` with a `schedule`, `webhook` with a `path`; `TriggerDeclaration` in
-`packages/plugin-format`, `triggers.*` validation codes), so an agent's non-chat wake-ups ship in one
-reviewable artifact and a malformed declaration is rejected at deploy. This is the *declaration*
+`triggers` declarations (`TriggerDeclaration` in `packages/plugin-format`, `triggers.*` validation
+codes), so an agent's non-chat wake-ups ship in one reviewable artifact and a malformed declaration
+is rejected at deploy. A cron declaration needs a unique non-empty name, a non-empty prompt, and a
+five-field schedule; timezone is an IANA name, default UTC only when omitted, and only legal with a
+schedule; target, when present, is a non-empty channel address; schedule is forbidden on other
+types; webhook `{type, path}` is unchanged. This is the *declaration*
 surface only. A generic HMAC hook ingress is shipped (`ingest_hook` above); bundle-declared
 `cron` / `webhook` *consumption* -- a per-agent scheduler that fires a declared schedule, or a
 mapping from a declared webhook path onto that handler -- is still the open Epic #29
@@ -141,4 +144,4 @@ first thing a real `Trigger` port would have to take ownership of.
 
 - **Epic(s):** #29 — triggers: decide whether "trigger" is a real seam (extract an `EventSource` port) or just new event types on the existing ingresses.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six swappable jobs; not separately graded.
-- **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) — hooks are bundle-declared turns the system starts.
+- **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Accepted) — hooks are bundle-declared turns the system starts.

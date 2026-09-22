@@ -315,6 +315,10 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
 - `triggers` (a list of `cron`/`webhook` declarations for waking the agent beyond chat, #273/#270 —
   see the [triggers seam](../triggers/INTERFACE.md)) is still **declaration-only**: its validator
   runs at deploy, but no runtime scheduler/ingress consumes a declared trigger yet (Epic #29).
+  A cron declaration needs a unique non-empty name, a non-empty prompt, and a five-field schedule;
+  timezone is an IANA name, default UTC only when omitted, and only legal with a schedule; target,
+  when present, is a non-empty channel address; schedule is forbidden on other types; webhook
+  `{type, path}` is unchanged.
 - `toolPolicy` (`{enforcement, allow, approvalRequired, deny}` glob collections over canonical
   `"<server>/<tool>"` MCP tool names,
   `packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) is **declaration-only and
