@@ -43,6 +43,31 @@ impl TierDefaults for LocalTier {
 /// The local tier correctly defaults to the compose stack on localhost; the
 /// cluster tier discovers its connection from the release instead (see
 /// [`ClusterAgentTarget`] / [`ClusterConn`], #524), so it no longer shares this.
+/// The administrative approval recovery verbs (#2753), flattened into each
+/// tier's `approvals` so their parse runs in its own frame.
+#[derive(Args, Debug, Clone, Default)]
+struct ApprovalRecoveryArgs {
+    /// Report installation-wide approval identity FACTS, plus the
+    /// declaration skeleton to fill in and feed back to the upgrade. A pure
+    /// read: no agent lookup, no principal, nothing mutated.
+    #[arg(long)]
+    report_identity: bool,
+    /// Administratively reject this approval under the installation-wide
+    /// recovery grant (`api.approvalRecovery.enabled`). Requires --reason
+    /// and --recovery-key; every use is audited.
+    #[arg(long, value_name = "APPROVAL_ID")]
+    recover: Option<String>,
+    /// Why this administrative recovery is being performed. Written
+    /// verbatim to the durable audit row. Required by --recover.
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+    /// The caller-chosen idempotency key for --recover.
+    /// Retrying the identical command with the same key is absorbed by the
+    /// server as one act; the CLI never generates or decorates it.
+    #[arg(long = "recovery-key", value_name = "KEY")]
+    recovery_key: Option<String>,
+}
+
 #[derive(Args, Debug, Clone)]
 struct AgentTarget<T: TierDefaults> {
     /// Agent name or id.
@@ -1404,6 +1429,8 @@ enum SkillAction {
         /// as --route-resolution.
         #[arg(long)]
         clear_routes: bool,
+        #[command(flatten)]
+        recovery: ApprovalRecoveryArgs,
     },
     // The about text is composed from the same consts the runtime `{error, fix}`
     // payload uses, so the discovery surface cannot drift from the answer
@@ -1955,6 +1982,8 @@ enum LocalAction {
         /// Remove every approval route binding on the agent.
         #[arg(long)]
         clear_routes: bool,
+        #[command(flatten)]
+        recovery: ApprovalRecoveryArgs,
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
@@ -2959,6 +2988,8 @@ enum ClusterAction {
         /// Remove every approval route binding on the agent.
         #[arg(long)]
         clear_routes: bool,
+        #[command(flatten)]
+        recovery: ApprovalRecoveryArgs,
     },
 }
 
@@ -3557,6 +3588,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                recovery:
+                    ApprovalRecoveryArgs {
+                        report_identity,
+                        recover,
+                        ..
+                    },
                 ..
             } => {
                 // Answered, not absent (ADR-0041, ADR-0077): the durable
@@ -3573,7 +3610,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                     || routes_from.is_some()
                     || list_routes
                     || clear_routes;
-                if routes_asked {
+                //
+                // The recovery verbs decline FIRST and with their own reason
+                // (#2753): they address the durable store's administrative
+                // surface, and answering them with the route or list reason
+                // would point the operator at the wrong absent thing.
+                if report_identity || recover.is_some() {
+                    Err(commands::skill_approvals_recovery_unavailable())
+                } else if routes_asked {
                     Err(commands::skill_approval_routes_unavailable())
                 } else if list || resolve.is_some() {
                     Err(commands::skill_approvals_list_unavailable())
@@ -3917,6 +3961,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                recovery:
+                    ApprovalRecoveryArgs {
+                        report_identity,
+                        recover,
+                        reason,
+                        recovery_key,
+                    },
             } => emit(
                 commands::approvals(
                     target.into(),
@@ -3934,6 +3985,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                         routes_from,
                         list_routes,
                         clear_routes,
+                        report_identity,
+                        recover,
+                        reason,
+                        recovery_key,
                     },
                 )
                 .await?,
@@ -5221,6 +5276,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                 routes_from,
                 list_routes,
                 clear_routes,
+                recovery:
+                    ApprovalRecoveryArgs {
+                        report_identity,
+                        recover,
+                        reason,
+                        recovery_key,
+                    },
             } => {
                 let ClusterAgentTarget {
                     agent,
@@ -5251,6 +5313,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                             routes_from,
                             list_routes,
                             clear_routes,
+                            report_identity,
+                            recover,
+                            reason,
+                            recovery_key,
                         },
                     )
                     .await?,

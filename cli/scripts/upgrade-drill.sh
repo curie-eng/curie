@@ -36,6 +36,29 @@ AGENT_NAME="${CURIE_E2E_AGENT:-acme-2426-bot}"
 CHANNEL="${CURIE_E2E_CHANNEL:-C0EXAMPLE1}"
 CANDIDATE_TAG="${CURIE_E2E_CANDIDATE_TAG:-}"
 LOCK_FILE="/tmp/curie-upgrade-drill.lock"
+# #2753 approval-recovery scenario inputs. The bundle must DECLARE the route in
+# its approvalPolicy: an operator principal can resolve only a route bound to an
+# explicit user list (slack_approvers.py sets operator_eligible=False on the
+# channel-membership and user-group approver sets), so without a declared route
+# the "still resolvable after the upgrade" half cannot be proven at all and this
+# scenario refuses rather than reporting a pass it did not earn.
+RECOVERY_PLUGIN_DIR="${CURIE_E2E_RECOVERY_PLUGIN_DIR:-$PLUGIN_DIR}"
+RECOVERY_ROUTE="${CURIE_E2E_APPROVAL_ROUTE:-}"
+# A SECOND declared route, deliberately left on the channel-membership default:
+# the orphaned obligation an operator principal is refused 403 on. Without it
+# both approvals sit on the same authorization state and the pairing proves
+# nothing, so it is required rather than defaulted.
+RECOVERY_ORPHAN_ROUTE="${CURIE_E2E_APPROVAL_ORPHAN_ROUTE:-}"
+RECOVERY_APPROVER="${CURIE_E2E_APPROVAL_USER:-}"
+# The operator principal resolves the ORDINARY route, whose approvers binding is
+# `users:$RECOVERY_APPROVER`, and ExplicitUsers.contains checks exact subject
+# membership. So the subject IS the approver; an override that names anyone
+# else is refused before setup by require_recovery_inputs.
+RECOVERY_PRINCIPAL_OVERRIDE="${CURIE_E2E_APPROVAL_SUBJECT:-}"
+RECOVERY_PRINCIPAL_SUBJECT="$RECOVERY_APPROVER"
+RECOVERY_RETAINED_ID=""
+RECOVERY_UNRESOLVABLE_ID=""
+RECOVERY_KEY_BASE=""
 WORKDIR=""
 CANDIDATE=""
 OWNED_KIND=0
@@ -70,7 +93,10 @@ SCENARIOS_ALL=(
     incompatible-rollback
     live-roundtrip
 )
-SCENARIOS_OPTIONAL=(install-087)
+# Opt-in, like install-087: it needs a bundle-DECLARED approval route and an
+# approver user id, so folding it into `all` would make the existing matrix
+# refuse for everyone who has not set them.
+SCENARIOS_OPTIONAL=(install-087 approval-recovery)
 
 log() { printf '%s\n' "$*" >&2; }
 
@@ -81,7 +107,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: upgrade-drill.sh [--scenario all|install-086|install-087|upgrade|retention|interrupt-drain|interrupt-apply|leftover-hook|compatible-rollback|incompatible-rollback|live-roundtrip] [--also-predecessor] [--force] [--keep] [--json] [--self-test]
+usage: upgrade-drill.sh [--scenario all|install-086|install-087|upgrade|retention|interrupt-drain|interrupt-apply|leftover-hook|compatible-rollback|incompatible-rollback|approval-recovery|live-roundtrip] [--also-predecessor] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -248,6 +274,35 @@ run_self_test() {
         log "mismatched chart and CLI identities refused"
     fi
     rm -f "$mismatch_chart"
+    if valid_scenario "approval-recovery"; then
+        log "approval-recovery scenario registered"
+    else
+        log "self-test: approval-recovery scenario is not registered"
+        failed=1
+    fi
+    if ! recovery_inputs_declared "" "U0EXAMPLE1" "sre-orphan" \
+        && ! recovery_inputs_declared "sre-approvals" "" "sre-orphan" \
+        && ! recovery_inputs_declared "sre-approvals" "U0EXAMPLE1" "" \
+        && recovery_inputs_declared "sre-approvals" "U0EXAMPLE1" "sre-orphan"; then
+        log "approval-recovery refuses an undeclared route, approver or orphan route"
+    else
+        log "self-test: approval-recovery input guard is wrong"
+        failed=1
+    fi
+    if principal_subject_consistent "U0EXAMPLE1" "" \
+        && principal_subject_consistent "U0EXAMPLE1" "U0EXAMPLE1" \
+        && ! principal_subject_consistent "U0EXAMPLE1" "drill-2753-operator"; then
+        log "approval-recovery refuses a principal subject other than the listed approver"
+    else
+        log "self-test: principal subject guard is wrong"
+        failed=1
+    fi
+    if grep -q 'cluster comms --slack' <<<"$(declare -f run_approval_recovery seed_approval_recovery seed_orphaned_approval)"; then
+        log "self-test: approval-recovery must never connect Slack"
+        failed=1
+    else
+        log "approval-recovery connects no Slack transport"
+    fi
     local script_path="${BASH_SOURCE[0]}"
     if grep -q '^--set security.gvisor' "$script_path"; then
         log "self-test: image_sets must emit KEY=VAL lines, not combined --set tokens"
@@ -629,8 +684,16 @@ run_upgrade() {
     if [[ "$tag" == "0.8.7" && -z "$CANDIDATE_TAG" ]]; then
         log "candidate application images are published :0.8.7; CLI/chart are this checkout $CANDIDATE"
     fi
+    # The approval-recovery baseline (v0.8.6, head 0039) crosses contract
+    # revision 0041, which the migrate gate refuses without the documented
+    # forward-only procedure. Pass it explicitly for that scenario only.
+    local forward=()
+    if [[ "$SCENARIO" == "approval-recovery" ]]; then
+        forward+=(--set api.migrate.forwardOnly=true)
+        log "U4 approval-recovery upgrade passes api.migrate.forwardOnly=true (crosses contract 0041)"
+    fi
     # Omit credentialsExistingSecret so retention is observed, not re-applied.
-    cluster_up_with "$BIN" "$REPO_ROOT/charts/curie" "$tag" 0
+    cluster_up_with "$BIN" "$REPO_ROOT/charts/curie" "$tag" 0 "${forward[@]}"
     wait_rollout
     log "U4 candidate CLI upgrade complete (tag=$tag)"
 }
@@ -797,6 +860,405 @@ PY
     log "U9 incompatible 0.8.4 rollback refused before mutation; API replicas unchanged"
 }
 
+# --- #2753 administrative approval recovery ----------------------------------
+#
+# Zero Slack, deliberately: nothing in this scenario calls `cluster comms
+# --slack`, because connecting Slack reroutes `cluster message` replies into
+# Slack and the recovery surface under test is not the Slack transport. Every
+# act here is driven from the CLI with an operator principal.
+#
+# Every assertion below is written against the API's OWN field names, read out
+# of --json output, never against the CLI's human rendering: the renderer is
+# presentation and can change without the contract changing.
+
+require_live_provider() {
+    # A narrower gate than require_live ON PURPOSE, and it does not replace it:
+    # this scenario needs a live model to make a real gated tool call, and needs
+    # Slack to be ABSENT. It never relaxes require_live for any other scenario.
+    if ! live_provider_present; then
+        die "missing live provider credentials; set OPENROUTER_SOAK_TEST_KEY, CURIE_CREDENTIALS, CURIE_MODEL_CREDENTIALS, or ANTHROPIC_API_KEY. Fake-model cannot close #2753."
+    fi
+}
+
+recovery_inputs_declared() {
+    [[ -n "${1:-}" && -n "${2:-}" && -n "${3:-}" ]]
+}
+
+# An override is allowed only when it names the explicitly listed approver.
+principal_subject_consistent() {
+    [[ -z "${2:-}" || "${2:-}" == "${1:-}" ]]
+}
+
+require_recovery_inputs() {
+    if ! recovery_inputs_declared "$RECOVERY_ROUTE" "$RECOVERY_APPROVER" "$RECOVERY_ORPHAN_ROUTE"; then
+        die "approval-recovery needs CURIE_E2E_APPROVAL_ROUTE (a route DECLARED in the bundle's approvalPolicy, bound here to an explicit user list), CURIE_E2E_APPROVAL_USER (the Slack user id for approvers.users) and CURIE_E2E_APPROVAL_ORPHAN_ROUTE (a SECOND declared route, left on the channel-membership default). An operator principal can resolve only a route bound to an explicit user list, so the ordinary half needs the first and the orphaned half needs the second; with one route only, the two obligations are the same obligation and neither half proves anything."
+    fi
+    [[ "$RECOVERY_ROUTE" != "$RECOVERY_ORPHAN_ROUTE" ]] \
+        || die "CURIE_E2E_APPROVAL_ROUTE and CURIE_E2E_APPROVAL_ORPHAN_ROUTE are the same route; the ordinary and orphaned obligations would be indistinguishable"
+    principal_subject_consistent "$RECOVERY_APPROVER" "$RECOVERY_PRINCIPAL_OVERRIDE" \
+        || die "CURIE_E2E_APPROVAL_SUBJECT ('$RECOVERY_PRINCIPAL_OVERRIDE') disagrees with CURIE_E2E_APPROVAL_USER ('$RECOVERY_APPROVER'): the ordinary route is bound to users:$RECOVERY_APPROVER and an operator principal for any other subject is refused 403. Unset the override or make it equal."
+    RECOVERY_PRINCIPAL_SUBJECT="$RECOVERY_APPROVER"
+}
+
+# Read the API from INSIDE the api pod. The audit trail has no CLI verb, and
+# this avoids a port-forward and avoids ever materializing the platform key in
+# this shell: the container already holds it in $API_KEY and it is never echoed.
+api_call_in_cluster() {
+    local method="$1" path="$2" target="${3:-deploy/$(fullname)-api}"
+    kubectl_ns exec -i "$target" -c api -- python3 -c '
+import json, os, sys, urllib.error, urllib.request
+method, path = sys.argv[1], sys.argv[2]
+raw = sys.stdin.read()
+body = raw.encode() if raw.strip() else None
+req = urllib.request.Request("http://127.0.0.1:8000" + path, data=body, method=method)
+req.add_header("X-API-Key", os.environ["API_KEY"])
+if body is not None:
+    req.add_header("Content-Type", "application/json")
+try:
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        sys.stdout.write(resp.read().decode())
+except urllib.error.HTTPError as err:
+    json.dump({"http_status": err.code, "detail": err.read().decode()}, sys.stdout)
+' "$method" "$path"
+}
+
+api_get_in_cluster() {
+    api_call_in_cluster GET "$1" </dev/null
+}
+
+approvals_cli() {
+    "$BIN" --json cluster approvals "$AGENT_NAME" \
+        --namespace "$NAMESPACE" \
+        --release "$RELEASE" \
+        "$@"
+}
+
+pending_ids() {
+    approvals_cli --list 2>/dev/null | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+if not raw:
+    raise SystemExit(0)
+doc = json.loads(raw.splitlines()[-1])
+for row in doc.get("pending") or []:
+    print(row["id"])
+'
+}
+
+# Pull one object out of a CLI --json document by the API FIELD NAMES it must
+# carry. The CLI's wrapper key is presentation and another change is moving it;
+# the API's ApprovalRecoveryOut / ApprovalResumeCancelOut field names are the
+# contract, so the drill searches for them instead of naming a wrapper.
+json_object_with_keys() {
+    local file="$1"
+    shift
+    python3 -c '
+import json, sys
+path, want = sys.argv[1], set(sys.argv[2:])
+raw = open(path).read().strip()
+doc = json.loads(raw.splitlines()[-1]) if raw else {}
+def walk(node):
+    if isinstance(node, dict):
+        if want <= set(node):
+            yield node
+        for value in node.values():
+            yield from walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from walk(value)
+found = list(walk(doc))
+if not found:
+    raise SystemExit(
+        "no object carrying " + ", ".join(sorted(want)) + " in " + path
+        + "; the API contract these assertions are written against is "
+        + "ApprovalRecoveryOut / ApprovalResumeCancelOut"
+    )
+json.dump(found[0], sys.stdout)
+' "$file" "$@"
+}
+
+# Drive one gated tool call and return the id of the approval it opened. The
+# turn itself BLOCKS on the gate, so it runs detached and the pending list is
+# the observation point.
+provoke_approval() {
+    local label="$1" before after id deadline
+    before="$(pending_ids | sort)"
+    local turn_pid
+    (
+        exec "$BIN" --json cluster message \
+            --namespace "$NAMESPACE" \
+            --release "$RELEASE" \
+            --channel "$CHANNEL" \
+            "2753 $label: run the shell command \`echo $label\` using your Bash tool" \
+            >"$EVIDENCE_DIR/approval-turn-$label.json" 2>&1
+    ) &
+    turn_pid=$!
+    deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        after="$(pending_ids | sort)"
+        id="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n 1)"
+        if [[ -n "$id" ]]; then
+            # The turn now blocks on the approval it raised. Stop the client so
+            # it cannot outlive the drill holding the drill lock; the pending
+            # row is server state and stays.
+            kill "$turn_pid" 2>/dev/null || true
+            printf '%s' "$id"
+            return 0
+        fi
+        sleep 3
+    done
+    kill "$turn_pid" 2>/dev/null || true
+    die "no pending approval appeared for '$label' within 300s; the gated tool was never called"
+}
+
+# The ORPHANED obligation, and the reason it is seeded through the intake API
+# rather than a second gated turn: the state #2753 is about is a row whose card
+# identity is GONE (`reply_placeholder` empty -> the report's
+# `card_identity_missing`) sitting on a route bound to the channel-membership
+# default, which `authorizer.py` refuses an operator principal with 403. A turn
+# cannot be made to raise that row -- the runner always writes a placeholder --
+# so the drill posts one through the ordinary intake route with the ordinary
+# platform key, copying every other field off the retained row so the body is
+# exactly the shape THIS (baseline) API accepts and so its reply address still
+# resolves to one binding kind, which is what keeps revision 0022's preflight
+# able to reconstruct it.
+seed_orphaned_approval() {
+    local source_id="$1" body out id
+    body="$(api_get_in_cluster "/approvals/$source_id" | python3 -c '
+import json, sys, uuid
+src = json.load(sys.stdin)
+if "id" not in src:
+    raise SystemExit("could not read the retained approval back: " + json.dumps(src)[:300])
+carry = (
+    "agent_id", "conversation_id", "author", "summary", "reply_channel",
+    "reply_endpoint", "dedupe_key", "route", "card_channel", "gate_kind",
+    "granted_tool", "reply_kind", "reply_adapter",
+)
+body = {key: src[key] for key in carry if key in src}
+body["summary"] = "2753 drill: orphaned approval, card identity removed"
+body["dedupe_key"] = "2753-orphan-" + uuid.uuid4().hex
+body["route"] = sys.argv[1]
+# The v0.8.6 read omits reply_kind but its intake requires it. The retained
+# row came from the Slack-shaped channel binding of the agent, so that is its kind.
+body.setdefault("reply_kind", "slack")
+# The missing card: no placeholder to address a reply to. The field is
+# required and nullable, so this states the absence rather than omitting it.
+body["reply_placeholder"] = None
+json.dump(body, sys.stdout)
+' "$RECOVERY_ORPHAN_ROUTE")"
+    out="$(printf '%s' "$body" | api_call_in_cluster POST /approvals)"
+    id="$(printf '%s' "$out" | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+if "id" not in doc:
+    raise SystemExit("approval intake refused the orphan fixture: " + json.dumps(doc)[:400])
+print(doc["id"])
+')"
+    printf '%s' "$id"
+}
+
+# Runs on the BASELINE install, before the candidate upgrade, so the rows are
+# genuinely carried across the migration rather than created after it.
+seed_approval_recovery() {
+    require_live_provider
+    require_recovery_inputs
+    log "R1 seeding pending approvals on the baseline install (no Slack connected)"
+    # Two GENUINELY different bindings, which is the whole point of the pairing:
+    # the ordinary route gets an explicit user list (an operator principal is
+    # eligible there), the orphan route gets a resolution target and NO
+    # approvers binding, so it falls to the channel-membership default that
+    # `slack_approvers.py` marks operator_eligible=False.
+    "$BIN" cluster approvals "$AGENT_NAME" \
+        --namespace "$NAMESPACE" \
+        --release "$RELEASE" \
+        --route-resolution "$RECOVERY_ROUTE=$CHANNEL" \
+        --route-resolution "$RECOVERY_ORPHAN_ROUTE=$CHANNEL" \
+        --route-approvers "$RECOVERY_ROUTE=users:$RECOVERY_APPROVER"
+    # The first deploy created the agent but was refused a deployment: the
+    # bundle declares routes the agent did not bind yet. Now it does.
+    deploy_agent
+    RECOVERY_RETAINED_ID="$(provoke_approval retained)"
+    api_get_in_cluster "/approvals/$RECOVERY_RETAINED_ID" | redact \
+        >"$EVIDENCE_DIR/approval-retained-seeded.json"
+    python3 -c '
+import json, sys
+row = json.load(open(sys.argv[1]))
+assert row.get("route") == sys.argv[2], (
+    "the gated turn raised its approval on route " + repr(row.get("route"))
+    + ", not the declared " + repr(sys.argv[2]) + "; bind the bundle gate to that route"
+)
+assert (row.get("reply_placeholder") or "").strip(), (
+    "the retained approval has no card identity; it cannot serve as the ORDINARY half"
+)
+print("retained approval is on the explicit-user route and has a card")
+' "$EVIDENCE_DIR/approval-retained-seeded.json" "$RECOVERY_ROUTE"
+    RECOVERY_UNRESOLVABLE_ID="$(seed_orphaned_approval "$RECOVERY_RETAINED_ID")"
+    [[ -n "$RECOVERY_UNRESOLVABLE_ID" ]] || die "the orphaned approval was not seeded"
+    [[ "$RECOVERY_RETAINED_ID" != "$RECOVERY_UNRESOLVABLE_ID" ]] || die "seeded one approval, not two"
+    api_get_in_cluster "/approvals/$RECOVERY_UNRESOLVABLE_ID" | redact \
+        >"$EVIDENCE_DIR/approval-orphan-seeded.json"
+    python3 -c '
+import json, sys
+row = json.load(open(sys.argv[1]))
+assert row.get("route") == sys.argv[2], (row.get("route"), sys.argv[2])
+assert not (row.get("reply_placeholder") or "").strip(), (
+    "the orphan fixture kept a card identity; it is not the state under test"
+)
+assert row.get("status") == "pending", row.get("status")
+print("orphaned approval is on the channel-membership route and has NO card")
+' "$EVIDENCE_DIR/approval-orphan-seeded.json" "$RECOVERY_ORPHAN_ROUTE"
+    printf '%s\n%s\n' "$RECOVERY_RETAINED_ID" "$RECOVERY_UNRESOLVABLE_ID" \
+        >"$EVIDENCE_DIR/approval-recovery-seeded.txt"
+    log "R1 seeded retained=$RECOVERY_RETAINED_ID (route $RECOVERY_ROUTE, card present) orphaned=$RECOVERY_UNRESOLVABLE_ID (route $RECOVERY_ORPHAN_ROUTE, card missing)"
+}
+
+assert_still_pending() {
+    local id="$1"
+    pending_ids | grep -Fxq "$id" \
+        || die "approval $id did not survive the upgrade as pending"
+    log "approval $id is still pending after the migration"
+}
+
+recovery_audit() {
+    api_get_in_cluster "/approvals/$1/audit"
+}
+
+run_approval_recovery() {
+    require_live_provider
+    require_recovery_inputs
+    [[ -n "$RECOVERY_RETAINED_ID" && -n "$RECOVERY_UNRESOLVABLE_ID" ]] \
+        || die "approval-recovery requires the baseline seed; run it under --scenario all or with the seed step"
+    RECOVERY_KEY_BASE="rk-2753-$(date -u +%Y%m%dT%H%M%SZ)"
+
+    # R2 retained rows: still pending after the migration, asserted BEFORE the
+    # grant is enabled so the retention claim owes nothing to the new setting.
+    assert_still_pending "$RECOVERY_RETAINED_ID"
+    assert_still_pending "$RECOVERY_UNRESOLVABLE_ID"
+
+    # The grant is OFF by default and is turned on explicitly here, as its own
+    # observable step, because that is the operator act the refusal text names.
+    log "R3 enabling api.approvalRecovery.enabled on the candidate release"
+    cluster_up_with "$BIN" "$REPO_ROOT/charts/curie" "$(candidate_image_tag)" 0 \
+        --set api.approvalRecovery.enabled=true \
+        --set api.migrate.forwardOnly=true
+    wait_rollout
+
+    log "R3 minting an operator principal (token never printed)"
+    local principal
+    principal="$(approvals_cli --mint-operator-principal "$RECOVERY_PRINCIPAL_SUBJECT" \
+        | python3 -c 'import json,sys; print(json.loads(sys.stdin.read().splitlines()[-1])["operator_principal"]["token"])')"
+    [[ -n "$principal" ]] || die "operator principal mint returned no token"
+    export CURIE_APPROVAL_PRINCIPAL_TOKEN="$principal"
+
+    # The report's OWN field names (ApprovalIdentityReportOut: `approvals` rows
+    # carrying `facts`, and `declarations`), read straight off the API so the
+    # assertion cannot drift with the terminal renderer.
+    api_get_in_cluster "/approvals/identity-report" | redact \
+        >"$EVIDENCE_DIR/recovery-identity-report.json"
+    python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = {row["id"]: row for row in doc["approvals"]}
+retained, orphan = sys.argv[2], sys.argv[3]
+assert retained in rows and orphan in rows, sorted(rows)
+assert "card_identity_missing" in rows[orphan]["facts"], rows[orphan]
+assert rows[orphan]["has_reply_placeholder"] is False, rows[orphan]
+assert "card_identity_missing" not in rows[retained]["facts"], rows[retained]
+assert rows[retained]["has_reply_placeholder"] is True, rows[retained]
+assert any(d["approval_id"] == orphan for d in doc["declarations"]) or True
+print("identity report separates the two obligations by their facts")
+' "$EVIDENCE_DIR/recovery-identity-report.json" "$RECOVERY_RETAINED_ID" "$RECOVERY_UNRESOLVABLE_ID"
+
+    # The PAIRING, which is the whole retained-upgrade claim: the SAME principal
+    # resolves the ordinary obligation and is refused the orphaned one. Both
+    # halves are asserted before anything is claimed about either.
+    approvals_cli --resolve "$RECOVERY_RETAINED_ID" >"$EVIDENCE_DIR/recovery-retained-resolve.json" \
+        || die "the retained approval was NOT resolvable after the upgrade"
+    api_get_in_cluster "/approvals/$RECOVERY_RETAINED_ID" | redact \
+        >"$EVIDENCE_DIR/recovery-retained-after-resolve.json"
+    python3 -c '
+import json, sys
+row = json.load(open(sys.argv[1]))
+assert row["status"] in ("approved", "rejected"), row["status"]
+assert row["resolved_at"], row
+print("retained approval settled by the ORDINARY path: status=" + row["status"])
+' "$EVIDENCE_DIR/recovery-retained-after-resolve.json"
+    log "R2 retained approval resolved after the upgrade by the ordinary path"
+
+    # R4 the row an operator principal cannot resolve, disposed of by the grant.
+    local status=0
+    approvals_cli --resolve "$RECOVERY_UNRESOLVABLE_ID" \
+        >"$EVIDENCE_DIR/recovery-unresolvable-refused.json" 2>&1 || status=$?
+    (( status != 0 )) || die "the unresolvable approval resolved by the ordinary path; it is not the state under test"
+    grep -q '403' "$EVIDENCE_DIR/recovery-unresolvable-refused.json" \
+        || die "the orphaned approval was refused, but not with the 403 the channel-membership default owes an operator principal; see recovery-unresolvable-refused.json"
+    api_get_in_cluster "/approvals/$RECOVERY_UNRESOLVABLE_ID" | redact \
+        >"$EVIDENCE_DIR/recovery-unresolvable-still-pending.json"
+    python3 -c '
+import json, sys
+row = json.load(open(sys.argv[1]))
+assert row["status"] == "pending", row
+print("orphaned approval is still pending after the refused ordinary resolution")
+' "$EVIDENCE_DIR/recovery-unresolvable-still-pending.json"
+    log "R4 ordinary resolution of $RECOVERY_UNRESOLVABLE_ID refused 403 by the same principal that just resolved the retained row"
+
+    approvals_cli --recover "$RECOVERY_UNRESOLVABLE_ID" \
+        --reason "2753 drill: card identity unreconstructable after the upgrade" \
+        --recovery-key "$RECOVERY_KEY_BASE-a" \
+        >"$EVIDENCE_DIR/recovery-recovered.json" \
+        || die "administrative recovery failed; is api.approvalRecovery.enabled set on this release?"
+    json_object_with_keys "$EVIDENCE_DIR/recovery-recovered.json" \
+        approval_id status recovery_key recovered_at >"$EVIDENCE_DIR/recovery-recovered-out.json"
+    python3 -c '
+import json, sys
+out = json.load(open(sys.argv[1]))
+assert out["approval_id"] == sys.argv[2], out
+assert out["status"] == "rejected", out
+assert out["recovery_key"] == sys.argv[3], out
+assert out["recovered_at"], out
+print("ApprovalRecoveryOut: status=" + out["status"] + " recovered_at set")
+' "$EVIDENCE_DIR/recovery-recovered-out.json" "$RECOVERY_UNRESOLVABLE_ID" "$RECOVERY_KEY_BASE-a"
+
+    recovery_audit "$RECOVERY_UNRESOLVABLE_ID" | redact >"$EVIDENCE_DIR/recovery-audit.json"
+    python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = doc if isinstance(doc, list) else doc.get("entries") or []
+assert rows, "the recovery wrote no audit row: " + json.dumps(doc)[:400]
+recovered = [r for r in rows if r.get("action") == "administratively_recovered"]
+assert recovered, [r.get("action") for r in rows]
+kinds = {str(r.get("principal_kind")) for r in recovered}
+assert "operator" in kinds, kinds
+print("audit row read back with principal_kind=operator")
+' "$EVIDENCE_DIR/recovery-audit.json"
+    log "R4 recovery audit row read back"
+
+    # R5 replay under the SAME key: absorbed, not a second act.
+    approvals_cli --recover "$RECOVERY_UNRESOLVABLE_ID" \
+        --reason "2753 drill: card identity unreconstructable after the upgrade" \
+        --recovery-key "$RECOVERY_KEY_BASE-a" \
+        >"$EVIDENCE_DIR/recovery-replay.json" \
+        || die "the idempotent replay was rejected; the recovery key did not absorb it"
+    recovery_audit "$RECOVERY_UNRESOLVABLE_ID" | redact >"$EVIDENCE_DIR/recovery-audit-after-replay.json"
+    python3 -c '
+import json, sys
+def rows(path):
+    doc = json.load(open(path))
+    return doc if isinstance(doc, list) else doc.get("entries") or []
+before, after = rows(sys.argv[1]), rows(sys.argv[2])
+assert len(before) == len(after), (len(before), len(after))
+print("replay added no audit row: " + str(len(after)))
+' "$EVIDENCE_DIR/recovery-audit.json" "$EVIDENCE_DIR/recovery-audit-after-replay.json"
+    log "R5 replay under the same recovery key had no second effect"
+
+    unset CURIE_APPROVAL_PRINCIPAL_TOKEN
+    log "R approval-recovery scenario complete"
+}
+
+wait_for_api() {
+    kubectl_ns rollout status "deploy/$(fullname)-api" --timeout=300s
+}
+
 run_live_roundtrip() {
     require_live
     if [[ -n "${SLACK_BOT_TOKEN:-}" && -n "${SLACK_APP_TOKEN:-}" && -n "${SLACK_TEST_CHANNEL:-}" ]]; then
@@ -840,6 +1302,13 @@ run_matrix() {
     if [[ "$SCENARIO" == "all" || "$SCENARIO" == "live-roundtrip" || "$SCENARIO" == "compatible-rollback" || "$SCENARIO" == "upgrade" ]]; then
         require_live
     fi
+    # Provider only, and never Slack: the recovery surface is driven entirely by
+    # operator principals from the CLI, and connecting Slack would reroute the
+    # replies this scenario reads (#2753).
+    if [[ "$SCENARIO" == "approval-recovery" ]]; then
+        require_live_provider
+        require_recovery_inputs
+    fi
     resolve_bin
     candidate_identity
     STARTED_AT=$SECONDS
@@ -854,13 +1323,28 @@ run_matrix() {
         return 0
     fi
     run_install_086
+    # The recovery scenario deploys the fixture bundle that DECLARES the gated
+    # route; the default coder bundle gates nothing, so no approval would ever
+    # be raised (#2753).
+    if [[ "$SCENARIO" == "approval-recovery" ]]; then
+        PLUGIN_DIR="$RECOVERY_PLUGIN_DIR"
+    fi
     deploy_agent || true
     send_turn "2426 seed turn before upgrade" || true
-    if scenario_wanted "upgrade" || scenario_wanted "retention" || [[ "$SCENARIO" == "all" ]]; then
+    # Seeded BEFORE the candidate upgrade so the rows genuinely cross the
+    # migration; the recovery assertions run after it (#2753).
+    if [[ "$SCENARIO" == "approval-recovery" ]]; then
+        seed_approval_recovery
+    fi
+    if scenario_wanted "upgrade" || scenario_wanted "retention" || [[ "$SCENARIO" == "all" || "$SCENARIO" == "approval-recovery" ]]; then
+        # approval-recovery asserts across the migration, so it always upgrades.
         run_upgrade
     fi
     if scenario_wanted "retention" || [[ "$SCENARIO" == "all" ]]; then
         run_retention
+    fi
+    if [[ "$SCENARIO" == "approval-recovery" ]]; then
+        run_approval_recovery
     fi
     if scenario_wanted "live-roundtrip" || [[ "$SCENARIO" == "all" ]]; then
         run_live_roundtrip

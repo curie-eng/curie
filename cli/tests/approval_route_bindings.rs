@@ -172,6 +172,10 @@ fn assert_routes_cleared(out: ApprovalsOutput, context: &str) {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
+        ApprovalsOutput::IdentityReport { .. }
+        | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
+        }
     }
 }
 
@@ -341,6 +345,10 @@ async fn routes_from_builds_the_strict_split_route_shape() {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
+        ApprovalsOutput::IdentityReport { .. }
+        | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
+        }
     }
 }
 
@@ -443,6 +451,10 @@ async fn route_approvers_narrows_who_without_moving_where() {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
+        ApprovalsOutput::IdentityReport { .. }
+        | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
+        }
     }
 }
 
@@ -504,6 +516,10 @@ async fn list_routes_reads_without_writing() {
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
+        }
+        ApprovalsOutput::IdentityReport { .. }
+        | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
         }
     }
 }
@@ -662,6 +678,10 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
             }
             ApprovalsOutput::ConsoleLoginCode { .. } => {
                 panic!("expected the DryRun output, not a console login-code mint")
+            }
+            ApprovalsOutput::IdentityReport { .. }
+            | ApprovalsOutput::Recovered { .. } => {
+                panic!("expected the DryRun output, not an administrative recovery result")
             }
         }
     };
@@ -1105,6 +1125,10 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
+        }
+        ApprovalsOutput::IdentityReport { .. }
+        | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the Routes output, not an administrative recovery result")
         }
     }
 }

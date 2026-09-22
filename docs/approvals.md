@@ -388,6 +388,50 @@ case, the requesting channel is the card location.
 | Notification arrived, but it has no buttons | Expected: notification is visibility-only. Use its approval ID and go to the configured approval channel to find the verified Slack resolution card; the ping deliberately does not disclose that channel's identifier. |
 | Card resolved, but the agent never continued | The skill has no instruction for the `[approval resolved]` prefix. |
 
+## Break-glass recovery
+
+An upgrade can leave an approval nobody can reach: the card is gone, or the row
+predates something the resume path now needs, and the suspended session waits
+forever. Recovery is the way out. It is off by default and is meant to be turned
+on for the length of a recovery and turned off again.
+
+Enable it with `api.approvalRecovery.enabled` (environment
+`CURIE_APPROVAL_RECOVERY_ENABLED`).
+
+**Read this before you enable it.** Recovery adds no credential and no new
+authentication scheme. It widens what the platform API key you already have can
+do. While it is enabled, anyone holding that key can administratively reject an
+approval anywhere in the installation, including
+approvals the ordinary approver set could have resolved perfectly well. That is
+deliberate. A recovery path fenced to rows something has already classified as
+unrecoverable is useless in exactly the situation nobody planned for, which is
+the only situation recovery exists for.
+
+What makes that acceptable is the audit trail. Every recovery writes its audit
+row in the same database transaction as its effect, so there is no such thing as
+a recovery that happened without a row explaining it. Read the rows back with
+`GET /approvals/{id}/audit`; a recovery carries `authorizer=approval_recovery`
+and the operator who acted.
+
+Two routes, both requiring the platform key:
+
+| Route | What it does |
+|---|---|
+| `GET /approvals/identity-report` | Facts about every pending approval, and the declaration skeleton the upgrade workflow consumes. A pure read. It makes no Slack call, excludes nothing, and never claims a row cannot be resolved. |
+| `POST /approvals/{id}/recover` | Settles a stranded approval as `rejected` and wakes its session over the ordinary runs stream. `rejected` is the only disposition; there is no approve-on-behalf-of. |
+
+`recover` requires a reason and a caller-supplied `recovery_key`, and takes the
+acting identity from an operator principal (`POST /approvals/principals/operator`)
+for attribution. The key is recorded in the recovery's audit row. Replaying the
+same key returns the outcome that already happened and changes nothing; a key
+already recorded for another approval, or a record settled some other way, is a
+`409`. Cancelling an owed resume is not part of this path yet (#2829).
+
+A report entry stating `reply_identity_unreconstructable` means neither the row
+nor any binding says how that reply would be authenticated. The report does not
+guess: it emits an empty declaration for you to fill in and feed back to the
+upgrade, because a guessed reply route is a silent misroute.
+
 ## Where the code is
 
 | Concern | Path |
@@ -397,6 +441,7 @@ case, the requesting channel is the card location.
 | Remembering the card so an expiry can disable it | `apps/worker/src/curie_worker/approval_cards.py` |
 | Click to resolve, and rendering the verdict | `apps/dispatcher/src/curie_dispatcher/approval_actions.py` |
 | The resolve endpoint, claim, and audit | `apps/api/src/curie_api/routers/approvals.py` |
+| Break-glass recovery | `apps/api/src/curie_api/routers/approval_recovery.py` |
 | Who may resolve | `apps/api/src/curie_api/authorizer.py`, `apps/api/src/curie_api/approvers.py`, `apps/api/src/curie_api/slack_approvers.py` |
 | The resume turn | `apps/api/src/curie_api/resumequeue.py` |
 | The manifest shape | `packages/plugin-format/src/plugin_format/models.py` |
