@@ -1534,7 +1534,8 @@ class TestHelmCiWorkflowTriggers:
         assert triggers["push"]["branches"] == ["main", "next"]
         assert "paths" not in triggers["push"]
         assert "paths-ignore" not in triggers["push"]
-        assert triggers["pull_request"]["branches"] == ["main", "next"]
+        # Epic integration PRs run the chart gates. Push stays main and next.
+        assert triggers["pull_request"]["branches"] == ["main", "next", "epic/**"]
         # The Python paths are not strays to tidy up: the object-store
         # web-identity gate executes those repository files against each
         # rendered workload, so a PR touching only them (a revert of the
