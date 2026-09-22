@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{
-    parser::ValueSource, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+    error::ErrorKind, parser::ValueSource, Args, CommandFactory, FromArgMatches, Parser,
+    Subcommand, ValueEnum,
 };
 use curie::api;
 use curie::artifacts;
@@ -3609,6 +3610,23 @@ async fn main() {
     let matches = Cli::command().get_matches();
     let cluster_target_sources = ClusterTargetSources::from_matches(&matches);
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if matches!(
+        cli.command.as_ref(),
+        Some(Command::Dev {
+            action: DevAction::SecretsE2e {
+                eso: Some(SecretsE2eEso::None),
+                real_aws: true,
+                ..
+            }
+        })
+    ) {
+        Cli::command()
+            .error(
+                ErrorKind::ArgumentConflict,
+                "the argument '--real-aws' cannot be used with '--eso none'",
+            )
+            .exit();
+    }
     ui::init(Ui::from_process(cli.color, cli.debug, cli.quiet, cli.json));
     // main never returns Err (which would give anyhow's default exit 1 and skip
     // classification). Run the command, then map any error to a semantic exit
@@ -3780,9 +3798,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                 ci,
                 real_aws,
             } => {
-                if real_aws && eso == Some(SecretsE2eEso::None) {
-                    bail!("the argument '--real-aws' cannot be used with '--eso none'");
-                }
                 commands::dev_secrets_e2e(
                     seed.as_deref(),
                     eso.map(SecretsE2eEso::as_str),

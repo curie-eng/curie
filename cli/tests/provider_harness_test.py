@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import shutil
 import signal
@@ -13,6 +14,8 @@ import stat
 import sys
 import tempfile
 import unittest
+
+import yaml
 
 HARNESS_PATH = pathlib.Path(__file__).parents[1] / "scripts" / "provider_harness.py"
 SPEC = importlib.util.spec_from_file_location("provider_harness", HARNESS_PATH)
@@ -24,6 +27,294 @@ SPEC.loader.exec_module(provider_harness)
 
 
 class ProviderHarnessContracts(unittest.TestCase):
+    def test_blocked_account_public_access_is_refused_without_mutation(self):
+        class KindInventoryBoundary:
+            def __init__(self, delegate, private_dir):
+                self.delegate = delegate
+                self.private_dir = private_dir
+
+            def run(self, argv, action, **kwargs):
+                if list(argv) == ["kind", "get", "clusters"]:
+                    stderr_path = provider_harness.write_private_file(
+                        self.private_dir / "kind-inventory.stderr", b""
+                    )
+                    return provider_harness.ToolResult(0, b"", stderr_path)
+                return self.delegate.run(argv, action, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            executable_dir = root / "bin"
+            executable_dir.mkdir()
+            command_log = root / "aws-commands.jsonl"
+            aws_stub = executable_dir / "aws"
+            aws_stub.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+arguments = sys.argv[1:]
+with open(os.environ["AWS_STUB_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(arguments) + "\\n")
+if arguments[:2] == ["sts", "get-caller-identity"]:
+    print(json.dumps({"Account": "000000000000"}))
+elif arguments[:2] == ["resourcegroupstaggingapi", "get-resources"]:
+    print(json.dumps({"ResourceTagMappingList": []}))
+elif arguments[:2] == ["s3control", "get-public-access-block"]:
+    print(json.dumps({"PublicAccessBlockConfiguration": {
+        "BlockPublicAcls": True,
+        "IgnorePublicAcls": True,
+        "BlockPublicPolicy": True,
+        "RestrictPublicBuckets": True,
+    }}))
+else:
+    raise SystemExit(2)
+""",
+                encoding="utf-8",
+            )
+            aws_stub.chmod(0o700)
+            case = provider_harness.HarnessCase(
+                repo_root=root,
+                snapshot=root,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="preinstalled",
+                real_aws=True,
+                curie_bin=root / "curie",
+            )
+            work = case.work
+            try:
+                case.aws_env["AWS_STUB_LOG"] = str(command_log)
+                case.aws_env["PATH"] = f"{executable_dir}{os.pathsep}{case.aws_env['PATH']}"
+                case.runner = KindInventoryBoundary(case.runner, work)
+
+                # Read contracts are from the provider APIs. No account setting is written.
+                # https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+                # https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/API_GetResources.html
+                # https://docs.aws.amazon.com/AmazonS3/latest/API/API_control_GetPublicAccessBlock.html
+                with self.assertRaisesRegex(
+                    provider_harness.HarnessError,
+                    "account S3 public access settings block",
+                ):
+                    case.preflight()
+                commands = [
+                    json.loads(line)
+                    for line in command_log.read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertEqual(
+                    [command[:2] for command in commands],
+                    [
+                        ["sts", "get-caller-identity"],
+                        ["resourcegroupstaggingapi", "get-resources"],
+                        ["s3control", "get-public-access-block"],
+                    ],
+                )
+                for command in commands:
+                    self.assertIn("--profile", command)
+                    self.assertEqual(command[command.index("--profile") + 1], "theconnman")
+                    self.assertIn("--region", command)
+                    self.assertEqual(command[command.index("--region") + 1], "us-east-1")
+                    self.assertFalse(
+                        any(token.startswith(("put-", "delete-", "create-")) for token in command)
+                    )
+            finally:
+                shutil.rmtree(work)
+
+    def test_emulator_aws_calls_require_an_isolated_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            case = provider_harness.HarnessCase(
+                repo_root=root,
+                snapshot=root,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="preinstalled",
+                real_aws=False,
+                curie_bin=root / "curie",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    provider_harness.HarnessError, "emulator AWS endpoint is unavailable"
+                ):
+                    case.aws(
+                        "secretsmanager",
+                        "list-secrets",
+                        action="prove emulator endpoint guard",
+                    )
+                self.assertEqual(case.commands, [])
+            finally:
+                shutil.rmtree(case.work)
+
+    def test_cleanup_attempts_every_target_and_verification_after_a_delete_failure(self):
+        class FaultInjectedCleanupCase(provider_harness.HarnessCase):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.attempted = []
+                self.verified = False
+
+            def delete_cleanup_target(self, target, *, real_cluster_already_attempted):
+                self.attempted.append(target.identity)
+                if target.identity.endswith("-fails"):
+                    raise provider_harness.HarnessError("injected delete failure")
+
+            def verify_cleanup(self, targets):
+                self.verified = True
+                self.assertion_target_count = len(targets)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            case = FaultInjectedCleanupCase(
+                repo_root=root,
+                snapshot=root,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="none",
+                real_aws=False,
+                curie_bin=root / "curie",
+            )
+            try:
+                with provider_harness.ResourceLedger(case.ledger_path) as ledger:
+                    case.ledger = ledger
+                    identities = [
+                        "curie-aws-secrets-e2e-first",
+                        "curie-aws-secrets-e2e-fails",
+                        "curie-aws-secrets-e2e-last",
+                    ]
+                    for identity in identities:
+                        ledger.record_intent("docker_image", identity)
+                    with self.assertRaisesRegex(
+                        provider_harness.HarnessError, "injected delete failure"
+                    ):
+                        case.cleanup()
+                case.ledger = None
+                self.assertEqual(case.attempted, list(reversed(identities)))
+                self.assertTrue(case.verified)
+                self.assertEqual(case.assertion_target_count, len(identities))
+            finally:
+                shutil.rmtree(case.work)
+
+    def test_rendered_sync_manifests_match_external_secrets_contract(self):
+        class RecordingCase(provider_harness.HarnessCase):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.applied = []
+
+            def apply(self, manifest, action, namespace=provider_harness.NAMESPACE):
+                self.applied.append((manifest, action, namespace))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            case = RecordingCase(
+                repo_root=root,
+                snapshot=root,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="preinstalled",
+                real_aws=True,
+                curie_bin=root / "curie",
+            )
+            try:
+                # https://external-secrets.io/latest/provider/aws-secrets-manager/
+                # https://external-secrets.io/latest/api/pushsecret/
+                case.apply_sync_objects()
+                self.assertEqual(len(case.applied), 1)
+                documents = [
+                    json.loads(document) for document in case.applied[0][0].split(b"\n---\n")
+                ]
+                store, external, push = documents
+                self.assertEqual(
+                    store["spec"]["provider"]["aws"],
+                    {
+                        "service": "SecretsManager",
+                        "region": "us-east-1",
+                        "auth": {"jwt": {"serviceAccountRef": {"name": "acme-harness-eso"}}},
+                    },
+                )
+                self.assertEqual(
+                    external["spec"]["data"][0],
+                    {
+                        "secretKey": provider_harness.STATIC_KEY,
+                        "remoteRef": {
+                            "key": case.primary_name,
+                            "property": provider_harness.STATIC_KEY,
+                        },
+                    },
+                )
+                self.assertEqual(push["spec"]["deletionPolicy"], "None")
+                match = push["spec"]["data"][0]["match"]
+                self.assertEqual(match["remoteRef"]["remoteKey"], case.backup_name)
+                self.assertEqual(match["remoteRef"]["property"], provider_harness.ROTATED_KEY)
+                metadata = push["spec"]["data"][0]["metadata"]["spec"]
+                self.assertEqual(metadata["tags"], {"purpose": provider_harness.PURPOSE})
+            finally:
+                shutil.rmtree(case.work)
+
+    def test_rotation_rbac_is_scoped_to_one_secret(self):
+        class RecordingCase(provider_harness.HarnessCase):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.applied = []
+
+            def apply(self, manifest, action, namespace=provider_harness.NAMESPACE):
+                self.applied.append((manifest, action, namespace))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            case = RecordingCase(
+                repo_root=root,
+                snapshot=HARNESS_PATH.parents[2],
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="preinstalled",
+                real_aws=False,
+                curie_bin=root / "curie",
+            )
+            try:
+                with provider_harness.ResourceLedger(case.ledger_path) as ledger:
+                    case.ledger = ledger
+                    case.create_namespace_and_rbac()
+                case.ledger = None
+
+                self.assertEqual(len(case.applied), 2)
+                documents = list(yaml.safe_load_all(case.applied[1][0]))
+                role = next(document for document in documents if document["kind"] == "Role")
+                binding = next(
+                    document for document in documents if document["kind"] == "RoleBinding"
+                )
+                self.assertEqual(
+                    role["rules"],
+                    [
+                        {
+                            "apiGroups": [""],
+                            "resources": ["secrets"],
+                            "resourceNames": [provider_harness.TARGET_SECRET],
+                            "verbs": ["get", "patch"],
+                        }
+                    ],
+                )
+                self.assertEqual(
+                    binding["subjects"],
+                    [{"kind": "ServiceAccount", "name": "acme-harness-rotation"}],
+                )
+                self.assertEqual(binding["roleRef"]["name"], "acme-harness-rotation")
+            finally:
+                shutil.rmtree(case.work)
+
     def test_generated_cluster_node_and_aws_names_fit_provider_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
