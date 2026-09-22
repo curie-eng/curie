@@ -1294,7 +1294,7 @@ class HarnessCase:
     def apply_sync_objects(self) -> None:
         # Provider shape follows the official AWS and PushSecret references:
         # https://external-secrets.io/latest/provider/aws-secrets-manager/
-        # https://external-secrets.io/latest/guides/pushsecrets/
+        # https://raw.githubusercontent.com/external-secrets/external-secrets/v2.11.0/docs/snippets/aws-sm-push-secret-with-metadata.yaml
         if self.real_aws:
             provider = {
                 "aws": {
@@ -1351,6 +1351,9 @@ class HarnessCase:
                 ],
             },
         }
+        push_metadata_spec: dict[str, Any] = {"secretPushFormat": "string"}
+        if self.real_aws:
+            push_metadata_spec["tags"] = {"purpose": PURPOSE}
         push = {
             "apiVersion": "external-secrets.io/v1alpha1",
             "kind": "PushSecret",
@@ -1370,7 +1373,11 @@ class HarnessCase:
                                 "property": ROTATED_KEY,
                             },
                         },
-                        "metadata": {"secretPushFormat": "string"},
+                        "metadata": {
+                            "apiVersion": "kubernetes.external-secrets.io/v1alpha1",
+                            "kind": "PushSecretMetadata",
+                            "spec": push_metadata_spec,
+                        },
                     }
                 ],
             },
@@ -1645,14 +1652,12 @@ class HarnessCase:
                 return None
             payload = parse_json(result.stdout, "rotated backup")
             raw = payload.get("SecretString")
-            if raw is None and isinstance(payload.get("SecretBinary"), str):
-                raw = base64.b64decode(payload["SecretBinary"]).decode("utf-8")
             if not isinstance(raw, str):
                 return None
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
-                return full_digest(raw)
+                return None
             value = parsed.get(ROTATED_KEY) if isinstance(parsed, dict) else None
             return full_digest(value) if isinstance(value, str) else None
 
@@ -1667,26 +1672,6 @@ class HarnessCase:
         )
         if target is None:
             raise HarnessError("backup ledger intent is missing")
-        if self.real_aws:
-            description = self.aws(
-                "secretsmanager",
-                "describe-secret",
-                "--secret-id",
-                self.backup_name,
-                "--output",
-                "json",
-                action="describe rotated backup",
-            )
-            arn = str(parse_json(description.stdout, "rotated backup identity").get("ARN", ""))
-            self.aws(
-                "secretsmanager",
-                "tag-resource",
-                "--secret-id",
-                arn,
-                "--tags",
-                f"Key=purpose,Value={PURPOSE}",
-                action="tag rotated backup",
-            )
         self.ledger.mark_created(target.id, self.backup_name)
         self.record_assertion("PushSecret backed up rotated key", True, expected_digest[:12])
 
