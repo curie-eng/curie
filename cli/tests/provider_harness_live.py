@@ -403,7 +403,7 @@ class ProviderHarnessLive(unittest.TestCase):
                 provider_harness.wait_until = bounded_wait
                 with self.assertRaisesRegex(
                     provider_harness.HarnessError,
-                    "timed out while waiting for owned kind cluster deletion",
+                    "kind set mismatch",
                 ):
                     case.verify_cleanup([])
             finally:

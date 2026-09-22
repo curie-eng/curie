@@ -270,6 +270,90 @@ else:
             finally:
                 shutil.rmtree(case.work)
 
+    def test_cleanup_verification_attempts_every_check_after_an_earlier_failure(self):
+        class RecordingVerificationCase(provider_harness.HarnessCase):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.verifications = []
+
+            def current_clusters(self):
+                self.verifications.append("kind set")
+                return {"unexpected-cluster"}
+
+            def aws_reports_absent(self, service, operation, *_args):
+                self.verifications.append(f"{service}:{operation}")
+                return False
+
+            def aws(self, service, operation, *_args, **_kwargs):
+                self.verifications.append(f"{service}:{operation}")
+                stderr_path = provider_harness.write_private_file(
+                    self.work / "verification.stderr", b""
+                )
+                return provider_harness.ToolResult(
+                    0, b'{"ResourceTagMappingList": []}', stderr_path
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            case = RecordingVerificationCase(
+                repo_root=root,
+                snapshot=root,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="preinstalled",
+                real_aws=True,
+                curie_bin=root / "curie",
+            )
+            case.account_id = "000000000000"
+            case.prior_clusters = {"prior-cluster"}
+            targets = [
+                provider_harness.CleanupTarget(1, "secretsmanager", case.primary_name, "created"),
+                provider_harness.CleanupTarget(2, "iam_role", case.role_name, "created"),
+                provider_harness.CleanupTarget(
+                    3,
+                    "iam_oidc_provider",
+                    f"{provider_harness.OWNED_PREFIX}issuer.example.com",
+                    "created",
+                ),
+                provider_harness.CleanupTarget(4, "s3_bucket", case.bucket_name, "created"),
+            ]
+            original_wait = provider_harness.wait_until
+
+            def immediate_wait(action, predicate, timeout=180, interval=2.0):
+                del timeout, interval
+                if not predicate():
+                    raise provider_harness.HarnessError(
+                        f"timed out while waiting for {action}"
+                    )
+
+            provider_harness.wait_until = immediate_wait
+            try:
+                with self.assertRaisesRegex(
+                    provider_harness.HarnessError, "kind set mismatch"
+                ) as raised:
+                    case.verify_cleanup(targets)
+                self.assertIn("Secrets Manager absence", str(raised.exception))
+                self.assertIn("IAM role absence", str(raised.exception))
+                self.assertIn("IAM OIDC provider absence", str(raised.exception))
+                self.assertIn("S3 bucket absence", str(raised.exception))
+                self.assertEqual(
+                    case.verifications,
+                    [
+                        "kind set",
+                        "secretsmanager:describe-secret",
+                        "iam:get-role",
+                        "iam:get-open-id-connect-provider",
+                        "s3api:head-bucket",
+                        "resourcegroupstaggingapi:get-resources",
+                    ],
+                )
+            finally:
+                provider_harness.wait_until = original_wait
+                shutil.rmtree(case.work)
+
     def test_rendered_sync_manifests_match_external_secrets_contract(self):
         class RecordingCase(provider_harness.HarnessCase):
             def __init__(self, *args, **kwargs):
@@ -472,6 +556,113 @@ else:
             successful_work = successful.work
             successful.run()
             self.assertFalse(successful_work.exists())
+
+    def test_cleanup_phase_signal_interrupts_completion_and_next_guard_is_fresh(self):
+        class CleanupSignalCase(provider_harness.HarnessCase):
+            def preflight(self):
+                pass
+
+            def _run_body(self):
+                pass
+
+            def cleanup(self):
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    raise AssertionError("cleanup signal handler is not callable")
+                handler(signal.SIGTERM, None)
+
+            def write_evidence(self, orchestrator_status, cleanup_status):
+                del orchestrator_status, cleanup_status
+
+        handled = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+        original = {sig: signal.getsignal(sig) for sig in handled}
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            case = CleanupSignalCase(
+                repo_root=root,
+                snapshot=root,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="none",
+                real_aws=False,
+                curie_bin=root / "curie",
+            )
+            case_guard = provider_harness.install_signal_handlers()
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(provider_harness.HarnessInterrupted):
+                        case.run()
+                with sqlite3.connect(case.ledger_path) as database:
+                    completion = database.execute(
+                        "SELECT orchestrator_status, cleanup_status FROM completion"
+                    ).fetchone()
+                self.assertEqual(completion, ("interrupted", "complete"))
+                self.assertEqual(case.cleanup_signals, [signal.SIGTERM])
+            finally:
+                case_guard.restore()
+                shutil.rmtree(case.work)
+
+            fresh_guard = provider_harness.install_signal_handlers()
+            try:
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    self.fail("fresh signal handler is not callable")
+                with self.assertRaises(provider_harness.HarnessInterrupted):
+                    handler(signal.SIGTERM, None)
+                self.assertEqual(fresh_guard.received_signals, [signal.SIGTERM])
+            finally:
+                fresh_guard.restore()
+                for sig, handler in original.items():
+                    self.assertEqual(signal.getsignal(sig), handler)
+
+    def test_ci_interruption_stops_before_constructing_the_next_mode(self):
+        # This covers mode loop control flow. The live selector proves orchestration.
+        class InterruptingCase:
+            def __init__(self, *args):
+                constructed_modes.append(args[4])
+
+            def run(self):
+                raise provider_harness.HarnessInterrupted(signal.SIGTERM)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            executable = root / "curie"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            constructed_modes = []
+            original_argv = sys.argv
+            original_require_tools = provider_harness.require_tools
+            original_candidate_snapshot = provider_harness.candidate_snapshot
+            original_case = provider_harness.HarnessCase
+
+            def controlled_snapshot(_repo_root, _runner):
+                context = tempfile.TemporaryDirectory(
+                    prefix="provider-harness-control-flow-", dir=root
+                )
+                return "a" * 40, pathlib.Path(context.name), context
+
+            sys.argv = [
+                str(HARNESS_PATH),
+                "--curie-bin",
+                str(executable),
+                "--ci",
+            ]
+            provider_harness.require_tools = lambda _tools: None
+            provider_harness.candidate_snapshot = controlled_snapshot
+            provider_harness.HarnessCase = InterruptingCase
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    status = provider_harness.main()
+                self.assertEqual(status, provider_harness.INTERRUPTED_EXIT)
+                self.assertEqual(constructed_modes, ["preinstalled"])
+            finally:
+                provider_harness.HarnessCase = original_case
+                provider_harness.candidate_snapshot = original_candidate_snapshot
+                provider_harness.require_tools = original_require_tools
+                sys.argv = original_argv
 
     def test_seed_shape_and_owned_resource_names_are_validated(self):
         with tempfile.TemporaryDirectory() as directory:

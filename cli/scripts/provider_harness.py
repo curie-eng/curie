@@ -30,7 +30,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 OWNED_PREFIX = "curie-aws-secrets-e2e-"
@@ -619,6 +619,11 @@ class HarnessCase:
                     cleanup_status = "failed"
                     if pending is None:
                         pending = exc
+                if self.cleanup_signals and not isinstance(pending, HarnessInterrupted):
+                    if isinstance(pending, HarnessError):
+                        safe_print(str(pending), error=True)
+                    orchestrator_status = "interrupted"
+                    pending = HarnessInterrupted(self.cleanup_signals[0])
                 ledger.record_completion(orchestrator_status, cleanup_status)
                 self.write_evidence(orchestrator_status, cleanup_status)
         self.ledger = None
@@ -1913,76 +1918,106 @@ class HarnessCase:
             os.fsync(log.fileno())
 
     def verify_cleanup(self, targets: list[CleanupTarget]) -> None:
-        wait_until(
-            "owned kind cluster deletion",
-            lambda: self.current_clusters() == self.prior_clusters,
-            timeout=180,
-        )
-        self.record_assertion("post run kind set equals exact prior set", True)
+        failures: list[str] = []
+
+        def verify(label: str, operation: Callable[[], None]) -> None:
+            try:
+                operation()
+            except HarnessError as exc:
+                failures.append(f"{label}: {exc}")
+            except Exception:
+                failures.append(f"{label}: unexpected failure")
+
+        def verify_kind_set() -> None:
+            wait_until(
+                "kind set mismatch",
+                lambda: self.current_clusters() == self.prior_clusters,
+                timeout=180,
+            )
+            self.record_assertion("post run kind set equals exact prior set", True)
+
+        verify("kind set mismatch", verify_kind_set)
         for target in targets:
             if target.kind == "secretsmanager" and self.real_aws:
-                wait_until(
-                    f"Secrets Manager deletion {target.identity}",
-                    lambda target=target: self.aws_reports_absent(
-                        "secretsmanager",
-                        "describe-secret",
-                        ["--secret-id", target.identity],
-                        "verify provider entry absent",
-                        ["ResourceNotFoundException"],
+                verify(
+                    "Secrets Manager absence",
+                    lambda target=target: wait_until(
+                        f"Secrets Manager deletion {target.identity}",
+                        lambda: self.aws_reports_absent(
+                            "secretsmanager",
+                            "describe-secret",
+                            ["--secret-id", target.identity],
+                            "verify provider entry absent",
+                            ["ResourceNotFoundException"],
+                        ),
+                        timeout=180,
                     ),
-                    timeout=180,
                 )
             elif target.kind == "iam_role":
-                wait_until(
-                    f"IAM role deletion {target.identity}",
-                    lambda target=target: self.aws_reports_absent(
-                        "iam",
-                        "get-role",
-                        ["--role-name", target.identity],
-                        "verify IAM role absent",
-                        ["NoSuchEntity"],
+                verify(
+                    "IAM role absence",
+                    lambda target=target: wait_until(
+                        f"IAM role deletion {target.identity}",
+                        lambda: self.aws_reports_absent(
+                            "iam",
+                            "get-role",
+                            ["--role-name", target.identity],
+                            "verify IAM role absent",
+                            ["NoSuchEntity"],
+                        ),
+                        timeout=120,
                     ),
-                    timeout=120,
                 )
             elif target.kind == "iam_oidc_provider":
                 oidc_arn = f"arn:aws:iam::{self.account_id}:oidc-provider/{target.identity}"
-                wait_until(
-                    "IAM OIDC provider deletion",
-                    lambda oidc_arn=oidc_arn: self.aws_reports_absent(
-                        "iam",
-                        "get-open-id-connect-provider",
-                        ["--open-id-connect-provider-arn", oidc_arn],
-                        "verify IAM OIDC provider absent",
-                        ["NoSuchEntity"],
+                verify(
+                    "IAM OIDC provider absence",
+                    lambda oidc_arn=oidc_arn: wait_until(
+                        "IAM OIDC provider deletion",
+                        lambda: self.aws_reports_absent(
+                            "iam",
+                            "get-open-id-connect-provider",
+                            ["--open-id-connect-provider-arn", oidc_arn],
+                            "verify IAM OIDC provider absent",
+                            ["NoSuchEntity"],
+                        ),
+                        timeout=120,
                     ),
-                    timeout=120,
                 )
             elif target.kind == "s3_bucket":
-                wait_until(
-                    f"S3 bucket deletion {target.identity}",
-                    lambda target=target: self.aws_reports_absent(
-                        "s3api",
-                        "head-bucket",
-                        ["--bucket", target.identity],
-                        "verify OIDC bucket absent",
-                        ["404", "NoSuchBucket"],
+                verify(
+                    "S3 bucket absence",
+                    lambda target=target: wait_until(
+                        f"S3 bucket deletion {target.identity}",
+                        lambda: self.aws_reports_absent(
+                            "s3api",
+                            "head-bucket",
+                            ["--bucket", target.identity],
+                            "verify OIDC bucket absent",
+                            ["404", "NoSuchBucket"],
+                        ),
+                        timeout=120,
                     ),
-                    timeout=120,
                 )
         if self.real_aws:
-            tagged = self.aws(
-                "resourcegroupstaggingapi",
-                "get-resources",
-                "--tag-filters",
-                f"Key=purpose,Values={PURPOSE}",
-                "--output",
-                "json",
-                action="verify owned AWS tags absent",
-            )
-            mappings = parse_json(tagged.stdout, "post cleanup tag inventory").get(
-                "ResourceTagMappingList", []
-            )
-            self.record_assertion("post cleanup tag inventory is empty", not mappings)
+            def verify_tag_inventory() -> None:
+                tagged = self.aws(
+                    "resourcegroupstaggingapi",
+                    "get-resources",
+                    "--tag-filters",
+                    f"Key=purpose,Values={PURPOSE}",
+                    "--output",
+                    "json",
+                    action="verify owned AWS tags absent",
+                )
+                mappings = parse_json(tagged.stdout, "post cleanup tag inventory").get(
+                    "ResourceTagMappingList", []
+                )
+                self.record_assertion("post cleanup tag inventory is empty", not mappings)
+
+            verify("AWS tag inventory", verify_tag_inventory)
+        if failures:
+            raise HarnessError("cleanup verification failed: " + "; ".join(failures))
 
     def current_clusters(self) -> set[str]:
         result = self.runner.run(["kind", "get", "clusters"], "verify kind inventory")
