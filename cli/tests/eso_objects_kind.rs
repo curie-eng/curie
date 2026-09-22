@@ -18,7 +18,7 @@ use curie::provider::eso::{
     Kubectl, KubectlOutput, SeedOutcome, StoreSpec, SyncEntry, SystemKubectl,
 };
 use curie::provider::{
-    InventoryClass, InventoryEntry, RotationOwner, SecretMaterial, UpdatePolicy,
+    InventoryClass, InventoryEntry, RotationOwner, SecretMaterial, Store, UpdatePolicy,
 };
 
 fn enabled() -> Option<PathBuf> {
@@ -269,7 +269,13 @@ fn crds_installed(kc: &PathBuf) -> bool {
     .0
 }
 
-fn inventory(logical: &str, target: &str, keys: &[&str], owner: RotationOwner) -> InventoryEntry {
+fn inventory(
+    logical: &str,
+    target: &str,
+    keys: &[&str],
+    owner: RotationOwner,
+    rotated: &[&str],
+) -> InventoryEntry {
     InventoryEntry {
         logical_name: logical.into(),
         class: InventoryClass::External,
@@ -278,6 +284,9 @@ fn inventory(logical: &str, target: &str, keys: &[&str], owner: RotationOwner) -
         consumers: vec![],
         rotation_owner: owner,
         update_policy: UpdatePolicy::Replace,
+        store: Store::Sm,
+        rotated_keys: rotated.iter().map(|k| k.to_string()).collect(),
+        chart: None,
     }
 }
 
@@ -297,9 +306,14 @@ fn rendered_objects_pass_server_dry_run() {
         role_arn: "arn:aws:iam::000000000000:role/curie-eso-test".into(),
     };
     let static_entry = SyncEntry::from_inventory(
-        &inventory("platform", "curie-platform", &["A", "B"], RotationOwner::Sm),
+        &inventory(
+            "platform",
+            "curie-platform",
+            &["A", "B"],
+            RotationOwner::Sm,
+            &[],
+        ),
         "curie/test",
-        &[],
     )
     .unwrap();
     let split = SyncEntry::from_inventory(
@@ -308,9 +322,9 @@ fn rendered_objects_pass_server_dry_run() {
             "curie-finance",
             &["CLIENT_ID", "CLIENT_SECRET", "REFRESH_TOKEN"],
             RotationOwner::Workload("finance-agent".into()),
+            &["REFRESH_TOKEN"],
         ),
         "curie/test",
-        &["REFRESH_TOKEN".to_string()],
     )
     .unwrap();
     let objects = vec![
@@ -350,9 +364,14 @@ fn force_sync_against_fake_provider() {
     let ns = Namespace::create(&kc, "sync");
     let k = system(&kc);
     let entry = SyncEntry::from_inventory(
-        &inventory("platform", "curie-platform", &["A", "B"], RotationOwner::Sm),
+        &inventory(
+            "platform",
+            "curie-platform",
+            &["A", "B"],
+            RotationOwner::Sm,
+            &[],
+        ),
         "curie/test",
-        &[],
     )
     .unwrap();
     let es = render_external_secret(&entry, &ns.name, "fake-store", "1h");
@@ -371,9 +390,8 @@ fn force_sync_against_fake_provider() {
     );
 
     let broken = SyncEntry::from_inventory(
-        &inventory("broken", "curie-broken", &["A"], RotationOwner::Sm),
+        &inventory("broken", "curie-broken", &["A"], RotationOwner::Sm, &[]),
         "curie/test",
-        &[],
     )
     .unwrap();
     eso::apply(
