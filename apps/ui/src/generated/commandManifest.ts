@@ -5719,6 +5719,57 @@ export const commandManifest = {
           "name": "e2e-ladder"
         },
         {
+          "about": "Prove AWS Secrets Manager sync and rotation through External Secrets on an owned kind cluster (`bash cli/scripts/provider-e2e.sh`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Synthetic seed JSON. Defaults to the checked in harness fixture",
+              "id": "seed",
+              "long": "seed",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "External Secrets setup for an emulator run",
+              "id": "eso",
+              "long": "eso",
+              "positional": false,
+              "possible_values": [
+                "preinstalled",
+                "none"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run the emulator once with External Secrets and once without it",
+              "id": "ci",
+              "long": "ci",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run against AWS in us-east-1 with profile theconnman",
+              "id": "real_aws",
+              "long": "real-aws",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "secrets-e2e"
+        },
+        {
           "about": "Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes MCP server and a live provider (#2246, #2854, `bash cli/scripts/sre-demo-e2e.sh`). Turns start with `curie cluster message`. Approvals resolve through `curie cluster approvals` and an operator principal. Missing the live provider skips with the reason in the run summary",
           "hidden": false,
           "name": "sre-demo-e2e"
