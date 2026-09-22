@@ -558,6 +558,16 @@ fn govcloud_region_and_role_parse() {
 }
 
 #[test]
+fn a_pasted_provider_value_is_not_echoed() {
+    let planted = "sk-example-provider-token";
+    let raw = secrets_yaml(&SECRET_LINES.replace("provider: aws", &format!("provider: {planted}")));
+    let err = Installation::parse(&raw).expect_err("pasted provider must fail");
+    let text = format!("{err:#}");
+    assert!(text.contains("secrets.provider"), "{}", redact(&text));
+    assert!(!text.contains(planted), "{}", redact(&text));
+}
+
+#[test]
 fn secrets_block_rejects_invalid_fields() {
     assert_field_error(
         &secrets_yaml(&SECRET_LINES.replace("provider: aws", "provider: vault")),
