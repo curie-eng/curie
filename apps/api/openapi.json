@@ -2196,8 +2196,24 @@
             "default": "",
             "title": "Owned Secret Name",
             "type": "string"
+          },
+          "triggers": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Triggers",
+            "type": "array"
+          },
+          "version_id": {
+            "format": "uuid",
+            "title": "Version Id",
+            "type": "string"
           }
         },
+        "required": [
+          "version_id"
+        ],
         "title": "ConnectorManifests",
         "type": "object"
       },
