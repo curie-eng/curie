@@ -2928,8 +2928,10 @@ async def revoke_console_session(
 #: a person to type a password and pass MFA, short enough that an abandoned
 #: attempt stops being redeemable soon after.
 OIDC_LOGIN_TTL = timedelta(minutes=10)
-#: Most live (unconsumed, unexpired) login attempts that may exist at once. The
-#: login start is unauthenticated and writes a row, so expiry alone bounds the
+#: Most unexpired login attempts that may exist at once, consumed or not:
+#: counting only unconsumed rows would let a caller free capacity by redeeming
+#: its own attempt with a failing callback. The login start is
+#: unauthenticated and writes a row, so expiry alone bounds the
 #: table only by time: an anonymous flood would grow it by (rate x TTL). A
 #: fixed cap bounds it by count instead. 1000 is far above any real appliance's
 #: concurrent logins in a ten-minute window, and small enough that counting and
