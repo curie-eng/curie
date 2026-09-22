@@ -348,3 +348,39 @@ def test_existing_publication_namespace_refuses_the_run(
     with pytest.raises(fe.ConfigError):
         preflight.create_namespace()
     assert preflight.teardown.run() == []
+
+
+def test_a_second_run_on_the_same_app_is_refused_before_it_mutates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fe, "LOCK_DIR", tmp_path / "locks")
+    config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
+
+    def make() -> fe.Preflight:
+        return fe.Preflight(
+            config,
+            repo_root=REPO_ROOT,
+            candidate="c" * 40,
+            namespace="test-factory-unit",
+            evidence_path=tmp_path / "e.json",
+            admission_timeout=1,
+        )
+
+    first, second = make(), make()
+    first._lock("app-42", "this App")
+    with pytest.raises(fe.ConfigError, match="holds this App"):
+        second._lock("app-42", "this App")
+    assert first.teardown.run()[0]["ok"]
+    second._lock("app-42", "this App")
+    second.teardown.run()
+
+
+def test_tunnel_url_skips_the_cloudflared_control_host() -> None:
+    assert (
+        fe.quick_tunnel_url("INF Requesting new quick Tunnel on https://api.trycloudflare.com...")
+        is None
+    )
+    assert (
+        fe.quick_tunnel_url("|  https://contribute-cookie-mode-newman.trycloudflare.com  |")
+        == "https://contribute-cookie-mode-newman.trycloudflare.com"
+    )

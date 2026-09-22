@@ -77,6 +77,14 @@ EXIT_SCENARIO = 3
 _NAMESPACE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _REPO = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 _TUNNEL_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+# cloudflared logs its own control host (api.trycloudflare.com) before the
+# quick-tunnel URL; only a generated, hyphenated subdomain is the tunnel.
+_QUICK_TUNNEL_URL = re.compile(r"https://(?!api\.)[a-z0-9]+(?:-[a-z0-9]+)+\.trycloudflare\.com")
+
+
+def quick_tunnel_url(line: str) -> str | None:
+    match = _QUICK_TUNNEL_URL.search(line)
+    return match.group(0) if match else None
 
 
 class ConfigError(Exception):
@@ -711,14 +719,19 @@ class Preflight:
         annotations = json.loads(raw)["metadata"].get("annotations") or {}
         if name == self.namespace:
             return bool(annotations.get(RUN_ANNOTATION) == self.run_id)
-        # The publication namespace is the release's own object.
-        return bool(annotations.get("meta.helm.sh/release-namespace") == self.namespace)
+        # The publication namespace is the release's own object, and the release
+        # is ours only while the parent namespace carries this run's marker.
+        return bool(
+            annotations.get("meta.helm.sh/release-namespace") == self.namespace
+            and self._owned(self.namespace)
+        )
 
     def delete_namespaces(self) -> dict[str, Any]:
         names = [self.namespace, self.publication_namespace()]
         owned = [name for name in names if self._owned(name)]
+        uninstall_failed = ""
         if self.namespace in owned:
-            run(
+            uninstall = subprocess.run(
                 [
                     "helm",
                     "--kube-context",
@@ -732,8 +745,12 @@ class Preflight:
                     "--timeout",
                     "5m",
                 ],
+                capture_output=True,
+                text=True,
                 check=False,
             )
+            if uninstall.returncode != 0 and "not found" not in uninstall.stderr:
+                uninstall_failed = uninstall.stderr.strip()[-500:]
         for name in owned:
             self.kubectl("delete", "namespace", name, "--ignore-not-found", "--wait=false")
         _wait("namespace deletion", 600, lambda: all(map(self._namespace_absent, owned)), 5)
@@ -747,6 +764,18 @@ class Preflight:
         ]
         if leftover:
             raise PreflightFailed(f"CRDs this run created are still present: {leftover}")
+        # Cluster-scoped release objects outlive the namespace; verify them.
+        kinds = "clusterroles,clusterrolebindings,priorityclasses"
+        cluster_left = [
+            item["metadata"]["name"]
+            for item in json.loads(self.kubectl("get", kinds, "-o", "json"))["items"]
+            if (item["metadata"].get("annotations") or {}).get("meta.helm.sh/release-namespace")
+            == self.namespace
+        ]
+        if cluster_left or uninstall_failed:
+            raise PreflightFailed(
+                f"release objects remain {cluster_left}; helm uninstall: {uninstall_failed or 'ok'}"
+            )
         return {
             "deleted": owned,
             "crds_deleted": self.created_crds,
@@ -894,9 +923,9 @@ class Preflight:
         def reader() -> None:
             assert process.stdout is not None
             for line in process.stdout:
-                match = _TUNNEL_URL.search(line)
-                if match and not found:
-                    found.append(match.group(0))
+                url = quick_tunnel_url(line)
+                if url and not found:
+                    found.append(url)
 
         threading.Thread(target=reader, daemon=True).start()
         self.tunnel_url = _wait("the tunnel URL", 90, lambda: found[0] if found else None, 1)
@@ -910,28 +939,30 @@ class Preflight:
         _wait("the api through the tunnel", 180, reachable, 5)
         self.step("tunnel up")
 
-    def _lock_app(self) -> None:
-        """One run per App: overlapping runs would each restore the other's tunnel URL."""
+    def _lock(self, name: str, holds: str) -> None:
+        """Serialize runs on this machine that share an App or a kube context.
+
+        Taken before any fixture or cluster mutation and released last, so a
+        refused run changes nothing and CRD ownership is never contested.
+        """
 
         LOCK_DIR.mkdir(parents=True, exist_ok=True)
-        handle = open(LOCK_DIR / f"app-{self.config.app_id}.lock", "w")  # noqa: SIM115
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        handle = open(LOCK_DIR / f"{safe}.lock", "w")  # noqa: SIM115
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             handle.close()
-            raise PreflightFailed(
-                "another factory-e2e run on this machine holds this App's webhook"
-            ) from None
+            raise ConfigError(f"another factory-e2e run on this machine holds {holds}") from None
 
         def unlock() -> dict[str, Any]:
             fcntl.flock(handle, fcntl.LOCK_UN)
             handle.close()
             return {"released": True}
 
-        self.teardown.push("release App lock", unlock)
+        self.teardown.push(f"release lock {safe}", unlock)
 
     def repoint_webhook(self) -> None:
-        self._lock_app()
         status, original = self.as_app("GET", "/app/hook/config")
         if status != 200 or not isinstance(original, dict):
             raise PreflightFailed(f"could not read the App webhook config (HTTP {status})")
@@ -1100,6 +1131,8 @@ class Preflight:
 
     def run(self, scenario: ScenarioDriver | None) -> None:
         self.check_tools()
+        self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
+        self._lock(f"context-{self.config.kube_context}", "this kube context")
         self.check_images()
         self.check_app()
         self.create_namespace()
