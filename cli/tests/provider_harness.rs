@@ -25,7 +25,7 @@ fn output_text(output: &Output) -> String {
 }
 
 #[test]
-fn secrets_e2e_help_exposes_only_the_approved_surface_and_accepts_valid_modes() {
+fn secrets_e2e_help_exposes_only_the_approved_surface_and_valid_modes_reach_seed_check() {
     let root = repo_root();
     let dev_help = run(&["dev", "--help"], &root);
     let dev_text = output_text(&dev_help);
@@ -42,18 +42,35 @@ fn secrets_e2e_help_exposes_only_the_approved_surface_and_accepts_valid_modes() 
         );
     }
 
-    for args in [
-        vec!["dev", "secrets-e2e", "--eso", "preinstalled", "--help"],
-        vec!["dev", "secrets-e2e", "--eso", "none", "--help"],
-        vec!["dev", "secrets-e2e", "--ci", "--help"],
-        vec!["dev", "secrets-e2e", "--real-aws", "--help"],
-    ] {
-        let output = run(&args, &root);
+    let temp = tempfile::tempdir().expect("create temporary directory");
+    let missing = temp.path().join("missing.json");
+    let modes: &[&[&str]] = &[
+        &["dev", "secrets-e2e", "--eso", "preinstalled"],
+        &["dev", "secrets-e2e", "--eso", "none"],
+        &["dev", "secrets-e2e", "--ci"],
+        &["dev", "secrets-e2e", "--real-aws"],
+    ];
+    for args in modes {
+        let output = Command::new(bin())
+            .args(*args)
+            .args(["--seed"])
+            .arg(&missing)
+            .current_dir(&root)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run valid mode with missing seed");
+        let text = output_text(&output);
         assert!(
-            output.status.success(),
-            "valid mode did not parse: {}\n{}",
-            args.join(" "),
-            output_text(&output)
+            !output.status.success(),
+            "valid mode accepted a missing seed: {args:?}\n{text}"
+        );
+        assert!(
+            text.to_ascii_lowercase().contains("seed"),
+            "valid mode did not reach seed validation: {args:?}\n{text}"
+        );
+        assert!(
+            !text.contains("required tool") && !text.contains("kind is required"),
+            "tool preflight ran before seed validation: {args:?}\n{text}"
         );
     }
 }
@@ -71,6 +88,11 @@ fn conflicting_modes_are_rejected_by_clap_before_dispatch() {
         let output = run(args, outside_checkout.path());
         let text = output_text(&output);
         assert!(!output.status.success(), "conflict was accepted: {args:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "conflict returned the wrong exit status: {args:?}\n{text}"
+        );
         assert!(
             text.contains("cannot be used with"),
             "conflict reached dispatch or produced the wrong error: {args:?}\n{text}"
