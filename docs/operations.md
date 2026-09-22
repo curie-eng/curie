@@ -868,6 +868,23 @@ refused post is recorded on the notice and does not change the execution row.
 Waiting for approval is not an ending: the execution deadline stays 1800
 seconds from start and covers that wait.
 
+Review feedback on a factory pull request asks for one more revision of that
+pull request. When a work item owns the PR, an `issue_comment`,
+`pull_request_review_comment` or `pull_request_review` that mentions
+`api.githubFactoryMention` goes to the factory, not to the Slack-bound review
+path. The sender must have write access now, the PR must still be open at the
+recorded head, and the delivery must come from the work item's installation.
+Each refusal is a `factory_ignored` code (`ordinary_comment`,
+`lineage_unbound`, `lineage_closed`, `installation_mismatch`,
+`sender_permission_refused`, `terminal_pull_request`, `active_request`, and
+others). An accepted mention becomes the work item's next execution request.
+When that revision completes, or ends early, the reconciler answers on the pull
+request: in the review thread for an inline comment, otherwise as a PR comment
+that links the feedback. If GitHub refuses the thread reply with 422, the answer
+is posted as a linked PR comment. PR review feedback reaches the factory only
+when `api.githubFactoryIngressEnabled` is true. A PR no work item owns keeps
+the existing review behavior.
+
 ### Driving the factory end to end
 
 `curie dev factory-e2e preflight` proves the signed intake loop against a real
