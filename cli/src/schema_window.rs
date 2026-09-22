@@ -475,6 +475,11 @@ mod tests {
             "catalog revisions missing this tree's alembic head {tree_head}"
         );
         assert_eq!(
+            chart_window.schema_head,
+            *tree_head,
+            "Chart.yaml appVersion {app_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
+        );
+        assert_eq!(
             newest_window.schema_head,
             *tree_head,
             "newest catalog appVersion {newest_catalog_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
