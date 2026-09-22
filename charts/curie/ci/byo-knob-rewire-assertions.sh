@@ -86,6 +86,11 @@ elif mode == "byo":
     n = expect("GITHUB_WEBHOOK_SECRET", "sm-webhook", "hmac")
     m = expect("CURIE_INSTALLATION_ID", "sm-identity", "id")
     data = chart_secret()
+    # Provenance a later upgrade reads: without it a BYO release whose first
+    # render could not see its Secret looks like a pre-installationId release.
+    ann = next(d for d in docs if d.get("kind") == "Secret" and d["metadata"]["name"] == "t-curie-secrets")["metadata"].get("annotations") or {}
+    if ann.get("curietech.ai/installation-id-source") != "byo":
+        fail(f"chart Secret does not record the BYO identity source: {ann}")
     for k in ("installationId", "githubWebhookSecret"):
         if k in data:
             fail(f"chart Secret still carries {k} with its BYO knob set")

@@ -853,7 +853,11 @@ fails the render rather than silently re-keying the claim fence. The chart
 Secret records only a sha256 of a BYO identity (annotation
 curietech.ai/installation-id-sha256), so a later switch to another BYO Secret,
 or back to the managed path, is checked against it too. Adopting a BYO identity
-on a release that predates installationId keeps the legacy quiesce bridge.
+on a release that predates installationId keeps the legacy quiesce bridge; the
+annotation curietech.ai/installation-id-source=byo marks every BYO release, even
+one first rendered before its Secret synced, so it is never mistaken for that
+legacy case and can never fall back to the managed path. Such a release whose
+first render had no identity records the hash at its first observed upgrade.
 
 Fresh installs always mint a new identity, including adoption of a retained
 Secret. Upgrades reuse the stored identity; the first upgrade from a chart that
@@ -873,7 +877,9 @@ before contacting Valkey.
 {{- $byoName := include "curie.installation.idSecretName" . -}}
 {{- $byoKey := include "curie.installation.idSecretKey" . -}}
 {{- $managedMetadata := get $managedSecret "metadata" | default dict -}}
-{{- $priorHash := get (get $managedMetadata "annotations" | default dict) "curietech.ai/installation-id-sha256" | default "" -}}
+{{- $managedAnnotations := get $managedMetadata "annotations" | default dict -}}
+{{- $priorHash := get $managedAnnotations "curietech.ai/installation-id-sha256" | default "" -}}
+{{- $priorByo := eq (get $managedAnnotations "curietech.ai/installation-id-source" | default "") "byo" -}}
 {{- $managedEncoded := get $managedSecretData "installationId" | default "" -}}
 {{- $idHash := "" -}}
 {{- if $byoName -}}
@@ -892,7 +898,7 @@ before contacting Valkey.
 {{- $mismatch = ne ($managedEncoded | b64dec) $byoDecoded -}}
 {{- else if $priorHash -}}
 {{- $mismatch = ne $priorHash $idHash -}}
-{{- else if ne (trim (toString (get $managedMetadata "uid" | default ""))) "" -}}
+{{- else if and (not $priorByo) (ne (trim (toString (get $managedMetadata "uid" | default ""))) "") -}}
 {{- /* A release that predates installationId adopting a BYO identity: keep
        the one-release legacy bridge so older workers observe the quiesce. */ -}}
 {{- $legacy = true -}}
@@ -906,7 +912,7 @@ before contacting Valkey.
 {{- $observed = false -}}
 {{- $idHash = $priorHash -}}
 {{- end -}}
-{{- else if and .Release.IsUpgrade $priorHash (eq (trim (toString $managedEncoded)) "") -}}
+{{- else if and .Release.IsUpgrade (or $priorHash $priorByo) (eq (trim (toString $managedEncoded)) "") -}}
 {{- fail "this release reads its installation identity from a BYO Secret (installation.idExistingSecret), and the chart Secret holds no copy of it. Unsetting the knob would mint a new identity and unfence in-flight claims; keep installation.idExistingSecret set." -}}
 {{- else if .Release.IsInstall -}}
 {{- $installationId = randAlphaNum 32 -}}
