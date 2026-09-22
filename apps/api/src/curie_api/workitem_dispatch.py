@@ -847,6 +847,8 @@ async def finish(
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
     )
     if isinstance(result, WorkItemConflict):
+        # The conflict path commits and expires this row.
+        await session.refresh(request)
         return DispatchConflict(
             code=_map_finish_conflict(result, request),
             work_item_id=result.work_item_id,
@@ -934,6 +936,8 @@ async def record_termination(
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
     )
     if isinstance(result, WorkItemConflict):
+        # The conflict path commits and expires this row.
+        await session.refresh(request)
         return DispatchConflict(
             code=_map_finish_conflict(result, request),
             work_item_id=result.work_item_id,

@@ -305,11 +305,17 @@ def _cancel(work_item_id: uuid.UUID, request_id: uuid.UUID) -> None:
 
 
 def _completed(client: TestClient, agent: dict[str, Any], **overrides: Any) -> SimpleNamespace:
+    """Admit and start. Completion waits until a pull request is open."""
+
+    del client
     facts = _facts(agent["agent_id"], **overrides)
     seeded = _admit(facts)
-    epoch = _start(facts.request_id)
-    _finish(facts.request_id, epoch, "completed", "completed")
+    seeded.runtime_epoch = _start(facts.request_id)
     return seeded
+
+
+def _complete(seeded: SimpleNamespace) -> None:
+    _finish(seeded.request_id, seeded.runtime_epoch, "completed", "completed")
 
 
 def _publication_payload(deployment_id: str, **overrides: Any) -> dict[str, Any]:
@@ -623,15 +629,27 @@ def test_failed_names_terminal_cause_and_delivery_budget(
     _assert_common(body)
 
 
-def test_completed_without_publication_is_completed_unpublished(
+def test_completion_without_a_pull_request_stays_running(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
 
+    async def refuse(session: AsyncSession) -> None:
+        result = await finish(
+            session,
+            seeded.request_id,
+            runtime_epoch=seeded.runtime_epoch,
+            outcome="completed",
+            cause="completed",
+        )
+        assert getattr(result, "code", None) is not None, result
+
+    with_session(refuse)
+
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
-    assert body["state"] == "completed_unpublished"
+    assert body["state"] == "running"
     assert body["pr"] is None
     assert body["publication"] is None
     assert body["ci"]["state"] == "not_applicable"
@@ -733,6 +751,7 @@ def test_opened_pr_is_published_found_by_conversation_and_ci_is_unavailable(
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
+    _complete(seeded)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
@@ -753,6 +772,7 @@ def test_readmitted_item_running_again_reports_running_and_keeps_the_pr(
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
+    _complete(seeded)
     second = _facts(agent["agent_id"])
     _admit(second)
     _start(second.request_id)
@@ -775,6 +795,7 @@ def test_sticky_cancel_with_retained_pr_reports_cancelled_and_pr(
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
+    _complete(seeded)
     work_item_version, _ = _versions(seeded.request_id)
 
     async def body(session: AsyncSession) -> None:
@@ -1323,6 +1344,7 @@ def test_hung_credential_acquisition_still_answers_the_detail_promptly(
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
+    _complete(seeded)
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=8.0)
@@ -1370,6 +1392,7 @@ def test_repeated_timeouts_do_not_accumulate_credential_work(
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
+    _complete(seeded)
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=20.0)
