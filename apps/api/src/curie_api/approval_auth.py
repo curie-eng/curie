@@ -17,6 +17,7 @@ from typing import Annotated, Literal
 from fastapi import Cookie, Depends, Header, HTTPException, status
 
 from . import adapter_principal, approval_principal, crud
+from .auth import CONSOLE_SESSION_COOKIE as CONSOLE_SESSION_COOKIE
 from .auth import require_api_key
 from .config import get_settings
 from .deps import SessionDep
@@ -24,7 +25,6 @@ from .deps import SessionDep
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
-CONSOLE_SESSION_COOKIE = "curie_console_session"
 
 AuthenticatedPrincipalKind = Literal["chat", "console", "operator", "adapter"]
 
