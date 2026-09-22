@@ -124,6 +124,7 @@ fn launcher_orchestrator_and_fixture_are_tracked() {
     let required = [
         "cli/scripts/provider-e2e.sh",
         "cli/scripts/provider_harness.py",
+        "cli/tests/provider_harness_live.py",
         "cli/tests/fixtures/provider-bundle/.claude-plugin/plugin.json",
         "cli/tests/fixtures/provider-bundle/.mcp.json",
         "cli/tests/fixtures/provider-bundle/connectors.yaml",

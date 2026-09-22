@@ -33,6 +33,8 @@ while true; do
     fi
     break
 done
+wait "$child"
+status=$?
 
 trap - TERM HUP INT
 exit "$status"
