@@ -1702,7 +1702,11 @@ the upgrade refuses before touching Valkey, and an upgrade whose BYO identity
 differs from the one the release already uses fails the render. The chart
 Secret keeps only a sha256 of a BYO identity (annotation
 `curietech.ai/installation-id-sha256`), so a later switch to another BYO Secret,
-or unsetting the knob, is refused too. Seed the BYO Secret with the current
+or unsetting the knob, is refused too. A BYO release is also marked
+`curietech.ai/installation-id-source: byo`, so one whose first render could not
+read its Secret is never mistaken for a pre-installationId release; its first
+observed upgrade records the hash, and cannot check it against anything, so let
+the Secret sync before the first upgrade. Seed the BYO Secret with the current
 `installationId` before switching an existing release.
 An agent may appear in `connectorSecrets` or `connectorExistingSecrets`, not
 both, and its BYO keys pass the same reserved-name guard. The CLI does not yet
