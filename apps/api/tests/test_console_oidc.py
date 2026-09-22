@@ -751,6 +751,135 @@ def test_idp_error_callbacks_cannot_recycle_cap_capacity(
     assert idp.token_requests == []
 
 
+def _race_login_starts(racers: int) -> tuple[int, int, list[BaseException]]:
+    """Fire ``racers`` login starts at once, each on its own connection.
+
+    Every racer first checks out its own connection (``SELECT 1``), then waits
+    on a shared barrier, so all of them enter ``create_oidc_login_attempt``
+    together rather than one after another as connections open. Returns
+    (created, exhausted, anything else that was raised).
+    """
+
+    from curie_api import crud
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    async def run() -> tuple[int, int, list[BaseException]]:
+        engine = create_async_engine(get_settings().database_url, pool_size=racers, max_overflow=0)
+        ready = 0
+        go = asyncio.Event()
+
+        async def one() -> str:
+            nonlocal ready
+            async with AsyncSession(engine) as session:
+                await session.execute(text("SELECT 1"))
+                ready += 1
+                if ready == racers:
+                    go.set()
+                await go.wait()
+                try:
+                    await crud.create_oidc_login_attempt(session)
+                except crud.OidcLoginAttemptsExhausted:
+                    return "exhausted"
+                return "created"
+
+        try:
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*(one() for _ in range(racers)), return_exceptions=True),
+                timeout=60,
+            )
+        finally:
+            await engine.dispose()
+        errors = [o for o in outcomes if isinstance(o, BaseException)]
+        return outcomes.count("created"), outcomes.count("exhausted"), errors
+
+    return asyncio.run(run())
+
+
+def test_concurrent_login_starts_cannot_overshoot_the_cap(
+    clean_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Racing starts queue on the advisory lock, so exactly the cap succeed.
+
+    Without the lock every racer prunes, counts zero and inserts, and the table
+    ends up with one row per racer however small the cap.
+    """
+
+    _sql("TRUNCATE curie.oidc_login_attempts")
+    _cap_at(monkeypatch, 5)
+    try:
+        created, exhausted, errors = _race_login_starts(40)
+
+        assert errors == []
+        assert (created, exhausted) == (5, 35)
+        assert _attempt_count() == 5
+    finally:
+        _sql("TRUNCATE curie.oidc_login_attempts")
+
+
+def test_login_start_that_raises_after_locking_does_not_block_the_next(
+    clean_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock is transaction-scoped: an escaped error frees it on session close.
+
+    ``new_state`` runs after the lock is taken, so making it raise leaves the
+    first start holding the lock until its session closes (a rollback, which
+    is what the request session does with an escaped exception). The next
+    start must then acquire it promptly and write its row, and no advisory
+    lock may be left behind.
+    """
+
+    from curie_api import crud
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    _sql("TRUNCATE curie.oidc_login_attempts")
+    real_new_state = crud.new_state
+    cls, key = crud.OIDC_LOGIN_ATTEMPT_LOCK
+    lock = {"cls": cls, "key": key}
+
+    def boom() -> str:
+        raise RuntimeError("state generation failed")
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            monkeypatch.setattr(crud, "new_state", boom)
+            async with AsyncSession(engine) as failing:
+                with pytest.raises(RuntimeError, match="state generation failed"):
+                    await crud.create_oidc_login_attempt(failing)
+                held = await failing.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                        "AND classid = :cls AND objid = :key AND objsubid = 2 "
+                        "AND pid = pg_backend_pid()"
+                    ),
+                    lock,
+                )
+                # Precondition: the failure really happened under the lock.
+                assert held == 1
+            monkeypatch.setattr(crud, "new_state", real_new_state)
+
+            async with AsyncSession(engine) as next_start:
+                started = await asyncio.wait_for(
+                    crud.create_oidc_login_attempt(next_start), timeout=10
+                )
+            assert started.state
+        finally:
+            await engine.dispose()
+
+    try:
+        asyncio.run(run())
+
+        assert _attempt_count() == 1
+        leftover = _sql(
+            "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' "
+            "AND classid = :cls AND objid = :key AND objsubid = 2",
+            lock,
+        )
+        assert leftover[0]["n"] == 0
+    finally:
+        _sql("TRUNCATE curie.oidc_login_attempts")
+
+
 # --- principal and tenant status ----------------------------------------------
 
 
