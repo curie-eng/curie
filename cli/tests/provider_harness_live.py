@@ -144,12 +144,42 @@ def tagged_resources() -> list[dict]:
     return mappings
 
 
-def delete_owned_rows(rows: Sequence[tuple[str, str, str]]) -> None:
+def aws_account_id() -> str:
+    account_id = str(aws_json("sts", "get-caller-identity").get("Account", ""))
+    if re.fullmatch(r"[0-9]{12}", account_id) is None:
+        raise AssertionError("AWS account identity is invalid")
+    return account_id
+
+
+def oidc_provider_arn(account_id: str, issuer_host: str) -> str:
+    if not issuer_host.startswith(provider_harness.OWNED_PREFIX):
+        raise AssertionError("OIDC issuer host is outside the harness prefix")
+    provider_harness.require_owned_name(issuer_host)
+    return f"arn:aws:iam::{account_id}:oidc-provider/{issuer_host}"
+
+
+def delete_owned_rows(
+    rows: Sequence[tuple[str, str, str]],
+    *,
+    account_id: str,
+    kubeconfig: pathlib.Path,
+) -> None:
     """Best effort test trap using only exact identities from the durable ledger."""
 
     for kind, identity, _state in reversed(rows):
         if kind == "kind_cluster" and identity.startswith(provider_harness.OWNED_PREFIX):
-            run(["kind", "delete", "cluster", "--name", identity], timeout=180)
+            run(
+                [
+                    "kind",
+                    "delete",
+                    "cluster",
+                    "--name",
+                    identity,
+                    "--kubeconfig",
+                    str(kubeconfig),
+                ],
+                timeout=180,
+            )
     for kind, identity, _state in reversed(rows):
         if kind == "secretsmanager" and identity.startswith(provider_harness.OWNED_PREFIX):
             aws(
@@ -172,12 +202,12 @@ def delete_owned_rows(rows: Sequence[tuple[str, str, str]]) -> None:
                 )
         elif kind == "iam_role" and identity.startswith(provider_harness.OWNED_PREFIX):
             aws("iam", "delete-role", "--role-name", identity)
-        elif kind == "iam_oidc_provider" and identity.startswith("arn:"):
+        elif kind == "iam_oidc_provider":
             aws(
                 "iam",
                 "delete-open-id-connect-provider",
                 "--open-id-connect-provider-arn",
-                identity,
+                oidc_provider_arn(account_id, identity),
             )
         elif kind == "s3_bucket" and identity.startswith(provider_harness.OWNED_PREFIX):
             for key in (".well-known/openid-configuration", "openid/v1/jwks"):
@@ -188,7 +218,9 @@ def delete_owned_rows(rows: Sequence[tuple[str, str, str]]) -> None:
             run(["docker", "image", "rm", "--force", identity])
 
 
-def direct_aws_resource_is_absent(kind: str, identity: str) -> bool:
+def direct_aws_resource_is_absent(
+    kind: str, identity: str, *, account_id: str = ""
+) -> bool:
     if kind == "secretsmanager":
         result = aws("secretsmanager", "describe-secret", "--secret-id", identity)
         return result.returncode != 0 and "ResourceNotFoundException" in result.stderr
@@ -211,7 +243,7 @@ def direct_aws_resource_is_absent(kind: str, identity: str) -> bool:
             "iam",
             "get-open-id-connect-provider",
             "--open-id-connect-provider-arn",
-            identity,
+            oidc_provider_arn(account_id, identity),
         )
         return result.returncode != 0 and "NoSuchEntity" in result.stderr
     if kind == "s3_bucket":
@@ -227,11 +259,22 @@ class ProviderHarnessLive(unittest.TestCase):
         prior = kind_clusters()
         with tempfile.TemporaryDirectory() as directory:
             case = new_case(pathlib.Path(directory), real_aws=False)
+            kubeconfig = provider_harness.write_private_file(case.admin_kubeconfig, b"")
             created = False
             try:
                 self.assertNotIn(case.cluster, prior)
                 result = run(
-                    ["kind", "create", "cluster", "--name", case.cluster, "--wait", "120s"],
+                    [
+                        "kind",
+                        "create",
+                        "cluster",
+                        "--name",
+                        case.cluster,
+                        "--kubeconfig",
+                        str(kubeconfig),
+                        "--wait",
+                        "120s",
+                    ],
                     timeout=180,
                 )
                 self.assertEqual(result.returncode, 0, "owned kind cluster creation failed")
@@ -243,7 +286,18 @@ class ProviderHarnessLive(unittest.TestCase):
                 self.assertIn(case.cluster, kind_clusters())
             finally:
                 if created or case.cluster in kind_clusters():
-                    run(["kind", "delete", "cluster", "--name", case.cluster], timeout=180)
+                    run(
+                        [
+                            "kind",
+                            "delete",
+                            "cluster",
+                            "--name",
+                            case.cluster,
+                            "--kubeconfig",
+                            str(kubeconfig),
+                        ],
+                        timeout=180,
+                    )
                 wait_for("owned kind test cluster deletion", lambda: kind_clusters() == prior)
                 shutil.rmtree(case.work, ignore_errors=True)
 
@@ -276,6 +330,16 @@ class ProviderHarnessLive(unittest.TestCase):
                 )
                 self.assertEqual(created.returncode, 0, "test owned secret creation failed")
                 created_secret = True
+                created_payload = json.loads(created.stdout)
+                created_arn = created_payload.get("ARN")
+                self.assertIsInstance(created_arn, str)
+                wait_for(
+                    "test owned tag visibility",
+                    lambda: any(
+                        mapping.get("ResourceARN") == created_arn
+                        for mapping in tagged_resources()
+                    ),
+                )
                 with self.assertRaisesRegex(
                     provider_harness.HarnessError,
                     "preexisting tagged AWS resources must be removed first",
@@ -310,6 +374,7 @@ class ProviderHarnessLive(unittest.TestCase):
         prior = kind_clusters()
         with tempfile.TemporaryDirectory() as directory:
             case = new_case(pathlib.Path(directory), real_aws=False)
+            kubeconfig = provider_harness.write_private_file(case.admin_kubeconfig, b"")
             case.prior_clusters = prior
             original_wait = provider_harness.wait_until
             created_cluster = False
@@ -320,7 +385,17 @@ class ProviderHarnessLive(unittest.TestCase):
             try:
                 self.assertNotIn(case.cluster, prior)
                 created = run(
-                    ["kind", "create", "cluster", "--name", case.cluster, "--wait", "120s"],
+                    [
+                        "kind",
+                        "create",
+                        "cluster",
+                        "--name",
+                        case.cluster,
+                        "--kubeconfig",
+                        str(kubeconfig),
+                        "--wait",
+                        "120s",
+                    ],
                     timeout=180,
                 )
                 self.assertEqual(created.returncode, 0, "owned mismatch cluster creation failed")
@@ -334,7 +409,18 @@ class ProviderHarnessLive(unittest.TestCase):
             finally:
                 provider_harness.wait_until = original_wait
                 if created_cluster:
-                    run(["kind", "delete", "cluster", "--name", case.cluster], timeout=180)
+                    run(
+                        [
+                            "kind",
+                            "delete",
+                            "cluster",
+                            "--name",
+                            case.cluster,
+                            "--kubeconfig",
+                            str(kubeconfig),
+                        ],
+                        timeout=180,
+                    )
                 wait_for("owned mismatch cluster deletion", lambda: kind_clusters() == prior)
                 shutil.rmtree(case.work, ignore_errors=True)
 
@@ -348,6 +434,7 @@ class ProviderHarnessLive(unittest.TestCase):
         self.assertTrue(candidate.is_file() and os.access(candidate, os.X_OK), "set CURIE_BIN")
         candidate = candidate.resolve()
         prior_clusters = kind_clusters()
+        account_id = aws_account_id()
         self.assertEqual(tagged_resources(), [], "owned AWS tag inventory must start empty")
 
         process: subprocess.Popen[bytes] | None = None
@@ -357,6 +444,9 @@ class ProviderHarnessLive(unittest.TestCase):
             root = pathlib.Path(directory)
             stdout_path = root / "stdout.log"
             stderr_path = root / "stderr.log"
+            fallback_kubeconfig = provider_harness.write_private_file(
+                root / "fallback.kubeconfig", b""
+            )
             try:
                 with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                     process = subprocess.Popen(
@@ -419,7 +509,7 @@ class ProviderHarnessLive(unittest.TestCase):
                         wait_for(
                             f"direct absence of {kind}",
                             lambda kind=kind, identity=identity: direct_aws_resource_is_absent(
-                                kind, identity
+                                kind, identity, account_id=account_id
                             ),
                         )
                     elif kind == "docker_image":
@@ -429,26 +519,57 @@ class ProviderHarnessLive(unittest.TestCase):
                         self.assertNotIn(identity, kind_clusters())
                 self.assertEqual(tagged_resources(), [])
             finally:
+                if ledger_path is None and stdout_path.exists():
+                    match = re.search(
+                        r"(?m)^provider-harness-ledger: (.+)$",
+                        stdout_path.read_text(encoding="utf-8", errors="replace"),
+                    )
+                    if match is not None:
+                        ledger_path = pathlib.Path(match.group(1))
+                durable_completion = (
+                    ledger_path is not None and completion(ledger_path) is not None
+                )
+                if process is not None and not durable_completion:
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    if ledger_path is not None:
+                        try:
+                            wait_for(
+                                "fallback durable completion",
+                                lambda: completion(ledger_path) is not None,
+                                timeout=900,
+                            )
+                        except AssertionError:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
                 if process is not None and process.poll() is None:
                     try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        process.wait(timeout=30)
+                        process.wait(timeout=60)
                     except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         process.wait(timeout=30)
                 if ledger_path is not None:
                     rows = ledger_rows(ledger_path) or rows
-                    delete_owned_rows(rows)
+                    delete_owned_rows(
+                        rows,
+                        account_id=account_id,
+                        kubeconfig=fallback_kubeconfig,
+                    )
                     wait_for("fallback kind cleanup", lambda: kind_clusters() == prior_clusters)
                     for kind, identity, _state in rows:
                         if kind in AWS_KINDS:
                             wait_for(
                                 f"fallback direct absence of {kind}",
                                 lambda kind=kind, identity=identity: direct_aws_resource_is_absent(
-                                    kind, identity
+                                    kind, identity, account_id=account_id
                                 ),
                             )
                     wait_for(
