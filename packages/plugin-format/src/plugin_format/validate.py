@@ -8,6 +8,7 @@ errors instead of raising, so the caller can surface every problem at once.
 import json
 import re
 from collections.abc import Callable, Mapping
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -76,6 +77,9 @@ _TRIGGERS_ADAPTER = TypeAdapter(list[TriggerDeclaration])
 
 # Claude Code plugin names are kebab-case: lowercase alphanumerics and hyphens.
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_TZDATA_ZONES = frozenset(
+    files("tzdata").joinpath("zones").read_text(encoding="utf-8").splitlines()
+)
 
 
 class ValidationIssue(BaseModel):
@@ -927,22 +931,18 @@ def _five_field_cron(expression: str) -> bool:
 
 
 def _target_acceptable(value: object) -> bool:
-    """A channel address string, or an object whose ``channel`` is one."""
+    """A nonblank channel address string."""
 
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, dict):
-        channel = value.get("channel")
-        return isinstance(channel, str) and bool(channel.strip())
-    return False
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _iana_timezone(value: object) -> bool:
-    name = _stripped(value)
-    if not name:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if value not in _TZDATA_ZONES:
         return False
     try:
-        ZoneInfo(name)
+        ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError):
         return False
     return True
@@ -955,8 +955,8 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
     ``webhook``. A ``cron`` trigger needs a non-empty ``name``, a non-empty
     ``prompt``, and a five-field ``schedule`` (ADR-0099). ``timezone`` is an
     IANA name and is legal only with a non-empty schedule; a missing key means
-    UTC and is not written back. ``target``, when present, is a non-empty
-    channel address string or an object with a non-empty ``channel``.
+    UTC and is not written back. ``target``, when present, is a nonblank
+    channel address string.
     ``schedule`` on any other known type is forbidden. A ``webhook`` still needs
     a non-empty ``path``. Presence is raw key membership, so an explicit JSON
     null is present. The parsed model collapses an omitted key and null to
@@ -1042,8 +1042,7 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
         if "target" in raw_item and not _target_acceptable(trigger.target):
             c.error(
                 "triggers.target_invalid",
-                "a trigger 'target', when set, must be a non-empty channel address "
-                "or an object with a non-empty 'channel'",
+                "a trigger 'target', when set, must be a nonblank channel address string",
                 loc,
             )
         if trigger.type == "webhook" and not _stripped(trigger.path):

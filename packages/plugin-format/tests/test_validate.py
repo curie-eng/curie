@@ -1,5 +1,8 @@
 import json
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -273,8 +276,8 @@ def test_unparsed_cron_schedule_is_rejected(tmp_path: Path, schedule: str) -> No
 
 @pytest.mark.parametrize(
     "timezone",
-    ["Not/AZone", "", None],
-    ids=["unknown", "blank", "null"],
+    ["Not/AZone", "", None, "localtime", "posixrules", " America/New_York "],
+    ids=["unknown", "blank", "null", "localtime", "posixrules", "padded_iana"],
 )
 def test_unresolved_cron_timezone_is_rejected(tmp_path: Path, timezone: str | None) -> None:
     bundle = _trigger_bundle(
@@ -290,6 +293,38 @@ def test_unresolved_cron_timezone_is_rejected(tmp_path: Path, timezone: str | No
         ],
     )
     assert "triggers.timezone_invalid" in _codes(bundle)
+
+
+def test_packaged_tzdata_accepts_an_iana_zone_without_a_host_database(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "timezone": "America/New_York",
+            }
+        ],
+    )
+    program = "\n".join(
+        [
+            "import sys",
+            "from pathlib import Path",
+            "from plugin_format import validate_bundle",
+            "result = validate_bundle(Path(sys.argv[1]))",
+            "assert result.valid, result.errors",
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(bundle)],
+        env=os.environ | {"PYTHONTZPATH": ""},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -329,7 +364,14 @@ def test_duplicate_trigger_name_after_strip_is_rejected(tmp_path: Path) -> None:
     assert "triggers.duplicate_name" in _codes(bundle)
 
 
-def test_channel_object_target_is_valid(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "target",
+    [{"channel": "C0EXAMPLE1"}, {"channel": "   "}],
+    ids=["nonblank_channel", "blank_channel"],
+)
+def test_channel_object_target_is_structurally_invalid(
+    tmp_path: Path, target: dict[str, str]
+) -> None:
     bundle = _trigger_bundle(
         tmp_path,
         [
@@ -338,28 +380,11 @@ def test_channel_object_target_is_valid(tmp_path: Path) -> None:
                 "name": "weekday-digest",
                 "schedule": "0 9 * * 1-5",
                 "prompt": "Post the daily plan.",
-                "target": {"channel": "C0EXAMPLE1"},
+                "target": target,
             }
         ],
     )
-    result = validate_bundle(bundle)
-    assert result.valid, result.errors
-
-
-def test_blank_channel_object_target_is_rejected(tmp_path: Path) -> None:
-    bundle = _trigger_bundle(
-        tmp_path,
-        [
-            {
-                "type": "cron",
-                "name": "weekday-digest",
-                "schedule": "0 9 * * 1-5",
-                "prompt": "Post the daily plan.",
-                "target": {"channel": "   "},
-            }
-        ],
-    )
-    assert "triggers.target_invalid" in _codes(bundle)
+    assert "triggers.invalid" in _codes(bundle)
 
 
 def test_oversized_cron_number_is_rejected(tmp_path: Path) -> None:

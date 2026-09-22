@@ -112,9 +112,8 @@ class TriggerDeclaration(BaseModel):
     # No "UTC" default: an omitted key and an explicit null both parse as None.
     # Only a missing key means UTC, and validate_bundle does not write it back.
     timezone: str | None = None
-    # A channel address string, or {"channel": "<address>"} as already stored
-    # on the connectors route. validate_bundle rejects a blank address.
-    target: str | dict[str, Any] | None = None
+    # A channel address string. validate_bundle rejects a blank address.
+    target: str | None = None
     prompt: str | None = None
     path: str | None = None
 
