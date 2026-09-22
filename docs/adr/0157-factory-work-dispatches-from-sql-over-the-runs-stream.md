@@ -7,13 +7,13 @@ Status: Accepted
 Partially amends
 [ADR 0146](0146-headless-capacity-is-a-wait-not-a-reply.md)
 and
-[ADR 0155](0155-work-items-own-durable-execution-identity.md).
+[ADR 0162](0162-work-items-own-durable-execution-identity.md).
 
 This ADR is Accepted with explicit maintainer approval recorded on September 18,
 2026 for [issue 2573](https://github.com/curie-eng/curie/issues/2573). The
 coordinated acceptance follows
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
-The realizing paths are `apps/api/alembic/versions/0046_work_item_dispatch.py`,
+The realizing paths are `apps/api/alembic/versions/0047_work_item_dispatch.py`,
 `apps/api/src/curie_api/workitem_dispatch.py`,
 `apps/api/src/curie_api/workitem_reconciler.py`,
 `apps/api/src/curie_api/routers/work_items.py`,
@@ -24,7 +24,7 @@ The realizing paths are `apps/api/alembic/versions/0046_work_item_dispatch.py`,
 
 ## Context
 
-ADR 0155 persisted WorkItem and ExecutionRequest identity and transition fences.
+ADR 0162 persisted WorkItem and ExecutionRequest identity and transition fences.
 It implemented no dispatch loop, runtime admission, or process termination. ADR
 0146 decided that headless capacity is a wait, not a reply, and used the stream
 pending list as that wait. Once SQL owns the request, the pending list is
@@ -60,7 +60,7 @@ share an id and are fenced by SQL. The terminate wake keeps the stable id
 `work-item-{request_id}-terminate` because its handler never reaches `_complete`.
 
 **D2. Dispatch and ownership columns are fenced by their own counters, not the
-ADR 0155 row `version`.** `dispatch_generation`, `dispatch_epoch`, `runtime_epoch`,
+ADR 0162 row `version`.** `dispatch_generation`, `dispatch_epoch`, `runtime_epoch`,
 and the acquire owner fence ownership. Updates that touch only those columns do
 not advance `version` and lock only `execution_requests`. Lifecycle transitions
 keep WorkItem-first lock order and version CAS.
@@ -102,7 +102,7 @@ raised.
 
 ADR 0146 decisions 1 and 4 are partially amended: admission still happens before
 claim, but the durable wait and expiry live in SQL rather than the pending list
-and graveyard. ADR 0155's "no dispatch loop, runtime admission, process
+and graveyard. ADR 0162's "no dispatch loop, runtime admission, process
 termination" scope and its cancellation cause set are realized and extended here
 with `owner_lost`.
 

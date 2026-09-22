@@ -4790,6 +4790,8 @@ def review_lineage_app(
         "branch": "pending",
         "head_sha": FIRST_REVISION_SHA,
         "status": 200,
+        "state": "open",
+        "merged": False,
         "calls": [],
     }
     real_client = httpx.Client
@@ -4818,8 +4820,8 @@ def review_lineage_app(
                 "number": PR_NUMBER,
                 "html_url": PR_URL,
                 "node_id": truth["node_id"],
-                "state": "open",
-                "merged": False,
+                "state": truth["state"],
+                "merged": truth["merged"],
                 "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
                 "base": {"repo": repo, "ref": "main"},
             },
@@ -5396,3 +5398,337 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
 
     asyncio.run(exercise())
     assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
+
+
+# --- Canonical worker lineage PATCH integration -------------------------------
+
+
+def _lineage_identity(lineage_id: str) -> dict[str, Any]:
+    return _rows(
+        "SELECT status, pr_number, pr_url, head_sha, version, "
+        "github_repository_id, github_installation_id, github_pr_node_id, base_ref "
+        "FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": uuid.UUID(lineage_id)},
+    )[0]
+
+
+def _reportable(publication_id: str) -> None:
+    _execute(
+        "UPDATE curie.publications SET approval_card_reported_at = now() WHERE id = :id",
+        {"id": uuid.UUID(publication_id)},
+    )
+
+
+def _approved_revision(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    *,
+    conversation_id: str,
+    dedupe_key: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key=dedupe_key,
+        ),
+    )
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    return deployment, publication
+
+
+class _TerminalObservationCluster:
+    def __init__(self) -> None:
+        self.validations = 0
+        self.terminal_cleanups = 0
+
+    def observe(self, _job_name: str) -> Any:
+        from curie_worker.publication_loop import PublicationJobObservation
+
+        return PublicationJobObservation(
+            phase="succeeded",
+            pr_url=PR_URL,
+            pr_number=PR_NUMBER,
+            commit_sha=FIRST_REVISION_SHA,
+            logs="",
+        )
+
+    def validate_existing(self, _resources: Any) -> None:
+        self.validations += 1
+
+    def apply(self, _resources: Any) -> None:
+        raise AssertionError("the terminal Job observation must not apply a new Job")
+
+    def cleanup_credentials(self, _names: Any) -> None:
+        return None
+
+    def cleanup_terminal(self, _names: Any) -> None:
+        self.terminal_cleanups += 1
+
+
+class _UnexpectedPublicationCredentials:
+    def redeem(self, _publication_id: uuid.UUID) -> Any:
+        raise AssertionError("a terminal Job observation must not redeem credentials")
+
+
+class _PublicationTranscript:
+    def __init__(self) -> None:
+        self.records: list[tuple[uuid.UUID, str]] = []
+
+    def record_result(
+        self,
+        _agent_id: uuid.UUID,
+        _workspace_conversation_id: str,
+        publication_id: uuid.UUID,
+        text: str,
+    ) -> None:
+        self.records.append((publication_id, text))
+
+
+class _PublicationReplies:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def emit(self, event: Any, **_kwargs: Any) -> None:
+        assert event.event == "reply.update"
+        assert event.message is None
+        assert event.settled is None
+        assert event.text is not None
+        self.messages.append(event.text)
+
+
+async def _reconcile_through_lineage_patch(
+    client: TestClient,
+    *,
+    lease_owner: str,
+) -> tuple[Any, _TerminalObservationCluster, _PublicationTranscript, _PublicationReplies]:
+    from curie_worker.publication_clients import PublicationLineageClient
+    from curie_worker.publication_k8s import PublicationJobSettings
+    from curie_worker.publication_loop import PublicationReconciler
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    settings = PublicationJobSettings(
+        namespace="curie",
+        runner_image="ghcr.io/curie-eng/curie-runner:test",
+        image_pull_policy="IfNotPresent",
+        image_pull_secrets=(),
+        priority_class_name="curie-publication",
+        service_account_name="curie-publication",
+        owner_name="curie-publication",
+        git_user_name="Curie Publisher",
+        git_user_email="publisher@example.test",
+        cpu_request="100m",
+        cpu_limit="1",
+        memory_request="256Mi",
+        memory_limit="1Gi",
+        ephemeral_request="1Gi",
+        ephemeral_limit="4Gi",
+    )
+    engine = create_async_engine(get_settings().database_url)
+    store = PostgresPublicationStore(engine, schema="curie", lease_owner=lease_owner)
+    cluster = _TerminalObservationCluster()
+    transcript = _PublicationTranscript()
+    replies = _PublicationReplies()
+    try:
+        work = await store.claim_next()
+        assert work is not None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=client.app),
+            base_url="http://api.example.test",
+        ) as http:
+            reconciler = PublicationReconciler(
+                store=store,
+                credentials=_UnexpectedPublicationCredentials(),
+                cluster=cluster,
+                github=SimpleNamespace(),
+                lineage=PublicationLineageClient(
+                    api_base_url="http://api.example.test",
+                    worker_token=WORKER_TOKEN,
+                    client=http,
+                ),
+                replies=replies,
+                transcript=transcript,
+                job_settings=settings,
+            )
+            await reconciler.reconcile(work)
+        return work, cluster, transcript, replies
+    finally:
+        await engine.dispose()
+
+
+def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    """The reconciler, API PATCH and PostgreSQL settlement execute as one path."""
+
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id="thread-worker-lineage-patch",
+        dedupe_key="worker-lineage-patch",
+    )
+    truth["branch"] = publication["branch"]
+    _reportable(publication["id"])
+
+    async def reconcile() -> Any:
+        return await _reconcile_through_lineage_patch(
+            client,
+            lease_owner="lineage-patch-worker",
+        )
+
+    work, cluster, transcript, replies = client.portal.call(reconcile)
+
+    assert truth["calls"]
+    assert cluster.validations == 1
+    assert cluster.terminal_cleanups == 1
+    assert transcript.records == [
+        (work.publication_id, f"Published the approved changes: {PR_URL}")
+    ]
+    assert replies.messages == [f"Published the approved changes: {PR_URL}"]
+    assert _lineage_identity(publication["lineage_id"]) == {
+        "status": "open",
+        "pr_number": PR_NUMBER,
+        "pr_url": PR_URL,
+        "head_sha": FIRST_REVISION_SHA,
+        "version": work.lineage_version + 1,
+        "github_repository_id": 9001,
+        "github_installation_id": 41,
+        "github_pr_node_id": "PR_example_123",
+        "base_ref": "main",
+    }
+    assert _rows(
+        "SELECT status, lease_owner, patch_bytes IS NULL AS cleared FROM curie.publications "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    ) == [{"status": "succeeded", "lease_owner": None, "cleared": True}]
+
+
+def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unchanged(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    """A stale worker must not convert provider terminal truth into a lineage write."""
+
+    from curie_worker.publication_clients import PublicationLineageClient
+    from curie_worker.publication_loop import PublicationLineageRefused
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id="thread-stale-before-provider",
+        dedupe_key="stale-before-provider",
+    )
+    truth["branch"] = publication["branch"]
+    truth["state"] = "closed"
+    truth["merged"] = True
+    _reportable(publication["id"])
+
+    async def claim() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="stale-lineage-worker"
+        )
+        try:
+            work = await store.claim_next()
+            assert work is not None
+            return work
+        finally:
+            await engine.dispose()
+
+    work = client.portal.call(claim)
+    _claim_publication_lease(publication["id"], "replacement-lineage-worker")
+    snapshot = (
+        "SELECT p.status, p.version, p.lease_owner, l.status AS lineage_status, "
+        "l.pr_number, l.head_sha, l.version AS lineage_version "
+        "FROM curie.publications p JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+        "WHERE p.id = :id"
+    )
+    before = _rows(snapshot, {"id": uuid.UUID(publication["id"])})
+
+    async def stale_advance() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=client.app),
+            base_url="http://api.example.test",
+        ) as http:
+            with pytest.raises(PublicationLineageRefused):
+                await PublicationLineageClient(
+                    api_base_url="http://api.example.test",
+                    worker_token=WORKER_TOKEN,
+                    client=http,
+                ).advance(
+                    work.publication_id,
+                    expected_version=work.lineage_version,
+                    expected_head_sha=work.expected_remote_head,
+                    expected_publication_version=work.version,
+                    lease_owner=work.lease_owner,
+                    pr_number=PR_NUMBER,
+                    pr_url=PR_URL,
+                    head_sha=FIRST_REVISION_SHA,
+                )
+
+    client.portal.call(stale_advance)
+
+    assert truth["calls"] == []
+    assert _rows(snapshot, {"id": uuid.UUID(publication["id"])}) == before
+    assert _lineage_identity(publication["lineage_id"]) == {
+        "status": "open",
+        "pr_number": None,
+        "pr_url": None,
+        "head_sha": None,
+        "version": 1,
+        "github_repository_id": None,
+        "github_installation_id": None,
+        "github_pr_node_id": None,
+        "base_ref": None,
+    }
+
+
+def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    """The reconciler maps API terminal truth onto the store's terminal CAS."""
+
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id="thread-terminal-lineage-patch",
+        dedupe_key="terminal-lineage-patch",
+    )
+    truth["branch"] = publication["branch"]
+    truth["state"] = "closed"
+    truth["merged"] = True
+    _reportable(publication["id"])
+
+    async def reconcile() -> Any:
+        return await _reconcile_through_lineage_patch(
+            client,
+            lease_owner="terminal-lineage-worker",
+        )
+
+    work, cluster, transcript, replies = client.portal.call(reconcile)
+
+    assert truth["calls"]
+    assert cluster.validations == 1
+    assert cluster.terminal_cleanups == 0
+    assert transcript.records == []
+    assert replies.messages == []
+    assert _lineage_identity(publication["lineage_id"]) == {
+        "status": "merged",
+        "pr_number": PR_NUMBER,
+        "pr_url": PR_URL,
+        "head_sha": FIRST_REVISION_SHA,
+        "version": work.lineage_version + 1,
+        "github_repository_id": None,
+        "github_installation_id": None,
+        "github_pr_node_id": None,
+        "base_ref": None,
+    }

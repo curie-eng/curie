@@ -1126,7 +1126,8 @@ class ApprovalAuditEntry(Base):
     __tablename__ = "approval_audit_entries"
     __table_args__ = (
         CheckConstraint(
-            "principal_kind IS NULL OR principal_kind IN ('chat', 'console', 'operator')",
+            "principal_kind IS NULL OR principal_kind IN "
+            "('chat', 'console', 'operator', 'adapter')",
             name="approval_audit_principal_kind_ck",
         ),
     )
@@ -1143,6 +1144,9 @@ class ApprovalAuditEntry(Base):
     # honestly retain NULL/false rather than being retro-labelled.
     principal_kind: Mapped[str | None] = mapped_column(default=None)
     authenticated: Mapped[bool] = mapped_column(server_default="false", default=False)
+    # The adapter that transported an `adapter` principal's decision (ADR-0154);
+    # `actor` is then the sender it authenticated. NULL for every other kind.
+    principal_subject: Mapped[str | None] = mapped_column(default=None)
     # The decision the actor attempted (approved/rejected).
     decision: Mapped[str]
     # The authorizer snapshot: which implementation decided, its verdict, and

@@ -1,4 +1,4 @@
-# 154. The tracker owns dependencies and Curie admits ready work
+# 161. The tracker owns dependencies and Curie admits ready work
 
 Date: 2026-09-18
 

@@ -72,9 +72,12 @@ def _bundle(root: Path, connectors: str) -> Path:
 
 
 def _answering_probe(dialed: list[dict[str, Any]]):
-    async def probe(config: Any, **_kwargs: object) -> tuple[int, bool, frozenset[str]]:
+    async def probe(
+        config: Any, **_kwargs: object
+    ) -> tuple[int, bool, frozenset[str], frozenset[str]]:
         dialed.append(dict(config))
-        return 1, False, frozenset({"mcp__grafana__search_dashboards"})
+        tools = frozenset({"mcp__grafana__search_dashboards"})
+        return 1, False, tools, tools
 
     return probe
 
@@ -152,7 +155,9 @@ def test_secretref_server_that_refuses_the_client_is_still_a_failure(
     # Secondary path: a hosted server that DOES authenticate the client now
     # fails on the real dial (probe_failed, re-dialed each turn) instead of the
     # network-free diagnosis, so the failure stays visible.
-    async def refuses(*_args: object, **_kwargs: object) -> tuple[int, bool, frozenset[str]]:
+    async def refuses(
+        *_args: object, **_kwargs: object
+    ) -> tuple[int, bool, frozenset[str], frozenset[str]]:
         raise RuntimeError("401 Unauthorized")
 
     monkeypatch.setattr("curie_runner.mcp_tool_capability._probe_server", refuses)

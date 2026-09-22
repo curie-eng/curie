@@ -58,6 +58,17 @@ A second harness must supply an object satisfying `ModelSession`
   safe boundary.
 - `async def close(self) -> None` (`runner/src/curie_runner/adapter.py::ModelSession.close`) — tear down.
 
+Optional capabilities sit beside the five-method port. A session may implement
+`McpServerReconnector.ensure_mcp_server`
+(`runner/src/curie_runner/adapter.py::McpServerReconnector.ensure_mcp_server`) so the runner
+can verify and repair the session's own MCP connection before clearing a connector failure.
+A harness that omits it keeps side-probe-only connector recovery. A session may also expose
+the duck-typed `export_replay_state` hook. It returns `HarnessReplayState` for a full
+checkpoint or delta, or `None` when there is nothing new to export
+(`runner/src/curie_runner/history.py::HarnessReplayState`), and `SessionRunner` bounds the export to
+`_HISTORY_REPLAY_EXPORT_BUDGET_SECONDS` (five seconds) before preserving portable replay
+without the harness checkpoint (`runner/src/curie_runner/session.py::SessionRunner`).
+
 Apart from `PartialMessageBoundary` and `StreamedToolUseBoundary`, the values a `receive_turn` iterator yields must be
 mappable by `translate_message` (`runner/src/curie_runner/translate.py::translate_message`)
 into the ACI outbound union (`TextDelta` / `ToolNote` / `SideEffectFlag` / `ErrorEvent` /
@@ -139,6 +150,10 @@ walled off, called out in vision-doc Job 1:
   `runner/src/curie_runner/harness/contribution.py::BundleCompileResult` whose `plugins`
   field is typed `list[Any]` and, for the built-in, is filled with the SDK's own
   `SdkPluginConfig` objects (`runner/src/curie_runner/plugin.py::load_plugins`).
+- **Duck-typed replay export.** `export_replay_state` is discovered with `getattr` in
+  `runner/src/curie_runner/session.py::SessionRunner`, unlike the declared
+  `McpServerReconnector` optional protocol. A second harness can therefore miss a
+  load-bearing checkpoint capability without a protocol conformance failure.
 
 ## Cross-links
 

@@ -5,7 +5,7 @@ Date: 2026-09-10
 Status: Accepted
 
 Partially amended by
-[ADR 0155](0155-work-items-own-durable-execution-identity.md). The tracker
+[ADR 0162](0162-work-items-own-durable-execution-identity.md). The tracker
 remains the backlog and Curie still does not copy tracker content. The stream no
 longer owns durable admitted execution state.
 

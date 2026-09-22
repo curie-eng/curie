@@ -30,6 +30,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import adapter_principal
 from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
 from .models import GIT_FLOW_CREATED_BY, Environment
@@ -1714,6 +1715,46 @@ class ApprovalPrincipalOut(BaseModel):
     expires_at: datetime
 
 
+class AdapterPrincipalMint(BaseModel):
+    """Administrative request to issue one channel adapter credential (ADR-0154)."""
+
+    subject: str = Field(min_length=1)
+    binding_ids: list[uuid.UUID] = Field(min_length=1)
+    ttl_s: int = Field(
+        default=adapter_principal.DEFAULT_TTL_SECONDS,
+        gt=0,
+        le=adapter_principal.MAX_TTL_SECONDS,
+    )
+
+    @field_validator("subject")
+    @classmethod
+    def _nonblank_subject(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("subject must not be blank")
+        return value
+
+
+class AdapterPrincipalRotate(BaseModel):
+    """Self-rotation request: only the next credential's lifetime is chosen."""
+
+    ttl_s: int = Field(
+        default=adapter_principal.DEFAULT_TTL_SECONDS,
+        gt=0,
+        le=adapter_principal.MAX_TTL_SECONDS,
+    )
+
+
+class AdapterPrincipalOut(BaseModel):
+    """One-time delivery of a channel adapter credential."""
+
+    token: str
+    subject: str
+    kind: Literal["adapter"] = "adapter"
+    binding_ids: list[uuid.UUID]
+    scopes: list[str]
+    expires_at: datetime
+
+
 class ApprovalOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -1866,8 +1907,11 @@ class ApprovalAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
-    principal_kind: Literal["chat", "console", "operator"] | None
+    principal_kind: Literal["chat", "console", "operator", "adapter"] | None
     authenticated: bool
+    # The adapter that transported an `adapter` principal's decision
+    # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.
+    principal_subject: str | None
     decision: str
     authorizer: str
     authorized: bool
