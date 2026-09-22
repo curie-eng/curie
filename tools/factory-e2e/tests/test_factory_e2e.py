@@ -296,3 +296,55 @@ def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Pat
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
     assert api["githubWebhookSecret"] == "not-the-dev-default"
+
+
+def test_namespace_undo_is_registered_before_the_create_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
+    preflight = fe.Preflight(
+        config,
+        repo_root=REPO_ROOT,
+        candidate="c" * 40,
+        namespace="test-factory-unit",
+        evidence_path=tmp_path / "e.json",
+        admission_timeout=1,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        calls.append(argv)
+        if "create" in argv:
+            manifest = json.loads(input_text or "{}")
+            assert manifest["metadata"]["annotations"][fe.RUN_ANNOTATION] == preflight.run_id
+            raise fe.PreflightFailed("connection lost after the server applied it")
+        return ""
+
+    monkeypatch.setattr(fe, "run", fake_run)
+    with pytest.raises(fe.PreflightFailed):
+        preflight.create_namespace()
+    assert [name for name, _ in preflight.teardown._steps] == ["delete namespaces"]
+
+
+def test_existing_publication_namespace_refuses_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
+    preflight = fe.Preflight(
+        config,
+        repo_root=REPO_ROOT,
+        candidate="c" * 40,
+        namespace="test-factory-unit",
+        evidence_path=tmp_path / "e.json",
+        admission_timeout=1,
+    )
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        if "test-factory-unit-curie-publication" in argv:
+            return "namespace/test-factory-unit-curie-publication"
+        return ""
+
+    monkeypatch.setattr(fe, "run", fake_run)
+    with pytest.raises(fe.ConfigError):
+        preflight.create_namespace()
+    assert preflight.teardown.run() == []

@@ -25,12 +25,15 @@ import argparse
 import base64
 import dataclasses
 import datetime as dt
+import fcntl
+import http.client
 import json
 import os
 import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -63,6 +66,9 @@ DEFAULT_LABEL = "curie-factory"
 NAMESPACE_PREFIX = "test-factory-"
 APP_KEY_REF = "factory-e2e-github-app"
 SANDBOX_CRD = "sandboxes.agents.x-k8s.io"
+OWNER_LABEL = "app.kubernetes.io/managed-by=curie-factory-e2e"
+RUN_ANNOTATION = "curie.dev/factory-e2e-run"
+LOCK_DIR = Path.home() / ".cache" / "curie-factory-e2e"
 
 EXIT_FAILED = 1
 EXIT_CONFIG = 2
@@ -448,6 +454,38 @@ def http_json(
         return status, raw.decode(errors="replace")
 
 
+def public_get_status(url: str, *, timeout: float = 10) -> int:
+    """GET a public https URL, resolving its host through DNS-over-HTTPS.
+
+    A fresh quick-tunnel host answers NXDOMAIN for its first seconds, and a
+    local caching resolver then keeps serving that NXDOMAIN long after GitHub
+    can reach the tunnel. Resolving through a public resolver avoids waiting
+    out the negative cache; TLS still verifies against the real host name.
+    """
+
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ""
+    status, answer = http_json(
+        "GET",
+        f"https://cloudflare-dns.com/dns-query?name={host}&type=A",
+        headers={"Accept": "application/dns-json"},
+        timeout=timeout,
+    )
+    records = answer.get("Answer") if status == 200 and isinstance(answer, dict) else None
+    addresses = [r["data"] for r in records or [] if r.get("type") == 1]
+    if not addresses:
+        return 0
+    raw = socket.create_connection((addresses[0], 443), timeout=timeout)
+    tls = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+    connection = http.client.HTTPSConnection(host, timeout=timeout)
+    connection.sock = tls
+    try:
+        connection.request("GET", parsed.path or "/", headers={"Host": host})
+        return connection.getresponse().status
+    finally:
+        connection.close()
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -499,6 +537,8 @@ class Preflight:
         self.evidence_path = evidence_path
         self.admission_timeout = admission_timeout
         self.teardown = Teardown()
+        self.run_id = uuid.uuid4().hex[:12]
+        self.created_crds: list[str] = []
         self.evidence: dict[str, Any] = {
             "schema": "curie.factory-e2e.evidence/v1",
             "mode": "preflight",
@@ -507,6 +547,7 @@ class Preflight:
             "kube_context": config.kube_context,
             "namespace": namespace,
             "release": RELEASE,
+            "run_id": "",
             "started_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
             "steps": [],
         }
@@ -628,62 +669,104 @@ class Preflight:
         run(["tar", "-xf", str(archive), "-C", str(self.workdir)])
         return self.workdir / "charts" / "curie"
 
+    def _namespace_absent(self, name: str) -> bool:
+        return not self.kubectl(
+            "get", "namespace", name, "--ignore-not-found", "-o", "name"
+        ).strip()
+
     def create_namespace(self) -> None:
-        existing = self.kubectl(
-            "get", "namespace", self.namespace, "--ignore-not-found", "-o", "name"
-        )
-        if existing.strip():
-            raise ConfigError(
-                f"namespace {self.namespace} already exists; the driver only uses a namespace "
-                "it created. Delete it or pass another --namespace."
-            )
-        self.kubectl("create", "namespace", self.namespace)
+        self.evidence["run_id"] = self.run_id
+        for name in (self.namespace, self.publication_namespace()):
+            if not self._namespace_absent(name):
+                raise ConfigError(
+                    f"namespace {name} already exists; the driver only uses namespaces it "
+                    "creates. Delete it or pass another --namespace."
+                )
+        # Registered before the create call: an ambiguous create (the server
+        # applied it, the client lost the answer) is still reconciled, and the
+        # run annotation keeps the undo from touching anyone else's namespace.
         self.teardown.push("delete namespaces", self.delete_namespaces)
-        self.kubectl(
-            "label", "namespace", self.namespace, "app.kubernetes.io/managed-by=curie-factory-e2e"
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": self.namespace,
+                "labels": dict([OWNER_LABEL.split("=", 1)]),
+                "annotations": {RUN_ANNOTATION: self.run_id},
+            },
+        }
+        run(
+            ["kubectl", "--context", self.config.kube_context, "create", "-f", "-"],
+            input_text=json.dumps(manifest),
         )
         self.step("namespace created", namespace=self.namespace)
 
     def publication_namespace(self) -> str:
         return f"{self.namespace}-{RELEASE}-publication"
 
+    def _owned(self, name: str) -> bool:
+        raw = self.kubectl("get", "namespace", name, "--ignore-not-found", "-o", "json")
+        if not raw.strip():
+            return False
+        annotations = json.loads(raw)["metadata"].get("annotations") or {}
+        if name == self.namespace:
+            return bool(annotations.get(RUN_ANNOTATION) == self.run_id)
+        # The publication namespace is the release's own object.
+        return bool(annotations.get("meta.helm.sh/release-namespace") == self.namespace)
+
     def delete_namespaces(self) -> dict[str, Any]:
-        run(
-            [
-                "helm",
-                "--kube-context",
-                self.config.kube_context,
-                "uninstall",
-                RELEASE,
-                "-n",
-                self.namespace,
-                "--no-hooks",
-                "--wait",
-                "--timeout",
-                "5m",
-            ],
-            check=False,
-        )
         names = [self.namespace, self.publication_namespace()]
-        for name in names:
-            self.kubectl("delete", "namespace", name, "--ignore-not-found", "--wait=false")
-
-        def gone() -> bool:
-            return all(
-                not self.kubectl(
-                    "get", "namespace", name, "--ignore-not-found", "-o", "name"
-                ).strip()
-                for name in names
+        owned = [name for name in names if self._owned(name)]
+        if self.namespace in owned:
+            run(
+                [
+                    "helm",
+                    "--kube-context",
+                    self.config.kube_context,
+                    "uninstall",
+                    RELEASE,
+                    "-n",
+                    self.namespace,
+                    "--no-hooks",
+                    "--wait",
+                    "--timeout",
+                    "5m",
+                ],
+                check=False,
             )
-
-        _wait("namespace deletion", 600, gone, interval=5)
-        return {"deleted": names, "verified_absent": True}
+        for name in owned:
+            self.kubectl("delete", "namespace", name, "--ignore-not-found", "--wait=false")
+        _wait("namespace deletion", 600, lambda: all(map(self._namespace_absent, owned)), 5)
+        # Helm keeps chart CRDs on uninstall; remove only the ones this run added.
+        for crd in self.created_crds:
+            self.kubectl("delete", "crd", crd, "--ignore-not-found", "--wait=true")
+        leftover = [
+            crd
+            for crd in self.created_crds
+            if self.kubectl("get", "crd", crd, "--ignore-not-found", "-o", "name").strip()
+        ]
+        if leftover:
+            raise PreflightFailed(f"CRDs this run created are still present: {leftover}")
+        return {
+            "deleted": owned,
+            "crds_deleted": self.created_crds,
+            "verified_absent": True,
+        }
 
     def install(self) -> None:
         chart = self.extract_chart()
         consumer = bool(
             self.kubectl("get", "crd", SANDBOX_CRD, "--ignore-not-found", "-o", "name").strip()
         )
+        for manifest in sorted((chart / "crds").glob("*.yaml")):
+            match = re.search(r"^  name:\s*(\S+)", manifest.read_text(), re.MULTILINE)
+            if (
+                match
+                and not self.kubectl(
+                    "get", "crd", match.group(1), "--ignore-not-found", "-o", "name"
+                ).strip()
+            ):
+                self.created_crds.append(match.group(1))
         key_file = str(self.config.private_key_file)
         self.kubectl(
             "-n",
@@ -717,12 +800,17 @@ class Preflight:
                 self.namespace,
                 "-f",
                 str(values_file),
-                "--wait",
                 "--timeout",
                 "20m",
             ]
         )
         values_file.unlink()
+        # No `helm --wait`: schema migration is a post-install hook, and the
+        # api's init container waits for that schema, so --wait deadlocks.
+        # Helm still blocks on the hook jobs; the workloads are awaited here.
+        for kind in ("deployment", "statefulset"):
+            for workload in self.kubectl("-n", self.namespace, "get", kind, "-o", "name").split():
+                self.kubectl("-n", self.namespace, "rollout", "status", workload, "--timeout=15m")
         self.step(
             "installed",
             chart="charts/curie@candidate",
@@ -815,18 +903,46 @@ class Preflight:
 
         def reachable() -> bool:
             try:
-                status, _ = http_json("GET", self.tunnel_url + "/health", timeout=10)
+                return public_get_status(self.tunnel_url + "/health") == 200
             except OSError:
                 return False
-            return status == 200
 
         _wait("the api through the tunnel", 180, reachable, 5)
         self.step("tunnel up")
 
+    def _lock_app(self) -> None:
+        """One run per App: overlapping runs would each restore the other's tunnel URL."""
+
+        LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        handle = open(LOCK_DIR / f"app-{self.config.app_id}.lock", "w")  # noqa: SIM115
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            raise PreflightFailed(
+                "another factory-e2e run on this machine holds this App's webhook"
+            ) from None
+
+        def unlock() -> dict[str, Any]:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+            return {"released": True}
+
+        self.teardown.push("release App lock", unlock)
+
     def repoint_webhook(self) -> None:
+        self._lock_app()
         status, original = self.as_app("GET", "/app/hook/config")
         if status != 200 or not isinstance(original, dict):
             raise PreflightFailed(f"could not read the App webhook config (HTTP {status})")
+        if (
+            _TUNNEL_URL.search(str(original.get("url") or ""))
+            and not self.config.restore_webhook_url
+        ):
+            raise PreflightFailed(
+                "the App webhook already points at a quick tunnel (another run, or one that "
+                "died); set CURIE_FACTORY_WEBHOOK_RESTORE_URL so this run restores a real URL"
+            )
         restore = {
             "url": self.config.restore_webhook_url or original.get("url"),
             "content_type": original.get("content_type") or "json",
@@ -886,10 +1002,17 @@ class Preflight:
             if status != 204:
                 raise PreflightFailed(f"deleting a fixture branch failed (HTTP {status})")
             deleted += 1
-        open_left = self._paged(f"{repo}/issues?state=open")
-        branches_left = [b["name"] for b in self._paged(f"{repo}/branches")]
-        if open_left or branches_left != [self.default_branch]:
-            raise PreflightFailed("the fixture repository did not read back as reset")
+
+        # GitHub's list endpoints lag a close or delete by a few seconds.
+        def clean() -> bool:
+            open_left = self._paged(f"{repo}/issues?state=open")
+            branches_left = [b["name"] for b in self._paged(f"{repo}/branches")]
+            return not open_left and branches_left == [self.default_branch]
+
+        try:
+            _wait("the fixture repository to read back as reset", 60, clean, 5)
+        except PreflightFailed:
+            raise PreflightFailed("the fixture repository did not read back as reset") from None
         return {"closed": closed, "branches_deleted": deleted, "verified_clean": True}
 
     def ensure_label(self) -> None:
