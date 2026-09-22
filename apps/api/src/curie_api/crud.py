@@ -1411,6 +1411,68 @@ async def mark_publication_lineage_terminal(
     return refreshed
 
 
+def publication_lineage_outcome_conflict(
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    data: PublicationLineageAdvance,
+) -> PublicationLineageConflict | None:
+    """Preconditions one revision outcome must meet before it may claim a lineage.
+
+    Pure, so the route can reject a stale outcome before it contacts GitHub and
+    the advancing writer can repeat the same verdict under its row locks. The
+    order is load bearing and carried over unchanged. Which check fires first
+    decides which conflict code the caller sees, and the worker branches on it.
+    """
+
+    if lineage.status != "open":
+        return PublicationLineageConflict(
+            "publication.lineage_terminal",
+            "the pull request for this thread is merged or closed; start a new thread",
+        )
+    if publication.revision_number != lineage.latest_revision:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "publication revision is not the current thread lineage revision",
+        )
+    # Case insensitive on both sides: `_validated_pr_url` in the worker accepts
+    # GitHub's own spelling of the repository and preserves it, so a repository
+    # whose GitHub casing differs from `repo_full_name` publishes fine and must
+    # not then take a stable refusal here.
+    canonical = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
+    if data.pr_url.casefold() != canonical.casefold():
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity does not match the publication repository",
+        )
+    if lineage.pr_number is not None and (
+        lineage.pr_number != data.pr_number
+        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
+    ):
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity no longer matches the stored thread lineage",
+        )
+    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
+        return PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage version or expected head is stale",
+        )
+    if (
+        publication.version != data.expected_publication_version
+        or publication.lease_owner != data.lease_owner
+    ):
+        return PublicationLineageConflict(
+            "publication.lease_lost",
+            "publication lease is no longer held by this worker",
+        )
+    if publication.status not in ("approved", "launching", "running"):
+        return PublicationLineageConflict(
+            "publication.revision_not_approved",
+            "publication revision must be approved before advancing its lineage",
+        )
+    return None
+
+
 async def advance_publication_lineage(
     session: AsyncSession,
     publication_id: uuid.UUID,
@@ -1444,50 +1506,9 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication thread pull request lineage is absent",
         )
-    if lineage.status != "open":
-        raise PublicationLineageConflict(
-            "publication.lineage_terminal",
-            "the pull request for this thread is merged or closed; start a new thread",
-        )
-    if publication.revision_number != lineage.latest_revision:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "publication revision is not the current thread lineage revision",
-        )
-    # GitHub repository owner and name are case-insensitive; the worker and the
-    # identity verifier already compare them with casefold.
-    expected_url = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
-    if data.pr_url.casefold() != expected_url.casefold():
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity does not match the publication repository",
-        )
-    if lineage.pr_number is not None and (
-        lineage.pr_number != data.pr_number
-        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
-    ):
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request identity no longer matches the stored thread lineage",
-        )
-    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
-        raise PublicationLineageConflict(
-            "publication.lineage_stale",
-            "pull request lineage version or expected head is stale",
-        )
-    if (
-        publication.version != data.expected_publication_version
-        or publication.lease_owner != data.lease_owner
-    ):
-        raise PublicationLineageConflict(
-            "publication.lease_lost",
-            "publication lease is no longer held by this worker",
-        )
-    if publication.status not in ("approved", "launching", "running"):
-        raise PublicationLineageConflict(
-            "publication.revision_not_approved",
-            "publication revision must be approved before advancing its lineage",
-        )
+    conflict = publication_lineage_outcome_conflict(publication, lineage, data)
+    if conflict is not None:
+        raise conflict
 
     identity_values: dict[str, Any] = {}
     if identity is not None:
@@ -1512,7 +1533,7 @@ async def advance_publication_lineage(
                 "publication.lineage_stale",
                 "immutable GitHub lineage identity changed",
             )
-        await _require_current_lineage_workspace(
+        await require_current_lineage_workspace(
             session,
             lineage,
             conflict_code="publication.lineage_stale",
@@ -1854,6 +1875,91 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
     return result
 
 
+# Per served agent: its approval route map, read fresh, and the (kind, address)
+# pairs of the adapter's bindings that belong to that agent.
+_ServedTargets = dict[uuid.UUID, tuple[Any, frozenset[tuple[str, str]]]]
+
+
+async def _adapter_served_targets(
+    session: AsyncSession, bindings: frozenset[uuid.UUID]
+) -> _ServedTargets:
+    """What an adapter serving ``bindings`` can reach, keyed by agent id.
+
+    Read fresh on every call, like ``get_approval_route_binding``: a binding
+    deleted or a route re-pointed after the credential was issued narrows what
+    the adapter sees immediately.
+    """
+
+    if not bindings:
+        return {}
+    rows = await session.execute(
+        select(
+            AgentChannel.agent_id,
+            AgentChannel.kind,
+            AgentChannel.address,
+            Agent.approval_routes,
+        )
+        .join(Agent, Agent.id == AgentChannel.agent_id)
+        .where(AgentChannel.id.in_(bindings))
+    )
+    pairs: dict[uuid.UUID, set[tuple[str, str]]] = {}
+    routes: dict[uuid.UUID, Any] = {}
+    for agent_id, kind, address, approval_routes in rows:
+        pairs.setdefault(agent_id, set()).add((kind, address))
+        routes[agent_id] = approval_routes
+    return {agent_id: (routes[agent_id], frozenset(p)) for agent_id, p in pairs.items()}
+
+
+def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
+    """THE served predicate (ADR-0154), shared by the list and the resolver.
+
+    An approval is served when it names an agent and a route, and that agent's
+    route resolves to the ``(kind, address)`` of one of the adapter's bindings
+    ON THE SAME AGENT. A routeless approval, or a route whose resolution is
+    missing or malformed, is served by no adapter: fail closed.
+    """
+
+    if approval.agent_id is None or not approval.route:
+        return False
+    target = targets.get(approval.agent_id)
+    if target is None:
+        return False
+    approval_routes, pairs = target
+    if not isinstance(approval_routes, dict):
+        return False
+    binding = approval_routes.get(approval.route)
+    if not isinstance(binding, dict):
+        return False
+    resolution = binding.get("resolution")
+    if not isinstance(resolution, dict):
+        return False
+    kind, address = resolution.get("kind"), resolution.get("address")
+    if not isinstance(kind, str) or not isinstance(address, str):
+        return False
+    return (kind, address) in pairs
+
+
+async def approval_served_by(
+    session: AsyncSession, approval: Approval, bindings: frozenset[uuid.UUID]
+) -> bool:
+    """Whether an adapter serving ``bindings`` may see and resolve ``approval``."""
+
+    return _approval_served(approval, await _adapter_served_targets(session, bindings))
+
+
+async def existing_channel_binding_ids(
+    session: AsyncSession, binding_ids: frozenset[uuid.UUID]
+) -> frozenset[uuid.UUID]:
+    """The subset of ``binding_ids`` that still name an ``agent_channels`` row."""
+
+    if not binding_ids:
+        return frozenset()
+    result = await session.scalars(
+        select(AgentChannel.id).where(AgentChannel.id.in_(binding_ids))
+    )
+    return frozenset(result)
+
+
 async def list_approvals(
     session: AsyncSession,
     *,
@@ -1861,16 +1967,36 @@ async def list_approvals(
     agent_id: uuid.UUID | None = None,
     conversation_id: str | None = None,
     limit: int = 50,
+    served_by: frozenset[uuid.UUID] | None = None,
 ) -> list[Approval]:
-    stmt = select(Approval).order_by(Approval.created_at.desc()).limit(limit)
+    """Newest first. ``served_by`` (an adapter principal's bindings) narrows the
+    result to approvals that adapter serves, BEFORE ``limit`` applies, so an
+    adapter never gets a short page because unserved rows took the slots."""
+
+    stmt = select(Approval).order_by(Approval.created_at.desc())
     if status is not None:
         stmt = stmt.where(Approval.status == status)
     if agent_id is not None:
         stmt = stmt.where(Approval.agent_id == agent_id)
     if conversation_id is not None:
         stmt = stmt.where(Approval.conversation_id == conversation_id)
-    result = await session.scalars(stmt)
-    return list(result)
+    if served_by is None:
+        result = await session.scalars(stmt.limit(limit))
+        return list(result)
+    targets = await _adapter_served_targets(session, served_by)
+    if not targets:
+        return []
+    # Narrow in SQL to the served agents' routed rows, then apply the one
+    # predicate the resolver also uses; the route map is JSONB, so the
+    # resolution match itself stays in Python. The SQL side still needs its
+    # own bound: `_approval_served` can only drop rows, never keep more than
+    # it's given, so a hard cap here (well above `limit`) keeps a busy agent's
+    # adapter listing from materializing every routed approval it has.
+    stmt = stmt.where(Approval.agent_id.in_(targets), Approval.route.is_not(None)).limit(
+        max(limit, 1000)
+    )
+    served = [a for a in await session.scalars(stmt) if _approval_served(a, targets)]
+    return served[:limit]
 
 
 async def pending_approval_inventory(
@@ -2167,11 +2293,14 @@ async def append_approval_audit(
     evidence: dict[str, Any] | None = None,
     principal_kind: str | None = None,
     authenticated: bool = False,
+    principal_subject: str | None = None,
 ) -> ApprovalAuditEntry:
     """Append one audit row (#247). Append-only by design; never updated.
 
     ``evidence`` (#420) is the membership snapshot the authorizer decided on;
-    None for writers that made no membership decision.
+    None for writers that made no membership decision. ``principal_subject``
+    names the adapter that transported an ``adapter`` principal's decision
+    (ADR-0154); None for every other kind.
     """
 
     entry = ApprovalAuditEntry(
@@ -2181,6 +2310,7 @@ async def append_approval_audit(
         actor_channel=actor_channel,
         principal_kind=principal_kind,
         authenticated=authenticated,
+        principal_subject=principal_subject,
         decision=decision,
         authorizer=authorizer,
         authorized=authorized,
@@ -2362,7 +2492,7 @@ async def revoke_console_session(
     return row
 
 
-async def _require_current_lineage_workspace(
+async def require_current_lineage_workspace(
     session: AsyncSession,
     lineage: ThreadPublicationLineage,
     *,
@@ -2417,7 +2547,7 @@ async def _require_review_binding(
         if lineage.binding_id
         else None
     )
-    await _require_current_lineage_workspace(
+    await require_current_lineage_workspace(
         session,
         lineage,
         conflict_code="publication.review_ineligible",

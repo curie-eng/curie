@@ -390,6 +390,22 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    # Tell the gate whether the platform's own ``curie-state`` tools exist this
+    # session (#2286 adversarial round). The toolPolicy exemption is by exact
+    # live tool name, and a name the platform never published is not ours -- an
+    # ambient project ``.mcp.json`` can mount a server keyed ``curie-state``,
+    # because ``strict_mcp_config`` is off. Set AFTER construction rather than
+    # passed to ``build_approval_gate`` deliberately: the gate is built above at
+    # the three fail-closed approval boot checks, which must raise before any
+    # other boot work happens, and hoisting ``resolve_state_client`` above them
+    # would reorder the boot to suit a field. Both this flag and the conditional
+    # mount below read the same ``state_client`` local, which nothing rebinds in
+    # between, so the exemption and the mount cannot disagree. The mount keeps
+    # its own ``is not None`` because ``build_state_server`` needs the narrowed
+    # client, not the bool.
+    state_mounted = state_client is not None
+    if approval_gate is not None:
+        approval_gate.state_server_mounted = state_mounted
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,

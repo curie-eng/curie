@@ -518,6 +518,100 @@
         "title": "ActionUndoOut",
         "type": "object"
       },
+      "AdapterPrincipalMint": {
+        "description": "Administrative request to issue one channel adapter credential (ADR-0154).",
+        "properties": {
+          "binding_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Binding Ids",
+            "type": "array"
+          },
+          "subject": {
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          },
+          "ttl_s": {
+            "default": 86400,
+            "exclusiveMinimum": 0.0,
+            "maximum": 604800.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "subject",
+          "binding_ids"
+        ],
+        "title": "AdapterPrincipalMint",
+        "type": "object"
+      },
+      "AdapterPrincipalOut": {
+        "description": "One-time delivery of a channel adapter credential.",
+        "properties": {
+          "binding_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Binding Ids",
+            "type": "array"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "kind": {
+            "const": "adapter",
+            "default": "adapter",
+            "title": "Kind",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "subject",
+          "binding_ids",
+          "scopes",
+          "expires_at"
+        ],
+        "title": "AdapterPrincipalOut",
+        "type": "object"
+      },
+      "AdapterPrincipalRotate": {
+        "description": "Self-rotation request: only the next credential's lifetime is chosen.",
+        "properties": {
+          "ttl_s": {
+            "default": 86400,
+            "exclusiveMinimum": 0.0,
+            "maximum": 604800.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "title": "AdapterPrincipalRotate",
+        "type": "object"
+      },
       "AdmissionFacts": {
         "properties": {
           "address": {
@@ -1167,7 +1261,8 @@
                 "enum": [
                   "chat",
                   "console",
-                  "operator"
+                  "operator",
+                  "adapter"
                 ],
                 "type": "string"
               },
@@ -1176,6 +1271,17 @@
               }
             ],
             "title": "Principal Kind"
+          },
+          "principal_subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Principal Subject"
           },
           "reason": {
             "anyOf": [
@@ -1197,6 +1303,7 @@
           "actor_channel",
           "principal_kind",
           "authenticated",
+          "principal_subject",
           "decision",
           "authorizer",
           "authorized",
@@ -9089,6 +9196,7 @@
     },
     "/approvals": {
       "get": {
+        "description": "List approvals, newest first. The platform key sees every row; an\nadapter principal sees only approvals routed to a binding it serves.",
         "operationId": "list_approvals_approvals_get",
         "parameters": [
           {
@@ -9164,6 +9272,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
             }
           }
         ],
@@ -9252,6 +9376,149 @@
           }
         },
         "summary": "Create Approval",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/approvals/principals/adapter": {
+      "post": {
+        "description": "Issue a channel adapter credential (ADR-0154); the platform key\nauthorizes issuance once and the adapter never presents it at runtime.\n\nEvery binding must exist now: a credential naming a row that does not\nexist would serve nothing, and silently dropping it would hide a typo.",
+        "operationId": "mint_adapter_principal_approvals_principals_adapter_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdapterPrincipalMint"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterPrincipalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Adapter Principal",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/approvals/principals/adapter/rotate": {
+      "post": {
+        "description": "Exchange a live adapter credential for the next one, same subject and\nbindings (ADR-0154), so the platform key never mints at runtime.\n\nBindings deleted since issuance are dropped rather than carried forward;\nan adapter left serving nothing gets 401, as an unusable credential would.",
+        "operationId": "rotate_adapter_principal_approvals_principals_adapter_rotate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AdapterPrincipalRotate"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterPrincipalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rotate Adapter Principal",
         "tags": [
           "approvals"
         ]
@@ -9472,6 +9739,38 @@
             }
           },
           {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Actor"
+            }
+          },
+          {
             "in": "cookie",
             "name": "curie_console_session",
             "required": false,
@@ -9528,7 +9827,7 @@
     },
     "/channels/token": {
       "post": {
-        "description": "Mint a `chn` token for one binding (platform key only).\n\nPlatform-key-only on purpose: a `chn` token does exactly one thing, enqueue\nfor the binding in its claims. If it could mint, a compromised adapter would\ndefeat both the TTL and the generation -- the only two things standing in for\na revocation list.\n\nThe token claims the ROW's id and the generation this mint stamps. Minting\nis a rotation write: it bumps the row under `FOR UPDATE` and signs the NEW\nvalue, so a remint revokes the token it replaces (#2379). The token also\ndies when the pair is deleted and recreated (a new row id) and when the\nbinding is re-pointed or merely re-asserted (another bump).",
+        "description": "Mint a `chn` token for one binding (platform key or adapter principal).\n\nNever a `chn` token: it does exactly one thing, enqueue for the binding in\nits claims. If it could mint, a compromised adapter would defeat both the\nTTL and the generation -- the only two things standing in for a revocation\nlist. An adapter principal (ADR-0154) may mint only for a binding in its own\nset, so a compromised adapter renews its own binding's token and nothing\nelse, under the same cap and the same generation bump.\n\nThe token claims the ROW's id and the generation this mint stamps. Minting\nis a rotation write: it bumps the row under `FOR UPDATE` and signs the NEW\nvalue, so a remint revokes the token it replaces (#2379). The token also\ndies when the pair is deleted and recreated (a new row id) and when the\nbinding is re-pointed or merely re-asserted (another bump).",
         "operationId": "mint_channel_token_channels_token_post",
         "parameters": [
           {
@@ -9545,6 +9844,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
             }
           }
         ],

@@ -1,7 +1,7 @@
 """Durable work items and bounded execution requests.
 
-Revision ID: 0045
-Revises: 0044
+Revision ID: 0046
+Revises: 0045
 Create Date: 2026-09-18
 """
 
@@ -11,8 +11,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0045"
-down_revision: str | None = "0044"
+revision: str = "0046"
+down_revision: str | None = "0045"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

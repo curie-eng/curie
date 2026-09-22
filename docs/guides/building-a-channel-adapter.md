@@ -73,7 +73,7 @@ ordered by `(kind, address)` -- an agent may hold more than one binding.
 Two credentials, in opposite directions, both operator-issued.
 
 **Inbound (your credential for calling the platform).** The operator mints a
-`chn` token, platform key only:
+`chn` token with the platform key:
 
 ```bash
 curl -X POST "$CURIE_API_URL/channels/token" \
@@ -81,6 +81,12 @@ curl -X POST "$CURIE_API_URL/channels/token" \
   -H 'Content-Type: application/json' \
   -d '{"kind":"email","address":"agent@example.com","ttl_s":3600}'
 ```
+
+An adapter principal (`adp` credential, ADR-0154) can also mint a `chn` token
+itself, but only for a binding in its own set; minting for any other binding is
+403. The platform key issues an adapter principal at
+`POST /approvals/principals/adapter`, and the adapter can rotate its own
+credential afterward without going back to the platform key.
 
 For the first-party mail adapter, `curie cluster channel-token <agent> --kind email --address <inbox>` mints, writes the Secret the adapter reads, and rolls it, so recovery is that one command rather than a curl plus a kubectl patch.
 

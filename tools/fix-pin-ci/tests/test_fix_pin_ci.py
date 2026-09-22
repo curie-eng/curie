@@ -1624,6 +1624,22 @@ def test_valid_fix_pin_ignores_closed_issue_milestone(
     assert not _pull_lookup_calls(tmp_path), "a direct train needs no prerequisite lookup"
 
 
+def test_not_applicable_fix_pin_ignores_issue_milestone_on_main(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        "Closes #12\n\nFix pin: n/a - milestone does not change this test surface\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone="v0.9.2",
+        base_ref="main",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert _gh_call_log(tmp_path).exists(), "a closed issue must be looked up even when excused"
+    assert not _pull_lookup_calls(tmp_path), "a direct main pull request needs no stack lookup"
+    assert not call_log.exists(), "an excused declaration must not run curie"
+
+
 def test_one_exact_same_repository_prerequisite_is_accepted_before_fix_pin_verification(
     tmp_path: Path,
 ) -> None:

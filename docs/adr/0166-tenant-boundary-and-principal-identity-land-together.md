@@ -1,4 +1,4 @@
-# 162. Tenant boundary and principal identity land together
+# 166. Tenant boundary and principal identity land together
 
 Date: 2026-09-20
 
@@ -7,9 +7,13 @@ Status: Accepted
 Accepted 2026-09-21 with explicit maintainer approval from Brian Conn, recorded
 on the publishing pull request (PR #2848, commit `9eda2941`). The decision was
 first published on `main` as ADR 0155; it is republished here on `next`, the
-branch that feature work targets, under the next free number because `next`
-already numbers 0155 through 0161 for other decisions. The body below is that
-text, unchanged.
+branch that feature work targets, under the next free number because `main`
+was reconciled forward into `next` after this republish was first drafted,
+bringing `main`'s own ADR 0155 onto `next` at its original number and pushing
+this republish's number from 0162 (already reused by `next`'s own renumbered
+"WorkItems own durable execution identity" ADR during that reconciliation) to
+0166, the next free number as of this merge. The body below is that text,
+unchanged.
 
 ## Context
 

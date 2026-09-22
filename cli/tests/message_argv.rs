@@ -2,6 +2,7 @@
 //! trap (#2498). Sibling verbs such as `cluster versions` take `<AGENT>` first;
 //! this verb routes by `--channel` (omit it when exactly one channel is bound).
 
+use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -23,6 +24,38 @@ fn run_in(dir: &Path, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .current_dir(dir)
+        .output()
+        .unwrap_or_else(|err| panic!("run curie {}: {err}", args.join(" ")))
+}
+
+fn run_with_kubeconfig(args: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kubeconfig = dir.path().join("config");
+    fs::write(
+        &kubeconfig,
+        r#"apiVersion: v1
+kind: Config
+current-context: test-ctx
+contexts:
+- name: test-ctx
+  context:
+    cluster: test-cluster
+    user: test-user
+clusters:
+- name: test-cluster
+  cluster:
+    server: https://127.0.0.1:6443
+users:
+- name: test-user
+  user: {}
+"#,
+    )
+    .expect("write isolated kubeconfig");
+
+    Command::new(bin())
+        .args(args)
+        .env("KUBECONFIG", &kubeconfig)
+        .current_dir(repo_root())
         .output()
         .unwrap_or_else(|err| panic!("run curie {}: {err}", args.join(" ")))
 }
@@ -217,6 +250,67 @@ fn cluster_message_single_text_dry_run_is_not_usage() {
     assert!(
         !text.contains("does not take an agent name"),
         "single-text must not trip the two-positional explanation\n{text}"
+    );
+}
+
+#[test]
+fn cluster_message_separated_context_single_text_dry_run_succeeds() {
+    let output = run_with_kubeconfig(&[
+        "cluster",
+        "message",
+        "--context",
+        "test-ctx",
+        ISSUE_TEXT,
+        "--dry-run",
+    ]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "separated --context <ctx> single-text --dry-run must succeed\n{text}"
+    );
+    assert!(
+        text.contains("Kubernetes context: test-ctx"),
+        "the named kubeconfig context must be resolved\n{text}"
+    );
+    assert!(
+        text.contains("enqueue a synthetic QueuedTurn"),
+        "the normal cluster message dry-run plan must be rendered\n{text}"
+    );
+    assert!(
+        !text.contains("does not take an agent name"),
+        "a valid separated context value must not trip the two-positional explanation\n{text}"
+    );
+}
+
+#[test]
+fn cluster_message_separated_context_two_positionals_keep_agent_refusal() {
+    let output = run_with_kubeconfig(&[
+        "cluster",
+        "message",
+        "--context",
+        "test-ctx",
+        ISSUE_AGENT,
+        ISSUE_TEXT,
+    ]);
+    assert_two_positional_usage(&output, "cluster message");
+}
+
+#[test]
+fn local_message_context_is_clap_error_not_agent_refusal() {
+    let output = run(&["local", "message", "--context", "test-ctx", ISSUE_TEXT]);
+    let text = combined(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "local message --context must be rejected by clap\n{text}"
+    );
+    assert!(
+        text.contains("unexpected argument"),
+        "local message --context must remain an unsupported local option\n{text}"
+    );
+    assert!(
+        !text.contains("does not take an agent name"),
+        "local unsupported --context must not be misclassified as the two-positional agent form\n{text}"
     );
 }
 
