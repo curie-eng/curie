@@ -1658,11 +1658,22 @@ class ConsoleSession(Base):
     """
 
     __tablename__ = "console_sessions"
+    __table_args__ = (Index("ix_console_sessions_principal_id", "principal_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Administrator-selected at login-code mint and immutable thereafter. NULL
     # preserves pre-ADR-0106 sessions, which cannot resolve approvals.
     subject: Mapped[str | None] = mapped_column(default=None)
+    # The principal an OIDC login established (#2908, ADR 0155 step 3). NULL on
+    # every login-code session. Deliberately a separate column from `subject`
+    # rather than the IdP `sub` written into it: approver sets match `subject`
+    # against provider ids (Slack user ids and the like), so an IdP-controlled
+    # `sub` stored there could equal a listed approver and inherit authority.
+    # CASCADE because a principal that is deleted outright must not leave a
+    # session behind that still names it.
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.principals.id", ondelete="CASCADE"), default=None
+    )
     # SHA-256 hex of the single-use login code. Unique so a hash collision or a
     # duplicate mint cannot produce two rows one code could satisfy.
     login_code_hash: Mapped[str] = mapped_column(unique=True, index=True)
@@ -1736,9 +1747,11 @@ class Tenant(Base):
 class Principal(Base):
     """A tenant scoped human or service identity (#2907, ADR 0155 step 2).
 
-    Keyed on the IdP subject within a tenant; ``email`` and ``display_name``
-    are attributes and never the identity key. A rebuildable projection of the
-    customer IdP, with no callers yet.
+    Keyed on the IdP issuer and subject within a tenant (#2908: an OIDC ``sub``
+    is only unique per issuer, so switching IdPs must not let the new one
+    inherit an old principal); ``email`` and ``display_name`` are attributes
+    and never the identity key. A rebuildable projection of the customer IdP,
+    created lazily by the generic OIDC login.
     """
 
     __tablename__ = "principals"
@@ -1753,7 +1766,10 @@ class Principal(Base):
             name="principals_authorization_version_ck",
         ),
         UniqueConstraint(
-            "tenant_id", "idp_subject", name="principals_tenant_idp_subject_key"
+            "tenant_id",
+            "idp_issuer",
+            "idp_subject",
+            name="principals_tenant_issuer_subject_key",
         ),
         # Target of principal_teams' tenant-scoped foreign key.
         UniqueConstraint("tenant_id", "id", name="principals_tenant_id_id_key"),
@@ -1761,6 +1777,9 @@ class Principal(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    # The OIDC `iss` that vouched for `idp_subject`. '' for rows that predate
+    # 0052, which no login can match because every login carries its issuer.
+    idp_issuer: Mapped[str] = mapped_column(String, default="", server_default="")
     idp_subject: Mapped[str] = mapped_column(String)
     type: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="active", server_default="active")
@@ -1844,5 +1863,37 @@ class PrincipalTeam(Base):
     source: Mapped[str] = mapped_column(String)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class OidcLoginAttempt(Base):
+    """One in-flight OIDC authorization-code login (#2908, ADR 0155).
+
+    Server-side, short-lived and single-use: the row exists from the redirect to
+    the IdP until the callback consumes it. It holds what the callback needs and
+    the browser must not be trusted with -- the nonce the ID token has to echo
+    and the PKCE verifier that makes a stolen authorization code useless -- the
+    same preference for durable server state over client-held state ADR-0083
+    took for console sessions. Only a HASH of ``state`` is stored, so reading
+    this table does not yield a value that completes someone's login.
+    """
+
+    __tablename__ = "oidc_login_attempts"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="oidc_login_attempts_state_hash_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # SHA-256 hex of the `state` the browser carries in the query and cookie.
+    state_hash: Mapped[str] = mapped_column(String)
+    nonce: Mapped[str] = mapped_column(String)
+    code_verifier: Mapped[str] = mapped_column(String)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Stamped by the one callback allowed to use this attempt.
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
