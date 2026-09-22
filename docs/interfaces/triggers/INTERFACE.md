@@ -42,7 +42,9 @@ another hardcoded handler. The four that exist:
 - **GitHub push** — `apps/api/src/curie_api/routers/github.py::github_webhook`:
   `@router.post("/webhook")` verifies the HMAC signature, then branches on
   `x_github_event`; a `"push"` event is handed to `process_push(...)`, a `"ping"`
-  is answered `"pong"`, and every other event is `"ignored"`.
+  is answered `"pong"`, review events follow the review ingress when that gate
+  is on, factory issue events follow signed factory intake when that gate is on,
+  and every other event is `"ignored"`.
 
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
   a timer in the API asks GitHub whether the deploy branches moved and hands any

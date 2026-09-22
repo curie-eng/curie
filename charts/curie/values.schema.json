@@ -34,6 +34,18 @@
           "exclusiveMinimum": 0,
           "description": "Positive cadence in seconds for reconciling accepted GitHub review feedback."
         },
+        "githubFactoryIngressEnabled": {
+          "type": "boolean",
+          "description": "Opt-in gate for signed GitHub issue admission. The API validates the App credentials, label, mention login, allowlist, and non-default webhook secret at boot."
+        },
+        "githubFactoryLabel": {
+          "type": "string",
+          "description": "Issue label that requests initial factory admission. Empty while intake is off."
+        },
+        "githubFactoryMention": {
+          "type": "string",
+          "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."
+        },
         "githubRepoAllowlist": {
           "type": "array",
           "uniqueItems": true,
