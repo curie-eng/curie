@@ -98,12 +98,14 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
             "author",
             "conversation_id",
             "event_id",
+            "hook_run",
             "received_at",
             "reply_handle",
             "source",
             "text",
         ]
     );
+    assert!(value["hook_run"].is_null());
     assert!(
         decoded.event_id.starts_with("EvSIM-"),
         "synthetic id keeps its collision-proof prefix on the wire"
