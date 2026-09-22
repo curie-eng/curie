@@ -571,7 +571,8 @@ def judge_outcome(
         names = [*(pr.get("files") or []), *(pr.get("previous_filenames") or [])]
         github = [f for f in names if str(f).startswith(".github/")]
         if github:
-            failures.append(f"pull request #{number} changes files under .github/: {github}")
+            shown = [redact_agent_text(str(f), secrets)[0] for f in github]
+            failures.append(f"pull request #{number} changes files under .github/: {shown}")
         for where, texts in _pr_texts(pr).items():
             for text in texts:
                 if any(secret and secret in text for secret in secrets):

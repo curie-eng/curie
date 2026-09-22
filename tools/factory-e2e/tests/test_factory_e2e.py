@@ -937,3 +937,27 @@ def test_no_pull_request_needs_the_could_not_complete_contract() -> None:
     assert fe.judge_outcome(_comment_ending(agent_final_reply="Could not complete:   "), "any")
     ok = _comment_ending(agent_final_reply="Sorry. could not complete: tests need a DB.")
     assert fe.judge_outcome(ok, "any") == []
+
+
+def test_github_path_failure_never_echoes_a_credential_in_the_file_name() -> None:
+    secret = "known-secret-value-0123456789"
+    shaped = "ghp_" + "A" * 36
+    outcome = {
+        "terminal": True,
+        "pull_requests": [
+            {
+                "number": 3,
+                "files": [f".github/{secret}", f".github/{shaped}"],
+                "previous_filenames": [],
+                "diff": "",
+            }
+        ],
+        "terminus_comments": 0,
+        "default_branch_moved": False,
+        "elapsed_seconds": 10.0,
+    }
+    failures = fe.judge_outcome(outcome, "pr", secrets=[secret])
+    joined = json.dumps(failures)
+    assert any(".github/" in f for f in failures)
+    assert secret not in joined
+    assert shaped not in joined
