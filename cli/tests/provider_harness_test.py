@@ -696,6 +696,75 @@ else:
         with self.assertRaises(ValueError):
             provider_harness.require_owned_name("shared-connector-secrets")
 
+    def test_owned_secret_path_requires_owned_prefix_and_one_safe_leaf(self):
+        owned = "curie-aws-secrets-e2e-20260922000000-abc123/acme-harness-fixture"
+        self.assertEqual(provider_harness.require_owned_secret_path(owned), owned)
+        self.assertEqual(
+            provider_harness.require_owned_secret_path(owned + "-rotated"), owned + "-rotated"
+        )
+        for rejected in (
+            "shared-prefix/acme-harness-fixture",
+            "curie-aws-secrets-e2e-r1/../acme-harness-fixture",
+            "curie-aws-secrets-e2e-r1/acme..fixture",
+            "curie-aws-secrets-e2e-r1/acme/fixture",
+            "curie-aws-secrets-e2e-r1/Acme-Fixture",
+            "Curie-aws-secrets-e2e-r1/acme-fixture",
+            "curie-aws-secrets-e2e-r1",
+            "curie-aws-secrets-e2e-r1/",
+        ):
+            with self.assertRaises(ValueError, msg=rejected):
+                provider_harness.require_owned_secret_path(rejected)
+
+    def test_first_revert_index_flags_any_sample_off_the_live_rotation(self):
+        live = "a" * 64
+        self.assertIsNone(provider_harness.first_revert_index([live, live, live], live))
+        self.assertIsNone(provider_harness.first_revert_index([], live))
+        self.assertEqual(provider_harness.first_revert_index([live, "b" * 64, live], live), 1)
+        self.assertEqual(provider_harness.first_revert_index([None, live], live), 0)
+
+    def test_rotation_report_parser_accepts_known_outcomes_only(self):
+        good = json.dumps(
+            {
+                "entry": "acme-harness-fixture",
+                "seeds": [{"key": "ROTATED_KEY", "outcome": "already_present"}],
+            }
+        ).encode()
+        self.assertEqual(
+            provider_harness.parse_rotation_report(good + b"\n", ["ROTATED_KEY"]),
+            {"ROTATED_KEY": "already_present"},
+        )
+        for outcome in ("no_backup", "not_in_backup", "created", "added"):
+            payload = json.dumps(
+                {"entry": "e", "seeds": [{"key": "ROTATED_KEY", "outcome": outcome}]}
+            ).encode()
+            self.assertEqual(
+                provider_harness.parse_rotation_report(payload, ["ROTATED_KEY"]),
+                {"ROTATED_KEY": outcome},
+            )
+        rejected = [
+            {"entry": "e", "seeds": [{"key": "ROTATED_KEY", "outcome": "overwritten"}]},
+            {"entry": "e", "seeds": []},
+            {"entry": "e"},
+            {"seeds": [{"key": "ROTATED_KEY", "outcome": "added"}]},
+            {"entry": "e", "seeds": [{"key": "OTHER_KEY", "outcome": "added"}]},
+            {
+                "entry": "e",
+                "seeds": [
+                    {"key": "ROTATED_KEY", "outcome": "added"},
+                    {"key": "ROTATED_KEY", "outcome": "added"},
+                ],
+            },
+        ]
+        for payload in rejected:
+            with self.assertRaises(provider_harness.HarnessError, msg=payload):
+                provider_harness.parse_rotation_report(
+                    json.dumps(payload).encode(), ["ROTATED_KEY"]
+                )
+        with self.assertRaises(provider_harness.HarnessError):
+            provider_harness.parse_rotation_report(good + b"\n" + good, ["ROTATED_KEY"])
+        with self.assertRaises(provider_harness.HarnessError):
+            provider_harness.parse_rotation_report(b"", ["ROTATED_KEY"])
+
     def test_private_files_are_created_with_owner_only_access_and_checked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
