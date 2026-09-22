@@ -752,12 +752,40 @@ release binary has no dev scripts.
 | `curie dev verify-fix-pin <CHANGE> <SELECTOR>` | Prove that a fix makes the selected test fail when only its product files are reversed. |
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |
+| `curie dev secrets-e2e` | Prove AWS Secrets Manager sync and rotation through External Secrets on an owned kind cluster. Defaults to the emulator with External Secrets installed. |
 | `curie dev field-parity` | `bash cli/scripts/check-field-parity.sh` -- assert CLI `api.rs` mirror structs cover their platform API model fields (#691), and CLI `commands.rs`/`spec.rs` mirror structs cover the frozen `packages/plugin-format` schema's fields (#701). |
 | `curie dev emit-parity` | `bash cli/scripts/check-emit-parity.sh` -- assert a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal covers that struct's fields, one hop downstream of `field-parity` (#699). |
 | `curie dev wire-tolerance` | `bash scripts/check-wire-tolerance.sh` -- assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception (#625). |
 | `curie dev restore-drill` | `bash cli/scripts/restore-drill.sh` -- bounded synthetic restore of postgres, bundles, mail SQLite, and Valkey from a disposable compose install onto a distinct target (#2427). `--check-backup` is the completeness guard; `--negative` omits a required component and expects refusal. Not an RPO/RTO claim or a production backup product. |
 | `curie dev upgrade-drill` | `bash cli/scripts/upgrade-drill.sh` -- isolated retained-upgrade drill (#2426): published v0.8.6 CLI/chart/images on a task-owned kind install, candidate CLI upgrade, drain/apply interrupt recovery, leftover-hook non-quiesce, compatible rollback that serves a new turn, and incompatible 0.8.4 schema rollback refused before Helm mutates. `--also-predecessor` adds the published v0.8.7 happy path. Refuses the permanent soak. Live provider/channel rows fail closed when credential references are absent. |
 | `curie dev release-accept` | Read-only evaluator for the seven-day / 200-canary release gate (#2430). `--self-test` proves a synthetic qualifying ledger passes and that independently missing each criterion fails closed. `--ledger PATH` evaluates a private evidence file as a live result; fixture or source proof cannot qualify. Does not start a campaign, rotate credentials, or mutate the soak. |
+
+Run the secrets harness from a clean, committed source checkout with the current
+`curie` binary built from that checkout. It requires Docker, kind, kubectl, and
+uv. Modes that install or use External Secrets also require Helm and AWS CLI v2.
+The harness uses a private kubeconfig for its owned cluster and prints its
+private cleanup ledger path before the first mutation.
+
+```bash
+curie dev secrets-e2e --ci
+curie dev secrets-e2e --eso none
+curie dev secrets-e2e --real-aws
+curie dev secrets-e2e --seed path/to/seed.json
+```
+
+`--ci` runs the emulator once with External Secrets and once without it.
+`--eso none` performs the image load and bundle validation case without
+installing External Secrets. `--seed` replaces the checked in synthetic fixture;
+the file must be a flat JSON object containing exactly `STATIC_KEY` and
+`ROTATED_KEY`, both with nonempty string values.
+
+`--real-aws` is explicit and uses only profile `theconnman` in `us-east-1`. It
+creates purpose tagged resources with the `curie-aws-secrets-e2e-` prefix and
+cleans up those exact resources. The temporary public S3 issuer exposes only
+the discovery and JWKS documents. Preflight refuses the run when account S3
+public access settings block that policy or matching tagged resources already
+exist. `--ci` cannot be combined with `--eso` or `--real-aws`, and
+`--real-aws` cannot be combined with `--eso none`.
 
 Use `curie dev verify-fix-pin <CHANGE> <SELECTOR>` from a source checkout to
 verify a fix commit or pull request. `<CHANGE>` accepts a committed change
