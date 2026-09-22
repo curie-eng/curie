@@ -15,6 +15,7 @@ use curie::ops::{
     parse_helm_history, rollback, select_rollback_revision, ClusterRollbackOutput, CommonOpts,
     HelmRevision, RollbackOpts,
 };
+use curie::schema_compat::{pending_revisions, plan_upgrade, TargetMetadata};
 use curie::schema_window::{live_in_window, window_for};
 
 fn catalog_marks_artifact_identity_ambiguous(version: &str) -> bool {
@@ -61,22 +62,68 @@ fn v089_published_window_ends_at_0039_and_requires_artifact_identity() {
     assert!(catalog_marks_artifact_identity_ambiguous("0.8.9"));
 }
 
-/// Release v0.9.0 shipped Alembic head 0044 and serves the 0045 expand (#2806),
-/// so its catalog head is 0045. Pin both the accepted live head and the
-/// fail-closed boundary for an unknown successor.
+/// The released 0.9.0 and 0.9.1 artifacts stop at Alembic head 0044. Pin the
+/// accepted live head and the boundary before the later 0.9.2 migration.
 #[test]
-fn v090_accepts_0045_and_refuses_an_unknown_newer_revision() {
-    let window = window_for("0.9.0").expect("0.9.0 is catalogued");
-    assert_eq!(window.schema_min, "0001");
+fn v090_and_v091_accept_0044_and_refuse_0045() {
+    for version in ["0.9.0", "0.9.1"] {
+        let window = window_for(version).unwrap_or_else(|| panic!("{version} is catalogued"));
+        assert_eq!(window.schema_min, "0001", "{version}");
+        assert_eq!(window.schema_head, "0044", "{version}");
+        assert!(live_in_window("0044", &window), "{version}");
+        assert!(live_in_window("0039", &window), "{version}");
+        assert!(!live_in_window("0045", &window), "{version}");
+        assert!(
+            !catalog_marks_artifact_identity_ambiguous(version),
+            "{version} has one unambiguous released artifact identity"
+        );
+    }
+}
+
+/// The 0.9.2 chart establishes the new 0045 serving floor and head.
+#[test]
+fn v092_accepts_0045_and_refuses_outside_its_single_revision_window() {
+    let window = window_for("0.9.2").expect("0.9.2 is catalogued");
+    assert_eq!(window.schema_min, "0045");
     assert_eq!(window.schema_head, "0045");
-    assert!(live_in_window("0044", &window));
-    assert!(live_in_window("0039", &window));
+    assert!(!live_in_window("0044", &window));
     assert!(live_in_window("0045", &window));
     assert!(!live_in_window("0046", &window));
     assert!(
-        !catalog_marks_artifact_identity_ambiguous("0.9.0"),
-        "0.9.0 has one unambiguous released artifact identity"
+        !catalog_marks_artifact_identity_ambiguous("0.9.2"),
+        "0.9.2 has one unambiguous released artifact identity"
     );
+}
+
+/// The installed 0.9.1 source reports catalog head 0044 while the target chart
+/// provides its own graph and makes 0045 the only pending live migration.
+#[test]
+fn v091_catalog_source_head_and_chart_target_graph_pin_the_0045_boundary() {
+    let source = window_for("0.9.1").expect("0.9.1 is catalogued");
+    let target: TargetMetadata =
+        serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
+            .expect("packaged chart schema compatibility metadata parses");
+
+    assert_eq!(source.schema_head, "0044");
+    assert_eq!(target.schema_min, "0045");
+    assert_eq!(target.schema_head, "0045");
+
+    let pending =
+        pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].revision, "0045");
+    assert_eq!(pending[0].kind, "expand");
+
+    let decision = plan_upgrade(
+        Some("0044"),
+        &target,
+        &pending,
+        false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(decision.action, "apply");
+    assert_eq!(decision.source_head.as_deref(), Some("0044"));
+    assert_eq!(decision.target_min, "0045");
 }
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
