@@ -351,7 +351,11 @@ def aws_environment(
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
     ):
         environment.pop(key, None)
+    for key in tuple(environment):
+        if key == "AWS_ENDPOINT_URL" or key.startswith("AWS_ENDPOINT_URL_"):
+            environment.pop(key)
     environment["AWS_EC2_METADATA_DISABLED"] = "true"
+    environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"] = "true"
     if credentials_path is not None:
         environment["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials_path)
     if config_path is not None:
@@ -1108,7 +1112,7 @@ class HarnessCase:
         self.prove_public_issuer()
         issuer_host = self.issuer.removeprefix("https://")
         expected_oidc_arn = f"arn:aws:iam::{self.account_id}:oidc-provider/{issuer_host}"
-        oidc_row = self.ledger.record_intent("iam_oidc_provider", expected_oidc_arn)
+        oidc_row = self.ledger.record_intent("iam_oidc_provider", issuer_host)
         result = self.aws(
             "iam",
             "create-open-id-connect-provider",
@@ -1127,7 +1131,7 @@ class HarnessCase:
         )
         if self.oidc_arn != expected_oidc_arn:
             raise HarnessError("IAM OIDC provider identity is invalid")
-        self.ledger.mark_created(oidc_row, self.oidc_arn)
+        self.ledger.mark_created(oidc_row, issuer_host)
         trust = write_private_file(
             self.work / "trust.json",
             json.dumps(
@@ -1774,12 +1778,13 @@ class HarnessCase:
                 action="delete exact IAM role",
                 allow_failure=True,
             )
-        elif target.kind == "iam_oidc_provider" and target.identity.startswith("arn:"):
+        elif target.kind == "iam_oidc_provider":
+            oidc_arn = f"arn:aws:iam::{self.account_id}:oidc-provider/{target.identity}"
             self.aws(
                 "iam",
                 "delete-open-id-connect-provider",
                 "--open-id-connect-provider-arn",
-                target.identity,
+                oidc_arn,
                 action="delete exact IAM OIDC provider",
                 allow_failure=True,
             )
@@ -1819,7 +1824,15 @@ class HarnessCase:
             )
         elif target.kind == "kind_cluster" and not real_cluster_already_attempted:
             self.runner.run(
-                ["kind", "delete", "cluster", "--name", target.identity],
+                [
+                    "kind",
+                    "delete",
+                    "cluster",
+                    "--name",
+                    target.identity,
+                    "--kubeconfig",
+                    str(self.admin_kubeconfig),
+                ],
                 "delete owned kind cluster",
                 allow_failure=True,
                 timeout=180,
@@ -1851,7 +1864,15 @@ class HarnessCase:
                 cluster_name = cluster_target.identity
                 try:
                     self.runner.run(
-                        ["kind", "delete", "cluster", "--name", cluster_name],
+                        [
+                            "kind",
+                            "delete",
+                            "cluster",
+                            "--name",
+                            cluster_name,
+                            "--kubeconfig",
+                            str(self.admin_kubeconfig),
+                        ],
                         "delete owned kind cluster before AWS cleanup",
                         timeout=180,
                     )
@@ -1923,13 +1944,14 @@ class HarnessCase:
                     ),
                     timeout=120,
                 )
-            elif target.kind == "iam_oidc_provider" and target.identity.startswith("arn:"):
+            elif target.kind == "iam_oidc_provider":
+                oidc_arn = f"arn:aws:iam::{self.account_id}:oidc-provider/{target.identity}"
                 wait_until(
                     "IAM OIDC provider deletion",
-                    lambda target=target: self.aws_reports_absent(
+                    lambda oidc_arn=oidc_arn: self.aws_reports_absent(
                         "iam",
                         "get-open-id-connect-provider",
-                        ["--open-id-connect-provider-arn", target.identity],
+                        ["--open-id-connect-provider-arn", oidc_arn],
                         "verify IAM OIDC provider absent",
                         ["NoSuchEntity"],
                     ),

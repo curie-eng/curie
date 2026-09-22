@@ -151,6 +151,74 @@ else:
             finally:
                 shutil.rmtree(case.work)
 
+    def test_configured_aws_endpoints_are_ignored_but_explicit_emulator_endpoint_is_used(self):
+        ambient = {
+            "AWS_ENDPOINT_URL": "https://ambient.example.com",
+            "AWS_ENDPOINT_URL_SECRETS_MANAGER": "https://service.example.com",
+            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "false",
+        }
+        previous = {key: os.environ.get(key) for key in ambient}
+        os.environ.update(ambient)
+        try:
+            environment = provider_harness.aws_environment()
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertNotIn("AWS_ENDPOINT_URL", environment)
+        self.assertNotIn("AWS_ENDPOINT_URL_SECRETS_MANAGER", environment)
+        self.assertEqual(environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"], "true")
+
+        class CaptureRunner:
+            def __init__(self, private_dir):
+                self.private_dir = private_dir
+                self.argv = None
+                self.environment = None
+
+            def run(self, argv, _action, *, env=None, **_kwargs):
+                self.argv = list(argv)
+                self.environment = env
+                stderr_path = provider_harness.write_private_file(
+                    self.private_dir / "aws.stderr", b""
+                )
+                return provider_harness.ToolResult(0, b"{}", stderr_path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            case = provider_harness.HarnessCase(
+                repo_root=root,
+                snapshot=root,
+                commit="a" * 40,
+                seed={
+                    provider_harness.STATIC_KEY: "synthetic-static",
+                    provider_harness.ROTATED_KEY: "synthetic-initial",
+                },
+                mode="preinstalled",
+                real_aws=False,
+                curie_bin=root / "curie",
+            )
+            capture = CaptureRunner(case.work)
+            try:
+                case.aws_env = environment
+                case.aws_endpoint = "http://127.0.0.1:5000"
+                case.runner = capture
+                case.aws(
+                    "secretsmanager",
+                    "list-secrets",
+                    action="capture explicit emulator endpoint",
+                )
+                self.assertIsNotNone(capture.argv)
+                endpoint_index = capture.argv.index("--endpoint-url")
+                self.assertEqual(capture.argv[endpoint_index + 1], case.aws_endpoint)
+                self.assertEqual(
+                    capture.environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"], "true"
+                )
+            finally:
+                shutil.rmtree(case.work)
+
     def test_cleanup_attempts_every_target_and_verification_after_a_delete_failure(self):
         class FaultInjectedCleanupCase(provider_harness.HarnessCase):
             def __init__(self, *args, **kwargs):
