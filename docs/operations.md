@@ -1308,6 +1308,155 @@ with anything. If such an approval expires, its message keeps its buttons.
 Edit or delete that Slack message by hand, or ignore it -- the approval itself
 is expired in the API either way, so a click on it cannot approve anything.
 
+## When the schema upgrade refuses over an approval's reply identity
+
+Two revisions record where an approval's reply has to go back through:
+`0022` writes `approvals.reply_kind`, and `0024` writes the `reply_adapter`
+that names the egress identity authenticating it. Both establish that from the
+bindings the installation actually has, and both **refuse** rather than guess
+when a row's identity cannot be established. An upgrade that stops here fails
+the `-schema-migrate` Job with a message naming every offending approval id.
+
+Nothing is deleted and no approval is settled to clear it. Deleting the row
+destroys the audit history, and settling one does not help anyway: neither
+preflight reads `status`. The supported recovery is a round trip.
+
+### 1. Report
+
+**Read the failed Job's log.** The refusal is self-sufficient: it lists every
+approval the migration could not reconstruct, its `reply_channel`, its status
+and why it could not be reconstructed, and then prints a declaration document
+skeleton with one entry per row, ready to fill in.
+
+```sh
+kubectl -n curie logs job/curie-schema-migrate
+```
+
+That matters rather than being a convenience. `schema_compat.json` sets the
+minimum schema the API serves to its own head, so the API that answers the
+identity report **refuses to start against a pre-head schema** -- and a blocked
+installation is on one by definition. On an installation that is *not* blocked,
+the same facts come from the CLI:
+
+```sh
+curie --json cluster approvals <agent> --report-identity > identity-report.json
+```
+
+Two things about that command line are not optional. `cluster approvals` takes
+a **required positional agent**, so the command has to name one even though this
+report is installation-wide and ignores it -- pass any existing agent. And the
+report is a payload, so it needs the global **`--json`** flag: the default human
+output summarizes the facts and does not emit a document you can feed back.
+
+The CLI wraps the report under `identity_report`, which carries `approvals`
+(one facts entry per approval) and `declarations` (the skeleton, one entry per
+row, every field but the id left for you). Lift the skeleton into the document
+the migration consumes:
+
+```sh
+jq '{declarations: .identity_report.declarations}' identity-report.json > declarations.json
+```
+
+That is the same document the failed Job prints, in the same shape.
+
+### 2. Declare
+
+Fill the skeleton in by hand. It is a statement that a human knows what the
+approval was **raised** on -- not what its address happens to be bound to now,
+which is the thing the schema already cannot tell.
+
+```json
+{
+  "declarations": [
+    {
+      "approval_id": "0f2b1d6e-...",
+      "reply_kind": "email",
+      "reply_adapter": "smtp-primary",
+      "actor": "U0OPERATOR",
+      "reason": "raised on the smtp-primary egress, retired since"
+    }
+  ]
+}
+```
+
+Every field is required. `reply_adapter` may be `null`, and only `null`, for a
+Slack row, which legitimately has no adapter. A document that is unparseable,
+missing a field, or naming an approval the migration does not report is refused
+whole: none of its declarations are applied, and the refusal names the file and
+the offending entry. A declaration for a row the migration **can** reconstruct
+is also refused -- the migration's own answer wins, because overriding
+provenance the schema can still prove is a rewrite, not a recovery.
+
+### 3. Supply it to the upgrade
+
+The document is mounted from a Secret you create, never passed as a Helm value:
+`helm get values` would keep an inline declaration in the release forever and
+re-apply it to every later upgrade, whereas a Secret can be deleted afterwards,
+which makes the grant single-use.
+
+```sh
+kubectl -n curie create secret generic curie-approval-declarations \
+  --from-file=declarations.json=./declarations.json
+```
+
+Then set `api.migrate.provenanceDeclarationsSecret=curie-approval-declarations`
+and run the upgrade. The Job mounts it read-only and reads it through
+`CURIE_APPROVAL_PROVENANCE_DECLARATIONS`. Delete the Secret and unset the value
+once the upgrade succeeds; a document left mounted that names an
+already-migrated approval produces a loud refusal on the next upgrade rather
+than silently re-applying.
+
+### 4. Read the record back
+
+Each honored declaration appends exactly one `approval_audit_entries` row, so
+the bypass is attributed and reviewable rather than silent:
+
+```sql
+SELECT approval_id, actor, reason, evidence
+FROM curie.approval_audit_entries
+WHERE action = 'provenance_declaration_honored'
+ORDER BY created_at;
+```
+
+`evidence` carries the declared kind and adapter, the revision that honored it,
+and the reason the migration could not reconstruct the row on its own.
+
+### The fence, and why your API stays up
+
+Both revisions take `curie.agent_channels` and then `curie.approvals` in ACCESS
+EXCLUSIVE for the length of their own transaction, so the preflight, the
+backfill and the constraint tightening are one unit and a binding cannot be
+re-pointed in the middle of them. A concurrent approval insert or binding write
+**blocks and then succeeds**: an in-flight turn's approval request is queued,
+never refused.
+
+The mode is the strongest one each revision needs, taken up front on purpose.
+A weaker fence would let a reader through, but the revision's own `ADD COLUMN`
+needs ACCESS EXCLUSIVE anyway, so the fence would have to be upgraded mid
+transaction -- and an ordinary resolver that reads an approval and then writes
+its decision closes that cycle, which PostgreSQL breaks by aborting one side.
+Taking the strong lock first costs concurrent reads of these two tables a brief
+wait for the migration's duration, and buys back never killing a live
+resolution.
+
+The two tables are locked one after the other, `agent_channels` first, because
+that is the order every writer touching both uses: deleting an agent removes its
+bindings and then cascades into its approvals, and publication writes the
+binding before the approval. In that order a writer cannot deadlock against the
+fence. A reader can: the approval-recovery endpoint reads `approvals` and then
+`agent_channels`, the opposite order, and no single order suits both. When a
+read and the fence do cycle, PostgreSQL detects it after `deadlock_timeout`
+(1 s by default) and aborts one side. Both outcomes are safe. An aborted
+migration has changed nothing and the migrate Job retries it (`backoffLimit: 3`);
+an aborted recovery read changed nothing and is answered with HTTP 409 and a
+plain instruction to retry, rather than a 500.
+
+If the fence cannot be taken inside `CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS`
+(`api.migrate.fenceLockTimeoutMs`, default 15000) the migration refuses
+**before mutating anything**, names the session that held the table, and the
+database is exactly as it was. Stop that writer, or raise the bound, and
+re-run.
+
 ## Which claim env reaches which sandbox container
 
 Almost nobody writes a `SandboxClaim` by hand -- the worker creates them. But

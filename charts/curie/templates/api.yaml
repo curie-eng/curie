@@ -273,6 +273,8 @@ spec:
             # instead of disabling. <= 0 disables the sweeper.
             - name: APPROVAL_SWEEP_INTERVAL_S
               value: {{ .Values.api.approvalSweepIntervalSeconds | quote }}
+            - name: CURIE_APPROVAL_RECOVERY_ENABLED
+              value: {{ .Values.api.approvalRecovery.enabled | quote }}
             # How long a fetched user-group member set is reused (#420). Rendered
             # unconditionally for the same reason as the sweeper above: 0 is the
             # meaningful strict-mode value (fetch per resolve) and is falsy in Go

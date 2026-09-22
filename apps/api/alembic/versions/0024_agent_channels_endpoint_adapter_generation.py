@@ -67,6 +67,14 @@ from urllib.parse import urlsplit
 
 import sqlalchemy as sa
 from alembic import op
+from curie_api.migration_fence import (
+    AUDIT_COLUMNS_AT_0013,
+    UnreconstructableRow,
+    fence_identity_tables,
+    honor_declarations,
+    load_declarations,
+    report_and_guidance,
+)
 
 revision: str = "0024"
 down_revision: str | None = "0023"
@@ -108,6 +116,14 @@ def _redacted(endpoint: str | None) -> str:
 def upgrade() -> None:
     conn = op.get_bind()
 
+    # The identity fence, same two tables in the same order as 0022 and
+    # `0037_multibinding_state_identity.py`, so no two of them can deadlock.
+    # Everything below commits as one unit behind it, and a concurrent binding
+    # write or approval insert blocks and then succeeds rather than being
+    # refused. ACCESS EXCLUSIVE, up front: the ADD COLUMNs below need it, and
+    # taking it later would be a lock upgrade -- see `migration_fence`.
+    fence_identity_tables(conn)
+
     op.add_column(TABLE, sa.Column("endpoint", sa.String(), nullable=True), schema=SCHEMA)
     op.add_column(TABLE, sa.Column("adapter", sa.String(), nullable=True), schema=SCHEMA)
     op.add_column(
@@ -136,6 +152,12 @@ def upgrade() -> None:
     # database reaching this line can have a binding that names an adapter. A
     # pre-existing non-Slack approval therefore has no adapter provenance
     # ANYWHERE in the schema, and the only honest answer is to stop.
+    #
+    # `ap.reply_adapter IS NULL` is part of the question, not an optimization: a
+    # row 0022 recovered by declaration already carries its egress identity ON
+    # THE APPROVAL, which is where `resumequeue` reads it from. It is routable,
+    # so it is not unroutable, and dropping it from this set is what lets ONE
+    # mounted document carry an operator through `alembic upgrade head`.
     unroutable = conn.execute(
         sa.text(
             f"""
@@ -145,6 +167,7 @@ def upgrade() -> None:
                    ap.status AS status
             FROM {SCHEMA}.{APPROVALS} ap
             WHERE ap.reply_kind <> :slack
+              AND ap.reply_adapter IS NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM {SCHEMA}.{TABLE} c
@@ -157,11 +180,47 @@ def upgrade() -> None:
         ),
         {"slack": SLACK},
     ).all()
-    if unroutable:
+    # The declaration arm, for exactly the rows above. 0024's unreconstructable
+    # question is a different one from 0022's -- a non-Slack approval whose
+    # reply has no egress identity anywhere in the schema -- and it takes the
+    # same disposition: an operator vouches per row, one audit row records it,
+    # and nothing is settled or deleted to get the migration through.
+    rows = [
+        UnreconstructableRow(
+            approval_id=str(row.id),
+            reply_channel=row.reply_channel,
+            status=row.status,
+            reason=(
+                f"no {row.reply_kind!r} binding at its address names an adapter, "
+                "and this revision creates the adapter column NULL"
+            ),
+        )
+        for row in unroutable
+    ]
+    # What 0022 already established for each of these rows. The kind is a
+    # recovered fact about the ORIGINAL turn; this revision is missing only the
+    # adapter half, so a declaration that names a different kind is refused and
+    # one that agrees recovers the adapter alone.
+    established_kinds = {str(row.id): row.reply_kind for row in unroutable}
+    honored = honor_declarations(
+        conn,
+        unreconstructable={row.approval_id: row.reason for row in rows},
+        declarations=load_declarations(),
+        established_kinds=established_kinds,
+        revision=revision,
+        audit_columns=AUDIT_COLUMNS_AT_0013,
+    )
+    rows = [row for row in rows if row.approval_id not in honored]
+
+    # The refusal carries the whole disposition, for the same reason 0022's
+    # does: a blocked installation is on a pre-head schema, so the API that
+    # serves the identity report cannot start against it, and this Job's log is
+    # the only place the operator can be told what to do.
+    if rows:
         detail = "; ".join(
-            f"{row.id} (reply_channel {row.reply_channel!r}, kind "
-            f"{row.reply_kind!r}, status {row.status})"
-            for row in unroutable
+            f"{row.approval_id} (reply_channel {row.reply_channel!r}, "
+            f"status {row.status})"
+            for row in rows
         )
         raise RuntimeError(
             "cannot complete the approval routing backfill (#1459): these "
@@ -170,13 +229,10 @@ def upgrade() -> None:
             "A pre-existing non-Slack approval has no adapter provenance anywhere "
             "in the schema; resuming it would POST the reply with no credential "
             "and fail closed inside the worker, days after the fact and far from "
-            "any request. Remediation is to DRAIN them, exactly as the quiescent "
-            "cutover's step does: settle each approval above (POST "
-            "/approvals/{id}/resolve, or let it expire) and confirm it has "
-            "resumed or been abandoned, then re-run this migration. Configuring "
-            "the bindings first is NOT an option -- the endpoint and adapter "
-            "columns those routes live in are created by this very revision, so "
-            "no route can exist until it completes."
+            "any request. Configuring the bindings first is NOT an option -- the "
+            "endpoint and adapter columns those routes live in are created by this "
+            "very revision, so no route can exist until it completes. "
+            + report_and_guidance(rows, revision=revision)
         )
 
 

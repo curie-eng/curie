@@ -72,6 +72,9 @@ fn gates(out: &ApprovalsOutput) -> (Vec<String>, Option<String>) {
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the gate view, not a console login-code mint")
         }
+        ApprovalsOutput::IdentityReport { .. } | ApprovalsOutput::Recovered { .. } => {
+            panic!("expected the gate view, not an administrative recovery result")
+        }
     }
 }
 
