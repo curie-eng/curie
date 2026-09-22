@@ -9,9 +9,10 @@ from datetime import timedelta
 
 from channel_protocol.reply import ReplyTarget
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .publication_loop import PublicationWork
+from .publication_loop import PublicationIdentity, PublicationWork
 from .reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute
 
 _SAFE_SCHEMA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -19,6 +20,22 @@ _SAFE_SCHEMA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 class PublicationStoreError(RuntimeError):
     """A durable publication transition lost its compare-and-swap."""
+
+
+# The SET half of the identity capture in _terminal_cas, spliced into the
+# lineage advance only when the worker holds a verified identity. It lives here,
+# already indented for its splice site, so that method reads as "update the
+# parameters, assign the two fragments" instead of carrying the SQL and its
+# rationale five levels deep.
+#
+# Plain assignment, never COALESCE: COALESCE would silently keep a stored value
+# that diverged from provider truth, which is the class of defect #2903 is. The
+# equality guards in _identity_where make a divergence lose the CAS instead.
+_IDENTITY_SET = """
+                                   github_repository_id = :github_repository_id,
+                                   github_installation_id = :github_installation_id,
+                                   github_pr_node_id = :github_pr_node_id,
+                                   base_ref = :base_ref,"""
 
 
 @dataclass(frozen=True)
@@ -87,6 +104,55 @@ class PostgresPublicationStore:
         self._table = f'"{schema}".publications'
         self._approvals = f'"{schema}".approvals'
         self._lineages = f'"{schema}".thread_publication_lineages'
+        # Only the identity-capture CAS reads these two: it re-asserts the
+        # deployment and workspace authority the API checked one round trip
+        # earlier, so a deactivation inside that window cannot capture.
+        self._deployments = f'"{schema}".deployments'
+        self._workspaces = f'"{schema}".thread_workspaces'
+        # The WHERE half of the identity capture, the counterpart to
+        # _IDENTITY_SET. Composed once here, where the two table names it needs
+        # are already resolved.
+        #
+        # "Identity is never backfilled onto a PR that was published before the
+        # App existed" is a user constraint and a security property, and the
+        # leading predicate is what makes it an assertion of the statement
+        # instead of an assertion about its caller: a row that already carries
+        # pr_number must already carry identity, so a pre-App lineage produces
+        # zero rows here whatever the worker asks for. Without it the property
+        # rests entirely on the gate in _verified_identity and the version CAS
+        # happening to read the same row snapshot, and one mechanism is not
+        # enough for it. Do not delete it as redundant: a first capture has
+        # pr_number NULL, so it can never refuse one.
+        #
+        # The API verified deployment and workspace authority one HTTP round
+        # trip ago and deactivation does not bump the lineage version, so the
+        # version CAS cannot close that window. The two EXISTS predicates
+        # re-assert both facts here. They are deliberately absent from the
+        # identity-free statement: they protect the capture that makes a lineage
+        # reviewable, and a token-mode install has no identity to protect.
+        self._identity_where = f"""
+                               AND (pr_number IS NULL
+                                    OR github_repository_id IS NOT NULL)
+                               AND (github_repository_id IS NULL
+                                    OR github_repository_id = :github_repository_id)
+                               AND (github_installation_id IS NULL
+                                    OR github_installation_id = :github_installation_id)
+                               AND (github_pr_node_id IS NULL
+                                    OR github_pr_node_id = :github_pr_node_id)
+                               AND (base_ref IS NULL OR base_ref = :base_ref)
+                               AND EXISTS (
+                                    SELECT 1 FROM {self._deployments} d
+                                     WHERE d.id = l.deployment_id
+                                       AND d.agent_id = l.agent_id
+                                       AND d.status = 'active'
+                               )
+                               AND EXISTS (
+                                    SELECT 1 FROM {self._workspaces} w
+                                     WHERE w.agent_id = l.agent_id
+                                       AND w.conversation_id = l.conversation_id
+                                       AND lower(w.repo_full_name)
+                                           = lower(l.repo_full_name)
+                               )"""
         self._lease_owner = lease_owner
         self._lease_seconds = lease_seconds
         self._result_max_attempts = result_max_attempts
@@ -337,7 +403,7 @@ class PostgresPublicationStore:
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
-                   l.pr_url, l.head_sha,
+                   l.pr_url, l.head_sha, l.github_repository_id,
                    a.conversation_id
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
@@ -409,6 +475,11 @@ class PostgresPublicationStore:
             branch=str(row["branch"]),
             pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
             pr_url=str(row["pr_url"]) if row["pr_url"] is not None else None,
+            github_repository_id=(
+                int(row["github_repository_id"])
+                if row["github_repository_id"] is not None
+                else None
+            ),
             expected_prior_head=str(row["expected_prior_head"]),
             expected_remote_head=(
                 str(row["head_sha"])
@@ -570,6 +641,7 @@ class PostgresPublicationStore:
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        identity: PublicationIdentity | None = None,
         **lineage: object,
     ) -> None:
         """Persist the outcome and clear private work before any reply attempt."""
@@ -612,6 +684,7 @@ class PostgresPublicationStore:
                 if lineage.get("expected_prior_head") is not None
                 else None
             ),
+            identity=identity,
         )
 
     async def pending_result(
@@ -1015,6 +1088,7 @@ class PostgresPublicationStore:
         pr_number: int | None = None,
         new_head: str | None = None,
         expected_prior_head: str | None = None,
+        identity: PublicationIdentity | None = None,
     ) -> None:
         version = self._versions.get(publication_id)
         if version is None:
@@ -1031,14 +1105,34 @@ class PostgresPublicationStore:
                     raise PublicationStoreError(
                         "publication success omitted lineage CAS identity"
                     )
-                lineage_updated = (
-                    await connection.execute(
-                        text(
-                            f"""
-                            UPDATE {self._lineages}
+                parameters: dict[str, object] = {
+                    "lineage_id": lineage_id,
+                    "lineage_version": lineage_version,
+                    "pr_number": pr_number,
+                    "pr_url": result_url,
+                    "new_head": new_head,
+                    "expected_prior": expected_prior_head,
+                }
+                identity_set = ""
+                identity_where = ""
+                if identity is not None:
+                    parameters.update(
+                        github_repository_id=identity.repository_id,
+                        github_installation_id=identity.installation_id,
+                        github_pr_node_id=identity.pr_node_id,
+                        base_ref=identity.base_ref,
+                    )
+                    identity_set = _IDENTITY_SET
+                    identity_where = self._identity_where
+                try:
+                    lineage_updated = (
+                        await connection.execute(
+                            text(
+                                f"""
+                            UPDATE {self._lineages} AS l
                                SET pr_number = COALESCE(pr_number, :pr_number),
                                    pr_url = COALESCE(pr_url, :pr_url),
-                                   head_sha = :new_head,
+                                   head_sha = :new_head,{identity_set}
                                    version = version + 1,
                                    updated_at = now()
                              WHERE id = :lineage_id
@@ -1049,20 +1143,31 @@ class PostgresPublicationStore:
                                AND (
                                     (head_sha IS NULL AND base_sha = :expected_prior)
                                     OR head_sha = :expected_prior
-                               )
+                               ){identity_where}
                          RETURNING version
                             """
-                        ),
-                        {
-                            "lineage_id": lineage_id,
-                            "lineage_version": lineage_version,
-                            "pr_number": pr_number,
-                            "pr_url": result_url,
-                            "new_head": new_head,
-                            "expected_prior": expected_prior_head,
-                        },
-                    )
-                ).scalar_one_or_none()
+                            ),
+                            parameters,
+                        )
+                    ).scalar_one_or_none()
+                except IntegrityError as exc:
+                    # Only the identity-bearing variant can land here:
+                    # uq_publication_github_pr_owner, the identity check
+                    # constraint and the per-conversation unique index all
+                    # become reachable the moment identity is written, while the
+                    # identity-free statement writes no identity column and its
+                    # COALESCEd pr_number and pr_url cannot violate any of them.
+                    # Do not name one of them: several can reject this statement
+                    # and blaming a specific index sends an operator hunting the
+                    # wrong lineage. PostgreSQL's own name stays on the chained
+                    # driver error for whoever reads the traceback. Without the
+                    # catch at all the violation escapes as a raw driver error
+                    # and loops on lease expiry instead of failing visibly under
+                    # the bounded retry.
+                    raise PublicationStoreError(
+                        "a database constraint rejected the identity capture "
+                        f"for pull request {pr_number} on lineage {lineage_id}"
+                    ) from exc
                 if lineage_updated is None:
                     raise PublicationStoreError("publication lineage advance CAS was lost")
             updated = (

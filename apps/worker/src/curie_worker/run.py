@@ -50,6 +50,7 @@ from .markers import Markers
 from .publication_clients import (
     GitHubPublicationLookup,
     PublicationCredentialClient,
+    PublicationIdentityClient,
     PublicationTranscriptClient,
 )
 from .publication_k8s import KubernetesPublicationCluster, PublicationJobSettings
@@ -763,6 +764,12 @@ def _build_publication_loop(
             api_base_url=config.api_base_url,
             worker_token=config.internal_worker_token,
             client=http,
+        ),
+        identity=PublicationIdentityClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=http,
+            lease_seconds=config.publication_lease_seconds,
         ),
         cluster=cluster,
         github=GitHubPublicationLookup(http),
