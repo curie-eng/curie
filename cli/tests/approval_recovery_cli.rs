@@ -312,32 +312,31 @@ fn recover_refuses_a_missing_recovery_key_before_any_request() {
 /// The refusal prints the mint-it-first hint and must not suggest that the
 /// platform API key can stand in as an identity.
 #[test]
-fn recovery_verbs_require_the_operator_principal_with_the_mint_hint() {
+fn recover_requires_the_operator_principal_with_the_mint_hint() {
     let server = no_request_server();
-    for args in [vec![
+    let args = [
         "--recover",
         APPROVAL_ID,
         "--reason",
         REASON,
         "--recovery-key",
         RECOVERY_KEY,
-    ]] {
-        let output = run("local", &args, Some(&server), None);
-        let combined = text(&output);
-        assert_eq!(
-            output.status.code(),
-            Some(2),
-            "a missing principal is an input error, not a platform failure; output:\n{combined}"
-        );
-        assert!(
-            combined.contains("CURIE_APPROVAL_PRINCIPAL_TOKEN"),
-            "the refusal must name the env-backed credential; output:\n{combined}"
-        );
-        assert!(
-            combined.contains("mint") || combined.contains("Mint"),
-            "the refusal must give the operator the mint recovery; output:\n{combined}"
-        );
-    }
+    ];
+    let output = run("local", &args, Some(&server), None);
+    let combined = text(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a missing principal is an input error, not a platform failure; output:\n{combined}"
+    );
+    assert!(
+        combined.contains("CURIE_APPROVAL_PRINCIPAL_TOKEN"),
+        "the refusal must name the env-backed credential; output:\n{combined}"
+    );
+    assert!(
+        combined.contains("mint") || combined.contains("Mint"),
+        "the refusal must give the operator the mint recovery; output:\n{combined}"
+    );
 }
 
 // --------------------------------------------------------------------------
