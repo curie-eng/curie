@@ -194,3 +194,23 @@ def test_0052_backfills_existing_principals_with_blank_issuer(
         assert rows == [{"idp_issuer": ""}]
     finally:
         command.upgrade(config, "head")
+
+
+EXPIRES_AT_INDEX = "ix_oidc_login_attempts_expires_at"
+
+
+def test_head_indexes_login_attempt_expiry(isolated_migration_db: None) -> None:
+    """The unauthenticated login start prunes and counts by ``expires_at``.
+
+    Without an index both are a sequential scan of every live attempt, so an
+    anonymous flood of ``/console/oidc/login`` makes each request cost more.
+    """
+
+    command.upgrade(_config(), "head")
+    rows = _sql(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'curie' "
+        "AND tablename = 'oidc_login_attempts'"
+    )
+    by_name = {row["indexname"]: row["indexdef"] for row in rows}
+    assert EXPIRES_AT_INDEX in by_name, by_name
+    assert by_name[EXPIRES_AT_INDEX].rstrip().endswith("(expires_at)"), by_name
