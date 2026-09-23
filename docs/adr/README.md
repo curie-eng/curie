@@ -191,4 +191,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
 | 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 | 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
+| 0169 | [A mean tester tests an agent the way a person does, over Slack, from any installation](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md) | Draft |
 <!-- END GENERATED: adr-index -->
