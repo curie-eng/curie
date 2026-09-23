@@ -24,10 +24,17 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.4.8)
+## Contract surface (v0.5.0)
 
-`PROTOCOL_VERSION = "0.4.8"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.5.0"` is embedded in the schema and in every outbound
 event.
+
+`QueuedTurn.reply_handle` may be absent only when `source` is `cron` and
+`hook_run` supplies a nonblank agent ID, hook name, and scheduled slot. A
+targeted cron turn retains its reply handle, as do Slack and webhook turns.
+Generated TypeScript and Rust types express the optional field but cannot
+enforce this cross field rule. The current worker rejects targetless turns
+before processing. Targetless cron execution is deferred to a separate change.
 
 **Session setup** (`SessionConfig`, with `to_env()` / `from_env()`):
 

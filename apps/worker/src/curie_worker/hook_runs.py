@@ -12,7 +12,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-HookRunOutcome = Literal["ran", "failed"]
+# "blocked" is the kill-switch outcome for a targetless run (#2963, ADR-0099);
+# migration 0048 already allows it.
+HookRunOutcome = Literal["ran", "failed", "blocked"]
 
 
 class HookRunRecorderError(RuntimeError):

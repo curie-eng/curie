@@ -704,7 +704,10 @@ fn cluster_relay_turn(
         reply_ref.hyphenated().to_string(),
         None,
     );
-    turn.reply_handle.adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
+    turn.reply_handle
+        .as_mut()
+        .expect("cluster relay turns are targeted")
+        .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
     (turn, reply_ref)
 }
 
@@ -6967,16 +6970,20 @@ mod tests {
         // was the wiring, so wiring a synthetic thread back in must fail HERE.
         let placeholder_ts = "1717171717.000900";
         let turn = connected_turn("C-real", &opts(Some("C-real")), None, placeholder_ts);
+        let reply_handle = turn
+            .reply_handle
+            .as_ref()
+            .expect("connected turns are targeted");
         assert_eq!(
-            turn.reply_handle.placeholder.as_deref(),
+            reply_handle.placeholder.as_deref(),
             Some(turn.conversation_id.as_str()),
             "the connected turn must thread on the placeholder we actually posted"
         );
         assert_eq!(turn.conversation_id, placeholder_ts);
-        assert_eq!(turn.reply_handle.channel, "C-real");
+        assert_eq!(reply_handle.channel, "C-real");
         // #770/ADR-0078: no per-turn endpoint, so the reply rides the connected
         // transport.
-        assert!(turn.reply_handle.endpoint.is_none());
+        assert!(reply_handle.endpoint.is_none());
     }
 
     #[test]
@@ -6993,11 +7000,12 @@ mod tests {
             placeholder_ts,
         );
         assert_eq!(turn.conversation_id, thread);
-        assert_eq!(
-            turn.reply_handle.placeholder.as_deref(),
-            Some(placeholder_ts)
-        );
-        assert!(turn.reply_handle.endpoint.is_none());
+        let reply_handle = turn
+            .reply_handle
+            .as_ref()
+            .expect("connected turns are targeted");
+        assert_eq!(reply_handle.placeholder.as_deref(), Some(placeholder_ts));
+        assert!(reply_handle.endpoint.is_none());
     }
 
     #[test]

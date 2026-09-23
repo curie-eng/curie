@@ -46,6 +46,7 @@ from aci_protocol import (
     HookRunRef,
     OutboundEvent,
     QueuedTurn,
+    ReplyHandle,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
@@ -281,7 +282,7 @@ def _target_for(qevent: QueuedTurn) -> ReplyTarget:
     card, both addressed to a channel the turn may never have come from -- build
     their own ``ReplyTarget`` inline and deliberately do not come through here.
     """
-    handle = qevent.reply_handle
+    handle = _reply_handle_for(qevent)
     return ReplyTarget(
         kind=handle.kind,
         address=handle.channel,
@@ -316,7 +317,14 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
     no (kind, address, conversation) combination can collide with another by
     moving a separator. The key is only ever compared, never parsed back.
     """
-    handle = qevent.reply_handle
+    if qevent.reply_handle is None and qevent.hook_run is not None:
+        # A targetless cron turn (#2963) has no channel pair; its thread belongs
+        # to the hook agent. ``@`` is not a legal channel kind, so this key can
+        # never collide with a bound (kind, address).
+        return scoped_conversation_id(
+            "@cron", qevent.hook_run.agent_id, qevent.conversation_id
+        )
+    handle = _reply_handle_for(qevent)
     return scoped_conversation_id(
         handle.kind,
         handle.channel,
@@ -332,8 +340,55 @@ def _route_from_handle(qevent: QueuedTurn) -> TargetRoute:
     writes to the stream at all after ADR-0096 phase 2: the ingress API mints the
     handle from the binding row, and the dispatcher and CLI are first-party.
     """
-    handle = qevent.reply_handle
+    handle = _reply_handle_for(qevent)
     return TargetRoute(endpoint=handle.endpoint, adapter=handle.adapter)
+
+
+def _reply_handle_for(qevent: QueuedTurn) -> ReplyHandle:
+    """Return the reply handle of a targeted turn.
+
+    Raises for a targetless turn, so any egress path left unguarded fails closed
+    instead of inventing somewhere to send.
+    """
+
+    handle = qevent.reply_handle
+    if handle is None:
+        raise ValueError("targetless turn has no reply target")
+    return handle
+
+
+def _is_targetless(qevent: QueuedTurn) -> bool:
+    """A turn with no reply target: a hook run nobody is waiting on (#2963)."""
+
+    return qevent.reply_handle is None
+
+
+def _check_targetless_shape(qevent: QueuedTurn) -> None:
+    """Re-check the wire rule here: direct callers can skip model validation.
+
+    Only a CRON turn carrying its hook run key may omit the reply handle.
+    """
+
+    if _is_targetless(qevent) and (
+        qevent.source is not TurnSource.CRON or qevent.hook_run is None
+    ):
+        raise ValueError("only a cron turn with a hook run may omit its reply target")
+    # A targetless turn carries no resume authority (#2963): an id shaped like a
+    # work-item wake or an approval resume is an identity violation. It is refused
+    # here, before any effect, because settling it through the normal completion
+    # path would look up runs and write the done marker keyed by that id, which
+    # could finish or defer the UNRELATED run that legitimately owns it.
+    if _is_targetless(qevent) and (
+        parse_work_item_event_id(qevent.event_id) is not None
+        or Kernel._is_approval_resume(qevent.event_id)
+    ):
+        raise ValueError("a targetless turn may not carry a work-item or resume id")
+
+
+# The route a targetless turn threads through signatures that require one. No
+# delivery path uses it: every sink call is skipped for a targetless turn, and
+# ``_target_for`` still raises for one, so nothing can be addressed with it.
+_NO_EGRESS_ROUTE = TargetRoute()
 
 
 def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
@@ -971,7 +1026,7 @@ class _ThrottledReply:
         self,
         sink: ReplySink,
         *,
-        target: ReplyTarget,
+        target: ReplyTarget | None,
         route: TargetRoute,
         min_interval_s: float,
         nav: NavAffordance | None = None,
@@ -1042,7 +1097,7 @@ class _ThrottledReply:
         self._last = now
         # A message creating emit must stay fail loud so ref minting and turn
         # retry semantics remain intact. Only an existing message edit is soft.
-        if self._target.reply_ref is None:
+        if self._target is None or self._target.reply_ref is None:
             await self._emit(text)
             self._last_text = text
             return
@@ -1066,6 +1121,9 @@ class _ThrottledReply:
         await self._emit(text or "(no response)")
 
     async def _emit(self, text: str) -> None:
+        if self._target is None:
+            # A targetless turn (#2963): the stream is consumed, never sent.
+            return
         ack = await self._sink.emit(
             ReplyUpdate(
                 version=REPLY_WIRE_VERSION,
@@ -1233,7 +1291,8 @@ class Kernel:
             qevent: The queued turn the delivery belonged to.
             ack: The adapter's acknowledgement.
         """
-        if ack.ref and qevent.reply_handle.placeholder is None:
+        handle = qevent.reply_handle
+        if handle is not None and ack.ref and handle.placeholder is None:
             self._minted_refs.setdefault(qevent.event_id, ack.ref)
 
     async def _reply_for(
@@ -1263,6 +1322,10 @@ class Kernel:
         Returns:
             The adapter's acknowledgement.
         """
+        if _is_targetless(qevent):
+            # No egress for a targetless turn (#2963): nobody is waiting, and the
+            # hook run row is where its outcome is recorded.
+            return ReplyAck()
         if terminal:
             # Marked BEFORE the send, never after, so an exception from ``_reply``
             # cannot skip the mark for text that may already be on the screen.
@@ -1313,7 +1376,15 @@ class Kernel:
         attempted = event_id in self._terminal_reply_attempted
         self._terminal_reply_attempted.discard(event_id)
 
-        if qevent.reply_handle.placeholder is None:
+        handle = qevent.reply_handle
+        if handle is None:
+            logger.debug(
+                "event %s has no reply target; no not started notice",
+                event_id,
+            )
+            return
+
+        if handle.placeholder is None:
             logger.debug(
                 "event %s has no placeholder to edit; no not-started notice",
                 event_id,
@@ -1409,6 +1480,7 @@ class Kernel:
         for -- the leaseless path is a supported caller, not a degraded one.
         """
 
+        _check_targetless_shape(qevent)
         error: BaseException | None = None
         hook_token = _HOOK_RUN_CARRY.set(_HookRunCarry())
         # A redelivery must never inherit an earlier delivery's terminal-send mark
@@ -1561,6 +1633,9 @@ class Kernel:
         the wire permitted died on the first line of the kernel. The reply path
         now posts a message when there is none to edit and edits it thereafter.
         """
+        _check_targetless_shape(qevent)
+        targetless = _is_targetless(qevent)
+        handle = qevent.reply_handle
         event_id = qevent.event_id
         thread_key = _thread_key_for(qevent)
         # The turn's route starts as the one the server minted onto the wire. A
@@ -1568,7 +1643,7 @@ class Kernel:
         # bound-but-undeployed status reply, when the diagnostic binding lookup
         # supplies the server-controlled endpoint. Other pre-resolution paths
         # can only reach the handle's route, which is why it travels on the wire.
-        route = _route_from_handle(qevent)
+        route = _NO_EGRESS_ROUTE if targetless else _route_from_handle(qevent)
 
         # Acquire the per-thread order lock BEFORE any await, so concurrent
         # same-thread events queue in task-arrival order (asyncio.Lock is FIFO and
@@ -1744,7 +1819,8 @@ class Kernel:
                         "outcome": "resumed",
                     },
                 )
-            else:
+            elif not targetless:
+                # A targetless turn owns no card: it never paused for approval.
                 await self._finalize_settled_card(qevent, route)
 
             # Crash-safety: a prior attempt executed a side effect but never
@@ -1793,14 +1869,65 @@ class Kernel:
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
-            if self._binding is not None:
+            if targetless:
+                # Routed by the hook run's agent, never a channel binding (#2963).
+                # The id is the one the hook row lookup parsed and matched, not
+                # the raw wire string. Each refusal of a valid open run closes
+                # its row, since no reply exists to carry the reason.
+                hook_carry = _HOOK_RUN_CARRY.get()
+                assert hook_carry is not None and hook_carry.agent_id is not None
+                binding = self._binding
+                resolved = (
+                    await binding.resolve_agent(hook_carry.agent_id)
+                    if binding is not None
+                    else None
+                )
+                if binding is None or resolved is None:
+                    logger.error(
+                        "targetless cron event %s: agent %s has no active "
+                        "deployment; dropping",
+                        event_id,
+                        hook_carry.agent_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="failed",
+                    )
+                    return
+                if self._killswitch is not None and await self._killswitch.is_killed(
+                    resolved.agent_id
+                ):
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="blocked",
+                    )
+                    return
+                agent_id = resolved.agent_id
+                agent_name = resolved.agent_name
+                # No kind/address: there is no binding to scope the state
+                # namespace to. No approval grant, resumed kind or decision
+                # either: a targetless turn is never a resume.
+                boot_env = binding.boot_env(resolved, thread_key)
+                workspace_deployment_id = resolved.deployment_id
+                packs = binding.packs_for(resolved)
+                approval_routes = resolved.approval_routes
+            elif self._binding is not None:
+                assert handle is not None
                 # The routing key is the PAIR (ADR-0096 phase 2): the queue wire
                 # carries a required `kind`, and both halves bind into the
                 # resolver's predicate. Never the address alone -- one address
                 # can be bound under two kinds, and dropping the kind here would
                 # answer an unbound kind with the other agent.
                 resolved = await self._binding.resolve(
-                    qevent.reply_handle.kind, qevent.reply_handle.channel
+                    handle.kind, handle.channel
                 )
                 if resolved is None:
                     # Binding doubles predate the diagnostic lookup; keep a miss
@@ -1810,7 +1937,7 @@ class Kernel:
                     )
                     undeployed = (
                         await undeployed_lookup(
-                            qevent.reply_handle.kind, qevent.reply_handle.channel
+                            handle.kind, handle.channel
                         )
                         if undeployed_lookup is not None
                         else None
@@ -1819,14 +1946,14 @@ class Kernel:
                         # A bound non-Slack route may carry the only endpoint the
                         # platform can use to deliver this status reply.
                         route = TargetRoute(
-                            endpoint=undeployed.endpoint or qevent.reply_handle.endpoint,
-                            adapter=undeployed.adapter or qevent.reply_handle.adapter,
+                            endpoint=undeployed.endpoint or handle.endpoint,
+                            adapter=undeployed.adapter or handle.adapter,
                         )
                         logger.warning(
                             "undeployed agent turn dropped for agent=%s route=%s:%s",
                             undeployed.agent_name,
-                            qevent.reply_handle.kind,
-                            qevent.reply_handle.channel,
+                            handle.kind,
+                            handle.channel,
                         )
                         await self._drop_with_message(
                             qevent,
@@ -1843,8 +1970,8 @@ class Kernel:
                         qevent,
                         route,
                         "No agent is configured for this "
-                        f"{qevent.reply_handle.kind} address "
-                        f"{qevent.reply_handle.channel} yet.",
+                        f"{handle.kind} address "
+                        f"{handle.channel} yet.",
                         lease=lease,
                     )
                     return
@@ -1854,8 +1981,8 @@ class Kernel:
                 # names none leaves the server-minted handle standing -- the
                 # dispatcher and CLI bind no endpoint of their own.
                 route = TargetRoute(
-                    endpoint=resolved.endpoint or qevent.reply_handle.endpoint,
-                    adapter=resolved.adapter or qevent.reply_handle.adapter,
+                    endpoint=resolved.endpoint or handle.endpoint,
+                    adapter=resolved.adapter or handle.adapter,
                 )
                 hook_carry = _HOOK_RUN_CARRY.get()
                 if (
@@ -1892,8 +2019,8 @@ class Kernel:
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
                 boot_env_kwargs: dict[str, Any] = {
-                    "kind": qevent.reply_handle.kind,
-                    "address": qevent.reply_handle.channel,
+                    "kind": handle.kind,
+                    "address": handle.channel,
                 }
                 # The internal thread key is channel-scoped, so it no longer
                 # starts with the eval marker carried by conversation_id.
@@ -2084,6 +2211,20 @@ class Kernel:
                         return
                     raise
 
+                if outcome.status is SessionStatus.AWAITING_APPROVAL and targetless:
+                    # A resume needs a reply route this turn does not carry
+                    # (#2963), so a gate on a targetless turn is a failed run,
+                    # never a pause and never a grant. The gated tool never ran.
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="classified_failure",
+                        lease=lease,
+                        hook_outcome="failed",
+                    )
+                    return
+
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
                     # A gate fired (ADR-0010): persist the durable record, then
                     # suspend the session until a human resolves it. The event
@@ -2241,7 +2382,7 @@ class Kernel:
             # while a failed entry stays PENDING for reclaim -- so completing
             # here would tell the adapter to deliver a turn that is about to run
             # again. An EMPTY status IS the clear on the neutral wire.
-            if self._config.shimmer:
+            if self._config.shimmer and not targetless:
                 # Rebuilt rather than reusing the ``target`` captured at entry, so
                 # a placeholder-less turn clears the status against the message it
                 # actually posted. Slack's status call does not read the ref, but a
@@ -2825,6 +2966,9 @@ class Kernel:
         second sanctioned source -- no adapter can write to the stream, so the
         handle is trustworthy). A terminal path that marked done without a record
         would be a completion nothing could ever recover.
+        A targetless cron turn (#2963) is the one exception: no adapter is
+        waiting, so no completion is owed, and ``_settle_targetless`` marks it
+        done with no record.
 
         Since ADR-0131 this is also the FENCE. When the caller holds a delivery
         lease, steps 1 and 2 fuse into ``Markers.settle_fenced``, one script that
@@ -2894,6 +3038,13 @@ class Kernel:
                     qevent.event_id,
                     exc.code,
                 )
+        if hook_outcome is None and _is_targetless(qevent):
+            # A targeted terminal that started nothing (an escalation, a refused
+            # admission or workspace) leaves the row open for a human reading the
+            # reply. A targetless one has no reader and redelivery skips a done
+            # event, so every targetless terminal closes the row: "ran" only when
+            # an attempt started and ended ok, otherwise "failed" (#2963).
+            hook_outcome = "failed"
         hook_carry = _HOOK_RUN_CARRY.get()
         if (
             hook_outcome is not None
@@ -2908,6 +3059,9 @@ class Kernel:
         ):
             await hook_carry.recorder.close(hook_carry.ref, hook_outcome)
         event_id = qevent.event_id
+        if _is_targetless(qevent):
+            await self._settle_targetless(qevent, outcome, telemetry_outcome, lease)
+            return
         record = CompletionRecord(
             event_id=event_id,
             event=TurnCompleted(
@@ -2981,6 +3135,55 @@ class Kernel:
         except ValueError:
             duration = 0.0
         record_metric("curie.turn.duration", duration, attributes=attributes)
+
+    async def _settle_targetless(
+        self,
+        qevent: QueuedTurn,
+        outcome: str,
+        telemetry_outcome: str,
+        lease: DeliveryLease | None,
+    ) -> None:
+        """``_complete``'s terminal write for a targetless turn (#2963).
+
+        Marker only: no adapter is waiting, so no ``turn.completed`` is owed and
+        no outbox record is written. The fenced form refuses exactly as
+        ``settle_fenced`` does, with the same lease-lost handling.
+        """
+        event_id = qevent.event_id
+        if _is_fenced(lease):
+            assert lease is not None  # narrowed by _is_fenced
+            settled = await self._markers.settle_fenced_without_completion(
+                event_id,
+                stream=lease.stream,
+                group=lease.group,
+                entry_id=lease.entry_id,
+                owner=lease.owner,
+                generation=lease.generation,
+            )
+            if not settled:
+                logger.warning(
+                    "fenced out of terminal settlement for event %s "
+                    "(owner=%s generation=%d outcome=%s): another owner holds "
+                    "this delivery; writing no marker",
+                    event_id,
+                    lease.owner,
+                    lease.generation,
+                    outcome,
+                )
+                _LIFECYCLE_OUTCOME.set("fenced_out")
+                lease.lost.set()
+                return
+        else:
+            await self._markers.mark_done_without_completion(event_id)
+        _LIFECYCLE_OUTCOME.set(telemetry_outcome)
+        record_metric(
+            "curie.turn.completed",
+            attributes={
+                "service.name": "curie-worker",
+                "source": "worker",
+                "outcome": telemetry_outcome,
+            },
+        )
 
     async def _deliver_completion(self, record: CompletionRecord, *, generation: str) -> bool:
         """Emit a stored completion and clear it, or leave it owed. True on send.
@@ -3158,6 +3361,8 @@ class Kernel:
         Best-effort: the sink swallows errors, so a workspace without the
         assistant feature costs one debug line and nothing else.
         """
+        if _is_targetless(qevent):
+            return
         load = sample_load(packs, qevent.conversation_id)
         tip = sample_tip(packs, qevent.conversation_id)
         if load and tip:
@@ -3272,6 +3477,7 @@ class Kernel:
         pressure_retried: bool,
         workspace_inference: _WorkspaceInferenceCarry,
     ) -> TurnOutcome:
+        handle = qevent.reply_handle
         thread_key = _thread_key_for(qevent)
         attempt_started = time.monotonic()
 
@@ -3288,10 +3494,13 @@ class Kernel:
         # that never started. Reviews publish their receipt after reservation;
         # jobs publish the deferred booting state below after routing succeeds.
         review_candidate = _REVIEW_EVENT_ID_RE.fullmatch(qevent.event_id) is not None
-        defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
-        defer_review_booting = qevent.reply_handle.placeholder is None and review_candidate
-        if not self._config.slack_no_edit_streaming and not (
-            defer_job_booting or defer_review_booting
+        placeholder = None if handle is None else handle.placeholder
+        defer_job_booting = placeholder is None and qevent.source.is_job
+        defer_review_booting = placeholder is None and review_candidate
+        if (
+            handle is not None
+            and not self._config.slack_no_edit_streaming
+            and not (defer_job_booting or defer_review_booting)
         ):
             try:
                 await self._reply_for(
@@ -5094,6 +5303,7 @@ class Kernel:
         # thread key like the sandbox and the lock: two channels sharing a
         # conversation id must not pop each other's card. Outside the try because
         # the failure log below names it.
+        handle = _reply_handle_for(qevent)
         thread_key = _thread_key_for(qevent)
         try:
             # Expiry states only that nobody decided, so it needs no record read.
@@ -5143,7 +5353,7 @@ class Kernel:
                         # either from the turn addresses the wrong place; ``kind``
                         # empty is the pre-upgrade entry, which falls back to the
                         # turn exactly as it did before.
-                        kind=ref.kind or qevent.reply_handle.kind,
+                        kind=ref.kind or handle.kind,
                         address=ref.channel,
                         conversation_id=qevent.conversation_id,
                         reply_ref=ref.ts,
@@ -5256,6 +5466,7 @@ class Kernel:
         that case.
         """
 
+        handle = _reply_handle_for(qevent)
         # Both identities are live in this function and they are not
         # interchangeable: ``thread`` is the BARE adapter conversation id used
         # only for replies; ``thread_key`` is the canonical server identity that
@@ -5279,8 +5490,8 @@ class Kernel:
         # its own: the schema permits the same address string under two kinds,
         # so an address-only comparison misreads an email turn whose address
         # happens to equal a Slack policy channel as "the requesting channel".
-        card_kind = qevent.reply_handle.kind
-        card_channel = qevent.reply_handle.channel
+        card_kind = handle.kind
+        card_channel = handle.channel
         notification_target: tuple[str, str, TargetRoute] | None = None
         if route_name:
             binding = (approval_routes or {}).get(route_name)
@@ -5356,11 +5567,11 @@ class Kernel:
                         repo_full_name=snapshot.repo_full_name,
                         author=qevent.author,
                         summary=summary,
-                        reply_kind=qevent.reply_handle.kind,
-                        reply_channel=qevent.reply_handle.channel,
+                        reply_kind=handle.kind,
+                        reply_channel=handle.channel,
                         reply_placeholder=self._target_for(qevent).reply_ref,
-                        reply_endpoint=qevent.reply_handle.endpoint,
-                        reply_adapter=qevent.reply_handle.adapter,
+                        reply_endpoint=handle.endpoint,
+                        reply_adapter=handle.adapter,
                         dedupe_key=qevent.event_id,
                         base_sha=snapshot.base_sha,
                         patch=snapshot.patch,
@@ -5407,8 +5618,8 @@ class Kernel:
                         # creation time, never looked up at resume: an operator may
                         # re-bind the address between suspension and resume, and the
                         # persisted values are facts about the original turn.
-                        reply_kind=qevent.reply_handle.kind,
-                        reply_channel=qevent.reply_handle.channel,
+                        reply_kind=handle.kind,
+                        reply_channel=handle.channel,
                         # The ref this turn actually DELIVERED on, not the one the wire
                         # carried. On a placeholder-less turn (ADR-0079) the two differ:
                         # the wire says null and the turn has since posted its own
@@ -5416,8 +5627,8 @@ class Kernel:
                         # nothing to edit, so the approval's outcome would land on a
                         # second message beside the request it answers.
                         reply_placeholder=self._target_for(qevent).reply_ref,
-                        reply_endpoint=qevent.reply_handle.endpoint,
-                        reply_adapter=qevent.reply_handle.adapter,
+                        reply_endpoint=handle.endpoint,
+                        reply_adapter=handle.adapter,
                         dedupe_key=qevent.event_id,
                         route=route_name,
                         card_channel=card_channel,
@@ -5612,10 +5823,10 @@ class Kernel:
         # different kinds, and comparing addresses alone would hand a non-Slack
         # turn's transport to a Slack policy card that merely shares its address.
         in_requesting_channel = (card_kind, card_channel) == (
-            qevent.reply_handle.kind,
-            qevent.reply_handle.channel,
+            handle.kind,
+            handle.channel,
         )
-        card_endpoint = qevent.reply_handle.endpoint if in_requesting_channel else None
+        card_endpoint = handle.endpoint if in_requesting_channel else None
         card_adapter = route.adapter if in_requesting_channel else None
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
@@ -5766,7 +5977,7 @@ class Kernel:
         acc = _StreamAccumulator(workspace_inferred_repo=workspace_inferred_repo)
         reply = _ThrottledReply(
             self._sink,
-            target=self._target_for(qevent),
+            target=None if _is_targetless(qevent) else self._target_for(qevent),
             route=route,
             min_interval_s=self._config.slack_edit_min_interval_s,
             nav=nav,

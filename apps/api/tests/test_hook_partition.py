@@ -51,13 +51,13 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import QueuedTurn
+from channel_protocol import hook_conversation_id as conversation_id
 from curie_api.config import get_settings
 from curie_api.delivery import sha16
 from curie_api.hook_partition import (
     HOOK_NAME,
     PARTITION_VALUE,
     PartitionError,
-    conversation_id,
     derive_partition,
     resolve_pointer,
     validate_pointer_syntax,

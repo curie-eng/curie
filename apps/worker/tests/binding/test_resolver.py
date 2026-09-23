@@ -1480,3 +1480,96 @@ def test_reserved_connector_secret_is_dropped_order_independently() -> None:
             await engine.dispose()
 
     asyncio.run(go())
+
+
+async def _seed_unbound_agent(engine: AsyncEngine, *, name: str) -> uuid.UUID:
+    """An agent with NO agent_channels row: reachable only by explicit id (#2963)."""
+    agent_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(f"INSERT INTO {_SCHEMA}.agents (id, name) VALUES (:id, :name)"),
+            {"id": agent_id, "name": name},
+        )
+    return agent_id
+
+
+def test_resolve_agent_picks_prod_then_most_recent_without_a_binding() -> None:
+    """#2963: targetless cron routes by agent id, never through agent_channels.
+
+    Seeded order is prod (older), prod (newer), dev (newest). The newer prod is
+    the only correct winner under the shared order (prod first, deployed_at
+    DESC). A channel-bound decoy with its own active deployment proves no
+    binding join leaks another agent in.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        agent_ids: list[uuid.UUID] = []
+        try:
+            token = uuid.uuid4().hex[:8]
+            agent_id = await _seed_unbound_agent(engine, name=f"unbound-{token}")
+            agent_ids.append(agent_id)
+            decoy = await _seed_agent(
+                engine,
+                channel=f"C-decoy-{token}",
+                name=f"decoy-{token}",
+                max_usd=None,
+                max_tokens=None,
+            )
+            agent_ids.append(decoy)
+            await _seed_deployment(
+                engine, agent_id=agent_id, environment="prod",
+                bundle_ref=f"bundles/{token}-prod-old.zip",
+            )
+            await _seed_deployment(
+                engine, agent_id=agent_id, environment="prod",
+                bundle_ref=f"bundles/{token}-prod-new.zip",
+            )
+            await _seed_deployment(
+                engine, agent_id=agent_id, environment="dev",
+                bundle_ref=f"bundles/{token}-dev.zip",
+            )
+            await _seed_deployment(
+                engine, agent_id=decoy, environment="prod",
+                bundle_ref=f"bundles/{token}-decoy.zip",
+            )
+
+            resolved = await _resolver(engine).resolve_agent(agent_id)
+
+            assert resolved is not None
+            assert resolved.agent_id == agent_id
+            assert resolved.agent_name == f"unbound-{token}"
+            assert resolved.bundle_ref == f"bundles/{token}-prod-new.zip"
+            assert resolved.endpoint is None
+            assert resolved.adapter is None
+        finally:
+            await _cleanup(engine, agent_ids)
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_resolve_agent_misses_without_an_active_deployment_or_agent() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        agent_ids: list[uuid.UUID] = []
+        try:
+            token = uuid.uuid4().hex[:8]
+            undeployed = await _seed_unbound_agent(engine, name=f"undeployed-{token}")
+            agent_ids.append(undeployed)
+            inactive = await _seed_unbound_agent(engine, name=f"inactive-{token}")
+            agent_ids.append(inactive)
+            await _seed_deployment(
+                engine, agent_id=inactive, environment="prod",
+                bundle_ref=f"bundles/{token}-inactive.zip", status="superseded",
+            )
+
+            resolver = _resolver(engine)
+            assert await resolver.resolve_agent(undeployed) is None
+            assert await resolver.resolve_agent(inactive) is None
+            assert await resolver.resolve_agent(uuid.uuid4()) is None
+        finally:
+            await _cleanup(engine, agent_ids)
+            await engine.dispose()
+
+    asyncio.run(go())

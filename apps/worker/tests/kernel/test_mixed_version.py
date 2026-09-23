@@ -1,4 +1,4 @@
-"""A 0.2.9 runner against a 0.4.0 worker fails LOUDLY.
+"""A 0.2.9 runner against a 0.5.0 worker fails LOUDLY.
 
 T-B14 (round-2 finding 4). The ACI bump is a breaking minor (D1), so a runner
 image left at ``0.2.9`` is not "mostly compatible" -- ``ndjson.py:61-68`` refuses
@@ -75,9 +75,13 @@ def test_the_worker_build_rejects_historical_and_previous_deployed_minors() -> N
     # test that has to be edited for reasons unrelated to its subject teaches
     # people to edit it without reading it. A minor bump still lands here, which
     # is exactly when someone should look.
-    assert PROTOCOL_VERSION.startswith("0.4."), PROTOCOL_VERSION
+    assert PROTOCOL_VERSION.startswith("0.5."), PROTOCOL_VERSION
+    assert is_compatible("0.4.8", PROTOCOL_VERSION) is False
+    assert is_compatible(PROTOCOL_VERSION, "0.4.8") is False
     assert is_compatible("0.3.0", PROTOCOL_VERSION) is False
+    assert is_compatible(PROTOCOL_VERSION, "0.3.0") is False
     assert is_compatible("0.2.9", PROTOCOL_VERSION) is False
+    assert is_compatible(PROTOCOL_VERSION, "0.2.9") is False
 
 
 def test_a_0_2_9_frame_is_refused_by_the_decoder() -> None:

@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from aci_protocol import (
     PROTOCOL_VERSION,
+    HookRunRef,
     QueuedTurn,
     ReplyHandle,
     TurnSource,
@@ -256,9 +257,11 @@ def test_the_attachments_field_is_a_patch_bump() -> None:
     traffic for a field nobody is required to send.
     """
 
-    major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
-    assert (major, minor) == (0, 4)
-    assert patch >= 3
+    before = tuple(int(part) for part in "0.4.2".split("."))
+    with_attachments = tuple(int(part) for part in "0.4.3".split("."))
+
+    assert with_attachments[:2] == before[:2]
+    assert with_attachments[2] == before[2] + 1
 
 
 def test_a_patch_difference_is_compatible_in_both_directions() -> None:
@@ -271,10 +274,16 @@ def test_a_patch_difference_is_compatible_in_both_directions() -> None:
     being a tautology about any two version strings.
     """
 
-    assert is_compatible("0.4.2", PROTOCOL_VERSION) is True
-    assert is_compatible(PROTOCOL_VERSION, "0.4.2") is True
-    assert is_compatible("0.3.9", PROTOCOL_VERSION) is False
-    assert is_compatible(PROTOCOL_VERSION, "0.3.9") is False
+    assert is_compatible("0.4.2", "0.4.3") is True
+    assert is_compatible("0.4.3", "0.4.2") is True
+    assert is_compatible("0.3.9", "0.4.3") is False
+    assert is_compatible("0.4.3", "0.3.9") is False
+
+
+def test_targetless_turns_start_a_new_incompatible_protocol_line() -> None:
+    assert PROTOCOL_VERSION == "0.5.0"
+    assert is_compatible("0.4.5", PROTOCOL_VERSION) is False
+    assert is_compatible(PROTOCOL_VERSION, "0.4.5") is False
 
 
 def test_a_payload_written_before_attachments_existed_decodes_with_none() -> None:
@@ -394,3 +403,169 @@ def test_a_partial_hook_run_is_rejected(missing_field: str) -> None:
 
     locations = {tuple(error["loc"]) for error in exc_info.value.errors()}
     assert ("hook_run", missing_field) in locations
+
+
+def _targetless_cron_payload() -> dict[str, object]:
+    return {
+        "event_id": "e1",
+        "conversation_id": "c1",
+        "author": "cron",
+        "text": "run the nightly report",
+        "received_at": "20260922T030000Z",
+        "source": "cron",
+        "hook_run": {
+            "agent_id": "00000000000040008000000000000001",
+            "name": "acme_nightly",
+            "slot_utc": "20260922T030000Z",
+        },
+    }
+
+
+def _construct_or_parse_targetless(
+    payload: dict[str, object], reader: str
+) -> QueuedTurn:
+    if reader == "constructor":
+        return QueuedTurn(**payload)  # type: ignore[arg-type]
+    return parse_queued_turn(json.dumps(payload))
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize("explicit_null", [False, True], ids=["omitted", "null"])
+def test_a_targetless_cron_turn_round_trips_with_complete_identity(
+    explicit_null: bool,
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    if explicit_null:
+        payload["reply_handle"] = None
+
+    turn = _construct_or_parse_targetless(payload, reader)
+
+    assert turn.reply_handle is None
+    assert turn.hook_run == HookRunRef(
+        agent_id="00000000000040008000000000000001",
+        name="acme_nightly",
+        slot_utc="20260922T030000Z",
+    )
+    assert parse_queued_turn(turn.model_dump_json()) == turn
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+def test_a_targetless_cron_turn_without_run_identity_is_rejected(
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    payload["hook_run"] = None
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+def test_a_targetless_cron_turn_with_omitted_run_identity_is_rejected(
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    del payload["hook_run"]
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize("missing_field", ["agent_id", "name", "slot_utc"])
+def test_a_targetless_cron_turn_with_partial_identity_is_rejected(
+    missing_field: str,
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    hook_run = dict(payload["hook_run"])  # type: ignore[arg-type]
+    del hook_run[missing_field]
+    payload["hook_run"] = hook_run
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize("field", ["agent_id", "name", "slot_utc"])
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param("", id="empty"),
+        pytest.param(" \t", id="whitespace"),
+        pytest.param(7, id="nonstring"),
+    ],
+)
+def test_a_targetless_cron_turn_with_invalid_identity_is_rejected(
+    field: str,
+    invalid_value: object,
+    reader: str,
+) -> None:
+    payload = _targetless_cron_payload()
+    hook_run = dict(payload["hook_run"])  # type: ignore[arg-type]
+    hook_run[field] = invalid_value
+    payload["hook_run"] = hook_run
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize("reader", ["constructor", "consumer"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(None, id="default_slack"),
+        pytest.param(TurnSource.SLACK.value, id="slack"),
+        pytest.param(TurnSource.WEBHOOK.value, id="webhook"),
+    ],
+)
+def test_only_cron_may_be_targetless(source: str | None, reader: str) -> None:
+    payload = _targetless_cron_payload()
+    if source is None:
+        del payload["source"]
+    else:
+        payload["source"] = source
+    payload["reply_handle"] = None
+
+    with pytest.raises(ValidationError):
+        _construct_or_parse_targetless(payload, reader)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [TurnSource.SLACK, TurnSource.WEBHOOK, TurnSource.CRON],
+)
+def test_a_targeted_turn_still_round_trips_for_every_source(
+    source: TurnSource,
+) -> None:
+    hook_run = (
+        HookRunRef(
+            agent_id="00000000000040008000000000000001",
+            name="acme_nightly",
+            slot_utc="20260922T030000Z",
+        )
+        if source is TurnSource.CRON
+        else None
+    )
+    turn = QueuedTurn(
+        event_id="e1",
+        conversation_id="c1",
+        author="u1",
+        text="hi",
+        reply_handle=ReplyHandle(
+            kind="slack",
+            channel="C1",
+            placeholder="1.0",
+        ),
+        received_at="20260922T030000Z",
+        source=source,
+        hook_run=hook_run,
+    )
+
+    restored = parse_queued_turn(turn.model_dump_json())
+
+    assert restored == turn
+    assert restored.reply_handle == turn.reply_handle
+    assert restored.source is source
