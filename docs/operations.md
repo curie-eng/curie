@@ -983,6 +983,12 @@ body, diff or file names fails the run. The reply, the comment and the pull
 request's title, body and file names are recorded with such strings replaced
 by `[REDACTED]`, redacted in full before the reply is cut to 4000 characters,
 and any redaction in agent text fails the run.
+A pull request ending also fails unless the WorkItem row's own
+`publication_lineage_id` is set and its lineage records that pull request; the
+read route's conversation fallback does not count, so the driver reads the
+install's Postgres. A comment ending also clears the notice's delivery record
+and waits for the reconciler to record it again: it must record the original
+comment by its marker, and the issue must still carry exactly one.
 Elapsed time runs from the request's start to the pull request or comment.
 The evidence records the work item state and ending cause, the pull request
 and its changed files, the terminus comment, CI, elapsed and execution time,
