@@ -4830,6 +4830,71 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
     prepare_deploy_with_commit_sha(opts, None).await
 }
 
+/// The agent a deploy binds: an explicit `--agent` beats the target's declared
+/// agent, which beats the bundle's manifest name (#1166). The one statement of
+/// that rule, shared by `prepare_deploy` and the provider preflight that must
+/// know the name before anything is created.
+pub fn deploy_agent_name(
+    flag: Option<&str>,
+    target_agent: Option<&str>,
+    plugin_name: &str,
+) -> String {
+    flag.or(target_agent).unwrap_or(plugin_name).to_string()
+}
+
+/// Resolve a named `--target` against the bundle's deploy.yaml (ADR-0089).
+/// Read-only: the API parses the file and answers, nothing is created.
+async fn resolve_named_target(
+    client: &ApiClient,
+    target: Option<&str>,
+    deploy_targets_path: &Path,
+    deploy_targets_read: &std::io::Result<String>,
+) -> Result<Option<crate::api::ResolvedTarget>> {
+    let Some(name) = target else {
+        return Ok(None);
+    };
+    let content = deploy_targets_read.as_ref().map_err(|err| {
+        crate::exit::usage(format!(
+            "--target {name} needs a deploy.yaml in the bundle, but {} could not be \
+             read: {err}",
+            deploy_targets_path.display()
+        ))
+    })?;
+    let resolved = client.resolve_deploy_target(content, name).await?;
+    reject_documentation_placeholder_target(name, &resolved)?;
+    Ok(Some(resolved))
+}
+
+/// The agent name `prepare_deploy` would bind for these flags, computed
+/// without creating an agent, a version or uploading anything: it reads the
+/// manifest and, for a named target, makes the same read-only resolve call.
+pub async fn resolve_deploy_agent_name(
+    plugin_dir: &Path,
+    agent: Option<&str>,
+    target: Option<&str>,
+    api_url: &str,
+    api_key: &str,
+) -> Result<String> {
+    let plugin_dir = plugin_dir
+        .canonicalize()
+        .with_context(|| format!("plugin dir not found: {}", plugin_dir.display()))?;
+    let (plugin_name, _version) = read_manifest(&plugin_dir)?;
+    let resolved = match target {
+        Some(_) if agent.is_none() => {
+            let client = ApiClient::new(api_url, api_key)?;
+            let path = plugin_dir.join("deploy.yaml");
+            let read = std::fs::read_to_string(&path);
+            resolve_named_target(&client, target, &path, &read).await?
+        }
+        _ => None,
+    };
+    Ok(deploy_agent_name(
+        agent,
+        resolved.as_ref().and_then(|r| r.agent.as_deref()),
+        &plugin_name,
+    ))
+}
+
 /// Prepare a deploy with commit provenance supplied by an installer binary.
 /// Ordinary deploys pass no override and continue discovering the clean bundle
 /// checkout's HEAD. The override is deliberately crate-private: it is not a
@@ -5027,21 +5092,13 @@ async fn prepare_deploy_with_commit_sha(
     let deploy_targets_path = plugin_dir.join("deploy.yaml");
     let deploy_targets_read = std::fs::read_to_string(&deploy_targets_path);
     let deploy_targets_yaml = deploy_targets_read.as_ref().ok().cloned();
-    let resolved = match &opts.target {
-        Some(name) => {
-            let content = deploy_targets_read.as_ref().map_err(|err| {
-                crate::exit::usage(format!(
-                    "--target {name} needs a deploy.yaml in the bundle, but {} could not be \
-                     read: {err}",
-                    deploy_targets_path.display()
-                ))
-            })?;
-            let target = client.resolve_deploy_target(content, name).await?;
-            reject_documentation_placeholder_target(name, &target)?;
-            Some(target)
-        }
-        None => None,
-    };
+    let resolved = resolve_named_target(
+        &client,
+        opts.target.as_deref(),
+        &deploy_targets_path,
+        &deploy_targets_read,
+    )
+    .await?;
 
     // A target states its environment, which is the point: the flag's `dev`
     // default is what let a prod workflow deploy to dev in silence (#1166).
@@ -5087,11 +5144,11 @@ async fn prepare_deploy_with_commit_sha(
     // stays the DISPLAY name so the log still says which bundle was deployed;
     // `agent_name` is what the platform binds. Explicit flags beat the target,
     // so a one-off deploy never requires editing a committed file.
-    let agent_name = opts
-        .agent
-        .clone()
-        .or_else(|| resolved.as_ref().and_then(|r| r.agent.clone()))
-        .unwrap_or_else(|| plugin_name.clone());
+    let agent_name = deploy_agent_name(
+        opts.agent.as_deref(),
+        resolved.as_ref().and_then(|r| r.agent.as_deref()),
+        &plugin_name,
+    );
     let slack_channel = opts
         .slack_channel
         .as_deref()
@@ -8671,6 +8728,13 @@ pub fn skill_approval_routes_unavailable() -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deploy_agent_name_prefers_flag_then_target_then_manifest() {
+        assert_eq!(super::deploy_agent_name(Some("f"), Some("t"), "m"), "f");
+        assert_eq!(super::deploy_agent_name(None, Some("t"), "m"), "t");
+        assert_eq!(super::deploy_agent_name(None, None, "m"), "m");
+    }
+
     use super::{
         absent_container_note, check_deploy_routes_bound, declared_approval_routes,
         github_repo_allowlist_is_empty, merge_secret_env, model_credential_summary,
