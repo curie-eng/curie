@@ -13,11 +13,13 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 
+use crate::provider::eso::SystemKubectl;
+use crate::provider::reconcile;
 use crate::provider::{
-    aws::AwsSecretsProvider, ObjectMetadata, ProviderError, PutRequest, SecretMaterial,
-    SecretsProvider, EXPIRY_TAG,
+    aws::AwsSecretsProvider, platform_inventory, InventoryEntry, ObjectMetadata, ProviderError,
+    PutRequest, SecretMaterial, SecretsProvider, Store, EXPIRY_TAG,
 };
 
 const SERVICE: &str = "ai.curietech.curie";
@@ -149,18 +151,88 @@ pub fn set_discovered(
         parse_expiry(raw)?;
     }
     let (logical, key) = provider_target(&opts.name)?;
+    let entry = inventory_entry(&logical)?;
+    if let Some(entry) = entry.as_ref() {
+        if let Some(reason) = reconcile::refuses_set(entry, &key) {
+            return Err(crate::exit::CliError::failure(reason).into());
+        }
+    }
     let provider = provider_for_installation(installation)?
         .context("declared secrets provider could not be constructed")?;
-    set_provider(&provider, &logical, &key, expires, opts.from_env)
+    let version = write_provider(&provider, &logical, &key, expires, opts.from_env)?;
+    let Some(entry) = entry else {
+        crate::ui::ui().success(&format!(
+            "saved {logical}/{key} in Secrets Manager only; {logical} is not in the install inventory"
+        ));
+        return Ok(());
+    };
+    sync_after_write(installation, &entry, &logical, &key, &version.id)
 }
 
-fn set_provider(
+fn inventory_entry(logical: &str) -> Result<Option<InventoryEntry>> {
+    Ok(platform_inventory()?
+        .into_iter()
+        .find(|entry| entry.logical_name == logical))
+}
+
+fn kubectl_for(installation: &crate::installation::Installation) -> Result<Option<SystemKubectl>> {
+    let Some(path) = reconcile::kubeconfig_file() else {
+        return Ok(None);
+    };
+    Ok(Some(SystemKubectl {
+        context: installation.install.context.clone(),
+        kubeconfig: Some(path),
+        call_timeout: Some(std::time::Duration::from_secs(60)),
+    }))
+}
+
+fn sync_after_write(
+    installation: &crate::installation::Installation,
+    entry: &InventoryEntry,
+    logical: &str,
+    key: &str,
+    version: &str,
+) -> Result<()> {
+    let namespace = installation.install.namespace.as_str();
+    let release = installation.install.release.as_str();
+    let store = reconcile::store_name(release);
+    let kubectl = kubectl_for(installation)?;
+    let reach = reconcile::reach(
+        kubectl
+            .as_ref()
+            .map(|client| client as &dyn crate::provider::eso::Kubectl),
+        namespace,
+        &store,
+    )?;
+    if !reach.provisioned() {
+        crate::ui::ui().success(&format!(
+            "saved {logical}/{key} in Secrets Manager only; the install is not provisioned ({})",
+            reach.detail(namespace, &store)
+        ));
+        return Ok(());
+    }
+    let client = kubectl.context("provisioned install has no kubectl client")?;
+    let prefix = installation
+        .secrets
+        .as_ref()
+        .map(|secrets| secrets.prefix.as_str())
+        .context("provisioned install is missing its secrets prefix")?;
+    let scoped = format!("{}/{}", prefix.trim_end_matches('/'), release);
+    let consumers = reconcile::publish(&client, namespace, release, &scoped, entry, version)?;
+    crate::ui::ui().success(&format!(
+        "saved {logical}/{key} in Secrets Manager and rolled {}",
+        consumers.join(", ")
+    ));
+    Ok(())
+}
+
+fn write_provider(
     provider: &dyn SecretsProvider,
     logical: &str,
     key: &str,
     expires: Option<&str>,
     from_env: Option<String>,
-) -> Result<()> {
+) -> Result<crate::provider::ObjectVersion> {
     let value = match from_env {
         Some(var) => std::env::var(&var)
             .with_context(|| format!("{var} is not set; cannot save {logical}/{key}"))?,
@@ -193,26 +265,34 @@ fn set_provider(
         let tags = BTreeMap::from([(EXPIRY_TAG.to_string(), expires.to_string())]);
         provider.tag(logical, &tags, Some(&version.id))?;
     }
-    crate::ui::ui().success(&format!(
-        "saved {logical}/{key} in the declared secrets provider"
-    ));
-    Ok(())
+    Ok(version)
 }
 
 fn provider_target(raw: &str) -> Result<(String, String)> {
     let Some((logical, key)) = raw.split_once('/') else {
         return Err(crate::exit::usage(
-            "provider secrets use logical/KEY, where logical is a Kubernetes Secret name and KEY is an environment-variable-style key",
+            "provider secrets use logical/KEY, where logical is a Kubernetes Secret name and KEY is an inventory key",
         ));
     };
     if logical.is_empty() || key.is_empty() || key.contains('/') || !kubernetes_secret_name(logical)
     {
         return Err(crate::exit::usage(
-            "provider secrets use logical/KEY, where logical is a Kubernetes Secret name and KEY is an environment-variable-style key",
+            "provider secrets use logical/KEY, where logical is a Kubernetes Secret name and KEY is an inventory key",
         ));
     }
-    validate_name(key)?;
+    if !provider_key(key) {
+        return Err(crate::exit::usage(
+            "provider secrets use logical/KEY, where logical is a Kubernetes Secret name and KEY is an inventory key",
+        ));
+    }
     Ok((logical.to_string(), key.to_string()))
+}
+
+fn provider_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
 fn kubernetes_secret_name(name: &str) -> bool {
@@ -274,6 +354,8 @@ struct ProviderCheckEntry {
     version: String,
     expires_at: Option<String>,
     status: &'static str,
+    missing_keys: Vec<String>,
+    stale_consumers: Vec<String>,
 }
 
 struct ProviderCheckOutput {
@@ -288,6 +370,8 @@ impl crate::ui::CliOutput for ProviderCheckOutput {
                 "version": entry.version,
                 "expires_at": entry.expires_at,
                 "status": entry.status,
+                "missing_keys": entry.missing_keys,
+                "stale_consumers": entry.stale_consumers,
             })).collect::<Vec<_>>(),
         })
     }
@@ -298,14 +382,22 @@ impl crate::ui::CliOutput for ProviderCheckOutput {
             return;
         }
         for entry in &self.entries {
-            let detail = match &entry.expires_at {
+            let mut detail = match &entry.expires_at {
                 Some(expires_at) => format!("{} expires at {expires_at}", entry.name),
                 None => format!("{} has no expiry", entry.name),
             };
-            if entry.status == "warning" {
+            if !entry.missing_keys.is_empty() {
+                detail.push_str(&format!(" missing {}", entry.missing_keys.join(",")));
+            }
+            if !entry.stale_consumers.is_empty() {
+                detail.push_str(&format!(" stale {}", entry.stale_consumers.join(",")));
+            }
+            if entry.status == "warning"
+                || entry.status == "expired"
+                || entry.status == "missing"
+                || entry.status == "stale"
+            {
                 ui.warn(&detail);
-            } else if entry.status == "expired" {
-                ui.warn(&format!("{detail} and is expired"));
             } else {
                 ui.success(&detail);
             }
@@ -315,61 +407,119 @@ impl crate::ui::CliOutput for ProviderCheckOutput {
 
 /// Check expiry metadata for one provider object or the whole installation.
 pub fn check_discovered(file: Option<&Path>, name: Option<&str>) -> Result<()> {
-    let provider = discover_provider(file)?.ok_or_else(|| {
+    let installation = discover_installation(file)?.ok_or_else(|| {
         crate::exit::usage("curie secrets check requires a curie.yaml secrets provider")
     })?;
+    if installation.secrets.is_none() {
+        return Err(crate::exit::usage(
+            "curie secrets check requires a curie.yaml secrets provider",
+        ));
+    }
+    let provider = provider_for_installation(&installation)?
+        .context("declared secrets provider could not be constructed")?;
+    let inventory = platform_inventory()?;
     let metadata = match name {
-        Some(name) => vec![provider.get_metadata(name)?],
+        Some(name) => match provider.get_metadata(name) {
+            Ok(item) => vec![item],
+            Err(ProviderError::NotFound { .. })
+                if inventory.iter().any(|entry| entry.logical_name == name) =>
+            {
+                vec![ObjectMetadata {
+                    name: name.to_string(),
+                    version: crate::provider::ObjectVersion { id: String::new() },
+                    tags: BTreeMap::new(),
+                    key_names: Vec::new(),
+                }]
+            }
+            Err(error) => return Err(error.into()),
+        },
         None => provider.list("")?,
     };
-    let output = provider_check_output(metadata, OffsetDateTime::now_utc())?;
-    let expired: Vec<&str> = output
+    let namespace = installation.install.namespace.as_str();
+    let release = installation.install.release.as_str();
+    let store = reconcile::store_name(release);
+    let kubectl = kubectl_for(&installation)?;
+    let cluster = reconcile::reach(
+        kubectl
+            .as_ref()
+            .map(|client| client as &dyn crate::provider::eso::Kubectl),
+        namespace,
+        &store,
+    )?;
+    let mut stamps = BTreeMap::new();
+    if cluster.provisioned() {
+        let client = kubectl.context("provisioned install has no kubectl client")?;
+        for item in &metadata {
+            if let Some(entry) = inventory
+                .iter()
+                .find(|entry| entry.logical_name == item.name && entry.store == Store::Sm)
+            {
+                for consumer in &entry.consumers {
+                    stamps.insert(
+                        (item.name.clone(), consumer.clone()),
+                        reconcile::consumer_stamp(&client, namespace, release, consumer)?,
+                    );
+                }
+            }
+        }
+    }
+    let output = provider_check_output(
+        metadata,
+        &inventory,
+        cluster.provisioned(),
+        &stamps,
+        OffsetDateTime::now_utc(),
+    )?;
+    let failed: Vec<&str> = output
         .entries
         .iter()
-        .filter(|entry| entry.status == "expired")
+        .filter(|entry| matches!(entry.status, "expired" | "missing" | "stale"))
         .map(|entry| entry.name.as_str())
         .collect();
-    if expired.is_empty() {
+    if failed.is_empty() {
         crate::ui::ui().emit(&output);
         return Ok(());
     }
     Err(crate::ui::ui().failed_report(
         &output,
         crate::exit::CliError::failure(format!(
-            "provider secret expiry check failed: {} expired",
-            expired.join(", ")
+            "provider secret check failed: {}",
+            failed.join(", ")
         ))
-        .with_fix("Rotate each expired secret and set a future --expires timestamp.")
+        .with_fix("Replace missing keys, roll stale consumers, and set a future --expires timestamp for anything expired.")
         .into(),
     ))
 }
 
 fn provider_check_output(
     mut metadata: Vec<ObjectMetadata>,
+    inventory: &[InventoryEntry],
+    provisioned: bool,
+    stamps: &BTreeMap<(String, String), Option<String>>,
     now: OffsetDateTime,
 ) -> Result<ProviderCheckOutput> {
     metadata.sort_by(|left, right| left.name.cmp(&right.name));
     let mut entries = Vec::with_capacity(metadata.len());
     for item in metadata {
-        let expires_at = item.tags.get(EXPIRY_TAG).cloned();
-        let status = match expires_at.as_deref() {
-            None => "ok",
-            Some(raw) => {
-                let expiry = parse_expiry(raw)?;
-                if expiry <= now {
-                    "expired"
-                } else if expiry - now <= Duration::days(30) {
-                    "warning"
-                } else {
-                    "ok"
+        let entry = inventory
+            .iter()
+            .find(|candidate| candidate.logical_name == item.name);
+        let mut object_stamps = BTreeMap::new();
+        if let Some(entry) = entry {
+            for consumer in &entry.consumers {
+                if let Some(stamp) = stamps.get(&(item.name.clone(), consumer.clone())) {
+                    object_stamps.insert(consumer.clone(), stamp.clone());
                 }
             }
-        };
+        }
+        let checked = reconcile::assess(&item, entry, now, provisioned, &object_stamps)?;
         entries.push(ProviderCheckEntry {
-            name: item.name,
-            version: item.version.id,
-            expires_at,
-            status,
+            name: checked.name,
+            version: checked.version,
+            expires_at: checked.expires_at,
+            status: checked.status,
+            missing_keys: checked.missing_keys,
+            stale_consumers: checked.stale_consumers,
         });
     }
     Ok(ProviderCheckOutput { entries })
@@ -390,12 +540,39 @@ pub fn remove_discovered(file: Option<&Path>, name: &str) -> Result<()> {
             "provider secret name must be a Kubernetes Secret name",
         ));
     }
-    let provider = discover_provider(file)?.ok_or_else(|| {
+    let installation = discover_installation(file)?.ok_or_else(|| {
         crate::exit::usage("curie secrets rm requires a curie.yaml secrets provider")
     })?;
+    if installation.secrets.is_none() {
+        return Err(crate::exit::usage(
+            "curie secrets rm requires a curie.yaml secrets provider",
+        ));
+    }
+    let provider = provider_for_installation(&installation)?
+        .context("declared secrets provider could not be constructed")?;
     provider.delete(name, None)?;
+    let namespace = installation.install.namespace.as_str();
+    let release = installation.install.release.as_str();
+    let store = reconcile::store_name(release);
+    let kubectl = kubectl_for(&installation)?;
+    let cluster = reconcile::reach(
+        kubectl
+            .as_ref()
+            .map(|client| client as &dyn crate::provider::eso::Kubectl),
+        namespace,
+        &store,
+    )?;
+    if !cluster.provisioned() {
+        crate::ui::ui().success(&format!(
+            "removed {name} from Secrets Manager only; the install is not provisioned ({})",
+            cluster.detail(namespace, &store)
+        ));
+        return Ok(());
+    }
+    let client = kubectl.context("provisioned install has no kubectl client")?;
+    reconcile::delete_objects(&client, namespace, name)?;
     crate::ui::ui().success(&format!(
-        "removed {name} from the declared secrets provider"
+        "removed {name} from Secrets Manager and deleted its ExternalSecret"
     ));
     Ok(())
 }
@@ -1238,6 +1415,9 @@ mod tests {
                 entry("warning", "2026-10-22T00:00:00Z"),
                 entry("expired", "2026-09-21T00:00:00Z"),
             ],
+            &[],
+            false,
+            &BTreeMap::new(),
             now,
         )
         .unwrap();
