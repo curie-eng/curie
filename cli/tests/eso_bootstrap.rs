@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use curie::provider::bootstrap::{
     decide, dry_run_lines, ensure, minor_version, remove_owned_controller, ControllerTeardown,
-    Decision, EnsureOutcome, InstallationView, ESO_CHART, OWNERSHIP_CONFIGMAP,
+    Decision, EnsureOutcome, InstallRef, InstallationView, ESO_CHART, OWNERSHIP_CONFIGMAP,
 };
 use curie::provider::eso::{Kubectl, KubectlOutput, StoreSpec, ESO_VERSION};
 use serde_json::json;
@@ -109,6 +109,10 @@ impl Kubectl for Scripted {
         if joined.contains("get secretstore") {
             return Ok(ok(&self.store_body));
         }
+        if joined.contains("delete") {
+            assert!(!self.fail_writes, "kubectl delete must not run: {joined}");
+            return Ok(ok("deleted"));
+        }
         Ok(fail("unexpected kubectl command"))
     }
 }
@@ -171,7 +175,20 @@ fn crd(version: &str) -> String {
 }
 
 fn owned_map() -> String {
-    json!({"data": {"installed-by": "curie", "chart-version": ESO_VERSION}}).to_string()
+    json!({"data": {
+        "installed-by": "curie",
+        "chart-version": ESO_VERSION,
+        "install-namespace": "acme-harness",
+        "install-release": "acme-harness",
+    }})
+    .to_string()
+}
+
+fn this_install() -> InstallRef {
+    InstallRef {
+        namespace: "acme-harness".to_string(),
+        release: "acme-harness".to_string(),
+    }
 }
 
 fn compatible(script: &mut Scripted) {
@@ -229,7 +246,7 @@ fn an_empty_cluster_installs_and_a_match_reuses() {
 #[test]
 fn ensure_installs_when_nothing_is_present_and_is_idempotent_on_reuse() {
     let install = Scripted::absent();
-    let outcome = ensure(&install, &install, &spec()).expect("install");
+    let outcome = ensure(&install, &install, &spec(), &this_install(), None).expect("install");
     assert_eq!(outcome, EnsureOutcome::Installed);
     let calls = install.calls();
     assert!(
@@ -253,7 +270,7 @@ fn ensure_installs_when_nothing_is_present_and_is_idempotent_on_reuse() {
     compatible(&mut reuse);
     reuse.ownership =
         "Error from server (NotFound): configmaps \"curie-eso-install\" not found\n".to_string();
-    let outcome = ensure(&reuse, &reuse, &spec()).expect("reuse");
+    let outcome = ensure(&reuse, &reuse, &spec(), &this_install(), None).expect("reuse");
     assert_eq!(outcome, EnsureOutcome::Reused);
     let calls = reuse.calls();
     assert!(
@@ -270,7 +287,7 @@ fn an_incompatible_controller_refuses_before_any_write() {
     script.deploy_body =
         compatible_deploy("ghcr.io/external-secrets/external-secrets:v2.10.0", None);
     script.fail_writes = true;
-    let error = ensure(&script, &script, &spec()).expect_err("must refuse");
+    let error = ensure(&script, &script, &spec(), &this_install(), None).expect_err("must refuse");
     let text = format!("{error:#}");
     assert!(text.contains("Nothing was changed"), "{text}");
     assert!(
@@ -292,7 +309,7 @@ fn teardown_removes_only_a_controller_curie_installed() {
     let mut absent = Scripted::absent();
     absent.fail_writes = true;
     assert_eq!(
-        remove_owned_controller(&absent, &absent).expect("absent"),
+        remove_owned_controller(&absent, &absent, &this_install()).expect("absent"),
         ControllerTeardown::Retained
     );
 
@@ -300,7 +317,19 @@ fn teardown_removes_only_a_controller_curie_installed() {
     foreign.ownership = json!({"data": {"installed-by": "someone-else"}}).to_string();
     foreign.fail_writes = true;
     assert_eq!(
-        remove_owned_controller(&foreign, &foreign).expect("foreign"),
+        remove_owned_controller(&foreign, &foreign, &this_install()).expect("foreign"),
+        ControllerTeardown::Retained
+    );
+
+    let mut other_install = Scripted::absent();
+    other_install.ownership = owned_map();
+    other_install.fail_writes = true;
+    let other = InstallRef {
+        namespace: "other-ns".to_string(),
+        release: "other-release".to_string(),
+    };
+    assert_eq!(
+        remove_owned_controller(&other_install, &other_install, &other).expect("other install"),
         ControllerTeardown::Retained
     );
 
@@ -308,17 +337,27 @@ fn teardown_removes_only_a_controller_curie_installed() {
     unreadable.ownership = "unreachable\n".to_string();
     unreadable.fail_writes = true;
     assert_eq!(
-        remove_owned_controller(&unreadable, &unreadable).expect("unreadable"),
+        remove_owned_controller(&unreadable, &unreadable, &this_install()).expect("unreadable"),
         ControllerTeardown::Unproven
     );
 
     let mut owned = Scripted::absent();
     owned.ownership = owned_map();
     assert_eq!(
-        remove_owned_controller(&owned, &owned).expect("owned"),
+        remove_owned_controller(&owned, &owned, &this_install()).expect("owned"),
         ControllerTeardown::Removed
     );
-    assert!(owned.calls().iter().any(|call| call.contains("uninstall")));
+    let calls = owned.calls();
+    assert!(
+        calls.iter().any(|call| call.contains("uninstall")),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.contains("delete") && call.contains(OWNERSHIP_CONFIGMAP)),
+        "{calls:?}"
+    );
 }
 
 #[test]

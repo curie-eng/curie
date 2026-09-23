@@ -1885,10 +1885,15 @@ async fn bootstrap_provider_apply(cfg: Installation, dry_run: bool) -> Result<Ap
             lines: crate::provider::bootstrap::dry_run_lines(&spec),
         }));
     }
-    let outcome =
-        tokio::task::spawn_blocking(move || crate::provider::bootstrap::ensure_system(&spec))
-            .await
-            .context("External Secrets bootstrap stopped")??;
+    let install = crate::provider::bootstrap::InstallRef {
+        namespace: cfg.install.namespace.clone(),
+        release: cfg.install.release.clone(),
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::provider::bootstrap::ensure_system(&spec, &install)
+    })
+    .await
+    .context("External Secrets bootstrap stopped")??;
     let verb = match outcome {
         crate::provider::bootstrap::EnsureOutcome::Installed => "installed",
         crate::provider::bootstrap::EnsureOutcome::Reused => "reused",

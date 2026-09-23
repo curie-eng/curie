@@ -1034,8 +1034,15 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     // A controller Curie did not install stays, including when the marker
     // cannot be read. A failed uninstall does not skip the release sweep.
     let step = cl.step("checking External Secrets ownership");
-    match tokio::task::spawn_blocking(crate::provider::bootstrap::remove_owned_controller_system)
-        .await
+    let install = crate::provider::bootstrap::InstallRef {
+        namespace: opts.common.namespace.clone(),
+        release: opts.common.release.clone(),
+    };
+    let mut eso_failure = String::new();
+    match tokio::task::spawn_blocking(move || {
+        crate::provider::bootstrap::remove_owned_controller_system(&install)
+    })
+    .await
     {
         Ok(Ok(crate::provider::bootstrap::ControllerTeardown::Removed)) => {
             step.done("removed the controller Curie installed");
@@ -1048,7 +1055,8 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         }
         Ok(Err(error)) => {
             step.fail("failed");
-            ui.plumbing(&format!("{error:#}"));
+            eso_failure = format!("{error:#}");
+            ui.plumbing(&eso_failure);
         }
         Err(error) => {
             step.fail("failed");
@@ -1188,7 +1196,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
 
     // Pure decision (#767): success on a complete teardown, else a fail-forward
     // error whose exit class and message follow from the outcomes plus stderr.
-    teardown_result(
+    let result = teardown_result(
         helm_outcome,
         hook_outcome,
         sweep_outcome,
@@ -1196,7 +1204,15 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         &hook_err,
         &sweep_err,
         &opts.common,
-    )
+    );
+    if eso_failure.is_empty() {
+        result
+    } else {
+        match result {
+            Ok(_) => bail!("External Secrets controller was not removed: {eso_failure}"),
+            Err(error) => Err(error).context(eso_failure),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -176,12 +176,21 @@ pub fn dry_run_lines(spec: &StoreSpec) -> Vec<String> {
     ]
 }
 
-pub fn ensure(kubectl: &dyn Kubectl, helm: &dyn Helm, spec: &StoreSpec) -> Result<EnsureOutcome> {
+pub fn ensure(
+    kubectl: &dyn Kubectl,
+    helm: &dyn Helm,
+    spec: &StoreSpec,
+    install: &InstallRef,
+    endpoint: Option<&str>,
+) -> Result<EnsureOutcome> {
     let view = inspect(kubectl, helm)?;
     let outcome = match decide(&view, &spec.namespace) {
         Decision::Install => {
             install_controller(helm)?;
-            mark_owned(kubectl)?;
+            if let Some(endpoint) = endpoint.filter(|value| !value.is_empty()) {
+                point_controller_at(kubectl, endpoint)?;
+            }
+            mark_owned(kubectl, install)?;
             EnsureOutcome::Installed
         }
         Decision::Reuse => EnsureOutcome::Reused,
@@ -198,21 +207,39 @@ pub fn ensure(kubectl: &dyn Kubectl, helm: &dyn Helm, spec: &StoreSpec) -> Resul
     Ok(outcome)
 }
 
-pub fn ensure_system(spec: &StoreSpec) -> Result<EnsureOutcome> {
+pub fn ensure_system(spec: &StoreSpec, install: &InstallRef) -> Result<EnsureOutcome> {
     crate::ops::require_on_path("helm")?;
     crate::ops::require_on_path("kubectl")?;
-    ensure(&SystemKubectl::default(), &SystemHelm, spec)
+    let endpoint = std::env::var("CURIE_ESO_AWS_ENDPOINT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    ensure(
+        &SystemKubectl::default(),
+        &SystemHelm,
+        spec,
+        install,
+        endpoint.as_deref(),
+    )
 }
 
-/// Uninstall the controller only when the ownership marker says Curie installed it.
+/// The Curie install that created the controller. Teardown matches both fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallRef {
+    pub namespace: String,
+    pub release: String,
+}
+
+/// Uninstall the controller only when this install created it.
 pub fn remove_owned_controller(
     kubectl: &dyn Kubectl,
     helm: &dyn Helm,
+    install: &InstallRef,
 ) -> Result<ControllerTeardown> {
     match read_ownership(kubectl) {
         Ownership::Absent | Ownership::Foreign => Ok(ControllerTeardown::Retained),
         Ownership::Unreadable => Ok(ControllerTeardown::Unproven),
-        Ownership::Owned => {
+        Ownership::Owned(owner) if owner != *install => Ok(ControllerTeardown::Retained),
+        Ownership::Owned(_) => {
             let args = argv(&["uninstall", ESO_RELEASE, "-n", ESO_NAMESPACE]);
             let out = helm.run(&args)?;
             if !out.success
@@ -224,19 +251,37 @@ pub fn remove_owned_controller(
                     out.stderr.trim()
                 );
             }
+            let deleted = kubectl.run(
+                &argv(&[
+                    "-n",
+                    ESO_NAMESPACE,
+                    "delete",
+                    "configmap",
+                    OWNERSHIP_CONFIGMAP,
+                    "--ignore-not-found",
+                ]),
+                None,
+            )?;
+            if !deleted.success {
+                bail!(
+                    "External Secrets was uninstalled, but the ownership marker {} remains: {}",
+                    OWNERSHIP_CONFIGMAP,
+                    deleted.stderr.trim()
+                );
+            }
             Ok(ControllerTeardown::Removed)
         }
     }
 }
 
-pub fn remove_owned_controller_system() -> Result<ControllerTeardown> {
+pub fn remove_owned_controller_system(install: &InstallRef) -> Result<ControllerTeardown> {
     crate::ops::require_on_path("helm")?;
     crate::ops::require_on_path("kubectl")?;
-    remove_owned_controller(&SystemKubectl::default(), &SystemHelm)
+    remove_owned_controller(&SystemKubectl::default(), &SystemHelm, install)
 }
 
 enum Ownership {
-    Owned,
+    Owned(InstallRef),
     Absent,
     Foreign,
     Unreadable,
@@ -410,7 +455,46 @@ fn install_controller(helm: &dyn Helm) -> Result<()> {
     Ok(())
 }
 
-fn mark_owned(kubectl: &dyn Kubectl) -> Result<()> {
+fn point_controller_at(kubectl: &dyn Kubectl, endpoint: &str) -> Result<()> {
+    let all = format!("AWS_ENDPOINT_URL={endpoint}");
+    let sts = format!("AWS_ENDPOINT_URL_STS={endpoint}");
+    let secrets_manager = format!("AWS_SECRETSMANAGER_ENDPOINT={endpoint}");
+    let args = vec![
+        "-n".to_string(),
+        ESO_NAMESPACE.to_string(),
+        "set".to_string(),
+        "env".to_string(),
+        format!("deployment/{ESO_DEPLOYMENT}"),
+        all,
+        sts,
+        secrets_manager,
+    ];
+    let out = kubectl.run(&args, None)?;
+    if !out.success {
+        bail!(
+            "could not point External Secrets at the configured endpoint: {}",
+            out.stderr.trim()
+        );
+    }
+    let args = argv(&[
+        "-n",
+        ESO_NAMESPACE,
+        "rollout",
+        "status",
+        &format!("deployment/{ESO_DEPLOYMENT}"),
+        "--timeout=180s",
+    ]);
+    let out = kubectl.run(&args, None)?;
+    if !out.success {
+        bail!(
+            "External Secrets did not roll out after the endpoint change: {}",
+            out.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn mark_owned(kubectl: &dyn Kubectl, install: &InstallRef) -> Result<()> {
     let body = json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -421,6 +505,8 @@ fn mark_owned(kubectl: &dyn Kubectl) -> Result<()> {
         "data": {
             "installed-by": INSTALLED_BY,
             "chart-version": ESO_VERSION,
+            "install-namespace": install.namespace,
+            "install-release": install.release,
         },
     });
     apply_raw(kubectl, None, &body)
@@ -457,6 +543,7 @@ fn wait_until_ready(
     timeout: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut last_condition = String::new();
     loop {
         let out = kubectl.run(
             &argv(&["-n", namespace, "get", "secretstore", name, "-o", "json"]),
@@ -467,6 +554,9 @@ fn wait_until_ready(
                 if store_ready(&body) {
                     return Ok(());
                 }
+                if let Some(summary) = condition_summary(&body) {
+                    last_condition = summary;
+                }
             }
         } else if !is_missing(&out.stderr) && Instant::now() >= deadline {
             bail!(
@@ -476,13 +566,27 @@ fn wait_until_ready(
         }
         if Instant::now() >= deadline {
             bail!(
-                "SecretStore {namespace}/{name} did not become Ready within {}s",
+                "SecretStore {namespace}/{name} did not become Ready within {}s ({last_condition})",
                 timeout.as_secs()
             );
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(Duration::from_secs(2).min(remaining));
     }
+}
+
+fn condition_summary(body: &Value) -> Option<String> {
+    let conditions = body["status"]["conditions"].as_array()?;
+    let condition = conditions
+        .iter()
+        .find(|condition| condition["type"] == json!("Ready"))?;
+    let reason = condition["reason"].as_str().unwrap_or("");
+    let message = condition["message"].as_str().unwrap_or("");
+    let mut summary = format!("{reason}: {message}");
+    if summary.len() > 240 {
+        summary.truncate(240);
+    }
+    Some(summary)
 }
 
 fn store_ready(body: &Value) -> bool {
@@ -520,10 +624,21 @@ fn read_ownership(kubectl: &dyn Kubectl) -> Ownership {
     let Ok(body) = serde_json::from_str::<Value>(&out.stdout) else {
         return Ownership::Unreadable;
     };
-    if body["data"]["installed-by"].as_str() == Some(INSTALLED_BY) {
-        Ownership::Owned
-    } else {
-        Ownership::Foreign
+    let data = &body["data"];
+    if data["installed-by"].as_str() != Some(INSTALLED_BY) {
+        return Ownership::Foreign;
+    }
+    match (
+        data["install-namespace"].as_str(),
+        data["install-release"].as_str(),
+    ) {
+        (Some(namespace), Some(release)) if !namespace.is_empty() && !release.is_empty() => {
+            Ownership::Owned(InstallRef {
+                namespace: namespace.to_string(),
+                release: release.to_string(),
+            })
+        }
+        _ => Ownership::Foreign,
     }
 }
 
