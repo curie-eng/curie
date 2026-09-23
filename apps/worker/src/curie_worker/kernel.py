@@ -373,6 +373,16 @@ def _check_targetless_shape(qevent: QueuedTurn) -> None:
         qevent.source is not TurnSource.CRON or qevent.hook_run is None
     ):
         raise ValueError("only a cron turn with a hook run may omit its reply target")
+    # A targetless turn carries no resume authority (#2963): an id shaped like a
+    # work-item wake or an approval resume is an identity violation. It is refused
+    # here, before any effect, because settling it through the normal completion
+    # path would look up runs and write the done marker keyed by that id, which
+    # could finish or defer the UNRELATED run that legitimately owns it.
+    if _is_targetless(qevent) and (
+        parse_work_item_event_id(qevent.event_id) is not None
+        or Kernel._is_approval_resume(qevent.event_id)
+    ):
+        raise ValueError("a targetless turn may not carry a work-item or resume id")
 
 
 # The route a targetless turn threads through signatures that require one. No
@@ -1668,27 +1678,6 @@ class Kernel:
                 # completion an earlier delivery durably owed and never
                 # confirmed, which it re-emits from the STORED record.
                 await self._reemit_pending_completion(event_id)
-                return
-
-            if targetless and (
-                parse_work_item_event_id(event_id) is not None
-                or self._is_approval_resume(event_id)
-            ):
-                # A targetless turn carries no resume authority (#2963): an id
-                # shaped like a work-item wake or an approval resume is an
-                # identity violation, dropped before the hook row or any grant
-                # lookup is touched.
-                logger.error(
-                    "targetless event %s carries a work-item or resume id; dropping",
-                    event_id,
-                )
-                await self._complete(
-                    qevent,
-                    route,
-                    "dropped",
-                    telemetry_outcome="interrupted",
-                    lease=lease,
-                )
                 return
 
             if qevent.source is TurnSource.CRON:

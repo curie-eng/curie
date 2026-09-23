@@ -41,6 +41,7 @@ from curie_worker.binding import (
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.killswitch import kill_key
 from curie_worker.sandbox import QuotaRejection
+from curie_worker.workitem_dispatch import WorkItemAcquireGrant, WorkItemRun
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -494,8 +495,70 @@ def test_targetless_cron_for_a_killed_agent_records_blocked(
 # --- 8. no resume authority -------------------------------------------------
 
 
+def _reserved_event_id(kind: str, request_id: uuid.UUID | None = None) -> str:
+    rid = request_id or uuid.uuid4()
+    if kind == "approval-resume":
+        return f"approval-{rid}-resolved"
+    if kind == "work-item-execute":
+        return f"work-item-{rid}-execute-1"
+    assert kind == "work-item-terminate"
+    return f"work-item-{rid}-terminate"
+
+
+_RESERVED_KINDS = ["approval-resume", "work-item-execute", "work-item-terminate"]
+
+
+@pytest.mark.parametrize("kind", _RESERVED_KINDS)
 def test_targetless_turn_with_a_resume_event_id_gets_no_authority(
-    make_harness, make_hook_run
+    make_harness, make_hook_run, kind: str
+) -> None:
+    """A reserved event id on a targetless turn is refused before any effect."""
+
+    async def go() -> None:
+        async with make_hook_run() as run, _seed_deployments(
+            run.engine, run.agent_id
+        ), make_harness(
+            hook_runs=run.recorder(),
+            binding_factory=_resolver_factory(run.engine),
+        ) as h:
+            h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+            event = _targetless(run.ref, event_id=_reserved_event_id(kind))
+            before = await _owned_keys(h)
+
+            with pytest.raises(ValueError):
+                await h.kernel.process_event(event)
+
+            assert await _owned_keys(h) == before
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert not await _has_outbox_record(h, event.event_id)
+            assert h.runner.opened == []
+            for env in h.fake_k8s.claim_envs:
+                assert env is None or not (
+                    {GRANT_TOOL_ENV, RESUMED_KIND_ENV, DECISION_ENV} & env.keys()
+                )
+            assert h.fake_k8s.claim_envs == []
+            assert h.sink.events == []
+            assert await run.state() == (None, None)
+
+    asyncio.run(go())
+
+
+class _RecordingWorkItemClient:
+    """Records every lifecycle call a WorkItemRun could make."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, uuid.UUID]] = []
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        async def record(request_id: uuid.UUID, *args: object, **kwargs: object) -> None:
+            self.calls.append((name, request_id))
+
+        return record
+
+
+@pytest.mark.parametrize("kind", ["work-item-execute", "work-item-terminate"])
+def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
+    make_harness, make_hook_run, kind: str
 ) -> None:
     async def go() -> None:
         async with make_hook_run() as run, _seed_deployments(
@@ -504,17 +567,55 @@ def test_targetless_turn_with_a_resume_event_id_gets_no_authority(
             hook_runs=run.recorder(),
             binding_factory=_resolver_factory(run.engine),
         ) as h:
-            event = _targetless(
-                run.ref, event_id=f"approval-{uuid.uuid4()}-resolved"
+            h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+            request_id = uuid.uuid4()
+            execute_id = _reserved_event_id("work-item-execute", request_id)
+            event_id = _reserved_event_id(kind, request_id)
+            client = _RecordingWorkItemClient()
+            stops: list[str] = []
+
+            async def on_stop(*args: object, **kwargs: object) -> None:
+                stops.append("stop")
+
+            async def on_stale(*args: object, **kwargs: object) -> None:
+                stops.append("stale")
+
+            thread_key = f"work-item-{request_id}"
+            live = WorkItemRun(
+                client=client,  # type: ignore[arg-type]
+                request_id=request_id,
+                owner=h.config.consumer_name,
+                grant=WorkItemAcquireGrant(
+                    generation=1,
+                    work_item_id=request_id,
+                    conversation_id=thread_key,
+                    wait_deadline="",
+                ),
+                event_id=execute_id,
+                thread_key=thread_key,
+                on_stop=on_stop,
+                on_stale=on_stale,
             )
+            live.started = True
+            live.runtime_epoch = 7
+            live.execution_deadline = datetime.now(UTC) + timedelta(hours=1)
+            h.kernel._work_item_runs[request_id] = live
+            event = _targetless(run.ref, event_id=event_id)
+            before = await _owned_keys(h)
 
-            await h.kernel.process_event(event)
+            with pytest.raises(ValueError):
+                await h.kernel.process_event(event)
 
+            assert client.calls == []
+            assert stops == []
+            assert h.kernel._work_item_runs.get(request_id) is live
+            assert live.started and not live.finished and not live.held
+            assert live.event_id == execute_id
+            assert live.runtime_epoch == 7
+            assert await _owned_keys(h) == before
+            assert not await h.async_redis.exists(h.config.done_key(event_id))
+            assert not await _has_outbox_record(h, event_id)
             assert h.runner.opened == []
-            for env in h.fake_k8s.claim_envs:
-                assert env is None or not (
-                    {GRANT_TOOL_ENV, RESUMED_KIND_ENV, DECISION_ENV} & env.keys()
-                )
             assert h.fake_k8s.claim_envs == []
             assert h.sink.events == []
             assert await run.state() == (None, None)
