@@ -1318,9 +1318,16 @@ class HarnessCase:
             "describe-secret",
             "--secret-id",
             secret_id,
+            "--output",
+            "json",
             action="confirm the provider entry is gone",
             allow_failure=True,
         )
+        if gone.status == 0:
+            described = parse_json(gone.stdout, "deleted provider object")
+            provider_gone = bool(described.get("DeletedDate"))
+        else:
+            provider_gone = tool_error_has_code(gone, "ResourceNotFoundException")
         external = self.kubectl(
             "-n",
             NAMESPACE,
@@ -1334,7 +1341,7 @@ class HarnessCase:
             "rm removes the provider entry and its ExternalSecret",
             removed == 0
             and "ExternalSecret" in removed_text
-            and tool_error_has_code(gone, "ResourceNotFoundException")
+            and provider_gone
             and external.status != 0,
         )
 
