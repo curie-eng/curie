@@ -53,3 +53,4 @@ ADR-0015 rejects a credential broker in the app. ADR-0097 makes `curie.yaml` the
 - aws-sdk-rust in the CLI: +12 MB and three times the release build for what the aws CLI already does.
 - Reloader for restarts: another controller that can restart the worker mid-turn.
 - An import/migration command: only one install would use it.
+
