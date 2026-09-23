@@ -490,6 +490,10 @@
           "/config",
           "/connector-capabilities/probes",
           "/console/login-codes",
+          "/console/logout",
+          "/console/oidc/callback",
+          "/console/oidc/login",
+          "/console/principal",
           "/console/session",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
@@ -588,7 +592,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1200,
+      "cardinality_bound": 1232,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -667,6 +671,10 @@
           "/config",
           "/connector-capabilities/probes",
           "/console/login-codes",
+          "/console/logout",
+          "/console/oidc/callback",
+          "/console/oidc/login",
+          "/console/principal",
           "/console/session",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
@@ -772,7 +780,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6000,
+      "cardinality_bound": 6160,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -851,6 +859,10 @@
           "/config",
           "/connector-capabilities/probes",
           "/console/login-codes",
+          "/console/logout",
+          "/console/oidc/callback",
+          "/console/oidc/login",
+          "/console/principal",
           "/console/session",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
@@ -956,7 +968,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6000,
+      "cardinality_bound": 6160,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

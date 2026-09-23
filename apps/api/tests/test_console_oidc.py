@@ -645,14 +645,14 @@ def _attempt_count() -> int:
 
 
 def _cap_at(monkeypatch: pytest.MonkeyPatch, cap: int) -> None:
-    from curie_api import crud
+    from curie_api.crud import console as crud
 
     # raising=False so a missing constant fails on behavior, not on setup.
     monkeypatch.setattr(crud, "OIDC_LOGIN_ATTEMPT_CAP", cap, raising=False)
 
 
 def test_login_attempt_cap_is_a_positive_int() -> None:
-    from curie_api import crud
+    from curie_api.crud import console as crud
 
     cap = getattr(crud, "OIDC_LOGIN_ATTEMPT_CAP", None)
     assert isinstance(cap, int) and not isinstance(cap, bool), cap
@@ -763,7 +763,7 @@ def _race_login_starts(racers: int) -> tuple[int, int, list[BaseException]]:
     (created, exhausted, anything else that was raised).
     """
 
-    from curie_api import crud
+    from curie_api.crud import console as crud
     from sqlalchemy.ext.asyncio import AsyncSession
 
     async def run() -> tuple[int, int, list[BaseException]]:
@@ -831,7 +831,7 @@ def test_login_start_that_raises_after_locking_does_not_block_the_next(
     lock may be left behind.
     """
 
-    from curie_api import crud
+    from curie_api.crud import console as crud
     from sqlalchemy.ext.asyncio import AsyncSession
 
     _sql("TRUNCATE curie.oidc_login_attempts")
