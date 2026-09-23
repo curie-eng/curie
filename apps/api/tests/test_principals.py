@@ -22,19 +22,24 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
-from sqlalchemy import text
+from sqlalchemy import ForeignKeyConstraint, Table, UniqueConstraint, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+DEFAULT_TENANT_UUID = uuid.UUID(DEFAULT_TENANT_ID)
 
 
 def _fk_targets(column: Any) -> set[str]:
     return {fk.target_fullname for fk in column.foreign_keys}
 
 
-def _fk_ondelete(column: Any) -> set[str | None]:
-    return {fk.ondelete for fk in column.foreign_keys}
+def _unique_constraint_names(table: Table) -> set[str | None]:
+    return {c.name for c in table.constraints if isinstance(c, UniqueConstraint)}
+
+
+def _foreign_key_constraints(table: Table) -> dict[str | None, ForeignKeyConstraint]:
+    return {c.name: c for c in table.constraints if isinstance(c, ForeignKeyConstraint)}
 
 
 # --- ORM model shape -------------------------------------------------------
@@ -89,6 +94,13 @@ def test_principal_model_shape() -> None:
 
     assert [c.name for c in Principal.__table__.primary_key.columns] == ["id"]
 
+    # (tenant_id, id) is the composite target principal_teams' tenant-scoped
+    # FK points at, so a membership can never link across tenants.
+    assert {
+        "principals_tenant_idp_subject_key",
+        "principals_tenant_id_id_key",
+    } <= _unique_constraint_names(Principal.__table__)
+
 
 def test_team_model_shape() -> None:
     from curie_api.models import Team
@@ -119,6 +131,11 @@ def test_team_model_shape() -> None:
 
     assert [c.name for c in Team.__table__.primary_key.columns] == ["id"]
 
+    assert {
+        "teams_tenant_source_external_id_key",
+        "teams_tenant_id_id_key",
+    } <= _unique_constraint_names(Team.__table__)
+
 
 def test_principal_team_model_shape() -> None:
     from curie_api.models import PrincipalTeam
@@ -131,15 +148,33 @@ def test_principal_team_model_shape() -> None:
         "team_id",
     }
 
-    principal_id_col = columns["principal_id"]
-    assert principal_id_col.nullable is False
-    assert _fk_targets(principal_id_col) == {"curie.principals.id"}
-    assert _fk_ondelete(principal_id_col) == {"CASCADE"}
+    tenant_id_col = columns["tenant_id"]
+    assert tenant_id_col.type.python_type is uuid.UUID
+    assert tenant_id_col.nullable is False
 
-    team_id_col = columns["team_id"]
-    assert team_id_col.nullable is False
-    assert _fk_targets(team_id_col) == {"curie.teams.id"}
-    assert _fk_ondelete(team_id_col) == {"CASCADE"}
+    assert columns["principal_id"].nullable is False
+    assert columns["team_id"].nullable is False
+
+    # Both FKs are composite and tenant-scoped: a membership's tenant_id must
+    # match the tenant of the principal AND of the team it links.
+    fks = _foreign_key_constraints(PrincipalTeam.__table__)
+    assert set(fks) == {"principal_teams_principal_fkey", "principal_teams_team_fkey"}
+
+    principal_fk = fks["principal_teams_principal_fkey"]
+    assert principal_fk.column_keys == ["tenant_id", "principal_id"]
+    assert [e.target_fullname for e in principal_fk.elements] == [
+        "curie.principals.tenant_id",
+        "curie.principals.id",
+    ]
+    assert principal_fk.ondelete == "CASCADE"
+
+    team_fk = fks["principal_teams_team_fkey"]
+    assert team_fk.column_keys == ["tenant_id", "team_id"]
+    assert [e.target_fullname for e in team_fk.elements] == [
+        "curie.teams.tenant_id",
+        "curie.teams.id",
+    ]
+    assert team_fk.ondelete == "CASCADE"
 
     source_col = columns["source"]
     assert source_col.type.python_type is str
@@ -154,9 +189,7 @@ def test_principal_team_model_shape() -> None:
 
     # The ORM must declare the index under the same name 0052 creates, so a
     # future metadata-vs-migration drift check sees one index, not two.
-    assert "ix_principal_teams_team_id" in {
-        index.name for index in PrincipalTeam.__table__.indexes
-    }
+    assert "ix_principal_teams_team_id" in {index.name for index in PrincipalTeam.__table__.indexes}
 
     synced_at_col = columns["synced_at"]
     assert synced_at_col.type.python_type is datetime
@@ -199,9 +232,12 @@ async def _expect_integrity_error(
     statement: str,
     params: dict[str, Any],
     *,
-    constraint: str,
+    constraint: str | frozenset[str],
 ) -> None:
     """Assert the insert fails on exactly ``constraint``, not any IntegrityError.
+
+    ``constraint`` may be a set when more than one constraint is violated and
+    Postgres does not promise which of them it reports first.
 
     A bare IntegrityError would let a future NOT NULL, FK or default change make
     a test pass for the wrong reason; asyncpg reports the violated constraint's
@@ -215,7 +251,8 @@ async def _expect_integrity_error(
         if savepoint.is_active:
             await savepoint.rollback()
     cause = exc_info.value.orig.__cause__
-    assert getattr(cause, "constraint_name", None) == constraint, str(exc_info.value)
+    expected = {constraint} if isinstance(constraint, str) else set(constraint)
+    assert getattr(cause, "constraint_name", None) in expected, str(exc_info.value)
 
 
 _INSERT_PRINCIPAL = (
@@ -231,8 +268,8 @@ _INSERT_TEAM = (
     "VALUES (:id, :tenant_id, :source, :external_id, :name)"
 )
 _INSERT_MEMBERSHIP = (
-    "INSERT INTO curie.principal_teams (principal_id, team_id, source) "
-    "VALUES (:principal_id, :team_id, :source)"
+    "INSERT INTO curie.principal_teams (tenant_id, principal_id, team_id, source) "
+    "VALUES (:tenant_id, :principal_id, :team_id, :source)"
 )
 
 
@@ -242,6 +279,7 @@ async def _insert_principal(
     idp_subject: str | None = None,
     email: str | None = None,
     type_: str = "human",
+    tenant_id: uuid.UUID = DEFAULT_TENANT_UUID,
 ) -> uuid.UUID:
     principal_id = uuid.uuid4()
     await _exec(
@@ -249,7 +287,7 @@ async def _insert_principal(
         _INSERT_PRINCIPAL,
         {
             "id": principal_id,
-            "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+            "tenant_id": tenant_id,
             "idp_subject": idp_subject or f"sub-{uuid.uuid4()}",
             "type": type_,
             "email": email,
@@ -263,6 +301,7 @@ async def _insert_team(
     *,
     source: str = "curie_managed",
     external_id: str | None = None,
+    tenant_id: uuid.UUID = DEFAULT_TENANT_UUID,
 ) -> uuid.UUID:
     team_id = uuid.uuid4()
     await _exec(
@@ -270,13 +309,25 @@ async def _insert_team(
         _INSERT_TEAM,
         {
             "id": team_id,
-            "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+            "tenant_id": tenant_id,
             "source": source,
             "external_id": external_id,
             "name": f"team-{team_id}",
         },
     )
     return team_id
+
+
+async def _insert_tenant(conn: AsyncConnection) -> uuid.UUID:
+    """A second tenant, rolled back with the rest of the test's transaction."""
+    tenant_id = uuid.uuid4()
+    await _exec(
+        conn,
+        "INSERT INTO curie.tenants (id, deployment_id, status) "
+        "VALUES (:id, :deployment_id, 'active')",
+        {"id": tenant_id, "deployment_id": f"deployment-{tenant_id}"},
+    )
+    return tenant_id
 
 
 def test_principal_insert_applies_defaults(migrated: None) -> None:
@@ -328,14 +379,36 @@ def test_unique_constraint_is_named(migrated: None) -> None:
             conn,
             "SELECT conname FROM pg_constraint "
             "WHERE conname IN ('principals_tenant_idp_subject_key', "
-            "'teams_tenant_source_external_id_key') AND contype = 'u'",
+            "'teams_tenant_source_external_id_key', "
+            "'principals_tenant_id_id_key', 'teams_tenant_id_id_key') "
+            "AND contype = 'u'",
         )
 
     names = {row["conname"] for row in _rolled_back(body)}
     assert names == {
         "principals_tenant_idp_subject_key",
         "teams_tenant_source_external_id_key",
+        "principals_tenant_id_id_key",
+        "teams_tenant_id_id_key",
     }
+
+
+def test_membership_foreign_keys_are_named(migrated: None) -> None:
+    async def body(conn: AsyncConnection) -> list[dict[str, Any]]:
+        return await _exec(
+            conn,
+            "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint "
+            "WHERE conrelid = 'curie.principal_teams'::regclass AND contype = 'f'",
+        )
+
+    defs = {row["conname"]: row["def"] for row in _rolled_back(body)}
+    assert set(defs) == {"principal_teams_principal_fkey", "principal_teams_team_fkey"}
+    assert "(tenant_id, principal_id)" in defs["principal_teams_principal_fkey"]
+    assert "principals(tenant_id, id)" in defs["principal_teams_principal_fkey"]
+    assert "ON DELETE CASCADE" in defs["principal_teams_principal_fkey"]
+    assert "(tenant_id, team_id)" in defs["principal_teams_team_fkey"]
+    assert "teams(tenant_id, id)" in defs["principal_teams_team_fkey"]
+    assert "ON DELETE CASCADE" in defs["principal_teams_team_fkey"]
 
 
 def test_principal_teams_team_id_index_exists(migrated: None) -> None:
@@ -357,8 +430,7 @@ def test_same_email_different_subject_accepted(migrated: None) -> None:
         await _insert_principal(conn, idp_subject="sub-b", email="shared@example.com")
         rows = await _exec(
             conn,
-            "SELECT count(*) AS n FROM curie.principals "
-            "WHERE email = 'shared@example.com'",
+            "SELECT count(*) AS n FROM curie.principals WHERE email = 'shared@example.com'",
         )
         return int(rows[0]["n"])
 
@@ -491,6 +563,7 @@ def test_membership_defaults_and_duplicate_pk_rejected(migrated: None) -> None:
         principal_id = await _insert_principal(conn)
         team_id = await _insert_team(conn)
         params = {
+            "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
             "principal_id": principal_id,
             "team_id": team_id,
             "source": "curie_managed",
@@ -518,7 +591,12 @@ def test_bad_membership_source_rejected(migrated: None) -> None:
         await _expect_integrity_error(
             conn,
             _INSERT_MEMBERSHIP,
-            {"principal_id": principal_id, "team_id": team_id, "source": "manual"},
+            {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+                "principal_id": principal_id,
+                "team_id": team_id,
+                "source": "manual",
+            },
             constraint="principal_teams_source_ck",
         )
 
@@ -533,6 +611,7 @@ def test_deleting_principal_cascades_memberships(migrated: None) -> None:
             conn,
             _INSERT_MEMBERSHIP,
             {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
                 "principal_id": principal_id,
                 "team_id": team_id,
                 "source": "curie_managed",
@@ -545,8 +624,7 @@ def test_deleting_principal_cascades_memberships(migrated: None) -> None:
         )
         memberships = await _exec(
             conn,
-            "SELECT count(*) AS n FROM curie.principal_teams "
-            "WHERE principal_id = :id",
+            "SELECT count(*) AS n FROM curie.principal_teams WHERE principal_id = :id",
             {"id": principal_id},
         )
         teams = await _exec(
@@ -570,6 +648,7 @@ def test_deleting_team_cascades_memberships(migrated: None) -> None:
             conn,
             _INSERT_MEMBERSHIP,
             {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
                 "principal_id": principal_id,
                 "team_id": team_id,
                 "source": "curie_managed",
@@ -584,3 +663,81 @@ def test_deleting_team_cascades_memberships(migrated: None) -> None:
         return int(rows[0]["n"])
 
     assert _rolled_back(body) == 0
+
+
+# --- Tenant isolation of memberships --------------------------------------
+
+
+def _membership(
+    tenant_id: uuid.UUID, principal_id: uuid.UUID, team_id: uuid.UUID
+) -> dict[str, Any]:
+    return {
+        "tenant_id": tenant_id,
+        "principal_id": principal_id,
+        "team_id": team_id,
+        "source": "curie_managed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("membership_tenant", "constraint"),
+    [
+        # Under A the principal matches, so the team side is what fails.
+        ("principal", "principal_teams_team_fkey"),
+        # Under B the team matches, so the principal side is what fails.
+        ("team", "principal_teams_principal_fkey"),
+    ],
+    ids=["under-principal-tenant", "under-team-tenant"],
+)
+def test_cross_tenant_membership_rejected(
+    migrated: None, membership_tenant: str, constraint: str
+) -> None:
+    async def body(conn: AsyncConnection) -> None:
+        tenant_a = uuid.UUID(DEFAULT_TENANT_ID)
+        tenant_b = await _insert_tenant(conn)
+        principal_id = await _insert_principal(conn, tenant_id=tenant_a)
+        team_id = await _insert_team(conn, tenant_id=tenant_b)
+        tenant_id = tenant_a if membership_tenant == "principal" else tenant_b
+        await _expect_integrity_error(
+            conn,
+            _INSERT_MEMBERSHIP,
+            _membership(tenant_id, principal_id, team_id),
+            constraint=constraint,
+        )
+
+    _rolled_back(body)
+
+
+def test_membership_under_unrelated_tenant_rejected(migrated: None) -> None:
+    async def body(conn: AsyncConnection) -> None:
+        tenant_b = await _insert_tenant(conn)
+        tenant_c = await _insert_tenant(conn)
+        principal_id = await _insert_principal(conn, tenant_id=tenant_b)
+        team_id = await _insert_team(conn, tenant_id=tenant_b)
+        # Both FKs are violated; Postgres does not promise which it reports.
+        await _expect_integrity_error(
+            conn,
+            _INSERT_MEMBERSHIP,
+            _membership(tenant_c, principal_id, team_id),
+            constraint=frozenset({"principal_teams_principal_fkey", "principal_teams_team_fkey"}),
+        )
+
+    _rolled_back(body)
+
+
+def test_same_tenant_membership_in_second_tenant_accepted(migrated: None) -> None:
+    async def body(conn: AsyncConnection) -> list[dict[str, Any]]:
+        tenant_b = await _insert_tenant(conn)
+        principal_id = await _insert_principal(conn, tenant_id=tenant_b)
+        team_id = await _insert_team(conn, tenant_id=tenant_b)
+        await _exec(conn, _INSERT_MEMBERSHIP, _membership(tenant_b, principal_id, team_id))
+        return await _exec(
+            conn,
+            "SELECT tenant_id FROM curie.principal_teams "
+            "WHERE principal_id = :principal_id AND team_id = :team_id",
+            {"principal_id": principal_id, "team_id": team_id},
+        )
+
+    (row,) = _rolled_back(body)
+    assert row["tenant_id"] is not None
+    assert row["tenant_id"] != uuid.UUID(DEFAULT_TENANT_ID)
