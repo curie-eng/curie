@@ -3635,7 +3635,7 @@ async fn provider_bind_and_apply_cluster_connectors(
     use anyhow::Context as _;
     use curie::provider::connector_deploy;
     let ui = ui::ui();
-    let plan = connector_deploy::plan(&connector_deploy::PlanInput {
+    let plan = connector_deploy::plan_deploy(&connector_deploy::PlanInput {
         release,
         namespace,
         agent: agent_name,
