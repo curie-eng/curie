@@ -6264,23 +6264,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                     target.context, target.cluster
                 ));
             }
-            let provider = cfg.secrets.is_some();
             let local = curie::installation::plan_installation(cfg, dry_run)?;
-            // A declared provider installs External Secrets and does not render
-            // the Curie chart. Chart resolution would require a checkout the
-            // provider path does not use.
-            let chart = if provider {
-                String::new()
-            } else {
-                let resolved = artifacts::resolve_chart(
-                    chart.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                    artifacts::cache_root,
-                    std::path::Path::new("charts/curie").is_dir(),
-                )?;
-                materialize_artifact(resolved, dry_run, "chart").await?
-            };
+            let resolved = artifacts::resolve_chart(
+                chart.as_deref(),
+                artifacts::Channel::current(),
+                artifacts::version(),
+                artifacts::cache_root,
+                std::path::Path::new("charts/curie").is_dir(),
+            )?;
+            let chart = materialize_artifact(resolved, dry_run, "chart").await?;
             emit(
                 curie::installation::apply(curie::installation::ApplyOpts {
                     local,

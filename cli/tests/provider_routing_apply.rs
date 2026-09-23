@@ -275,6 +275,10 @@ fn provider_present_apply_dry_run_routes_names_offline() {
 
     assert!(all.contains("--history-max"), "{all}");
     assert!(
+        all.contains("charts/curie"),
+        "the Helm step must render the resolved Curie chart: {all}"
+    );
+    assert!(
         all.contains("installation.idExistingSecret=rel-curie-installation-id"),
         "{all}"
     );
