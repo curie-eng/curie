@@ -3418,7 +3418,6 @@ class HarnessCase:
 
 ROUTING_RELEASE = "rt"
 ROUTING_NAMESPACE = "curie-aws-secrets-e2e-routing"
-ROUTING_ROLE_ARN = "arn:aws:iam::000000000000:role/curie-aws-secrets-e2e-routing"
 ROUTING_APPLY_COUNT = 4
 ROUTING_MAX_REVISIONS = 3
 ROUTING_MODEL_ENV = "CURIE_E2E_MODEL"
@@ -3551,6 +3550,7 @@ def routing_installation(
     context: str,
     prefix: str,
     images: dict[str, str],
+    role_arn: str,
     *,
     provider: bool = True,
 ) -> dict[str, Any]:
@@ -3583,7 +3583,7 @@ def routing_installation(
             "provider": "aws",
             "region": REGION,
             "prefix": prefix,
-            "role_arn": ROUTING_ROLE_ARN,
+            "role_arn": role_arn,
         }
     return document
 
@@ -3610,6 +3610,7 @@ class RoutingHarnessCase(HarnessCase):
         self.load_and_verify_images()
         self.preload_chart_images()
         self.start_moto()
+        self.create_routing_role()
         self.create_routing_namespace()
         self.make_values()
         config = self.write_config(provider=True)
@@ -3651,6 +3652,26 @@ class RoutingHarnessCase(HarnessCase):
                 "load chart image into kind",
                 timeout=300,
             )
+
+    def create_routing_role(self) -> None:
+        """The web identity role the apply-created SecretStore assumes in the emulator."""
+        document = write_private_file(
+            self.work / "assume-role.json",
+            b'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"*"},"Action":"sts:AssumeRoleWithWebIdentity"}]}',
+        )
+        result = self.aws(
+            "iam",
+            "create-role",
+            "--role-name",
+            require_owned_name(f"{OWNED_PREFIX}{self.suffix}-routing"),
+            "--assume-role-policy-document",
+            f"file://{document}",
+            action="create emulator role",
+        )
+        arn = str(parse_json(result.stdout, "emulator role").get("Role", {}).get("Arn", ""))
+        if not arn.startswith("arn:aws:iam::"):
+            raise HarnessError("emulator role ARN is missing")
+        self.role_arn = arn
 
     def create_routing_namespace(self) -> None:
         assert self.ledger is not None
@@ -3736,7 +3757,7 @@ class RoutingHarnessCase(HarnessCase):
         metadata = parse_json(account.stdout, "provider service account").get("metadata", {})
         annotation = metadata.get("annotations", {}).get("eks.amazonaws.com/role-arn", "")
         self.record_assertion(
-            "service account is annotated with role_arn", annotation == ROUTING_ROLE_ARN
+            "service account is annotated with role_arn", annotation == self.role_arn
         )
 
     def prove_incompatible_eso_refuses(self, config: pathlib.Path) -> None:
@@ -3870,6 +3891,7 @@ class RoutingHarnessCase(HarnessCase):
             self.context,
             self.prefix,
             images,
+            self.role_arn,
             provider=provider,
         )
         name = "curie.yaml" if provider else "curie-no-provider.yaml"
