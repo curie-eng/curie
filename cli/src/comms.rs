@@ -2,10 +2,12 @@
 //! with one `helm upgrade --reuse-values`, keeping the chart as the source of
 //! truth.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::local::{fake_model_env_override, otel_endpoint_env_override, ModelMode};
 use crate::ops::{plain, require_on_path, run_step, secret_set, CmdArg, CommonOpts, OpsCommand};
+use crate::provider::binding::{helm_ref, merge_json_key, remove_json_key};
+use crate::provider::SecretsProvider;
 
 /// The worker's stub bot token (compose default); restored on disconnect.
 const LOCAL_SLACK_STUB_BOT_TOKEN: &str = "xoxb-dev";
@@ -68,6 +70,51 @@ pub struct LocalCommsOpts {
     /// verb silently reverts five services from a `--build` stack's tag to
     /// `:latest`.
     pub stack_image_env: Vec<(String, String)>,
+}
+
+fn set_string(key: &str, value: &str) -> [CmdArg; 2] {
+    [plain("--set-string"), plain(format!("{key}={value}"))]
+}
+
+/// Provider connect: point the chart at the inventory Secret and clear inline
+/// tokens. The values themselves go to the provider, not to helm.
+pub fn provider_connect_commands(opts: &CommsOpts) -> Result<Vec<OpsCommand>> {
+    let app = helm_ref("slack-app-token", &opts.common.release)?;
+    let bot = helm_ref("slack-bot-token", &opts.common.release)?;
+    let mut args = vec![
+        plain("upgrade"),
+        plain(&opts.common.release),
+        plain(&opts.chart),
+        plain("-n"),
+        plain(&opts.common.namespace),
+        plain("--reuse-values"),
+    ];
+    for binding in [&app, &bot] {
+        args.extend(set_string(&binding.secret_knob, &binding.target));
+        args.extend(set_string(&binding.key_knob, &binding.key));
+    }
+    args.extend([
+        plain("--set"),
+        plain("dispatcher.slack.appToken="),
+        plain("--set"),
+        plain("dispatcher.slack.botToken="),
+        plain("--set"),
+        plain("worker.slackApiBaseUrl="),
+    ]);
+    Ok(vec![OpsCommand::new("helm", args)])
+}
+
+fn sync_slack(provider: &dyn SecretsProvider, opts: &CommsOpts) -> Result<()> {
+    let app = helm_ref("slack-app-token", &opts.common.release)?;
+    let bot = helm_ref("slack-bot-token", &opts.common.release)?;
+    if opts.disconnect {
+        remove_json_key(provider, app.logical_name, &app.key)?;
+        remove_json_key(provider, bot.logical_name, &bot.key)?;
+        return Ok(());
+    }
+    merge_json_key(provider, app.logical_name, &app.key, &opts.app_token)?;
+    merge_json_key(provider, bot.logical_name, &bot.key, &opts.bot_token)?;
+    Ok(())
 }
 
 pub fn connect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
@@ -350,9 +397,12 @@ impl crate::ui::CliOutput for CommsOutput {
 pub async fn comms(opts: CommsOpts) -> Result<CommsOutput> {
     let ui = crate::ui::ui();
     require_connect_tokens(opts.disconnect, &opts.app_token, &opts.bot_token)?;
+    let declared = crate::secrets::declared_scope(&opts.common.namespace, &opts.common.release)?;
 
     let cmds = if opts.disconnect {
         disconnect_commands(&opts)
+    } else if declared.is_some() {
+        provider_connect_commands(&opts)?
     } else {
         connect_commands(&opts)
     };
@@ -376,6 +426,11 @@ pub async fn comms(opts: CommsOpts) -> Result<CommsOutput> {
 
     require_on_path("helm")?;
     require_on_path("kubectl")?;
+    if let Some(installation) = &declared {
+        let provider = crate::secrets::provider_for_installation(installation)?
+            .context("declared secrets provider could not be constructed")?;
+        sync_slack(&provider, &opts)?;
+    }
     let cl = ui.checklist();
     let label = if opts.disconnect {
         format!("disconnecting Slack from release {}", opts.common.release)

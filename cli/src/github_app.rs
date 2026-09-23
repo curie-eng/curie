@@ -75,6 +75,30 @@ const JWT_LIFETIME_SECONDS: i64 = 480;
 /// the api pod fails to start on a Secret that is perfectly correct.
 pub const DEFAULT_APP_KEY_DATA_KEY: &str = "privateKey";
 
+fn provider_chart_held_commands(opts: &GithubAppOpts, clone_base: &str) -> Result<Vec<OpsCommand>> {
+    let binding =
+        crate::provider::binding::helm_ref("github-app-private-key", &opts.common.release)?;
+    let args = vec![
+        plain("upgrade"),
+        plain(&opts.common.release),
+        plain(&opts.chart),
+        plain("-n"),
+        plain(&opts.common.namespace),
+        plain("--reuse-values"),
+        plain("--set-string"),
+        plain(format!("api.githubAppId={}", opts.app_id.trim())),
+        plain("--set-string"),
+        plain(format!("{}={}", binding.secret_knob, binding.target)),
+        plain("--set-string"),
+        plain(format!("{}={}", binding.key_knob, binding.key)),
+        plain("--set"),
+        plain("api.githubAppPrivateKey="),
+        plain("--set"),
+        plain(format!("api.githubCloneBase={clone_base}")),
+    ];
+    Ok(vec![OpsCommand::new("helm", args)])
+}
+
 pub fn connect_commands(opts: &GithubAppOpts, clone_base: &str) -> Vec<OpsCommand> {
     let mut args = vec![
         plain("upgrade"),
@@ -1745,6 +1769,7 @@ pub(crate) async fn guard_app_identity(opts: &GithubAppOpts, clone_base: &str) -
 pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubAppOutput> {
     let ui = crate::ui::ui();
     require_connect_inputs(&opts)?;
+    let declared = crate::secrets::declared_scope(&opts.common.namespace, &opts.common.release)?;
 
     // On a real run helm must be on PATH before either the values read below
     // or the upgrade further down; a --dry-run has always worked with no
@@ -1759,6 +1784,8 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
 
     let cmds = if opts.disconnect {
         disconnect_commands(&opts)
+    } else if declared.is_some() && opts.existing_secret.trim().is_empty() {
+        provider_chart_held_commands(&opts, clone_base)?
     } else {
         connect_commands(&opts, clone_base)
     };
@@ -1797,6 +1824,27 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     // mutation. Disconnect has no credential to authenticate; dry-run is offline.
     if !opts.disconnect {
         guard_app_identity(&opts, clone_base).await?;
+    }
+    if let Some(installation) = &declared {
+        let provider = crate::secrets::provider_for_installation(installation)?
+            .context("declared secrets provider could not be constructed")?;
+        let binding =
+            crate::provider::binding::helm_ref("github-app-private-key", &opts.common.release)?;
+        if opts.disconnect {
+            crate::provider::binding::remove_json_key(
+                &provider,
+                binding.logical_name,
+                &binding.key,
+            )?;
+        } else {
+            let pem = load_connect_pem(&opts).await?;
+            crate::provider::binding::merge_json_key(
+                &provider,
+                binding.logical_name,
+                &binding.key,
+                &pem,
+            )?;
+        }
     }
     let expected_inventory = ExpectedSandboxInventory::from_values(revision_values.as_ref())?;
     let prior_sandboxes = read_desired_sandboxes(&opts, Some(prior_revision))
