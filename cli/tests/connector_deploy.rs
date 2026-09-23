@@ -19,7 +19,7 @@ use curie::connectors::prepare;
 use curie::installation::{ProviderKind, SecretsBlock};
 use curie::ops::{CmdArg, CommonOpts};
 use curie::provider::connector_deploy::{
-    apply_objects, eso_prune_args, plan, preflight, preflight_targets, write_provider, Plan,
+    apply_objects, eso_prune_args, plan_deploy, preflight, preflight_targets, write_provider, Plan,
     PlanInput, RemoteKeys, ESO_MANAGER_PREFIX, EXTERNAL_SECRET_CRD,
 };
 use curie::provider::eso::{
@@ -80,7 +80,7 @@ fn build_plan(
     hosted: &BTreeMap<String, String>,
     sandbox: &BTreeMap<String, String>,
 ) -> Result<Plan> {
-    plan(&PlanInput {
+    plan_deploy(&PlanInput {
         release: RELEASE,
         namespace: NS,
         agent: AGENT,

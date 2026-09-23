@@ -2,7 +2,7 @@
 //! connector credentials go to Secrets Manager and External Secrets syncs
 //! them into the cluster, instead of the CLI writing value Secrets itself.
 //!
-//! The steps are split so the caller can order them: [`plan`] is pure,
+//! The steps are split so the caller can order them: [`plan_deploy`] is pure,
 //! [`preflight_targets`] and [`preflight`] only read, and only then do [`write_provider`] and
 //! [`apply_objects`] write. Values live in [`SecretMaterial`] so a `Debug` of
 //! the plan cannot print them, and no error here carries a value.
@@ -35,7 +35,7 @@ pub const ESO_MANAGER_PREFIX: &str = "externalsecrets.external-secrets.io/";
 /// How often ESO re-reads Secrets Manager for a connector entry.
 const REFRESH_INTERVAL: &str = "1h";
 
-/// What [`plan`] needs. Values are borrowed; the plan copies them into
+/// What [`plan_deploy`] needs. Values are borrowed; the plan copies them into
 /// [`SecretMaterial`].
 pub struct PlanInput<'a> {
     pub release: &'a str,
@@ -164,7 +164,7 @@ fn planned(
 /// key union must equal what the API declared owned: the API decides which
 /// keys this deploy resolves (#1163), and a disagreement would sync a key the
 /// connector does not read or leave one it does read undelivered.
-pub fn plan(input: &PlanInput) -> Result<Plan> {
+pub fn plan_deploy(input: &PlanInput) -> Result<Plan> {
     let agent = input.agent;
     let hosted_pattern = hosted_target_name("{release}", agent);
     let mut hosted = Vec::new();
