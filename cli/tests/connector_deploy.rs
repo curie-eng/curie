@@ -19,8 +19,8 @@ use curie::connectors::prepare;
 use curie::installation::{ProviderKind, SecretsBlock};
 use curie::ops::{CmdArg, CommonOpts};
 use curie::provider::connector_deploy::{
-    apply_objects, eso_prune_args, plan, preflight, write_provider, Plan, PlanInput, RemoteKeys,
-    ESO_MANAGER_PREFIX, EXTERNAL_SECRET_CRD,
+    apply_objects, eso_prune_args, plan, preflight, preflight_targets, write_provider, Plan,
+    PlanInput, RemoteKeys, ESO_MANAGER_PREFIX, EXTERNAL_SECRET_CRD,
 };
 use curie::provider::eso::{
     self, release_store_spec, render_external_secret, render_push_secret, Kubectl, KubectlOutput,
@@ -1244,4 +1244,207 @@ fn into_provider_delivery_drops_the_secret_and_keeps_its_name() {
     assert_eq!(after_objects, expected);
     assert!(after_objects.contains(&("Deployment".to_string(), "r1-bot-mcp-conn".to_string())));
     assert!(after_objects.contains(&("Service".to_string(), "r1-bot-mcp-conn".to_string())));
+}
+
+// ---------------------------------------------------------------- review findings contract
+
+const STORE: &str = "curie-secrets";
+
+fn rendered(entry: &SyncEntry) -> Value {
+    render_external_secret(entry, NS, STORE, "1h")
+}
+
+/// Finding 1: the sandbox ExternalSecret keeps the owner label on its own
+/// metadata (so the CLI prune finds it) but must not stamp the owner label on
+/// the Secret it creates, or the worker's reconcile deletes it as undeclared.
+#[test]
+fn sandbox_external_secret_does_not_label_its_target_with_the_connector_owner() {
+    let plan = default_plan();
+    let sandbox = plan.sandbox.as_ref().expect("sandbox entry");
+    assert_eq!(sandbox.sync.labels, owner_labels());
+    assert!(
+        !sandbox.sync.target_labels.contains_key(OWNER),
+        "sandbox target labels carry the owner: {:?}",
+        sandbox.sync.target_labels
+    );
+    let es = rendered(&sandbox.sync);
+    assert_eq!(es["metadata"]["labels"][OWNER], json!(AGENT), "{es}");
+    let template_labels = &es["spec"]["target"]["template"]["metadata"]["labels"];
+    assert!(
+        template_labels.get(OWNER).is_none(),
+        "sandbox target Secret is labelled with the connector owner: {es}"
+    );
+}
+
+/// Finding 1, other side: the hosted target Secret stays labelled.
+#[test]
+fn hosted_external_secret_still_labels_its_target_with_the_connector_owner() {
+    let plan = default_plan();
+    let hosted = &plan.hosted[0];
+    assert_eq!(hosted.sync.target_labels, owner_labels());
+    let es = rendered(&hosted.sync);
+    assert_eq!(es["metadata"]["labels"][OWNER], json!(AGENT), "{es}");
+    assert_eq!(
+        es["spec"]["target"]["template"]["metadata"]["labels"][OWNER],
+        json!(AGENT),
+        "{es}"
+    );
+}
+
+const TWO_STATIC_DECL: &str = "\
+connectors:
+  a:
+    image: ghcr.io/example/a:1
+    secrets:
+      - A_KEY
+  b:
+    image: ghcr.io/example/b:1
+    secrets:
+      - B_KEY
+";
+
+fn hosted_external_secrets(plan: &Plan) -> Vec<Value> {
+    plan.entries()
+        .into_iter()
+        .filter(|e| e.sync.target == HOSTED_TARGET)
+        .map(|e| rendered(&e.sync))
+        .collect()
+}
+
+/// Finding 2: two hosted connectors with static keys share one target Secret,
+/// so exactly one Owner ExternalSecret (`<agent>.hosted`) carries all keys.
+#[test]
+fn two_static_hosted_connectors_get_one_owner_external_secret() {
+    let decl = parse_connectors(TWO_STATIC_DECL).expect("decl parses");
+    let hosted = map(&[("A_KEY", V1), ("B_KEY", V2)]);
+    let plan = build_plan(&decl, &hosted, &BTreeMap::new()).expect("plan");
+    assert_eq!(plan.hosted.len(), 1, "one hosted entry: {:?}", plan.hosted);
+    let entry = &plan.hosted[0];
+    assert_eq!(entry.sync.name, format!("{AGENT}.hosted"));
+    assert_eq!(entry.sync.target, HOSTED_TARGET);
+    assert_eq!(
+        entry.sync.static_keys,
+        vec!["A_KEY".to_string(), "B_KEY".to_string()]
+    );
+    assert!(entry.sync.rotated_keys.is_empty());
+    assert_eq!(
+        exposed(&entry.static_values),
+        map(&[("A_KEY", V1), ("B_KEY", V2)])
+    );
+    let es = hosted_external_secrets(&plan);
+    assert_eq!(es.len(), 1);
+    assert_eq!(es[0]["spec"]["target"]["creationPolicy"], json!("Owner"));
+}
+
+const ROTATING_PLUS_STATIC_DECL: &str = "\
+connectors:
+  a:
+    image: ghcr.io/example/a:1
+    secrets:
+      - A_KEY
+      - A_ROT
+    secret_rotation:
+      A_ROT: workload
+  b:
+    image: ghcr.io/example/b:1
+    secrets:
+      - B_KEY
+";
+
+/// Finding 2: when a rotating entry merges into the shared target, no other
+/// ExternalSecret on that target may claim Owner.
+#[test]
+fn rotating_and_static_hosted_connectors_all_merge_into_the_shared_target() {
+    let decl = parse_connectors(ROTATING_PLUS_STATIC_DECL).expect("decl parses");
+    let hosted = map(&[("A_KEY", V1), ("A_ROT", V2), ("B_KEY", V3)]);
+    let plan = build_plan(&decl, &hosted, &BTreeMap::new()).expect("plan");
+    let es = hosted_external_secrets(&plan);
+    assert!(!es.is_empty());
+    for object in &es {
+        assert_eq!(
+            object["spec"]["target"]["creationPolicy"],
+            json!("CreateOrMerge"),
+            "{object}"
+        );
+    }
+    let mut keys: Vec<String> = plan
+        .hosted
+        .iter()
+        .flat_map(|e| e.sync.static_keys.iter().chain(e.sync.rotated_keys.iter()))
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["A_KEY", "A_ROT", "B_KEY"]);
+}
+
+/// Finding 3: names-only preflight, callable before any deployment mutation.
+#[test]
+fn preflight_targets_accepts_absent_targets_read_only() {
+    let k = ReadKubectl::new(true);
+    preflight_targets(&k, NS, RELEASE, AGENT, true).expect("absent targets ok");
+    k.assert_read_only();
+    let calls = k.calls();
+    for target in [HOSTED_TARGET, SANDBOX_TARGET] {
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a.ends_with(target))),
+            "{target} not read: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn preflight_targets_skips_the_sandbox_target_without_sandbox() {
+    let k = ReadKubectl::new(true).with_secret(SANDBOX_TARGET, &["helm"]);
+    preflight_targets(&k, NS, RELEASE, AGENT, false).expect("sandbox not checked");
+    k.assert_read_only();
+}
+
+#[test]
+fn preflight_targets_accepts_eso_managed_targets_for_this_agent() {
+    let hosted_manager = format!("{ESO_MANAGER_PREFIX}{AGENT}.hosted");
+    let sandbox_manager = format!("{ESO_MANAGER_PREFIX}{SANDBOX_ENTRY}");
+    let k = ReadKubectl::new(true)
+        .with_secret(HOSTED_TARGET, &[&hosted_manager])
+        .with_secret(SANDBOX_TARGET, &[&sandbox_manager]);
+    preflight_targets(&k, NS, RELEASE, AGENT, true).expect("eso-managed ok");
+    k.assert_read_only();
+}
+
+#[test]
+fn preflight_targets_refuses_another_agents_eso_manager() {
+    let other = format!("{ESO_MANAGER_PREFIX}bother.hosted");
+    let k = ReadKubectl::new(true).with_secret(HOSTED_TARGET, &[&other]);
+    let err = preflight_targets(&k, NS, RELEASE, AGENT, true).expect_err("not ours");
+    assert!(format!("{err:#}").contains(HOSTED_TARGET), "{err:#}");
+    k.assert_read_only();
+}
+
+#[test]
+fn preflight_targets_refuses_a_helm_managed_target_by_name() {
+    let k = ReadKubectl::new(true).with_secret(SANDBOX_TARGET, &["helm"]);
+    let err = preflight_targets(&k, NS, RELEASE, AGENT, true).expect_err("helm Secret");
+    assert!(format!("{err:#}").contains(SANDBOX_TARGET), "{err:#}");
+    k.assert_read_only();
+}
+
+#[test]
+fn preflight_targets_refuses_a_missing_crd() {
+    let k = ReadKubectl::new(false);
+    let err = preflight_targets(&k, NS, RELEASE, AGENT, true).expect_err("no CRD");
+    assert!(format!("{err:#}").contains("curie apply"), "{err:#}");
+    k.assert_read_only();
+}
+
+/// Finding 4: the prune keep list always spares `<agent>.sandbox`, so a
+/// redeploy that drops sandbox credentials does not delete the ExternalSecret
+/// the SandboxTemplate still references.
+#[test]
+fn object_names_always_keep_the_sandbox_external_secret() {
+    let plan = build_plan(&decl(), &hosted_values(), &BTreeMap::new()).expect("plan");
+    assert!(plan.sandbox.is_none());
+    assert!(
+        plan.object_names().contains(&SANDBOX_ENTRY.to_string()),
+        "{:?}",
+        plan.object_names()
+    );
 }
