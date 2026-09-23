@@ -1,7 +1,7 @@
 ---
 seam: Triggers
 kind: SOFT
-impls: 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook)
+impls: 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) + per-agent cron scheduler (worker cron_loop)
 grade: not separately graded
 epics:
   - "#29"
@@ -13,7 +13,7 @@ order: 17
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) + per-agent cron scheduler (worker cron_loop) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -103,27 +103,33 @@ is rejected at deploy. A cron declaration needs a unique non-empty name, a non-e
 five-field schedule; timezone, when present, is an IANA zone name matching an exact key in packaged
 tzdata, so host only aliases such as `localtime` are rejected; it defaults to UTC only when omitted and is legal only with a
 schedule; target, when present, is a non-empty channel address string; schedule is forbidden on other
-types; webhook `{type, path}` is unchanged. This is the *declaration*
-surface only. A generic HMAC hook ingress is shipped (`ingest_hook` above); bundle-declared
-`cron` / `webhook` *consumption* -- a per-agent scheduler that fires a declared schedule, or a
-mapping from a declared webhook path onto that handler -- is still the open Epic #29
-question and is not built. Declaring a trigger validates its shape; it does not yet
-wire a live wake-up for that declaration.
+types; webhook `{type, path}` is unchanged. Declared `cron` triggers are consumed: the worker's
+per-agent cron scheduler (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop`, ADR-0099,
+#268) fires each declared schedule as a CRON `QueuedTurn`. See
+[Cron triggers](../../guides/cron-triggers.md) for the operator guide. A generic HMAC hook ingress
+is shipped (`ingest_hook` above); mapping a declared `webhook` path onto that handler is still the
+open Epic #29 question and is not built, so a declared webhook validates its shape but does not yet
+wire a live wake-up.
 
 ## Implementations today
 
-Five external triggers, all hardcoded, in two different processes:
+Five hardcoded external triggers in two different processes, plus the declared per-agent cron
+scheduler in the worker:
 
 1. Slack `app_mention` in the dispatcher (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`).
 2. GitHub `push` webhook in the API (`apps/api/src/curie_api/routers/github.py::github_webhook`).
 3. Commit poll in the API (`apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`),
    opt-in via `api.commitPollIntervalSeconds`. Timer-driven wake is therefore no longer
-   entirely unbuilt: this one is real, though it is a single hardcoded platform timer and
-   not the per-agent declared `cron` the trigger DECLARATION surface anticipates.
+   entirely unbuilt: this one is real, though it is a single hardcoded platform timer. The
+   per-agent declared `cron` is item 6.
 4. Generic HMAC hook in the API (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`).
 5. GitHub review feedback in the API
    (`apps/api/src/curie_api/routers/github.py::github_webhook`), with worker-only
    provider truth and lineage checks in `apps/api/src/curie_api/routers/github_reviews.py`.
+6. Declared cron triggers in the worker
+   (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop.run_forever`, ADR-0099, #268):
+   each tick reads every in-force deployment's `cron` triggers, records the due slot in
+   `hook_runs`, and enqueues one CRON turn. Operator guide: [Cron triggers](../../guides/cron-triggers.md).
 
 Plus three further wake paths that also enqueue a run without going through any of those
 five: the Slack block-action handler

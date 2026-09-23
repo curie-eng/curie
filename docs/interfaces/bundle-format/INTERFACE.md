@@ -320,8 +320,11 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   runtime renderer cannot drift. A gate that omits `summary` keeps today's machine
   `summarize_tool_call` string on the card and notice.
 - `triggers` (a list of `cron`/`webhook` declarations for waking the agent beyond chat, #273/#270 —
-  see the [triggers seam](../triggers/INTERFACE.md)) is still **declaration-only**: its validator
-  runs at deploy, but no runtime scheduler/ingress consumes a declared trigger yet (Epic #29).
+  see the [triggers seam](../triggers/INTERFACE.md)) is validated at deploy, and a declared `cron`
+  trigger is **consumed at runtime** by the worker's per-agent cron scheduler
+  (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop`, ADR-0099, #268); see
+  [Cron triggers](../../guides/cron-triggers.md). A declared `webhook` is still declaration-only:
+  no ingress maps its path yet (Epic #29).
   A cron declaration needs a unique non-empty name, a non-empty prompt, and a five-field schedule;
   timezone, when present, is an IANA zone name matching an exact key in packaged tzdata, so
   host only aliases such as `localtime` are rejected; it defaults to UTC only when omitted and is legal only with a schedule; target,
