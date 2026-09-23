@@ -1066,6 +1066,9 @@ fn route_up_opts_passes_names_instead_of_values() {
     assert!(matches!(up.github_token, GithubTokenPlan::Untouched));
     assert_eq!(up.history_max, Some(HISTORY_MAX));
     for (key, value) in &plan.knob_sets {
+        if key == "agentSandbox.runner.fakeModel" {
+            continue; // typed lane, see fake_model_false_goes_through_the_typed_set_lane
+        }
         let expression = format!("{key}={value}");
         assert!(
             up.set_string.contains(&expression),
@@ -1275,5 +1278,27 @@ fn a_backslash_escaped_second_assignment_key_in_set_is_refused() {
     assert!(
         !text.contains(GITHUB_VALUE),
         "refusal leaked a value: {text}"
+    );
+}
+
+#[test]
+fn fake_model_false_goes_through_the_typed_set_lane() {
+    // `--set-string` would render the STRING "false", which the chart's
+    // `and fakeModel ...` reads as truthy, so the worker gets no credentials.
+    let plan = fresh_declared_plan();
+    let mut up = up_literal();
+    route_up_opts(&mut up, &plan);
+    let expression = "agentSandbox.runner.fakeModel=false".to_string();
+    assert!(up.set.contains(&expression), "{:?}", up.set);
+    assert!(!up.set_string.contains(&expression), "{:?}", up.set_string);
+
+    let rendered = display(&up);
+    assert!(
+        rendered.contains("--set agentSandbox.runner.fakeModel=false"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("--set-string agentSandbox.runner.fakeModel=false"),
+        "{rendered}"
     );
 }

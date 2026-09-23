@@ -417,11 +417,16 @@ pub fn route_up_opts(up: &mut crate::ops::UpOpts, plan: &RoutingPlan) {
     up.set_string.retain(keeps);
     up.credentials = None;
     up.github_token = crate::ops::GithubTokenPlan::Untouched;
-    up.set_string.extend(
-        plan.knob_sets
-            .iter()
-            .map(|(key, value)| format!("{key}={value}")),
-    );
+    // fakeModel is a boolean the chart tests for truthiness: the string
+    // "false" would be truthy, so it goes through a typed `--set`.
+    for (key, value) in &plan.knob_sets {
+        let expression = format!("{key}={value}");
+        if key == crate::ops::FAKE_MODEL_KEY {
+            up.set.push(expression);
+        } else {
+            up.set_string.push(expression);
+        }
+    }
     up.history_max = Some(HISTORY_MAX);
 }
 
