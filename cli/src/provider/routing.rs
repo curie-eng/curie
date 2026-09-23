@@ -329,7 +329,10 @@ pub fn plan_routing(inputs: &RoutingInputs<'_>) -> Result<RoutingPlan> {
     let mut conflicts: Vec<String> = Vec::new();
     for (key, value) in &cfg.set {
         for assigned in assignment_keys(&format!("{key}={value}")) {
-            if (knob_paths.contains(&assigned) || DROPPED_VALUE_KEYS.contains(&assigned.as_str()))
+            // A Helm escape in a key could spell an owned key past this check.
+            if (assigned.contains('\\')
+                || knob_paths.contains(&assigned)
+                || DROPPED_VALUE_KEYS.contains(&assigned.as_str()))
                 && !conflicts.contains(&assigned)
             {
                 conflicts.push(assigned);
@@ -408,7 +411,7 @@ pub fn route_up_opts(up: &mut crate::ops::UpOpts, plan: &RoutingPlan) {
     let keeps = |e: &String| {
         !assignment_keys(e)
             .iter()
-            .any(|key| owned.contains(key.as_str()))
+            .any(|key| key.contains('\\') || owned.contains(key.as_str()))
     };
     up.set.retain(keeps);
     up.set_string.retain(keeps);
