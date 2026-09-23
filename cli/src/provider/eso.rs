@@ -4,6 +4,7 @@
 //! can script it. Secret values travel on stdin only and never appear in argv,
 //! errors, or logs.
 
+use std::collections::BTreeMap;
 use std::io::{Read as _, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -33,6 +34,24 @@ pub struct StoreSpec {
     pub region: String,
     pub service_account: String,
     pub role_arn: String,
+}
+
+/// The per-release store `cluster deploy` syncs connector credentials through:
+/// SecretStore `<release>-secrets-manager` authenticating as the IRSA service
+/// account `<release>-secrets-sync`. One helper so every caller names the same
+/// objects.
+pub fn release_store_spec(
+    release: &str,
+    namespace: &str,
+    secrets: &crate::installation::SecretsBlock,
+) -> StoreSpec {
+    StoreSpec {
+        name: format!("{release}-secrets-manager"),
+        namespace: namespace.to_string(),
+        region: secrets.region.clone(),
+        service_account: format!("{release}-secrets-sync"),
+        role_arn: secrets.role_arn.clone(),
+    }
 }
 
 /// Service account annotated with the IRSA role.
@@ -75,9 +94,19 @@ pub struct SyncEntry {
     pub remote_key: String,
     pub static_keys: Vec<String>,
     pub rotated_keys: Vec<String>,
+    /// Labels for the ESO objects and, through the ExternalSecret's target
+    /// template, for the Secret ESO creates. Empty renders exactly as before.
+    pub labels: BTreeMap<String, String>,
 }
 
 impl SyncEntry {
+    /// Attach labels. A connector deploy labels its objects with the owner so
+    /// the worker's reconcile and the CLI prune recognise them.
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
     /// Only a provider-held (`store: sm`) entry syncs. Its rotated keys come
     /// from the entry, whose validation already requires them to be drawn
     /// from `keys` under a workload owner.
@@ -108,6 +137,7 @@ impl SyncEntry {
             remote_key: format!("{}/{}", prefix.trim_end_matches('/'), name),
             static_keys,
             rotated_keys: rotated,
+            labels: BTreeMap::new(),
         })
     }
 
@@ -140,7 +170,7 @@ pub fn render_external_secret(
     } else {
         "CreateOrMerge"
     };
-    json!({
+    let mut rendered = json!({
         "apiVersion": EXTERNAL_SECRET_API,
         "kind": "ExternalSecret",
         "metadata": { "name": entry.name, "namespace": namespace },
@@ -150,7 +180,19 @@ pub fn render_external_secret(
             "target": { "name": entry.target, "creationPolicy": policy },
             "data": data,
         },
-    })
+    });
+    if !entry.labels.is_empty() {
+        rendered["metadata"]["labels"] = json!(entry.labels);
+        // `Merge` keeps the data keys ESO writes; the template only adds the
+        // labels to the Secret it creates or merges into (probed on ESO 2.11.0
+        // under both Owner and CreateOrMerge).
+        rendered["spec"]["target"]["template"] = json!({
+            "engineVersion": "v2",
+            "mergePolicy": "Merge",
+            "metadata": { "labels": entry.labels },
+        });
+    }
+    rendered
 }
 
 /// PushSecret backing rotated keys up. `None` when nothing rotates.
@@ -176,7 +218,7 @@ pub fn render_push_secret(entry: &SyncEntry, namespace: &str, store: &str) -> Op
             })
         })
         .collect();
-    Some(json!({
+    let mut rendered = json!({
         "apiVersion": PUSH_SECRET_API,
         "kind": "PushSecret",
         "metadata": { "name": format!("{}-rotated-backup", entry.name), "namespace": namespace },
@@ -188,7 +230,11 @@ pub fn render_push_secret(entry: &SyncEntry, namespace: &str, store: &str) -> Op
             "selector": { "secret": { "name": entry.target } },
             "data": data,
         },
-    }))
+    });
+    if !entry.labels.is_empty() {
+        rendered["metadata"]["labels"] = json!(entry.labels);
+    }
+    Some(rendered)
 }
 
 /// Result of one kubectl invocation.

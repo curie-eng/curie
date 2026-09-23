@@ -3528,6 +3528,12 @@ async fn bind_cluster_connector_secrets(
 /// per-agent Helm Secret, and only then are the connector objects applied --
 /// the one order both the single-target and `--all-targets` cluster deploy
 /// paths use.
+///
+/// With a secrets provider declared in `curie.yaml` the same values go to
+/// Secrets Manager instead and External Secrets delivers them
+/// ([`provider_bind_and_apply_cluster_connectors`]); without one this is
+/// exactly the Helm value bind above.
+#[allow(clippy::too_many_arguments)]
 async fn bind_and_apply_cluster_connectors(
     namespace: &str,
     release: &str,
@@ -3536,14 +3542,197 @@ async fn bind_and_apply_cluster_connectors(
     explicit_secrets: &[String],
     connector_env_secret_names: &[String],
     prepared: curie::connectors::PreparedConnectorSync,
+    provider: Option<&ConnectorProviderContext>,
 ) -> Result<()> {
     let bind_values = cluster_connector_bind_values(
         explicit_secrets,
         connector_env_secret_names,
         prepared.owned_secret_values(),
     )?;
+    if let Some(provider) = provider {
+        return provider_bind_and_apply_cluster_connectors(
+            namespace,
+            release,
+            chart,
+            agent_name,
+            bind_values,
+            prepared,
+            provider,
+        )
+        .await;
+    }
     bind_cluster_connector_secrets(namespace, release, chart, agent_name, bind_values).await?;
     apply_connectors(prepared).await
+}
+
+/// The secrets provider `cluster deploy` routes connector credentials
+/// through (ADR 0163 decisions 3, 5, 6, 7). Built once, before any activation,
+/// so a missing AWS CLI or a bad `secrets:` block stops the deploy before it
+/// changes anything.
+struct ConnectorProviderContext {
+    provider: curie::provider::aws::AwsSecretsProvider,
+    store: curie::provider::eso::StoreSpec,
+    /// `<secrets.prefix>/<release>`, the prefix AwsSecretsProvider scopes names under.
+    remote_prefix: String,
+    /// The bundle's connectors.yaml, read once, for the hosted inventory entries.
+    decl: curie::connector_build::ConnectorsFileDecl,
+}
+
+/// Read `curie.yaml` in the cwd and, when it declares `secrets:`, build the
+/// provider context. No file or no block is `None`, and then nothing here
+/// looks for the AWS CLI.
+fn load_connector_provider(
+    namespace: &str,
+    release: &str,
+    plugin_dir: &std::path::Path,
+) -> Result<Option<ConnectorProviderContext>> {
+    let Some(installation) = load_declared_cluster_target()? else {
+        return Ok(None);
+    };
+    let Some(secrets_block) = installation.secrets.clone() else {
+        return Ok(None);
+    };
+    // The provider scopes names by the file's release; syncing them into a
+    // different release would read objects that release never wrote.
+    if installation.install.release != release || installation.install.namespace != namespace {
+        return Err(anyhow::Error::from(
+            curie::exit::CliError::usage(format!(
+                "curie.yaml declares a secrets provider for namespace {} release {}, but this \
+                 deploy targets namespace {namespace} release {release}",
+                installation.install.namespace, installation.install.release
+            ))
+            .with_fix(
+                "Deploy to the release curie.yaml names, or run from a directory whose curie.yaml \
+                 describes the target release.",
+            ),
+        ));
+    }
+    let provider = secrets::provider_for_installation(&installation)?
+        .ok_or_else(|| anyhow::anyhow!("curie.yaml declares secrets but no provider was built"))?;
+    let decl = curie::connector_build::load(plugin_dir)?;
+    Ok(Some(ConnectorProviderContext {
+        provider,
+        store: curie::provider::eso::release_store_spec(release, namespace, &secrets_block),
+        remote_prefix: format!("{}/{release}", secrets_block.prefix),
+        decl,
+    }))
+}
+
+/// Provider-mode bind and apply for one deployed agent, strictly sequential
+/// (#2496): plan, read-only preflight, Secrets Manager writes, ESO objects
+/// and sync, the Helm knob bind by name, then the connector apply without the
+/// value Secret, then the ESO prune. The preflight runs before every write, so
+/// a refusal leaves Secrets Manager, the cluster and the Helm release alone.
+async fn provider_bind_and_apply_cluster_connectors(
+    namespace: &str,
+    release: &str,
+    chart: Option<&str>,
+    agent_name: &str,
+    sandbox_values: std::collections::BTreeMap<String, String>,
+    prepared: curie::connectors::PreparedConnectorSync,
+    ctx: &ConnectorProviderContext,
+) -> Result<()> {
+    use anyhow::Context as _;
+    use curie::provider::connector_deploy;
+    let ui = ui::ui();
+    let plan = connector_deploy::plan(&connector_deploy::PlanInput {
+        release,
+        namespace,
+        agent: agent_name,
+        remote_prefix: &ctx.remote_prefix,
+        decl: &ctx.decl,
+        hosted_values: prepared.owned_secret_values(),
+        sandbox_values: &sandbox_values,
+    })?;
+    drop(sandbox_values);
+    let kubeconfig = prepared
+        .bound_kubeconfig_path()
+        .context("connector sync has no captured Kubernetes target")?
+        .to_path_buf();
+    let kubectl = curie::provider::eso::SystemKubectl {
+        context: None,
+        kubeconfig: Some(kubeconfig),
+        call_timeout: Some(std::time::Duration::from_secs(60)),
+    };
+
+    // The provider and kubectl drivers block; run them off the async workers.
+    let plan = {
+        let (kubectl, provider, store, prefix) = (
+            kubectl.clone(),
+            ctx.provider.clone(),
+            ctx.store.clone(),
+            ctx.remote_prefix.clone(),
+        );
+        let namespace = namespace.to_string();
+        tokio::task::spawn_blocking(move || -> Result<connector_deploy::Plan> {
+            connector_deploy::preflight(&kubectl, &namespace, &plan)?;
+            let report = connector_deploy::write_provider(&provider, &plan)?;
+            ui::ui().note(&format!(
+                "connectors: wrote {} credential object(s) to Secrets Manager ({} unchanged)",
+                report.written.len() + report.backups_created.len(),
+                report.unchanged.len()
+            ));
+            connector_deploy::apply_objects(
+                &kubectl,
+                &provider,
+                &plan,
+                &store,
+                &prefix,
+                std::time::Duration::from_secs(120),
+                std::time::Duration::from_secs(1),
+            )?;
+            Ok(plan)
+        })
+        .await
+        .context("connector credential sync did not finish")??
+    };
+    let mut spared = Vec::new();
+    if let Some((secret_name, keys)) = plan.sandbox_target() {
+        ui.note(&format!(
+            "connectors: {secret_name} is delivered by External Secrets"
+        ));
+        spared.push(secret_name.to_string());
+        let resolved = artifacts::resolve_chart(
+            chart,
+            artifacts::Channel::current(),
+            artifacts::version(),
+            artifacts::cache_root,
+            std::path::Path::new("charts/curie").is_dir(),
+        )?;
+        let chart = materialize_artifact(resolved, false, "chart").await?;
+        curie::cluster_secrets::provider_bind(curie::cluster_secrets::ProviderBindOpts {
+            common: CommonOpts {
+                namespace: namespace.to_string(),
+                release: release.to_string(),
+                dry_run: false,
+            },
+            chart,
+            agent: agent_name.to_string(),
+            secret_name: secret_name.to_string(),
+            keys,
+        })
+        .await?;
+    }
+
+    apply_connectors(prepared.into_provider_delivery().spare_from_prune(spared)).await?;
+
+    let args = connector_deploy::eso_prune_args(namespace, agent_name, &plan.object_names());
+    let pruned = tokio::task::spawn_blocking(move || {
+        curie::provider::eso::Kubectl::run(&kubectl, &args, None)
+    })
+    .await
+    .context("pruning stale External Secrets objects did not finish")?;
+    match pruned {
+        Ok(out) if out.success => {}
+        Ok(out) => ui.warn(&format!(
+            "connectors: pruning stale External Secrets objects for {agent_name} failed: {}",
+            out.stderr.trim()
+        )),
+        Err(err) => ui.warn(&format!(
+            "connectors: pruning stale External Secrets objects for {agent_name} failed: {err:#}"
+        )),
+    }
+    Ok(())
 }
 
 async fn materialize_artifact(
@@ -5229,6 +5418,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let connector_env_secret_names = curie::connector_build::hosted_env_secret_names(
                     &curie::connector_build::load(&plugin_dir)?,
                 );
+                // ADR 0163: a `secrets:` block in curie.yaml routes connector
+                // credentials through Secrets Manager. Built here, before any
+                // activation, so a provider that cannot be constructed stops
+                // the deploy before it changes anything. No block: `None`, and
+                // every writer below behaves exactly as without a provider.
+                let connector_provider =
+                    load_connector_provider(&namespace, &release, &plugin_dir)?;
 
                 let targets: Vec<Option<String>> = if all_targets {
                     let path = plugin_dir.join("deploy.yaml");
@@ -5430,6 +5626,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             &secret,
                             &connector_env_secret_names,
                             prepared_connectors,
+                            connector_provider.as_ref(),
                         )
                         .await
                         {
@@ -5501,6 +5698,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         &secret,
                         &connector_env_secret_names,
                         prepared_connectors,
+                        connector_provider.as_ref(),
                     )
                     .await?;
                     emit(deployed)

@@ -119,19 +119,7 @@ pub fn bind_commands(opts: &BindOpts) -> Result<Vec<OpsCommand>> {
                 CmdArg::SecretValuesFile(pairs),
             ],
         ),
-        OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("-n"),
-                plain(&opts.common.namespace),
-                plain("delete"),
-                plain("sandboxclaim"),
-                plain("-l"),
-                plain(format!("{CONNECTOR_AGENT_LABEL_KEY}={}", opts.agent)),
-                plain("--wait=true"),
-                plain("--ignore-not-found=true"),
-            ],
-        ),
+        sandbox_claim_delete(&opts.common, &opts.agent),
     ])
 }
 
@@ -147,6 +135,91 @@ pub async fn bind(opts: BindOpts) -> Result<()> {
     let label = format!(
         "binding connector secrets for agent {} on release {}",
         opts.agent, opts.common.release
+    );
+    for cmd in &cmds {
+        run_step(&cl, &label, "bound", cmd).await?;
+    }
+    Ok(())
+}
+
+pub struct ProviderBindOpts {
+    pub common: CommonOpts,
+    pub chart: String,
+    pub agent: String,
+    /// The ESO-synced sandbox Secret the runner template should read.
+    pub secret_name: String,
+    pub keys: Vec<String>,
+}
+
+fn sandbox_claim_delete(common: &CommonOpts, agent: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(&common.namespace),
+            plain("delete"),
+            plain("sandboxclaim"),
+            plain("-l"),
+            plain(format!("{CONNECTOR_AGENT_LABEL_KEY}={agent}")),
+            plain("--wait=true"),
+            plain("--ignore-not-found=true"),
+        ],
+    )
+}
+
+/// Provider mode (ADR 0163 decision 6): point the per-agent template at the
+/// Secret External Secrets syncs, by NAME, and null the value map so no
+/// credential stays in the Helm release. Nothing value-bearing is in argv or
+/// a values file. Then the same sandboxclaim delete as [`bind_commands`], so
+/// claimed sandboxes restart onto the new reference.
+pub fn provider_bind_commands(opts: &ProviderBindOpts) -> Result<Vec<OpsCommand>> {
+    validate_agent_resource_name(&opts.agent)?;
+    if opts.keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let agent = &opts.agent;
+    let mut keys = opts.keys.clone();
+    keys.sort();
+    Ok(vec![
+        OpsCommand::new(
+            "helm",
+            vec![
+                plain("upgrade"),
+                plain(&opts.common.release),
+                plain(&opts.chart),
+                plain("-n"),
+                plain(&opts.common.namespace),
+                plain("--reuse-values"),
+                plain("--set"),
+                plain(format!(
+                    "agentSandbox.connectorExistingSecrets.{agent}.existingSecret={}",
+                    opts.secret_name
+                )),
+                plain("--set"),
+                plain(format!(
+                    "agentSandbox.connectorExistingSecrets.{agent}.keys={{{}}}",
+                    keys.join(",")
+                )),
+                plain("--set"),
+                plain(format!("agentSandbox.connectorSecrets.{agent}=null")),
+            ],
+        ),
+        sandbox_claim_delete(&opts.common, agent),
+    ])
+}
+
+pub async fn provider_bind(opts: ProviderBindOpts) -> Result<()> {
+    let cmds = provider_bind_commands(&opts)?;
+    if cmds.is_empty() {
+        return Ok(());
+    }
+    require_on_path("helm")?;
+    require_on_path("kubectl")?;
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    let label = format!(
+        "binding sandbox Secret {} for agent {} on release {}",
+        opts.secret_name, opts.agent, opts.common.release
     );
     for cmd in &cmds {
         run_step(&cl, &label, "bound", cmd).await?;
