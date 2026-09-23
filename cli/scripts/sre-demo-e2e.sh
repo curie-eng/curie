@@ -272,15 +272,17 @@ EOF
 }
 
 run_cluster() {
-  local bin
+  local bin subcommand
   bin="$(curie_bin)"
-  "$bin" --json cluster --namespace "$NAMESPACE" --release "$RELEASE" --chart "$ROOT/charts/curie" "$@"
+  subcommand="$1"
+  shift
+  "$bin" --json cluster "$subcommand" --namespace "$NAMESPACE" --release "$RELEASE" "$@"
 }
 
 cluster_turn() {
   local text="$1"
   shift
-  run_cluster message --timeout-secs "$TIMEOUT_SECS" "$@" "$text"
+  run_cluster message --timeout-secs "$TIMEOUT_SECS" --chart "$ROOT/charts/curie" "$@" "$text"
 }
 
 turn_is_reply() {
@@ -502,8 +504,8 @@ drive_gated_turn() {
   : >"$err"
   local bin
   bin="$(curie_bin)"
-  "$bin" --json cluster --namespace "$NAMESPACE" --release "$RELEASE" \
-    --chart "$ROOT/charts/curie" message --timeout-secs "$TIMEOUT_SECS" \
+  "$bin" --json cluster message --namespace "$NAMESPACE" --release "$RELEASE" \
+    --chart "$ROOT/charts/curie" --timeout-secs "$TIMEOUT_SECS" \
     "$@" "$text" >"$out" 2>"$err" &
   TURN_PID=$!
   local id

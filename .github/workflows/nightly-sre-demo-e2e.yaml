@@ -97,11 +97,23 @@ jobs:
         uses: azure/setup-helm@v5.0.1
         with:
           version: v3.16.4
-      - name: Set up a cache-only buildx builder (named, NOT the default)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Start disposable local registry
+        run: docker run -d --name sre-demo-registry -p 127.0.0.1:5000:5000 registry:2
+      - name: Set up a named buildx builder
         id: democache
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           use: false
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."localhost:5000"]
+              http = true
+      - name: Build SRE demo connectors
+        env:
+          BUILDX_BUILDER: ${{ steps.democache.outputs.name }}
+        run: cli/target/release/curie build --plugin-dir examples/sre-bot --registry localhost:5000
       - name: Build the api image locally
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -153,6 +165,11 @@ jobs:
           cat > kind-config.yaml <<'EOF'
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
+          # Local registry mapping: https://kind.sigs.k8s.io/docs/user/local-registry/
+          containerdConfigPatches:
+            - |-
+              [plugins."io.containerd.grpc.v1.cri".registry]
+                config_path = "/etc/containerd/certs.d"
           nodes:
             - role: control-plane
               extraPortMappings:
@@ -168,6 +185,14 @@ jobs:
           node_image: kindest/node:v1.31.0
           cluster_name: curie-sre-demo
           config: kind-config.yaml
+      - name: Map the local registry into kind
+        run: |
+          set -euo pipefail
+          docker network connect kind sre-demo-registry
+          for node in $(kind get nodes --name curie-sre-demo); do
+            docker exec "$node" mkdir -p /etc/containerd/certs.d/localhost:5000
+            printf '%s\n' '[host."http://sre-demo-registry:5000"]' | docker exec -i "$node" cp /dev/stdin /etc/containerd/certs.d/localhost:5000/hosts.toml
+          done
       - name: Load images into the kind cluster
         run: |
           set -euo pipefail
@@ -217,3 +242,6 @@ jobs:
           path: ${{ runner.temp }}/sre-demo-outcomes.jsonl
           if-no-files-found: ignore
           retention-days: 7
+      - name: Remove disposable local registry
+        if: always()
+        run: docker rm -f sre-demo-registry || true
