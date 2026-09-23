@@ -59,11 +59,14 @@ What we add or change.
 
 **A. Two tiers by default: per agent and per channel. Bundles can add more.**
 The agent tier belongs to one agent and is shared by every channel that agent
-works in. The place tier belongs to one agent in one channel, identified by
-the channel binding `(kind, address)` and treated as an opaque string. Two
-agents in the same channel do not share memory: each has its own place tier
-there. No key, API or runner code names a specific surface. A direct message
-is a place whose address is the person, so private chats get their own memory
+works in. The channel tier belongs to one agent in one channel. "Channel" here
+means the platform's generic binding, the `agent_channels` row: a kind and an
+address, treated as an opaque string (#1459, following
+[ADR-0096](0096-port-adapters-are-deployed-services.md)'s channel-neutral
+port). A Slack channel, a mailbox, and a direct message
+are all channels. Two agents in the same channel do not share memory: each has
+its own channel tier there. No key, API or runner code names a specific surface. A direct message
+is a channel whose address is the person, so private chats get their own memory
 with no extra mechanism. Each tier holds an optional document an operator
 wrote (J) and the entries the agent saved. A bundle that needs another tier
 can declare one; this needs to be possible, not visible.
@@ -78,12 +81,12 @@ remember something that is not a declared kind, or that the bundle forbids,
 the agent does not save it and says it cannot remember that kind of thing. An
 operator can still add it to the tier's document from a file (J).
 
-**C. The agent gets a `remember` / `forget` tool, bound to the current place.**
+**C. The agent gets a `remember` / `forget` tool, bound to the current channel.**
 `remember` names one of the declared kinds and the platform refuses any other.
 `forget` removes an entry by its id; injected entries carry their ids so the
 agent can name one. The declared kinds and their descriptions are the tool's
 instructions, so the model sees exactly what it may save. The tool writes only
-to the place the message came from; if the model passes a place name, it is
+to the channel the message came from; if the model passes a channel name, it is
 ignored. The tool is mounted only when memory is turned on for the deployment
 and the bundle declares at least one kind.
 
@@ -129,11 +132,11 @@ that stays a model judgment, backed by provenance and open correction.
 
 **J. Operators seed from a file. No seeding from channel history.**
 `curie` writes either tier's document from a file, addressed by agent name.
-An agent with no channel binding is refused a place-tier write and told why.
+An agent with no channel binding is refused a channel-tier write and told why.
 [ADR-0095](0095-tiered-memory-lifecycle.md)'s plan to read a channel's history
 to build starting memory is dropped: it needs new Slack permissions and a
 re-consent in every workspace, and channel history is the least trustworthy
-input available. A place starts empty.
+input available. A channel starts empty.
 
 **K. Refused saves are reported as refused.**
 The tool call is marked failed in the trace, and the reply does not claim the
@@ -164,7 +167,7 @@ a person or operator removed; the agent has no way to know. Entries merged
 away by compaction are not treated as deleted.
 
 **O. Boots log what they loaded.**
-"Found agent tier," "found place tier," or "found nothing," distinguishably.
+"Found agent tier," "found channel tier," or "found nothing," distinguishably.
 Without this, a tier that was never written and a tier the runner cannot read
 look the same.
 
@@ -172,7 +175,7 @@ look the same.
 
 - **A per-person tier.** No. It splits facts a channel should share, and
   facts keyed to a person tend to be facts about that person, which then
-  follow them around. DMs already get their own memory via the place tier.
+  follow them around. DMs already get their own memory via the channel tier.
 - **Let the agent save anything, with the bundle listing only exclusions.**
   No. The agent then decides on its own what is worth keeping, and anything
   the bundle author did not think to forbid gets stored. An allow-list of
@@ -212,7 +215,7 @@ look the same.
 
 - #1461 can be built. Done means: a bundle with memory writes a fact through
   the tool, a fresh thread reads it back, a bundle without memory is refused.
-- The runner needs to know its place. That is one new value in `boot_env`,
+- The runner needs to know its channel. That is one new value in `boot_env`,
   which is a frozen contract, so it gets its own issue before any code.
 - The declared kinds are a new field in the bundle manifest, also a frozen
   contract, so they get their own issue first too. Whether a deployment turns
@@ -232,8 +235,8 @@ look the same.
   folded into this one. The acceptance PR sets them to
   `Superseded by ADR-0167`.
 - Known gaps: no time-based expiry; compaction merges and drops by model
-  judgment, so it can lose a nuance; the place tier assumes one agent per
-  place until multi-channel lands.
+  judgment, so it can lose a nuance; the channel tier assumes one agent per
+  channel until multi-channel lands.
 
 ## Before this can be accepted
 
