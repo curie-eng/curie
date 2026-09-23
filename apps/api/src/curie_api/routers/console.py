@@ -297,6 +297,11 @@ async def oidc_callback(
         claims = await oidc.validate_id_token(id_token, nonce=attempt.nonce)
     except oidc.OidcError as exc:
         return _refuse_callback(str(exc))
+    # Before resolve_principal, so a refused person gets no principal row and
+    # an existing principal's attributes are not refreshed by a login that
+    # does not happen.
+    if not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
+        return _refuse_callback("ID token lacks a required claim")
 
     principal = await crud.resolve_principal(session, claims)
     if not await crud.principal_is_active(session, principal):

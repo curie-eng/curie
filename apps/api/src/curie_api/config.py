@@ -10,7 +10,9 @@ Override any field via the matching environment variable for shared or
 production deployments.
 """
 
+import json
 from functools import lru_cache
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 from aci_protocol import (
@@ -20,8 +22,8 @@ from aci_protocol import (
     WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
-from pydantic import AliasChoices, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .workspace_policy import valid_allowlist_entry
 
@@ -105,6 +107,22 @@ class Settings(BaseSettings):
     # public registrations.
     oidc_client_secret: str = Field(default="", validation_alias="CURIE_OIDC_CLIENT_SECRET")
     oidc_redirect_uri: str = Field(default="", validation_alias="CURIE_OIDC_REDIRECT_URI")
+    # Claims a validated ID token must carry to be admitted, as a JSON object of
+    # claim name -> required string, e.g. {"groups": "curie-admins"}. A string
+    # claim must equal the value; a list claim must contain it as an element.
+    # Authentication at the IdP says who someone is, not that they belong here:
+    # without a requirement every account the IdP will sign in is admitted.
+    # NoDecode: the validator below parses the JSON itself, so malformed input
+    # is a ValidationError naming the variable rather than a settings-source
+    # crash.
+    oidc_required_claims: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=dict, validation_alias="CURIE_OIDC_REQUIRED_CLAIMS"
+    )
+    # Space-separated scopes the authorize redirect requests. Configurable
+    # because the claims above are often released only for an extra scope
+    # (e.g. "groups"); `openid` is mandatory, since without it there is no ID
+    # token to validate.
+    oidc_scopes: str = Field(default="openid email profile", validation_alias="CURIE_OIDC_SCOPES")
 
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
     # brand the app. Overridable via ORG_NAME for a white-labeled deployment.
@@ -643,6 +661,36 @@ class Settings(BaseSettings):
     def oidc_enabled(self) -> bool:
         """Whether generic OIDC login is configured (the issuer is the switch)."""
         return bool(self.oidc_issuer.strip())
+
+    @field_validator("oidc_required_claims", mode="before")
+    @classmethod
+    def _parse_oidc_required_claims(cls, value: Any) -> Any:
+        """Accept only a JSON object of non-blank claim names to string values.
+
+        Checked here rather than left to the dict[str, str] coercion so that
+        nothing is coerced: a number, boolean, null or list value is refused at
+        boot instead of becoming a requirement no token could meet as written.
+        """
+        if isinstance(value, str):
+            try:
+                value = json.loads(value) if value.strip() else {}
+            except ValueError:
+                raise ValueError("CURIE_OIDC_REQUIRED_CLAIMS must be a JSON object") from None
+        if not isinstance(value, dict):
+            raise ValueError("CURIE_OIDC_REQUIRED_CLAIMS must be a JSON object")
+        for name, required in value.items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(required, str):
+                raise ValueError(
+                    "CURIE_OIDC_REQUIRED_CLAIMS maps non-blank claim names to string values"
+                )
+        return value
+
+    @field_validator("oidc_scopes")
+    @classmethod
+    def _require_openid_scope(cls, value: str) -> str:
+        if "openid" not in value.split():
+            raise ValueError("CURIE_OIDC_SCOPES must include openid")
+        return value
 
     @model_validator(mode="after")
     def _validate_oidc(self) -> "Settings":
