@@ -1569,6 +1569,15 @@ class Kernel:
                 return candidate
         return None
 
+    def _work_item_repository(self, event_id: str) -> str | None:
+        """The WorkItem repository for an acquired execute wake, else None."""
+
+        parsed = parse_work_item_event_id(event_id)
+        if parsed is None or parsed.kind != "execute":
+            return None
+        run = self._work_item_runs.get(parsed.request_id)
+        return run.repo_full_name if run is not None else None
+
     async def _adopt_resumed_work_item(
         self, event_id: str, thread_key: str
     ) -> uuid.UUID | None:
@@ -1600,6 +1609,7 @@ class Kernel:
                         work_item_id=found.request_id,
                         conversation_id=thread_key,
                         wait_deadline="",
+                        repo_full_name=None,
                     ),
                     event_id=event_id,
                     thread_key=thread_key,
@@ -3604,6 +3614,7 @@ class Kernel:
                             review_turn=qevent if verified_review is not None else None,
                             workspace_inference=workspace_inference,
                             approval_resume=self._is_approval_resume(qevent.event_id),
+                            work_item_repo=self._work_item_repository(qevent.event_id),
                         )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -4298,6 +4309,7 @@ class Kernel:
         workspace_inference: _WorkspaceInferenceCarry,
         attachment_fresh_only: bool = False,
         approval_resume: bool = False,
+        work_item_repo: str | None = None,
     ) -> _RouteResult:
         # A thread that requires a repository must establish (or confirm) it
         # before any platform response path. This deliberately precedes the
@@ -4319,14 +4331,22 @@ class Kernel:
             # quotes the gated tool's arguments, so ``apiVersion: batch/v1`` would
             # read as a repository; its repository is the thread's existing
             # selection, which a null request returns.
-            repo_fact = trusted_repository_fact(
-                event.text,
-                ignore_message=(
-                    verified_review is not None
-                    or source is TurnSource.WEBHOOK
-                    or approval_resume
-                ),
-            )
+            #
+            # A factory work-item execution (#2992) already knows its
+            # repository: the API bound it to the WorkItem from the signed
+            # delivery. The issue URL in its objective is the assignment, not a
+            # repository choice, so the turn text is never parsed for it.
+            if work_item_repo is not None:
+                repo_fact = work_item_repo
+            else:
+                repo_fact = trusted_repository_fact(
+                    event.text,
+                    ignore_message=(
+                        verified_review is not None
+                        or source is TurnSource.WEBHOOK
+                        or approval_resume
+                    ),
+                )
             if self._workspace is None:
                 # The coordinator is available across the worker, not a condition
                 # on generic agent turns. Refuse only an event that requires a

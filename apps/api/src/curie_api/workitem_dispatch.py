@@ -65,6 +65,7 @@ class AcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: datetime
+    repo_full_name: str
 
 
 @dataclass(frozen=True)
@@ -460,6 +461,7 @@ async def acquire(
             work_item_id=work_item.id,
             conversation_id=work_item.conversation_id,
             wait_deadline=request.wait_deadline,
+            repo_full_name=work_item.repo_full_name,
         )
         await session.execute(
             update(ExecutionRequest)
@@ -502,6 +504,7 @@ async def acquire(
         work_item_id=work_item.id,
         conversation_id=work_item.conversation_id,
         wait_deadline=request.wait_deadline,
+        repo_full_name=work_item.repo_full_name,
     )
     await session.commit()
     return grant
