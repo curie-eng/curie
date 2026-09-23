@@ -3021,3 +3021,83 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py
+
+  # AWS Secrets Manager provider suite (#2956): `curie dev secrets-e2e --ci`
+  # on an owned kind cluster against the moto emulator, once with External
+  # Secrets (sync, rotation suite, negative controls) and once without it.
+  # Selected by its own path filter rather than the shared tier selector, so a
+  # change outside these paths skips every step and the job reports success.
+  secrets-e2e:
+    name: Secrets emulator suite (kind + moto)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Select on changed paths
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch --quiet origin "$BASE_REF"
+            changed="$(git diff --name-only "origin/$BASE_REF...HEAD")"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            changed="cli/"
+          else
+            changed="$(git diff --name-only "$BEFORE" HEAD)"
+          fi
+          if printf '%s\n' "$changed" | grep -qE '^(cli/|charts/curie/|packages/plugin-format/|apps/api/|apps/worker/|\.github/workflows/ci\.yaml$)'; then
+            selected=true
+          else
+            selected=false
+          fi
+          echo "secrets-e2e selected=$selected"
+          echo "selected=$selected" >> "$GITHUB_OUTPUT"
+      - name: Cargo cache
+        if: steps.select.outputs.selected == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Build the curie binary
+        if: steps.select.outputs.selected == 'true'
+        working-directory: cli
+        run: cargo build --release --locked
+      - name: Install uv
+        if: steps.select.outputs.selected == 'true'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Install Helm
+        if: steps.select.outputs.selected == 'true'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Install kind
+        if: steps.select.outputs.selected == 'true'
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          version: v0.24.0
+          install_only: true
+      # The harness addresses the emulator with the fixed profile it uses for
+      # real AWS. moto accepts any key, so the profile carries placeholders.
+      - name: Write the emulator AWS profile
+        if: steps.select.outputs.selected == 'true'
+        run: |
+          set -euo pipefail
+          aws --version
+          install -d -m 700 "$HOME/.aws"
+          printf '[theconnman]\naws_access_key_id = testing\naws_secret_access_key = testing\n' > "$HOME/.aws/credentials"
+          printf '[profile theconnman]\nregion = us-east-1\n' > "$HOME/.aws/config"
+          chmod 600 "$HOME/.aws/credentials" "$HOME/.aws/config"
+      - name: Run the secrets emulator suite
+        if: steps.select.outputs.selected == 'true'
+        run: cli/target/release/curie dev secrets-e2e --ci
+      - name: Upload harness evidence
+        if: ${{ failure() && steps.select.outputs.selected == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: secrets-e2e-evidence-${{ github.run_attempt }}
+          path: .projects/aws-secrets/evidence/aws-sec-harness/
+          if-no-files-found: ignore

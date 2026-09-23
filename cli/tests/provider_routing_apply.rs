@@ -283,8 +283,12 @@ fn provider_present_apply_dry_run_routes_names_offline() {
         "{all}"
     );
     assert!(
-        all.contains("rel-curie-sm"),
-        "store named in dry run: {all}"
+        all.contains("kubectl apply secretstore rel-aws"),
+        "External Secrets bootstrap in dry run: {all}"
+    );
+    assert!(
+        all.contains("--version 2.11.0"),
+        "dry run must name the pinned External Secrets chart: {all}"
     );
     for target in [
         "rel-curie-installation-id",
@@ -362,8 +366,8 @@ case "$*" in
     *"get statefulset"*)
         printf '%s\n' '{"apiVersion":"v1","items":[],"kind":"List","metadata":{"resourceVersion":""}}'
         ;;
-    *"get secretstore rel-curie-sm"*)
-        printf '%s\n' '{"apiVersion":"external-secrets.io/v1","kind":"SecretStore","metadata":{"name":"rel-curie-sm","namespace":"rel"}}'
+    *"get secretstore rel-aws"*)
+        printf '%s\n' '{"apiVersion":"external-secrets.io/v1","kind":"SecretStore","metadata":{"name":"rel-aws","namespace":"rel"}}'
         ;;
     *"get secret rel-curie-postgres "*)
         if [ "$ROUTING_TEST_MODE" = target ]; then

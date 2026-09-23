@@ -1729,6 +1729,11 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     let provider = if dry_run {
         None
     } else {
+        if local.cfg.secrets.is_some() {
+            // Fail on a missing cluster tool before Secrets Manager is read.
+            crate::ops::require_on_path("helm")?;
+            crate::ops::require_on_path("kubectl")?;
+        }
         crate::secrets::provider_for_installation(&local.cfg)?
     };
     let sm = provider
@@ -1843,7 +1848,11 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     // one-time generation, the namespace, and the ExternalSecret sync, all
     // before Helm renders against the synced Secrets (ADR 0163).
     if let (Some(routing), Some(provider), Some(sm)) = (&routing, &provider, &sm) {
-        converge_provider(routing, provider, sm, &up.common, up.adopt).await?;
+        let secrets = cfg
+            .secrets
+            .as_ref()
+            .context("provider apply requires a secrets block")?;
+        converge_provider(routing, provider, sm, secrets, &up.common, up.adopt).await?;
     }
 
     // Stage BEFORE the upgrade deletes the old store. A failure here leaves the
@@ -1868,10 +1877,19 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     let up_out = crate::ops::up_prepared(up, up_values, live, github_token).await?;
 
     let mut lines = match (&routing, dry_run) {
-        (Some(routing), true) => crate::provider::routing::dry_run_lines(
-            routing,
-            &crate::provider::routing::store_name(&routing.release),
-        ),
+        (Some(routing), true) => {
+            let secrets = cfg
+                .secrets
+                .as_ref()
+                .context("provider apply requires a secrets block")?;
+            let mut lines =
+                crate::provider::bootstrap::dry_run_lines(&provider_store_spec(routing, secrets));
+            lines.extend(crate::provider::routing::dry_run_lines(
+                routing,
+                &crate::provider::reconcile::store_name(&routing.release),
+            ));
+            lines
+        }
         _ => vec![],
     };
     match up_out {
@@ -1937,14 +1955,31 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
 const PROVIDER_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const PROVIDER_SYNC_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The External Secrets store a provider apply installs and syncs through.
+fn provider_store_spec(
+    routing: &crate::provider::routing::RoutingPlan,
+    secrets: &SecretsBlock,
+) -> crate::provider::eso::StoreSpec {
+    crate::provider::eso::StoreSpec {
+        name: crate::provider::reconcile::store_name(&routing.release),
+        namespace: routing.namespace.clone(),
+        region: secrets.region.clone(),
+        service_account: format!("{}-aws-eso", routing.release),
+        role_arn: secrets.role_arn.clone(),
+    }
+}
+
 /// Converge a declared provider before Helm runs. Order is load bearing:
-/// Secrets Manager and the SecretStore are checked (read only) before any
-/// write, so a refusal changes nothing; generation happens only after that,
-/// and the snapshot is re-read and re-checked before the cluster is touched.
+/// Secrets Manager, the target Secrets, the namespace verdict and the External
+/// Secrets controller are checked
+/// (read only) before any write, so a refusal changes nothing. Only then is
+/// the namespace owned, External Secrets installed or reused, and the stateful
+/// internals generated; the snapshot is re-read and re-checked before sync.
 async fn converge_provider(
     routing: &crate::provider::routing::RoutingPlan,
     provider: &dyn crate::provider::SecretsProvider,
     sm: &BTreeMap<String, Vec<String>>,
+    secrets: &SecretsBlock,
     common: &crate::ops::CommonOpts,
     adopt: bool,
 ) -> Result<()> {
@@ -1953,13 +1988,37 @@ async fn converge_provider(
         call_timeout: Some(std::time::Duration::from_secs(60)),
         ..Default::default()
     };
-    let store = routing::store_name(&routing.release);
-    // Every read-only refusal first: Secrets Manager, the SecretStore, the
-    // target Secrets and the namespace ownership verdict.
+    let spec = provider_store_spec(routing, secrets);
+    // Every read-only refusal first: Secrets Manager, the target Secrets and
+    // the namespace ownership verdict.
     let to_create = routing::preflight(routing, sm)?;
-    routing::check_store(&kubectl, &routing.namespace, &store)?;
     routing::check_targets(&kubectl, routing)?;
     crate::ops::check_primary_namespace_ownership(common, adopt).await?;
+    let namespace = routing.namespace.clone();
+    tokio::task::spawn_blocking(move || crate::provider::bootstrap::check_system(&namespace))
+        .await
+        .context("External Secrets check stopped")??;
+    // The namespace is owned before External Secrets creates its objects in it.
+    crate::ops::establish_primary_namespace_ownership(common, adopt).await?;
+    let install = crate::provider::bootstrap::InstallRef {
+        namespace: routing.namespace.clone(),
+        release: routing.release.clone(),
+    };
+    let bootstrap_spec = spec.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::provider::bootstrap::ensure_system(&bootstrap_spec, &install)
+    })
+    .await
+    .context("External Secrets bootstrap stopped")??;
+    let verb = match outcome {
+        crate::provider::bootstrap::EnsureOutcome::Installed => "installed",
+        crate::provider::bootstrap::EnsureOutcome::Reused => "reused",
+    };
+    crate::ui::ui().note(&format!(
+        "External Secrets {verb} at {}",
+        crate::provider::eso::ESO_VERSION
+    ));
+    routing::check_store(&kubectl, &routing.namespace, &spec.name)?;
     if !to_create.is_empty() {
         routing::generate(provider, routing, &to_create)?;
         let reread = routing::read_sm_inventory(provider)?;
@@ -1971,11 +2030,10 @@ async fn converge_provider(
             );
         }
     }
-    crate::ops::establish_primary_namespace_ownership(common, adopt).await?;
     routing::sync(
         &kubectl,
         routing,
-        &store,
+        &spec.name,
         PROVIDER_SYNC_TIMEOUT,
         PROVIDER_SYNC_POLL,
     )

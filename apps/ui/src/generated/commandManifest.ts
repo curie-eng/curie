@@ -5731,7 +5731,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "External Secrets setup for an emulator run",
+              "help": "External Secrets setup for an emulator run. `none` leaves it for `curie apply` to install, which runs the routing proof",
               "id": "eso",
               "long": "eso",
               "positional": false,
@@ -5743,7 +5743,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Run the emulator once with External Secrets and once without it",
+              "help": "Run the emulator once with External Secrets preinstalled (rotation) and once with `curie apply` installing it (routing)",
               "id": "ci",
               "long": "ci",
               "positional": false,

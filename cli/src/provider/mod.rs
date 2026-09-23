@@ -5,9 +5,12 @@
 
 pub mod aws;
 pub mod binding;
+pub mod bootstrap;
 mod catalog;
+pub mod connector_deploy;
 pub mod eso;
 mod inventory;
+pub mod reconcile;
 pub mod render_check;
 pub mod rotation;
 pub mod routing;

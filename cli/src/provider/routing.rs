@@ -29,11 +29,6 @@ pub const DEFAULT_LANGFUSE_PUBLIC_KEY: &str = "pk-lf-curie-dev";
 /// ExternalSecret refresh interval for platform credentials.
 pub const REFRESH_INTERVAL: &str = "1h";
 
-/// The SecretStore the ExternalSecrets read through: `<release>-curie-sm`.
-pub fn store_name(release: &str) -> String {
-    format!("{release}-curie-sm")
-}
-
 /// Why an inventory entry is routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteReason {

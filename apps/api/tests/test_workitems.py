@@ -1374,6 +1374,12 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                                 and row.waiting_lock
                                 and row.blocked_by_holder
                             ):
+                                # The link also samples the database clock while it
+                                # waits. That probe shares the backend, so ignore it
+                                # and keep watching for the lineage statement.
+                                if "clock_timestamp" in row.query.lower():
+                                    await asyncio.sleep(0.01)
+                                    continue
                                 assert "thread_publication_lineages" in row.query.lower()
                                 return
                             if service_task.done():
