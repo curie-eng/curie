@@ -5465,6 +5465,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let connector_provider =
                     load_connector_provider(&namespace, &release, &plugin_dir)?;
 
+                // Provider mode: each target's agent name as the API lists it,
+                // so the names-only preflight can run before any mutation.
+                let mut listed_target_agents: Vec<(String, Option<String>)> = Vec::new();
                 let targets: Vec<Option<String>> = if all_targets {
                     let path = plugin_dir.join("deploy.yaml");
                     let content = std::fs::read_to_string(&path).map_err(|err| {
@@ -5494,6 +5497,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
+                    listed_target_agents = listed
+                        .targets
+                        .iter()
+                        .map(|t| (t.name.clone(), t.agent.clone()))
+                        .collect();
                     listed.targets.into_iter().map(|t| Some(t.name)).collect()
                 } else {
                     vec![target]
@@ -5561,6 +5569,41 @@ async fn run(command: Option<Command>) -> Result<()> {
                                 return Err(curie::exit::with_json_payload(err, payload));
                             }
                         };
+
+                    // Provider mode: refuse a colliding target Secret before
+                    // ANY API mutation. Names only, resolved by the same rule
+                    // `prepare_deploy` applies (flag, then the listed target's
+                    // agent, then the manifest name); the exact check after
+                    // preparation below still runs.
+                    let binds_sandbox =
+                        !secret.is_empty() || !connector_env_secret_names.is_empty();
+                    if connector_provider.is_some() {
+                        let (plugin_name, _version) = curie::scaffold::read_manifest(&plugin_dir)?;
+                        for (target, target_agent) in &listed_target_agents {
+                            let agent_name = commands::deploy_agent_name(
+                                agent.as_deref(),
+                                target_agent.as_deref(),
+                                &plugin_name,
+                            );
+                            if let Err(err) = preflight_provider_targets(
+                                &connector_target,
+                                &namespace,
+                                &release,
+                                &agent_name,
+                                binds_sandbox,
+                            )
+                            .await
+                            {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        }
+                    }
 
                     // Resolve every target and every connector credential before
                     // activating the first deployment. Preparation may create
@@ -5638,10 +5681,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                         prepared_deploy.emit_cron_trigger_warning();
                     }
 
-                    // Provider mode: refuse a colliding target Secret before
-                    // the first deployment is activated.
-                    let binds_sandbox =
-                        !secret.is_empty() || !connector_env_secret_names.is_empty();
+                    // Provider mode: the exact check again, against the names
+                    // preparation bound, before the first deployment is activated.
                     if connector_provider.is_some() {
                         for (target, prepared_deploy, _) in &prepared_targets {
                             if let Err(err) = preflight_provider_targets(
@@ -5718,6 +5759,33 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // Prepared and activated as two halves, exactly what
                     // `commands::deploy` does, so provider mode can run its
                     // collision preflight before the deployment is activated.
+                    // Provider mode also runs it names-only BEFORE preparation,
+                    // which creates the agent/version and uploads the bundle.
+                    let binds_sandbox =
+                        !secret.is_empty() || !connector_env_secret_names.is_empty();
+                    let preflight_target = if connector_provider.is_some() {
+                        let agent_name = commands::resolve_deploy_agent_name(
+                            &plugin_dir,
+                            agent.as_deref(),
+                            target.as_deref(),
+                            &api_url,
+                            &api_key,
+                        )
+                        .await?;
+                        let preflight_target =
+                            curie::connectors::bind_current_cluster(&namespace, &release).await?;
+                        preflight_provider_targets(
+                            &preflight_target,
+                            &namespace,
+                            &release,
+                            &agent_name,
+                            binds_sandbox,
+                        )
+                        .await?;
+                        Some(preflight_target)
+                    } else {
+                        None
+                    };
                     let prepared_deploy = commands::prepare_deploy(DeployOpts {
                         delivery,
                         plugin_dir: plugin_dir.clone(),
@@ -5737,15 +5805,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                     })
                     .await?;
                     prepared_deploy.emit_cron_trigger_warning();
-                    if connector_provider.is_some() {
-                        let preflight_target =
-                            curie::connectors::bind_current_cluster(&namespace, &release).await?;
+                    if let Some(preflight_target) = &preflight_target {
                         preflight_provider_targets(
-                            &preflight_target,
+                            preflight_target,
                             &namespace,
                             &release,
                             prepared_deploy.agent_name(),
-                            !secret.is_empty() || !connector_env_secret_names.is_empty(),
+                            binds_sandbox,
                         )
                         .await?;
                     }
