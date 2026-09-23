@@ -310,3 +310,172 @@ fn provider_present_apply_dry_run_routes_names_offline() {
     fixture.assert_aws_never_called();
     fixture.assert_no_kubectl_mutation();
 }
+
+// ------------------------------------------------ non-dry-run refusal order
+
+/// A fresh release with a present SecretStore, driven through a real
+/// (non-dry-run) apply. `ROUTING_TEST_MODE` picks the one foreign object the
+/// kubectl stub reports: `target` (an unowned `rel-curie-postgres` Secret) or
+/// `namespace` (a namespace another release created). Every stub invocation is
+/// logged, so a test can prove the refusal came before any write.
+struct LiveFixture {
+    temp: tempfile::TempDir,
+    file: PathBuf,
+    log: PathBuf,
+}
+
+impl LiveFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("curie.yaml");
+        fs::write(
+            &file,
+            format!("version: 1\ninstall:\n  namespace: rel\n  release: rel\n{PROVIDER}"),
+        )
+        .expect("write curie.yaml");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir(&bin_dir).expect("bin dir");
+        write_exec(
+            &bin_dir,
+            "helm",
+            r#"#!/bin/sh
+printf 'HELM: %s\n' "$*" >> "$ROUTING_TEST_LOG"
+case "$1 $2" in
+    "get values"|"history "*|"status "*)
+        printf '%s\n' 'Error: release: not found' >&2
+        exit 1
+        ;;
+    "list "*)
+        printf '%s\n' '[]'
+        exit 0
+        ;;
+esac
+exit 0
+"#,
+        );
+        write_exec(
+            &bin_dir,
+            "kubectl",
+            r#"#!/bin/sh
+printf 'KUBECTL: %s\n' "$*" >> "$ROUTING_TEST_LOG"
+case "$*" in
+    *"get statefulset"*)
+        printf '%s\n' '{"apiVersion":"v1","items":[],"kind":"List","metadata":{"resourceVersion":""}}'
+        ;;
+    *"get secretstore rel-curie-sm"*)
+        printf '%s\n' '{"apiVersion":"external-secrets.io/v1","kind":"SecretStore","metadata":{"name":"rel-curie-sm","namespace":"rel"}}'
+        ;;
+    *"get secret rel-curie-postgres "*)
+        if [ "$ROUTING_TEST_MODE" = target ]; then
+            printf '%s\n' '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"rel-curie-postgres","namespace":"rel"}}'
+        fi
+        ;;
+    *"get namespace rel "*)
+        if [ "$ROUTING_TEST_MODE" = namespace ]; then
+            printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"rel","uid":"u-1","resourceVersion":"7","labels":{"curietech.ai/created-by":"other","curietech.ai/created-in":"other"}}}'
+        fi
+        ;;
+esac
+exit 0
+"#,
+        );
+        write_exec(
+            &bin_dir,
+            "aws",
+            r#"#!/bin/sh
+if [ "${1:-}" = '--version' ]; then
+    printf '%s\n' 'aws-cli/2.31.0 Python/3.13.7 Linux/fixture exe/x86_64'
+    exit 0
+fi
+printf 'AWS: %s\n' "$*" >> "$ROUTING_TEST_LOG"
+case " $* " in
+    *" secretsmanager list-secrets "*)
+        printf '%s\n' '{"SecretList":[]}'
+        ;;
+    *" secretsmanager create-secret "*)
+        printf '%s\n' '{"VersionId":"00000000-0000-4000-8000-000000000001"}'
+        ;;
+    *)
+        printf '%s\n' 'ResourceNotFoundException: fixture object is absent' >&2
+        exit 254
+        ;;
+esac
+"#,
+        );
+        let log = temp.path().join("calls.log");
+        Self { temp, file, log }
+    }
+
+    fn apply(&self, mode: &str) -> Output {
+        let mut paths = vec![self.temp.path().join("bin")];
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        Command::new(bin())
+            .current_dir(repo_root())
+            .arg("--json")
+            .arg("apply")
+            .arg("--file")
+            .arg(&self.file)
+            .env("PATH", std::env::join_paths(paths).expect("PATH"))
+            .env("ROUTING_TEST_LOG", &self.log)
+            .env("ROUTING_TEST_MODE", mode)
+            .env("CURIE_CONFIG_DIR", self.temp.path().join("config"))
+            .env_remove("CURIE_CREDENTIALS")
+            .env_remove("CURIE_MODEL_CREDENTIALS")
+            .env_remove("CURIE_GITHUB_TOKEN")
+            .env_remove("CURIE_MODEL")
+            .env_remove("AWS_PROFILE")
+            .output()
+            .expect("run curie")
+    }
+
+    fn calls(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Refused, and nothing was written anywhere: no Secrets Manager create,
+    /// no kubectl write, no Helm upgrade.
+    fn assert_refused_without_mutation(&self, output: &Output, needle: &str) {
+        let all = visible(output);
+        assert!(!output.status.success(), "apply must refuse:\n{all}");
+        assert!(all.contains(needle), "refusal must name {needle}:\n{all}");
+        let calls = self.calls();
+        assert!(
+            calls.contains("secretsmanager list-secrets"),
+            "the fixture must reach the provider path: {calls}"
+        );
+        assert!(
+            !calls.contains("create-secret") && !calls.contains("put-secret-value"),
+            "Secrets Manager was written before the refusal: {calls}"
+        );
+        for line in calls.lines().filter(|l| l.starts_with("KUBECTL: ")) {
+            for verb in [" label ", " annotate ", " patch ", " apply ", " create "] {
+                assert!(
+                    !format!("{line} ").contains(verb),
+                    "kubectl mutation before the refusal: {line}"
+                );
+            }
+        }
+        for line in calls.lines().filter(|l| l.starts_with("HELM: ")) {
+            assert!(
+                !line.starts_with("HELM: upgrade") && !line.starts_with("HELM: install"),
+                "helm mutation before the refusal: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_foreign_target_secret_is_refused_before_any_provider_or_cluster_write() {
+    let fixture = LiveFixture::new();
+    let output = fixture.apply("target");
+    fixture.assert_refused_without_mutation(&output, "rel-curie-postgres");
+}
+
+#[test]
+fn a_foreign_namespace_is_refused_before_any_provider_or_cluster_write() {
+    let fixture = LiveFixture::new();
+    let output = fixture.apply("namespace");
+    fixture.assert_refused_without_mutation(&output, "foreign ownership labels");
+}

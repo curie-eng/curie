@@ -1089,3 +1089,178 @@ fn route_up_opts_passes_names_instead_of_values() {
         assert!(!rendered.contains(value), "{value} leaked: {rendered}");
     }
 }
+
+// ------------------------------------------------------ review regressions
+
+#[test]
+fn a_comma_joined_second_assignment_in_set_is_refused_and_dropped() {
+    // Helm reads `a=x,b=y` as two assignments, so the second key must be
+    // checked too, not only the YAML mapping key.
+    let smuggled = format!("ClusterIP,api.githubToken={GITHUB_VALUE}");
+    let cfg = install(&format!("set:\n  ui.service.type: \"{smuggled}\"\n"));
+    assert_refused(
+        plan_with(&cfg, None, None),
+        "api.githubToken",
+        Some(GITHUB_VALUE),
+    );
+
+    let plan = fresh_declared_plan();
+    let mut up = up_literal();
+    let expression = format!("ui.service.type={smuggled}");
+    up.set_string.push(expression.clone());
+    up.set.push(expression.clone());
+    route_up_opts(&mut up, &plan);
+    assert!(
+        !up.set_string.contains(&expression) && !up.set.contains(&expression),
+        "a set expression whose second assignment is a dropped key survived"
+    );
+    assert!(!display(&up).contains(GITHUB_VALUE), "{}", display(&up));
+}
+
+/// Another apply wins the race for the project key: its `create` stores a
+/// rival value and reports `Conflict`. `put` is never a legal generation path.
+struct RacingProvider {
+    inner: FakeProvider,
+    rival: String,
+}
+
+impl SecretsProvider for RacingProvider {
+    fn put(&self, _request: &PutRequest<'_>) -> Result<ObjectVersion, ProviderError> {
+        panic!("generation must create atomically, never put")
+    }
+
+    fn create(
+        &self,
+        name: &str,
+        material: &SecretMaterial,
+    ) -> Result<ObjectVersion, ProviderError> {
+        let mut objects = self.inner.objects.lock().unwrap();
+        if name == "langfuse-init-project-secret-key" {
+            objects.insert(
+                name.to_string(),
+                json!({"langfuseInitProjectSecretKey": self.rival}).to_string(),
+            );
+        }
+        if objects.contains_key(name) {
+            return Err(ProviderError::Conflict {
+                name: name.to_string(),
+                expected_version: None,
+                actual_version: None,
+            });
+        }
+        objects.insert(name.to_string(), material.expose().to_string());
+        Ok(ObjectVersion {
+            id: "1".to_string(),
+        })
+    }
+
+    fn get(&self, name: &str, version: Option<&str>) -> Result<StoredObject, ProviderError> {
+        self.inner.get(name, version)
+    }
+
+    fn get_metadata(&self, name: &str) -> Result<ObjectMetadata, ProviderError> {
+        self.inner.get_metadata(name)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, ProviderError> {
+        self.inner.list(prefix)
+    }
+
+    fn tag(
+        &self,
+        name: &str,
+        tags: &BTreeMap<String, String>,
+        expected_version: Option<&str>,
+    ) -> Result<ObjectVersion, ProviderError> {
+        self.inner.tag(name, tags, expected_version)
+    }
+
+    fn delete(
+        &self,
+        name: &str,
+        expected_version: Option<&str>,
+    ) -> Result<ObjectVersion, ProviderError> {
+        self.inner.delete(name, expected_version)
+    }
+}
+
+#[test]
+fn a_lost_create_race_keeps_the_rival_key_and_derives_the_header_from_it() {
+    let plan = bare_fresh_plan();
+    let provider = RacingProvider {
+        inner: FakeProvider::default(),
+        rival: PROJECT_KEY_VALUE.to_string(),
+    };
+    let created = generate(
+        &provider,
+        &plan,
+        &[
+            "otlp-auth-header".to_string(),
+            "langfuse-init-project-secret-key".to_string(),
+        ],
+    )
+    .expect("a lost race is not an error");
+    assert_eq!(
+        created,
+        vec!["otlp-auth-header".to_string()],
+        "the project key was created by the rival, not by this apply"
+    );
+    assert_eq!(
+        provider.inner.body("langfuse-init-project-secret-key")["langfuseInitProjectSecretKey"],
+        json!(PROJECT_KEY_VALUE),
+        "the rival's project key is never overwritten"
+    );
+    assert_eq!(
+        provider.inner.body("otlp-auth-header")["otlpAuthHeader"],
+        json!(basic(DEFAULT_LANGFUSE_PUBLIC_KEY, PROJECT_KEY_VALUE)),
+        "the OTLP header must match the stored project key"
+    );
+}
+
+#[test]
+fn generate_never_calls_put() {
+    let plan = bare_fresh_plan();
+    let provider = RacingProvider {
+        inner: FakeProvider::default(),
+        rival: PROJECT_KEY_VALUE.to_string(),
+    };
+    let to_create: Vec<String> = GENERATED.iter().map(|s| s.to_string()).collect();
+    generate(&provider, &plan, &to_create).expect("generate through create only");
+    for logical in GENERATED {
+        provider.inner.body(logical);
+    }
+}
+
+fn assert_preserved_reference_is_preflighted(live: Value, logical: &str) {
+    let cfg = install("");
+    let plan = plan_with(&cfg, Some(&live), Some(&BTreeMap::new())).expect("plan");
+    assert_eq!(
+        reason_of(&plan, logical),
+        Some(RouteReason::Optional),
+        "a live reference to this release's synced Secret keeps {logical} routed"
+    );
+    let mut sm = full_sm(&plan);
+    sm.remove(logical);
+    let error = preflight(&plan, &sm).expect_err("the missing source must be refused");
+    let text = err_text(&error);
+    assert!(
+        text.contains(&format!("{REMOTE_PREFIX}/{logical}")),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_preserved_model_reference_is_routed_and_preflighted() {
+    assert_preserved_reference_is_preflighted(
+        json!({"agentSandbox": {"runner": {"credentialsExistingSecret": "rel-curie-runner-credentials"}}}),
+        "runner-model-credentials",
+    );
+}
+
+#[test]
+fn a_preserved_slack_reference_is_routed_and_preflighted() {
+    assert_preserved_reference_is_preflighted(
+        json!({"dispatcher": {"slack": {"appTokenExistingSecret": "rel-curie-slack"}}}),
+        "slack-app-token",
+    );
+}
