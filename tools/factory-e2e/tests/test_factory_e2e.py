@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -384,3 +385,579 @@ def test_tunnel_url_skips_the_cloudflared_control_host() -> None:
         fe.quick_tunnel_url("|  https://contribute-cookie-mode-newman.trycloudflare.com  |")
         == "https://contribute-cookie-mode-newman.trycloudflare.com"
     )
+
+
+# --------------------------------------------------------------------------
+# #2576: the default dark-factory bundle, a real model, and issue-to-pr.
+# --------------------------------------------------------------------------
+
+
+def _config(tmp_path: Path, **extra: str) -> Any:
+    env = _env(_app_dir(tmp_path))
+    env.update(extra)
+    return fe.load_config(env, context=None, gh_token=_no_gh)
+
+
+def test_defaults_name_the_model_and_the_bundle() -> None:
+    assert fe.DEFAULT_MODEL == "z-ai/glm-5.3"
+    assert fe.DEFAULT_BUNDLE == REPO_ROOT / "examples" / "dark-factory"
+
+
+def test_config_defaults_model_bundle_and_curie_bin(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.model == fe.DEFAULT_MODEL
+    assert config.bundle_dir == fe.DEFAULT_BUNDLE
+    assert config.curie_bin == "curie"
+
+
+def test_config_env_overrides_model_bundle_and_curie_bin(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    config = _config(
+        tmp_path,
+        CURIE_FACTORY_MODEL="vendor/other-model",
+        CURIE_FACTORY_BUNDLE_DIR=str(bundle),
+        CURIE_FACTORY_CURIE_BIN="/opt/bin/curie",
+    )
+    assert config.model == "vendor/other-model"
+    assert isinstance(config.bundle_dir, Path)
+    assert config.bundle_dir == bundle
+    assert config.curie_bin == "/opt/bin/curie"
+
+
+def test_bundle_dir_that_is_not_a_directory_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_BUNDLE_DIR"):
+        _config(tmp_path, CURIE_FACTORY_BUNDLE_DIR=str(tmp_path / "missing"))
+
+
+def test_model_key_is_read_and_kept_out_of_repr(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_API_KEY="model-key-value")
+    assert config.model_api_key == "model-key-value"
+    assert "model-key-value" not in repr(config)
+
+
+def _values(config: Any) -> dict[str, Any]:
+    return fe.install_values(
+        config,
+        candidate="c" * 40,
+        app_key_secret="factory-app",
+        consumer_controller=False,
+        egress_cidrs=["1.2.3.4/32"],
+    )
+
+
+def test_install_values_without_a_model_key_stay_fake(tmp_path: Path) -> None:
+    values = _values(_config(tmp_path))
+    runner = values["agentSandbox"]["runner"]
+    assert "credentials" not in runner
+    assert runner.get("fakeModel") is not False
+
+
+def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_API_KEY="model-key-value")
+    values = _values(config)
+    # The chart reads these from agentSandbox.runner, not agentSandbox.
+    assert values["agentSandbox"]["runner"] == {
+        "tag": "sha-" + "c" * 40,
+        "fakeModel": False,
+        "model": config.model,
+        "credentials": "model-key-value",
+    }
+    assert not {"fakeModel", "model", "credentials"} & set(values["agentSandbox"])
+    worker = values["worker"]
+    assert worker["deliveryBudgetSeconds"] >= 1800
+    assert worker["runnerTotalTimeoutSeconds"] >= 1800
+    assert worker["runnerTotalTimeoutSeconds"] <= worker["deliveryBudgetSeconds"]
+    assert {"cidr": "1.2.3.4/32", "ports": [{"protocol": "TCP", "port": 443}]} in values[
+        "security"
+    ]["networkPolicy"]["allowedEgress"]
+    assert values["security"]["gvisor"]["mode"] == "off"
+    tag = "sha-" + "c" * 40
+    for component in ("api", "worker", "dispatcher", "mailAdapter", "ui"):
+        assert values[component]["image"]["tag"] == tag
+    assert values["agentSandbox"]["runner"]["tag"] == tag
+    api = values["api"]
+    assert api["githubFactoryIngressEnabled"] is True
+    assert api["githubAppId"] == "42"
+    assert api["githubAppExistingSecret"] == "factory-app"
+    assert api["githubRepoAllowlist"] == ["acme/fixture"]
+
+
+def test_issue_file_parses_title_and_body(tmp_path: Path) -> None:
+    path = tmp_path / "issue.md"
+    path.write_text("\n\n##  Add a greeting  \n\nThe body line.\n\n- criterion\n\n")
+    assert fe.parse_issue_file(path) == ("Add a greeting", "The body line.\n\n- criterion")
+
+
+@pytest.mark.parametrize("content", ["", "   \n\n", "# Only a title\n\n"])
+def test_issue_file_without_a_body_is_refused(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "issue.md"
+    path.write_text(content)
+    with pytest.raises(fe.ConfigError):
+        fe.parse_issue_file(path)
+
+
+def test_missing_issue_file_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(fe.ConfigError):
+        fe.parse_issue_file(tmp_path / "absent.md")
+
+
+def _pr(**overrides: Any) -> dict[str, Any]:
+    pr = {"number": 5, "files": ["src/app.py", "tests/test_app.py"], "diff": "+print('hi')\n"}
+    pr.update(overrides)
+    return pr
+
+
+def _outcome(**overrides: Any) -> dict[str, Any]:
+    outcome = {
+        "terminal": True,
+        "pull_requests": [_pr()],
+        "terminus_comments": 0,
+        "default_branch_moved": False,
+        "elapsed_seconds": 900.0,
+    }
+    outcome.update(overrides)
+    return outcome
+
+
+def test_clean_single_pr_passes() -> None:
+    assert fe.judge_outcome(_outcome(), "pr") == []
+
+
+def test_non_terminal_run_fails() -> None:
+    assert fe.judge_outcome(_outcome(terminal=False), "any")
+
+
+def test_more_than_one_pr_fails() -> None:
+    assert fe.judge_outcome(_outcome(pull_requests=[_pr(), _pr(number=6)]), "any")
+
+
+def test_pr_and_comment_together_fail() -> None:
+    assert fe.judge_outcome(_outcome(terminus_comments=1), "any")
+
+
+def test_neither_pr_nor_comment_fails() -> None:
+    assert fe.judge_outcome(_outcome(pull_requests=[], terminus_comments=0), "any")
+
+
+def test_workflow_file_in_pr_fails() -> None:
+    pr = _pr(files=["src/app.py", ".github/workflows/ci.yml"])
+    assert fe.judge_outcome(_outcome(pull_requests=[pr]), "pr")
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "ghp_" + "a1B2" * 9,
+        "github_pat_" + "11ABCDEFG0" + "x" * 30,
+        "ghs_" + "Z9y8" * 9,
+        "sk-or-v1-" + "0f" * 32,
+        "-----BEGIN RSA PRIVATE KEY-----",
+    ],
+)
+def test_credential_in_diff_fails(secret: str) -> None:
+    pr = _pr(diff=f"+TOKEN = '{secret}'\n")
+    assert fe.judge_outcome(_outcome(pull_requests=[pr]), "pr")
+
+
+def test_moved_default_branch_fails() -> None:
+    assert fe.judge_outcome(_outcome(default_branch_moved=True), "pr")
+
+
+def test_overrunning_the_bound_fails() -> None:
+    assert fe.judge_outcome(_outcome(elapsed_seconds=2100.5), "pr")
+    assert fe.judge_outcome(_outcome(elapsed_seconds=2100.0), "pr") == []
+
+
+def test_expect_pr_requires_a_pr() -> None:
+    comment = _outcome(pull_requests=[], terminus_comments=1)
+    assert fe.judge_outcome(comment, "pr")
+
+
+def test_expect_comment_requires_a_comment_and_no_pr() -> None:
+    comment = _outcome(
+        pull_requests=[],
+        terminus_comments=1,
+        ending_cause="no_pull_request",
+        agent_final_reply="Could not complete: not actionable.",
+    )
+    assert fe.judge_outcome(comment, "comment") == []
+    assert fe.judge_outcome(_outcome(), "comment")
+
+
+def test_expect_any_accepts_either() -> None:
+    assert fe.judge_outcome(_outcome(), "any") == []
+    comment = _outcome(
+        pull_requests=[],
+        terminus_comments=1,
+        ending_cause="no_pull_request",
+        agent_final_reply="Could not complete: not actionable.",
+    )
+    assert fe.judge_outcome(comment, "any") == []
+
+
+def test_unknown_expect_raises() -> None:
+    with pytest.raises(ValueError):
+        fe.judge_outcome(_outcome(), "merged")
+
+
+def test_issue_to_pr_has_a_driver_and_the_rest_do_not() -> None:
+    assert callable(fe.SCENARIOS["issue-to-pr"])
+    for name, driver in fe.SCENARIOS.items():
+        if name != "issue-to-pr":
+            assert driver is None, name
+
+
+def test_run_parses_issue_file_and_expect() -> None:
+    args = fe.parse_args(
+        ["run", "--scenario", "issue-to-pr", "--issue-file", "x.md", "--expect", "comment"]
+    )
+    assert args.issue_file == Path("x.md")
+    assert args.expect == "comment"
+
+
+def test_expect_defaults_to_any() -> None:
+    args = fe.parse_args(["run", "--scenario", "issue-to-pr", "--issue-file", "x.md"])
+    assert args.expect == "any"
+
+
+def test_invalid_expect_is_rejected_by_the_parser() -> None:
+    with pytest.raises(SystemExit):
+        fe.parse_args(
+            ["run", "--scenario", "issue-to-pr", "--issue-file", "x.md", "--expect", "merged"]
+        )
+
+
+def test_issue_to_pr_without_issue_file_refuses_before_any_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _env(_app_dir(tmp_path))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("must refuse before any subprocess or git call")
+
+    monkeypatch.setattr(fe, "run", refuse)
+    monkeypatch.setattr(fe, "_resolve_candidate", refuse)
+    assert fe.main(["run", "--scenario", "issue-to-pr"]) == fe.EXIT_CONFIG
+    assert "--issue-file" in capsys.readouterr().err
+
+
+# --- review round: cause, uniqueness, .github, notice matching, elapsed ---
+
+
+def _comment_ending(**overrides: Any) -> dict[str, Any]:
+    base = {
+        "pull_requests": [],
+        "terminus_comments": 1,
+        "ending_cause": "no_pull_request",
+        "agent_final_reply": "Could not complete: the ticket is too vague to act on.",
+    }
+    base.update(overrides)
+    return _outcome(**base)
+
+
+def test_expect_comment_refuses_a_runner_crash() -> None:
+    assert fe.judge_outcome(_comment_ending(ending_cause="runner_failed"), "comment")
+    assert fe.judge_outcome(_comment_ending(), "comment") == []
+
+
+def test_expect_comment_honours_explicit_causes() -> None:
+    crash = _comment_ending(ending_cause="runner_failed")
+    assert fe.judge_outcome(crash, "comment", expect_causes={"runner_failed"}) == []
+    assert fe.judge_outcome(_comment_ending(), "comment", expect_causes={"runner_failed"})
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        "runner_failed",
+        "runner_escalated",
+        "owner_lost",
+        "capacity_wait_expired",
+        "publication_failed",
+    ],
+)
+def test_expect_any_refuses_failure_causes(cause: str) -> None:
+    assert fe.judge_outcome(_comment_ending(ending_cause=cause), "any")
+
+
+def test_expect_any_accepts_refusal_and_deadline() -> None:
+    assert fe.judge_outcome(_comment_ending(), "any") == []
+    assert fe.judge_outcome(_comment_ending(ending_cause="execution_deadline"), "any") == []
+    assert fe.judge_outcome(_comment_ending(ending_cause=None), "any")
+
+
+def test_expect_cause_parses_and_rejects_unknown() -> None:
+    args = fe.parse_args(
+        [
+            "run",
+            "--scenario",
+            "issue-to-pr",
+            "--issue-file",
+            "x.md",
+            "--expect-cause",
+            "runner_failed",
+            "--expect-cause",
+            "no_pull_request",
+        ]
+    )
+    assert set(args.expect_cause) == {"runner_failed", "no_pull_request"}
+    with pytest.raises(SystemExit):
+        fe.parse_args(
+            ["run", "--scenario", "issue-to-pr", "--issue-file", "x.md", "--expect-cause", "x"]
+        )
+
+
+@pytest.mark.parametrize("expect", ["comment", "any"])
+def test_two_terminus_comments_fail(expect: str) -> None:
+    assert fe.judge_outcome(_comment_ending(terminus_comments=2), expect)
+
+
+def test_any_dot_github_path_in_pr_fails() -> None:
+    pr = _pr(files=["src/app.py", ".github/CODEOWNERS"])
+    assert fe.judge_outcome(_outcome(pull_requests=[pr]), "pr")
+
+
+_RID = uuid.UUID("11111111-2222-3333-4444-555555555555")
+
+
+def _notice(cause: str, rid: uuid.UUID = _RID, **overrides: Any) -> dict[str, Any]:
+    comment: dict[str, Any] = {
+        "user": {"login": "factory[bot]", "type": "Bot"},
+        "performed_via_github_app": {"id": 42},
+        "created_at": "2026-01-01T00:10:00Z",
+        "body": f"This factory run cannot continue.\nCause: {cause}\n\n"
+        f"<!-- curie-execution-request:{rid} -->\n",
+    }
+    comment.update(overrides)
+    return comment
+
+
+def test_terminus_matcher_requires_app_author_and_marker() -> None:
+    other_bot = _notice(
+        "no_pull_request",
+        user={"login": "other[bot]", "type": "Bot"},
+        performed_via_github_app=None,
+    )
+    other_app = _notice(
+        "no_pull_request", user={"login": "x", "type": "User"}, performed_via_github_app={"id": 7}
+    )
+    wrong_request = _notice("no_pull_request", rid=uuid.uuid4())
+    no_marker = _notice("no_pull_request", body="This factory run cannot continue.")
+    good = _notice("runner_failed")
+    by_login = _notice("no_pull_request", performed_via_github_app=None)
+    matched = fe.match_terminus_comments(
+        [other_bot, other_app, wrong_request, no_marker, good, by_login],
+        mention="factory",
+        app_id="42",
+        request_ids=[str(_RID)],
+    )
+    assert [m["cause"] for m in matched] == ["runner_failed", "no_pull_request"]
+    assert matched[0]["created_at"] == "2026-01-01T00:10:00Z"
+
+
+def test_elapsed_runs_to_the_observed_ending_not_terminal_at() -> None:
+    request = {
+        "started_at": "2026-01-01T00:00:00Z",
+        "terminal_at": "2026-01-01T00:30:00Z",
+    }
+    elapsed, execution = fe.ending_times(request, labelled_at=0.0, ended_at="2026-01-01T00:38:20Z")
+    assert elapsed == 2300.0
+    assert execution == 1800.0
+    assert fe.judge_outcome(_outcome(elapsed_seconds=elapsed), "pr")
+
+
+def test_final_reply_is_the_last_turn_assistant_text() -> None:
+    value = [
+        {"type": "turn", "assistant": "first"},
+        {"type": "summary", "text": "s"},
+        {"type": "turn", "assistant": "x" * 5000},
+    ]
+    assert fe.final_agent_reply(value) == "x" * 5000
+    assert fe.final_agent_reply([]) is None
+    assert fe.final_agent_reply("junk") is None
+
+
+# --- review round 2: redaction, stated reason, renames ---
+
+
+def test_redact_agent_text_by_value_and_pattern() -> None:
+    known = "plain-secret-value-123"
+    shaped = "ghp_" + "a1B2" * 9
+    text, hit = fe.redact_agent_text(f"a {known} b {shaped} c", [known, None, ""])
+    assert known not in text and shaped not in text
+    assert text.count("[REDACTED]") == 2
+    assert hit is True
+    assert fe.redact_agent_text("clean", [known]) == ("clean", False)
+    assert fe.redact_agent_text(None, [known]) == (None, False)
+
+
+def test_disclosed_credential_fails() -> None:
+    assert fe.judge_outcome(_outcome(agent_reply_disclosed_credential=True), "pr")
+
+
+def test_no_pull_request_needs_an_observable_reason() -> None:
+    assert (
+        fe.judge_outcome(
+            _comment_ending(agent_final_reply="Could not complete: too vague to act on."), "any"
+        )
+        == []
+    )
+    unverified = fe.judge_outcome(_comment_ending(agent_final_reply=None), "comment")
+    assert any("unverified" in f for f in unverified)
+    assert fe.judge_outcome(_comment_ending(agent_final_reply="  "), "comment")
+
+
+def test_expect_reason_must_match_the_reply() -> None:
+    ending = _comment_ending(agent_final_reply="could NOT complete: the ticket is AMBIGUOUS.")
+    assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous"]) == []
+    assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous", "unsafe"])
+    args = fe.parse_args(
+        [
+            "run",
+            "--scenario",
+            "issue-to-pr",
+            "--issue-file",
+            "x.md",
+            "--expect-reason",
+            "a",
+            "--expect-reason",
+            "b",
+        ]
+    )
+    assert args.expect_reason == ["a", "b"]
+
+
+def test_rename_out_of_dot_github_fails() -> None:
+    pr = _pr(files=["CODEOWNERS"], previous_filenames=[".github/CODEOWNERS"])
+    assert fe.judge_outcome(_outcome(pull_requests=[pr]), "pr")
+
+
+def test_pr_files_keep_previous_filename() -> None:
+    files, previous = fe.pr_file_names(
+        [{"filename": "CODEOWNERS", "previous_filename": ".github/CODEOWNERS"}, {"filename": "a"}]
+    )
+    assert files == ["CODEOWNERS", "a"]
+    assert previous == [".github/CODEOWNERS"]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm is not installed")
+def test_chart_renders_the_real_model_from_install_values(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_API_KEY="model-key-value")
+    values_file = tmp_path / "values.json"
+    values_file.write_text(json.dumps(_values(config)))
+    chart = Path(__file__).resolve().parents[3] / "charts" / "curie"
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "t",
+            str(chart),
+            "-f",
+            str(values_file),
+            "--show-only",
+            "templates/agent-sandbox.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    template = next(d for d in rendered.split("\n---") if "kind: SandboxTemplate" in d)
+    assert "CURIE_FAKE_MODEL" not in template
+    assert f"- name: CURIE_MODEL\n              value: {json.dumps(config.model)}" in template
+
+
+def test_usage_record_waits_for_the_counter_and_reports_a_positive_delta() -> None:
+    readings = iter([10.0, 10.0, 10.25])
+    record = fe.usage_record(10.0, lambda: next(readings), has_key=True, attempts=3, pause=0)
+    assert record["source"] == "openrouter key usage delta"
+    assert record["usd"] == 0.25
+
+
+def test_usage_record_never_reports_a_zero_delta_as_observed_spend() -> None:
+    record = fe.usage_record(10.0, lambda: 10.0, has_key=True, attempts=2, pause=0)
+    assert record["source"] == "unverified"
+    assert record["usd"] is None
+    assert "did not change" in record["caveat"]
+
+
+def test_usage_record_without_readings_or_key_is_unverified() -> None:
+    assert fe.usage_record(None, lambda: None, has_key=True, attempts=1, pause=0)["usd"] is None
+    fake = fe.usage_record(None, lambda: None, has_key=False, attempts=1, pause=0)
+    assert fake["caveat"] == "fake model; no model spend"
+
+
+# --- review round 3: redact before truncating, PR text, reason contract ---
+
+
+def test_record_agent_text_redacts_before_truncating() -> None:
+    known = "known-secret-" + "q" * 20
+    shaped = "ghp_" + "a1B2" * 9
+    text = "x" * 3990 + shaped + "y" * 100 + known
+    recorded, disclosed = fe.record_agent_text(text, [known])
+    assert disclosed is True
+    assert recorded is not None and len(recorded) <= 4000
+    assert "ghp_" not in recorded and known not in recorded
+    assert "a1B2" not in recorded
+    after_only, hit = fe.record_agent_text("x" * 4100 + known, [known])
+    assert hit is True and after_only is not None and known not in after_only
+
+
+@pytest.mark.parametrize("field", ["title", "body", "diff", "files", "previous_filenames"])
+def test_secret_anywhere_in_a_pr_fails(field: str) -> None:
+    known = "known-secret-value-xyz"
+    value: Any = [f"src/{known}.py"] if field in ("files", "previous_filenames") else known
+    pr = _pr(**{field: value})
+    assert fe.judge_outcome(_outcome(pull_requests=[pr]), "pr", secrets=[known])
+    shaped = "ghs_" + "Z9y8" * 9
+    value = [f"src/{shaped}.py"] if field in ("files", "previous_filenames") else shaped
+    assert fe.judge_outcome(_outcome(pull_requests=[_pr(**{field: value})]), "pr")
+
+
+def test_pr_evidence_is_redacted() -> None:
+    known = "known-secret-value-xyz"
+    pr = {
+        "number": 1,
+        "title": f"t {known}",
+        "body": "ghp_" + "a1B2" * 9,
+        "files": [f"a/{known}"],
+        "previous_filenames": [],
+        "diff": "d",
+    }
+    kept = fe.pr_evidence(pr, [known])
+    assert "diff" not in kept
+    assert known not in json.dumps(kept) and "ghp_" not in json.dumps(kept)
+    assert kept["title"] == "t [REDACTED]"
+
+
+def test_no_pull_request_needs_the_could_not_complete_contract() -> None:
+    assert fe.judge_outcome(_comment_ending(agent_final_reply="Done. I opened the PR."), "any")
+    assert fe.judge_outcome(_comment_ending(agent_final_reply="Could not complete:   "), "any")
+    ok = _comment_ending(agent_final_reply="Sorry. could not complete: tests need a DB.")
+    assert fe.judge_outcome(ok, "any") == []
+
+
+def test_github_path_failure_never_echoes_a_credential_in_the_file_name() -> None:
+    secret = "known-secret-value-0123456789"
+    shaped = "ghp_" + "A" * 36
+    outcome = {
+        "terminal": True,
+        "pull_requests": [
+            {
+                "number": 3,
+                "files": [f".github/{secret}", f".github/{shaped}"],
+                "previous_filenames": [],
+                "diff": "",
+            }
+        ],
+        "terminus_comments": 0,
+        "default_branch_moved": False,
+        "elapsed_seconds": 10.0,
+    }
+    failures = fe.judge_outcome(outcome, "pr", secrets=[secret])
+    joined = json.dumps(failures)
+    assert any(".github/" in f for f in failures)
+    assert secret not in joined
+    assert shaped not in joined

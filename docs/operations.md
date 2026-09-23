@@ -824,6 +824,27 @@ Give the App **Checks: Read** so the work item detail can report CI for the
 published head. Without it, CI reports `unavailable` / `github_forbidden` and
 nothing else changes.
 
+### The default factory agent
+
+Curie ships its factory agent as the bundle in
+[`examples/dark-factory`](../examples/dark-factory/README.md). Deploy it to the
+agent bound to the repository. It is one agent with one skill: it reads the
+issue by link, pins the acceptance criteria, plans, writes a failing test where
+one is feasible, implements, runs the repository's own checks, reviews its diff
+against every criterion, and ends in one pull request or a stated reason. Any
+other bundle can take its place; the platform does not require this one.
+
+The bundle reads the issue through the GitHub MCP server the runner image
+preinstalls, with its own `GITHUB_PERSONAL_ACCESS_TOKEN` bound at deploy
+(`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). Give it a token
+limited to **Issues: Read**. Its `toolPolicy` allows only `github/get_issue`, so
+the runner denies every GitHub write tool. Open runner egress to the GitHub API
+CIDRs (`agentSandbox.connectorEgress.<agent>`), and raise
+`worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` to 1800
+so the execution deadline, not the 600 s default, bounds a run. Whether a run
+executes the repository's tests is the bundle's instruction. The platform does
+not check it.
+
 ### Factory work items wait for capacity
 
 Factory execution waits in PostgreSQL rather than on the runs-stream pending
@@ -900,7 +921,10 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
    commit's chart into a namespace it creates (`test-factory-<commit>` by
    default, or `--namespace test-factory-<slug>`). If the cluster already runs
    the agent-sandbox controller, the install is consumer mode.
-2. Turns on factory intake, binds one agent to the fixture repository, exposes
+2. Turns on factory intake, binds one agent to the fixture repository, deploys
+   the default factory bundle (`examples/dark-factory`) onto it with a
+   short-lived installation token limited to Issues: Read as the bundle's
+   GitHub credential, sets the agent's publication policy to `auto`, exposes
    the api through a temporary cloudflared quick tunnel, and points the App
    webhook at it with an App JWT.
 3. Resets the fixture repository by closing its issues and pull requests and
@@ -929,12 +953,43 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses instead of creating them |
 | `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start) |
 | `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
+| `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
+| `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
+| `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to 1800 s; unset, the model is fake |
+| `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3`) |
 
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
 preflight and then one scenario driver: `issue-to-pr`, `revision`,
 `cancel-waiting`, `cancel-running` or `evaluation`. A scenario that has no
 driver yet is refused before anything is installed.
+
+`run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]... [--expect-reason <regex>]...`
+opens the ticket (first line is the title, the rest the body) as the one
+labelled issue and waits for the run to end. It fails unless the run ended as
+exactly one pull request or one terminus comment, inside the execution bound,
+with no `.github/` file or credential-shaped string in the diff and the default
+branch unmoved, and unless the ending matches `--expect`. Only a comment the
+App posted with this run's execution request marker counts, and more than one
+fails. A comment ending passes only when its cause is one the run accepts:
+each `--expect-cause` given, or by default `no_pull_request` for `--expect
+comment` and `no_pull_request` or `execution_deadline` for `--expect any`.
+A `no_pull_request` comment also needs the agent's final reply as its stated
+reason: a missing reply fails as unverified, the reply must contain `Could not
+complete:` followed by an explanation, and each `--expect-reason` must also
+match it, ignoring case. A rename out of `.github/` fails like a change inside
+it. A known secret or credential-shaped string in the pull request's title,
+body, diff or file names fails the run. The reply, the comment and the pull
+request's title, body and file names are recorded with such strings replaced
+by `[REDACTED]`, redacted in full before the reply is cut to 4000 characters,
+and any redaction in agent text fails the run.
+Elapsed time runs from the request's start to the pull request or comment.
+The evidence records the work item state and ending cause, the pull request
+and its changed files, the terminus comment, CI, elapsed and execution time,
+the agent's final reply from its transcript when the api returns exactly one,
+the configured model, and the model spend
+as the OpenRouter key's usage delta (or `unverified`). The key is shared, so
+that delta includes any concurrent use of it.
 
 ### Reading work item outcomes
 
