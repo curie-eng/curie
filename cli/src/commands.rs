@@ -4633,9 +4633,6 @@ pub struct PreparedDeploy {
     step: crate::ui::Step,
     tier: DeployTier,
     plugin_dir: PathBuf,
-    /// Advisory derived from the exact archive accepted by the platform. It is
-    /// emitted by the invocation owner so a multi target deploy prints it once.
-    cron_trigger_warning: Option<String>,
 }
 
 fn is_documentation_placeholder_channel(channel: &str) -> bool {
@@ -4677,12 +4674,6 @@ impl PreparedDeploy {
 
     pub fn version_id(&self) -> &str {
         &self.outcome.version.id
-    }
-
-    pub fn emit_cron_trigger_warning(&self) {
-        if let Some(warning) = &self.cron_trigger_warning {
-            crate::ui::ui().warn(warning);
-        }
     }
 }
 
@@ -4819,10 +4810,6 @@ async fn prepare_deploy_with_commit_sha(
             None
         }
     };
-    let cron_trigger_warning = packed_manifest
-        .as_ref()
-        .ok()
-        .and_then(|(_, body)| cron_trigger_warning_from_manifest(body).ok().flatten());
     let commit_sha = match installer_commit_sha {
         Some(commit_sha) => Some(commit_sha.to_string()),
         None => {
@@ -5026,7 +5013,6 @@ async fn prepare_deploy_with_commit_sha(
         step,
         tier: opts.tier,
         plugin_dir,
-        cron_trigger_warning,
     })
 }
 
@@ -5112,7 +5098,6 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         step,
         tier,
         plugin_dir,
-        cron_trigger_warning: _,
     } = prepared;
     let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
@@ -5250,7 +5235,6 @@ pub(crate) async fn deploy_with_commit_sha(
     installer_commit_sha: Option<&str>,
 ) -> Result<DeployOutput> {
     let prepared = prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?;
-    prepared.emit_cron_trigger_warning();
     deploy_prepared(prepared).await
 }
 
@@ -7740,15 +7724,15 @@ fn cron_trigger_warning_from_manifest(body: &str) -> Result<Option<String>> {
     let warning = match identities.as_slice() {
         [] => return Ok(None),
         [identity] => format!(
-            "cron trigger {identity} is declared, but this platform tier does not yet fire it; follow #268"
+            "cron trigger {identity} is declared, but the skill tier has no scheduler and does not fire it; cron triggers fire only on local and cluster installs"
         ),
         [first, second] => format!(
-            "cron triggers {first} and {second} are declared, but this platform tier does not yet fire them; follow #268"
+            "cron triggers {first} and {second} are declared, but the skill tier has no scheduler and does not fire them; cron triggers fire only on local and cluster installs"
         ),
         many => {
             let (last, rest) = many.split_last().expect("cron identities are not empty");
             format!(
-                "cron triggers {}, and {last} are declared, but this platform tier does not yet fire them; follow #268",
+                "cron triggers {}, and {last} are declared, but the skill tier has no scheduler and does not fire them; cron triggers fire only on local and cluster installs",
                 rest.join(", ")
             )
         }
