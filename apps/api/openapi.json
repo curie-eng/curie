@@ -11448,6 +11448,49 @@
         ]
       }
     },
+    "/console/logout": {
+      "post": {
+        "description": "Revoke the session in the cookie, whichever login minted it, and clear it.\n\nDeliberately no credential beyond the cookie itself: the cookie names the\none session this can end, and ``X-API-Key`` is not a way to name one.\nAlways the same 204, whether the cookie was live, unknown, already revoked\nor absent, so logout is idempotent and says nothing about which it was.\nSameSite=Strict keeps a cross-site page from logging someone out.",
+        "operationId": "logout_console_logout_post",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout",
+        "tags": [
+          "console"
+        ]
+      }
+    },
     "/console/oidc/callback": {
       "get": {
         "description": "Finish an OIDC login and mint a principal console session.\n\nThe order is the security argument: bind ``state`` to this browser's\ncookie, then spend the server-side attempt (single use, committed before\nanything else can fail), and only then touch the IdP with the code and the\nstored PKCE verifier. The ID token is validated against the attempt's\nnonce, the principal is resolved and must be active in an active tenant,\nand only then does a session exist. Every terminal response clears the\nstate cookie, and every refusal looks the same.\n\nThe ``code`` and ``state`` in the query may land in access logs. That is\ntolerated: the code is useless without the verifier that never left the\nserver, and the state is single-use and cookie-bound.",

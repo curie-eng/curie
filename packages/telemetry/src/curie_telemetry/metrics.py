@@ -233,6 +233,7 @@ _HTTP_OPERATIONS = [
     "/cluster-message-replies/{reply_ref}",
     "/config",
     "/console/login-codes",
+    "/console/logout",
     # Generic OIDC console login (#2908).
     "/console/oidc/callback",
     "/console/oidc/login",

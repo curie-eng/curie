@@ -1078,6 +1078,7 @@
           "/cluster-message-replies/{reply_ref}",
           "/config",
           "/console/login-codes",
+          "/console/logout",
           "/console/oidc/callback",
           "/console/oidc/login",
           "/console/principal",
@@ -1159,7 +1160,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4080
+      "cardinality_bound": 4120
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1214,6 +1215,7 @@
           "/cluster-message-replies/{reply_ref}",
           "/config",
           "/console/login-codes",
+          "/console/logout",
           "/console/oidc/callback",
           "/console/oidc/login",
           "/console/principal",
@@ -1295,7 +1297,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4080
+      "cardinality_bound": 4120
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1350,6 +1352,7 @@
           "/cluster-message-replies/{reply_ref}",
           "/config",
           "/console/login-codes",
+          "/console/logout",
           "/console/oidc/callback",
           "/console/oidc/login",
           "/console/principal",
@@ -1424,7 +1427,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 816
+      "cardinality_bound": 824
     },
     "curie.background.loop": {
       "type": "counter",

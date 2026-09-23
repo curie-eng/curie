@@ -27,6 +27,8 @@ session bound to a principal instead of a ``subject``. No token ever reaches
 browser script -- the reason for a server-side code flow rather than an
 endpoint that accepts an ID token from the page. ``GET /console/principal`` is
 the first route guarded by ``require_principal_session``.
+
+``POST /console/logout`` ends either kind of session.
 """
 
 import hmac
@@ -145,6 +147,31 @@ async def current_session(
         subject=subject,
         expires_at=expires_at,
     )
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def logout(
+    session: SessionDep,
+    console_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+) -> Response:
+    """Revoke the session in the cookie, whichever login minted it, and clear it.
+
+    Deliberately no credential beyond the cookie itself: the cookie names the
+    one session this can end, and ``X-API-Key`` is not a way to name one.
+    Always the same 204, whether the cookie was live, unknown, already revoked
+    or absent, so logout is idempotent and says nothing about which it was.
+    SameSite=Strict keeps a cross-site page from logging someone out.
+    """
+    if console_session:
+        row = await crud.live_console_session(session, console_session)
+        if row is not None:
+            await crud.revoke_console_session(session, row)
+    response = Response(
+        status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "no-store"}
+    )
+    # Same name, path and flags as the set, or the browser keeps its cookie.
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    return response
 
 
 # --- generic OIDC login (#2908) ------------------------------------------------
