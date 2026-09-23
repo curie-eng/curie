@@ -409,7 +409,7 @@ pub(crate) fn guard_byo_key_conflict(
     // The provider's own inventory Secret is not an operator-managed BYO ref.
     // A later `--private-key` rotates that object; an unrelated name still
     // refuses, because the chart would keep reading the operator Secret.
-    if provider_owned_ref(opts, &name)? {
+    if provider_owned_ref(opts, &name, &key)? {
         return Ok(());
     }
     // CliError::failure + with_fix rather than bail!, so the --json path emits
@@ -428,7 +428,7 @@ pub(crate) fn guard_byo_key_conflict(
     .into())
 }
 
-fn provider_owned_ref(opts: &GithubAppOpts, name: &str) -> Result<bool> {
+fn provider_owned_ref(opts: &GithubAppOpts, name: &str, key: &str) -> Result<bool> {
     let Some(installation) = crate::secrets::cwd_installation()? else {
         return Ok(false);
     };
@@ -440,7 +440,7 @@ fn provider_owned_ref(opts: &GithubAppOpts, name: &str) -> Result<bool> {
     }
     let binding =
         crate::provider::binding::helm_ref("github-app-private-key", &opts.common.release)?;
-    Ok(name == binding.target)
+    Ok(name == binding.target && key == binding.key)
 }
 
 /// The refusal for a release whose `api.githubAppExistingSecret` is truthy to
@@ -2040,6 +2040,9 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     // fullname, so a helm failure in the loop above no longer pays for a
     // discovery round-trip whose answer nothing reads (#1533). The live path
     // discovers the rendered name, which is override-proof.
+    if declared.is_some() && !opts.disconnect {
+        crate::provider::eso::sync_if_present(&opts.common.namespace, "github-app-private-key")?;
+    }
     let fullname = crate::ops::release_fullname(&opts.common.namespace, &opts.common.release).await;
     let rollout = rollout_commands(&opts.common.namespace, &fullname);
     let roll_label = format!("rolling {} to pick up the credential", opts.common.release);

@@ -90,6 +90,10 @@ if [ "$tool" = "kubectl" ] && [ "$1" = "get" ] \
   echo '{"items":[{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxTemplate","metadata":{"name":"curie-runner","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"acme-release","meta.helm.sh/release-namespace":"acme-system"}},"spec":{"service":true}},{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxWarmPool","metadata":{"name":"curie-runner-pool","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"acme-release","meta.helm.sh/release-namespace":"acme-system"}},"spec":{"replicas":0,"sandboxTemplateRef":{"name":"curie-runner"}}}]}'
   exit 0
 fi
+if [ "$tool" = "kubectl" ] && echo "$*" | grep -q "externalsecret"; then
+  echo "Error from server (NotFound): externalsecrets.external-secrets.io not found" >&2
+  exit 1
+fi
 if [ "$ALLOW_MUTATION" = "1" ]; then
   if [ "$tool" = "helm" ] && [ "$1" = "upgrade" ]; then
     echo 2 > "$SHIM_LOG.rev"

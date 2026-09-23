@@ -445,6 +445,11 @@ pub async fn comms(opts: CommsOpts) -> Result<CommsOutput> {
     for cmd in &cmds {
         run_step(&cl, &label, ok_detail, cmd).await?;
     }
+    if declared.is_some() && !opts.disconnect {
+        for name in ["slack-app-token", "slack-bot-token"] {
+            crate::provider::eso::sync_if_present(&opts.common.namespace, name)?;
+        }
+    }
     // The Secret change alone does not roll the pods (secretKeyRef env vars are
     // resolved once at pod start), so restart them and wait for the new/cleared
     // token to be live before reporting success.
