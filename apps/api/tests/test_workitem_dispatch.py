@@ -317,6 +317,7 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
             "slack", ADDRESS, WIRE_CONVERSATION
         )
         assert unpublished.wait_deadline == admitted.request.wait_deadline
+        assert unpublished.repo_full_name == facts.repo_full_name
 
         stale = await acquire(
             session, facts.request_id, owner=OWNER, generation=0
@@ -706,6 +707,7 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
         headers=WORKER_HEADERS,
     )
     assert acquired.status_code == 200, acquired.text
+    assert acquired.json()["repo_full_name"] == facts.repo_full_name
     started = dispatch_client.post(
         f"{INTERNAL_PREFIX}/requests/{request_id}/start",
         json={

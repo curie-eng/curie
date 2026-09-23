@@ -590,6 +590,7 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
                     work_item_id=request_id,
                     conversation_id=thread_key,
                     wait_deadline="",
+                    repo_full_name="acme/widgets",
                 ),
                 event_id=execute_id,
                 thread_key=thread_key,

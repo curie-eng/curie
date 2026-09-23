@@ -171,6 +171,7 @@ async def acquire_work_item_request(
         "work_item_id": result.work_item_id,
         "conversation_id": result.conversation_id,
         "wait_deadline": result.wait_deadline,
+        "repo_full_name": result.repo_full_name,
     }
 
 

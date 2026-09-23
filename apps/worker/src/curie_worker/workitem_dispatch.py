@@ -63,6 +63,10 @@ class WorkItemAcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: str
+    # The repository the signed delivery bound to the WorkItem. None only on
+    # the synthetic grant an approval resume rebuilds, which keeps the
+    # thread's existing workspace selection.
+    repo_full_name: str | None
 
 
 @dataclass(frozen=True)
@@ -192,6 +196,14 @@ class WorkItemDispatchClient:
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
                 conversation_id=str(body["conversation_id"]),
                 wait_deadline=str(body["wait_deadline"]),
+                # An API replica from before #2992 omits the field mid-rollout.
+                # The acquisition is already committed, so read absence as "no
+                # WorkItem repository" rather than failing the wake.
+                repo_full_name=(
+                    str(body["repo_full_name"])
+                    if body.get("repo_full_name") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -444,6 +456,7 @@ class WorkItemRun:
         self.request_id = request_id
         self.owner = owner
         self.generation = grant.generation
+        self.repo_full_name = grant.repo_full_name
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False
