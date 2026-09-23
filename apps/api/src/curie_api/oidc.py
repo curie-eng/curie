@@ -30,6 +30,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import time
 import urllib.parse
@@ -40,7 +41,9 @@ from typing import Any
 import httpx
 import jwt
 
-from .config import get_settings
+from .config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 #: Per-request timeout for every IdP call. Long enough for a slow IdP, short
 #: enough that a hung one cannot pin a request worker for the default minutes.
@@ -477,6 +480,26 @@ async def validate_id_token(token: str, *, nonce: str) -> OidcClaims:
         display_name=name if isinstance(name, str) and name else None,
         raw=claims,
     )
+
+
+def log_admission_policy(settings: Settings) -> None:
+    """Warn once, at startup, when an enabled OIDC login admits by omission.
+
+    Prod refuses this shape at boot (see ``Settings._validate_oidc``); dev
+    allows it for local IdPs, but it is the configuration that silently admits
+    every account the IdP will sign in, so it is said out loud.
+    """
+
+    if (
+        settings.oidc_enabled
+        and not settings.oidc_required_claims
+        and not settings.oidc_admit_all_authenticated
+    ):
+        logger.warning(
+            "oidc login admits every account the IdP authenticates: set "
+            "CURIE_OIDC_REQUIRED_CLAIMS, or CURIE_OIDC_ADMIT_ALL_AUTHENTICATED=true "
+            "to make that explicit (required under ENVIRONMENT=prod)"
+        )
 
 
 def meets_required_claims(claims: OidcClaims, required: Mapping[str, str]) -> bool:

@@ -123,6 +123,14 @@ class Settings(BaseSettings):
     # (e.g. "groups"); `openid` is mandatory, since without it there is no ID
     # token to validate.
     oidc_scopes: str = Field(default="openid email profile", validation_alias="CURIE_OIDC_SCOPES")
+    # The explicit "every account the IdP authenticates may log in" switch.
+    # Under prod an enabled OIDC login must name its admission policy: either
+    # required claims or this flag, never neither (an IdP shared with the whole
+    # company would otherwise admit the whole company by omission) and never
+    # both (the claims would read as a restriction that does not apply).
+    oidc_admit_all_authenticated: bool = Field(
+        default=False, validation_alias="CURIE_OIDC_ADMIT_ALL_AUTHENTICATED"
+    )
 
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
     # brand the app. Overridable via ORG_NAME for a white-labeled deployment.
@@ -694,7 +702,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_oidc(self) -> "Settings":
-        """Refuse a partial OIDC configuration, and plaintext IdP URLs in prod.
+        """Refuse a partial OIDC configuration, and plaintext IdP URLs or a
+        missing admission policy in prod.
 
         Every one of the four is load-bearing on the first login: without the
         audience no token can be accepted, without the JWKS URL no signature can
@@ -729,6 +738,17 @@ class Settings(BaseSettings):
             if plaintext:
                 raise ValueError(
                     f"ENVIRONMENT=prod requires https URLs for: {', '.join(plaintext)}"
+                )
+            if not self.oidc_required_claims and not self.oidc_admit_all_authenticated:
+                raise ValueError(
+                    "ENVIRONMENT=prod with OIDC login needs an admission policy: set "
+                    "CURIE_OIDC_REQUIRED_CLAIMS, or CURIE_OIDC_ADMIT_ALL_AUTHENTICATED=true "
+                    "to admit every account the IdP authenticates"
+                )
+            if self.oidc_required_claims and self.oidc_admit_all_authenticated:
+                raise ValueError(
+                    "CURIE_OIDC_REQUIRED_CLAIMS and CURIE_OIDC_ADMIT_ALL_AUTHENTICATED=true "
+                    "contradict each other; set one of them"
                 )
         return self
 
