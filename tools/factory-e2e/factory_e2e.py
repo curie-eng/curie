@@ -25,9 +25,21 @@ opens the operator's ticket as the one labelled issue, waits for the run to
 end, and judges the ending: exactly one pull request or one terminus comment,
 an accepted terminus cause, no `.github/` file or credential in the diff,
 the default branch untouched, and
-the run inside its bound. The other scenarios (revision, cancel-waiting,
-cancel-running, evaluation) have no driver yet and refuse before anything is
-installed.
+the run inside its bound.
+
+`revision --issue-file <file> [--revision-file <file>]` waits for that run to
+open a pull request, posts an ordinary PR comment (it must be ignored), then
+a mention comment, and judges that the mention adds a second request to the
+same WorkItem that pushes a new commit to the same pull request and gets one
+linked App reply. `cancel-waiting` installs with a sandbox pod quota of 0 so
+the request waits on capacity, removes the label, and judges a direct
+`cancelled` with cause `issue_cancelled`. `cancel-running [--issue-file]`
+removes the label once the request runs and judges `cancellation_requested`
+then `cancelled`, and after a quiet window no pull request, branch or
+publication. Revision and cancel-running need CURIE_FACTORY_MODEL_API_KEY.
+Each of the three also checks `curie cluster work-items <id> --json` against
+the api at each state, and that an unknown id exits 1. `evaluation` has no
+driver yet and refuses before anything is installed.
 
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
@@ -184,8 +196,7 @@ def resolve_scenario(name: str) -> ScenarioDriver:
     driver = SCENARIOS.get(name)
     if driver is None:
         raise ScenarioUnavailable(
-            f"scenario {name!r} has no driver yet; only `preflight` and "
-            "`run --scenario issue-to-pr` run today. "
+            f"scenario {name!r} has no driver yet. "
             "Add the driver to SCENARIOS in tools/factory-e2e/factory_e2e.py."
         )
     return driver
@@ -420,19 +431,51 @@ def request_id_for(repository_id: int, issue_number: int) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, identity)
 
 
+def revision_request_id(repository_id: int, comment_id: int) -> uuid.UUID:
+    """The execution request id the api derives for a PR mention revision.
+
+    Mirrors UnverifiedFeedback.event_id in github_review_events.py and the
+    request id _admit derives from it in github_factory_review.py.
+    """
+
+    inner = uuid.uuid5(uuid.NAMESPACE_URL, f"{repository_id}:issue_comment:{comment_id}")
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"github-feedback-{inner}")
+
+
 def match_delivery(
-    deliveries: list[dict[str, Any]], *, issue_number: int, repo: str
+    deliveries: list[dict[str, Any]],
+    *,
+    issue_number: int,
+    repo: str,
+    action: str = "labeled",
 ) -> dict[str, Any] | None:
-    """The newest `issues.labeled` delivery for this issue, from detailed deliveries."""
+    """The newest `issues.<action>` delivery for this issue, from detailed deliveries."""
 
     found = None
     for delivery in deliveries:
-        if delivery.get("event") != "issues" or delivery.get("action") != "labeled":
+        if delivery.get("event") != "issues" or delivery.get("action") != action:
             continue
         payload = (delivery.get("request") or {}).get("payload") or {}
         issue = payload.get("issue") or {}
         repository = payload.get("repository") or {}
         if issue.get("number") == issue_number and repository.get("full_name") == repo:
+            found = delivery
+    return found
+
+
+def match_comment_delivery(
+    deliveries: list[dict[str, Any]], *, comment_id: int, repo: str
+) -> dict[str, Any] | None:
+    """The newest `issue_comment.created` delivery for this comment. Pure."""
+
+    found = None
+    for delivery in deliveries:
+        if delivery.get("event") != "issue_comment" or delivery.get("action") != "created":
+            continue
+        payload = (delivery.get("request") or {}).get("payload") or {}
+        comment = payload.get("comment") or {}
+        repository = payload.get("repository") or {}
+        if comment.get("id") == comment_id and repository.get("full_name") == repo:
             found = delivery
     return found
 
@@ -456,8 +499,14 @@ def install_values(
     app_key_secret: str,
     consumer_controller: bool,
     egress_cidrs: Sequence[str] = (),
+    sandbox_pod_quota: int | None = None,
 ) -> dict[str, Any]:
-    """Helm values for the disposable install. Written to a 0600 file, never argv."""
+    """Helm values for the disposable install. Written to a 0600 file, never argv.
+
+    ``sandbox_pod_quota`` caps the namespace's sandbox pods; 0 makes every
+    sandbox claim a quota refusal, so the worker defers the request for
+    capacity and it stays waiting (the cancel-waiting scenario).
+    """
 
     tag = f"sha-{candidate}"
     values: dict[str, Any] = {component: {"image": {"tag": tag}} for component in CHART_COMPONENTS}
@@ -494,6 +543,8 @@ def install_values(
         # must not exceed the delivery budget.
         values["worker"]["deliveryBudgetSeconds"] = EXECUTION_BOUND_SECONDS
         values["worker"]["runnerTotalTimeoutSeconds"] = EXECUTION_BOUND_SECONDS
+    if sandbox_pod_quota is not None:
+        values["resourceQuota"] = {"hard": {"sandboxPodCount": str(sandbox_pod_quota)}}
     if config.priority_classes is not None:
         platform, sandbox = config.priority_classes
         values["priorityClasses"] = {
@@ -593,6 +644,193 @@ def judge_outcome(
             f"the run took {float(elapsed):.1f}s, over the {ELAPSED_LIMIT_SECONDS}s bound"
         )
     return failures
+
+
+def parse_work_item_cli(exit_code: int, stdout: str) -> dict[str, Any]:
+    """One `curie cluster work-items <id> --json` call as evidence keeps it.
+
+    Pure. Only the exit code, the item state and the request statuses in
+    sequence order are kept; stdout that is not the JSON object reads as no
+    state and no statuses.
+    """
+
+    state: str | None = None
+    statuses: list[str] = []
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        parsed = None
+    item = parsed.get("item") if isinstance(parsed, dict) else None
+    if isinstance(item, dict):
+        raw_state = item.get("state")
+        state = raw_state if isinstance(raw_state, str) else None
+        requests = [r for r in item.get("requests") or [] if isinstance(r, dict)]
+        requests.sort(key=lambda r: int(r.get("sequence") or 0))
+        statuses = [str(r.get("status")) for r in requests]
+    return {"exit_code": exit_code, "state": state, "request_statuses": statuses}
+
+
+def judge_cli_state(
+    observation: Mapping[str, Any], *, expected_state: str, expected_statuses: Sequence[str]
+) -> list[str]:
+    """Every way one CLI read disagrees with the expected work item. Pure."""
+
+    failures: list[str] = []
+    if observation.get("exit_code") != 0:
+        failures.append(f"work-items exited {observation.get('exit_code')}, expected 0")
+    if observation.get("state") != expected_state:
+        failures.append(
+            f"work-items state {observation.get('state')!r}, expected {expected_state!r}"
+        )
+    if list(observation.get("request_statuses") or []) != list(expected_statuses):
+        failures.append(
+            f"work-items request statuses {observation.get('request_statuses')}, "
+            f"expected {list(expected_statuses)}"
+        )
+    return failures
+
+
+def judge_revision(obs: Mapping[str, Any]) -> list[str]:
+    """Every way a PR mention revision falls short. Empty means it passed. Pure."""
+
+    failures: list[str] = []
+    if obs.get("ordinary_delivery_api_status") != "factory_ignored":
+        failures.append(
+            "the ordinary PR comment was not ignored: api status "
+            f"{obs.get('ordinary_delivery_api_status')!r}"
+        )
+    if obs.get("ordinary_new_requests") != 0:
+        failures.append(
+            f"the ordinary PR comment created {obs.get('ordinary_new_requests')} request(s)"
+        )
+    if obs.get("mention_delivery_status_code") != 200:
+        failures.append(f"the mention delivery got HTTP {obs.get('mention_delivery_status_code')}")
+    if obs.get("mention_delivery_api_status") != "factory_admitted":
+        failures.append(
+            f"the mention was not admitted: api status {obs.get('mention_delivery_api_status')!r}"
+        )
+    if not obs.get("work_item_id") or obs.get("revision_request_work_item_id") != obs.get(
+        "work_item_id"
+    ):
+        failures.append("the revision request does not belong to the original WorkItem")
+    statuses = list(obs.get("request_statuses") or [])
+    if len(statuses) != 2:
+        failures.append(f"the WorkItem has {len(statuses)} request(s), expected 2")
+    elif statuses[-1] != "completed":
+        failures.append(f"the revision request ended {statuses[-1]!r}, expected 'completed'")
+    numbers = list(obs.get("pull_request_numbers") or [])
+    if len(numbers) != 1:
+        failures.append(f"{len(numbers)} pull requests were opened, expected exactly one")
+    before, after = obs.get("pr_number_before"), obs.get("pr_number_after")
+    if before is None or before != after or (numbers and numbers != [before]):
+        failures.append(f"the pull request changed: #{before} before, #{after} after")
+    if not obs.get("head_sha_after") or obs.get("head_sha_after") == obs.get("head_sha_before"):
+        failures.append("the pull request head did not move")
+    if int(obs.get("commits_after") or 0) <= int(obs.get("commits_before") or 0):
+        failures.append("the pull request gained no commit")
+    replies = list(obs.get("revision_replies") or [])
+    if len(replies) != 1:
+        failures.append(f"{len(replies)} App replies carry the revision marker, expected one")
+    elif not obs.get("mention_comment_url") or not re.search(
+        rf"(?m)^In response to {re.escape(str(obs['mention_comment_url']))}\s*$",
+        str(replies[0].get("body") or ""),
+    ):
+        failures.append("the revision reply does not link the mention comment")
+    if obs.get("app_comments_after_ordinary") != 1:
+        failures.append(
+            f"{obs.get('app_comments_after_ordinary')} App comments followed the ordinary "
+            "comment, expected only the revision reply"
+        )
+    if obs.get("default_branch_moved"):
+        failures.append("the default branch moved during the run")
+    failures.extend(f"cli: {f}" for f in obs.get("cli_failures") or [])
+    return failures
+
+
+def judge_cancel_waiting(obs: Mapping[str, Any]) -> list[str]:
+    """Every way cancelling a waiting request falls short. Pure."""
+
+    failures: list[str] = []
+    if obs.get("before_status") != "waiting":
+        failures.append(f"before the cancel the request was {obs.get('before_status')!r}")
+    if obs.get("before_started_at") is not None:
+        failures.append("the request had started before the cancel")
+    if int(obs.get("before_capacity_deferrals") or 0) < 1:
+        failures.append("the request recorded no capacity deferral before the cancel")
+    if obs.get("unlabel_delivery_status_code") != 200:
+        failures.append(f"the unlabel delivery got HTTP {obs.get('unlabel_delivery_status_code')}")
+    if obs.get("unlabel_delivery_api_status") != "factory_cancelled":
+        failures.append(
+            f"the unlabel api status was {obs.get('unlabel_delivery_api_status')!r}, "
+            "expected 'factory_cancelled'"
+        )
+    if obs.get("after_status") != "cancelled":
+        failures.append(f"after the cancel the request was {obs.get('after_status')!r}")
+    if obs.get("after_terminal_cause") != "issue_cancelled":
+        failures.append(f"the terminal cause was {obs.get('after_terminal_cause')!r}")
+    seen = set(obs.get("statuses_seen_after") or [])
+    for status in ("running", "cancellation_requested"):
+        if status in seen:
+            failures.append(f"a waiting cancel passed through {status!r}")
+    if obs.get("pull_request_numbers"):
+        failures.append(f"pull requests were opened: {obs.get('pull_request_numbers')}")
+    failures.extend(f"cli: {f}" for f in obs.get("cli_failures") or [])
+    return failures
+
+
+def judge_cancel_running(obs: Mapping[str, Any]) -> list[str]:
+    """Every way cancelling a running request falls short. Pure.
+
+    The cancellation_requested state must be read back, through the api
+    and the work-items CLI; a delivery status alone leaves it unverified.
+    """
+
+    failures: list[str] = []
+    if obs.get("before_status") != "running":
+        failures.append(f"before the cancel the request was {obs.get('before_status')!r}")
+    if not obs.get("before_started_at"):
+        failures.append("the request had not started before the cancel")
+    if obs.get("unlabel_delivery_status_code") != 200:
+        failures.append(f"the unlabel delivery got HTTP {obs.get('unlabel_delivery_status_code')}")
+    if obs.get("unlabel_delivery_api_status") != "factory_cancellation_requested":
+        failures.append(
+            f"the unlabel api status was {obs.get('unlabel_delivery_api_status')!r}, "
+            "expected 'factory_cancellation_requested'"
+        )
+    seen = list(obs.get("statuses_seen_after") or [])
+    if not seen or seen[-1] != "cancelled":
+        failures.append(f"the observed statuses {seen} do not end in 'cancelled'")
+    elif "cancellation_requested" not in seen:
+        failures.append("cancellation_requested was never read back before cancelled; unverified")
+    elif seen.index("cancellation_requested") > seen.index("cancelled"):
+        failures.append(f"cancellation_requested was observed after cancelled: {seen}")
+    if not obs.get("cli_cancellation_requested_checked"):
+        failures.append("the work-items CLI was not read during cancellation_requested")
+    if obs.get("final_status") != "cancelled":
+        failures.append(f"the request ended {obs.get('final_status')!r}")
+    if obs.get("final_terminal_cause") != "issue_cancelled":
+        failures.append(f"the terminal cause was {obs.get('final_terminal_cause')!r}")
+    if obs.get("pull_request_numbers"):
+        failures.append(f"pull requests were opened: {obs.get('pull_request_numbers')}")
+    if obs.get("work_item_pr") is not None:
+        failures.append("the WorkItem records a pull request")
+    if obs.get("publication_status") == "published":
+        failures.append("the cancelled run published")
+    if obs.get("new_branches"):
+        failures.append(f"new branches were pushed: {obs.get('new_branches')}")
+    if obs.get("default_branch_moved"):
+        failures.append("the default branch moved during the run")
+    causes = list(obs.get("terminus_causes") or [])
+    if len(causes) > 1:
+        failures.append(f"{len(causes)} terminus comments were posted, at most one is allowed")
+    if any(cause != "issue_cancelled" for cause in causes):
+        failures.append(f"a terminus comment carries cause other than issue_cancelled: {causes}")
+    failures.extend(f"cli: {f}" for f in obs.get("cli_failures") or [])
+    return failures
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
 
 
 def _parse_time(value: Any) -> dt.datetime | None:
@@ -835,10 +1073,14 @@ class Preflight:
         expect: str = "any",
         expect_causes: Sequence[str] = (),
         expect_reasons: Sequence[str] = (),
+        scenario_name: str | None = None,
+        revision_text: str | None = None,
     ) -> None:
         if expect not in EXPECTATIONS:
             raise ConfigError(f"--expect must be one of {EXPECTATIONS}")
         self.issue_spec = issue_spec
+        self.scenario_name = scenario_name
+        self.revision_text = revision_text
         self.expect = expect
         self.expect_causes = frozenset(expect_causes)
         self.expect_reasons = tuple(expect_reasons)
@@ -878,6 +1120,7 @@ class Preflight:
         self.scenario_started: dt.datetime | None = None
         self.head_before = ""
         self.usage_before: float | None = None
+        self._kubeconfig: Path | None = None
 
     # --- small wrappers -------------------------------------------------
 
@@ -1126,12 +1369,16 @@ class Preflight:
         )
         self.chart_dir = chart
         egress_cidrs = self.egress_cidrs()
+        # cancel-waiting holds the request in `waiting` by refusing every
+        # sandbox claim through the namespace quota.
+        quota = 0 if self.scenario_name == "cancel-waiting" else None
         values = install_values(
             self.config,
             candidate=self.candidate,
             app_key_secret=APP_KEY_REF,
             consumer_controller=consumer,
             egress_cidrs=egress_cidrs,
+            sandbox_pod_quota=quota,
         )
         values_file = self.workdir / "values.json"
         fd = os.open(values_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1168,6 +1415,7 @@ class Preflight:
             factory_ingress=True,
             model=self.config.model if self.config.model_api_key else "fake",
             sandbox_egress_cidrs=len(egress_cidrs),
+            sandbox_pod_quota=quota,
         )
 
     def egress_cidrs(self) -> list[str]:
@@ -1554,7 +1802,18 @@ class Preflight:
         self.step("labelled issue opened", issue_number=number)
         return number
 
-    def await_delivery(self, issue_number: int, since: float) -> dict[str, Any]:
+    def await_delivery(
+        self,
+        since: float,
+        *,
+        event: str,
+        action: str,
+        match: Callable[[list[dict[str, Any]]], dict[str, Any] | None],
+        what: str,
+    ) -> dict[str, Any]:
+        """The first detailed App delivery ``match`` picks, among deliveries of
+        ``event``.``action`` since ``since``."""
+
         seen: set[str] = set()
         details: list[dict[str, Any]] = []
 
@@ -1567,21 +1826,27 @@ class Preflight:
                 key = str(item["id"])
                 if key in seen or delivered.timestamp() < since - 30:
                     continue
-                if item.get("event") != "issues" or item.get("action") != "labeled":
+                if item.get("event") != event or item.get("action") != action:
                     continue
                 status, detail = self.as_app("GET", f"/app/hook/deliveries/{key}")
                 if status == 200 and isinstance(detail, dict):
                     seen.add(key)
                     details.append(detail)
-            return match_delivery(details, issue_number=issue_number, repo=self.config.repo)
+            return match(details)
 
-        found: dict[str, Any] = _wait(
-            "the labelled-issue delivery", self.admission_timeout, probe, 5
-        )
+        found: dict[str, Any] = _wait(what, self.admission_timeout, probe, 5)
         return found
 
     def assert_admission(self, issue_number: int, since: float) -> None:
-        delivery = self.await_delivery(issue_number, since)
+        delivery = self.await_delivery(
+            since,
+            event="issues",
+            action="labeled",
+            match=lambda details: match_delivery(
+                details, issue_number=issue_number, repo=self.config.repo
+            ),
+            what="the labelled-issue delivery",
+        )
         api_status = delivery_api_status(delivery)
         self.evidence["delivery_id"] = delivery.get("guid")
         self.evidence["delivery_status_code"] = delivery.get("status_code")
@@ -1664,6 +1929,120 @@ class Preflight:
         self.head_before = self.default_branch_head()
         self.usage_before = self.model_usage()
         self.step("scenario baseline recorded", default_branch_head=self.head_before)
+
+    # --- scenario support -----------------------------------------------
+
+    def work_item_detail(self, work_item_id: str) -> dict[str, Any] | None:
+        status, body = self.api(
+            "GET", f"/work-items/{work_item_id}", headers={"X-API-Key": self.api_key}
+        )
+        return body if status == 200 and isinstance(body, dict) else None
+
+    def execution_request(self, request_id: str) -> dict[str, Any] | None:
+        status, body = self.api(
+            "GET",
+            f"/v1/internal/work-items/requests/{request_id}",
+            headers={"X-Curie-Worker-Token": self.worker_token},
+        )
+        return body if status == 200 and isinstance(body, dict) else None
+
+    def cli_work_items(self, work_item_id: str) -> dict[str, Any]:
+        """`curie cluster work-items <id> --json`: secrets only in the environment."""
+
+        if self._kubeconfig is None:
+            self._kubeconfig = self._write_kubeconfig()
+        argv = [
+            self.config.curie_bin,
+            "cluster",
+            "--context",
+            self.config.kube_context,
+            "work-items",
+            work_item_id,
+            "--json",
+            "--namespace",
+            self.namespace,
+            "--release",
+            RELEASE,
+            "--api-url",
+            self.api_url,
+        ]
+        env = {
+            **os.environ,
+            "CURIE_API_KEY": self.api_key,
+            "KUBECONFIG": str(self._kubeconfig),
+            "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
+        }
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)
+        return parse_work_item_cli(result.returncode, result.stdout)
+
+    def cli_check(
+        self,
+        obs: dict[str, Any],
+        work_item_id: str,
+        *,
+        expected_state: str,
+        expected_statuses: Sequence[str],
+        label: str,
+    ) -> None:
+        """One CLI read judged against the expected state, kept in ``obs``."""
+
+        observed = self.cli_work_items(work_item_id)
+        failures = judge_cli_state(
+            observed, expected_state=expected_state, expected_statuses=expected_statuses
+        )
+        obs.setdefault("cli", []).append(
+            {
+                "check": label,
+                "at": _now_iso(),
+                **observed,
+                "expected_state": expected_state,
+                "expected_statuses": list(expected_statuses),
+                "failures": failures,
+            }
+        )
+        obs.setdefault("cli_failures", []).extend(f"{label}: {f}" for f in failures)
+        log(f"cli work-items {label}: exit {observed['exit_code']} state {observed['state']}")
+
+    def cli_not_found_check(self, obs: dict[str, Any]) -> None:
+        """An unknown work item must exit 1."""
+
+        observed = self.cli_work_items(str(uuid.uuid4()))
+        failures = (
+            []
+            if observed["exit_code"] == 1
+            else [f"unknown id exited {observed['exit_code']}, expected 1"]
+        )
+        obs.setdefault("cli", []).append(
+            {"check": "unknown id", "at": _now_iso(), **observed, "failures": failures}
+        )
+        obs.setdefault("cli_failures", []).extend(f"unknown id: {f}" for f in failures)
+
+    def remove_label(self) -> None:
+        label = urllib.parse.quote(self.config.label, safe="")
+        status, _ = self.as_actor(
+            "DELETE", f"/repos/{self.config.repo}/issues/{self.issue_number}/labels/{label}"
+        )
+        if status != 200:
+            raise PreflightFailed(f"removing the factory label failed (HTTP {status})")
+
+    def post_pr_comment(self, pr_number: int, body: str) -> dict[str, Any]:
+        status, created = self.as_actor(
+            "POST", f"/repos/{self.config.repo}/issues/{pr_number}/comments", {"body": body}
+        )
+        if status != 201 or not isinstance(created, dict):
+            raise PreflightFailed(f"posting a comment on #{pr_number} failed (HTTP {status})")
+        return created
+
+    def pr_head(self, pr_number: int) -> tuple[str | None, int | None]:
+        status, body = self.as_actor("GET", f"/repos/{self.config.repo}/pulls/{pr_number}")
+        if status != 200 or not isinstance(body, dict):
+            raise PreflightFailed(f"reading pull request #{pr_number} failed (HTTP {status})")
+        commits = body.get("commits")
+        return (body.get("head") or {}).get("sha"), commits if isinstance(commits, int) else None
+
+    def new_branches(self) -> list[str]:
+        branches = self._paged(f"/repos/{self.config.repo}/branches")
+        return [str(b["name"]) for b in branches if b["name"] != self.default_branch]
 
     def write_evidence(self) -> None:
         self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1867,36 +2246,68 @@ def usage_record(
     return {"source": "unverified", "usd": None, "caveat": caveat}
 
 
-def issue_to_pr(p: Preflight) -> dict[str, Any]:
-    """Wait for the labelled ticket's run to end, then judge its ending."""
+def _await_ending(
+    p: Preflight,
+    work_item_id: str,
+    *,
+    since: float,
+    ended: Callable[[dict[str, Any]], bool],
+    what: str,
+    min_requests: int = 1,
+) -> tuple[dict[str, Any], bool]:
+    """Poll the work item until no request is active and ``ended`` holds.
 
-    work_item_id = p.evidence["work_item_id"]
+    Returns the last detail read and whether the ending was observed. The
+    wait is bounded by the newest request's execution deadline plus the
+    publication allowance, or NEVER_STARTED_CAP_SECONDS from ``since`` when
+    that request never starts.
+    """
+
     detail: dict[str, Any] = {}
-    comments: list[dict[str, Any]] = []
-    terminal = False
     while True:
-        status, body = p.api("GET", f"/work-items/{work_item_id}", headers={"X-API-Key": p.api_key})
-        if status == 200 and isinstance(body, dict):
+        body = p.work_item_detail(work_item_id)
+        if body is not None:
             detail = body
         requests = [r for r in detail.get("requests") or [] if isinstance(r, dict)]
-        active = not requests or any(r.get("status") in ACTIVE_REQUEST_STATUSES for r in requests)
-        if not active:
-            comments = _terminus_comments(p)
-            if detail.get("pr") or comments:
-                terminal = True
-                break
+        active = len(requests) < min_requests or any(
+            r.get("status") in ACTIVE_REQUEST_STATUSES for r in requests
+        )
+        if not active and ended(detail):
+            return detail, True
         latest = _latest_request(detail)
         started = _parse_time((latest or {}).get("started_at"))
         if started is not None:
             give_up = started.timestamp() + EXECUTION_BOUND_SECONDS + PUBLICATION_ALLOWANCE_SECONDS
         else:
-            give_up = p.labelled_at + NEVER_STARTED_CAP_SECONDS
+            give_up = since + NEVER_STARTED_CAP_SECONDS
         if time.time() > give_up:
-            log("issue-to-pr: the run did not end within the wait; judging what exists")
-            comments = _terminus_comments(p)
-            break
+            log(f"{what}: the run did not end within the wait; judging what exists")
+            return detail, False
         time.sleep(POLL_SECONDS)
 
+
+def _await_first_ending(
+    p: Preflight, work_item_id: str, what: str
+) -> tuple[dict[str, Any], bool, list[dict[str, Any]]]:
+    """The labelled run's ending: a pull request or a terminus comment."""
+
+    comments: list[dict[str, Any]] = []
+
+    def ended(detail: dict[str, Any]) -> bool:
+        comments[:] = _terminus_comments(p)
+        return bool(detail.get("pr") or comments)
+
+    detail, terminal = _await_ending(p, work_item_id, since=p.labelled_at, ended=ended, what=what)
+    if not terminal:
+        comments[:] = _terminus_comments(p)
+    return detail, terminal, comments
+
+
+def issue_to_pr(p: Preflight) -> dict[str, Any]:
+    """Wait for the labelled ticket's run to end, then judge its ending."""
+
+    work_item_id = p.evidence["work_item_id"]
+    detail, terminal, comments = _await_first_ending(p, work_item_id, "issue-to-pr")
     prs = _scenario_pull_requests(p)
     latest = _latest_request(detail) or {}
     if prs:
@@ -1968,6 +2379,419 @@ SCENARIOS["issue-to-pr"] = issue_to_pr
 
 
 # --------------------------------------------------------------------------
+# Scenarios: revision, cancel-waiting, cancel-running
+# --------------------------------------------------------------------------
+
+REVISION_QUIET_SECONDS = 60
+CANCEL_QUIET_SECONDS = 180
+CANCEL_SETTLE_SECONDS = 600
+WAITING_HOLD_SECONDS = 300
+DEFAULT_REVISION_TEXT = (
+    "Please make one small follow-up change on this pull request: add a docstring to "
+    "each function this pull request adds or changes, and add one unit test that "
+    "covers the changed behavior. Push it to this same pull request branch."
+)
+DEFAULT_CANCEL_RUNNING_ISSUE = (
+    "Add a temperature conversion family to unitconv",
+    "The Python unitconv project in this repository converts between units. Add a new "
+    "temperature conversion family covering Celsius, Fahrenheit, Kelvin and Rankine, "
+    "following the structure of the existing families:\n\n"
+    "1. A conversion function for every ordered pair of the four scales.\n"
+    "2. Input validation that rejects any temperature below absolute zero with a clear "
+    "error.\n"
+    "3. Registration of the new family wherever the existing families are registered, "
+    "including any command line entry point.\n"
+    "4. Unit tests for every pair, for round trips, and for the validation.\n"
+    "5. README documentation with examples.\n\n"
+    "Run the full test suite and fix every failure before opening the pull request.",
+)
+
+
+def revision_comment_text(text: str | None, mention: str) -> str:
+    """The mention comment body: the operator text, addressed to the factory. Pure."""
+
+    body = (text or DEFAULT_REVISION_TEXT).strip()
+    return body if f"@{mention}" in body else f"@{mention} {body}"
+
+
+def _timeline(obs: dict[str, Any], event: str, **facts: Any) -> None:
+    obs.setdefault("timeline", []).append({"at": _now_iso(), "event": event, **facts})
+
+
+def _ordered_statuses(detail: Mapping[str, Any]) -> list[str]:
+    requests = [r for r in detail.get("requests") or [] if isinstance(r, dict)]
+    requests.sort(key=lambda r: int(r.get("sequence") or 0))
+    return [str(r.get("status")) for r in requests]
+
+
+def _scenario_pr_numbers(p: Preflight) -> list[int]:
+    status, listing = p.as_actor(
+        "GET", f"/repos/{p.config.repo}/pulls?state=all&sort=created&direction=desc&per_page=100"
+    )
+    if status != 200 or not isinstance(listing, list):
+        raise PreflightFailed(f"listing fixture pull requests failed (HTTP {status})")
+    started = p.scenario_started
+    numbers = []
+    for item in listing:
+        created = _parse_time(item.get("created_at"))
+        if started is not None and (created is None or created < started):
+            continue
+        numbers.append(int(item["number"]))
+    return sorted(numbers)
+
+
+def _await_comment_delivery(p: Preflight, comment_id: int, since: float) -> dict[str, Any]:
+    return p.await_delivery(
+        since,
+        event="issue_comment",
+        action="created",
+        match=lambda details: match_comment_delivery(
+            details, comment_id=comment_id, repo=p.config.repo
+        ),
+        what=f"the delivery of comment {comment_id}",
+    )
+
+
+def _unlabel(p: Preflight, obs: dict[str, Any]) -> dict[str, Any]:
+    since = time.time()
+    p.remove_label()
+    _timeline(obs, "label removed", issue_number=p.issue_number)
+    log("factory label removed; awaiting the unlabeled delivery")
+    delivery = p.await_delivery(
+        since,
+        event="issues",
+        action="unlabeled",
+        match=lambda details: match_delivery(
+            details, issue_number=p.issue_number, repo=p.config.repo, action="unlabeled"
+        ),
+        what="the unlabeled-issue delivery",
+    )
+    obs["unlabel_delivery_id"] = delivery.get("guid")
+    obs["unlabel_delivery_status_code"] = delivery.get("status_code")
+    obs["unlabel_delivery_api_status"] = delivery_api_status(delivery)
+    _timeline(
+        obs,
+        "unlabel delivered",
+        delivery_id=delivery.get("guid"),
+        api_status=obs["unlabel_delivery_api_status"],
+    )
+    return delivery
+
+
+def _finish(p: Preflight, obs: dict[str, Any], failures: list[str]) -> dict[str, Any]:
+    obs["verdict"] = "passed" if not failures else "failed"
+    obs["failures"] = failures
+    p.evidence["scenario"] = obs
+    if failures:
+        raise PreflightFailed("; ".join(failures))
+    return obs
+
+
+def _new_obs(p: Preflight) -> dict[str, Any]:
+    obs: dict[str, Any] = {
+        "work_item_id": str(p.evidence["work_item_id"]),
+        "request_id": p.evidence.get("execution_request_id"),
+        "delivery_id": p.evidence.get("delivery_id"),
+        "issue_number": p.issue_number,
+        "cli": [],
+        "cli_failures": [],
+    }
+    # Recorded before any live step so a failure still leaves every id.
+    p.evidence["scenario"] = obs
+    return obs
+
+
+def revision(p: Preflight) -> dict[str, Any]:
+    """The labelled run opens a PR; an ordinary PR comment is ignored; a
+    mention revises the same PR under the same WorkItem."""
+
+    obs = _new_obs(p)
+    work_item_id = obs["work_item_id"]
+    repo = p.config.repo
+
+    log("revision: waiting for the labelled run to open a pull request")
+    detail, terminal, comments = _await_first_ending(p, work_item_id, "revision first run")
+    pr = detail.get("pr") if isinstance(detail.get("pr"), dict) else None
+    obs["first_run_terminal"] = terminal
+    obs["first_run_state"] = detail.get("state")
+    obs["first_run_statuses"] = _ordered_statuses(detail)
+    obs["first_run_terminus_causes"] = [c.get("cause") for c in comments]
+    if not terminal or pr is None or not pr.get("number"):
+        raw_reply, _ = _agent_final_reply(p)
+        known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
+        obs["first_run_agent_final_reply"], _ = record_agent_text(raw_reply, known)
+        raise PreflightFailed(
+            "revision needs the labelled run to end in a pull request; it ended "
+            f"terminal={terminal} with pr={pr} and {len(comments)} terminus comment(s)"
+        )
+    pr_number = int(pr["number"])
+    obs["pr_number_before"] = pr_number
+    obs["pr_url"] = pr.get("url")
+    obs["head_sha_before"], obs["commits_before"] = p.pr_head(pr_number)
+    _timeline(obs, "first run ended", pr_number=pr_number, head_sha=obs["head_sha_before"])
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state=str(detail.get("state")),
+        expected_statuses=_ordered_statuses(detail),
+        label="after first run",
+    )
+    requests_before = len(detail.get("requests") or [])
+
+    # An ordinary comment on the owned PR: ignored, no request, no reply.
+    since = time.time()
+    ordinary = p.post_pr_comment(
+        pr_number, "Noting for the record: the change reads fine so far. No action needed."
+    )
+    obs["ordinary_comment_id"] = ordinary.get("id")
+    obs["ordinary_comment_created_at"] = ordinary.get("created_at")
+    _timeline(obs, "ordinary comment posted", comment_id=ordinary.get("id"))
+    delivery = _await_comment_delivery(p, int(ordinary["id"]), since)
+    obs["ordinary_delivery_id"] = delivery.get("guid")
+    obs["ordinary_delivery_status_code"] = delivery.get("status_code")
+    obs["ordinary_delivery_api_status"] = delivery_api_status(delivery)
+    _timeline(obs, "ordinary comment delivered", api_status=obs["ordinary_delivery_api_status"])
+    log(f"revision: quiet window {REVISION_QUIET_SECONDS}s after the ordinary comment")
+    time.sleep(REVISION_QUIET_SECONDS)
+    quiet = p.work_item_detail(work_item_id) or {}
+    obs["ordinary_new_requests"] = len(quiet.get("requests") or []) - requests_before
+
+    # The mention: one revision request on the same WorkItem.
+    since = time.time()
+    mention = p.post_pr_comment(pr_number, revision_comment_text(p.revision_text, p.config.mention))
+    mention_id = int(mention["id"])
+    obs["mention_comment_id"] = mention_id
+    obs["mention_comment_url"] = mention.get("html_url")
+    _timeline(obs, "mention posted", comment_id=mention_id)
+    delivery = _await_comment_delivery(p, mention_id, since)
+    obs["mention_delivery_id"] = delivery.get("guid")
+    obs["mention_delivery_status_code"] = delivery.get("status_code")
+    obs["mention_delivery_api_status"] = delivery_api_status(delivery)
+    _timeline(obs, "mention delivered", api_status=obs["mention_delivery_api_status"])
+    revision_id = str(revision_request_id(p.repository_id, mention_id))
+    obs["revision_request_id"] = revision_id
+    try:
+        request = _wait(
+            f"revision request {revision_id}", 60, lambda: p.execution_request(revision_id), 3
+        )
+    except PreflightFailed:
+        request = {}
+    obs["revision_request_work_item_id"] = request.get("work_item_id")
+    obs["revision_request_status_at_admission"] = request.get("status")
+
+    def replies_on(number: int) -> list[dict[str, Any]]:
+        return match_terminus_comments(
+            p._paged(f"/repos/{repo}/issues/{number}/comments"),
+            mention=p.config.mention,
+            app_id=p.config.app_id,
+            request_ids=[revision_id],
+        )
+
+    def revision_ended(_detail: dict[str, Any]) -> bool:
+        return bool(replies_on(pr_number) or replies_on(p.issue_number))
+
+    if request:
+        log("revision: waiting for the revision request to end")
+        detail, terminal = _await_ending(
+            p,
+            work_item_id,
+            since=since,
+            ended=revision_ended,
+            what="revision request",
+            min_requests=2,
+        )
+    else:
+        detail, terminal = p.work_item_detail(work_item_id) or {}, False
+    obs["revision_terminal"] = terminal
+    pr_after = detail.get("pr") if isinstance(detail.get("pr"), dict) else None
+    obs["pr_number_after"] = pr_after.get("number") if pr_after else None
+    obs["work_item_state_after"] = detail.get("state")
+    obs["request_statuses"] = _ordered_statuses(detail)
+    obs["publication"] = detail.get("publication")
+    obs["head_sha_after"], obs["commits_after"] = p.pr_head(pr_number)
+    obs["pull_request_numbers"] = _scenario_pr_numbers(p)
+    pr_comments = p._paged(f"/repos/{repo}/issues/{pr_number}/comments")
+    known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
+    replies = match_terminus_comments(
+        pr_comments, mention=p.config.mention, app_id=p.config.app_id, request_ids=[revision_id]
+    )
+    obs["revision_replies"] = [
+        {**r, "body": record_agent_text(r["body"], known)[0]} for r in replies
+    ]
+    ordinary_at = _parse_time(obs.get("ordinary_comment_created_at"))
+    obs["app_comments_after_ordinary"] = sum(
+        1
+        for c in pr_comments
+        if _app_authored(c, p.config.mention, p.config.app_id)
+        and ordinary_at is not None
+        and (_parse_time(c.get("created_at")) or ordinary_at) >= ordinary_at
+    )
+    obs["default_branch_moved"] = p.default_branch_head() != p.head_before
+    _timeline(obs, "revision ended", terminal=terminal, head_sha=obs["head_sha_after"])
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state=str(detail.get("state")),
+        expected_statuses=obs["request_statuses"],
+        label="after revision",
+    )
+    p.cli_not_found_check(obs)
+    return _finish(p, obs, judge_revision(obs))
+
+
+def cancel_waiting(p: Preflight) -> dict[str, Any]:
+    """With every sandbox claim refused by quota, removing the label cancels
+    the waiting request outright."""
+
+    obs = _new_obs(p)
+    work_item_id = obs["work_item_id"]
+
+    def deferred() -> dict[str, Any] | None:
+        latest = _latest_request(p.work_item_detail(work_item_id) or {})
+        if latest is None:
+            return None
+        _timeline(
+            obs,
+            "polled",
+            status=latest.get("status"),
+            capacity_deferrals=latest.get("capacity_deferrals"),
+        )
+        if latest.get("status") != "waiting":
+            return latest
+        return latest if int(latest.get("capacity_deferrals") or 0) >= 1 else None
+
+    log("cancel-waiting: waiting for a capacity deferral")
+    try:
+        before = _wait("a capacity deferral", WAITING_HOLD_SECONDS, deferred, 5)
+    except PreflightFailed:
+        before = _latest_request(p.work_item_detail(work_item_id) or {}) or {}
+    obs["before_status"] = before.get("status")
+    obs["before_started_at"] = before.get("started_at")
+    obs["before_capacity_deferrals"] = before.get("capacity_deferrals")
+    obs["before_last_deferral_reason"] = before.get("last_deferral_reason")
+    p.cli_check(
+        obs, work_item_id, expected_state="waiting", expected_statuses=["waiting"], label="waiting"
+    )
+    if obs["before_status"] != "waiting":
+        return _finish(p, obs, judge_cancel_waiting(obs))
+
+    _unlabel(p, obs)
+    seen: list[str] = []
+    after: dict[str, Any] = {}
+    for attempt in range(3):
+        latest = _latest_request(p.work_item_detail(work_item_id) or {}) or {}
+        if attempt == 0:
+            after = latest
+        status = str(latest.get("status"))
+        _timeline(obs, "polled after unlabel", status=status)
+        if not seen or seen[-1] != status:
+            seen.append(status)
+        time.sleep(2)
+    obs["after_status"] = after.get("status")
+    obs["after_terminal_cause"] = after.get("terminal_cause")
+    obs["after_terminal_at"] = after.get("terminal_at")
+    obs["statuses_seen_after"] = seen
+    obs["pull_request_numbers"] = _scenario_pr_numbers(p)
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state="cancelled",
+        expected_statuses=["cancelled"],
+        label="cancelled",
+    )
+    p.cli_not_found_check(obs)
+    return _finish(p, obs, judge_cancel_waiting(obs))
+
+
+def cancel_running(p: Preflight) -> dict[str, Any]:
+    """Removing the label from a running request stops it without a PR,
+    a branch, or a publication."""
+
+    obs = _new_obs(p)
+    work_item_id = obs["work_item_id"]
+
+    log("cancel-running: waiting for the request to start")
+    give_up = p.labelled_at + NEVER_STARTED_CAP_SECONDS
+    before: dict[str, Any] = {}
+    last = None
+    while time.time() < give_up:
+        before = _latest_request(p.work_item_detail(work_item_id) or {}) or {}
+        status = before.get("status")
+        if status != last:
+            _timeline(obs, "status", status=status)
+            last = status
+        if status == "running" or (status and status not in ACTIVE_REQUEST_STATUSES):
+            break
+        time.sleep(3)
+    obs["before_status"] = before.get("status")
+    obs["before_started_at"] = before.get("started_at")
+    if obs["before_status"] != "running":
+        return _finish(p, obs, judge_cancel_running(obs))
+    p.cli_check(
+        obs, work_item_id, expected_state="running", expected_statuses=["running"], label="running"
+    )
+
+    _unlabel(p, obs)
+    seen: list[str] = []
+    final: dict[str, Any] = {}
+    deadline = time.time() + CANCEL_SETTLE_SECONDS
+    while time.time() < deadline:
+        final = _latest_request(p.work_item_detail(work_item_id) or {}) or {}
+        status = str(final.get("status"))
+        if not seen or seen[-1] != status:
+            seen.append(status)
+            _timeline(obs, "status after unlabel", status=status)
+            if status == "cancellation_requested":
+                obs["cli_cancellation_requested_checked"] = True
+                p.cli_check(
+                    obs,
+                    work_item_id,
+                    expected_state="cancellation_requested",
+                    expected_statuses=["cancellation_requested"],
+                    label="cancellation_requested",
+                )
+        if status not in ACTIVE_REQUEST_STATUSES:
+            break
+        time.sleep(2)
+    obs["statuses_seen_after"] = seen
+    obs["final_status"] = final.get("status")
+    obs["final_terminal_cause"] = final.get("terminal_cause")
+    obs["final_terminal_at"] = final.get("terminal_at")
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state="cancelled",
+        expected_statuses=["cancelled"],
+        label="cancelled",
+    )
+    log(f"cancel-running: quiet window {CANCEL_QUIET_SECONDS}s after the cancel")
+    time.sleep(CANCEL_QUIET_SECONDS)
+    detail = p.work_item_detail(work_item_id) or {}
+    publication = detail.get("publication") if isinstance(detail.get("publication"), dict) else None
+    obs["work_item_state_after_quiet"] = detail.get("state")
+    obs["work_item_pr"] = detail.get("pr")
+    obs["publication_status"] = publication.get("status") if publication else None
+    obs["pull_request_numbers"] = _scenario_pr_numbers(p)
+    obs["new_branches"] = p.new_branches()
+    obs["default_branch_moved"] = p.default_branch_head() != p.head_before
+    obs["terminus_causes"] = [c.get("cause") for c in _terminus_comments(p)]
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state="cancelled",
+        expected_statuses=["cancelled"],
+        label="after quiet window",
+    )
+    p.cli_not_found_check(obs)
+    return _finish(p, obs, judge_cancel_running(obs))
+
+
+SCENARIOS["revision"] = revision
+SCENARIOS["cancel-waiting"] = cancel_waiting
+SCENARIOS["cancel-running"] = cancel_running
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
@@ -2003,7 +2827,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scenario.add_argument(
         "--issue-file",
         type=Path,
-        help="issue-to-pr: Markdown ticket, first line the title, the rest the body",
+        help=(
+            "issue-to-pr, revision (required) and cancel-running (optional): Markdown "
+            "ticket, first line the title, the rest the body"
+        ),
+    )
+    scenario.add_argument(
+        "--revision-file",
+        type=Path,
+        help="revision: the mention comment's text (default: a small follow-up change)",
     )
     scenario.add_argument(
         "--expect",
@@ -2049,6 +2881,7 @@ def main(argv: list[str] | None = None) -> int:
     expect = "any"
     expect_causes: list[str] = []
     expect_reasons: list[str] = []
+    revision_text: str | None = None
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
@@ -2069,7 +2902,35 @@ def main(argv: list[str] | None = None) -> int:
                         re.compile(reason)
                     except re.error as exc:
                         raise ConfigError(f"--expect-reason {reason!r}: {exc}") from exc
+            elif args.scenario == "revision":
+                if args.issue_file is None:
+                    print(
+                        "factory-e2e: revision needs --issue-file <markdown ticket>: "
+                        "a ticket whose run opens the pull request to revise",
+                        file=sys.stderr,
+                    )
+                    return EXIT_CONFIG
+                issue_spec = parse_issue_file(args.issue_file)
+                if args.revision_file is not None:
+                    try:
+                        revision_text = args.revision_file.read_text().strip() or None
+                    except OSError as exc:
+                        raise ConfigError(
+                            f"cannot read the revision file {args.revision_file}: {exc.strerror}"
+                        ) from None
+            elif args.scenario == "cancel-running":
+                issue_spec = (
+                    parse_issue_file(args.issue_file)
+                    if args.issue_file is not None
+                    else DEFAULT_CANCEL_RUNNING_ISSUE
+                )
         config = load_config(os.environ, context=args.context)
+        if args.mode == "run" and args.scenario in ("revision", "cancel-running"):
+            if not config.model_api_key:
+                raise ConfigError(
+                    f"{args.scenario} needs CURIE_FACTORY_MODEL_API_KEY: a fake model "
+                    "cannot open a pull request or keep a run going"
+                )
         repo_root = _repo_root()
         candidate = _resolve_candidate(repo_root, args.candidate)
         namespace = (
@@ -2094,6 +2955,8 @@ def main(argv: list[str] | None = None) -> int:
         expect=expect,
         expect_causes=expect_causes,
         expect_reasons=expect_reasons,
+        scenario_name=args.scenario if args.mode == "run" else None,
+        revision_text=revision_text,
     )
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"

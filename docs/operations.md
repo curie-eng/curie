@@ -961,8 +961,8 @@ Every identity is an operator input. Nothing names a specific App or account:
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
 preflight and then one scenario driver: `issue-to-pr`, `revision`,
-`cancel-waiting`, `cancel-running` or `evaluation`. A scenario that has no
-driver yet is refused before anything is installed.
+`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` has no
+driver yet and is refused before anything is installed.
 
 `run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]... [--expect-reason <regex>]...`
 opens the ticket (first line is the title, the rest the body) as the one
@@ -990,6 +990,42 @@ the agent's final reply from its transcript when the api returns exactly one,
 the configured model, and the model spend
 as the OpenRouter key's usage delta (or `unverified`). The key is shared, so
 that delta includes any concurrent use of it.
+
+`run --scenario revision --issue-file <ticket.md> [--revision-file <text.md>]`
+needs the ticket's run to open a pull request. It then posts an ordinary
+comment on that pull request, which must be delivered as `factory_ignored`
+and add no request within 60 s. Next it posts a mention comment (the revision
+file's text, or by default a request for a docstring and a test, prefixed
+with `@<mention>` when absent). It passes when that delivery is
+`factory_admitted`, the revision request belongs to the same WorkItem, the
+WorkItem ends with two requests and the second `completed`, the same single
+pull request gained a commit and a new head, exactly one App reply carries the
+revision's marker and links the mention, no other App comment followed the
+ordinary one, and the default branch is unmoved.
+
+`run --scenario cancel-waiting` installs with the sandbox pod quota set to 0,
+so every sandbox claim is refused and the request waits on capacity. Once it
+shows a capacity deferral and no start, the driver removes the label. It
+passes when the `issues.unlabeled` delivery is `factory_cancelled` and the next
+read shows the request `cancelled` with cause `issue_cancelled`, never
+`running` or `cancellation_requested`, and no pull request.
+
+`run --scenario cancel-running [--issue-file <ticket.md>]` (by default a
+multi-step ticket that keeps the run busy for minutes) removes the label as
+soon as the request is `running`. It passes when the delivery is
+`factory_cancellation_requested`, the request then reads `cancelled` with
+cause `issue_cancelled` (a missed `cancellation_requested` read is covered by
+the delivery status), and after a 180 s quiet window there is no pull
+request, no WorkItem pull request, no published publication, no new branch,
+at most one terminus comment with cause `issue_cancelled`, and the default
+branch is unmoved.
+
+`revision` and `cancel-running` need `CURIE_FACTORY_MODEL_API_KEY` and refuse
+before installing without it; `cancel-waiting` runs with either model. Each
+of the three runs `curie cluster work-items <id> --json` at every state it
+judges and requires exit 0 with the api's state and request statuses, and
+requires exit 1 for an unknown id. The evidence records every id, delivery,
+comment, pull request head, status seen with its time, and CLI read.
 
 ### Reading work item outcomes
 

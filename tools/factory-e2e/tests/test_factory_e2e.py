@@ -601,11 +601,10 @@ def test_unknown_expect_raises() -> None:
         fe.judge_outcome(_outcome(), "merged")
 
 
-def test_issue_to_pr_has_a_driver_and_the_rest_do_not() -> None:
-    assert callable(fe.SCENARIOS["issue-to-pr"])
-    for name, driver in fe.SCENARIOS.items():
-        if name != "issue-to-pr":
-            assert driver is None, name
+def test_written_scenarios_have_drivers_and_evaluation_does_not() -> None:
+    for name in ("issue-to-pr", "revision", "cancel-waiting", "cancel-running"):
+        assert callable(fe.SCENARIOS[name]), name
+    assert fe.SCENARIOS["evaluation"] is None
 
 
 def test_run_parses_issue_file_and_expect() -> None:
@@ -937,6 +936,365 @@ def test_no_pull_request_needs_the_could_not_complete_contract() -> None:
     assert fe.judge_outcome(_comment_ending(agent_final_reply="Could not complete:   "), "any")
     ok = _comment_ending(agent_final_reply="Sorry. could not complete: tests need a DB.")
     assert fe.judge_outcome(ok, "any") == []
+
+
+# --------------------------------------------------------------------------
+# #2966: revision, cancel-waiting, cancel-running
+# --------------------------------------------------------------------------
+
+
+def test_revision_request_id_matches_the_api_derivation() -> None:
+    rid, cid = 123, 999
+    inner = uuid.uuid5(uuid.NAMESPACE_URL, f"{rid}:issue_comment:{cid}")
+    expected = uuid.uuid5(uuid.NAMESPACE_URL, f"github-feedback-{inner}")
+    assert fe.revision_request_id(rid, cid) == expected
+    assert fe.revision_request_id(rid, cid) != fe.request_id_for(rid, 9)
+
+
+def test_match_delivery_action_kwarg_picks_unlabeled_and_ignores_labeled() -> None:
+    found = fe.match_delivery(
+        [
+            _delivery("a", 9, "acme/fixture", action="labeled"),
+            _delivery("b", 9, "acme/fixture", action="unlabeled"),
+            _delivery("c", 8, "acme/fixture", action="unlabeled"),
+        ],
+        issue_number=9,
+        repo="acme/fixture",
+        action="unlabeled",
+    )
+    assert found is not None and found["guid"] == "b"
+
+
+def test_match_delivery_default_action_is_still_labeled() -> None:
+    found = fe.match_delivery(
+        [_delivery("a", 9, "acme/fixture", action="unlabeled")],
+        issue_number=9,
+        repo="acme/fixture",
+    )
+    assert found is None
+
+
+def _comment_delivery(guid: str, comment_id: int, repo: str, **overrides: Any) -> dict[str, Any]:
+    delivery: dict[str, Any] = {
+        "guid": guid,
+        "event": "issue_comment",
+        "action": "created",
+        "request": {
+            "payload": {
+                "comment": {"id": comment_id},
+                "repository": {"full_name": repo},
+            }
+        },
+    }
+    delivery.update(overrides)
+    return delivery
+
+
+def test_match_comment_delivery_picks_the_matching_comment() -> None:
+    found = fe.match_comment_delivery(
+        [
+            _comment_delivery("a", 555, "acme/fixture", action="edited"),
+            _comment_delivery("b", 111, "acme/fixture"),
+            _comment_delivery("c", 555, "acme/other"),
+            _comment_delivery("d", 555, "acme/fixture"),
+        ],
+        comment_id=555,
+        repo="acme/fixture",
+    )
+    assert found is not None and found["guid"] == "d"
+
+
+def test_match_comment_delivery_newest_wins_and_none_when_absent() -> None:
+    found = fe.match_comment_delivery(
+        [
+            _comment_delivery("a", 555, "acme/fixture"),
+            _comment_delivery("b", 555, "acme/fixture"),
+        ],
+        comment_id=555,
+        repo="acme/fixture",
+    )
+    assert found is not None and found["guid"] == "b"
+    assert (
+        fe.match_comment_delivery(
+            [_comment_delivery("a", 1, "acme/fixture")], comment_id=555, repo="acme/fixture"
+        )
+        is None
+    )
+
+
+def test_install_values_sandbox_pod_quota_sets_resource_quota(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    without = fe.install_values(
+        config, candidate="c" * 40, app_key_secret="factory-app", consumer_controller=False
+    )
+    assert "resourceQuota" not in without
+    with_quota = fe.install_values(
+        config,
+        candidate="c" * 40,
+        app_key_secret="factory-app",
+        consumer_controller=False,
+        sandbox_pod_quota=0,
+    )
+    assert with_quota["resourceQuota"]["hard"]["sandboxPodCount"] == "0"
+
+
+def test_parse_work_item_cli_reads_state_and_ordered_statuses() -> None:
+    stdout = json.dumps(
+        {
+            "item": {
+                "state": "running",
+                "requests": [
+                    {"sequence": 2, "status": "completed"},
+                    {"sequence": 1, "status": "running"},
+                ],
+            }
+        }
+    )
+    parsed = fe.parse_work_item_cli(0, stdout)
+    assert parsed["exit_code"] == 0
+    assert parsed["state"] == "running"
+    assert parsed["request_statuses"] == ["running", "completed"]
+
+
+def test_parse_work_item_cli_tolerates_non_json_stdout() -> None:
+    parsed = fe.parse_work_item_cli(1, "not-found: item unknown\n")
+    assert parsed["exit_code"] == 1
+    assert parsed["state"] is None
+    assert parsed["request_statuses"] == []
+
+
+def test_judge_cli_state_passes_and_fails() -> None:
+    good = {"exit_code": 0, "state": "running", "request_statuses": ["running"]}
+    assert fe.judge_cli_state(good, expected_state="running", expected_statuses=["running"]) == []
+    bad_exit = {**good, "exit_code": 1}
+    assert fe.judge_cli_state(bad_exit, expected_state="running", expected_statuses=["running"])
+    bad_state = {**good, "state": "cancelled"}
+    assert fe.judge_cli_state(bad_state, expected_state="running", expected_statuses=["running"])
+    bad_statuses = {**good, "request_statuses": ["waiting"]}
+    assert fe.judge_cli_state(bad_statuses, expected_state="running", expected_statuses=["running"])
+
+
+def test_revision_run_and_cancel_running_refuse_without_issue_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _env(_app_dir(tmp_path))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("must refuse before any subprocess or git call")
+
+    monkeypatch.setattr(fe, "run", refuse)
+    monkeypatch.setattr(fe, "_resolve_candidate", refuse)
+    assert fe.main(["run", "--scenario", "revision"]) == fe.EXIT_CONFIG
+    assert "--issue-file" in capsys.readouterr().err
+
+
+def test_revision_and_cancel_running_refuse_without_a_model_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(_app_dir(tmp_path))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("CURIE_FACTORY_MODEL_API_KEY", raising=False)
+    monkeypatch.setattr(fe, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no run")))
+    monkeypatch.setattr(fe, "_resolve_candidate", lambda *a, **k: "c" * 40)
+
+    def refuse_run(self: Any, driver: Any) -> Any:
+        raise AssertionError("must refuse before the live preflight runs")
+
+    monkeypatch.setattr(fe.Preflight, "run", refuse_run)
+    issue_file = tmp_path / "issue.md"
+    issue_file.write_text("# Title\n\nBody line.\n")
+    assert (
+        fe.main(["run", "--scenario", "revision", "--issue-file", str(issue_file)])
+        == fe.EXIT_CONFIG
+    )
+    assert fe.main(["run", "--scenario", "cancel-running"]) == fe.EXIT_CONFIG
+
+
+def test_run_parses_revision_file_and_cancel_running_issue_file_optional() -> None:
+    args = fe.parse_args(
+        [
+            "run",
+            "--scenario",
+            "revision",
+            "--issue-file",
+            "x.md",
+            "--revision-file",
+            "r.md",
+        ]
+    )
+    assert args.issue_file == Path("x.md")
+    assert args.revision_file == Path("r.md")
+    cancel_args = fe.parse_args(["run", "--scenario", "cancel-running"])
+    assert cancel_args.issue_file is None
+
+
+def _revision_obs(**overrides: Any) -> dict[str, Any]:
+    obs: dict[str, Any] = {
+        "ordinary_delivery_api_status": "factory_ignored",
+        "ordinary_new_requests": 0,
+        "mention_delivery_status_code": 200,
+        "mention_delivery_api_status": "factory_admitted",
+        "work_item_id": "w1",
+        "revision_request_work_item_id": "w1",
+        "request_statuses": ["completed", "completed"],
+        "pull_request_numbers": [7],
+        "pr_number_before": 7,
+        "pr_number_after": 7,
+        "head_sha_before": "a" * 40,
+        "head_sha_after": "b" * 40,
+        "commits_before": 1,
+        "commits_after": 2,
+        "revision_replies": [
+            {
+                "body": "The requested revision is pushed.\nIn response to https://github.com/acme/fixture/pull/7#issuecomment-555\n"
+            }
+        ],
+        "mention_comment_id": 555,
+        "mention_comment_url": "https://github.com/acme/fixture/pull/7#issuecomment-555",
+        "app_comments_after_ordinary": 1,
+        "default_branch_moved": False,
+        "cli_failures": [],
+    }
+    obs.update(overrides)
+    return obs
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "resolves issuecomment-555",
+        "In response to https://github.com/acme/fixture/pull/7#issuecomment-5550\n",
+    ],
+)
+def test_judge_revision_requires_the_exact_mention_link(body: str) -> None:
+    assert fe.judge_revision(_revision_obs(revision_replies=[{"body": body}])) != []
+
+
+def test_judge_revision_passes_the_clean_fixture() -> None:
+    assert fe.judge_revision(_revision_obs()) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"ordinary_delivery_api_status": "factory_admitted"},
+        {"ordinary_new_requests": 1},
+        {"mention_delivery_status_code": 500},
+        {"mention_delivery_api_status": "factory_ignored"},
+        {"revision_request_work_item_id": "w2"},
+        {"request_statuses": ["completed"]},
+        {"pull_request_numbers": [7, 8]},
+        {"pr_number_after": 8},
+        {"head_sha_after": "a" * 40},
+        {"commits_after": 1},
+        {"revision_replies": []},
+        {"revision_replies": [{"body": "no reference here"}]},
+        {"app_comments_after_ordinary": 2},
+        {"default_branch_moved": True},
+        {"cli_failures": ["work-items exit 1"]},
+    ],
+)
+def test_judge_revision_fails_one_rule_at_a_time(overrides: dict[str, Any]) -> None:
+    assert fe.judge_revision(_revision_obs(**overrides)) != []
+
+
+def _cancel_waiting_obs(**overrides: Any) -> dict[str, Any]:
+    obs: dict[str, Any] = {
+        "before_status": "waiting",
+        "before_started_at": None,
+        "before_capacity_deferrals": 2,
+        "unlabel_delivery_status_code": 200,
+        "unlabel_delivery_api_status": "factory_cancelled",
+        "after_status": "cancelled",
+        "after_terminal_cause": "issue_cancelled",
+        "statuses_seen_after": ["cancelled"],
+        "pull_request_numbers": [],
+        "cli_failures": [],
+    }
+    obs.update(overrides)
+    return obs
+
+
+def test_judge_cancel_waiting_passes_the_clean_fixture() -> None:
+    assert fe.judge_cancel_waiting(_cancel_waiting_obs()) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"before_status": "running"},
+        {"before_started_at": "2026-09-23T10:00:00Z"},
+        {"before_capacity_deferrals": 0},
+        {"unlabel_delivery_status_code": 500},
+        {"unlabel_delivery_api_status": "factory_ignored"},
+        {"after_status": "waiting"},
+        {"after_terminal_cause": "capacity_wait_expired"},
+        {"statuses_seen_after": ["running", "cancelled"]},
+        {"statuses_seen_after": ["cancellation_requested", "cancelled"]},
+        {"pull_request_numbers": [1]},
+        {"cli_failures": ["work-items exit 1"]},
+    ],
+)
+def test_judge_cancel_waiting_fails_one_rule_at_a_time(overrides: dict[str, Any]) -> None:
+    assert fe.judge_cancel_waiting(_cancel_waiting_obs(**overrides)) != []
+
+
+def _cancel_running_obs(**overrides: Any) -> dict[str, Any]:
+    obs: dict[str, Any] = {
+        "before_status": "running",
+        "before_started_at": "2026-09-23T10:00:00Z",
+        "unlabel_delivery_status_code": 200,
+        "unlabel_delivery_api_status": "factory_cancellation_requested",
+        "statuses_seen_after": ["cancellation_requested", "cancelled"],
+        "final_status": "cancelled",
+        "final_terminal_cause": "issue_cancelled",
+        "pull_request_numbers": [],
+        "work_item_pr": None,
+        "publication_status": None,
+        "new_branches": [],
+        "default_branch_moved": False,
+        "terminus_causes": ["issue_cancelled"],
+        "cli_failures": [],
+        "cli_cancellation_requested_checked": True,
+    }
+    obs.update(overrides)
+    return obs
+
+
+def test_judge_cancel_running_passes_the_clean_fixture() -> None:
+    assert fe.judge_cancel_running(_cancel_running_obs()) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"before_status": "waiting"},
+        {"before_started_at": None},
+        {"unlabel_delivery_api_status": "factory_cancelled"},
+        {"final_status": "waiting"},
+        {"final_terminal_cause": "capacity_wait_expired"},
+        {"pull_request_numbers": [9]},
+        {"work_item_pr": 9},
+        {"publication_status": "published"},
+        {"new_branches": ["revision/1"]},
+        {"default_branch_moved": True},
+        {"terminus_causes": ["issue_cancelled", "issue_cancelled"]},
+        {"cli_failures": ["work-items exit 1"]},
+        {"cli_cancellation_requested_checked": False},
+    ],
+)
+def test_judge_cancel_running_fails_one_rule_at_a_time(overrides: dict[str, Any]) -> None:
+    assert fe.judge_cancel_running(_cancel_running_obs(**overrides)) != []
+
+
+def test_judge_cancel_running_requires_reading_cancellation_requested_back() -> None:
+    missed = _cancel_running_obs(statuses_seen_after=["cancelled"])
+    assert fe.judge_cancel_running(missed) != []
+    wrong_order = _cancel_running_obs(statuses_seen_after=["cancelled", "cancellation_requested"])
+    assert fe.judge_cancel_running(wrong_order) != []
 
 
 def test_github_path_failure_never_echoes_a_credential_in_the_file_name() -> None:
