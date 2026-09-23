@@ -349,8 +349,12 @@ impl SecretsProvider for AwsSecretsProvider {
         let current = description
             .current_version
             .ok_or_else(|| unavailable(name))?;
-        self.invoke(name, "delete-secret", &json!({ "SecretId": remote }))
-            .map_err(ProviderFailure::into_provider)?;
+        self.invoke(
+            name,
+            "delete-secret",
+            &json!({ "SecretId": remote, "ForceDeleteWithoutRecovery": true }),
+        )
+        .map_err(ProviderFailure::into_provider)?;
         Ok(ObjectVersion { id: current })
     }
 }
