@@ -212,7 +212,7 @@ fn present_target_group(
             group.push(candidate);
         }
     }
-    if group.is_empty() {
+    if group.is_empty() && include_self {
         group.push(entry.clone());
     }
     Ok(group)
