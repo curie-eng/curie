@@ -26,6 +26,10 @@ pub const EXTERNAL_SECRET_CRD: &str = "externalsecrets.external-secrets.io";
 
 /// ESO's field manager for a Secret it writes is this prefix plus the
 /// ExternalSecret's name.
+/// Label ESO stamps on the sandbox Secret in place of the connector owner.
+/// A template label is required: with none, ESO 2.11.0 copies the
+/// ExternalSecret's own labels, owner included, onto the target Secret.
+pub const SANDBOX_LABEL: &str = "curie.dev/connector-sandbox";
 pub const ESO_MANAGER_PREFIX: &str = "externalsecrets.external-secrets.io/";
 
 /// How often ESO re-reads Secrets Manager for a connector entry.
@@ -225,7 +229,10 @@ pub fn plan(input: &PlanInput) -> Result<Plan> {
         // owner-labelled Secret it did not declare.
         let sync = SyncEntry::from_inventory(&entry, input.remote_prefix)?
             .with_labels(owner_labels(agent))
-            .with_target_labels(BTreeMap::new());
+            .with_target_labels(BTreeMap::from([(
+                SANDBOX_LABEL.to_string(),
+                agent.to_string(),
+            )]));
         Some(planned(sync, &entry, input.sandbox_values)?)
     };
     Ok(Plan {
@@ -380,25 +387,21 @@ pub fn preflight_targets(
 /// does not own. Runs before any provider, kubectl or helm write.
 ///
 /// A present target Secret is ours only when ESO already manages it for one of
-/// this plan's ExternalSecrets. Anything else (a kubectl-applied Secret from a
-/// provider-less deploy, a helm-rendered one) would be silently taken over by
-/// `CreateOrMerge` or fight `Owner`, so it is refused by name.
+/// this agent's ExternalSecrets (the same `<agent>.` rule as
+/// [`preflight_targets`], so a regrouped entry name is not refused). Anything
+/// else (a kubectl-applied Secret from a provider-less deploy, a helm-rendered
+/// one) would be silently taken over by `CreateOrMerge` or fight `Owner`, so it
+/// is refused by name.
 pub fn preflight(k: &dyn Kubectl, namespace: &str, plan: &Plan) -> Result<()> {
     check_crd(k)?;
-    // target -> the ExternalSecret names allowed to manage it
-    let mut targets: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for entry in plan.entries() {
-        targets
-            .entry(entry.sync.target.as_str())
-            .or_default()
-            .push(entry.sync.name.as_str());
-    }
-    for (target, owners) in targets {
-        let ours = |manager: &str| {
-            owners
-                .iter()
-                .any(|owner| manager == format!("{ESO_MANAGER_PREFIX}{owner}"))
-        };
+    let prefix = format!("{ESO_MANAGER_PREFIX}{}.", plan.agent);
+    let ours = |manager: &str| manager.starts_with(&prefix);
+    let targets: BTreeSet<&str> = plan
+        .entries()
+        .iter()
+        .map(|entry| entry.sync.target.as_str())
+        .collect();
+    for target in targets {
         check_target(k, namespace, target, &ours)?;
     }
     Ok(())
