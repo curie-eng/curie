@@ -349,8 +349,8 @@ fn check_target(
     };
     Err(crate::exit::CliError::failure(format!(
         "Secret {namespace}/{target} already exists and External Secrets does not \
-         manage it (field managers: {seen}); refusing to take it over. Nothing was \
-         written."
+         manage it (field managers: {seen}); refusing to take it over. No credential was \
+         written to Secrets Manager, Helm or the cluster."
     ))
     .with_fix(format!(
         "delete it (`kubectl -n {namespace} delete secret {target}`) or move it under \
