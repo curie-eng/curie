@@ -123,6 +123,17 @@ redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 return 1
 """
 
+# The fenced MARKER-ONLY settlement (#2963): a targetless cron turn owes no
+# ``turn.completed`` (no adapter is waiting), so it writes no outbox record. The
+# two guards are exactly ``_SETTLE_FENCED_LUA``'s, so a fenced-out owner writes
+# nothing here either.
+_SETTLE_FENCED_MARKER_LUA = """
+if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+if redis.call('HGET', KEYS[3], ARGV[3]) ~= ARGV[4] then return 0 end
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+return 1
+"""
+
 # Clear the record and its set membership together, but only when the record is
 # still the one the caller read. A stored generation that does not match -- a
 # different one, or none at all -- means this is not the record the caller read;
@@ -263,6 +274,48 @@ class Markers:
             str(ttl_s),
             _DONE_FIELD,
         )
+
+    def _done_ttl_s(self) -> int:
+        return max(
+            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
+        )
+
+    async def mark_done_without_completion(self, event_id: str) -> None:
+        """Leaseless marker-only done, for a targetless turn (#2963).
+
+        The one terminal outcome with no outbox record: no adapter is waiting
+        for a ``turn.completed``. The marker keeps ``mark_done``'s TTL so the
+        dedupe window does not depend on which form settled the turn.
+        """
+        await self._redis.set(self._config.done_key(event_id), "1", ex=self._done_ttl_s())
+
+    async def settle_fenced_without_completion(
+        self,
+        event_id: str,
+        *,
+        stream: str,
+        group: str,
+        entry_id: str,
+        owner: str,
+        generation: int,
+    ) -> bool:
+        """The fenced sibling of ``mark_done_without_completion``.
+
+        Same lease-token and generation fence as ``settle_fenced``; returns
+        False when the fence refused, in which case nothing was written.
+        """
+        settled = await self._redis.eval(
+            _SETTLE_FENCED_MARKER_LUA,
+            3,
+            self._config.done_key(event_id),
+            self._config.delivery_lease_key(stream, group, entry_id),
+            self._config.delivery_state_key(stream, group, entry_id),
+            str(self._done_ttl_s()),
+            owner,
+            _DELIVERY_GENERATION_FIELD,
+            str(generation),
+        )
+        return int(settled) == 1
 
     async def saw_side_effect(self, event_id: str) -> bool:
         return bool(await self._redis.exists(self._config.side_effect_key(event_id)))
