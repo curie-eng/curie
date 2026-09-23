@@ -363,12 +363,12 @@ def test_cancellation_during_registered_kill_recheck_releases_runner_response(
 
 def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
     make_harness,
-    make_hook_run,
 ) -> None:
+    # Cron does not post this deferred booting reply. The window that remains
+    # is a placeholder-less webhook job, which still publishes booting after
+    # routing and before the stream.
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder()
-        ) as h:
+        async with make_harness() as h:
             runner_hold = asyncio.Event()
             h.runner.hold = runner_hold
             h.runner.default_script = [Final(text="answer", status=DONE)]
@@ -387,8 +387,7 @@ def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
                         "digest",
                         thread="tDeferred",
                         placeholder=None,
-                        source=TurnSource.CRON,
-                        hook_run=run.ref,
+                        source=TurnSource.WEBHOOK,
                     )
                 )
             )
