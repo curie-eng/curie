@@ -75,6 +75,10 @@ exit 1
 const KUBECTL_SHIM: &str = r#"#!/usr/bin/env bash
 case " $* " in
   *rollout*) exit 0 ;;
+  *externalsecret*)
+    printf '%s\n' "Error from server (NotFound): externalsecrets.external-secrets.io not found" >&2
+    exit 1
+    ;;
 esac
 exit 1
 "#;

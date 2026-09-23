@@ -477,6 +477,32 @@ pub fn force_sync_and_wait(
     }
 }
 
+/// If the ExternalSecret exists, force it to the current provider value
+/// before a consumer rollout. A missing object is success: `curie apply`
+/// creates it later, and this command still records the helm reference.
+pub fn sync_if_present(namespace: &str, name: &str) -> Result<()> {
+    let kubectl = SystemKubectl::default();
+    let args = argv(&["-n", namespace, "get", "externalsecret", name, "-o", "name"]);
+    let out = kubectl.run(&args, None)?;
+    if !out.success {
+        let detail = out.stderr.to_ascii_lowercase();
+        if detail.contains("notfound") || detail.contains("not found") {
+            return Ok(());
+        }
+        bail!(
+            "could not read ExternalSecret {namespace}/{name}: {}",
+            out.stderr.trim()
+        );
+    }
+    force_sync_and_wait(
+        &kubectl,
+        namespace,
+        name,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    )
+}
+
 /// Stamp each Deployment's pod template with `provider_version`, then wait
 /// for its rollout.
 pub fn rollout_consumers(
