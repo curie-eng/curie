@@ -5464,6 +5464,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // every writer below behaves exactly as without a provider.
                 let connector_provider =
                     load_connector_provider(&namespace, &release, &plugin_dir)?;
+                // Whether the deploy binds a sandbox Secret for the agent, known
+                // before any API call: the provider preflight checks that target too.
+                let binds_sandbox = !secret.is_empty() || !connector_env_secret_names.is_empty();
 
                 // Provider mode: each target's agent name as the API lists it,
                 // so the names-only preflight can run before any mutation.
@@ -5575,8 +5578,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // `prepare_deploy` applies (flag, then the listed target's
                     // agent, then the manifest name); the exact check after
                     // preparation below still runs.
-                    let binds_sandbox =
-                        !secret.is_empty() || !connector_env_secret_names.is_empty();
                     if connector_provider.is_some() {
                         let (plugin_name, _version) = curie::scaffold::read_manifest(&plugin_dir)?;
                         for (target, target_agent) in &listed_target_agents {
@@ -5761,8 +5762,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // collision preflight before the deployment is activated.
                     // Provider mode also runs it names-only BEFORE preparation,
                     // which creates the agent/version and uploads the bundle.
-                    let binds_sandbox =
-                        !secret.is_empty() || !connector_env_secret_names.is_empty();
                     let preflight_target = if connector_provider.is_some() {
                         let agent_name = commands::resolve_deploy_agent_name(
                             &plugin_dir,
