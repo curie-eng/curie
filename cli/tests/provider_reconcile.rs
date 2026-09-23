@@ -166,7 +166,8 @@ fn publish_rolls_only_the_inventory_consumer() {
         "curie",
         "acme",
         "curie-aws-secrets-e2e/acme",
-        &entry(),
+        &[entry()],
+        "github-webhook-secret",
         "version-new",
     )
     .expect("publish");

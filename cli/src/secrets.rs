@@ -166,7 +166,7 @@ pub fn set_discovered(
         ));
         return Ok(());
     };
-    sync_after_write(installation, &entry, &logical, &key, &version.id)
+    sync_after_write(installation, &provider, &entry, &logical, &key, &version.id)
 }
 
 fn inventory_entry(logical: &str) -> Result<Option<InventoryEntry>> {
@@ -179,15 +179,48 @@ fn kubectl_for(installation: &crate::installation::Installation) -> Result<Optio
     let Some(path) = reconcile::kubeconfig_file() else {
         return Ok(None);
     };
+    let _ = path;
     Ok(Some(SystemKubectl {
         context: installation.install.context.clone(),
-        kubeconfig: Some(path),
+        kubeconfig: None,
         call_timeout: Some(std::time::Duration::from_secs(60)),
     }))
 }
 
+fn present_target_group(
+    provider: &dyn SecretsProvider,
+    entry: &InventoryEntry,
+    release: &str,
+    include_self: bool,
+) -> Result<Vec<InventoryEntry>> {
+    let target = reconcile::target_of(entry, release);
+    let mut group = Vec::new();
+    for candidate in platform_inventory()? {
+        if candidate.store != Store::Sm || reconcile::target_of(&candidate, release) != target {
+            continue;
+        }
+        let present = if candidate.logical_name == entry.logical_name {
+            include_self
+        } else {
+            match provider.get_metadata(&candidate.logical_name) {
+                Ok(_) => true,
+                Err(ProviderError::NotFound { .. }) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if present {
+            group.push(candidate);
+        }
+    }
+    if group.is_empty() {
+        group.push(entry.clone());
+    }
+    Ok(group)
+}
+
 fn sync_after_write(
     installation: &crate::installation::Installation,
+    provider: &dyn SecretsProvider,
     entry: &InventoryEntry,
     logical: &str,
     key: &str,
@@ -218,7 +251,10 @@ fn sync_after_write(
         .map(|secrets| secrets.prefix.as_str())
         .context("provisioned install is missing its secrets prefix")?;
     let scoped = format!("{}/{}", prefix.trim_end_matches('/'), release);
-    let consumers = reconcile::publish(&client, namespace, release, &scoped, entry, version)?;
+    let group = present_target_group(provider, entry, release, true)?;
+    let consumers = reconcile::publish(
+        &client, namespace, release, &scoped, &group, logical, version,
+    )?;
     crate::ui::ui().success(&format!(
         "saved {logical}/{key} in Secrets Manager and rolled {}",
         consumers.join(", ")
@@ -455,10 +491,11 @@ pub fn check_discovered(file: Option<&Path>, name: Option<&str>) -> Result<()> {
                 .find(|entry| entry.logical_name == item.name && entry.store == Store::Sm)
             {
                 for consumer in &entry.consumers {
-                    stamps.insert(
-                        (item.name.clone(), consumer.clone()),
-                        reconcile::consumer_stamp(&client, namespace, release, consumer)?,
-                    );
+                    if let Some(stamp) = reconcile::consumer_stamp(
+                        &client, namespace, release, consumer, &item.name,
+                    )? {
+                        stamps.insert((item.name.clone(), consumer.clone()), stamp);
+                    }
                 }
             }
         }
@@ -570,10 +607,47 @@ pub fn remove_discovered(file: Option<&Path>, name: &str) -> Result<()> {
         return Ok(());
     }
     let client = kubectl.context("provisioned install has no kubectl client")?;
-    reconcile::delete_objects(&client, namespace, name)?;
-    crate::ui::ui().success(&format!(
-        "removed {name} from Secrets Manager and deleted its ExternalSecret"
-    ));
+    let mut dropped_external = true;
+    if let Some(entry) = inventory_entry(name)? {
+        let remaining = present_target_group(&provider, &entry, release, false)?;
+        let target = reconcile::target_of(&entry, release);
+        if remaining.is_empty() {
+            reconcile::delete_objects(&client, namespace, name)?;
+            if target != name {
+                reconcile::delete_objects(&client, namespace, &target)?;
+            }
+        } else {
+            let sibling = provider.get_metadata(&remaining[0].logical_name)?;
+            let prefix = installation
+                .secrets
+                .as_ref()
+                .map(|secrets| secrets.prefix.as_str())
+                .context("provisioned install is missing its secrets prefix")?;
+            let scoped = format!("{}/{}", prefix.trim_end_matches('/'), release);
+            reconcile::publish(
+                &client,
+                namespace,
+                release,
+                &scoped,
+                &remaining,
+                &remaining[0].logical_name,
+                &sibling.version.id,
+            )?;
+            reconcile::delete_objects(&client, namespace, name)?;
+            dropped_external = false;
+        }
+    } else {
+        reconcile::delete_objects(&client, namespace, name)?;
+    }
+    if dropped_external {
+        crate::ui::ui().success(&format!(
+            "removed {name} from Secrets Manager and deleted its ExternalSecret"
+        ));
+    } else {
+        crate::ui::ui().success(&format!(
+            "removed {name} from Secrets Manager and updated the shared ExternalSecret"
+        ));
+    }
     Ok(())
 }
 
