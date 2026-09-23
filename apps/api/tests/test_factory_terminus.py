@@ -6,6 +6,15 @@ and
 https://docs.github.com/en/rest/issues/comments#list-issue-comments
 Admission is a signed issues webhook against create_app(). Work items are not
 inserted by this file.
+
+A revision asked for from pull request review feedback (#2798) answers on the
+pull request instead:
+https://docs.github.com/en/rest/pulls/comments#create-a-reply-for-a-review-comment
+https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-request
+and a pull request's conversation comments use the issue comment endpoints with
+the pull request number. Those revision requests are inserted directly with the
+objective the review ingress writes; machine fixtures drive the events, not
+human-authored GitHub proof.
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -68,6 +78,19 @@ class _GitHubComments(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         server = self.server
         assert isinstance(server, _CommentServer)
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        server.requests.append(("GET", path, None))
+        if server.by_path:
+            items = list(server.lists.get(path, []))
+            # Real GitHub pages; a small fixture list is unaffected since page 1
+            # at per_page 100 already covers it.
+            params = parse_qs(parsed.query)
+            page = int(params.get("page", ["1"])[0])
+            per_page = int(params.get("per_page", ["100"])[0])
+            start = (page - 1) * per_page
+            self._send(200, items[start : start + per_page])
+            return
         self._send(200, list(server.comments))
 
     def do_POST(self) -> None:  # noqa: N802
@@ -75,6 +98,25 @@ class _GitHubComments(BaseHTTPRequestHandler):
         assert isinstance(server, _CommentServer)
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length) or b"{}")
+        path = self.path.split("?", 1)[0]
+        server.requests.append(("POST", path, payload.get("body", "")))
+        if server.by_path:
+            refused = server.refuse_paths.get(path)
+            server.posts += 1
+            if refused is not None:
+                self._send(refused, {"message": "refused"})
+                return
+            listed = path.rsplit("/", 2)[0] if path.endswith("/replies") else path
+            comment = {"id": 8000 + server.posts, "body": payload.get("body", "")}
+            server.lists.setdefault(listed, []).append(comment)
+            if path in server.lost_response_paths:
+                # The comment lands, but the caller never sees the response: drop
+                # the connection instead of sending a status line, once.
+                server.lost_response_paths.discard(path)
+                self.close_connection = True
+                return
+            self._send(201, comment)
+            return
         if server.refuse_status is not None:
             server.posts += 1
             self._send(server.refuse_status, {"message": "refused"})
@@ -91,6 +133,15 @@ class _CommentServer(ThreadingHTTPServer):
         self.comments: list[dict[str, Any]] = []
         self.posts = 0
         self.refuse_status: int | None = None
+        # Path-aware mode for pull request replies. Each list endpoint keeps its
+        # own comments, and a review-thread reply lands in the PR review list.
+        self.by_path = False
+        self.lists: dict[str, list[dict[str, Any]]] = {}
+        self.refuse_paths: dict[str, int] = {}
+        self.requests: list[tuple[str, str, str | None]] = []
+        # Paths whose next POST response is dropped after the comment is
+        # recorded, simulating a lost response to a successful post.
+        self.lost_response_paths: set[str] = set()
 
 
 @pytest.fixture
@@ -732,3 +783,346 @@ def test_concurrent_reconcilers_post_one_comment(admitted: Any) -> None:
     assert sink.posts == 1
     assert len(_notices(row["id"])) == 1
     assert _notices(row["id"])[0]["posted_at"] is not None
+
+
+# --- #2798: a revision asked for on the pull request answers on the pull request.
+
+_REVISION_PR = iter(range(501, 600))
+
+
+def _revision_objective(pr: int, fragment: str) -> str:
+    """Line 1 is the canonical URL. Notice routing reads only that line."""
+
+    url = f"https://github.com/{REPO}/pull/{pr}#{fragment}"
+    provenance = json.dumps(
+        {
+            "event": "pull_request_review_comment",
+            "url": url,
+            "sender": "octocat",
+            "body": "@curie please rename the helper",
+        }
+    )
+    return f"{url}\n\nReview feedback asked for another revision.\n{provenance}"
+
+
+def _work_item_row(work_item_id: uuid.UUID) -> dict[str, Any]:
+    return _rows(
+        "SELECT w.id, w.conversation_id, w.agent_id, w.github_issue_number, "
+        "w.publication_lineage_id, l.deployment_id, l.pr_number "
+        "FROM curie.work_items w "
+        "JOIN curie.thread_publication_lineages l ON l.id = w.publication_lineage_id "
+        "WHERE w.id = :id",
+        {"id": work_item_id},
+    )[0]
+
+
+def _insert_revision(work_item_id: uuid.UUID, number: int, objective: str) -> uuid.UUID:
+    request_id = uuid.uuid4()
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.execution_requests "
+                        "(id, work_item_id, sequence, status, wait_deadline, objective, "
+                        "requester, reply_kind, reply_address, reply_conversation_id) "
+                        "VALUES (:id, :work_item, 2, 'waiting', "
+                        "clock_timestamp() + interval '30 seconds', :objective, "
+                        "'github:6601:octocat', 'github', :repo, :conversation)"
+                    ),
+                    {
+                        "id": request_id,
+                        "work_item": work_item_id,
+                        "objective": objective,
+                        "repo": REPO,
+                        "conversation": f"issue-{number}",
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE curie.work_items SET next_sequence = 3, "
+                        "version = version + 1 WHERE id = :id"
+                    ),
+                    {"id": work_item_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+    return request_id
+
+
+def _attach_revision_publication(work_item_id: uuid.UUID, request_id: uuid.UUID) -> None:
+    item = _work_item_row(work_item_id)
+    approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
+    pr_url = f"https://github.com/{REPO}/pull/{item['pr_number']}"
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.approvals "
+                        "(id, agent_id, conversation_id, author, summary, reply_kind, "
+                        "reply_channel, dedupe_key, status, purpose) VALUES "
+                        "(:id, :agent, :conversation, 'U0REQUEST1', "
+                        "'Publish repository changes', 'github', :channel, :dedupe, "
+                        "'approved', 'publication')"
+                    ),
+                    {
+                        "id": approval_id,
+                        "agent": item["agent_id"],
+                        "conversation": item["conversation_id"],
+                        "channel": REPO,
+                        "dedupe": f"terminus-revision-{publication_id.hex}",
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.publications "
+                        "(id, approval_id, deployment_id, workspace_conversation_id, "
+                        "lineage_id, execution_request_id, revision_number, repo_full_name, "
+                        "status, base_sha, changed_paths, title, body, reply_kind, "
+                        "reply_channel, result_url) "
+                        "VALUES (:id, :approval, :deployment, :conversation, :lineage, "
+                        ":request_id, 2, :repo, 'succeeded', :base, "
+                        "CAST('[\"README.md\"]' AS jsonb), "
+                        "'Rename the helper', 'Approved platform publication.', 'github', "
+                        ":channel, :result)"
+                    ),
+                    {
+                        "id": publication_id,
+                        "approval": approval_id,
+                        "deployment": item["deployment_id"],
+                        "conversation": item["conversation_id"],
+                        "lineage": item["publication_lineage_id"],
+                        "request_id": request_id,
+                        "repo": REPO,
+                        "base": "0123456789abcdef0123456789abcdef01234567",
+                        "channel": REPO,
+                        "result": pr_url,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE curie.thread_publication_lineages SET latest_revision = 2 "
+                        "WHERE id = :id"
+                    ),
+                    {"id": item["publication_lineage_id"]},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def _published_issue(client: Any, github: GitHubAPI, sink: _CommentServer) -> tuple[int, int, Any]:
+    """An issue whose first run opened a PR and completed without a comment."""
+
+    number = next(_REVISION_ISSUES)
+    pr = next(_REVISION_PR)
+    _label(client, github, number)
+    first = _request(number)
+    _start_running(first["id"])
+    _attach_publication(first["work_item_id"], status="succeeded", pr=pr)
+    _reconcile()
+    done = _request(number)
+    assert (done["status"], done["terminal_cause"]) == ("completed", "completed")
+    assert _notices(first["id"]) == []
+    assert sink.posts == 0
+    return number, pr, first
+
+
+_REVISION_ISSUES = iter(range(9301, 9399))
+
+
+def _complete_revision(
+    client: Any, github: GitHubAPI, sink: _CommentServer, fragment: str
+) -> tuple[int, int, uuid.UUID]:
+    number, pr, first = _published_issue(client, github, sink)
+    objective = _revision_objective(pr, fragment)
+    revision = _insert_revision(first["work_item_id"], number, objective)
+    _start_running(revision)
+    _attach_revision_publication(first["work_item_id"], revision)
+    _reconcile()
+    status = _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": revision},
+    )[0]
+    assert (status["status"], status["terminal_cause"]) == ("completed", "completed")
+    return number, pr, revision
+
+
+def _posts(sink: _CommentServer) -> list[tuple[str, str | None]]:
+    return [(path, body) for method, path, body in sink.requests if method == "POST"]
+
+
+def test_a_completed_first_request_still_owes_no_comment(admitted: Any) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    _published_issue(client, github, sink)
+    assert _posts(sink) == []
+
+
+def test_a_completed_revision_queues_exactly_one_notice(admitted: Any) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    _number, _pr, revision = _complete_revision(client, github, sink, "discussion_r88101")
+    notices = _notices(revision)
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == "completed"
+    _reconcile()
+    assert len(_notices(revision)) == 1
+
+
+def test_a_review_comment_revision_replies_in_its_thread(admitted: Any) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    _number, pr, revision = _complete_revision(client, github, sink, "discussion_r88102")
+    posts = _posts(sink)
+    assert [path for path, _ in posts] == [
+        f"/repos/{REPO}/pulls/{pr}/comments/88102/replies"
+    ]
+    assert marker_for(revision) in (posts[0][1] or "")
+    assert _notices(revision)[0]["posted_at"] is not None
+    _reconcile()
+    assert len(_posts(sink)) == 1
+
+
+@pytest.mark.parametrize(
+    "fragment", ["issuecomment-88103", "pullrequestreview-88104"]
+)
+def test_conversation_and_review_revisions_comment_on_the_pull_request(
+    admitted: Any, fragment: str
+) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, revision = _complete_revision(client, github, sink, fragment)
+    posts = _posts(sink)
+    assert [path for path, _ in posts] == [f"/repos/{REPO}/issues/{pr}/comments"]
+    assert pr != number
+    body = posts[0][1] or ""
+    assert f"https://github.com/{REPO}/pull/{pr}#{fragment}" in body
+    assert marker_for(revision) in body
+    assert _notices(revision)[0]["posted_at"] is not None
+
+
+def test_a_refused_thread_reply_falls_back_to_a_pull_request_comment(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    reply = None
+    # The PR number is only known once the first run publishes, so refuse every
+    # reply path this test could produce.
+    for pr in range(501, 600):
+        reply = f"/repos/{REPO}/pulls/{pr}/comments/88105/replies"
+        sink.refuse_paths[reply] = 422
+    _number, pr, revision = _complete_revision(client, github, sink, "discussion_r88105")
+    posts = [path for path, _ in _posts(sink)]
+    assert posts == [
+        f"/repos/{REPO}/pulls/{pr}/comments/88105/replies",
+        f"/repos/{REPO}/issues/{pr}/comments",
+    ]
+    fallback = sink.lists[f"/repos/{REPO}/issues/{pr}/comments"][0]["body"]
+    assert marker_for(revision) in fallback
+    assert f"https://github.com/{REPO}/pull/{pr}#discussion_r88105" in fallback
+    assert _notices(revision)[0]["posted_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("fragment", "listed"),
+    [
+        ("discussion_r88106", "pulls/{pr}/comments"),
+        ("discussion_r88107", "issues/{pr}/comments"),
+        ("issuecomment-88108", "issues/{pr}/comments"),
+    ],
+)
+def test_a_marker_already_on_the_pull_request_is_not_posted_again(
+    admitted: Any, fragment: str, listed: str
+) -> None:
+    """A crash after the post leaves the marker on either PR list. No second post."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    revision = _insert_revision(
+        first["work_item_id"], number, _revision_objective(pr, fragment)
+    )
+    sink.lists[f"/repos/{REPO}/{listed.format(pr=pr)}"] = [
+        {"id": 7555, "body": comment_body(revision, "completed")}
+    ]
+    _start_running(revision)
+    _attach_revision_publication(first["work_item_id"], revision)
+    _reconcile()
+    assert _posts(sink) == []
+    notices = _notices(revision)
+    assert len(notices) == 1
+    assert notices[0]["comment_id"] == 7555
+    assert notices[0]["posted_at"] is not None
+
+
+def _scan_page(request_id: uuid.UUID) -> int:
+    return _rows(
+        "SELECT scan_page FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["scan_page"]
+
+
+def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
+    """A thread reply that posts but whose response is lost must not double-post.
+
+    The conversation list holds more than 500 comments, so the first pass
+    exhausts the review list, then advances the cursor past the conversation
+    list's offset without finishing it. A second pass finishes the conversation
+    list and attempts the thread reply, whose response is then lost.
+    """
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    fragment = "discussion_r88109"
+    revision = _insert_revision(
+        first["work_item_id"], number, _revision_objective(pr, fragment)
+    )
+    sink.lists[f"/repos/{REPO}/issues/{pr}/comments"] = [
+        {"id": 9000 + i, "body": f"unrelated comment {i}"} for i in range(550)
+    ]
+    reply_path = f"/repos/{REPO}/pulls/{pr}/comments/88109/replies"
+    sink.lost_response_paths.add(reply_path)
+    _start_running(revision)
+    _attach_revision_publication(first["work_item_id"], revision)
+
+    _reconcile()
+    assert _posts(sink) == []
+    assert _notices(revision)[0]["posted_at"] is None
+    assert _scan_page(revision) > 1_000_000
+
+    _reconcile()
+    assert [path for path, _ in _posts(sink)] == [reply_path]
+    assert _notices(revision)[0]["posted_at"] is None
+    assert _scan_page(revision) == 1
+
+    _reconcile()
+    assert [path for path, _ in _posts(sink)] == [reply_path]
+    notices = _notices(revision)
+    assert notices[0]["posted_at"] is not None
+    assert notices[0]["comment_id"] == 8001
+
+
+def test_an_issue_originated_notice_still_comments_on_the_issue(admitted: Any) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    number = 9398
+    _label(client, github, number)
+    github.labels = []
+    _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    row = _request(number)
+    _reconcile()
+    posts = _posts(sink)
+    assert [path for path, _ in posts] == [f"/repos/{REPO}/issues/{number}/comments"]
+    assert marker_for(row["id"]) in (posts[0][1] or "")

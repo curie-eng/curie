@@ -1,11 +1,19 @@
-"""Post the one comment owed by a non-PR factory terminus.
+"""Post the one comment owed by a factory terminus.
 
 The notice row is already committed with the terminal update. This module only
 updates that notice. A refused post never rewrites the execution request.
 
+An issue-originated request comments on its issue. A revision asked for from
+pull request review feedback (#2798) answers on the pull request: a review
+comment gets a reply in its thread, other feedback a linked PR comment, and a
+thread reply GitHub refuses with 422 falls back to that linked PR comment.
+
 GitHub issue comments:
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
 https://docs.github.com/en/rest/issues/comments#list-issue-comments
+Pull request review comments:
+https://docs.github.com/en/rest/pulls/comments#create-a-reply-for-a-review-comment
+https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-request
 """
 
 from __future__ import annotations
@@ -20,12 +28,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
+from .factory_reply_target import ReplyTarget, parse_reply_target
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
-from .models import FactoryTerminalNotice, WorkItem
+from .models import ExecutionRequest, FactoryTerminalNotice, WorkItem
 from .repo_full_name import repo_url_path
 
 _REFUSED_STATUSES = {401, 403, 404}
 _PAGES_PER_PASS = 5
+_UNPROCESSABLE = ("unprocessable", "http_422")
+# A thread target scans two lists with one stored page. Pages of the review
+# comment list are stored as-is; once that list is exhausted, the conversation
+# list page is stored above this offset.
+_SECOND_LIST_OFFSET = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -40,12 +54,14 @@ def marker_for(request_id: uuid.UUID) -> str:
     return f"<!-- curie-execution-request:{request_id} -->"
 
 
-def comment_body(request_id: uuid.UUID, cause: str) -> str:
-    return (
-        "This factory run cannot continue.\n"
-        f"Cause: {cause}\n"
-        f"\n{marker_for(request_id)}\n"
-    )
+def comment_body(request_id: uuid.UUID, cause: str, *, feedback_url: str | None = None) -> str:
+    if cause == "completed":
+        text = "The requested revision is pushed to this pull request.\n"
+    else:
+        text = f"This factory run cannot continue.\nCause: {cause}\n"
+    if feedback_url is not None:
+        text += f"In response to {feedback_url}\n"
+    return f"{text}\n{marker_for(request_id)}\n"
 
 
 async def post_due_notices(session: AsyncSession, settings: Settings, *, limit: int = 20) -> int:
@@ -58,8 +74,12 @@ async def post_due_notices(session: AsyncSession, settings: Settings, *, limit: 
 
     rows = (
         await session.execute(
-            select(FactoryTerminalNotice, WorkItem)
+            select(FactoryTerminalNotice, WorkItem, ExecutionRequest.objective)
             .join(WorkItem, WorkItem.id == FactoryTerminalNotice.work_item_id)
+            .join(
+                ExecutionRequest,
+                ExecutionRequest.id == FactoryTerminalNotice.execution_request_id,
+            )
             .where(
                 FactoryTerminalNotice.posted_at.is_(None),
                 FactoryTerminalNotice.refused_at.is_(None),
@@ -77,8 +97,13 @@ async def post_due_notices(session: AsyncSession, settings: Settings, *, limit: 
         return 0
     delivered = 0
     async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
-        for notice, work_item in rows:
-            outcome = await _deliver(client, settings, work_item, notice)
+        for notice, work_item, objective in rows:
+            target = parse_reply_target(
+                objective,
+                repo_full_name=work_item.repo_full_name,
+                clone_base=settings.github_clone_base,
+            )
+            outcome = await _deliver(client, settings, work_item, notice, target)
             now = await _clock(session)
             notice.attempts += 1
             if outcome is None:
@@ -106,6 +131,7 @@ async def _deliver(
     settings: Settings,
     work_item: WorkItem,
     notice: FactoryTerminalNotice,
+    target: ReplyTarget,
 ) -> tuple[str, str] | None:
     try:
         token = await run_in_threadpool(
@@ -116,38 +142,96 @@ async def _deliver(
     except (GitHubInstallationRefused, GitHubAppError, ValueError):
         return None
     api = settings.github_api_url.rstrip("/")
-    path = (
-        f"/repos/{repo_url_path(work_item.repo_full_name)}"
-        f"/issues/{work_item.github_issue_number}/comments"
-    )
+    repo_path = f"/repos/{repo_url_path(work_item.repo_full_name)}"
+    number = work_item.github_issue_number if target.pr_number is None else target.pr_number
+    comments_path = f"{repo_path}/issues/{number}/comments"
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     marker = marker_for(notice.execution_request_id)
-    existing = await _find_marker(
-        client, api, path, headers, marker, start_page=max(1, notice.scan_page)
-    )
-    if existing.refusal is not None:
-        return ("refused", existing.refusal)
-    if existing.unavailable:
-        return None
-    if existing.comment_id is not None:
-        return ("posted", str(existing.comment_id))
-    if existing.next_page is not None:
-        notice.scan_page = existing.next_page
-        return None
-    body = comment_body(notice.execution_request_id, notice.terminal_cause)
+    stored = max(1, notice.scan_page)
+    # (path, first page, offset stored for this list's next page)
+    scans = [(comments_path, stored, 0)]
+    if target.kind == "thread":
+        # A thread reply lands on the review comment list; its 422 fallback on
+        # the conversation list. The marker may sit on either.
+        review_path = f"{repo_path}/pulls/{number}/comments"
+        if stored > _SECOND_LIST_OFFSET:
+            scans = [(comments_path, stored - _SECOND_LIST_OFFSET, _SECOND_LIST_OFFSET)]
+        else:
+            scans = [(review_path, stored, 0), (comments_path, 1, _SECOND_LIST_OFFSET)]
+    for path, start, offset in scans:
+        existing = await _find_marker(client, api, path, headers, marker, start_page=start)
+        if existing.refusal is not None:
+            return ("refused", existing.refusal)
+        if existing.unavailable:
+            return None
+        if existing.comment_id is not None:
+            return ("posted", str(existing.comment_id))
+        if existing.next_page is not None:
+            notice.scan_page = existing.next_page + offset
+            return None
+    body = comment_body(notice.execution_request_id, notice.terminal_cause, feedback_url=target.url)
+    if target.kind == "thread":
+        assert target.comment_id is not None
+        root = await _thread_root(client, api, repo_path, headers, target.comment_id)
+        replied = await _post(
+            client,
+            f"{api}{repo_path}/pulls/{number}/comments/{root}/replies",
+            headers,
+            body,
+        )
+        if replied != _UNPROCESSABLE:
+            if replied is None:
+                # Lost response after a possible success: rescan every list next pass.
+                notice.scan_page = 1
+            return replied
+    posted = await _post(client, f"{api}{comments_path}", headers, body)
+    if posted is None:
+        # Lost response after a possible success: rescan every list next pass.
+        notice.scan_page = 1
+    # A comment GitHub cannot process stays pending, as before #2798.
+    return None if posted == _UNPROCESSABLE else posted
+
+
+async def _thread_root(
+    client: httpx.AsyncClient,
+    api: str,
+    repo_path: str,
+    headers: dict[str, str],
+    comment_id: int,
+) -> int:
+    """Reply to the thread's first comment; replies to replies are refused."""
+
+    try:
+        found = await client.get(
+            f"{api}{repo_path}/pulls/comments/{comment_id}",
+            headers=headers,
+            follow_redirects=False,
+        )
+        payload = found.json() if found.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        root = payload.get("in_reply_to_id")
+        if type(root) is int and root > 0:
+            return root
+    return comment_id
+
+
+async def _post(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str], body: str
+) -> tuple[str, str] | None:
     try:
         created = await client.post(
-            f"{api}{path}",
-            headers=headers,
-            json={"body": body},
-            follow_redirects=False,
+            url, headers=headers, json={"body": body}, follow_redirects=False
         )
     except httpx.HTTPError:
         return None
+    if created.status_code == 422:
+        return _UNPROCESSABLE
     if created.status_code in _REFUSED_STATUSES:
         return ("refused", f"http_{created.status_code}")
     if created.status_code not in {200, 201}:

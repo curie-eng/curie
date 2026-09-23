@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from .config import get_settings
+from .factory_reply_target import parse_reply_target
 from .models import (
     ExecutionRequest,
     FactoryTerminalNotice,
@@ -182,10 +183,22 @@ async def _database_now(session: AsyncSession) -> datetime:
 def _queue_notice(
     session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
 ) -> None:
-    """Stage the owed comment in the terminal transaction. The caller commits."""
+    """Stage the owed comment in the terminal transaction. The caller commits.
 
-    if request.status == "completed" or request.terminal_at is None:
+    A completed run owes nothing, unless review feedback on its pull request
+    asked for it (#2798): that revision answers on the pull request.
+    """
+
+    if request.terminal_at is None:
         return
+    if request.status == "completed":
+        target = parse_reply_target(
+            request.objective,
+            repo_full_name=work_item.repo_full_name,
+            clone_base=get_settings().github_clone_base,
+        )
+        if target.kind == "issue":
+            return
     cause = request.terminal_cause
     if cause is None or not cause.strip():
         return
@@ -856,8 +869,7 @@ async def _terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    if status != "completed":
-        _queue_notice(session, work_item, request)
+    _queue_notice(session, work_item, request)
     return await _outcome(session, work_item, request)
 
 

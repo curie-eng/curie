@@ -17,6 +17,11 @@ from ..deps import EvalQueueDep, SessionDep, StoreDep
 from ..gitflow import log_push_outcome, process_push, verify_signature
 from ..github_factory import handle_factory_delivery
 from ..github_factory_events import is_plain_issue
+from ..github_factory_review import (
+    factory_owns,
+    handle_factory_review_delivery,
+    is_actionable_feedback,
+)
 from ..github_review_audit import claim_review_delivery, settle_review_delivery
 from ..github_review_events import FeedbackIgnored, FeedbackUnavailable, parse_feedback
 from ..github_review_store import admit_feedback
@@ -80,7 +85,27 @@ async def github_webhook(
         )
 
     if is_review:
-        if not settings.github_review_ingress_enabled:
+        # A factory-owned pull request answers through the factory arm (#2798).
+        # Otherwise the Slack-bound review arm keeps its merged behavior; with
+        # it disabled, actionable PR feedback reaches the factory's unbound guard.
+        review_enabled = settings.github_review_ingress_enabled
+        if factory_enabled and (
+            await factory_owns(session, x_github_event, payload)
+            or (
+                not review_enabled
+                and is_actionable_feedback(x_github_event, payload, x_github_delivery)
+            )
+        ):
+            return await handle_factory_review_delivery(
+                session,
+                settings=settings,
+                client=request.app.state.http_client,
+                event=x_github_event,
+                delivery_id=x_github_delivery,
+                body=body,
+                payload=payload,
+            )
+        if not review_enabled:
             return WebhookResult(status="feedback_disabled")
         try:
             delivery_id = uuid.UUID(x_github_delivery)
