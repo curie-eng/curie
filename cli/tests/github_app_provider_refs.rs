@@ -106,7 +106,7 @@ if [ "${1:-}" = "--version" ]; then
   printf '%s\n' "aws-cli/2.0.0"
   exit 0
 fi
-if [ "${1:-}" = "secretsmanager" ] && [ "${2:-}" = "describe-secret" ]; then
+if [ "${1:-}" = "secretsmanager" ] && { [ "${2:-}" = "describe-secret" ] || [ "${2:-}" = "get-secret-value" ]; }; then
   printf '%s\n' "ResourceNotFoundException" >&2
   exit 254
 fi
