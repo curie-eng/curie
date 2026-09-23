@@ -521,9 +521,59 @@ fn provider_absent_set_still_uses_private_storage_without_aws_or_kubectl() {
 }
 
 #[test]
-fn apply_refuses_a_declared_provider_before_any_external_command() {
+fn apply_with_a_provider_does_not_call_aws_when_helm_is_absent() {
     let env = isolated();
     fs::write(env.config.join("curie.yaml"), aws_install()).expect("write install");
+    let empty_path = env.config.join("no-tools");
+    fs::create_dir(&empty_path).expect("create empty path");
+
+    let dry_run = command(&env)
+        .env("PATH", &empty_path)
+        .args(["apply", "--dry-run", "--json"])
+        .output()
+        .expect("run dry run");
+    assert!(
+        dry_run.status.success(),
+        "dry run must stay local: {}",
+        panic_text(&dry_run)
+    );
+    let dry_text = raw_output(&dry_run);
+    assert!(
+        dry_text.contains("2.11.0"),
+        "dry run must name the pinned chart: {}",
+        panic_text(&dry_run)
+    );
+    assert!(
+        dry_text.contains("secretstore"),
+        "dry run must name the SecretStore: {}",
+        panic_text(&dry_run)
+    );
+    assert_aws_not_called(&env);
+
+    let live = command(&env)
+        .env("PATH", &empty_path)
+        .args(["apply", "--json"])
+        .output()
+        .expect("run apply");
+    assert_eq!(live.status.code(), Some(1), "{}", panic_text(&live));
+    let live_text = raw_output(&live);
+    assert!(
+        live_text.contains("`helm` is not on PATH"),
+        "apply must stop before a cluster write: {}",
+        panic_text(&live)
+    );
+    assert!(
+        !live_text.contains("cannot yet converge a declared secrets provider"),
+        "the old refusal must be gone: {}",
+        panic_text(&live)
+    );
+    assert_aws_not_called(&env);
+}
+
+#[test]
+fn apply_without_a_provider_does_not_mention_external_secrets() {
+    let env = isolated();
+    fs::write(env.config.join("curie.yaml"), BARE_INSTALL).expect("write install");
     let empty_path = env.config.join("no-tools");
     fs::create_dir(&empty_path).expect("create empty path");
 
@@ -536,10 +586,15 @@ fn apply_refuses_a_declared_provider_before_any_external_command() {
             .args(args)
             .output()
             .expect("run apply");
-        assert_eq!(output.status.code(), Some(1), "{}", panic_text(&output));
+        let text = raw_output(&output);
         assert!(
-            raw_output(&output).contains("cannot yet converge a declared secrets provider"),
-            "apply must refuse before external commands: {}",
+            !text.contains("external-secrets"),
+            "provider-absent apply must not install External Secrets: {}",
+            panic_text(&output)
+        );
+        assert!(
+            !text.contains("2.11.0"),
+            "provider-absent apply must not name the External Secrets pin: {}",
             panic_text(&output)
         );
         assert_aws_not_called(&env);

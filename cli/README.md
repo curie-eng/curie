@@ -780,8 +780,10 @@ curie dev secrets-e2e --seed path/to/seed.json
 ```
 
 `--ci` runs the emulator once with External Secrets and once without it.
-`--eso none` performs the image load and bundle validation case without
-installing External Secrets. `--seed` replaces the checked in synthetic fixture;
+`--eso none` loads images, then `curie apply` installs External Secrets
+2.11.0 because the harness did not install it. `--eso preinstalled` installs
+that chart first and checks that apply reuses it, refuses an incompatible
+image without writes, and leaves the controller in place on `cluster down`. `--seed` replaces the checked in synthetic fixture;
 the file must be a flat JSON object containing exactly `STATIC_KEY` and
 `ROTATED_KEY`, both with nonempty string values.
 
