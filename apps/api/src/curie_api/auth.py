@@ -115,12 +115,25 @@ async def require_principal_session(
     than at session expiry. A login-code session (no principal) and the
     platform key are both refused: neither identifies a person.
 
+    The principal must also belong to the IdP configured now: with OIDC
+    disabled, or with ``CURIE_OIDC_ISSUER`` pointed elsewhere, a session minted
+    under the old issuer is refused. A comparison, never a revocation, so
+    restoring the configuration readmits the same sessions. OIDC is the only
+    source of principal sessions today; a future one (e.g. a SAML adapter via
+    the service hook in #3003) must extend this check to its own issuer, or its
+    sessions will be refused here.
+
     Every refusal is the same 401, so the response does not tell a caller
     whether the cookie was unknown, expired, or valid for someone disabled.
     """
 
     principal = await crud.live_principal_session(session, console_session or "")
-    if principal is None:
+    settings = get_settings()
+    if (
+        principal is None
+        or not settings.oidc_enabled
+        or principal.idp_issuer != settings.oidc_issuer
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing, invalid, or expired principal session",
