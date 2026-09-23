@@ -2517,6 +2517,9 @@ def revision(p: Preflight) -> dict[str, Any]:
     obs["first_run_statuses"] = _ordered_statuses(detail)
     obs["first_run_terminus_causes"] = [c.get("cause") for c in comments]
     if not terminal or pr is None or not pr.get("number"):
+        raw_reply, _ = _agent_final_reply(p)
+        known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
+        obs["first_run_agent_final_reply"], _ = record_agent_text(raw_reply, known)
         raise PreflightFailed(
             "revision needs the labelled run to end in a pull request; it ended "
             f"terminal={terminal} with pr={pr} and {len(comments)} terminus comment(s)"
