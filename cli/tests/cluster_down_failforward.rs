@@ -27,6 +27,22 @@ use std::path::Path;
 use curie::exit::{classify, ExitClass};
 use curie::ops::{down, down_commands, CommonOpts, DownOpts};
 
+/// `cluster down` reads the External Secrets ownership marker before the
+/// release sweep. This release did not install that controller, so the probe
+/// is NotFound and must not touch the sweep marker or its first-failure flip.
+const OWNERSHIP_PROBE: &str = r#"if [ "$1" = -n ] && [ "$2" = external-secrets ] && [ "$3" = get ] && [ "$4" = configmap ]; then
+  echo 'Error from server (NotFound): configmaps "curie-eso-install" not found' >&2
+  exit 1
+fi
+"#;
+
+fn kubectl_fake(rest: &str) -> String {
+    let mut script = String::from("#!/bin/sh\n");
+    script.push_str(OWNERSHIP_PROBE);
+    script.push_str(rest);
+    script
+}
+
 /// Write `body` to `dir/name` and mark it executable (0o755).
 fn write_exec(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
@@ -87,9 +103,9 @@ async fn cluster_down_fails_forward_through_real_down() {
     write_exec(
         dir1.path(),
         "kubectl",
-        &format!(
-            "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{{\"name\":\"agent-ns\",\"labels\":{{}},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\necho '{unreachable}' >&2\nexit 1\n"
-        ),
+        &kubectl_fake(&format!(
+            "if [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{{\"name\":\"agent-ns\",\"labels\":{{}},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\necho '{unreachable}' >&2\nexit 1\n"
+        )),
     );
     prepend_path(dir1.path());
 
@@ -136,7 +152,9 @@ async fn cluster_down_fails_forward_through_real_down() {
     write_exec(
         dir2.path(),
         "kubectl",
-        "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\necho 'namespace \"prod-release-agent-sandbox\" deleted'\nexit 0\n",
+        &kubectl_fake(
+            "if [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\necho 'namespace \"prod-release-agent-sandbox\" deleted'\nexit 0\n",
+        ),
     );
     // Drop scenario 1's fakes: reset to the original PATH, then prepend dir2.
     restore_path(&original_path);
@@ -189,7 +207,9 @@ async fn cluster_down_fails_forward_through_real_down() {
     write_exec(
         dir3.path(),
         "kubectl",
-        "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\nexit 0\n",
+        &kubectl_fake(
+            "if [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\nexit 0\n",
+        ),
     );
     restore_path(&original_path);
     prepend_path(dir3.path());
@@ -244,11 +264,11 @@ async fn cluster_down_fails_forward_through_real_down() {
     write_exec(
         dir4.path(),
         "kubectl",
-        &format!(
-            "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{{\"name\":\"agent-ns\",\"labels\":{{}},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}}'\n  exit 0\nfi\necho x >> '{log}'\nif [ -f '{switched}' ]; then\n  echo 'namespace \"x\" deleted'\n  exit 0\nelse\n  touch '{switched}'\n  echo 'Kubernetes cluster unreachable: connection refused' >&2\n  exit 1\nfi\n",
+        &kubectl_fake(&format!(
+            "if [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{{\"name\":\"agent-ns\",\"labels\":{{}},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}}'\n  exit 0\nfi\necho x >> '{log}'\nif [ -f '{switched}' ]; then\n  echo 'namespace \"x\" deleted'\n  exit 0\nelse\n  touch '{switched}'\n  echo 'Kubernetes cluster unreachable: connection refused' >&2\n  exit 1\nfi\n",
             log = kubectl_log.display(),
             switched = kubectl_switched.display(),
-        ),
+        )),
     );
     restore_path(&original_path);
     prepend_path(dir4.path());
