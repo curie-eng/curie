@@ -1656,3 +1656,96 @@ class PrincipalTeam(Base):
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+# A secret-store reference, never a value (#2909): ``env:NAME`` or
+# ``k8s-secret:name/key``. The DB CHECK and the API's 422 both use it.
+PROVIDER_REFERENCE_PATTERN = (
+    r"^(env:[A-Z_][A-Z0-9_]*"
+    r"|k8s-secret:[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/[-._a-zA-Z0-9]{1,253})$"
+)
+PROVIDER_REFERENCE_MAX_LENGTH = 512
+# Refuses the shapes of well-known credentials the grammar above would admit
+# (a Secret key may hold hyphens, so ``k8s-secret:x/xoxb-...`` would pass):
+# a segment opening with a known token prefix, an env name that is an AWS
+# access key id, or a 32+ character hex run (signing secrets, hex tokens).
+# Best effort against a pasted value; no syntax can prove a string is not one.
+PROVIDER_REFERENCE_DENY_PATTERN = (
+    r"[:/](xox[a-z]-|xoxe\.|xapp-|gh[pousr]_|github_pat_|sk-|sk_live_|rk_live_|lin_api_|AIza|eyJ)"
+    r"|^env:(AKIA|ASIA)[A-Z0-9]{16}$"
+    r"|[0-9a-fA-F]{32}"
+)
+
+
+def _provider_reference_check(column: str) -> CheckConstraint:
+    return CheckConstraint(
+        f"{column} IS NULL OR (length({column}) <= {PROVIDER_REFERENCE_MAX_LENGTH} "
+        f"AND {column} ~ '{PROVIDER_REFERENCE_PATTERN}' "
+        f"AND {column} !~ '{PROVIDER_REFERENCE_DENY_PATTERN}')",
+        name=f"provider_installations_{column}_ck",
+    )
+
+
+class ProviderInstallation(Base):
+    """One connected external account, such as one Slack workspace (#2909, ADR 0155 step 4).
+
+    ``credential_ref`` and ``webhook_verification_ref`` point into the
+    deployment's secret store; the CHECKs hold them to the reference grammar
+    and refuse well-known credential shapes, whoever writes them.
+    ``disconnected_at`` is set exactly while the row is disconnected. The
+    installer FK carries ``tenant_id``, so the installer must be a principal
+    of the same tenant.
+    """
+
+    __tablename__ = "provider_installations"
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('slack', 'm365', 'github', 'jira', 'linear', "
+            "'confluence', 'quickbooks', 'other')",
+            name="provider_installations_provider_ck",
+        ),
+        CheckConstraint(
+            "status IN ('connected', 'disconnected', 'degraded')",
+            name="provider_installations_status_ck",
+        ),
+        CheckConstraint(
+            "(status = 'disconnected') = (disconnected_at IS NOT NULL)",
+            name="provider_installations_disconnected_at_ck",
+        ),
+        _provider_reference_check("credential_ref"),
+        _provider_reference_check("webhook_verification_ref"),
+        ForeignKeyConstraint(
+            ["tenant_id", "installed_by_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="provider_installations_installer_fkey",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "external_account_id",
+            name="provider_installations_tenant_provider_external_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="provider_installations_tenant_id_fkey")
+    )
+    provider: Mapped[str] = mapped_column(String)
+    external_account_id: Mapped[str] = mapped_column(String)
+    display_name: Mapped[str | None] = mapped_column(default=None)
+    credential_ref: Mapped[str | None] = mapped_column(default=None)
+    scopes: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    webhook_verification_ref: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(String, default="connected", server_default="connected")
+    installed_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    installed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    disconnected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
