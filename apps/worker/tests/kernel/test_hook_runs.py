@@ -119,15 +119,29 @@ async def _wait_for_blocked_hook_run_update(
     raise AssertionError("hook run update did not wait for the row lock")
 
 
-async def _wait_for_streamed_started_output(
-    updates: list[tuple[str, str, str]],
-) -> None:
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if any(text == "started" for _channel, _reply_ref, text in updates):
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("kernel did not deliver streamed start output")
+def _arm_started_frame(kernel: object) -> asyncio.Event:
+    """Latch once the kernel applies the cron start delta.
+
+    A cron turn does not post that partial, so the sink is not the signal that
+    the stream has begun. The latch fires when ``_apply_frame`` takes the first
+    text delta, which is the same moment the old partial edit was sent.
+    """
+    applied = asyncio.Event()
+    original = kernel._apply_frame  # type: ignore[attr-defined]
+
+    async def spy(
+        frame: object,
+        acc: object,
+        reply: object,
+        qevent: object,
+        agent_id: object = None,
+    ) -> None:
+        await original(frame, acc, reply, qevent, agent_id)
+        if isinstance(frame, TextDelta) and frame.text == "started":
+            applied.set()
+
+    kernel._apply_frame = spy  # type: ignore[attr-defined]
+    return applied
 
 
 @pytest.mark.parametrize(
@@ -289,8 +303,9 @@ def test_delivery_deadline_after_cron_start_closes_failed(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="started")]
             event = _event(hook_run=run.ref)
+            started = _arm_started_frame(h.kernel)
             task = asyncio.create_task(h.kernel.process_event(event, lease=lease))
-            await _wait_for_streamed_started_output(h.sink.updates)
+            await asyncio.wait_for(started.wait(), timeout=2.0)
 
             seconds, microseconds = await h.async_redis.time()
             now_ms = int(seconds) * 1000 + int(microseconds) // 1000
@@ -518,9 +533,10 @@ def test_cancellation_after_cron_start_closes_failed_and_propagates(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="started")]
             event = _event(hook_run=run.ref)
+            started = _arm_started_frame(h.kernel)
             task = asyncio.create_task(h.kernel.process_event(event))
             try:
-                await _wait_for_streamed_started_output(h.sink.updates)
+                await asyncio.wait_for(started.wait(), timeout=2.0)
 
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -551,9 +567,10 @@ def test_cancellation_survives_second_cancel_and_failed_failure_close(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="started")]
             event = _event(hook_run=run.ref)
+            started = _arm_started_frame(h.kernel)
             task = asyncio.create_task(h.kernel.process_event(event))
             try:
-                await _wait_for_streamed_started_output(h.sink.updates)
+                await asyncio.wait_for(started.wait(), timeout=2.0)
 
                 async with _reject_hook_run_outcome(
                     run.engine, run.run_id, "failed"
@@ -632,9 +649,10 @@ def test_lost_lease_after_cron_start_leaves_run_open(
             h.runner.default_script = [TextDelta(text="started")]
             h.runner.tail = [Final(text="complete", status=SessionStatus.DONE)]
             event = _event(hook_run=run.ref)
+            started = _arm_started_frame(h.kernel)
             task = asyncio.create_task(h.kernel.process_event(event, lease=lease))
             try:
-                await _wait_for_streamed_started_output(h.sink.updates)
+                await asyncio.wait_for(started.wait(), timeout=2.0)
 
                 await store.release(
                     h.config.stream,

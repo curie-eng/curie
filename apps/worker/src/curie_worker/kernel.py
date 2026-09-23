@@ -3492,7 +3492,9 @@ class Kernel:
         # A placeholderless job or review candidate must route first. Otherwise
         # every busy redelivery or authority outage posts a notice for a turn
         # that never started. Reviews publish their receipt after reservation;
-        # jobs publish the deferred booting state below after routing succeeds.
+        # webhook jobs publish that deferred booting state below after routing
+        # succeeds, and a cron turn does not. A cron turn posts once, when the
+        # final reply is delivered.
         review_candidate = _REVIEW_EVENT_ID_RE.fullmatch(qevent.event_id) is not None
         placeholder = None if handle is None else handle.placeholder
         defer_job_booting = placeholder is None and qevent.source.is_job
@@ -3815,7 +3817,11 @@ class Kernel:
                 # second time.
                 logger.warning("GitHub feedback receipt delivery unavailable")
 
-        if not self._config.slack_no_edit_streaming and defer_job_booting:
+        if (
+            not self._config.slack_no_edit_streaming
+            and defer_job_booting
+            and qevent.source is not TurnSource.CRON
+        ):
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
@@ -5981,7 +5987,10 @@ class Kernel:
             route=route,
             min_interval_s=self._config.slack_edit_min_interval_s,
             nav=nav,
-            no_edit=self._config.slack_no_edit_streaming,
+            no_edit=(
+                self._config.slack_no_edit_streaming
+                or qevent.source is TurnSource.CRON
+            ),
             # Reply delivery is best-effort ONLY on an approval-resume turn (the
             # granted tool has already executed in the runner): a dead reply
             # endpoint with no default transport completes the turn instead of

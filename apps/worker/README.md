@@ -167,6 +167,9 @@ XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
    -> XACK
 ```
 
+A targeted cron turn posts one message containing the final reply and does not
+show the booting caption or stream partial edits.
+
 Rules (detailed-architecture 2b), each with an integration test that provokes it
 (`tests/kernel/`):
 
