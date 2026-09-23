@@ -1906,13 +1906,15 @@ fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
         })
     );
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("#268"),
-        "a bundle with no cron trigger must not report #268"
+        !String::from_utf8_lossy(&output.stderr).contains("cron trigger"),
+        "a bundle with no cron trigger must not report one"
     );
 }
 
 #[test]
-fn cluster_deploy_cron_warning_is_once_for_single_and_all_targets() {
+fn cluster_deploy_with_cron_trigger_emits_no_cron_warning() {
+    // The worker scheduler fires cron triggers on cluster installs (#268), so
+    // deploy has nothing to warn about for single or all target invocations.
     for all_targets in [false, true] {
         let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
             all_targets,
@@ -1926,19 +1928,9 @@ fn cluster_deploy_cron_warning_is_once_for_single_and_all_targets() {
             Some(0),
             "cluster deploy failed: {stderr}"
         );
-        let warnings: Vec<&str> = stderr
-            .lines()
-            .filter(|line| line.contains("#268"))
-            .collect();
-        assert_eq!(
-            warnings.len(),
-            1,
-            "one cluster invocation must emit one cron warning: {stderr}"
-        );
-        assert!(warnings[0].contains("acme-nightly"), "was {stderr}");
         assert!(
-            warnings[0].contains("this platform tier does not yet fire it"),
-            "was {stderr}"
+            !stderr.contains("cron trigger") && !stderr.contains("#268"),
+            "cluster deploy must not warn about a cron trigger: {stderr}"
         );
     }
 }
@@ -2115,7 +2107,7 @@ fn cluster_deploy_json_single_target_shape_is_unchanged() {
     );
     assert_eq!(one_stdout_object(&output), expected_deploy("dev"));
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("#268"),
-        "a bundle with no cron trigger must not report #268"
+        !String::from_utf8_lossy(&output.stderr).contains("cron trigger"),
+        "a bundle with no cron trigger must not report one"
     );
 }

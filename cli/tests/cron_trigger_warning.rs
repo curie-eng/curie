@@ -107,15 +107,20 @@ fn valid_named_cron_trigger_warns_exactly_once_after_skill_check() {
         "valid skill check failed: {stderr}"
     );
     assert_eq!(
-        stderr.matches("#268").count(),
+        stderr.matches("skill tier has no scheduler").count(),
         1,
         "one invocation must print one scheduler warning: {stderr}"
     );
     assert!(stderr.contains("weekday digest"), "was {stderr}");
     assert!(
-        stderr.contains("this platform tier does not yet fire it"),
+        stderr.contains("the skill tier has no scheduler and does not fire it"),
         "was {stderr}"
     );
+    assert!(
+        stderr.contains("cron triggers fire only on local and cluster installs"),
+        "was {stderr}"
+    );
+    assert!(!stderr.contains("#268"), "was {stderr}");
 }
 
 #[test]
@@ -138,7 +143,15 @@ fn several_cron_triggers_share_one_warning_with_name_and_schedule_fallback() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(output.status.success(), "skill check failed: {stderr}");
-    assert_eq!(stderr.matches("#268").count(), 1, "was {stderr}");
+    assert_eq!(
+        stderr.matches("skill tier has no scheduler").count(),
+        1,
+        "was {stderr}"
+    );
+    assert!(
+        stderr.contains("the skill tier has no scheduler"),
+        "was {stderr}"
+    );
     assert!(stderr.contains("weekday digest"), "was {stderr}");
     assert!(
         stderr.contains("3 with schedule \"0 18 * * *\""),
@@ -160,7 +173,7 @@ fn skill_check_without_a_cron_trigger_has_no_scheduler_warning() {
         let output = run_skill_check(manifest, GREEN_REPORT);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "skill check failed: {stderr}");
-        assert!(!stderr.contains("#268"), "was {stderr}");
+        assert!(!stderr.contains("cron trigger"), "was {stderr}");
     }
 }
 
@@ -184,5 +197,8 @@ fn invalid_bundle_verdict_suppresses_cron_warning() {
 
     assert_eq!(output.status.code(), Some(2), "was {stderr}");
     assert!(stderr.contains("triggers.cron_missing_schedule"));
-    assert!(!stderr.contains("#268"), "was {stderr}");
+    assert!(
+        !stderr.contains("skill tier has no scheduler"),
+        "was {stderr}"
+    );
 }

@@ -5424,13 +5424,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                         prepared_targets.push((target, prepared_deploy, prepared_connectors));
                     }
 
-                    // Every target uploads the same packed bundle. The first
-                    // prepared result carries its validated cron advisory, so
-                    // the invocation reports it once before activation begins.
-                    if let Some((_, prepared_deploy, _)) = prepared_targets.first() {
-                        prepared_deploy.emit_cron_trigger_warning();
-                    }
-
                     // Activate and reconcile in the API's declared target order.
                     let mut completed = Vec::new();
                     for (target, prepared_deploy, prepared_connectors) in prepared_targets {
