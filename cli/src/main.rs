@@ -24,7 +24,6 @@ use curie::github_app as crate_github_app;
 use curie::local::{self, LocalDownOpts, LocalOpts};
 use curie::message::{self, MessageOpts};
 use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts, UpgradeChart, UpgradeOpts};
-use curie::provider::{self, StoreRoute};
 use curie::secrets;
 use curie::state::{apply_continue, load_turn, CliTurnArgs, TurnVerb};
 use curie::ui::{self, ColorFlag, Ui};
@@ -1330,9 +1329,9 @@ enum DevAction {
 
 #[derive(Subcommand)]
 enum SecretsAction {
-    /// Save a secret in Curie private storage. Prompts with hidden input by default.
+    /// Save a local secret or one key in a declared provider object.
     Set {
-        /// Environment-variable-style secret name, e.g. GITHUB_PERSONAL_ACCESS_TOKEN.
+        /// Local NAME, or provider logical/KEY such as platform-model/ANTHROPIC_API_KEY.
         name: String,
         /// Read the value from another environment variable instead of prompting.
         #[arg(long)]
@@ -1347,27 +1346,26 @@ enum SecretsAction {
         /// Kubernetes namespace the secret may be injected into.
         #[arg(long)]
         namespace: Option<String>,
-        /// Compare-and-set version from `curie secrets list --json`. Required to
-        /// replace an existing cluster-scoped secret.
+        /// Compare-and-set version from `curie secrets list --json`. Local
+        /// cluster-scoped store only.
         #[arg(long)]
         expected_version: Option<u64>,
         /// Installation file. When it declares `secrets.provider`, set uses the
-        /// provider. This build returns not implemented on that path.
+        /// provider. When omitted, a curie.yaml in the current directory is used.
         #[arg(long, value_name = "PATH")]
         file: Option<PathBuf>,
-        /// Expiry timestamp for a provider tag. This build returns not
-        /// implemented when the flag is set and does not write the local store.
+        /// RFC 3339 expiry timestamp written as provider metadata.
         #[arg(long, value_name = "TIMESTAMP")]
         expires: Option<String>,
     },
     /// List saved Curie secret names. Values are never printed.
     List {
         /// Installation file. When it declares `secrets.provider`, list uses
-        /// the provider. This build returns not implemented on that path.
+        /// the provider. When omitted, a curie.yaml in the current directory is used.
         #[arg(long, value_name = "PATH")]
         file: Option<PathBuf>,
     },
-    /// Remove a saved secret.
+    /// Remove a local saved secret. Refused when curie.yaml declares a provider.
     Unset {
         /// Environment-variable-style secret name.
         name: String,
@@ -1382,19 +1380,19 @@ enum SecretsAction {
         #[arg(long)]
         namespace: Option<String>,
     },
-    /// Declared provider check. This build returns not implemented.
+    /// Check declared provider objects for expiry.
     Check {
-        /// Object name. Omit to check the whole install once the backend exists.
+        /// Object name. Omit to check the whole install.
         name: Option<String>,
-        /// Installation file. Accepted and ignored until the backend exists.
+        /// Installation file. Defaults to curie.yaml in the current directory.
         #[arg(long, value_name = "PATH")]
         file: Option<PathBuf>,
     },
-    /// Declared provider remove. This build returns not implemented.
+    /// Remove one object from the declared provider.
     Rm {
         /// Logical name to remove.
         name: String,
-        /// Installation file. Accepted and ignored until the backend exists.
+        /// Installation file. Defaults to curie.yaml in the current directory.
         #[arg(long, value_name = "PATH")]
         file: Option<PathBuf>,
     },
@@ -3767,34 +3765,34 @@ async fn run(command: Option<Command>) -> Result<()> {
                 expected_version,
                 file,
                 expires,
-            } => match provider::route_set(file.as_deref(), expires.as_deref())? {
-                StoreRoute::Provider => provider::not_implemented("curie secrets set"),
-                StoreRoute::Local => secrets::set(secrets::SetSecretOpts {
+            } => secrets::set_discovered(
+                file.as_deref(),
+                expires.as_deref(),
+                secrets::SetSecretOpts {
                     name,
                     from_env,
                     cluster_identity,
                     namespace,
                     release,
                     expected_version,
-                }),
-            },
-            SecretsAction::List { file } => match provider::route_list(file.as_deref())? {
-                StoreRoute::Provider => provider::not_implemented("curie secrets list"),
-                StoreRoute::Local => secrets::list(),
-            },
+                },
+            ),
+            SecretsAction::List { file } => secrets::list_discovered(file.as_deref()),
             SecretsAction::Unset {
                 name,
                 cluster_identity,
                 release,
                 namespace,
-            } => secrets::unset(secrets::UnsetSecretOpts {
+            } => secrets::unset_discovered(secrets::UnsetSecretOpts {
                 name,
                 cluster_identity,
                 namespace,
                 release,
             }),
-            SecretsAction::Check { .. } => provider::not_implemented("curie secrets check"),
-            SecretsAction::Rm { .. } => provider::not_implemented("curie secrets rm"),
+            SecretsAction::Check { name, file } => {
+                secrets::check_discovered(file.as_deref(), name.as_deref())
+            }
+            SecretsAction::Rm { name, file } => secrets::remove_discovered(file.as_deref(), &name),
         },
         Some(Command::Dev { action }) => match action {
             DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh", &[]).await,
@@ -5865,6 +5863,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                 });
             }
             let cfg = curie::installation::Installation::load(&file)?;
+            if cfg.secrets.is_some() {
+                return Err(curie::exit::CliError::failure(
+                    "curie apply cannot yet converge a declared secrets provider without placing provider values in Helm",
+                )
+                .with_fix(
+                    "Use standalone curie secrets commands to populate the provider. Apply support lands with External Secrets convergence.",
+                )
+                .into());
+            }
             if let Some(target) =
                 curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
                     context.as_deref(),

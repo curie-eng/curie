@@ -12,6 +12,13 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
+
+use crate::provider::{
+    aws::AwsSecretsProvider, ObjectMetadata, ProviderError, PutRequest, SecretMaterial,
+    SecretsProvider, EXPIRY_TAG,
+};
 
 const SERVICE: &str = "ai.curietech.curie";
 const VAULT_ACCOUNT: &str = "curie:global:vault";
@@ -32,6 +39,337 @@ pub struct UnsetSecretOpts {
     pub cluster_identity: Option<String>,
     pub namespace: Option<String>,
     pub release: Option<String>,
+}
+
+/// Resolve the provider declared by one parsed installation.
+///
+/// Construction performs the backend preflight. An installation without a
+/// `secrets:` block never looks for the AWS CLI, preserving the local path.
+pub fn provider_for_installation(
+    installation: &crate::installation::Installation,
+) -> Result<Option<AwsSecretsProvider>> {
+    let Some(config) = installation.secrets.as_ref() else {
+        return Ok(None);
+    };
+    match config.provider {
+        crate::installation::ProviderKind::Aws => AwsSecretsProvider::new(
+            &config.region,
+            &config.prefix,
+            &installation.install.release,
+        )
+        .map(Some),
+    }
+}
+
+/// Load the installation selected by a standalone `curie secrets` command.
+///
+/// An explicit path always wins. Without one, a present `curie.yaml` in the
+/// current directory is authoritative, including when it is malformed. A
+/// genuinely absent file keeps the local secret store behavior.
+fn discover_installation(file: Option<&Path>) -> Result<Option<crate::installation::Installation>> {
+    if let Some(path) = file {
+        return crate::installation::Installation::load(path).map(Some);
+    }
+
+    let path = Path::new("curie.yaml");
+    match fs::symlink_metadata(path) {
+        Ok(_) => crate::installation::Installation::load(path).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspecting curie.yaml for a secrets provider"),
+    }
+}
+
+fn discover_provider(file: Option<&Path>) -> Result<Option<AwsSecretsProvider>> {
+    discover_installation(file)?
+        .as_ref()
+        .map(provider_for_installation)
+        .transpose()
+        .map(Option::flatten)
+}
+
+/// Route `curie secrets set` through a declared provider or the existing local
+/// store. Provider input names one logical object and one JSON key.
+pub fn set_discovered(
+    file: Option<&Path>,
+    expires: Option<&str>,
+    opts: SetSecretOpts,
+) -> Result<()> {
+    let installation = discover_installation(file)?;
+    let Some(installation) = installation
+        .as_ref()
+        .filter(|config| config.secrets.is_some())
+    else {
+        if expires.is_some() {
+            return Err(crate::exit::usage(
+                "--expires requires a curie.yaml secrets provider",
+            ));
+        }
+        return set(opts);
+    };
+
+    if opts.cluster_identity.is_some() || opts.namespace.is_some() || opts.release.is_some() {
+        return Err(crate::exit::usage(
+            "provider secrets are scoped by curie.yaml; do not pass --cluster-identity, --release, or --namespace",
+        ));
+    }
+    if opts.expected_version.is_some() {
+        return Err(crate::exit::usage(
+            "--expected-version applies to the local cluster-scoped store, not provider secrets",
+        ));
+    }
+    if let Some(raw) = expires {
+        parse_expiry(raw)?;
+    }
+    let (logical, key) = provider_target(&opts.name)?;
+    let provider = provider_for_installation(installation)?
+        .context("declared secrets provider could not be constructed")?;
+    set_provider(&provider, &logical, &key, expires, opts.from_env)
+}
+
+fn set_provider(
+    provider: &dyn SecretsProvider,
+    logical: &str,
+    key: &str,
+    expires: Option<&str>,
+    from_env: Option<String>,
+) -> Result<()> {
+    let value = match from_env {
+        Some(var) => std::env::var(&var)
+            .with_context(|| format!("{var} is not set; cannot save {logical}/{key}"))?,
+        None => prompt_secret(key)?,
+    };
+    if value.is_empty() {
+        bail!("refusing to store an empty secret for {logical}/{key}");
+    }
+
+    let (mut values, expected_version) = match provider.get(logical, None) {
+        Ok(stored) => {
+            let values: BTreeMap<String, String> = serde_json::from_str(stored.material.expose())
+                .with_context(|| {
+                format!("provider object {logical} is not a JSON string map")
+            })?;
+            (values, Some(stored.version.id))
+        }
+        Err(ProviderError::NotFound { .. }) => (BTreeMap::new(), None),
+        Err(error) => return Err(error.into()),
+    };
+    values.insert(key.to_string(), value);
+    let material =
+        SecretMaterial::new(serde_json::to_string(&values).context("serializing provider secret")?);
+    let version = provider.put(&PutRequest {
+        name: logical,
+        material: &material,
+        expected_version: expected_version.as_deref(),
+    })?;
+    if let Some(expires) = expires {
+        let tags = BTreeMap::from([(EXPIRY_TAG.to_string(), expires.to_string())]);
+        provider.tag(logical, &tags, Some(&version.id))?;
+    }
+    crate::ui::ui().success(&format!(
+        "saved {logical}/{key} in the declared secrets provider"
+    ));
+    Ok(())
+}
+
+fn provider_target(raw: &str) -> Result<(String, String)> {
+    let Some((logical, key)) = raw.split_once('/') else {
+        return Err(crate::exit::usage(
+            "provider secrets use logical/KEY, where logical is a Kubernetes Secret name and KEY is an environment-variable-style key",
+        ));
+    };
+    if logical.is_empty() || key.is_empty() || key.contains('/') || !kubernetes_secret_name(logical)
+    {
+        return Err(crate::exit::usage(
+            "provider secrets use logical/KEY, where logical is a Kubernetes Secret name and KEY is an environment-variable-style key",
+        ));
+    }
+    validate_name(key)?;
+    Ok((logical.to_string(), key.to_string()))
+}
+
+fn kubernetes_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                })
+                && label.chars().next().is_some_and(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit()
+                })
+                && label.chars().last().is_some_and(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit()
+                })
+        })
+}
+
+/// Route `curie secrets list` through a declared provider or the local store.
+pub fn list_discovered(file: Option<&Path>) -> Result<()> {
+    let Some(provider) = discover_provider(file)? else {
+        return list();
+    };
+    let metadata = provider.list("")?;
+    let mut names: Vec<String> = metadata.iter().map(|item| item.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    let entries = names
+        .iter()
+        .map(|name| SecretListEntry {
+            name: name.clone(),
+            scope: None,
+            version: None,
+        })
+        .collect();
+    crate::ui::ui().emit(&SecretsListOutput { names, entries });
+    Ok(())
+}
+
+/// Keep the legacy local delete verb from mutating a second store when the
+/// current installation declares a provider.
+pub fn unset_discovered(opts: UnsetSecretOpts) -> Result<()> {
+    if discover_installation(None)?
+        .as_ref()
+        .is_some_and(|installation| installation.secrets.is_some())
+    {
+        return Err(crate::exit::usage(
+            "curie secrets unset is local-only and is refused when curie.yaml declares a provider; use curie secrets rm <logical> to remove a provider object",
+        ));
+    }
+    unset(opts)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderCheckEntry {
+    name: String,
+    version: String,
+    expires_at: Option<String>,
+    status: &'static str,
+}
+
+struct ProviderCheckOutput {
+    entries: Vec<ProviderCheckEntry>,
+}
+
+impl crate::ui::CliOutput for ProviderCheckOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "checked": self.entries.iter().map(|entry| serde_json::json!({
+                "name": entry.name,
+                "version": entry.version,
+                "expires_at": entry.expires_at,
+                "status": entry.status,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        if self.entries.is_empty() {
+            ui.note("no provider secrets found");
+            return;
+        }
+        for entry in &self.entries {
+            let detail = match &entry.expires_at {
+                Some(expires_at) => format!("{} expires at {expires_at}", entry.name),
+                None => format!("{} has no expiry", entry.name),
+            };
+            if entry.status == "warning" {
+                ui.warn(&detail);
+            } else if entry.status == "expired" {
+                ui.warn(&format!("{detail} and is expired"));
+            } else {
+                ui.success(&detail);
+            }
+        }
+    }
+}
+
+/// Check expiry metadata for one provider object or the whole installation.
+pub fn check_discovered(file: Option<&Path>, name: Option<&str>) -> Result<()> {
+    let provider = discover_provider(file)?.ok_or_else(|| {
+        crate::exit::usage("curie secrets check requires a curie.yaml secrets provider")
+    })?;
+    let metadata = match name {
+        Some(name) => vec![provider.get_metadata(name)?],
+        None => provider.list("")?,
+    };
+    let output = provider_check_output(metadata, OffsetDateTime::now_utc())?;
+    let expired: Vec<&str> = output
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "expired")
+        .map(|entry| entry.name.as_str())
+        .collect();
+    if expired.is_empty() {
+        crate::ui::ui().emit(&output);
+        return Ok(());
+    }
+    Err(crate::ui::ui().failed_report(
+        &output,
+        crate::exit::CliError::failure(format!(
+            "provider secret expiry check failed: {} expired",
+            expired.join(", ")
+        ))
+        .with_fix("Rotate each expired secret and set a future --expires timestamp.")
+        .into(),
+    ))
+}
+
+fn provider_check_output(
+    mut metadata: Vec<ObjectMetadata>,
+    now: OffsetDateTime,
+) -> Result<ProviderCheckOutput> {
+    metadata.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut entries = Vec::with_capacity(metadata.len());
+    for item in metadata {
+        let expires_at = item.tags.get(EXPIRY_TAG).cloned();
+        let status = match expires_at.as_deref() {
+            None => "ok",
+            Some(raw) => {
+                let expiry = parse_expiry(raw)?;
+                if expiry <= now {
+                    "expired"
+                } else if expiry - now <= Duration::days(30) {
+                    "warning"
+                } else {
+                    "ok"
+                }
+            }
+        };
+        entries.push(ProviderCheckEntry {
+            name: item.name,
+            version: item.version.id,
+            expires_at,
+            status,
+        });
+    }
+    Ok(ProviderCheckOutput { entries })
+}
+
+fn parse_expiry(raw: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(raw, &Rfc3339).map_err(|_| {
+        crate::exit::usage(format!(
+            "expiry timestamp {raw:?} must be RFC 3339, for example 2027-01-15T08:00:00Z"
+        ))
+    })
+}
+
+/// Delete one logical provider object.
+pub fn remove_discovered(file: Option<&Path>, name: &str) -> Result<()> {
+    if !kubernetes_secret_name(name) {
+        return Err(crate::exit::usage(
+            "provider secret name must be a Kubernetes Secret name",
+        ));
+    }
+    let provider = discover_provider(file)?.ok_or_else(|| {
+        crate::exit::usage("curie secrets rm requires a curie.yaml secrets provider")
+    })?;
+    provider.delete(name, None)?;
+    crate::ui::ui().success(&format!(
+        "removed {name} from the declared secrets provider"
+    ));
+    Ok(())
 }
 
 /// The cluster target a stored connector secret is allowed to be injected into.
@@ -854,6 +1192,36 @@ fn config_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::ui::CliOutput;
+
+    #[test]
+    fn provider_expiry_check_distinguishes_warning_and_expired() {
+        let now = OffsetDateTime::parse("2026-09-22T00:00:00Z", &Rfc3339).unwrap();
+        let entry = |name: &str, expires_at: &str| ObjectMetadata {
+            name: name.to_string(),
+            version: crate::provider::ObjectVersion {
+                id: "version-one".to_string(),
+            },
+            tags: BTreeMap::from([(EXPIRY_TAG.to_string(), expires_at.to_string())]),
+            key_names: vec!["KEY".to_string()],
+        };
+        let output = provider_check_output(
+            vec![
+                entry("safe", "2026-10-23T00:00:00Z"),
+                entry("warning", "2026-10-22T00:00:00Z"),
+                entry("expired", "2026-09-21T00:00:00Z"),
+            ],
+            now,
+        )
+        .unwrap();
+        let statuses: BTreeMap<_, _> = output
+            .entries
+            .iter()
+            .map(|item| (item.name.as_str(), item.status))
+            .collect();
+        assert_eq!(statuses["safe"], "ok");
+        assert_eq!(statuses["warning"], "warning");
+        assert_eq!(statuses["expired"], "expired");
+    }
 
     #[test]
     fn validates_env_like_names() {

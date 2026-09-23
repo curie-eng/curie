@@ -5503,11 +5503,11 @@ export const commandManifest = {
       "name": "secrets",
       "subcommands": [
         {
-          "about": "Save a secret in Curie private storage. Prompts with hidden input by default",
+          "about": "Save a local secret or one key in a declared provider object",
           "args": [
             {
               "global": false,
-              "help": "Environment-variable-style secret name, e.g. GITHUB_PERSONAL_ACCESS_TOKEN",
+              "help": "Local NAME, or provider logical/KEY such as platform-model/ANTHROPIC_API_KEY",
               "id": "name",
               "positional": true,
               "required": true
@@ -5546,7 +5546,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Compare-and-set version from `curie secrets list --json`. Required to replace an existing cluster-scoped secret",
+              "help": "Compare-and-set version from `curie secrets list --json`. Local cluster-scoped store only",
               "id": "expected_version",
               "long": "expected-version",
               "positional": false,
@@ -5554,7 +5554,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Installation file. When it declares `secrets.provider`, set uses the provider. This build returns not implemented on that path",
+              "help": "Installation file. When it declares `secrets.provider`, set uses the provider. When omitted, a curie.yaml in the current directory is used",
               "id": "file",
               "long": "file",
               "positional": false,
@@ -5562,7 +5562,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Expiry timestamp for a provider tag. This build returns not implemented when the flag is set and does not write the local store",
+              "help": "RFC 3339 expiry timestamp written as provider metadata",
               "id": "expires",
               "long": "expires",
               "positional": false,
@@ -5577,7 +5577,7 @@ export const commandManifest = {
           "args": [
             {
               "global": false,
-              "help": "Installation file. When it declares `secrets.provider`, list uses the provider. This build returns not implemented on that path",
+              "help": "Installation file. When it declares `secrets.provider`, list uses the provider. When omitted, a curie.yaml in the current directory is used",
               "id": "file",
               "long": "file",
               "positional": false,
@@ -5588,7 +5588,7 @@ export const commandManifest = {
           "name": "list"
         },
         {
-          "about": "Remove a saved secret",
+          "about": "Remove a local saved secret. Refused when curie.yaml declares a provider",
           "args": [
             {
               "global": false,
@@ -5626,18 +5626,18 @@ export const commandManifest = {
           "name": "unset"
         },
         {
-          "about": "Declared provider check. This build returns not implemented",
+          "about": "Check declared provider objects for expiry",
           "args": [
             {
               "global": false,
-              "help": "Object name. Omit to check the whole install once the backend exists",
+              "help": "Object name. Omit to check the whole install",
               "id": "name",
               "positional": true,
               "required": false
             },
             {
               "global": false,
-              "help": "Installation file. Accepted and ignored until the backend exists",
+              "help": "Installation file. Defaults to curie.yaml in the current directory",
               "id": "file",
               "long": "file",
               "positional": false,
@@ -5648,7 +5648,7 @@ export const commandManifest = {
           "name": "check"
         },
         {
-          "about": "Declared provider remove. This build returns not implemented",
+          "about": "Remove one object from the declared provider",
           "args": [
             {
               "global": false,
@@ -5659,7 +5659,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Installation file. Accepted and ignored until the backend exists",
+              "help": "Installation file. Defaults to curie.yaml in the current directory",
               "id": "file",
               "long": "file",
               "positional": false,
