@@ -3056,7 +3056,7 @@ def routing_installation(
     document: dict[str, Any] = {
         "version": 1,
         "install": {"namespace": namespace, "release": release, "context": context},
-        "platform": {"ui": False},
+        "platform": {"ui": False, "gvisor": "off"},
         "credentials": {"model": ROUTING_MODEL_ENV, "github_token": ROUTING_GITHUB_ENV},
         "set": overrides,
     }
