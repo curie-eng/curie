@@ -4,7 +4,8 @@ Adds tenant scoped ``principals``, ``teams`` and ``principal_teams``. A
 principal is keyed on its IdP subject within a tenant; email and display name
 are attributes and never the key. ``teams`` and ``principal_teams`` are a
 rebuildable projection of the IdP's groups, not a system of record for
-membership. Nothing reads or writes these tables yet.
+membership; each membership carries its tenant so it cannot cross tenants.
+Nothing reads or writes these tables yet.
 
 Revision ID: 0052
 Revises: 0051
@@ -32,9 +33,7 @@ def upgrade() -> None:
         sa.Column("tenant_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("idp_subject", sa.String(), nullable=False),
         sa.Column("type", sa.String(), nullable=False),
-        sa.Column(
-            "status", sa.String(), server_default="active", nullable=False
-        ),
+        sa.Column("status", sa.String(), server_default="active", nullable=False),
         sa.Column("display_name", sa.String(), nullable=True),
         sa.Column("email", sa.String(), nullable=True),
         sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=True),
@@ -44,9 +43,7 @@ def upgrade() -> None:
             server_default="1",
             nullable=False,
         ),
-        sa.CheckConstraint(
-            "type IN ('human', 'service')", name="principals_type_ck"
-        ),
+        sa.CheckConstraint("type IN ('human', 'service')", name="principals_type_ck"),
         sa.CheckConstraint(
             "status IN ('active', 'disabled', 'revoked')",
             name="principals_status_ck",
@@ -57,9 +54,9 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(["tenant_id"], [f"{SCHEMA}.tenants.id"]),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "tenant_id", "idp_subject", name="principals_tenant_idp_subject_key"
-        ),
+        sa.UniqueConstraint("tenant_id", "idp_subject", name="principals_tenant_idp_subject_key"),
+        # Target of principal_teams' tenant-scoped foreign key.
+        sa.UniqueConstraint("tenant_id", "id", name="principals_tenant_id_id_key"),
         schema=SCHEMA,
     )
 
@@ -70,9 +67,7 @@ def upgrade() -> None:
         sa.Column("source", sa.String(), nullable=False),
         sa.Column("external_id", sa.String(), nullable=True),
         sa.Column("name", sa.String(), nullable=False),
-        sa.CheckConstraint(
-            "source IN ('idp_group', 'curie_managed')", name="teams_source_ck"
-        ),
+        sa.CheckConstraint("source IN ('idp_group', 'curie_managed')", name="teams_source_ck"),
         sa.CheckConstraint(
             "source <> 'idp_group' OR external_id IS NOT NULL",
             name="teams_idp_group_external_id_ck",
@@ -85,6 +80,8 @@ def upgrade() -> None:
             "external_id",
             name="teams_tenant_source_external_id_key",
         ),
+        # Target of principal_teams' tenant-scoped foreign key.
+        sa.UniqueConstraint("tenant_id", "id", name="teams_tenant_id_id_key"),
         schema=SCHEMA,
     )
 
@@ -92,6 +89,7 @@ def upgrade() -> None:
         "principal_teams",
         sa.Column("principal_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("team_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("tenant_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("source", sa.String(), nullable=False),
         sa.Column("version", sa.Integer(), server_default="1", nullable=False),
         sa.Column(
@@ -105,11 +103,19 @@ def upgrade() -> None:
             name="principal_teams_source_ck",
         ),
         sa.CheckConstraint("version >= 1", name="principal_teams_version_ck"),
+        # Both keys carry tenant_id, so a membership can only link a
+        # principal and a team from the same tenant.
         sa.ForeignKeyConstraint(
-            ["principal_id"], [f"{SCHEMA}.principals.id"], ondelete="CASCADE"
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            ondelete="CASCADE",
+            name="principal_teams_principal_fkey",
         ),
         sa.ForeignKeyConstraint(
-            ["team_id"], [f"{SCHEMA}.teams.id"], ondelete="CASCADE"
+            ["tenant_id", "team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            ondelete="CASCADE",
+            name="principal_teams_team_fkey",
         ),
         sa.PrimaryKeyConstraint("principal_id", "team_id"),
         schema=SCHEMA,
@@ -123,9 +129,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_principal_teams_team_id", table_name="principal_teams", schema=SCHEMA
-    )
+    op.drop_index("ix_principal_teams_team_id", table_name="principal_teams", schema=SCHEMA)
     op.drop_table("principal_teams", schema=SCHEMA)
     op.drop_table("teams", schema=SCHEMA)
     op.drop_table("principals", schema=SCHEMA)

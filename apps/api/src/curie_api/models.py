@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -1564,6 +1565,8 @@ class Principal(Base):
         UniqueConstraint(
             "tenant_id", "idp_subject", name="principals_tenant_idp_subject_key"
         ),
+        # Target of principal_teams' tenant-scoped foreign key.
+        UniqueConstraint("tenant_id", "id", name="principals_tenant_id_id_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1603,6 +1606,8 @@ class Team(Base):
             "external_id",
             name="teams_tenant_source_external_id_key",
         ),
+        # Target of principal_teams' tenant-scoped foreign key.
+        UniqueConstraint("tenant_id", "id", name="teams_tenant_id_id_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1616,7 +1621,9 @@ class PrincipalTeam(Base):
     """One principal's membership of one team, as last synced (#2907).
 
     A projection of the IdP's group membership, not a system of record;
-    ``version`` and ``synced_at`` record which sync produced the row.
+    ``version`` and ``synced_at`` record which sync produced the row. Both
+    foreign keys include ``tenant_id``, so a principal and a team from
+    different tenants cannot be linked.
     """
 
     __tablename__ = "principal_teams"
@@ -1626,15 +1633,24 @@ class PrincipalTeam(Base):
             name="principal_teams_source_ck",
         ),
         CheckConstraint("version >= 1", name="principal_teams_version_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            ondelete="CASCADE",
+            name="principal_teams_principal_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            ondelete="CASCADE",
+            name="principal_teams_team_fkey",
+        ),
         Index("ix_principal_teams_team_id", "team_id"),
     )
 
-    principal_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(f"{SCHEMA}.principals.id", ondelete="CASCADE"), primary_key=True
-    )
-    team_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(f"{SCHEMA}.teams.id", ondelete="CASCADE"), primary_key=True
-    )
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    team_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     source: Mapped[str] = mapped_column(String)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     synced_at: Mapped[datetime] = mapped_column(
