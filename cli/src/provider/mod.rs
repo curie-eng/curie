@@ -9,6 +9,7 @@ mod catalog;
 pub mod connector_deploy;
 pub mod eso;
 mod inventory;
+pub mod reconcile;
 pub mod render_check;
 pub mod rotation;
 
