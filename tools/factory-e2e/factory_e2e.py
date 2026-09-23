@@ -731,7 +731,10 @@ def judge_revision(obs: Mapping[str, Any]) -> list[str]:
     replies = list(obs.get("revision_replies") or [])
     if len(replies) != 1:
         failures.append(f"{len(replies)} App replies carry the revision marker, expected one")
-    elif f"issuecomment-{obs.get('mention_comment_id')}" not in str(replies[0].get("body") or ""):
+    elif not obs.get("mention_comment_url") or not re.search(
+        rf"(?m)^In response to {re.escape(str(obs['mention_comment_url']))}\s*$",
+        str(replies[0].get("body") or ""),
+    ):
         failures.append("the revision reply does not link the mention comment")
     if obs.get("app_comments_after_ordinary") != 1:
         failures.append(
@@ -778,8 +781,8 @@ def judge_cancel_waiting(obs: Mapping[str, Any]) -> list[str]:
 def judge_cancel_running(obs: Mapping[str, Any]) -> list[str]:
     """Every way cancelling a running request falls short. Pure.
 
-    The unlabel delivery's factory_cancellation_requested status stands in
-    for a cancellation_requested read that polling missed.
+    The cancellation_requested state must be read back, through the api
+    and the work-items CLI; a delivery status alone leaves it unverified.
     """
 
     failures: list[str] = []
@@ -797,10 +800,12 @@ def judge_cancel_running(obs: Mapping[str, Any]) -> list[str]:
     seen = list(obs.get("statuses_seen_after") or [])
     if not seen or seen[-1] != "cancelled":
         failures.append(f"the observed statuses {seen} do not end in 'cancelled'")
-    elif "cancellation_requested" in seen and seen.index("cancellation_requested") > seen.index(
-        "cancelled"
-    ):
+    elif "cancellation_requested" not in seen:
+        failures.append("cancellation_requested was never read back before cancelled; unverified")
+    elif seen.index("cancellation_requested") > seen.index("cancelled"):
         failures.append(f"cancellation_requested was observed after cancelled: {seen}")
+    if not obs.get("cli_cancellation_requested_checked"):
+        failures.append("the work-items CLI was not read during cancellation_requested")
     if obs.get("final_status") != "cancelled":
         failures.append(f"the request ended {obs.get('final_status')!r}")
     if obs.get("final_terminal_cause") != "issue_cancelled":
@@ -2733,6 +2738,15 @@ def cancel_running(p: Preflight) -> dict[str, Any]:
         if not seen or seen[-1] != status:
             seen.append(status)
             _timeline(obs, "status after unlabel", status=status)
+            if status == "cancellation_requested":
+                obs["cli_cancellation_requested_checked"] = True
+                p.cli_check(
+                    obs,
+                    work_item_id,
+                    expected_state="cancellation_requested",
+                    expected_statuses=["cancellation_requested"],
+                    label="cancellation_requested",
+                )
         if status not in ACTIVE_REQUEST_STATUSES:
             break
         time.sleep(2)

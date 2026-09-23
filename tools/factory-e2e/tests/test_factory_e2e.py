@@ -1147,14 +1147,30 @@ def _revision_obs(**overrides: Any) -> dict[str, Any]:
         "head_sha_after": "b" * 40,
         "commits_before": 1,
         "commits_after": 2,
-        "revision_replies": [{"body": "resolves issuecomment-555"}],
+        "revision_replies": [
+            {
+                "body": "The requested revision is pushed.\nIn response to https://github.com/acme/fixture/pull/7#issuecomment-555\n"
+            }
+        ],
         "mention_comment_id": 555,
+        "mention_comment_url": "https://github.com/acme/fixture/pull/7#issuecomment-555",
         "app_comments_after_ordinary": 1,
         "default_branch_moved": False,
         "cli_failures": [],
     }
     obs.update(overrides)
     return obs
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "resolves issuecomment-555",
+        "In response to https://github.com/acme/fixture/pull/7#issuecomment-5550\n",
+    ],
+)
+def test_judge_revision_requires_the_exact_mention_link(body: str) -> None:
+    assert fe.judge_revision(_revision_obs(revision_replies=[{"body": body}])) != []
 
 
 def test_judge_revision_passes_the_clean_fixture() -> None:
@@ -1242,6 +1258,7 @@ def _cancel_running_obs(**overrides: Any) -> dict[str, Any]:
         "default_branch_moved": False,
         "terminus_causes": ["issue_cancelled"],
         "cli_failures": [],
+        "cli_cancellation_requested_checked": True,
     }
     obs.update(overrides)
     return obs
@@ -1266,15 +1283,16 @@ def test_judge_cancel_running_passes_the_clean_fixture() -> None:
         {"default_branch_moved": True},
         {"terminus_causes": ["issue_cancelled", "issue_cancelled"]},
         {"cli_failures": ["work-items exit 1"]},
+        {"cli_cancellation_requested_checked": False},
     ],
 )
 def test_judge_cancel_running_fails_one_rule_at_a_time(overrides: dict[str, Any]) -> None:
     assert fe.judge_cancel_running(_cancel_running_obs(**overrides)) != []
 
 
-def test_judge_cancel_running_accepts_the_delivery_as_the_missed_observation() -> None:
-    passing = _cancel_running_obs(statuses_seen_after=["cancelled"])
-    assert fe.judge_cancel_running(passing) == []
+def test_judge_cancel_running_requires_reading_cancellation_requested_back() -> None:
+    missed = _cancel_running_obs(statuses_seen_after=["cancelled"])
+    assert fe.judge_cancel_running(missed) != []
     wrong_order = _cancel_running_obs(statuses_seen_after=["cancelled", "cancellation_requested"])
     assert fe.judge_cancel_running(wrong_order) != []
 
