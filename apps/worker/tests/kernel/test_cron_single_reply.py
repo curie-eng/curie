@@ -97,9 +97,11 @@ def test_human_slack_turn_still_shows_booting_text(make_harness) -> None:
 
             booting = h.config.booting_text
             texts = [text for _, _, text in h.sink.updates]
+            partials = [text for text in texts if text not in {booting, "answer ready"}]
             assert booting in texts
-            assert texts.index(booting) < texts.index("answer ready")
-            assert len(h.sink.updates) > 1
+            assert "answer ready" in texts
+            assert partials, "no streamed partial between the booting caption and the final"
+            assert texts.index(booting) < texts.index(partials[0]) < texts.index("answer ready")
 
     asyncio.run(go())
 
@@ -119,10 +121,14 @@ def test_webhook_job_still_posts_booting_then_edits(make_harness) -> None:
                 _qevent("run the hook", placeholder=None, source=TurnSource.WEBHOOK)
             )
 
+            booting = h.config.booting_text
             texts = [text for _, _, text in h.sink.updates]
-            assert h.config.booting_text in texts
+            partials = [text for text in texts if text not in {booting, "hook ready"}]
+            assert booting in texts
+            assert "hook ready" in texts
+            assert partials, "no streamed partial between the booting caption and the final"
+            assert texts.index(booting) < texts.index(partials[0]) < texts.index("hook ready")
             assert len(h.sink.text_posts) == 1, h.sink.text_posts
-            assert len(h.sink.updates) > 1
 
     asyncio.run(go())
 
