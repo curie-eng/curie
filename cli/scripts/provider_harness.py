@@ -1183,7 +1183,7 @@ class HarnessCase:
         )
         self.ledger.mark_created(row, f"{ESO_NAMESPACE}/external-secrets")
         if not self.real_aws:
-            endpoint = f"http://motosm.{NAMESPACE}.svc.cluster.local:5000"
+            endpoint = self.eso_moto_endpoint()
             self.kubectl(
                 "-n",
                 ESO_NAMESPACE,
@@ -1202,6 +1202,9 @@ class HarnessCase:
                 "--timeout=180s",
                 action="wait for External Secrets endpoint rollout",
             )
+
+    def eso_moto_endpoint(self) -> str:
+        return f"http://motosm.{NAMESPACE}.svc.cluster.local:5000"
 
     def create_provider_entry(self) -> None:
         assert self.ledger is not None
@@ -2628,6 +2631,24 @@ class HarnessCase:
                 action="delete exact OIDC bucket",
                 allow_failure=True,
             )
+        elif target.kind == "docker_container":
+            self.runner.run(
+                ["docker", "rm", "--force", target.identity],
+                "delete exact emulator container",
+                allow_failure=True,
+            )
+            wait_until(
+                f"emulator container deletion {target.identity}",
+                lambda: (
+                    self.runner.run(
+                        ["docker", "container", "inspect", target.identity],
+                        "verify emulator container absent",
+                        allow_failure=True,
+                    ).status
+                    != 0
+                ),
+                timeout=60,
+            )
         elif target.kind == "docker_image":
             self.runner.run(
                 ["docker", "image", "rm", "--force", target.identity],
@@ -2987,6 +3008,18 @@ def external_secret_mappings(external_secrets: dict[str, Any]) -> list[tuple[str
     return rows
 
 
+def moto_kind_ip(inspected: Any) -> str:
+    """The emulator container's IPv4 address on the `kind` docker network."""
+    record = inspected[0] if isinstance(inspected, list) and inspected else inspected
+    networks = (
+        record.get("NetworkSettings", {}).get("Networks", {}) if isinstance(record, dict) else {}
+    )
+    address = (networks.get("kind") or {}).get("IPAddress", "")
+    if re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}", address or "") is None:
+        raise HarnessError("emulator container has no address on the kind network")
+    return address
+
+
 def tag_form_images(rendered: str, exclude: Iterable[str] = ()) -> list[str]:
     """Third-party image references in rendered manifests that carry no digest."""
     skipped = set(exclude)
@@ -3051,6 +3084,8 @@ class RoutingHarnessCase(HarnessCase):
         self.hash_prefixes: dict[str, str] = {}
         self.curie_env: dict[str, str] = {}
         self.chart = str(self.snapshot / "charts/curie")
+        self.moto_container = require_owned_name(f"{OWNED_PREFIX}{self.suffix}-moto")
+        self.moto_ip = ""
 
     def _run_body(self) -> None:
         self.build_platform_images()
@@ -3058,7 +3093,6 @@ class RoutingHarnessCase(HarnessCase):
         self.scale_coredns()
         self.load_and_verify_images()
         self.preload_chart_images()
-        self.create_moto_namespace()
         self.start_moto()
         self.install_eso()
         self.create_routing_namespace_and_store()
@@ -3100,17 +3134,50 @@ class RoutingHarnessCase(HarnessCase):
                 timeout=300,
             )
 
-    def create_moto_namespace(self) -> None:
+    def start_moto(self) -> None:
+        """Moto as a container on the kind network: no port-forward to lose."""
         assert self.ledger is not None
-        row = self.ledger.record_intent("kubernetes_namespace", NAMESPACE)
-        self.apply(
-            yaml_document(
-                {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}}
-            ),
-            "create emulator namespace",
-            namespace=None,
+        credentials = write_private_file(
+            self.work / "aws-credentials",
+            "[theconnman]\naws_access_key_id = test\naws_secret_access_key = test\n",
         )
-        self.ledger.mark_created(row, NAMESPACE)
+        config = write_private_file(
+            self.work / "aws-config", "[profile theconnman]\nregion = us-east-1\n"
+        )
+        self.aws_env = aws_environment(credentials, config)
+        port = free_loopback_port()
+        row = self.ledger.record_intent("docker_container", self.moto_container)
+        self.runner.run(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--name",
+                self.moto_container,
+                "--network",
+                "kind",
+                "--publish",
+                f"127.0.0.1:{port}:5000",
+                MOTO_IMAGE,
+                "-H",
+                "0.0.0.0",
+                "-p",
+                "5000",
+            ],
+            "start emulator container",
+            timeout=600,
+        )
+        self.ledger.mark_created(row, self.moto_container)
+        inspected = self.runner.run(
+            ["docker", "container", "inspect", self.moto_container],
+            "inspect emulator container",
+        )
+        self.moto_ip = moto_kind_ip(parse_json(inspected.stdout, "emulator container"))
+        self.aws_endpoint = f"http://127.0.0.1:{port}"
+        wait_until("moto endpoint", lambda: self.tcp_ready(port), timeout=60, interval=0.5)
+
+    def eso_moto_endpoint(self) -> str:
+        return f"http://{self.moto_ip}:5000"
 
     def create_routing_namespace_and_store(self) -> None:
         assert self.ledger is not None

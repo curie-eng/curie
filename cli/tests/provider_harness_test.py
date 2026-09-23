@@ -1042,5 +1042,22 @@ class RoutingSuiteHelpers(unittest.TestCase):
         self.assertNotIn("secrets", control)
 
 
+class MotoContainerAddress(unittest.TestCase):
+    def test_kind_network_address_is_read_and_absence_is_refused(self):
+        inspected = [
+            {
+                "NetworkSettings": {
+                    "Networks": {
+                        "bridge": {"IPAddress": "172.17.0.2"},
+                        "kind": {"IPAddress": "172.18.0.5"},
+                    }
+                }
+            }
+        ]
+        self.assertEqual(provider_harness.moto_kind_ip(inspected), "172.18.0.5")
+        with self.assertRaises(provider_harness.HarnessError):
+            provider_harness.moto_kind_ip([{"NetworkSettings": {"Networks": {"bridge": {}}}}])
+
+
 if __name__ == "__main__":
     unittest.main()
