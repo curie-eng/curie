@@ -337,6 +337,7 @@
           "/cluster-message-replies/{reply_ref}",
           "/config",
           "/console/login-codes",
+          "/console/logout",
           "/console/oidc/callback",
           "/console/oidc/login",
           "/console/principal",
@@ -426,7 +427,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 960,
+      "cardinality_bound": 968,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -484,6 +485,7 @@
           "/cluster-message-replies/{reply_ref}",
           "/config",
           "/console/login-codes",
+          "/console/logout",
           "/console/oidc/callback",
           "/console/oidc/login",
           "/console/principal",
@@ -580,7 +582,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4800,
+      "cardinality_bound": 4840,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -638,6 +640,7 @@
           "/cluster-message-replies/{reply_ref}",
           "/config",
           "/console/login-codes",
+          "/console/logout",
           "/console/oidc/callback",
           "/console/oidc/login",
           "/console/principal",
@@ -734,7 +737,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4800,
+      "cardinality_bound": 4840,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
