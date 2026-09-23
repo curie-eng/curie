@@ -1586,9 +1586,6 @@ pub struct PreparedConnectorSync {
     /// Set by [`PreparedConnectorSync::into_provider_delivery`]: External
     /// Secrets writes the value Secret, so `sync` neither applies nor inspects it.
     provider_delivery: bool,
-    /// Names the prune must spare beyond what this sync applies (the ESO
-    /// sandbox Secret carries the owner label but is not a connector object).
-    prune_spare: Vec<String>,
 }
 
 impl PreparedConnectorSync {
@@ -1649,11 +1646,11 @@ impl PreparedConnectorSync {
         &self.keep
     }
 
-    /// The captured kubeconfig of the bound target, once `bind_target` ran.
-    pub fn bound_kubeconfig_path(&self) -> Option<&std::path::Path> {
-        self.bound_target
-            .as_ref()
-            .map(ClusterTarget::kubeconfig_path)
+    /// A clone of the bound target, once `bind_target` ran. The clone shares
+    /// the captured kubeconfig, so holding it keeps that file alive after this
+    /// plan is consumed by `sync`.
+    pub fn bound_target(&self) -> Option<ClusterTarget> {
+        self.bound_target.clone()
     }
 
     /// Hand the value Secret to External Secrets (ADR 0163 decision 6).
@@ -1674,13 +1671,6 @@ impl PreparedConnectorSync {
             });
         }
         self.provider_delivery = true;
-        self
-    }
-
-    /// Spare these names from the prune too. Provider delivery labels the
-    /// sandbox Secret with the owner, and it is not among the applied objects.
-    pub fn spare_from_prune(mut self, names: Vec<String>) -> Self {
-        self.prune_spare.extend(names);
         self
     }
 
@@ -1788,7 +1778,6 @@ pub fn prepare(
         target: target.clone(),
         bound_target: None,
         provider_delivery: false,
-        prune_spare: Vec::new(),
     })
 }
 
@@ -1812,7 +1801,6 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         target,
         bound_target,
         provider_delivery,
-        prune_spare,
     } = prepared;
     let bound_target = bound_target.context("connector sync has no captured Kubernetes target")?;
 
@@ -1856,10 +1844,8 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
     // Runs even with nothing declared -- that is the case where a connector was
     // REMOVED, and the whole reason this is not a bare `kubectl apply`.
     bound_target.revalidate_ambient_binding().await?;
-    let mut prune_keep = keep;
-    prune_keep.extend(prune_spare);
     let (ok, _out, err) = run(
-        &bound_target.args(&prune_args(&namespace, &agent_name, &prune_keep)),
+        &bound_target.args(&prune_args(&namespace, &agent_name, &keep)),
         None,
     )
     .await?;
