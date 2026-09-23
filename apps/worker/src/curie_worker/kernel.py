@@ -2966,6 +2966,9 @@ class Kernel:
         second sanctioned source -- no adapter can write to the stream, so the
         handle is trustworthy). A terminal path that marked done without a record
         would be a completion nothing could ever recover.
+        A targetless cron turn (#2963) is the one exception: no adapter is
+        waiting, so no completion is owed, and ``_settle_targetless`` marks it
+        done with no record.
 
         Since ADR-0131 this is also the FENCE. When the caller holds a delivery
         lease, steps 1 and 2 fuse into ``Markers.settle_fenced``, one script that

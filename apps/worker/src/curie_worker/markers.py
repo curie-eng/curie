@@ -252,10 +252,10 @@ class Markers:
         behind a guard that can never pass once ``done_key`` expires at
         ``idempotency_ttl_s``.
 
-        There is no marker-only form. Every durable terminal outcome goes through
-        ``Kernel._complete``, which writes the outbox record for THIS event id
-        first, so the record key is always this event's own -- the Lua below is a
-        no-op on the record when the sweeper cleared it concurrently, which is
+        This is the form for every turn that owes a completion. Every such
+        terminal outcome goes through ``Kernel._complete``, which writes the
+        outbox record for THIS event id first, so the record key is always this
+        event's own -- the Lua below is a no-op on the record when the sweeper cleared it concurrently, which is
         the only case where there is nothing to flag.
 
         It also widens the MARKER's own TTL to the outbox retention window, for
