@@ -13,6 +13,7 @@ import base64
 import contextlib
 import dataclasses
 import datetime as dt
+import gzip
 import hashlib
 import json
 import os
@@ -170,9 +171,7 @@ def first_rotation_sample_violation(
     digests = [initial] + [digest for _, _, digest in rotations]
     for index, (began, ended, digest) in enumerate(samples):
         allowed = {
-            digests[k]
-            for k in range(len(digests))
-            if starts[k] <= ended and began <= ends[k]
+            digests[k] for k in range(len(digests)) if starts[k] <= ended and began <= ends[k]
         }
         if digest not in allowed:
             return {
@@ -576,6 +575,8 @@ def yaml_document(value: dict[str, Any]) -> bytes:
 
 
 class HarnessCase:
+    EVIDENCE_SUITE = "aws-sec-harness"
+
     def __init__(
         self,
         repo_root: pathlib.Path,
@@ -605,7 +606,7 @@ class HarnessCase:
         self.bucket_name = require_owned_name(f"{OWNED_PREFIX}{suffix}-oidc")
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="curie-provider-harness-"))
         os.chmod(self.work, 0o700)
-        evidence_root = repo_root / ".projects/aws-secrets/evidence/aws-sec-harness" / suffix
+        evidence_root = repo_root / ".projects/aws-secrets/evidence" / self.EVIDENCE_SUITE / suffix
         evidence_root.mkdir(mode=0o700, parents=True, exist_ok=False)
         os.chmod(evidence_root, 0o700)
         self.evidence_root = evidence_root
@@ -863,6 +864,10 @@ class HarnessCase:
             require_private_file(self.work / filename)
 
     def build_images(self) -> None:
+        self.build_platform_images()
+        self.build_fixture_connector_image()
+
+    def build_platform_images(self) -> None:
         assert self.ledger is not None
         short = self.commit[:12]
         definitions = {
@@ -883,6 +888,9 @@ class HarnessCase:
             self.ledger.mark_created(row, tag)
             self.image_records[name] = {"tag": tag, "id": image_id}
 
+    def build_fixture_connector_image(self) -> None:
+        assert self.ledger is not None
+        short = self.commit[:12]
         fixture = self.snapshot / "cli/tests/fixtures/provider-bundle"
         self.runner.run(
             [str(self.curie_bin), "build", "--plugin-dir", str(fixture), "--force"],
@@ -1599,9 +1607,7 @@ class HarnessCase:
             "apply External Secrets sync objects",
         )
 
-    def secret_document(
-        self, name: str, namespace: str = NAMESPACE
-    ) -> dict[str, Any] | None:
+    def secret_document(self, name: str, namespace: str = NAMESPACE) -> dict[str, Any] | None:
         result = self.kubectl(
             "-n",
             namespace,
@@ -1619,9 +1625,7 @@ class HarnessCase:
         parsed = parse_json(result.stdout, "owned Secret")
         return parsed if isinstance(parsed, dict) else None
 
-    def decoded_secret_key(
-        self, name: str, key: str, namespace: str = NAMESPACE
-    ) -> bytes | None:
+    def decoded_secret_key(self, name: str, key: str, namespace: str = NAMESPACE) -> bytes | None:
         return decoded_document_key(self.secret_document(name, namespace), key)
 
     def wait_for_static_key(self) -> None:
@@ -2080,9 +2084,7 @@ class HarnessCase:
             slots_ok,
             f"max drift {max_drift:.3f}s",
         )
-        self.record_assertion(
-            "static key kept for the whole rotation phase", sampler.static_ok
-        )
+        self.record_assertion("static key kept for the whole rotation phase", sampler.static_ok)
         r15_digest = current
 
         # 3. Backup convergence after the final rotation.
@@ -2178,19 +2180,23 @@ class HarnessCase:
         )
         self.wait_rotation_key(STATIC_KEY, static_digest, "rebuild static key sync")
         self.deploy_rotation_workload()
-        observed = self.kubectl(
-            "-n",
-            ROTATION_NAMESPACE,
-            "exec",
-            f"deployment/{ROTATION_WORKLOAD}",
-            "--",
-            "python",
-            "-c",
-            "import hashlib,os;"
-            f"print(hashlib.sha256(os.environ['{ROTATED_KEY}'].encode()).hexdigest())",
-            action="read workload rotated key digest",
-            sensitive=True,
-        ).stdout.decode("ascii", "strict").strip()
+        observed = (
+            self.kubectl(
+                "-n",
+                ROTATION_NAMESPACE,
+                "exec",
+                f"deployment/{ROTATION_WORKLOAD}",
+                "--",
+                "python",
+                "-c",
+                "import hashlib,os;"
+                f"print(hashlib.sha256(os.environ['{ROTATED_KEY}'].encode()).hexdigest())",
+                action="read workload rotated key digest",
+                sensitive=True,
+            )
+            .stdout.decode("ascii", "strict")
+            .strip()
+        )
         report["workload_digest"] = observed[:12]
         self.record_assertion("rebuilt workload reads final rotation", observed == r15_digest)
 
@@ -2247,9 +2253,7 @@ class HarnessCase:
                 reverted = time.monotonic() - returned
                 break
             time.sleep(0.1)
-        report["negative_control_revert_seconds"] = (
-            None if reverted is None else round(reverted, 3)
-        )
+        report["negative_control_revert_seconds"] = None if reverted is None else round(reverted, 3)
         self.record_assertion(
             "Owner ExternalSecret reverted the rotation within 3 s",
             reverted is not None,
@@ -2803,6 +2807,7 @@ class HarnessCase:
                     ),
                 )
         if self.real_aws:
+
             def verify_tag_inventory() -> None:
                 tagged = self.aws(
                     "resourcegroupstaggingapi",
@@ -2861,6 +2866,624 @@ class HarnessCase:
                 STATIC_KEY: digest_prefix(self.seed[STATIC_KEY]),
                 ROTATED_KEY: digest_prefix(self.seed[ROTATED_KEY]),
             },
+            "assertions": self.assertions,
+            "orchestrator_status": status,
+            "cleanup_status": cleanup_status,
+            "commands": self.commands,
+        }
+        write_private_file(
+            self.evidence_root / "evidence.json",
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+        )
+
+
+ROUTING_RELEASE = "rt"
+ROUTING_NAMESPACE = "curie-aws-secrets-e2e-routing"
+ROUTING_ROLE_ARN = "arn:aws:iam::000000000000:role/curie-aws-secrets-e2e-routing"
+ROUTING_APPLY_COUNT = 4
+ROUTING_MAX_REVISIONS = 3
+ROUTING_MODEL_ENV = "CURIE_E2E_MODEL"
+ROUTING_GITHUB_ENV = "CURIE_E2E_GITHUB"
+ROUTING_MOTO_CREDENTIALS = "acme-harness-aws"
+# (logical name, target key, pod name marker) that must be proven in a running pod.
+ROUTING_REQUIRED_EXEC = (
+    ("runner-model-credentials", "agentCredentials", "-worker-"),
+    ("github-token", "githubToken", "-api-"),
+    ("installation-id", "installationId", "-worker-"),
+)
+IMAGE_LINE = re.compile(r"""^\s*(?:-\s*)?image:\s*["']?([^"'\s]+)["']?\s*$""", re.MULTILINE)
+
+
+def decode_helm_release(encoded: str) -> Any:
+    """Decode a `sh.helm.release.v1` Secret's `data.release` into its JSON.
+
+    Kubernetes base64 wraps Helm's own base64 of a gzip stream.
+    """
+    helm_encoded = base64.b64decode(encoded, validate=True)
+    payload = base64.b64decode(helm_encoded, validate=True)
+    if payload[:2] == b"\x1f\x8b":
+        payload = gzip.decompress(payload)
+    return json.loads(payload)
+
+
+def base64_forms(value: bytes) -> list[bytes]:
+    """Every base64 rendering of ``value`` at each of the three byte alignments.
+
+    Only characters fully determined by ``value`` are kept, so a match holds
+    wherever the value sits inside a longer base64 stream.
+    """
+    forms: list[bytes] = []
+    for offset, skip in ((0, 0), (1, 2), (2, 3)):
+        encoded = base64.b64encode(b"\0" * offset + value)
+        end = ((offset + len(value)) * 4) // 3
+        form = encoded[skip:end]
+        if form and form not in forms:
+            forms.append(form)
+    return forms
+
+
+def forbidden_hits(haystack: bytes, forbidden: dict[str, bytes]) -> list[str]:
+    """Labels of forbidden values found raw or base64 encoded in ``haystack``."""
+    hits: list[str] = []
+    for label, value in forbidden.items():
+        if not value:
+            continue
+        if value in haystack or any(form in haystack for form in base64_forms(value)):
+            hits.append(label)
+    return sorted(hits)
+
+
+def secret_key_env_refs(pods: dict[str, Any], secret: str, key: str) -> list[tuple[str, str, str]]:
+    """(pod, container, env name) of running containers reading ``secret``/``key``."""
+    found: list[tuple[str, str, str]] = []
+    for pod in pods.get("items", []):
+        if pod.get("status", {}).get("phase") != "Running":
+            continue
+        if pod.get("metadata", {}).get("deletionTimestamp"):
+            continue
+        running = {
+            status.get("name")
+            for status in pod.get("status", {}).get("containerStatuses", []) or []
+            if isinstance(status.get("state"), dict) and "running" in status["state"]
+        }
+        name = pod.get("metadata", {}).get("name", "")
+        for container in pod.get("spec", {}).get("containers", []) or []:
+            if container.get("name") not in running:
+                continue
+            for env in container.get("env", []) or []:
+                ref = (env.get("valueFrom") or {}).get("secretKeyRef") or {}
+                if ref.get("name") == secret and ref.get("key") == key:
+                    found.append((name, container["name"], env["name"]))
+    return found
+
+
+def secret_string_values(secret_string: str) -> list[str]:
+    """Every leaf value a Secrets Manager SecretString carries."""
+    try:
+        parsed = json.loads(secret_string)
+    except json.JSONDecodeError:
+        return [secret_string]
+    if not isinstance(parsed, dict):
+        return [secret_string]
+    return [value if isinstance(value, str) else json.dumps(value) for value in parsed.values()]
+
+
+def external_secret_mappings(external_secrets: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    """(target Secret, target key, remote id, property) for each ExternalSecret data row."""
+    rows: list[tuple[str, str, str, str]] = []
+    for item in external_secrets.get("items", []):
+        spec = item.get("spec", {})
+        target = (spec.get("target") or {}).get("name") or item["metadata"]["name"]
+        for data in spec.get("data", []) or []:
+            remote = data.get("remoteRef", {})
+            rows.append(
+                (
+                    target,
+                    data["secretKey"],
+                    remote["key"],
+                    remote.get("property") or data["secretKey"],
+                )
+            )
+    return rows
+
+
+def tag_form_images(rendered: str, exclude: Iterable[str] = ()) -> list[str]:
+    """Third-party image references in rendered manifests that carry no digest."""
+    skipped = set(exclude)
+    images = {match.group(1) for match in IMAGE_LINE.finditer(rendered)}
+    return sorted(image for image in images if "@" not in image and image not in skipped)
+
+
+def routing_installation(
+    namespace: str,
+    release: str,
+    context: str,
+    prefix: str,
+    images: dict[str, str],
+    *,
+    provider: bool = True,
+) -> dict[str, Any]:
+    """The routing suite's curie.yaml. ``images`` maps component to `repo:tag`."""
+
+    def split(reference: str) -> tuple[str, str]:
+        repository, _, tag = reference.rpartition(":")
+        return repository, tag
+
+    overrides: dict[str, str] = {}
+    for component in ("api", "worker", "dispatcher"):
+        repository, tag = split(images[component])
+        overrides[f"{component}.image.repository"] = repository
+        overrides[f"{component}.image.tag"] = tag
+        overrides[f"{component}.image.pullPolicy"] = "Never"
+    repository, tag = split(images["runner"])
+    overrides["agentSandbox.runner.image"] = repository
+    overrides["agentSandbox.runner.tag"] = tag
+    overrides["agentSandbox.runner.imagePullPolicy"] = "Never"
+    overrides["agentSandbox.runner.prewarm.imagePullPolicy"] = "Never"
+    document: dict[str, Any] = {
+        "version": 1,
+        "install": {"namespace": namespace, "release": release, "context": context},
+        "platform": {"ui": False},
+        "credentials": {"model": ROUTING_MODEL_ENV, "github_token": ROUTING_GITHUB_ENV},
+        "set": overrides,
+    }
+    if provider:
+        document["secrets"] = {
+            "provider": "aws",
+            "region": REGION,
+            "prefix": prefix,
+            "role_arn": ROUTING_ROLE_ARN,
+        }
+    return document
+
+
+class RoutingHarnessCase(HarnessCase):
+    """`curie apply` with a declared provider routes credentials through SM and ESO."""
+
+    EVIDENCE_SUITE = "aws-sec-routing"
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.prefix = require_owned_name(f"{OWNED_PREFIX}{self.suffix}")
+        self.remote_prefix = f"{self.prefix}/{ROUTING_RELEASE}"
+        self.sentinels: dict[str, str] = {}
+        self.decoys: dict[str, str] = {}
+        self.hash_prefixes: dict[str, str] = {}
+        self.curie_env: dict[str, str] = {}
+        self.chart = str(self.snapshot / "charts/curie")
+
+    def _run_body(self) -> None:
+        self.build_platform_images()
+        self.create_cluster()
+        self.scale_coredns()
+        self.load_and_verify_images()
+        self.preload_chart_images()
+        self.create_moto_namespace()
+        self.start_moto()
+        self.install_eso()
+        self.create_routing_namespace_and_store()
+        self.make_values()
+        config = self.write_config(provider=True)
+        self.seed_object("runner-model-credentials", {"agentCredentials": "model"})
+        self.prove_negative_apply(config)
+        self.seed_object("github-token", {"githubToken": "github"})
+        self.apply_repeatedly(config)
+        self.scan_release_storage()
+        self.prove_pods_carry_values()
+        self.prove_provider_absent_control()
+
+    def scale_coredns(self) -> None:
+        self.kubectl(
+            "-n",
+            "kube-system",
+            "scale",
+            "deploy",
+            "coredns",
+            "--replicas=1",
+            action="scale coredns to one replica",
+        )
+
+    def preload_chart_images(self) -> None:
+        rendered = self.runner.run(
+            ["helm", "template", ROUTING_RELEASE, self.chart, "--namespace", ROUTING_NAMESPACE],
+            "render snapshot chart for image inventory",
+            timeout=180,
+        ).stdout.decode("utf-8", "replace")
+        own = {record["tag"] for record in self.image_records.values()}
+        for image in tag_form_images(rendered, own):
+            if image.startswith("ghcr.io/curie-eng/"):
+                continue
+            self.runner.run(["docker", "pull", image], "pull chart image", timeout=900)
+            self.runner.run(
+                ["kind", "load", "docker-image", "--name", self.cluster, image],
+                "load chart image into kind",
+                timeout=300,
+            )
+
+    def create_moto_namespace(self) -> None:
+        assert self.ledger is not None
+        row = self.ledger.record_intent("kubernetes_namespace", NAMESPACE)
+        self.apply(
+            yaml_document(
+                {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}}
+            ),
+            "create emulator namespace",
+            namespace=None,
+        )
+        self.ledger.mark_created(row, NAMESPACE)
+
+    def create_routing_namespace_and_store(self) -> None:
+        assert self.ledger is not None
+        row = self.ledger.record_intent("kubernetes_namespace", ROUTING_NAMESPACE)
+        namespace = {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": ROUTING_NAMESPACE,
+                "labels": {
+                    "curietech.ai/created-by": ROUTING_RELEASE,
+                    "curietech.ai/created-in": ROUTING_NAMESPACE,
+                },
+            },
+        }
+        self.apply(yaml_document(namespace), "create labelled routing namespace", namespace=None)
+        self.ledger.mark_created(row, ROUTING_NAMESPACE)
+        provider = self.apply_emulator_credentials(ROUTING_NAMESPACE)
+        store = {
+            "apiVersion": "external-secrets.io/v1",
+            "kind": "SecretStore",
+            "metadata": {"name": f"{ROUTING_RELEASE}-curie-sm"},
+            "spec": {"provider": provider},
+        }
+        self.apply(yaml_document(store), "create routing SecretStore", namespace=ROUTING_NAMESPACE)
+        self.kubectl(
+            "-n",
+            ROUTING_NAMESPACE,
+            "wait",
+            "--for=condition=Ready",
+            f"secretstore/{ROUTING_RELEASE}-curie-sm",
+            "--timeout=120s",
+            action="wait for routing SecretStore",
+        )
+
+    def make_values(self) -> None:
+        for label in ("model", "github"):
+            self.sentinels[label] = f"synthetic-sentinel-{label}-{secrets.token_hex(20)}"
+            self.decoys[label] = f"synthetic-decoy-{label}-{secrets.token_hex(20)}"
+        env = aws_environment(self.work / "aws-credentials", self.work / "aws-config")
+        env.pop("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", None)
+        env["AWS_PROFILE"] = PROFILE
+        env["AWS_REGION"] = REGION
+        assert self.aws_endpoint is not None
+        env["AWS_ENDPOINT_URL"] = self.aws_endpoint
+        env["KUBECONFIG"] = str(self.admin_kubeconfig)
+        env[ROUTING_MODEL_ENV] = self.decoys["model"]
+        env[ROUTING_GITHUB_ENV] = self.decoys["github"]
+        self.curie_env = env
+
+    def write_config(self, *, provider: bool) -> pathlib.Path:
+        images = {name: record["tag"] for name, record in self.image_records.items()}
+        document = routing_installation(
+            ROUTING_NAMESPACE,
+            ROUTING_RELEASE,
+            self.context,
+            self.prefix,
+            images,
+            provider=provider,
+        )
+        name = "curie.yaml" if provider else "curie-no-provider.yaml"
+        return write_private_file(self.work / name, json.dumps(document, indent=2) + "\n")
+
+    def seed_object(self, logical_name: str, payload: dict[str, str]) -> None:
+        assert self.ledger is not None
+        remote_id = f"{self.remote_prefix}/{logical_name}"
+        body = {key: self.sentinels[label] for key, label in payload.items()}
+        path = write_private_file(self.work / f"seed-{logical_name}.json", json.dumps(body))
+        row = self.ledger.record_intent("secretsmanager", remote_id)
+        self.aws(
+            "secretsmanager",
+            "create-secret",
+            "--name",
+            remote_id,
+            "--secret-string",
+            f"file://{path}",
+            action=f"seed {logical_name}",
+        )
+        self.ledger.mark_created(row, remote_id)
+
+    def curie_apply(
+        self, config: pathlib.Path, *extra: str, allow_failure: bool = False
+    ) -> tuple[int, bytes]:
+        result = self.runner.run(
+            [str(self.curie_bin), "apply", "-f", str(config), "--chart", self.chart, *extra],
+            "curie apply" + (" " + " ".join(extra) if extra else ""),
+            env=self.curie_env,
+            timeout=1800,
+            allow_failure=allow_failure,
+        )
+        text = result.stdout + result.stderr_path.read_bytes()
+        return result.status, text
+
+    def sm_names(self) -> list[str]:
+        listed = self.aws(
+            "secretsmanager",
+            "list-secrets",
+            "--filters",
+            f"Key=name,Values={self.remote_prefix}/",
+            "--output",
+            "json",
+            action="list routed provider entries",
+        )
+        entries = parse_json(listed.stdout, "provider entry list").get("SecretList", [])
+        return sorted(
+            entry["Name"]
+            for entry in entries
+            if entry.get("Name", "").startswith(self.remote_prefix + "/")
+        )
+
+    def sm_version(self, name: str) -> str:
+        described = self.aws(
+            "secretsmanager",
+            "describe-secret",
+            "--secret-id",
+            name,
+            "--output",
+            "json",
+            action="describe routed provider entry",
+        )
+        stages = parse_json(described.stdout, "provider entry").get("VersionIdsToStages", {})
+        current = sorted(version for version, labels in stages.items() if "AWSCURRENT" in labels)
+        if len(current) != 1:
+            raise HarnessError("provider entry has no single current version")
+        return current[0]
+
+    def sm_value(self, name: str) -> str:
+        result = self.aws(
+            "secretsmanager",
+            "get-secret-value",
+            "--secret-id",
+            name,
+            "--output",
+            "json",
+            action="read routed provider entry",
+            sensitive=True,
+        )
+        value = parse_json(result.stdout, "provider entry value").get("SecretString")
+        if not isinstance(value, str):
+            raise HarnessError("provider entry has no SecretString")
+        filename = name.replace("/", "_") + ".value"
+        write_private_file(self.work / "sm" / filename, value)
+        return value
+
+    def forbidden_values(self) -> dict[str, bytes]:
+        forbidden: dict[str, bytes] = {}
+        for label, value in self.sentinels.items():
+            forbidden[f"sentinel:{label}"] = value.encode()
+        for label, value in self.decoys.items():
+            forbidden[f"decoy:{label}"] = value.encode()
+        for name in self.sm_names():
+            for index, value in enumerate(secret_string_values(self.sm_value(name))):
+                forbidden[f"sm:{name}#{index}"] = value.encode()
+        return forbidden
+
+    def owned_absent(self, kind: str, *selectors: str) -> bool:
+        result = self.kubectl(
+            "-n",
+            ROUTING_NAMESPACE,
+            "get",
+            kind,
+            *selectors,
+            "-o",
+            "name",
+            action=f"inventory {kind}",
+            allow_failure=True,
+        )
+        if result.status != 0:
+            return tool_error_has_code(result, "the server doesn't have a resource type")
+        return not result.stdout.strip()
+
+    def prove_negative_apply(self, config: pathlib.Path) -> None:
+        before = self.sm_names()
+        status, text = self.curie_apply(config, allow_failure=True)
+        missing = f"{self.remote_prefix}/github-token"
+        self.record_assertion("apply with a missing declared entry is refused", status != 0)
+        self.record_assertion("refusal names the missing entry", missing.encode() in text)
+        leaked = forbidden_hits(
+            text,
+            {f"sentinel:{k}": v.encode() for k, v in self.sentinels.items()}
+            | {f"decoy:{k}": v.encode() for k, v in self.decoys.items()},
+        )
+        self.record_assertion("refusal output carries no value", not leaked, ",".join(leaked))
+        self.record_assertion(
+            "refusal wrote no helm release",
+            self.owned_absent("secret", "--field-selector", "type=helm.sh/release.v1"),
+        )
+        self.record_assertion(
+            "refusal applied no ExternalSecret", self.owned_absent("externalsecrets")
+        )
+        self.record_assertion("refusal generated no provider entry", self.sm_names() == before)
+
+    def apply_repeatedly(self, config: pathlib.Path) -> None:
+        versions: dict[str, str] = {}
+        for attempt in range(1, ROUTING_APPLY_COUNT + 1):
+            self.curie_apply(config)
+            if attempt == 1:
+                versions = {name: self.sm_version(name) for name in self.sm_names()}
+        after = {name: self.sm_version(name) for name in self.sm_names()}
+        self.record_assertion(
+            "provider entries are generated once across four applies",
+            versions == after and bool(versions),
+            f"{len(after)} entries",
+        )
+
+    def scan_release_storage(self) -> None:
+        forbidden = self.forbidden_values()
+        for label, value in forbidden.items():
+            self.hash_prefixes[label] = digest_prefix(value)
+        releases = self.kubectl(
+            "-n",
+            ROUTING_NAMESPACE,
+            "get",
+            "secrets",
+            "-l",
+            f"owner=helm,name={ROUTING_RELEASE}",
+            "-o",
+            "json",
+            action="read stored helm revisions",
+            sensitive=True,
+        )
+        items = parse_json(releases.stdout, "helm revisions").get("items", [])
+        self.record_assertion(
+            "stored helm revisions are bounded",
+            0 < len(items) <= ROUTING_MAX_REVISIONS,
+            f"{len(items)} revisions",
+        )
+        hits: set[str] = set()
+        for item in items:
+            decoded = decode_helm_release(item["data"]["release"])
+            hits.update(forbidden_hits(json.dumps(decoded).encode(), forbidden))
+            hits.update(forbidden_hits(item["data"]["release"].encode(), forbidden))
+        for extra in ((), ("--all",)):
+            values = self.runner.run(
+                [
+                    "helm",
+                    "--kubeconfig",
+                    str(self.admin_kubeconfig),
+                    "--kube-context",
+                    self.context,
+                    "-n",
+                    ROUTING_NAMESPACE,
+                    "get",
+                    "values",
+                    ROUTING_RELEASE,
+                    *extra,
+                    "-o",
+                    "json",
+                ],
+                "read helm values" + (" --all" if extra else ""),
+                sensitive=True,
+            )
+            hits.update(forbidden_hits(values.stdout, forbidden))
+        self.record_assertion(
+            "no seeded, decoy or provider value in helm storage", not hits, ",".join(sorted(hits))
+        )
+
+    def prove_pods_carry_values(self) -> None:
+        mappings = external_secret_mappings(
+            parse_json(
+                self.kubectl(
+                    "-n",
+                    ROUTING_NAMESPACE,
+                    "get",
+                    "externalsecrets",
+                    "-o",
+                    "json",
+                    action="read ExternalSecrets",
+                ).stdout,
+                "ExternalSecrets",
+            )
+        )
+        self.record_assertion("ExternalSecrets exist", bool(mappings), f"{len(mappings)} rows")
+        expected: dict[tuple[str, str], str] = {}
+        for target, key, remote, prop in mappings:
+            parsed = json.loads(self.sm_value(remote))
+            value = parsed[prop] if isinstance(parsed, dict) else parsed
+            expected[(target, key)] = full_digest(
+                value if isinstance(value, str) else json.dumps(value)
+            )
+
+        def targets_match() -> bool:
+            for (target, key), digest in expected.items():
+                decoded = self.decoded_secret_key(target, key, ROUTING_NAMESPACE)
+                if decoded is None or full_digest(decoded) != digest:
+                    return False
+            return True
+
+        wait_until("ESO target Secrets equal provider values", targets_match, timeout=180)
+        self.record_assertion("every ESO target Secret equals its provider value", True)
+
+        checked: set[tuple[str, str, str]] = set()
+        proven: dict[tuple[str, str], set[str]] = {}
+
+        def exec_all() -> None:
+            pods = parse_json(
+                self.kubectl(
+                    "-n", ROUTING_NAMESPACE, "get", "pods", "-o", "json", action="read pods"
+                ).stdout,
+                "pods",
+            )
+            for (target, key), digest in expected.items():
+                for pod, container, env_name in secret_key_env_refs(pods, target, key):
+                    if (pod, container, env_name) in checked:
+                        continue
+                    result = self.kubectl(
+                        "-n",
+                        ROUTING_NAMESPACE,
+                        "exec",
+                        pod,
+                        "-c",
+                        container,
+                        "--",
+                        "printenv",
+                        env_name,
+                        action="read consumer env in pod",
+                        allow_failure=True,
+                        sensitive=True,
+                    )
+                    if result.status != 0:
+                        continue
+                    observed = result.stdout.removesuffix(b"\n")
+                    path = write_private_file(
+                        self.work / "exec" / f"{pod}.{container}.{env_name}", observed
+                    )
+                    require_private_file(path)
+                    self.record_assertion(
+                        f"{pod}/{container} {env_name} equals {target}/{key}",
+                        full_digest(observed) == digest,
+                        digest_prefix(observed),
+                    )
+                    checked.add((pod, container, env_name))
+                    proven.setdefault((target, key), set()).add(pod)
+
+        def required_proven() -> bool:
+            exec_all()
+            for _logical, key, marker in ROUTING_REQUIRED_EXEC:
+                pods = {
+                    pod
+                    for (_target, proven_key), names in proven.items()
+                    if proven_key == key
+                    for pod in names
+                }
+                if not any(marker in pod for pod in pods):
+                    return False
+            return True
+
+        wait_until("consumer pods carry provider values", required_proven, timeout=600, interval=10)
+        for logical, _key, marker in ROUTING_REQUIRED_EXEC:
+            self.record_assertion(f"{logical} proven by exec in a {marker.strip('-')} pod", True)
+
+    def prove_provider_absent_control(self) -> None:
+        config = self.write_config(provider=False)
+        status, text = self.curie_apply(config, "--dry-run", allow_failure=True)
+        self.record_assertion("provider absent dry run succeeds", status == 0)
+        self.record_assertion(
+            "provider absent plan has no --history-max", b"--history-max" not in text
+        )
+        self.record_assertion(
+            "provider absent plan has no provider existingSecret knob",
+            f"ExistingSecret={ROUTING_RELEASE}-curie-".encode() not in text,
+        )
+
+    def write_evidence(self, status: str, cleanup_status: str) -> None:
+        evidence = {
+            "candidate_commit": self.commit,
+            "suite": "routing",
+            "release": ROUTING_RELEASE,
+            "namespace": ROUTING_NAMESPACE,
+            "prefix": self.prefix,
+            "owned_resources": {"cluster": self.cluster},
+            "images": self.image_records,
+            "hash_prefixes": self.hash_prefixes,
             "assertions": self.assertions,
             "orchestrator_status": status,
             "cleanup_status": cleanup_status,
@@ -2991,7 +3614,10 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--eso", choices=("preinstalled", "none"))
     parser.add_argument("--ci", action="store_true")
     parser.add_argument("--real-aws", action="store_true")
+    parser.add_argument("--suite", choices=("rotation", "routing"), default="rotation")
     args = parser.parse_args()
+    if args.suite == "routing" and (args.ci or args.real_aws or args.eso is not None):
+        parser.error("--suite routing cannot be used with --ci, --real-aws or --eso")
     if args.ci and (args.real_aws or args.eso is not None):
         parser.error("--ci cannot be used with --real-aws or --eso")
     if args.real_aws and args.eso == "none":
@@ -3017,9 +3643,11 @@ def main() -> int:
         safe_print(f"seed error: {exc}", error=True)
         return 2
     tools = {"git", "docker", "kind", "kubectl", "uv"}
-    if args.real_aws or args.eso != "none" or args.ci:
+    if args.suite == "routing":
+        tools = {"git", "docker", "kind", "kubectl", "helm", "aws"}
+    elif args.real_aws or args.eso != "none" or args.ci:
         tools.update({"aws", "helm"})
-    if args.eso != "none" and not args.real_aws:
+    if args.suite == "rotation" and args.eso != "none" and not args.real_aws:
         # The emulator run drives the rotation suite, which builds a Rust example.
         tools.add("cargo")
     try:
@@ -3036,10 +3664,11 @@ def main() -> int:
     setup_guard = install_signal_handlers()
     try:
         modes = ["preinstalled", "none"] if args.ci else [args.eso or "preinstalled"]
+        case_class = RoutingHarnessCase if args.suite == "routing" else HarnessCase
         for mode in modes:
             case_guard = install_signal_handlers()
             try:
-                HarnessCase(
+                case_class(
                     repo_root,
                     snapshot,
                     commit,

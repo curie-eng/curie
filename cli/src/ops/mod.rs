@@ -162,6 +162,7 @@ mod testsupport {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],

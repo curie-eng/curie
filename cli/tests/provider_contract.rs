@@ -434,32 +434,6 @@ fn secrets_set_discovers_the_current_directory_provider() {
 }
 
 #[test]
-fn apply_refuses_a_declared_provider_before_any_external_command() {
-    let env = isolated();
-    fs::write(env.config.join("curie.yaml"), aws_install()).expect("write install");
-    let empty_path = env.config.join("no-tools");
-    fs::create_dir(&empty_path).expect("create empty path");
-
-    for args in [
-        vec!["apply", "--json"],
-        vec!["apply", "--dry-run", "--json"],
-    ] {
-        let output = command(&env)
-            .env("PATH", &empty_path)
-            .args(args)
-            .output()
-            .expect("run apply");
-        assert_eq!(output.status.code(), Some(1), "{}", panic_text(&output));
-        assert!(
-            raw_output(&output).contains("cannot yet converge a declared secrets provider"),
-            "apply must refuse before external commands: {}",
-            panic_text(&output)
-        );
-        assert_aws_not_called(&env);
-    }
-}
-
-#[test]
 fn secrets_set_file_without_secrets_stays_local() {
     let env = isolated();
     fs::write(env.config.join("curie.yaml"), aws_install()).expect("write discovered install");

@@ -1032,6 +1032,21 @@ enum SecretsE2eEso {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SecretsE2eSuite {
+    Rotation,
+    Routing,
+}
+
+impl SecretsE2eSuite {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotation => "rotation",
+            Self::Routing => "routing",
+        }
+    }
+}
+
 impl SecretsE2eEso {
     fn as_str(self) -> &'static str {
         match self {
@@ -1077,6 +1092,11 @@ enum DevAction {
         /// Run against AWS in us-east-1 with profile theconnman.
         #[arg(long)]
         real_aws: bool,
+        /// Which proof to run. `routing` drives `curie apply` with a declared
+        /// provider against an emulator and cannot be combined with --ci,
+        /// --real-aws or --eso.
+        #[arg(long, value_enum, default_value = "rotation")]
+        suite: SecretsE2eSuite,
     },
     /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
     /// MCP server and a live provider
@@ -3641,6 +3661,26 @@ async fn main() {
             )
             .exit();
     }
+    if let Some(Command::Dev {
+        action:
+            DevAction::SecretsE2e {
+                suite: SecretsE2eSuite::Routing,
+                eso,
+                ci,
+                real_aws,
+                ..
+            },
+    }) = cli.command.as_ref()
+    {
+        if *ci || *real_aws || eso.is_some() {
+            Cli::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "the argument '--suite routing' cannot be used with '--ci', '--real-aws' or '--eso'",
+                )
+                .exit();
+        }
+    }
     ui::init(Ui::from_process(cli.color, cli.debug, cli.quiet, cli.json));
     // main never returns Err (which would give anyhow's default exit 1 and skip
     // classification). Run the command, then map any error to a semantic exit
@@ -3811,12 +3851,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 eso,
                 ci,
                 real_aws,
+                suite,
             } => {
                 commands::dev_secrets_e2e(
                     seed.as_deref(),
                     eso.map(SecretsE2eEso::as_str),
                     ci,
                     real_aws,
+                    suite.as_str(),
                 )
                 .await
             }
@@ -4673,6 +4715,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             github_token: ops::GithubTokenPlan::Untouched,
                             dev,
                             adopt,
+                            history_max: None,
                         },
                         github_token,
                         clear_github_token,

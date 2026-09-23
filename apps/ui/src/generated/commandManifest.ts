@@ -5764,6 +5764,21 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "default_values": [
+                "rotation"
+              ],
+              "global": false,
+              "help": "Which proof to run. `routing` drives `curie apply` with a declared provider against an emulator and cannot be combined with --ci, --real-aws or --eso",
+              "id": "suite",
+              "long": "suite",
+              "positional": false,
+              "possible_values": [
+                "rotation",
+                "routing"
+              ],
+              "required": false
             }
           ],
           "hidden": false,

@@ -10,6 +10,7 @@ pub mod eso;
 mod inventory;
 pub mod render_check;
 pub mod rotation;
+pub mod routing;
 
 pub use catalog::{bundle_entries, merge, parse_inventory, platform_inventory, validate_inventory};
 pub use inventory::{
