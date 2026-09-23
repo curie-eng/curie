@@ -179,5 +179,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0154 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0154-adapter-principal-with-a-scoped-credential.md) | Accepted |
 | 0155 | [Tenant boundary and principal identity land together](0155-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
 | 0158 | [A custom connector is a bundle built HTTP MCP server that holds its own credential](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md) | Draft |
-| 0168 | [One installation hosts several Slack bot identities](0168-one-installation-hosts-several-slack-bot-identities.md) | Draft |
+| 0168 | [One installation hosts several bot identities](0168-one-installation-hosts-several-bot-identities.md) | Draft |
 <!-- END GENERATED: adr-index -->
