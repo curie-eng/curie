@@ -529,7 +529,8 @@ fn apply_with_a_provider_does_not_call_aws_when_helm_is_absent() {
 
     let live = command(&env)
         .env("PATH", &empty_path)
-        .args(["apply", "--json"])
+        .args(["apply", "--json", "--chart"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie"))
         .output()
         .expect("run apply");
     assert_eq!(live.status.code(), Some(1), "{}", panic_text(&live));
