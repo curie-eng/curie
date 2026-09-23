@@ -55,16 +55,22 @@ short of an operator deleting it, and no way to scope memory to a channel.
 
 ## Decision
 
-What we add or change. The design copies how Claude Code keeps memory: a
+What we add or change. The design follows how Claude Code keeps memory: a
 short index that is always loaded, detail that is read only when needed, a
-size check on every write, and no compaction or version history. When the
-index grows, information moves into detail; it is not compressed or dropped.
-It adds three things Claude Code does not need, because a Claude Code memory
-has one writer and a channel has many people in it: the bundle declares what
-may be saved (B), every entry records who stated it (F), and anyone in a
-channel can correct a fact (H).
+size check on every write, and no compaction or version history. When memory
+grows, information moves into detail; it is not compressed or dropped.
 
-**A. Two tiers by default: per agent and per channel. Bundles can add more.**
+It differs from Claude Code where a Curie agent's situation differs. A Claude
+Code session is usually one task, and the code it produces is the durable
+record, so its memory holds only what is left over. A Curie agent in a
+channel works on ongoing work with many people and produces nothing durable
+but its replies, so its memory is the record. That is why this design
+remembers more by default (C), groups memory by topic (D), shows how old each
+fact is (D), and adds three things a single-user memory does not need: the
+bundle declares what may be saved (B), every fact records who stated it (G),
+and anyone in a channel can correct a fact (I).
+
+**A. Two tiers: per agent and per channel. Bundles can add more.**
 The agent tier belongs to one agent and is shared by every channel that agent
 works in. The channel tier belongs to one agent in one channel. "Channel" here
 means the platform's generic binding, the `agent_channels` row: a kind and an
@@ -74,148 +80,183 @@ port). A Slack channel, a mailbox, and a direct message are all channels. Two
 agents in the same channel do not share memory: each has its own channel tier
 there. No key, API or runner code names a specific surface. A direct message
 is a channel whose address is the person, so private chats get their own
-memory with no extra mechanism. Each tier holds an operator's document (J)
-and the agent's own memory (C). A bundle that needs another tier can declare
+memory with no extra mechanism. Each tier holds an operator's document (K)
+and the agent's own memory (D). A bundle that needs another tier can declare
 one; this needs to be possible, not visible.
 
 **B. The bundle declares what kinds of fact the agent may save.**
 The agent cannot save whatever it wants. A bundle lists the kinds of fact it
-remembers, for example "who approves which form" or "a deadline", each with a
-one-line description and the tier it belongs to. The agent can only save
-facts of those kinds. A bundle that declares no kinds gets no save tool; its
-memory comes only from operators. If someone explicitly asks the agent to
-remember something that is not a declared kind, or that the bundle forbids,
-the agent does not save it and says it cannot remember that kind of thing. An
-operator can still add it to the tier's document from a file (J).
+remembers, each with a one-line description and the tier it belongs to. The
+agent can only save facts of those kinds. A bundle that declares nothing gets
+the defaults (C). A bundle that declares its own list replaces the defaults
+and can name any of them to keep them. An empty list turns saving off. If
+someone explicitly asks the agent to remember something that is not a
+declared kind, or that the bundle forbids, the agent does not save it and says
+it cannot remember that kind of thing. An operator can still add it to the
+tier's document from a file (K).
 
-**C. The agent's memory is an index plus entry bodies.**
-Each entry has an id, a kind, a one-line summary, and an optional body for
-detail: the conditions attached to a fact, or the reason behind a decision.
-The summaries form the tier's index, which is injected at boot. Bodies are not
-injected; the agent reads one when it needs the detail. This is Claude Code's
-`MEMORY.md` index and topic files. It keeps what every session carries small,
-while detail that would be lost by squeezing it into one line has somewhere to
-live.
+**C. Four default kinds, all in the channel tier.**
+These apply to every agent whose bundle declares no kinds of its own. They are
+use-case agnostic: any agent working in a channel needs them.
 
-**D. The agent gets a `remember` / `read` / `forget` tool, bound to the
+| Kind | What it holds | Example |
+|---|---|---|
+| How to work here | Instructions a person gives about how the agent should do its work in this channel | "Reply in threads." |
+| Decisions | Something decided in the channel that should hold going forward, with the reason | "We're dropping the weekly report; nobody reads it." |
+| Who owns what | Responsibilities, stated as roles | "Sam approves vendor contracts." |
+| Where things are | Pointers to documents, systems, trackers, locations | "The Q3 plan is in the shared drive under Planning." |
+
+Not covered by the defaults, on purpose: anything about a person beyond their
+role, such as preferences, habits or tendencies; data, figures and records,
+which belong in the system they came from; and secrets or credentials. Each
+default kind's description says so, so the model sees the boundary.
+
+The agent tier has no default kinds. Out of the box it holds only the
+operator's document. A fact learned in one channel does not spread to every
+channel because the agent judged it general. A bundle can declare agent-tier
+kinds.
+
+**D. Memory is grouped by topic. Each fact is stored on its own.**
+Each declared kind is a topic. A fact has an id, its topic, a one-line
+statement, optional detail (the conditions attached to it, or the reason
+behind it), and its provenance (G). The index injected at boot lists each
+topic with its facts' one-line statements, newest first, each marked with its
+id and the date it was stated ("as of 2026-09-01"), so the model can weigh an
+old fact accordingly. Detail is not injected; the agent reads it when needed.
+Each fact is its own row, so a busy topic never outgrows one stored value.
+This is Claude Code's index and topic files, arranged for a memory that grows
+faster.
+
+**E. The agent gets a `remember` / `read` / `forget` tool, bound to the
 current channel.**
-`remember` creates or updates an entry of a declared kind; the platform
-refuses any other kind. `read` returns one entry's body by id. `forget`
-removes an entry by id. Index lines carry their ids so the agent can name
-one. There is no tool to search memory or re-read the index: the index is
-already in the session. The declared kinds and their descriptions are the
-tool's instructions, so the model sees exactly what it may save. The tool
-writes only to the channel the message came from; if the model passes a
-channel name, it is ignored. The tool is mounted only when memory is turned on
-for the deployment and the bundle declares at least one kind.
+`remember` adds a fact to a declared topic, or updates one by id; the
+platform refuses any undeclared topic. `read` returns one fact with its
+detail, or a whole topic, newest first and paged when long. `forget` removes
+one fact by id. There is no search. The declared kinds and their descriptions
+are the tool's instructions, so the model sees exactly what it may save. The
+tool writes only to the channel the message came from; if the model passes a
+channel name, it is ignored. The tool is mounted only when an operator has
+turned memory on for the agent. Upgrading does not turn it on.
 
-**E. Saves are silent unless the person asked.**
+**F. Saves are silent unless the person asked.**
 When someone explicitly says "remember this" or "forget that," the reply
 confirms it. Otherwise the agent does not announce saves. Never an approval
 card.
 
-**F. Every entry records who stated it. The platform fills this in.**
-The author is part of the entry's provenance, beside the session id, trace
-ids and timestamp [ADR-0025](0025-memory-port-and-first-loader.md) already
-stores. It is shown in the console and not injected into the prompt. It is
-needed because the existing provenance cannot answer "who said this" on its
-own: it names no person, and the traces it points to live in the observability
-store, which is optional and does not keep data as long as memory does. The
-platform sets the author from whoever sent the message. The tool has no author
+**G. Every fact records who stated it and when. The platform fills this in.**
+The author is part of the fact's provenance, beside the session id, trace ids
+and timestamp [ADR-0025](0025-memory-port-and-first-loader.md) already
+stores. The existing provenance cannot answer "who said this" on its own: it
+names no person, and the traces it points to live in the observability store,
+which is optional and does not keep data as long as memory does. The platform
+sets the author from whoever sent the message. The tool has no author
 argument, so the model cannot label its own inference with a person's name. A
 turn with no person behind it (a scheduled job, an eval) gets a marker no
-caller can type.
+caller can type. Authors are shown in the console, and for "How to work here"
+facts they are also injected (H).
 
-**G. One id per fact. A correction replaces it. No version history.**
-A correction overwrites the entry under the same id and updates its
-provenance to the person who corrected it. Saving the exact same text again
-is refused. Claude Code keeps no memory history either; the old value
+**H. Instructions from channel members are marked as such.**
+"How to work here" facts, and any bundle kind that holds instructions, are
+injected under a header saying they are requests from people in the channel,
+not instructions from the operator, with each fact's author and date. They sit
+below the bundle's own prompt, which outranks them. This does not make them
+safe: anyone in a channel can ask for something harmful, and memory is not a
+security boundary. Approvals and policy gates stay the enforcement layer.
+
+**I. One id per fact. A correction replaces it. Anyone in a channel can
+correct any fact in it.**
+A correction overwrites the fact under the same id and updates its provenance
+to the person who corrected it. Saving the exact same text again is refused.
+No version history is kept; Claude Code keeps none either, and the old value
 survives only in the trace of the turn that changed it, while that trace is
-retained.
+retained. Accountability for open correction comes from provenance, not from
+permissions.
 
-**H. Anyone in a channel can correct any fact in it.**
-The corrected entry records who made the correction (F). Accountability comes
-from provenance, not from permissions.
-
-**I. What may be saved is the bundle's decision, not the runner's.**
+**J. What may be saved is the bundle's decision, not the runner's.**
 The runner has no content rules of its own. What it enforces is the bundle's
-list of kinds (B), plus any exclusion the bundle adds (for example, "never
-store figures"). The platform can check mechanically that a save names a
-declared kind. It cannot check that the text really is that kind of fact;
-that stays a model judgment, backed by provenance and open correction.
+list of kinds (B), or the defaults (C), plus any exclusion the bundle adds.
+The platform can check mechanically that a save names a declared kind. It
+cannot check that the text really is that kind of fact; that stays a model
+judgment, backed by provenance and open correction.
 
-**J. Operators seed a document from a file. No seeding from channel history.**
-Each tier can have one operator-written document, the equivalent of
-Claude Code's `CLAUDE.md`. `curie` writes it from a file, addressed by agent
-name. It is injected in full at boot, is never changed by the agent, and has
-its own size cap. An agent with no channel binding is refused a channel-tier
-write and told why. [ADR-0095](0095-tiered-memory-lifecycle.md)'s plan to read
-a channel's history to build starting memory is dropped: it needs new Slack
+**K. Operators seed a document from a file. No seeding from channel history.**
+Each tier can have one operator-written document, the equivalent of Claude
+Code's `CLAUDE.md`. `curie` writes it from a file, addressed by agent name. It
+is injected in full at boot, is never changed by the agent, and has its own
+size cap. An agent with no channel binding is refused a channel-tier write and
+told why. [ADR-0095](0095-tiered-memory-lifecycle.md)'s plan to read a
+channel's history to build starting memory is dropped: it needs new Slack
 permissions and a re-consent in every workspace, and channel history is the
 least trustworthy input available. A channel starts empty.
 
-**K. Refused saves are reported as refused.**
+**L. Refused saves are reported as refused.**
 The tool call is marked failed in the trace, and the reply does not claim the
 fact was saved.
 
-**L. The index is capped, and measured on every save.**
+**M. The index is capped, and measured on every save.**
 The cap is Claude Code's: 200 lines or 25 KB, whichever comes first. The API
 measures the index after every save. Near the cap, the save succeeds and the
-tool's reply tells the agent to shorten the index by moving detail out of
-summary lines and into bodies, keeping each summary to one short line. That is
-the only change the agent makes to shorten the index: it does not merge or
-drop entries on its own. Over the cap, the save still succeeds, the reply
-tells the agent to move detail now, and the operator is told, because index
-lines past the cap are not loaded at the next boot. They stay in the store and
-in the console, and the boot log says how many were left out (O). If the index
-is still over the cap once every summary is one short line, a person decides
-what to remove.
-Each body is capped at the state store's per-value limit. If a tier reaches
-the store's per-namespace limit, saves are refused and the operator decides
-what to delete.
+tool's reply tells the agent to move detail out of statements and into
+detail, keeping each statement to one short line. That is the only change the
+agent makes to shorten memory: it does not merge or drop facts on its own.
+Over the cap, the save still succeeds, and the oldest facts in each topic are
+left out of the index at the next boot, replaced by a line saying how many
+older facts the topic holds and that `read` shows them. Nothing is deleted.
+The operator is told, and the boot log records it (P). If a tier reaches the
+state store's per-namespace limit, saves are refused and a person decides what
+to remove.
 
-**M. No compaction.**
-Nothing compresses or rewrites memory. An entry changes only when the agent
-saves, corrects or forgets it, when the agent moves detail from its summary
-into its body (L), or when an operator or person edits it. Entries are removed
-only by a correction, a `forget`, or a person. Compaction is for a session's
-own context, not for memory.
+**N. No compaction.**
+Nothing compresses or rewrites memory. A fact changes only when the agent
+saves, corrects or forgets it, when the agent moves its detail out of the
+statement (M), or when an operator or person edits it. Facts are removed only
+by a correction, a `forget`, or a person. Compaction is for a session's own
+context, not for memory.
 
-**N. Deleted entries stay deleted.**
+**O. Deleted facts stay deleted.**
 Otherwise the agent re-saves the fact on the next turn, because the message
 that produced it is still in the conversation. The store has to remember what
 a person or operator removed; the agent has no way to know.
 
-**O. Boots log what they loaded.**
+**P. Boots log what they loaded.**
 "Found agent tier," "found channel tier," or "found nothing," distinguishably,
-plus how many index lines were left out for being past the cap. Without this,
-a tier that was never written and a tier the runner cannot read look the same.
+plus how many facts were left out of the index for being past the cap.
+Without this, a tier that was never written and a tier the runner cannot read
+look the same.
 
 ## Alternatives considered
 
 - **A per-person tier.** No. It splits facts a channel should share, and
   facts keyed to a person tend to be facts about that person, which then
   follow them around. DMs already get their own memory via the channel tier.
+- **Save nothing unless the bundle declares kinds.** No. The out-of-the-box
+  agent would forget every instruction, decision and owner it is told about,
+  which is most of what a channel agent needs to keep.
+- **Default kinds in the agent tier.** No. A fact from one channel would reach
+  every channel on the agent's own judgment, which is the route a poisoned
+  channel would use to spread.
 - **Let the agent save anything, with the bundle listing only exclusions.**
   No. The agent then decides on its own what is worth keeping, and anything
   the bundle author did not think to forbid gets stored. An allow-list of
   kinds means the default is "not saved".
 - **A platform-wide content rule** ("never store comments about people").
   No. The code can't judge whether a sentence is about a person, and a rule
-  enforced only by a prompt isn't enforced.
-- **Inject every entry in full, with no bodies.** No. Every session would
-  carry every detail, and the only way to stay under the cap would be to
-  squeeze detail into one line or drop it.
+  enforced only by a prompt isn't enforced. The defaults (C) leave personal
+  descriptions out by not declaring a kind for them.
+- **One index line per fact, with no topics.** No. A channel agent's memory
+  grows faster than a Claude Code session's, and every fact would cost an
+  index line.
+- **Inject every fact in full, with detail.** No. Every session would carry
+  every detail, and the only way to stay under the cap would be to drop it.
 - **A tool to search memory or re-read the index mid-session.** No. The index
-  is already in the session; only bodies need reading.
+  is already in the session; only detail and older facts need reading.
 - **Refuse saves over the cap.** No. The fact being saved right now would be
-  lost, while the agent can shorten the index in the same turn. Lines past the
-  cap are left out of the next boot, not deleted.
+  lost. Older facts are left out of the index instead, and stay readable.
 - **Compaction, on a schedule or when a tier fills**
-  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). No, see M.
+  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). No, see N.
   A rewrite nobody asked for can lose a fact nobody remembers existed.
-- **Version history on every fact.** No, see G.
-- **Seeding from channel history.** No, see J.
+- **Version history on every fact.** No, see I.
+- **Seeding from channel history.** No, see K.
 - **An operator instructions layer above memory**
   ([ADR-0095](0095-tiered-memory-lifecycle.md)). Not included. The bundle's
   `systemPrompt` already does this job.
@@ -224,10 +265,10 @@ a tier that was never written and a tier the runner cannot read look the same.
   Not needed here. Left as is.
 - **Model supplies the author.** No. The writer should not control the field
   that says who asserted a fact.
-- **Only the author can correct a fact.** No, see H.
+- **Only the author can correct a fact.** No, see I.
 - **Vector database or knowledge graph.** No. The index fits in context and
-  bodies are read by id, and an embedding index is a second copy with no
-  clean delete.
+  facts are read by id or topic, and an embedding index is a second copy with
+  no clean delete.
 
 ## Consequences
 
@@ -236,46 +277,53 @@ a tier that was never written and a tier the runner cannot read look the same.
 - The runner needs to know its channel. That is one new value in `boot_env`,
   which is a frozen contract, so it gets its own issue before any code.
 - The declared kinds are a new field in the bundle manifest, also a frozen
-  contract, so they get their own issue first too. Whether a deployment turns
-  memory on at all stays a deployment setting.
+  contract, so they get their own issue first too. The defaults (C) are what
+  an absent field means.
 - Writer and reader must compose the same key for every address, including
   odd characters. They live in different packages, so this is a test, not
   shared code.
-- Storage per tier is one index row (under the 25 KB cap, well within the
-  store's 64 KiB value limit) and one row per body. Loading at boot stays a
-  single read per tier.
-- The existing `log` row becomes the agent tier's index, one line per
-  existing entry, with no bodies. Existing entries have no author; they are
-  shown as unknown rather than guessed.
+- Storage per tier is one row per fact, keyed by topic and id. Loading at boot
+  lists a tier's facts once and builds the index from their statements.
+- The existing `log` row migrates into the agent tier as facts in one topic,
+  with no detail. Existing facts have no author; they are shown as unknown
+  rather than guessed.
+- Turning memory on for an agent now means it saves by default. Operators
+  should know that before they turn it on, and the console says so.
+- "Who owns what" stores people's names as role facts. That is personal data;
+  `forget` and deletion (O) are how a person has it removed.
+- "How to work here" lets any channel member give the agent standing
+  instructions. H marks them, but an agent whose side effects are not behind
+  approvals is exposed to a harmful one.
 - [ADR-0095](0095-tiered-memory-lifecycle.md) and
   [ADR-0111](0111-the-default-memory-compaction-algorithm.md) are marked as
   folded into this one. The acceptance PR sets them to
   `Superseded by ADR-0167`.
-- Known gaps: no time-based expiry; index lines past the cap are left out
-  until detail is moved into bodies or a person removes entries; the channel tier assumes
-  one agent per channel until multi-channel lands.
+- Known gaps: no time-based expiry, so stale facts stay until corrected,
+  though their dates are visible; the channel tier assumes one agent per
+  channel until multi-channel lands.
 
 ## Before this can be accepted
 
 1. A fact saved in thread A shows up in a new thread B in the same channel,
    and not in another channel or for another agent in the same channel.
-2. A bundle without memory is refused on write, and a bundle that declares
-   no kinds has no save tool.
+2. With memory off, no save tool is mounted. With memory on and no declared
+   kinds, the four defaults apply; a declared list replaces them; an empty
+   list turns saving off.
 3. A save naming an undeclared kind is refused and reported as refused.
 4. Writer and reader keys match for addresses with `@`, `:`, `/`, spaces, and
    non-ASCII.
-5. An entry's summary is injected at boot and its body is not; `read` returns
-   the body by id.
-6. A save near the cap succeeds with a shorten reminder; a save over the cap
-   succeeds with a rewrite error; the next boot leaves the excess lines out
-   and logs how many.
-7. A correction replaces the entry under the same id and records the new
+5. A fact's statement and date are injected at boot and its detail is not;
+   `read` returns the detail by id, and a topic newest first.
+6. A save near the cap succeeds with a reminder to move detail; over the cap,
+   the next boot leaves out the oldest facts per topic, says how many, and
+   they remain readable.
+7. A correction replaces the fact under the same id and records the new
    author; the next boot shows only the corrected text.
-8. A forgotten or deleted entry stays gone on the next turn, even though the
+8. A forgotten or deleted fact stays gone on the next turn, even though the
    message that produced it is still in the conversation.
-9. Unit tests for the index cap at the API and the compare-and-set conflict
-   path.
-10. A planted instruction disguised as memory is saved as an entry, shows its
+9. "How to work here" facts are injected under the channel-members header,
+   with author and date, below the bundle's prompt.
+10. A planted instruction disguised as memory is saved as a fact, shows its
     author in the console, and does not affect any approval.
 
 ## Related ADRs
