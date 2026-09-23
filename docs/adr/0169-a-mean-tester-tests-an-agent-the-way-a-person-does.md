@@ -79,6 +79,16 @@ So each probe opens its own thread. The installation under test needs no
 configuration to be tested, and multi-turn probes are out of scope until a
 design needs them.
 
+The probe is posted by the tester's connector with the tester's own bot token
+(`chat.postMessage` to the channel root). It is not posted by the platform's
+reply sink, which only ever answers inside the thread it was asked in. That is
+how the tester starts a conversation instead of only answering one.
+
+MEASURED 2026-09-23 on a downstream installation: one agent's bot posted a root
+mention of another agent's bot in a shared channel, and the target answered in
+the new thread one second later. The admission rule its dispatcher applied at
+the root is the one cited above.
+
 ### 3. What the target should do comes from its source, not its platform
 
 The tester reads the target's bundle from Git:
@@ -128,12 +138,13 @@ plan already posted there.
 - The tester never presses an approval card, its own or anyone's.
 - Each FAIL is reported as a case in the target's `evals/cases.json` shape, per
   ADR-0022's trace promotion, for its owner to commit. The tester commits
-  nothing.
+  nothing to the target's repository.
 
 ### 6. Its guardrails live in its connector, not its prompt
 
 One connector, built the ADR-0158 way, holds the tester's Slack token and its
-Git read token. The sandbox sees only its tools.
+Git token, which reads bundles and, for decision 8 only, opens issues. The
+sandbox sees only its tools.
 
 The connector:
 - posts only to channels the operator lists;
@@ -154,6 +165,61 @@ This is the capability-identity mutation convention (#1649) applied to a
 grader. A tester that always passes is worse than none, and one that always
 fails is useless.
 
+### 8. It tests and reports; it never repairs, and a person confirms every issue
+
+The tester changes nothing about its target: no redeploy, no configuration, no
+code. Its only effect beyond Slack is an issue, and only after a person has
+agreed the failure is real.
+
+- A FAIL can become an issue draft. UNCLEAR and PASS never do.
+- The draft carries the probe, the reply quoted, the behaviour expected and the
+  criterion or case it rests on, and the eval case from decision 5.
+- Before drafting, the tester searches the target's repository for an open
+  issue about the same failure, and links that one instead of drafting a new
+  one.
+- Filing is one tool, `file_issue`, behind the bundle's `approvalPolicy`. The
+  approval card shows the issue as it will be filed. The tester cannot file
+  what a person did not approve, and a denial is final for that draft.
+- The repository an issue goes to is the one the target's bundle was read from
+  (decision 3). No other repository is writable.
+
+### 9. Slack is the first surface, not the only one
+
+Planning, collecting and judging work on a surface-neutral record: a probe
+(surface, target address, text) and what came back (the final reply, any
+artefacts such as an approval card, and the time taken). Each surface is an
+adapter in the connector that sends a probe and collects its result, the way a
+person on that surface would.
+
+The location-independence rule holds per surface: an adapter may use only
+what a person on that surface can see. Slack ships first. Email is the next
+named adapter: send to the agent's address, read the reply on the thread. A
+new adapter adds surfaces, and changes no verdict rule.
+
+### 10. Adding a target costs no tester configuration
+
+A request names its target by mentioning the target's bot: `@mean-tester test
+@target`. The mention gives the bot to probe, and the channel it was asked in
+is where the probes go. The operator lists the repositories the tester may
+read. The target's bundle is found in them by its `plugin.json` name, or by
+the deploy target naming that channel (ADR-0089). A new agent in a listed
+repository can be tested the day it is deployed, with nothing added to the
+tester.
+
+### 11. What makes it grow without more people
+
+- **Known failures come back first.** A target's committed eval cases,
+  including those promoted from earlier FAILs, are re-probed before new
+  probes. Each run spends its first slots on regressions. The history lives in
+  the target's repository, not in the tester.
+- **Unattended runs wait for triggers.** Once the declared cron triggers of
+  [ADR-0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md) fire as
+  turns (#2876), a trigger can start one round per target on a schedule, under
+  the same per-round cap. Until then a person starts every round.
+- **Capacity is capped where it is spent.** Probes per round and concurrent
+  rounds per channel are connector limits, so a schedule cannot exhaust a
+  target installation's sandbox quota.
+
 ## Consequences
 
 - **The same agent gets the same verdict wherever the tester runs.** One tester
@@ -165,11 +231,13 @@ fails is useless.
   added later, it must report separately, so the black-box verdict stays
   location-independent.
 - **Tests leave marked messages** in the channels they run in.
-- **Probes spend the target's sandboxes and quota.** Hence the per-round cap and
-  the person-driven "continue".
+- **Probes spend the target's sandboxes and quota.** Hence the per-round and
+  per-channel caps, and a person-driven "continue" until triggers exist.
+- **Issues cost a person's click.** That is the price of never filing a false
+  one; a tester that filed on its own would train people to ignore it.
 - **Git can differ from what is deployed.** The report names the commit read.
   It does not claim to have tested a deployed version it cannot see.
-- **Agents reachable only by email are out of scope.**
+- **Only Slack ships first.** Email-only agents wait for the email adapter.
 
 ## Alternatives considered
 
@@ -192,6 +260,12 @@ fails is useless.
 - **Read the deployed bundle and pending approvals from the platform API.**
   Rejected by the constraint above. It also needs the platform key (decision
   3).
+- **File every FAIL automatically.** A FAIL is the tester's judgment, not a
+  confirmed defect, and one wrong verdict filed as an issue costs more trust
+  than a click costs time.
+- **Let the tester repair what it finds.** It would need write access to the
+  target's installation, which the location rule already excludes, and a
+  tester that changes its target can no longer tell what it tested.
 - **Fold it into an operations bot.** Mean testing is a different job from
   answering alerts. The bundles stay separate, and an operator who wants them
   on one Slack app across two installations cannot have that anyway (decision
@@ -199,9 +273,13 @@ fails is useless.
 
 ## Tracking
 
-On acceptance, file two issues:
-1. the bundle and its connector;
-2. the falsifiability suite (decision 7).
+On acceptance, file three issues:
+1. the bundle and its connector with the Slack adapter (decisions 1 to 6, 10);
+2. the falsifiability suite (decision 7);
+3. approval-gated issue filing (decision 8).
+
+The email adapter and scheduled runs (decisions 9 and 11) are follow-ups,
+filed when they are started.
 
 The first issue is not closed until one live round has run against a deployed
 agent in another installation, with the report committed as evidence.
