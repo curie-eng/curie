@@ -1203,7 +1203,11 @@ class HarnessCase:
         )
 
     def publish_bootstrap_evidence(self) -> None:
-        target = self.repo_root / ".projects/aws-secrets/evidence/aws-sec-eso-bootstrap" / self.suffix
+        target = (
+            self.repo_root
+            / ".projects/aws-secrets/evidence/aws-sec-eso-bootstrap"
+            / self.suffix
+        )
         target.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(target, 0o700)
         payload = {
