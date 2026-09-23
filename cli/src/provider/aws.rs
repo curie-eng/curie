@@ -242,6 +242,24 @@ impl SecretsProvider for AwsSecretsProvider {
         response_version(request.name, &response)
     }
 
+    fn create(
+        &self,
+        name: &str,
+        material: &SecretMaterial,
+    ) -> Result<ObjectVersion, ProviderError> {
+        // `create-secret` alone: Secrets Manager refuses an existing name with
+        // ResourceExistsException, so two racing creators cannot overwrite.
+        let remote = self.remote_name(name)?;
+        let input = json!({
+            "Name": remote,
+            "SecretString": material.expose(),
+        });
+        let response = self
+            .invoke(name, "create-secret", &input)
+            .map_err(ProviderFailure::into_provider)?;
+        response_version(name, &response)
+    }
+
     fn get(&self, name: &str, version: Option<&str>) -> Result<StoredObject, ProviderError> {
         let response = self.get_value(name, version)?;
         let version = response
@@ -396,6 +414,13 @@ fn parse_output(logical: &str, output: Output) -> ProviderResult<Value> {
         });
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("ResourceExistsException") {
+        return Err(ProviderFailure::provider(ProviderError::Conflict {
+            name: logical.to_string(),
+            expected_version: None,
+            actual_version: None,
+        }));
+    }
     if stderr.contains(NOT_FOUND) {
         return Err(ProviderFailure::provider(ProviderError::NotFound {
             name: logical.to_string(),

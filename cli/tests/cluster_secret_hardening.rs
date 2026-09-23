@@ -451,6 +451,7 @@ fn pure_up() -> UpOpts {
         github_token: GithubTokenPlan::Untouched,
         dev: true,
         adopt: false,
+        history_max: None,
     }
 }
 

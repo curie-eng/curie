@@ -1032,6 +1032,21 @@ enum SecretsE2eEso {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SecretsE2eSuite {
+    Rotation,
+    Routing,
+}
+
+impl SecretsE2eSuite {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotation => "rotation",
+            Self::Routing => "routing",
+        }
+    }
+}
+
 impl SecretsE2eEso {
     fn as_str(self) -> &'static str {
         match self {
@@ -1068,15 +1083,22 @@ enum DevAction {
         /// Synthetic seed JSON. Defaults to the checked in harness fixture.
         #[arg(long, value_name = "PATH")]
         seed: Option<PathBuf>,
-        /// External Secrets setup for an emulator run.
+        /// External Secrets setup for an emulator run. `none` leaves it for
+        /// `curie apply` to install, which runs the routing proof.
         #[arg(long, value_enum)]
         eso: Option<SecretsE2eEso>,
-        /// Run the emulator once with External Secrets and once without it.
+        /// Run the emulator once with External Secrets preinstalled (rotation)
+        /// and once with `curie apply` installing it (routing).
         #[arg(long, conflicts_with_all = ["real_aws", "eso"])]
         ci: bool,
         /// Run against AWS in us-east-1 with profile theconnman.
         #[arg(long)]
         real_aws: bool,
+        /// Which proof to run. `routing` drives `curie apply` with a declared
+        /// provider against an emulator and cannot be combined with --ci,
+        /// --real-aws or --eso.
+        #[arg(long, value_enum, default_value = "rotation")]
+        suite: SecretsE2eSuite,
     },
     /// Nightly SRE demo e2e: five assertions on kind with the pinned Kubernetes
     /// MCP server and a live provider
@@ -3869,6 +3891,26 @@ async fn main() {
             )
             .exit();
     }
+    if let Some(Command::Dev {
+        action:
+            DevAction::SecretsE2e {
+                suite: SecretsE2eSuite::Routing,
+                eso,
+                ci,
+                real_aws,
+                ..
+            },
+    }) = cli.command.as_ref()
+    {
+        if *ci || *real_aws || eso.is_some() {
+            Cli::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "the argument '--suite routing' cannot be used with '--ci', '--real-aws' or '--eso'",
+                )
+                .exit();
+        }
+    }
     ui::init(Ui::from_process(cli.color, cli.debug, cli.quiet, cli.json));
     // main never returns Err (which would give anyhow's default exit 1 and skip
     // classification). Run the command, then map any error to a semantic exit
@@ -4039,12 +4081,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 eso,
                 ci,
                 real_aws,
+                suite,
             } => {
                 commands::dev_secrets_e2e(
                     seed.as_deref(),
                     eso.map(SecretsE2eEso::as_str),
                     ci,
                     real_aws,
+                    suite.as_str(),
                 )
                 .await
             }
@@ -4901,6 +4945,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             github_token: ops::GithubTokenPlan::Untouched,
                             dev,
                             adopt,
+                            history_max: None,
                         },
                         github_token,
                         clear_github_token,
@@ -6219,23 +6264,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                     target.context, target.cluster
                 ));
             }
-            let provider = cfg.secrets.is_some();
             let local = curie::installation::plan_installation(cfg, dry_run)?;
-            // A declared provider installs External Secrets and does not render
-            // the Curie chart. Chart resolution would require a checkout the
-            // provider path does not use.
-            let chart = if provider {
-                String::new()
-            } else {
-                let resolved = artifacts::resolve_chart(
-                    chart.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                    artifacts::cache_root,
-                    std::path::Path::new("charts/curie").is_dir(),
-                )?;
-                materialize_artifact(resolved, dry_run, "chart").await?
-            };
+            let resolved = artifacts::resolve_chart(
+                chart.as_deref(),
+                artifacts::Channel::current(),
+                artifacts::version(),
+                artifacts::cache_root,
+                std::path::Path::new("charts/curie").is_dir(),
+            )?;
+            let chart = materialize_artifact(resolved, dry_run, "chart").await?;
             emit(
                 curie::installation::apply(curie::installation::ApplyOpts {
                     local,

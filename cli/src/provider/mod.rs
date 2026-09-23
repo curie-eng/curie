@@ -13,6 +13,7 @@ mod inventory;
 pub mod reconcile;
 pub mod render_check;
 pub mod rotation;
+pub mod routing;
 
 pub use catalog::{bundle_entries, merge, parse_inventory, platform_inventory, validate_inventory};
 pub use inventory::{
@@ -174,6 +175,21 @@ impl std::error::Error for ProviderError {}
 /// into `ProviderError`.
 pub trait SecretsProvider {
     fn put(&self, request: &PutRequest<'_>) -> Result<ObjectVersion, ProviderError>;
+
+    /// Create `name` only if it does not exist, atomically. An existing
+    /// object is never replaced: the call fails with `Conflict`. The default
+    /// is a create-only `put`; a backend with a native create overrides it.
+    fn create(
+        &self,
+        name: &str,
+        material: &SecretMaterial,
+    ) -> Result<ObjectVersion, ProviderError> {
+        self.put(&PutRequest {
+            name,
+            material,
+            expected_version: None,
+        })
+    }
 
     /// Read the current object when `version` is `None`, or that version id.
     fn get(&self, name: &str, version: Option<&str>) -> Result<StoredObject, ProviderError>;

@@ -27,7 +27,7 @@ use std::path::Path;
 use curie::exit::{classify, ExitClass};
 use curie::ops::{down, down_commands, CommonOpts, DownOpts};
 
-/// `cluster down` reads the External Secrets ownership marker before the
+/// `cluster down` reads the External Secrets ownership marker after the
 /// release sweep. This release did not install that controller, so the probe
 /// is NotFound and must not touch the sweep marker or its first-failure flip.
 const OWNERSHIP_PROBE: &str = r#"if [ "$1" = -n ] && [ "$2" = external-secrets ] && [ "$3" = get ] && [ "$4" = configmap ]; then

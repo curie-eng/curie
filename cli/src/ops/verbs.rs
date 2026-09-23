@@ -1031,39 +1031,6 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
 
     let cl = ui.checklist();
 
-    // A controller Curie did not install stays, including when the marker
-    // cannot be read. A failed uninstall does not skip the release sweep.
-    let step = cl.step("checking External Secrets ownership");
-    let install = crate::provider::bootstrap::InstallRef {
-        namespace: opts.common.namespace.clone(),
-        release: opts.common.release.clone(),
-    };
-    let mut eso_failure = String::new();
-    match tokio::task::spawn_blocking(move || {
-        crate::provider::bootstrap::remove_owned_controller_system(&install)
-    })
-    .await
-    {
-        Ok(Ok(crate::provider::bootstrap::ControllerTeardown::Removed)) => {
-            step.done("removed the controller Curie installed");
-        }
-        Ok(Ok(crate::provider::bootstrap::ControllerTeardown::Retained)) => {
-            step.done("left the existing controller in place");
-        }
-        Ok(Ok(crate::provider::bootstrap::ControllerTeardown::Unproven)) => {
-            step.fail("could not prove ownership, so the controller stays");
-        }
-        Ok(Err(error)) => {
-            step.fail("failed");
-            eso_failure = format!("{error:#}");
-            ui.plumbing(&eso_failure);
-        }
-        Err(error) => {
-            step.fail("failed");
-            ui.plumbing(&format!("{error:#}"));
-        }
-    }
-
     // helm uninstall, tolerating an already-absent release. On any OTHER failure
     // (e.g. a transient API-server blip) we do NOT bail: keep the stderr and fall
     // through to the sweep, so the run-created namespaces are never orphaned
@@ -1196,6 +1163,41 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
 
     // Pure decision (#767): success on a complete teardown, else a fail-forward
     // error whose exit class and message follow from the outcomes plus stderr.
+    // After the sweep: the controller removes its ExternalSecrets' cleanup
+    // finalizers, so uninstalling it first left the namespace terminating
+    // forever. A controller Curie did not install stays, including when the
+    // marker cannot be read.
+    let step = cl.step("checking External Secrets ownership");
+    let install = crate::provider::bootstrap::InstallRef {
+        namespace: opts.common.namespace.clone(),
+        release: opts.common.release.clone(),
+    };
+    let mut eso_failure = String::new();
+    match tokio::task::spawn_blocking(move || {
+        crate::provider::bootstrap::remove_owned_controller_system(&install)
+    })
+    .await
+    {
+        Ok(Ok(crate::provider::bootstrap::ControllerTeardown::Removed)) => {
+            step.done("removed the controller Curie installed");
+        }
+        Ok(Ok(crate::provider::bootstrap::ControllerTeardown::Retained)) => {
+            step.done("left the existing controller in place");
+        }
+        Ok(Ok(crate::provider::bootstrap::ControllerTeardown::Unproven)) => {
+            step.fail("could not prove ownership, so the controller stays");
+        }
+        Ok(Err(error)) => {
+            step.fail("failed");
+            eso_failure = format!("{error:#}");
+            ui.plumbing(&eso_failure);
+        }
+        Err(error) => {
+            step.fail("failed");
+            ui.plumbing(&format!("{error:#}"));
+        }
+    }
+
     let result = teardown_result(
         helm_outcome,
         hook_outcome,

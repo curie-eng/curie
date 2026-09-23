@@ -6,8 +6,9 @@
 use std::sync::Mutex;
 
 use curie::provider::bootstrap::{
-    decide, dry_run_lines, ensure, minor_version, remove_owned_controller, ControllerTeardown,
-    Decision, EnsureOutcome, InstallRef, InstallationView, ESO_CHART, OWNERSHIP_CONFIGMAP,
+    check, decide, dry_run_lines, ensure, minor_version, remove_owned_controller,
+    ControllerTeardown, Decision, EnsureOutcome, InstallRef, InstallationView, ESO_CHART,
+    OWNERSHIP_CONFIGMAP,
 };
 use curie::provider::eso::{Kubectl, KubectlOutput, StoreSpec, ESO_VERSION};
 use serde_json::json;
@@ -21,6 +22,7 @@ struct Scripted {
     ownership: String,
     store_body: String,
     fail_writes: bool,
+    namespace_exists: bool,
 }
 
 impl Scripted {
@@ -34,6 +36,7 @@ impl Scripted {
             ownership: "Error from server (NotFound): configmaps \"curie-eso-install\" not found\n".to_string(),
             store_body: ready_store(),
             fail_writes: false,
+            namespace_exists: false,
         }
     }
 
@@ -104,6 +107,15 @@ impl Kubectl for Scripted {
                 Ok(fail(&self.ownership))
             } else {
                 Ok(ok(&self.ownership))
+            };
+        }
+        if joined.contains("get namespace") {
+            return if self.namespace_exists {
+                Ok(ok("namespace/acme-harness"))
+            } else {
+                Ok(fail(
+                    "Error from server (NotFound): namespaces \"acme-harness\" not found",
+                ))
             };
         }
         if joined.contains("get secretstore") {
@@ -301,6 +313,55 @@ fn an_incompatible_controller_refuses_before_any_write() {
             .all(|call| !call.contains("apply") && !call.contains("upgrade")),
         "{:?}",
         script.calls()
+    );
+}
+
+#[test]
+fn check_refuses_an_incompatible_controller_with_reads_only() {
+    let mut script = Scripted::absent();
+    script.fail_writes = true;
+    check(&script, &script, "rel").expect("an empty cluster passes");
+    compatible(&mut script);
+    check(&script, &script, "rel").expect("a compatible controller passes");
+    script.deploy_body =
+        compatible_deploy("ghcr.io/external-secrets/external-secrets:v2.10.0", None);
+    let error = check(&script, &script, "rel").expect_err("must refuse");
+    let text = format!("{error:#}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(
+        script
+            .calls()
+            .iter()
+            .all(|call| !call.contains("apply") && !call.contains("upgrade")),
+        "{:?}",
+        script.calls()
+    );
+}
+
+#[test]
+fn ensure_leaves_an_existing_namespace_and_its_labels_alone() {
+    let mut script = Scripted::absent();
+    compatible(&mut script);
+    script.namespace_exists = true;
+    ensure(&script, &script, &spec(), &this_install(), None).expect("reuse");
+    assert!(
+        !script
+            .calls()
+            .iter()
+            .any(|call| call == "kubectl: apply -f -"),
+        "an existing namespace must not be re-applied: {:?}",
+        script.calls()
+    );
+    let mut fresh = Scripted::absent();
+    compatible(&mut fresh);
+    ensure(&fresh, &fresh, &spec(), &this_install(), None).expect("reuse");
+    assert!(
+        fresh
+            .calls()
+            .iter()
+            .any(|call| call == "kubectl: apply -f -"),
+        "a missing namespace is created: {:?}",
+        fresh.calls()
     );
 }
 

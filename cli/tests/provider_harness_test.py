@@ -213,9 +213,7 @@ else:
                 self.assertIsNotNone(capture.argv)
                 endpoint_index = capture.argv.index("--endpoint-url")
                 self.assertEqual(capture.argv[endpoint_index + 1], case.aws_endpoint)
-                self.assertEqual(
-                    capture.environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"], "true"
-                )
+                self.assertEqual(capture.environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"], "true")
             finally:
                 shutil.rmtree(case.work)
 
@@ -325,9 +323,7 @@ else:
             def immediate_wait(action, predicate, timeout=180, interval=2.0):
                 del timeout, interval
                 if not predicate():
-                    raise provider_harness.HarnessError(
-                        f"timed out while waiting for {action}"
-                    )
+                    raise provider_harness.HarnessError(f"timed out while waiting for {action}")
 
             provider_harness.wait_until = immediate_wait
             try:
@@ -737,9 +733,7 @@ else:
         r0, r1, r2 = "0" * 64, "1" * 64, "2" * 64
         rotations = [(3.0, 3.4, r1), (6.0, 6.3, r2)]
         samples = [(0.0, 0.1, r0), (2.9, 3.05, r0), (3.5, 3.6, r1), (6.4, 6.5, r2)]
-        self.assertIsNone(
-            provider_harness.first_rotation_sample_violation(samples, r0, rotations)
-        )
+        self.assertIsNone(provider_harness.first_rotation_sample_violation(samples, r0, rotations))
 
     def test_rotation_sample_evaluation_flags_a_revert_between_rotations(self):
         r0, r1, r2 = "0" * 64, "1" * 64, "2" * 64
@@ -758,9 +752,7 @@ else:
         rotations = [(3.0, 3.4, r1), (6.0, 6.3, r2)]
         for seen in (r1, r2):
             self.assertIsNone(
-                provider_harness.first_rotation_sample_violation(
-                    [(6.1, 6.2, seen)], r0, rotations
-                )
+                provider_harness.first_rotation_sample_violation([(6.1, 6.2, seen)], r0, rotations)
             )
         self.assertIsNotNone(
             provider_harness.first_rotation_sample_violation([(6.1, 6.2, r0)], r0, rotations)
@@ -903,6 +895,174 @@ else:
         self.assertIn("create provider entry", rendered)
         self.assertIn("17", rendered)
         self.assertNotIn(raw, rendered)
+
+
+class RoutingSuiteHelpers(unittest.TestCase):
+    def test_helm_release_decodes_through_both_base64_layers_and_gzip(self):
+        import base64
+        import gzip
+
+        release = {"name": "rt", "config": {"api": {"existingSecret": "rt-x"}}}
+        helm_layer = base64.b64encode(gzip.compress(json.dumps(release).encode()))
+        k8s_layer = base64.b64encode(helm_layer).decode()
+        self.assertEqual(provider_harness.decode_helm_release(k8s_layer), release)
+
+    def test_forbidden_scan_finds_raw_and_base64_at_every_alignment(self):
+        import base64
+
+        value = b"synthetic-sentinel-0123456789abcdef"
+        forbidden = {"sentinel": value, "other": b"synthetic-absent-value"}
+        self.assertEqual(
+            provider_harness.forbidden_hits(b"prefix " + value + b" suffix", forbidden),
+            ["sentinel"],
+        )
+        for pad in (b"", b"a", b"ab", b"abc"):
+            encoded = base64.b64encode(pad + value + b"tail")
+            self.assertNotIn(value, encoded)
+            self.assertEqual(provider_harness.forbidden_hits(encoded, forbidden), ["sentinel"], pad)
+        self.assertEqual(provider_harness.forbidden_hits(b"clean text", forbidden), [])
+        self.assertEqual(provider_harness.forbidden_hits(b"anything", {"empty": b""}), [])
+
+    def test_secret_key_ref_discovery_lists_only_running_consumers(self):
+        def pod(name, phase="Running", running=True, deleting=False):
+            env = [
+                {"name": "PLAIN", "value": "x"},
+                {
+                    "name": "AGENT_CREDENTIALS",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": "rt-curie-runner-credentials",
+                            "key": "agentCredentials",
+                        }
+                    },
+                },
+                {
+                    "name": "OTHER",
+                    "valueFrom": {
+                        "secretKeyRef": {"name": "rt-curie-runner-credentials", "key": "k"}
+                    },
+                },
+            ]
+            metadata = {"name": name}
+            if deleting:
+                metadata["deletionTimestamp"] = "2026-09-23T00:00:00Z"
+            return {
+                "metadata": metadata,
+                "spec": {"containers": [{"name": "worker", "env": env}]},
+                "status": {
+                    "phase": phase,
+                    "containerStatuses": [
+                        {"name": "worker", "state": {"running": {}} if running else {"waiting": {}}}
+                    ],
+                },
+            }
+
+        pods = {
+            "items": [
+                pod("rt-curie-worker-a"),
+                pod("rt-curie-worker-b", phase="Pending"),
+                pod("rt-curie-worker-c", running=False),
+                pod("rt-curie-worker-d", deleting=True),
+            ]
+        }
+        self.assertEqual(
+            provider_harness.secret_key_env_refs(
+                pods, "rt-curie-runner-credentials", "agentCredentials"
+            ),
+            [("rt-curie-worker-a", "worker", "AGENT_CREDENTIALS")],
+        )
+        self.assertEqual(
+            provider_harness.secret_key_env_refs(pods, "absent", "agentCredentials"), []
+        )
+
+    def test_external_secret_mappings_and_secret_string_values(self):
+        listed = {
+            "items": [
+                {
+                    "metadata": {"name": "rt-installation-id"},
+                    "spec": {
+                        "target": {"name": "rt-curie-installation-id"},
+                        "data": [
+                            {
+                                "secretKey": "installationId",
+                                "remoteRef": {
+                                    "key": "p/rt/installation-id",
+                                    "property": "installationId",
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        self.assertEqual(
+            provider_harness.external_secret_mappings(listed),
+            [
+                (
+                    "rt-curie-installation-id",
+                    "installationId",
+                    "p/rt/installation-id",
+                    "installationId",
+                )
+            ],
+        )
+        self.assertEqual(
+            provider_harness.secret_string_values('{"a": "one", "b": 2}'), ["one", "2"]
+        )
+        self.assertEqual(provider_harness.secret_string_values("plain"), ["plain"])
+
+    def test_tag_form_images_skip_digests_and_own_images(self):
+        rendered = (
+            "      image: busybox:1.36.1\n"
+            '        image: "valkey/valkey:8.1.10-alpine"\n'
+            "      - image: postgres:16@sha256:" + "a" * 64 + "\n"
+            "      image: curie-aws-secrets-e2e-api:abc\n"
+        )
+        self.assertEqual(
+            provider_harness.tag_form_images(rendered, {"curie-aws-secrets-e2e-api:abc"}),
+            ["busybox:1.36.1", "valkey/valkey:8.1.10-alpine"],
+        )
+
+    def test_routing_installation_names_only_and_drops_provider_for_control(self):
+        images = {
+            name: f"curie-aws-secrets-e2e-{name}:abc-123"
+            for name in ("api", "worker", "dispatcher", "runner")
+        }
+        document = provider_harness.routing_installation(
+            "curie-aws-secrets-e2e-routing",
+            "rt",
+            "kind-x",
+            "curie-aws-secrets-e2e-s",
+            images,
+            "arn:aws:iam::123456789012:role/r",
+        )
+        self.assertEqual(document["secrets"]["role_arn"], "arn:aws:iam::123456789012:role/r")
+        self.assertEqual(document["secrets"]["provider"], "aws")
+        self.assertNotIn("comms", document)
+        self.assertEqual(document["set"]["api.image.repository"], "curie-aws-secrets-e2e-api")
+        self.assertEqual(document["set"]["agentSandbox.runner.tag"], "abc-123")
+        self.assertTrue(all(isinstance(value, str) for value in document["set"].values()))
+        control = provider_harness.routing_installation(
+            "n", "rt", "kind-x", "p", images, "arn:aws:iam::123456789012:role/r", provider=False
+        )
+        self.assertNotIn("secrets", control)
+
+
+class MotoContainerAddress(unittest.TestCase):
+    def test_kind_network_address_is_read_and_absence_is_refused(self):
+        inspected = [
+            {
+                "NetworkSettings": {
+                    "Networks": {
+                        "bridge": {"IPAddress": "172.17.0.2"},
+                        "kind": {"IPAddress": "172.18.0.5"},
+                    }
+                }
+            }
+        ]
+        self.assertEqual(provider_harness.moto_kind_ip(inspected), "172.18.0.5")
+        with self.assertRaises(provider_harness.HarnessError):
+            provider_harness.moto_kind_ip([{"NetworkSettings": {"Networks": {"bridge": {}}}}])
 
 
 if __name__ == "__main__":

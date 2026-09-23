@@ -106,6 +106,10 @@ pub struct UpOpts {
     pub dev: bool,
     /// Explicit operator override for adopting a pre-existing primary namespace.
     pub adopt: bool,
+    /// Bound on stored Helm release revisions (`helm upgrade --history-max`).
+    /// `None` passes no flag and keeps Helm's default. A declared secrets
+    /// provider sets it so old revisions cannot pile up (ADR 0163 decision 5).
+    pub history_max: Option<u32>,
 }
 
 impl UpOpts {
@@ -234,7 +238,7 @@ impl std::fmt::Debug for GithubTokenPlan {
 /// chars). Hex keeps the value shell-, env- and URL-safe and satisfies every
 /// backing store's charset/min-length rule, and a hex `langfuse.encryptionKey`
 /// is the exact `openssl rand -hex 32` shape the chart documents.
-fn random_hex(n_bytes: usize) -> Result<String> {
+pub(crate) fn random_hex(n_bytes: usize) -> Result<String> {
     use std::fmt::Write;
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf)
@@ -268,7 +272,7 @@ fn operator_set_entry(part: &str) -> Option<(&str, &str)> {
 /// want different things from it: a key is matched trimmed, while a value's
 /// surrounding whitespace is only ever shell noise. Trimming here would decide
 /// that for them.
-pub(super) fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
+pub(crate) fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
     sets.iter()
         .flat_map(|s| s.split(','))
         .filter_map(operator_set_entry)
@@ -3370,6 +3374,10 @@ fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
         plain(&o.common.namespace),
         plain("--create-namespace"),
     ];
+    if let Some(history_max) = o.history_max {
+        args.push(plain("--history-max"));
+        args.push(plain(history_max.to_string()));
+    }
     plan.append_command_args(&mut args);
     vec![OpsCommand::new("helm", args)]
 }
@@ -4090,6 +4098,9 @@ async fn run_prepared_up(
             &operator_sets,
             opts.common.dry_run,
         ) {
+            // A provider release keeps its sealing key in Secrets Manager
+            // (ADR 0163); the chart value generated here is dropped.
+            SealingPrivateKeyDisposition::Generated if opts.history_max.is_some() => {}
             SealingPrivateKeyDisposition::Generated => {
                 ui.note("generated a sealing private key for this release; later cluster up runs preserve it");
             }
@@ -4474,6 +4485,7 @@ mod tests {
                 github_token: GithubTokenPlan::Untouched,
                 dev: true,
                 adopt: false,
+                history_max: None,
             },
             Some(existing),
             None,
@@ -4663,6 +4675,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -4708,6 +4721,7 @@ mod tests {
                 secrets: vec![],
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: false,
                 set: vec![],
                 set_string: vec![],
@@ -4764,6 +4778,7 @@ mod tests {
                 secrets: vec![],
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![
@@ -4821,6 +4836,7 @@ mod tests {
                 secrets: vec![],
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -4885,6 +4901,7 @@ mod tests {
                 retained_mail_values: None,
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -4970,6 +4987,7 @@ mod tests {
                 secrets: vec![],
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -5017,6 +5035,7 @@ mod tests {
                 secrets: vec![],
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set: vec![],
                 set_string: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
@@ -5064,6 +5083,7 @@ mod tests {
                 secrets: vec![],
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
                 set_string: vec![],
@@ -5112,6 +5132,7 @@ mod tests {
                 secrets: vec![],
                 dev: false,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -5170,6 +5191,7 @@ mod tests {
                     secrets: vec![],
                     dev: false,
                     adopt: false,
+                    history_max: None,
                     no_expose: true,
                     set: vec![],
                     set_string: vec![],
@@ -5225,6 +5247,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -5250,6 +5273,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec!["worker.replicas=2".into(), "dispatcher.deploy=false".into()],
             set_string: vec![],
@@ -5281,6 +5305,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -5309,6 +5334,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5336,6 +5362,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -5444,6 +5471,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -5471,6 +5499,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -5497,6 +5526,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -5527,6 +5557,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -5553,6 +5584,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec!["agentSandbox.runner.model=z-ai/glm-5.2".into()],
             set_string: vec![],
@@ -5587,6 +5619,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec!["worker.replicas=2,agentSandbox.runner.model=glm".into()],
             allow_web_egress: vec![],
@@ -5615,6 +5648,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5656,6 +5690,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec!["0.0.0.0/0".into()],
@@ -5692,6 +5727,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5729,6 +5765,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -5750,6 +5787,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5975,6 +6013,7 @@ mod tests {
             )],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6156,6 +6195,7 @@ mod tests {
                 retained_mail_values: None,
                 dev: true,
                 adopt: false,
+                history_max: None,
                 no_expose: true,
                 set,
                 set_string: vec![],
@@ -6324,6 +6364,7 @@ mod tests {
             ],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6377,6 +6418,7 @@ mod tests {
             secrets: vec![],
             dev: true,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6404,6 +6446,7 @@ mod tests {
             secrets: vec![],
             dev: true,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6435,6 +6478,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6487,6 +6531,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6540,6 +6585,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6574,6 +6620,7 @@ mod tests {
             secrets: vec![],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6863,6 +6910,7 @@ mod tests {
             secrets: vec![],
             dev: true,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -7116,6 +7164,7 @@ mod tests {
             secrets: vec![],
             dev: true,
             adopt: false,
+            history_max: None,
             no_expose: false,
             set: vec![],
             set_string: vec!["security.allowDevDefaults=false".into()],
@@ -7260,6 +7309,7 @@ mod tests {
             ],
             dev: false,
             adopt: false,
+            history_max: None,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -7746,20 +7796,23 @@ fn announce_adoption_override(namespace: &str, taken: &AdoptionOverride) {
     ));
 }
 
-async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> Result<()> {
+/// What establishing primary namespace ownership would do, decided by reads
+/// alone. Every refusal happens here, before any mutation.
+enum NamespaceOwnershipAction {
+    Create,
+    AlreadyOwned,
+    Patch {
+        record: NamespaceRecord,
+        overridden: Option<AdoptionOverride>,
+    },
+}
+
+async fn primary_namespace_ownership_action(
+    o: &CommonOpts,
+    adopt: bool,
+) -> Result<NamespaceOwnershipAction> {
     match namespace_probe(&o.namespace).await? {
-        NamespaceProbe::Absent => {
-            let manifest = namespace_manifest(&o.namespace, &o.release)?;
-            let command = namespace_create_cmd();
-            let (ok, _out, err) = run_capture_with_stdin(&command, &manifest).await?;
-            if !ok {
-                bail!(
-                    "could not atomically create owned namespace `{}`: {}; inspect the namespace and retry",
-                    o.namespace,
-                    failure_reason(&err)
-                );
-            }
-        }
+        NamespaceProbe::Absent => Ok(NamespaceOwnershipAction::Create),
         NamespaceProbe::Present(record) => {
             if record.terminating {
                 bail!(
@@ -7772,13 +7825,13 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
             if created_by.map(String::as_str) == Some(o.release.as_str())
                 && created_in.map(String::as_str) == Some(o.namespace.as_str())
             {
-                return Ok(());
+                return Ok(NamespaceOwnershipAction::AlreadyOwned);
             }
             if record.labels.get(ADOPTED_BY_LABEL).map(String::as_str) == Some(o.release.as_str())
                 && record.labels.get(ADOPTED_IN_LABEL).map(String::as_str)
                     == Some(o.namespace.as_str())
             {
-                return Ok(());
+                return Ok(NamespaceOwnershipAction::AlreadyOwned);
             }
             if (created_by.is_some() || created_in.is_some()) && !adopt {
                 let by = created_by.map(String::as_str).unwrap_or("<missing>");
@@ -7825,6 +7878,38 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
             } else {
                 None
             };
+            Ok(NamespaceOwnershipAction::Patch { record, overridden })
+        }
+    }
+}
+
+/// The read-only half of [`establish_primary_namespace_ownership`]: refuses
+/// exactly what it would refuse, and mutates nothing.
+pub(crate) async fn check_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> Result<()> {
+    primary_namespace_ownership_action(o, adopt)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn establish_primary_namespace_ownership(
+    o: &CommonOpts,
+    adopt: bool,
+) -> Result<()> {
+    match primary_namespace_ownership_action(o, adopt).await? {
+        NamespaceOwnershipAction::Create => {
+            let manifest = namespace_manifest(&o.namespace, &o.release)?;
+            let command = namespace_create_cmd();
+            let (ok, _out, err) = run_capture_with_stdin(&command, &manifest).await?;
+            if !ok {
+                bail!(
+                    "could not atomically create owned namespace `{}`: {}; inspect the namespace and retry",
+                    o.namespace,
+                    failure_reason(&err)
+                );
+            }
+        }
+        NamespaceOwnershipAction::AlreadyOwned => {}
+        NamespaceOwnershipAction::Patch { record, overridden } => {
             let command =
                 namespace_adoption_cmd(&o.namespace, &o.release, &record, overridden.as_ref())?;
             let (ok, _out, err) = run_capture(&command).await?;
