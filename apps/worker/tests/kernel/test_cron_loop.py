@@ -23,7 +23,7 @@ from typing import Any
 
 import redis
 from aci_protocol import QueuedTurn, TurnSource
-from curie_worker.cron_loop import CronSchedulerLoop
+from curie_worker.cron_loop import CronSchedulerLoop, _Target
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -461,5 +461,46 @@ def test_a_raising_hook_does_not_stop_the_agents_later_hooks(
             assert summary.admitted == 1
             assert [(r.slot_utc, r.outcome) for r in await seed.runs()] == [(seed.slot, None)]
             assert len(_entries(sync_redis, names["stream"])) == 1
+
+    asyncio.run(body())
+
+
+def test_bundle_attached_later_is_read_on_the_next_pass(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A version with no bundle_ref must not cache an empty trigger list, or a
+    bundle attached later to the same active version is never read (#268)."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            calls: list[str] = []
+
+            class _CountingSource:
+                def triggers(self, bundle_ref: str) -> list[dict[str, Any]]:
+                    calls.append(bundle_ref)
+                    return [dict(_trigger(seed))]
+
+            def _target(bundle_ref: str | None) -> _Target:
+                return _Target(
+                    agent_id=seed.agent_id,
+                    agent_name="doesnotmatter",
+                    version_id=seed.version_id,
+                    bundle_ref=bundle_ref,
+                    max_usd_per_day=None,
+                    max_output_tokens_per_run=None,
+                )
+
+            client = _async_redis()
+            try:
+                loop = _loop(seed.engine, client, _CountingSource(), names["stream"], seed.slot)
+                assert await loop._cron_triggers(_target(None)) == []
+                assert calls == []
+
+                triggers = await loop._cron_triggers(_target(seed.bundle_ref))
+                assert calls == [seed.bundle_ref]
+                assert len(triggers) == 1
+                assert triggers[0]["name"] == HOOK
+            finally:
+                await client.aclose()
 
     asyncio.run(body())

@@ -285,7 +285,7 @@ class CronSchedulerLoop:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._watermark = started_at or self._clock()
         # A version's declared triggers are immutable, so one fetch per version.
-        self._triggers: dict[uuid.UUID, list[dict[str, Any]]] = {}
+        self._triggers: dict[tuple[uuid.UUID, str], list[dict[str, Any]]] = {}
         # Table identifiers are not user input; the schema comes from config.
         self._targets_sql = text(_TARGETS_SQL.format(schema=db_schema))
         self._bindings_sql = text(_BINDINGS_SQL.format(schema=db_schema))
@@ -311,16 +311,16 @@ class CronSchedulerLoop:
         ]
 
     async def _cron_triggers(self, target: _Target) -> list[dict[str, Any]]:
-        cached = self._triggers.get(target.version_id)
+        if not target.bundle_ref:
+            # No bundle attached yet; do not cache, so a later bundle attach
+            # on this same active version is picked up on the next pass.
+            return []
+        cache_key = (target.version_id, target.bundle_ref)
+        cached = self._triggers.get(cache_key)
         if cached is None:
-            # A version with no stored bundle declares no triggers.
-            fetched = (
-                await asyncio.to_thread(self._source.triggers, target.bundle_ref)
-                if target.bundle_ref
-                else []
-            )
+            fetched = await asyncio.to_thread(self._source.triggers, target.bundle_ref)
             cached = [t for t in fetched if isinstance(t, dict) and t.get("type") == "cron"]
-            self._triggers[target.version_id] = cached
+            self._triggers[cache_key] = cached
         return cached
 
     def _budget_spent(self, target: _Target) -> bool:
