@@ -817,7 +817,7 @@ pull request stays linked, and later publication is refused.
 
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
 the review subscriptions when both gates are on. Give the App **Issues: Read and write**
-so Curie can re-read the issue and post one terminus comment, and **Metadata: Read** is already
+so Curie can re-read the issue and post one final comment, and **Metadata: Read** is already
 implied by repository installation discovery.
 
 Give the App **Checks: Read** so the work item detail can report CI for the
@@ -879,15 +879,17 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
-A labelled factory run ends as one pull request or one comment on the
-originating issue. The comment says the run cannot continue and names the
-cause (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
+A labelled factory run posts exactly one final comment on the originating
+issue. When publication succeeds, that comment names the exact pull request
+URL. When the run cannot complete, the comment contains `Could not complete:`
+followed by the platform cause
+(`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
 `publication_denied`, `publication_expired`, or `publication_failed`). The
-work item reconciler posts that comment after the terminal row commits. A
-refused post is recorded on the notice and does not change the execution row.
-Waiting for approval is not an ending: the execution deadline stays 1800
-seconds from start and covers that wait.
+work item reconciler posts the comment after the terminal row and any
+publication lineage commit. A refused post is recorded on the notice and does
+not change the execution row. Waiting for approval is not an ending: the
+execution deadline stays 1800 seconds from start and covers that wait.
 
 Review feedback on a factory pull request asks for one more revision of that
 pull request. When a work item owns the PR, an `issue_comment`,
@@ -899,6 +901,9 @@ Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
 others). An accepted mention becomes the work item's next execution request.
+The first line of that request's objective is the same-repository feedback
+URL, which keeps the existing issue, pull request, or review thread as the
+reply target.
 When that revision completes, or ends early, the reconciler answers on the pull
 request: in the review thread for an inline comment, otherwise as a PR comment
 that links the feedback. If GitHub refuses the thread reply with 422, the answer
@@ -906,9 +911,10 @@ is posted as a linked PR comment. PR review feedback reaches the factory only
 when `api.githubFactoryIngressEnabled` is true. A PR no work item owns keeps
 the existing review behavior.
 
-A factory run on a `github` binding streams no chat replies to GitHub. The
-worker acknowledges them locally, and the pull request or the one reconciler
-comment is the run's only GitHub response, so a `github` binding needs no
+A factory run on a `github` binding emits no booting, partial, or final chat
+text. The worker acknowledges runtime output locally. The one reconciler
+comment on a fresh issue is the run's only GitHub response, with the pull
+request URL included when publication succeeds, so a `github` binding needs no
 endpoint or adapter.
 
 ### Driving the factory end to end
@@ -966,34 +972,38 @@ driver yet and is refused before anything is installed.
 
 `run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]... [--expect-reason <regex>]...`
 opens the ticket (first line is the title, the rest the body) as the one
-labelled issue and waits for the run to end. It fails unless the run ended as
-exactly one pull request or one terminus comment, inside the execution bound,
-with no `.github/` file or credential-shaped string in the diff and the default
-branch unmoved, and unless the ending matches `--expect`. Only a comment the
-App posted with this run's execution request marker counts, and more than one
-fails. A comment ending passes only when its cause is one the run accepts:
-each `--expect-cause` given, or by default `no_pull_request` for `--expect
-comment` and `no_pull_request` or `execution_deadline` for `--expect any`.
-A `no_pull_request` comment also needs the agent's final reply as its stated
-reason: a missing reply fails as unverified, the reply must contain `Could not
-complete:` followed by an explanation, and each `--expect-reason` must also
-match it, ignoring case. A rename out of `.github/` fails like a change inside
-it. A known secret or credential-shaped string in the pull request's title,
-body, diff or file names fails the run. The reply, the comment and the pull
-request's title, body and file names are recorded with such strings replaced
-by `[REDACTED]`, redacted in full before the reply is cut to 4000 characters,
-and any redaction in agent text fails the run.
+labelled issue and waits for the marked final issue comment, even after the
+execution row and pull request are ready. It fails unless the run posted
+exactly one such comment inside the execution bound, with at most one pull
+request, no `.github/` file or credential-shaped string in the diff, and the
+default branch unmoved. `--expect pr` requires a pull request, `--expect
+comment` requires no pull request, and `--expect any` accepts either. A success
+comment must name the exact opened pull request URL anywhere in its body. A
+failure comment must contain `Could not complete:` followed by an explanation.
+Its cause must be one the run accepts: each `--expect-cause` given, or by
+default `no_pull_request` for `--expect comment` and `no_pull_request` or
+`execution_deadline` for `--expect any`. When `--expect comment` or `--expect
+any` accepts a `no_pull_request` ending, the agent's final transcript reply must
+separately contain `Could not complete:` followed by its reason. Each
+`--expect-reason` must match that transcript reply, ignoring case. The platform
+cause does not establish the agent's reason. Only a comment the App posted with
+this run's execution request marker counts, and more than one fails. A rename out of
+`.github/` fails like a change inside it. A known secret or credential-shaped
+string in the pull request's title, body, diff, file names, final comment, or
+agent reply fails the run. The comment, agent reply, and the pull request's
+title, body, and file names are recorded with such strings replaced by
+`[REDACTED]`.
 A pull request ending also fails unless the WorkItem row's own
 `publication_lineage_id` is set and its lineage records that pull request; the
 read route's conversation fallback does not count, so the driver reads the
-install's Postgres. A comment ending also clears the notice's delivery record
-and waits for the reconciler to record it again: it must record the original
-comment by its marker, and the issue must still carry exactly one.
-Elapsed time runs from the request's start to the pull request or comment.
+install's Postgres. Every outcome also clears the final notice's delivery
+record and waits for the reconciler to record it again: it must record the
+original comment by its marker, and the issue must still carry exactly one.
+Elapsed time runs from the request's start to the final comment.
 The evidence records the work item state and ending cause, the pull request
-and its changed files, the terminus comment, CI, elapsed and execution time,
-the agent's final reply from its transcript when the api returns exactly one,
-the configured model, and the model spend
+and its changed files, the final comment, the agent's final transcript reply
+and its source, CI, elapsed and execution time, the configured model, and the
+model spend
 as the OpenRouter key's usage delta (or `unverified`). The key is shared, so
 that delta includes any concurrent use of it.
 
@@ -1007,7 +1017,9 @@ with `@<mention>` when absent). It passes when that delivery is
 WorkItem ends with two requests and the second `completed`, the same single
 pull request gained a commit and a new head, exactly one App reply carries the
 revision's marker and links the mention, no other App comment followed the
-ordinary one, and the default branch is unmoved.
+ordinary one, and the default branch is unmoved. Before posting feedback, the
+driver also requires the initial run's one final issue comment to name that
+pull request.
 
 `run --scenario cancel-waiting` installs with the sandbox pod quota set to 0,
 so every sandbox claim is refused and the request waits on capacity. Once it
