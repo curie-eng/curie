@@ -312,7 +312,7 @@ fn is_flag_value(args: &[String], arg: &String) -> bool {
         .is_some_and(|prev| matches!(prev.as_str(), "-n" | "--namespace" | "--context"))
 }
 
-fn argv(parts: &[&str]) -> Vec<String> {
+pub(super) fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| part.to_string()).collect()
 }
 

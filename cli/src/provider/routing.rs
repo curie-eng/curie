@@ -681,14 +681,10 @@ pub fn render_external_secrets(plan: &RoutingPlan, store: &str) -> Vec<Value> {
         .collect()
 }
 
-fn args(parts: &[&str]) -> Vec<String> {
-    parts.iter().map(|p| p.to_string()).collect()
-}
-
 /// Refuse, before any mutation, when the SecretStore is absent.
 pub fn check_store(k: &dyn Kubectl, namespace: &str, store: &str) -> Result<()> {
     let out = k.run(
-        &args(&[
+        &super::eso::argv(&[
             "-n",
             namespace,
             "get",
@@ -764,7 +760,7 @@ pub fn check_targets(k: &dyn Kubectl, plan: &RoutingPlan) -> Result<()> {
     let mut foreign = Vec::new();
     for name in &names {
         let out = k.run(
-            &args(&[
+            &super::eso::argv(&[
                 "-n",
                 namespace,
                 "get",
