@@ -619,6 +619,7 @@ class HarnessCase:
         self.account_id = ""
         self.oidc_arn = ""
         self.role_arn = ""
+        self.emulator_role_arn = ""
         self.issuer = ""
         self.aws_env = aws_environment()
         self.aws_endpoint: str | None = None
@@ -828,6 +829,9 @@ class HarnessCase:
         self.load_and_verify_images()
         if self.mode == "none":
             self.prove_eso_absent()
+            self.create_namespace_and_rbac()
+            self.start_moto()
+            self.create_emulator_role()
             self.prove_apply_installs_eso()
             return
         self.create_namespace_and_rbac()
@@ -835,6 +839,7 @@ class HarnessCase:
             self.create_real_aws_identity()
         else:
             self.start_moto()
+            self.create_emulator_role()
         self.install_eso()
         self.prove_apply_reuses_eso()
         self.prove_incompatible_eso_refuses()
@@ -1053,6 +1058,10 @@ class HarnessCase:
         environment = os.environ.copy()
         environment["KUBECONFIG"] = str(self.admin_kubeconfig)
         environment["HELM_KUBECONTEXT"] = self.context
+        if self.mode == "none" and not self.real_aws:
+            environment["CURIE_ESO_AWS_ENDPOINT"] = (
+                f"http://motosm.{NAMESPACE}.svc.cluster.local:5000"
+            )
         for key in (
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
@@ -1062,8 +1071,33 @@ class HarnessCase:
             environment.pop(key, None)
         return environment
 
+    def provider_role_arn(self) -> str:
+        if self.real_aws:
+            return self.role_arn
+        return self.emulator_role_arn
+
+    def create_emulator_role(self) -> None:
+        document = write_private_file(
+            self.work / "assume-role.json",
+            b'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"*"},"Action":"sts:AssumeRoleWithWebIdentity"}]}',
+        )
+        result = self.aws(
+            "iam",
+            "create-role",
+            "--role-name",
+            "acme-harness",
+            "--assume-role-policy-document",
+            f"file://{document}",
+            action="create emulator role",
+        )
+        role = parse_json(result.stdout, "emulator role")
+        arn = str(role.get("Role", {}).get("Arn", ""))
+        if not arn.startswith("arn:aws:iam::"):
+            raise HarnessError("emulator role ARN is missing")
+        self.emulator_role_arn = arn
+
     def write_provider_installation(self) -> pathlib.Path:
-        role = "arn:aws:iam::000000000000:role/acme-harness"
+        role = self.provider_role_arn()
         document = "\n".join(
             [
                 "version: 1",
@@ -1088,7 +1122,7 @@ class HarnessCase:
             [str(self.curie_bin), *args],
             action,
             env=self.curie_env(),
-            timeout=600,
+            timeout=900,
             allow_failure=allow_failure,
         )
 
@@ -1165,7 +1199,7 @@ class HarnessCase:
         annotation = metadata.get("annotations", {}).get("eks.amazonaws.com/role-arn", "")
         self.record_assertion(
             "service account is annotated with role_arn",
-            annotation == "arn:aws:iam::000000000000:role/acme-harness",
+            annotation == self.provider_role_arn(),
         )
 
     def publish_bootstrap_evidence(self) -> None:
@@ -1551,6 +1585,8 @@ class HarnessCase:
                 "set",
                 "env",
                 "deployment/external-secrets",
+                f"AWS_ENDPOINT_URL={endpoint}",
+                f"AWS_ENDPOINT_URL_STS={endpoint}",
                 f"AWS_SECRETSMANAGER_ENDPOINT={endpoint}",
                 action="configure moto endpoint for External Secrets",
             )
@@ -3385,9 +3421,7 @@ def main() -> int:
     except ValueError as exc:
         safe_print(f"seed error: {exc}", error=True)
         return 2
-    tools = {"git", "docker", "kind", "kubectl", "uv", "helm"}
-    if args.real_aws or args.eso != "none" or args.ci:
-        tools.add("aws")
+    tools = {"git", "docker", "kind", "kubectl", "uv", "helm", "aws"}
     if args.eso != "none" and not args.real_aws:
         # The emulator run drives the rotation suite, which builds a Rust example.
         tools.add("cargo")
