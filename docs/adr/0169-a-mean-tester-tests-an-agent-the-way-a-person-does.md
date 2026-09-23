@@ -2,7 +2,7 @@
 
 Date: 2026-09-22
 
-Status: Draft
+Status: Accepted
 
 This ADR builds on [ADR-0022](0022-eval-completeness-tier-parity-and-trace-promotion.md),
 [ADR-0158](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md)
