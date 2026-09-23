@@ -57,62 +57,75 @@ short of an operator deleting it, and no way to scope memory to a channel.
 
 What we add or change.
 
-**A. Two tiers by default: agent and place. Bundles can add more.**
-There are two memory tiers: a *per agent* memory and a *per place* memory.
-The agent tier belongs to the agent and goes everywhere it goes. The place
-tier belongs to the agent plus one channel binding, `(kind, address)`, treated
-as an opaque string. No key, API or runner code names a specific surface. A
-direct message is a place whose address is the person, so private chats get
-their own memory with no extra mechanism. A bundle that needs another tier can
-declare one; this needs to be possible, not visible.
+**A. Two tiers by default: per agent and per channel. Bundles can add more.**
+The agent tier belongs to one agent and is shared by every channel that agent
+works in. The place tier belongs to one agent in one channel, identified by
+the channel binding `(kind, address)` and treated as an opaque string. Two
+agents in the same channel do not share memory: each has its own place tier
+there. No key, API or runner code names a specific surface. A direct message
+is a place whose address is the person, so private chats get their own memory
+with no extra mechanism. Each tier holds an optional document an operator
+wrote (J) and the entries the agent saved. A bundle that needs another tier
+can declare one; this needs to be possible, not visible.
 
 **B. The bundle declares what kinds of fact the agent may save.**
 The agent cannot save whatever it wants. A bundle lists the kinds of fact it
 remembers, for example "who approves which form" or "a deadline", each with a
 one-line description and the tier it belongs to. The agent can only save
 facts of those kinds. A bundle that declares no kinds gets no save tool; its
-memory comes only from operators.
+memory comes only from operators. If someone explicitly asks the agent to
+remember something that is not a declared kind, or that the bundle forbids,
+the agent does not save it and says it cannot remember that kind of thing. An
+operator can still add it to the tier's document from a file (J).
 
-**C. The agent gets a `remember` / `recall` tool, bound to the current place.**
-Every `remember` call names one of the declared kinds. The platform refuses a
-call whose kind is not declared. The declared kinds and their descriptions
-are the tool's instructions, so the model sees exactly what it may save. The
-tool writes only to the place the message came from; if the model passes a
-place name, it is ignored. The tool is mounted only when memory is turned on
-for the deployment and the bundle declares at least one kind.
+**C. The agent gets a `remember` / `forget` tool, bound to the current place.**
+`remember` names one of the declared kinds and the platform refuses any other.
+`forget` removes an entry by its id; injected entries carry their ids so the
+agent can name one. The declared kinds and their descriptions are the tool's
+instructions, so the model sees exactly what it may save. The tool writes only
+to the place the message came from; if the model passes a place name, it is
+ignored. The tool is mounted only when memory is turned on for the deployment
+and the bundle declares at least one kind.
 
-**D. Saves are silent unless the person asked.**
+**D. Memory is read once, at boot.**
+Everything in both tiers is injected when the session starts. There is no
+tool to read memory mid-session: the session already has it, and it knows
+what it saved itself. A running thread keeps the memory it booted with; a fact
+another thread saved in the meantime appears at this thread's next boot.
+
+**E. Saves are silent unless the person asked.**
 When someone explicitly says "remember this" or "forget that," the reply
 confirms it. Otherwise the agent does not announce saves. Never an approval
-card. An explicit request still has to fit a declared kind; if it does not,
-the agent says it cannot remember that kind of thing.
+card.
 
-**E. The platform fills in the author.**
-Every entry has an author field, separate from its text. The platform sets it
-from whoever sent the message. The tool has no author argument, so the model
-cannot label its own inference with a person's name. A turn with no person
-behind it (a scheduled job, an eval) gets a marker no caller can type.
+**F. Every entry records who stated it. The platform fills this in.**
+The author is part of the entry's provenance, beside the session id, trace
+ids and timestamp [ADR-0025](0025-memory-port-and-first-loader.md) already
+stores. It is shown in the console and not injected into the prompt. It is
+needed because the existing provenance cannot answer "who said this" on its
+own: it names no person, and the traces it points to live in the observability
+store, which is optional and does not keep data as long as memory does. The
+platform sets the author from whoever sent the message. The tool has no author
+argument, so the model cannot label its own inference with a person's name. A
+turn with no person behind it (a scheduled job, an eval) gets a marker no
+caller can type.
 
-**F. One id, many dated versions. Entries are never edited.**
-An entry has an id, a date, an author, and text. A correction adds a new
-version under the same id. Boot and `recall` show only the latest version of
-each id. Older versions stay in the database and can be read. Saving the exact
-same text again is refused.
+**G. One id per fact. A correction replaces it.**
+An entry has an id, a kind, its text, and its provenance. A correction
+overwrites the entry under the same id and updates its provenance to the
+person who corrected it. No version history is kept in the store. Saving the
+exact same text again is refused.
 
-**G. Anyone in a place can correct any fact there.**
-The new version records who made the correction. Accountability comes from
-the author field, not from permissions.
+**H. Anyone in a channel can correct any fact in it.**
+The corrected entry records who made the correction (F). Accountability comes
+from provenance, not from permissions.
 
-**H. What may be saved is the bundle's decision, not the runner's.**
+**I. What may be saved is the bundle's decision, not the runner's.**
 The runner has no content rules of its own. What it enforces is the bundle's
 list of kinds (B), plus any exclusion the bundle adds (for example, "never
 store figures"). The platform can check mechanically that a save names a
 declared kind. It cannot check that the text really is that kind of fact;
-that stays a model judgment, backed by the author field and open correction.
-
-**I. Refused saves are reported as refused.**
-The tool call is marked failed in the trace, and the reply does not claim the
-fact was saved.
+that stays a model judgment, backed by provenance and open correction.
 
 **J. Operators seed from a file. No seeding from channel history.**
 `curie` writes either tier's document from a file, addressed by agent name.
@@ -122,24 +135,33 @@ to build starting memory is dropped: it needs new Slack permissions and a
 re-consent in every workspace, and channel history is the least trustworthy
 input available. A place starts empty.
 
-**K. A hard size cap per tier, enforced by the API.**
+**K. Refused saves are reported as refused.**
+The tool call is marked failed in the trace, and the reply does not claim the
+fact was saved.
+
+**L. A hard size cap per tier, enforced by the API.**
 Writes over the cap are refused with the limit named. It lives in the API so
 operator and agent writes hit the same check.
 
-**L. Deleted entries stay deleted.**
+**M. Compaction runs when a tier nears its cap.**
+When a save takes a tier past 80% of its cap, the session compacts that tier
+after its reply has been sent, so the person does not wait for it. Compaction
+reads the tier's entries and the bundle's declared kinds, and rewrites the
+entries: it merges duplicates, combines entries that say the same thing, and
+drops entries that later ones made obsolete. Merged entries keep the
+provenance of every entry they came from. It never changes the operator's
+document. It writes back with compare-and-set and removes only the entries it
+read, so a save made by another thread while it runs survives. If compaction
+fails, the entries are left as they were. If the tier is still over the cap
+afterwards, new saves are refused (K and L) and the operator is told. No
+scheduler is needed; a nightly pass can be added later through
+[ADR-0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md).
+
+**N. Deleted entries stay deleted.**
 Otherwise the agent re-saves the fact on the next turn, because the message
 that produced it is still in the conversation. The store has to remember what
-was removed; the agent has no way to know.
-
-**M. Compaction is the next slice, not this one.**
-Compaction folds entries into the tier's document on a schedule. It needs
-[ADR-0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md)
-(scheduled turns) first. Until then, the cap (K) and deletion (L) keep the
-store bounded.
-
-**N. In a live session, use `recall` for current state.**
-Boot memory is a snapshot. If someone asks the agent to check the current
-record, it calls `recall` rather than answering from what it booted with.
+a person or operator removed; the agent has no way to know. Entries merged
+away by compaction are not treated as deleted.
 
 **O. Boots log what they loaded.**
 "Found agent tier," "found place tier," or "found nothing," distinguishably.
@@ -158,6 +180,21 @@ look the same.
 - **A platform-wide content rule** ("never store comments about people").
   No. The code can't judge whether a sentence is about a person, and a rule
   enforced only by a prompt isn't enforced.
+- **A `recall` tool to read memory mid-session.** No, see D. Everything is
+  already injected at boot.
+- **Version history on every fact.** No. It adds storage and queries to undo
+  a bad correction, which another correction already does. The old value
+  survives only in the trace of the turn that changed it, if that trace is
+  still retained.
+- **Refuse saves at the cap until an operator acts, with no compaction.** No.
+  The agent would stop learning as soon as a tier filled.
+- **Drop the oldest entries at the cap.** No. Facts nobody chose to lose would
+  disappear.
+- **Compaction on a schedule, from transcripts**
+  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). Not as the
+  default. It needs scheduled turns, and the transcripts it reads are raw
+  conversation rather than facts the bundle declared worth keeping. A
+  size-triggered pass over entries needs neither.
 - **Seeding from channel history.** No, see J.
 - **An operator instructions layer above memory**
   ([ADR-0095](0095-tiered-memory-lifecycle.md)). Not included. The bundle's
@@ -165,11 +202,9 @@ look the same.
 - **Looking up original Slack messages behind a fact**
   ([ADR-0100](0100-agents-search-their-own-surface-through-the-channel-port.md)).
   Not needed here. Left as is.
-- **Compaction now**
-  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). Not yet, see M.
 - **Model supplies the author.** No. The writer should not control the field
   that says who asserted a fact.
-- **Only the author can correct a fact.** No, see G.
+- **Only the author can correct a fact.** No, see H.
 - **Vector database or knowledge graph.** No. One bounded document per tier
   fits in context, and an index is a second copy with no clean delete.
 
@@ -179,36 +214,44 @@ look the same.
   the tool, a fresh thread reads it back, a bundle without memory is refused.
 - The runner needs to know its place. That is one new value in `boot_env`,
   which is a frozen contract, so it gets its own issue before any code.
+- The declared kinds are a new field in the bundle manifest, also a frozen
+  contract, so they get their own issue first too. Whether a deployment turns
+  memory on at all stays a deployment setting.
 - Writer and reader must compose the same key for every address, including
   odd characters. They live in different packages, so this is a test, not
   shared code.
 - The existing `log` row becomes the agent tier's entries. Rename, not
-  rewrite.
-- The declared kinds are a new field in the bundle manifest, which is a
-  frozen contract. It gets its own issue before any code, like the
-  `boot_env` change. Whether a deployment turns memory on at all stays a
-  deployment setting.
+  rewrite. Existing entries have no author; they are shown as unknown rather
+  than guessed.
+- Compaction is a model call made by the session that crossed the line, with
+  the agent's configured model, after its reply. That session holds its
+  sandbox slightly longer, and the cost is attributed to that agent like any
+  other turn. Compaction is rare: it runs only when a tier nears its cap.
 - [ADR-0095](0095-tiered-memory-lifecycle.md) and
   [ADR-0111](0111-the-default-memory-compaction-algorithm.md) are marked as
   folded into this one. The acceptance PR sets them to
   `Superseded by ADR-0167`.
-- Known gaps: no time-based expiry; no automatic contradiction detection; the
-  place tier assumes one agent per place until multi-channel lands.
+- Known gaps: no time-based expiry; compaction merges and drops by model
+  judgment, so it can lose a nuance; the place tier assumes one agent per
+  place until multi-channel lands.
 
 ## Before this can be accepted
 
-1. A fact saved in thread A shows up in a new thread B in the same place, and
-   not in another place.
+1. A fact saved in thread A shows up in a new thread B in the same channel,
+   and not in another channel or for another agent in the same channel.
 2. A bundle without memory is refused on write, and a bundle that declares
    no kinds has no save tool.
-3. A save naming an undeclared kind is refused, and reported as refused.
+3. A save naming an undeclared kind is refused and reported as refused.
 4. Writer and reader keys match for addresses with `@`, `:`, `/`, spaces, and
    non-ASCII.
-5. A refused save is reported as refused, with the trace marked failed.
-6. Unit tests for the size cap and the compare-and-set conflict path.
-7. A deleted entry stays deleted on the next turn.
-8. A correction creates a second version under the same id; only the latest
-   is loaded; both are readable.
+5. Unit tests for the size cap and the compare-and-set conflict path.
+6. A correction replaces the entry under the same id and records the new
+   author; the next boot shows only the corrected text.
+7. A forgotten or deleted entry stays gone on the next turn, even though the
+   message that produced it is still in the conversation.
+8. A save that takes a tier past 80% triggers compaction after the reply; the
+   tier shrinks; every remaining entry is a declared kind; a save made during
+   compaction survives; a failed compaction leaves the tier unchanged.
 9. A planted instruction disguised as memory is saved as an entry, shows its
    author in the console, and does not affect any approval.
 
@@ -218,7 +261,7 @@ look the same.
 |---|---|---|
 | [0025](0025-memory-port-and-first-loader.md) (Accepted) | The store, loading at boot, the entry format | Unchanged. This builds on it. |
 | [0095](0095-tiered-memory-lifecycle.md) (Draft) | Everything at once: tiers, history seeding, compaction, instructions layer, cap, Slack lookup | Folded in. Becomes `Superseded by ADR-0167` on acceptance. |
-| [0111](0111-the-default-memory-compaction-algorithm.md) (Draft) | Scheduled compaction | Folded in. Compaction gets its own ADR when built. |
+| [0111](0111-the-default-memory-compaction-algorithm.md) (Draft) | Scheduled compaction | Folded in. Compaction here runs over a tier's entries when it nears its cap (M), not over transcripts on a schedule. |
 | [0029](0029-conversation-history-port-and-first-loader.md) (Accepted) | Thread transcripts | Unchanged. Transcripts are not memory. |
-| [0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) | Scheduled turns | Unchanged. Compaction will need it later. |
+| [0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) | Scheduled turns | Unchanged. Not needed; a nightly compaction pass could use it later. |
 | [0100](0100-agents-search-their-own-surface-through-the-channel-port.md) (Draft) | Searching raw channel history | Unchanged. Not needed here. |
