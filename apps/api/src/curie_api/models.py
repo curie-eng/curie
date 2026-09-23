@@ -1517,3 +1517,25 @@ class HookRun(Base):
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+
+
+class Tenant(Base):
+    """A self-host appliance's tenant record (#2906).
+
+    First, no-behavior-change slice: a single row is auto-provisioned by
+    migration 0048 at a fixed, well-known id so later migrations can
+    reference it without a runtime lookup. ``deployment_id`` is an opaque
+    identifier for the physical appliance -- NOT a foreign key to
+    ``Deployment``/``deployments``, which is the unrelated dev/prod binding
+    of an AgentVersion.
+    """
+
+    __tablename__ = "tenants"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    deployment_id: Mapped[str] = mapped_column(String)
+    idp_config_ref: Mapped[str | None] = mapped_column(default=None)
+    retention_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    default_provider_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(String, default="active")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
