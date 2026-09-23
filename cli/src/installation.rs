@@ -1675,6 +1675,13 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
              WITHOUT it. Pass exactly one."
         );
     }
+    // Provider apply installs or reuses External Secrets and stops before Helm.
+    // Chart convergence that keeps provider values out of the release is a
+    // separate change. Running `up` here would write generated values into Helm.
+    if local.cfg.secrets.is_some() {
+        let dry_run = local.up.common.dry_run;
+        return bootstrap_provider_apply(local.cfg, dry_run).await;
+    }
     // Before the plan is completed, because the plan's stateful probe renders
     // THIS chart: an empty `up.chart` would render nothing and report every
     // live component as gone.
@@ -1858,6 +1865,42 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         namespace: cfg.install.namespace,
         release: cfg.install.release,
         comms: configured_comms,
+    })
+}
+
+async fn bootstrap_provider_apply(cfg: Installation, dry_run: bool) -> Result<ApplyOutput> {
+    let secrets = cfg
+        .secrets
+        .as_ref()
+        .context("provider apply requires a secrets block")?;
+    let spec = crate::provider::eso::StoreSpec {
+        name: format!("{}-aws", cfg.install.release),
+        namespace: cfg.install.namespace.clone(),
+        region: secrets.region.clone(),
+        service_account: format!("{}-aws-eso", cfg.install.release),
+        role_arn: secrets.role_arn.clone(),
+    };
+    if dry_run {
+        return Ok(ApplyOutput::DryRun(crate::ui::DryRunPlan {
+            lines: crate::provider::bootstrap::dry_run_lines(&spec),
+        }));
+    }
+    let outcome =
+        tokio::task::spawn_blocking(move || crate::provider::bootstrap::ensure_system(&spec))
+            .await
+            .context("External Secrets bootstrap stopped")??;
+    let verb = match outcome {
+        crate::provider::bootstrap::EnsureOutcome::Installed => "installed",
+        crate::provider::bootstrap::EnsureOutcome::Reused => "reused",
+    };
+    crate::ui::ui().note(&format!(
+        "External Secrets {verb} at {}",
+        crate::provider::eso::ESO_VERSION
+    ));
+    Ok(ApplyOutput::Applied {
+        namespace: cfg.install.namespace,
+        release: cfg.install.release,
+        comms: false,
     })
 }
 

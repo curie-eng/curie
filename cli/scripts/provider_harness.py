@@ -828,6 +828,7 @@ class HarnessCase:
         self.load_and_verify_images()
         if self.mode == "none":
             self.prove_eso_absent()
+            self.prove_apply_installs_eso()
             return
         self.create_namespace_and_rbac()
         if self.real_aws:
@@ -835,6 +836,9 @@ class HarnessCase:
         else:
             self.start_moto()
         self.install_eso()
+        self.prove_apply_reuses_eso()
+        self.prove_incompatible_eso_refuses()
+        self.prove_teardown_keeps_reused_controller()
         self.create_provider_entry()
         self.apply_sync_objects()
         self.wait_for_static_key()
@@ -1044,6 +1048,346 @@ class HarnessCase:
                 "the server doesn't have a resource type",
             )
             self.record_assertion(f"{kind}/{name} is absent", absent)
+
+    def curie_env(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment["KUBECONFIG"] = str(self.admin_kubeconfig)
+        environment["HELM_KUBECONTEXT"] = self.context
+        for key in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+        ):
+            environment.pop(key, None)
+        return environment
+
+    def write_provider_installation(self) -> pathlib.Path:
+        role = "arn:aws:iam::000000000000:role/acme-harness"
+        document = "\n".join(
+            [
+                "version: 1",
+                "install:",
+                f"  namespace: {NAMESPACE}",
+                "  release: acme-harness",
+                f"  context: {self.context}",
+                "secrets:",
+                "  provider: aws",
+                f"  region: {REGION}",
+                "  prefix: acme-harness",
+                f"  role_arn: {role}",
+                "",
+            ]
+        )
+        path = self.work / "install.yaml"
+        write_private_file(path, document.encode())
+        return path
+
+    def run_curie(self, *args: str, action: str, allow_failure: bool = False) -> ToolResult:
+        return self.runner.run(
+            [str(self.curie_bin), *args],
+            action,
+            env=self.curie_env(),
+            timeout=600,
+            allow_failure=allow_failure,
+        )
+
+    def helm_eso_revision(self) -> str:
+        result = self.runner.run(
+            [
+                "helm",
+                "--kubeconfig",
+                str(self.admin_kubeconfig),
+                "--kube-context",
+                self.context,
+                "list",
+                "-n",
+                ESO_NAMESPACE,
+                "-o",
+                "json",
+                "-f",
+                "external-secrets",
+            ],
+            "read External Secrets helm revision",
+        )
+        releases = parse_json(result.stdout, "External Secrets helm list")
+        if not isinstance(releases, list):
+            raise HarnessError("External Secrets helm list was not a list")
+        for release in releases:
+            if isinstance(release, dict) and release.get("name") == "external-secrets":
+                return str(release.get("revision", ""))
+        raise HarnessError("External Secrets helm release is absent")
+
+    def deployment_resource_version(self) -> str:
+        result = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            "-o",
+            "jsonpath={.metadata.resourceVersion}",
+            action="read External Secrets deployment version",
+        )
+        return result.stdout.decode().strip()
+
+    def assert_ready_store(self) -> None:
+        result = self.kubectl(
+            "-n",
+            NAMESPACE,
+            "get",
+            "secretstore",
+            "acme-harness-aws",
+            "-o",
+            "json",
+            action="read provider SecretStore",
+        )
+        body = parse_json(result.stdout, "provider SecretStore")
+        conditions = body.get("status", {}).get("conditions", [])
+        ready = any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in conditions
+        )
+        self.record_assertion("SecretStore is Ready", ready)
+        account = self.kubectl(
+            "-n",
+            NAMESPACE,
+            "get",
+            "serviceaccount",
+            "acme-harness-aws-eso",
+            "-o",
+            "json",
+            action="read provider service account",
+        )
+        metadata = parse_json(account.stdout, "provider service account").get("metadata", {})
+        annotation = metadata.get("annotations", {}).get("eks.amazonaws.com/role-arn", "")
+        self.record_assertion(
+            "service account is annotated with role_arn",
+            annotation == "arn:aws:iam::000000000000:role/acme-harness",
+        )
+
+    def publish_bootstrap_evidence(self) -> None:
+        target = self.repo_root / ".projects/aws-secrets/evidence/aws-sec-eso-bootstrap" / self.suffix
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(target, 0o700)
+        payload = {
+            "candidate_commit": self.commit,
+            "mode": self.mode,
+            "assertions": self.assertions,
+            "commands": self.commands,
+        }
+        write_private_file(
+            target / "evidence.json",
+            (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(),
+        )
+
+    def prove_apply_installs_eso(self) -> None:
+        installation = self.write_provider_installation()
+        self.run_curie(
+            "apply",
+            "--file",
+            str(installation),
+            "--context",
+            self.context,
+            action="curie apply installs External Secrets",
+        )
+        image = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+            action="read installed External Secrets image",
+        ).stdout.decode()
+        self.record_assertion("installed controller image is 2.11", "2.11" in image, image)
+        for name in (
+            "externalsecrets.external-secrets.io",
+            "secretstores.external-secrets.io",
+            "pushsecrets.external-secrets.io",
+        ):
+            result = self.kubectl(
+                "get",
+                "crd",
+                name,
+                action=f"read CRD {name}",
+                allow_failure=True,
+            )
+            self.record_assertion(f"CRD {name} exists", result.status == 0)
+        self.assert_ready_store()
+        revision = self.helm_eso_revision()
+        self.run_curie(
+            "apply",
+            "--file",
+            str(installation),
+            "--context",
+            self.context,
+            action="curie apply reuses the controller it installed",
+        )
+        self.record_assertion(
+            "re-apply keeps the External Secrets revision",
+            self.helm_eso_revision() == revision,
+            revision,
+        )
+        self.assert_ready_store()
+        self.publish_bootstrap_evidence()
+
+    def prove_apply_reuses_eso(self) -> None:
+        revision = self.helm_eso_revision()
+        installation = self.write_provider_installation()
+        self.run_curie(
+            "apply",
+            "--file",
+            str(installation),
+            "--context",
+            self.context,
+            action="curie apply reuses the preinstalled controller",
+        )
+        self.record_assertion(
+            "preinstalled External Secrets revision is unchanged",
+            self.helm_eso_revision() == revision,
+            revision,
+        )
+        marker = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "configmap",
+            "curie-eso-install",
+            action="prove Curie did not claim the preinstalled controller",
+            allow_failure=True,
+        )
+        self.record_assertion(
+            "preinstalled controller has no Curie ownership marker",
+            marker.status != 0,
+        )
+        self.assert_ready_store()
+        self.publish_bootstrap_evidence()
+
+    def prove_incompatible_eso_refuses(self) -> None:
+        original = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+            action="read the preinstalled External Secrets image",
+        ).stdout.decode().strip()
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "scale",
+            "deploy/external-secrets",
+            "--replicas=0",
+            action="stop External Secrets before the incompatible image patch",
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "patch",
+            "deploy",
+            "external-secrets",
+            "--type=json",
+            "-p",
+            '[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"ghcr.io/external-secrets/external-secrets:v2.10.0"}]',
+            action="present an incompatible External Secrets image",
+        )
+        version = self.deployment_resource_version()
+        revision = self.helm_eso_revision()
+        installation = self.write_provider_installation()
+        refused = self.run_curie(
+            "apply",
+            "--file",
+            str(installation),
+            "--context",
+            self.context,
+            action="curie apply refuses an incompatible controller",
+            allow_failure=True,
+        )
+        text = refused.stdout.decode("utf-8", "replace") + refused.stderr_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        self.record_assertion(
+            "incompatible controller is refused",
+            refused.status != 0 and "Nothing was changed" in text,
+        )
+        self.record_assertion(
+            "refused apply did not change the deployment",
+            self.deployment_resource_version() == version,
+        )
+        self.record_assertion(
+            "refused apply did not change the helm revision",
+            self.helm_eso_revision() == revision,
+            revision,
+        )
+        restored = json.dumps(
+            [
+                {
+                    "op": "replace",
+                    "path": "/spec/template/spec/containers/0/image",
+                    "value": original,
+                }
+            ]
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "patch",
+            "deploy",
+            "external-secrets",
+            "--type=json",
+            "-p",
+            restored,
+            action="restore the pinned External Secrets image",
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "scale",
+            "deploy/external-secrets",
+            "--replicas=1",
+            action="start the restored External Secrets controller",
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "rollout",
+            "status",
+            "deploy/external-secrets",
+            "--timeout=180s",
+            action="wait for the restored External Secrets controller",
+        )
+        self.publish_bootstrap_evidence()
+
+    def prove_teardown_keeps_reused_controller(self) -> None:
+        self.run_curie(
+            "cluster",
+            "down",
+            "--yes",
+            "--namespace",
+            NAMESPACE,
+            "--release",
+            "acme-harness",
+            "--context",
+            self.context,
+            action="curie cluster down leaves a reused controller",
+        )
+        result = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            action="prove the reused controller is still installed",
+            allow_failure=True,
+        )
+        self.record_assertion("teardown kept the reused controller", result.status == 0)
+        self.publish_bootstrap_evidence()
 
     def create_namespace_and_rbac(self) -> None:
         assert self.ledger is not None
@@ -3016,9 +3360,9 @@ def main() -> int:
     except ValueError as exc:
         safe_print(f"seed error: {exc}", error=True)
         return 2
-    tools = {"git", "docker", "kind", "kubectl", "uv"}
+    tools = {"git", "docker", "kind", "kubectl", "uv", "helm"}
     if args.real_aws or args.eso != "none" or args.ci:
-        tools.update({"aws", "helm"})
+        tools.add("aws")
     if args.eso != "none" and not args.real_aws:
         # The emulator run drives the rotation suite, which builds a Rust example.
         tools.add("cargo")
