@@ -8,12 +8,16 @@ on:
     # Commit events only. A title or body edit must not cancel an in-flight
     # run and restart kind shards. Body-edit guards live in their own workflows.
     types: [opened, synchronize, reopened]
+  # Manual run of the full suite, including kind. The nightly workflow on
+  # main dispatches this against next. Scheduled workflows only run from
+  # the default branch, so the schedule itself cannot live here.
+  workflow_dispatch:
 
-# Supersede an in-flight run when a branch is pushed again so runs stop
-# stacking. Keyed per workflow+ref: each PR branch and main have independent
-# groups, and a new push to a branch cancels only that branch's older run.
+# Supersede an in-flight run of the same event on the same ref. The event
+# name is part of the group so a dispatch is not cancelled by a push to
+# that ref, and a push still cancels only the older push.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -1790,22 +1794,39 @@ jobs:
           fetch-depth: 0
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      # Kind (the cluster rung, the released chart upgrade, and the upgrade
+      # matrix) stays on main. Next pull requests and pushes to next omit it.
+      # A dispatch, including the nightly run from main, keeps it.
       - id: filter
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
+          event="${{ github.event_name }}"
+          ref="${{ github.ref }}"
+          base_ref="${{ github.base_ref }}"
+          if [ "$event" = "pull_request" ]; then
+            git fetch --quiet origin "$base_ref"
+            extra=()
+            if [ "$base_ref" = "next" ]; then
+              extra=(--omit-kind)
+            fi
+            uv run --no-project --with pyyaml==6.0.3 python \
+              tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --base "origin/$base_ref" \
+              --head HEAD \
+              "${extra[@]}"
+          elif [ "$event" = "push" ] && [ "$ref" = "refs/heads/next" ]; then
+            uv run --no-project --with pyyaml==6.0.3 python \
+              tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --push \
+              --omit-kind
+          else
+            # workflow_dispatch and push to main. Dispatch is the nightly run.
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
-          else
-            base="${{ github.base_ref }}"
-            git fetch --quiet origin "$base"
-            uv run --no-project --with pyyaml==6.0.3 python \
-              tools/e2e-ci-selection/select_tiers.py \
-              --registry .github/e2e-selection.yaml \
-              --base "origin/$base" \
-              --head HEAD
           fi
 
   e2e-ladder-cluster:
