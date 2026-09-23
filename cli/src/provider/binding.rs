@@ -97,7 +97,14 @@ pub fn remove_json_key(provider: &dyn SecretsProvider, name: &str, key: &str) ->
         return Ok(());
     }
     if values.is_empty() {
-        provider.delete(name, Some(&expected))?;
+        // Keep the object. Deleting it schedules a recovery window, and the
+        // name cannot be created again until that window ends.
+        let material = SecretMaterial::new("{}".to_string());
+        provider.put(&PutRequest {
+            name,
+            material: &material,
+            expected_version: Some(&expected),
+        })?;
         return Ok(());
     }
     let material =
@@ -108,4 +115,104 @@ pub fn remove_json_key(provider: &dyn SecretsProvider, name: &str, key: &str) ->
         expected_version: Some(&expected),
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use super::super::{
+        ObjectMetadata, ObjectVersion, ProviderError, PutRequest, SecretMaterial, SecretsProvider,
+        StoredObject,
+    };
+    use super::remove_json_key;
+
+    struct Memory {
+        objects: Mutex<BTreeMap<String, String>>,
+        deleted: Mutex<Vec<String>>,
+    }
+
+    impl SecretsProvider for Memory {
+        fn put(&self, request: &PutRequest<'_>) -> Result<ObjectVersion, ProviderError> {
+            self.objects.lock().expect("objects").insert(
+                request.name.to_string(),
+                request.material.expose().to_string(),
+            );
+            Ok(ObjectVersion {
+                id: "v".to_string(),
+            })
+        }
+
+        fn get(&self, name: &str, _version: Option<&str>) -> Result<StoredObject, ProviderError> {
+            let objects = self.objects.lock().expect("objects");
+            let material = objects.get(name).ok_or_else(|| ProviderError::NotFound {
+                name: name.to_string(),
+            })?;
+            Ok(StoredObject {
+                version: ObjectVersion {
+                    id: "v".to_string(),
+                },
+                material: SecretMaterial::new(material.clone()),
+                key_names: Vec::new(),
+            })
+        }
+
+        fn get_metadata(&self, name: &str) -> Result<ObjectMetadata, ProviderError> {
+            let _ = name;
+            Err(ProviderError::Unavailable {
+                name: name.to_string(),
+                status: -1,
+            })
+        }
+
+        fn list(&self, _prefix: &str) -> Result<Vec<ObjectMetadata>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        fn tag(
+            &self,
+            _name: &str,
+            _tags: &BTreeMap<String, String>,
+            _expected_version: Option<&str>,
+        ) -> Result<ObjectVersion, ProviderError> {
+            Ok(ObjectVersion {
+                id: "v".to_string(),
+            })
+        }
+
+        fn delete(
+            &self,
+            name: &str,
+            _expected_version: Option<&str>,
+        ) -> Result<ObjectVersion, ProviderError> {
+            self.deleted.lock().expect("deleted").push(name.to_string());
+            Ok(ObjectVersion {
+                id: "v".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn removing_the_last_key_keeps_an_empty_object() {
+        let provider = Memory {
+            objects: Mutex::new(BTreeMap::from([(
+                "github-app-private-key".to_string(),
+                r#"{"githubAppPrivateKey":"pem"}"#.to_string(),
+            )])),
+            deleted: Mutex::new(Vec::new()),
+        };
+        remove_json_key(&provider, "github-app-private-key", "githubAppPrivateKey")
+            .expect("remove");
+        assert!(provider.deleted.lock().expect("deleted").is_empty());
+        assert_eq!(
+            provider
+                .objects
+                .lock()
+                .expect("objects")
+                .get("github-app-private-key")
+                .map(String::as_str),
+            Some("{}")
+        );
+    }
 }
