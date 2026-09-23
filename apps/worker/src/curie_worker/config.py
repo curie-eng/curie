@@ -1091,6 +1091,11 @@ class WorkerConfig(BaseSettings):
     connector_reconcile_interval_s: float = Field(
         default=60.0, gt=0, validation_alias="CURIE_CONNECTOR_RECONCILE_INTERVAL_S"
     )
+    # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
+    # A slot fires on the first tick at or after it, so the tick bounds lateness.
+    cron_tick_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_CRON_TICK_INTERVAL_S"
+    )
     # The reconciler reuses `connector_release` / `connector_namespace` above --
     # deliberately the same two values the runner's connector scope is built
     # from. They must agree: the runner dials a Service by the name those

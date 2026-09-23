@@ -47,6 +47,7 @@ from aci_protocol import (
     TurnSource,
     parse_queued_turn,
 )
+from channel_protocol import hook_conversation_id
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     inject_trace_context,
@@ -74,7 +75,6 @@ from ..graveyardwatcher import _text
 from ..hook_partition import (
     HOOK_NAME,
     PartitionError,
-    conversation_id,
     derive_partition,
 )
 from ..models import Agent, AgentChannel
@@ -260,7 +260,7 @@ def _mint_turn(
 
     return QueuedTurn(
         event_id=event_id,
-        conversation_id=conversation_id(agent.id, hook, partition),
+        conversation_id=hook_conversation_id(agent.id, hook, partition),
         # The author is the platform, not a person: no human sent this, and
         # putting an upstream-supplied identity here would let a hook impersonate
         # one to anything downstream that reads the field.
@@ -391,7 +391,7 @@ async def ingest_hook(
             )
         binding = selected
 
-    thread_id = conversation_id(agent.id, hook, partition)
+    thread_id = hook_conversation_id(agent.id, hook, partition)
     if mapping.selects_workspace and mapping.repository is not None:
         existing = await crud.get_thread_workspace(
             session, agent_id=agent.id, conversation_id=thread_id

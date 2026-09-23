@@ -40,6 +40,7 @@ from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
 from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
+from .cron_loop import CronSchedulerLoop
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
@@ -113,6 +114,9 @@ class Runtime:
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
     connector_loop: ConnectorReconcileLoop | None = None
+    # The cron scheduler (#268). Always built by ``build``; optional only so a
+    # Runtime constructed elsewhere need not name it.
+    cron_loop: CronSchedulerLoop | None = None
     publication_loop: PublicationReconcileLoop | None = None
 
 
@@ -568,6 +572,24 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         engine=engine,
         card_store=card_store,
         connector_loop=_build_connector_loop(config, engine),
+        cron_loop=CronSchedulerLoop(
+            engine=engine,
+            redis=async_redis,
+            source=HttpManifestSource(
+                api_base_url=config.api_base_url,
+                api_key=config.api_key,
+                release=config.connector_release,
+                namespace=config.connector_namespace,
+                app_name=config.connector_app_name,
+            ),
+            is_killed=killswitch.is_killed,
+            db_schema=config.db_schema,
+            stream=config.stream,
+            interval_seconds=config.cron_tick_interval_s,
+            delivery_budget_s=config.delivery_budget_s,
+            default_max_usd_per_day=config.default_max_usd_per_day,
+            default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
+        ),
         publication_loop=publication_loop,
     )
 
@@ -579,6 +601,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "evals",
         "heartbeat",
         "connectors",
+        "cron",
         "publications",
     }
 )
@@ -895,6 +918,18 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                     )
                 ]
                 if rt.connector_loop is not None
+                else []
+            ),
+            *(
+                [
+                    _supervise(
+                        "cron",
+                        lambda: rt.cron_loop.run_forever(shutdown),  # type: ignore[union-attr]
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if rt.cron_loop is not None
                 else []
             ),
             *(
