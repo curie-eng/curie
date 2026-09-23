@@ -19,6 +19,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     String,
     Text,
@@ -1539,3 +1540,103 @@ class Tenant(Base):
     default_provider_policy_ref: Mapped[str | None] = mapped_column(default=None)
     status: Mapped[str] = mapped_column(String, default="active")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Principal(Base):
+    """A tenant scoped human or service identity (#2907, ADR 0155 step 2).
+
+    Keyed on the IdP subject within a tenant; ``email`` and ``display_name``
+    are attributes and never the identity key. A rebuildable projection of the
+    customer IdP, with no callers yet.
+    """
+
+    __tablename__ = "principals"
+    __table_args__ = (
+        CheckConstraint("type IN ('human', 'service')", name="principals_type_ck"),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'revoked')",
+            name="principals_status_ck",
+        ),
+        CheckConstraint(
+            "authorization_version >= 1",
+            name="principals_authorization_version_ck",
+        ),
+        UniqueConstraint(
+            "tenant_id", "idp_subject", name="principals_tenant_idp_subject_key"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    idp_subject: Mapped[str] = mapped_column(String)
+    type: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="active", server_default="active")
+    display_name: Mapped[str | None] = mapped_column(default=None)
+    email: Mapped[str | None] = mapped_column(default=None)
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    authorization_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1"
+    )
+
+
+class Team(Base):
+    """A tenant scoped team: an IdP group projection or a Curie-managed team (#2907).
+
+    An ``idp_group`` team carries the IdP's group id in ``external_id``; the
+    IdP stays the system of record for its membership.
+    """
+
+    __tablename__ = "teams"
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('idp_group', 'curie_managed')", name="teams_source_ck"
+        ),
+        CheckConstraint(
+            "source <> 'idp_group' OR external_id IS NOT NULL",
+            name="teams_idp_group_external_id_ck",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "source",
+            "external_id",
+            name="teams_tenant_source_external_id_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    source: Mapped[str] = mapped_column(String)
+    external_id: Mapped[str | None] = mapped_column(default=None)
+    name: Mapped[str] = mapped_column(String)
+
+
+class PrincipalTeam(Base):
+    """One principal's membership of one team, as last synced (#2907).
+
+    A projection of the IdP's group membership, not a system of record;
+    ``version`` and ``synced_at`` record which sync produced the row.
+    """
+
+    __tablename__ = "principal_teams"
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('idp_group', 'curie_managed')",
+            name="principal_teams_source_ck",
+        ),
+        CheckConstraint("version >= 1", name="principal_teams_version_ck"),
+        Index("ix_principal_teams_team_id", "team_id"),
+    )
+
+    principal_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.principals.id", ondelete="CASCADE"), primary_key=True
+    )
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.teams.id", ondelete="CASCADE"), primary_key=True
+    )
+    source: Mapped[str] = mapped_column(String)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
