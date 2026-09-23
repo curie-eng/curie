@@ -3046,10 +3046,12 @@ class Kernel:
                     qevent.event_id,
                     exc.code,
                 )
-        if hook_outcome is None and outcome == "escalated" and _is_targetless(qevent):
-            # A targeted escalation that started nothing leaves the row open for
-            # a human reading the escalation. A targetless one has no reader, so
-            # the row is the only record that the run failed (#2963).
+        if hook_outcome is None and _is_targetless(qevent):
+            # A targeted terminal that started nothing (an escalation, a refused
+            # admission or workspace) leaves the row open for a human reading the
+            # reply. A targetless one has no reader and redelivery skips a done
+            # event, so every targetless terminal closes the row: "ran" only when
+            # an attempt started and ended ok, otherwise "failed" (#2963).
             hook_outcome = "failed"
         hook_carry = _HOOK_RUN_CARRY.get()
         if (

@@ -40,6 +40,7 @@ from curie_worker.binding import (
 )
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.killswitch import kill_key
+from curie_worker.sandbox import QuotaRejection
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -51,6 +52,7 @@ def _targetless(
     *,
     event_id: str | None = None,
     source: TurnSource = TurnSource.CRON,
+    prompt: str = PROMPT,
 ) -> QueuedTurn:
     """A targetless turn built without wire validation.
 
@@ -61,7 +63,7 @@ def _targetless(
         event_id=event_id or uuid.uuid4().hex,
         conversation_id=f"cron-{uuid.uuid4().hex}",
         author="cron",
-        text=PROMPT,
+        text=prompt,
         reply_handle=None,
         received_at="2026-09-22T03:00:00+00:00",
         source=source,
@@ -572,6 +574,71 @@ def test_targetless_run_under_a_valid_lease_settles_done_without_outbox(
     asyncio.run(go())
 
 
+async def _wait_until(predicate, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met in time")
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("fence", ["token", "generation"])
+def test_targetless_settlement_refuses_an_owner_fenced_out_mid_turn(
+    make_harness, make_hook_run, fence: str
+) -> None:
+    """Ownership moves while the runner holds the turn; the local flag stays clear.
+
+    No consumer heartbeat runs here, so the only thing that can notice is the
+    settlement fence itself (``settle_fenced_without_completion``). Removing
+    either the token or the generation guard from its Lua turns one case red.
+    """
+
+    async def go() -> None:
+        async with make_hook_run() as run, _seed_deployments(
+            run.engine, run.agent_id
+        ), make_harness(
+            hook_runs=run.recorder(),
+            binding_factory=_resolver_factory(run.engine),
+        ) as h:
+            _store, entry_id, lease = await _owned_lease(h)
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = []
+            h.runner.tail = [Final(text="done", status=SessionStatus.DONE)]
+            event = _targetless(run.ref)
+
+            task = asyncio.create_task(h.kernel.process_event(event, lease=lease))
+            await _wait_until(lambda: h.runner.turn_active)
+            config = h.config
+            if fence == "token":
+                await h.async_redis.set(
+                    config.delivery_lease_key(
+                        config.stream, config.consumer_group, entry_id
+                    ),
+                    "another-owner",
+                    keepttl=True,
+                )
+            else:
+                await h.async_redis.hset(
+                    config.delivery_state_key(
+                        config.stream, config.consumer_group, entry_id
+                    ),
+                    "gen",
+                    str(lease.generation + 1),
+                )
+            assert not lease.lost.is_set()
+            hold.set()
+            await asyncio.wait_for(task, timeout=15)
+
+            assert h.runner.opened == [PROMPT]
+            assert h.sink.events == []
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert not await _has_outbox_record(h, event.event_id)
+            assert lease.lost.is_set()
+
+    asyncio.run(go())
+
+
 def test_targetless_run_under_a_lost_lease_writes_no_done_marker(
     make_harness, make_hook_run
 ) -> None:
@@ -601,3 +668,54 @@ def test_targetless_run_under_a_lost_lease_writes_no_done_marker(
 
     asyncio.run(go())
 
+
+
+# --- 10. refused before the runner starts ------------------------------------
+
+
+@pytest.mark.parametrize("refusal", ["capacity", "workspace"])
+def test_targetless_turn_refused_before_runner_start_fails_the_hook_run(
+    make_harness, make_hook_run, refusal: str
+) -> None:
+    """A terminal refusal that starts no runner must still close the hook row.
+
+    ``_attempt`` returns ``terminal_ok`` on these paths without starting a
+    runner; the event is marked done, so redelivery never revisits it. For a
+    targetless turn the hook row is the only record, so it must say failed.
+    """
+
+    async def go() -> None:
+        async with make_hook_run() as run, _seed_deployments(
+            run.engine, run.agent_id
+        ), make_harness(
+            hook_runs=run.recorder(),
+            binding_factory=_resolver_factory(run.engine),
+            claim_timeout_seconds=0.05,
+        ) as h:
+            if refusal == "capacity":
+                h.fake_k8s.quota_rejection = QuotaRejection(
+                    quota_name="curie-sandbox-quota",
+                    requested={"limits.cpu": "2"},
+                    used={"limits.cpu": "7"},
+                    hard={"limits.cpu": "8"},
+                )
+                event = _targetless(run.ref)
+            else:
+                # No workspace coordinator is wired, so a repository request
+                # is refused with WORKSPACES_DISABLED_REFUSAL before any claim.
+                event = _targetless(
+                    run.ref,
+                    prompt="report on https://github.com/acme-corp/acme-bot",
+                )
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == []
+            assert h.sink.events == []
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert ended_at is not None
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert not await _has_outbox_record(h, event.event_id)
+
+    asyncio.run(go())
