@@ -1279,7 +1279,9 @@ fn sandbox_external_secret_does_not_label_its_target_with_the_connector_owner() 
     // would still hand the Secret the owner label. The template must exist
     // and carry labels of its own.
     assert!(
-        template_labels.as_object().is_some_and(|labels| !labels.is_empty()),
+        template_labels
+            .as_object()
+            .is_some_and(|labels| !labels.is_empty()),
         "sandbox template sets no labels, so ESO copies the owner label: {es}"
     );
 }
