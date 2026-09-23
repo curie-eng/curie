@@ -13,9 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use curie::cluster_secrets::{
-    bind_commands, provider_bind_commands, BindOpts, ProviderBindOpts,
-};
+use curie::cluster_secrets::{bind_commands, provider_bind_commands, BindOpts, ProviderBindOpts};
 use curie::connector_build::{parse_connectors, ConnectorsFileDecl};
 use curie::connectors::prepare;
 use curie::installation::{ProviderKind, SecretsBlock};
@@ -25,8 +23,8 @@ use curie::provider::connector_deploy::{
     ESO_MANAGER_PREFIX, EXTERNAL_SECRET_CRD,
 };
 use curie::provider::eso::{
-    self, release_store_spec, render_external_secret, render_push_secret, Kubectl,
-    KubectlOutput, SyncEntry,
+    self, release_store_spec, render_external_secret, render_push_secret, Kubectl, KubectlOutput,
+    SyncEntry,
 };
 use curie::provider::{
     InventoryClass, InventoryEntry, ObjectMetadata, ObjectVersion, ProviderError, PutRequest,
@@ -125,7 +123,10 @@ fn plan_hosted_entry_targets_the_release_secret_and_splits_rotation() {
     let hosted = &plan.hosted[0];
     assert_eq!(hosted.sync.name, HOSTED_ENTRY);
     assert_eq!(hosted.sync.target, HOSTED_TARGET);
-    assert_eq!(hosted.sync.remote_key, format!("{REMOTE_PREFIX}/{HOSTED_ENTRY}"));
+    assert_eq!(
+        hosted.sync.remote_key,
+        format!("{REMOTE_PREFIX}/{HOSTED_ENTRY}")
+    );
     assert_eq!(hosted.sync.static_keys, vec!["TOKEN_A".to_string()]);
     assert_eq!(hosted.sync.rotated_keys, vec!["TOKEN_B".to_string()]);
     assert_eq!(hosted.sync.labels, owner_labels());
@@ -164,7 +165,11 @@ fn plan_sandbox_entry_targets_the_fullname_secret() {
 #[test]
 fn plan_entries_and_object_names() {
     let plan = default_plan();
-    let names: Vec<&str> = plan.entries().iter().map(|e| e.sync.name.as_str()).collect();
+    let names: Vec<&str> = plan
+        .entries()
+        .iter()
+        .map(|e| e.sync.name.as_str())
+        .collect();
     assert_eq!(names, vec![HOSTED_ENTRY, SANDBOX_ENTRY]);
     let mut objects = plan.object_names();
     objects.sort();
@@ -438,7 +443,11 @@ impl MemProvider {
 
 impl SecretsProvider for MemProvider {
     fn put(&self, request: &PutRequest<'_>) -> Result<ObjectVersion, ProviderError> {
-        assert!(!request.name.contains('/'), "logical names only: {}", request.name);
+        assert!(
+            !request.name.contains('/'),
+            "logical names only: {}",
+            request.name
+        );
         self.puts.lock().unwrap().push(Put {
             name: request.name.to_string(),
             material: request.material.expose().to_string(),
@@ -452,7 +461,9 @@ impl SecretsProvider for MemProvider {
         }
         let mut objects = self.objects.lock().unwrap();
         let current = objects.get(request.name).map(|(v, _)| v.to_string());
-        if request.expected_version.map(str::to_string) != current && request.expected_version.is_some() {
+        if request.expected_version.map(str::to_string) != current
+            && request.expected_version.is_some()
+        {
             return Err(ProviderError::Conflict {
                 name: request.name.to_string(),
                 expected_version: request.expected_version.map(str::to_string),
@@ -524,7 +535,11 @@ fn backup_name() -> String {
 }
 
 fn puts_named(provider: &MemProvider, name: &str) -> Vec<Put> {
-    provider.puts().into_iter().filter(|p| p.name == name).collect()
+    provider
+        .puts()
+        .into_iter()
+        .filter(|p| p.name == name)
+        .collect()
 }
 
 // ---------------------------------------------------------------- write_provider
@@ -539,7 +554,10 @@ fn write_provider_creates_objects_and_backup() {
     let hosted = puts_named(&provider, HOSTED_ENTRY);
     assert_eq!(hosted.len(), 1);
     assert_eq!(hosted[0].expected_version, None);
-    assert_eq!(provider.stored(HOSTED_ENTRY).unwrap(), json!({ "TOKEN_A": V1 }));
+    assert_eq!(
+        provider.stored(HOSTED_ENTRY).unwrap(),
+        json!({ "TOKEN_A": V1 })
+    );
 
     let sandbox = puts_named(&provider, SANDBOX_ENTRY);
     assert_eq!(sandbox.len(), 1);
@@ -549,11 +567,17 @@ fn write_provider_creates_objects_and_backup() {
     );
 
     assert_eq!(puts_named(&provider, &backup_name()).len(), 1);
-    assert_eq!(provider.stored(&backup_name()).unwrap(), json!({ "TOKEN_B": V2 }));
+    assert_eq!(
+        provider.stored(&backup_name()).unwrap(),
+        json!({ "TOKEN_B": V2 })
+    );
 
     let mut written = report.written.clone();
     written.sort();
-    assert_eq!(written, vec![HOSTED_ENTRY.to_string(), SANDBOX_ENTRY.to_string()]);
+    assert_eq!(
+        written,
+        vec![HOSTED_ENTRY.to_string(), SANDBOX_ENTRY.to_string()]
+    );
     assert!(report.unchanged.is_empty());
     assert_eq!(report.backups_created, vec![backup_name()]);
 }
@@ -565,12 +589,20 @@ fn write_provider_skips_unchanged_objects() {
     write_provider(&provider, &default_plan()).expect("first write");
     let before = provider.puts().len();
     let report = write_provider(&provider, &default_plan()).expect("second write");
-    assert_eq!(provider.puts().len(), before, "no version churn: {:?}", provider.puts());
+    assert_eq!(
+        provider.puts().len(),
+        before,
+        "no version churn: {:?}",
+        provider.puts()
+    );
     assert!(report.written.is_empty());
     assert!(report.backups_created.is_empty());
     let mut unchanged = report.unchanged.clone();
     unchanged.sort();
-    assert_eq!(unchanged, vec![HOSTED_ENTRY.to_string(), SANDBOX_ENTRY.to_string()]);
+    assert_eq!(
+        unchanged,
+        vec![HOSTED_ENTRY.to_string(), SANDBOX_ENTRY.to_string()]
+    );
 }
 
 /// A changed value is written with the stored version as the expected one.
@@ -586,13 +618,20 @@ fn write_provider_updates_with_the_stored_version() {
 
     let hosted = puts_named(&provider, HOSTED_ENTRY);
     assert_eq!(hosted.len(), 2);
-    assert_eq!(hosted[1].expected_version.as_deref(), Some(stored_version.as_str()));
+    assert_eq!(
+        hosted[1].expected_version.as_deref(),
+        Some(stored_version.as_str())
+    );
     assert_eq!(
         provider.stored(HOSTED_ENTRY).unwrap(),
         json!({ "TOKEN_A": "fixture-value-changed" })
     );
     assert_eq!(report.written, vec![HOSTED_ENTRY.to_string()]);
-    assert_eq!(puts_named(&provider, SANDBOX_ENTRY).len(), 1, "sandbox unchanged");
+    assert_eq!(
+        puts_named(&provider, SANDBOX_ENTRY).len(),
+        1,
+        "sandbox unchanged"
+    );
 }
 
 /// Keys already in the provider object that the plan does not own survive.
@@ -615,8 +654,10 @@ fn write_provider_preserves_unrelated_keys() {
 /// An existing rotated backup is never overwritten.
 #[test]
 fn write_provider_never_overwrites_an_existing_backup() {
-    let provider = MemProvider::default()
-        .with_object(&backup_name(), json!({ "TOKEN_B": "fixture-rotated-by-workload" }));
+    let provider = MemProvider::default().with_object(
+        &backup_name(),
+        json!({ "TOKEN_B": "fixture-rotated-by-workload" }),
+    );
     let report = write_provider(&provider, &default_plan()).expect("write");
     assert!(puts_named(&provider, &backup_name()).is_empty());
     assert_eq!(
@@ -637,7 +678,9 @@ fn write_provider_errors_carry_no_material() {
     let text = format!("{err:#}");
     assert_no_values(&text);
     assert!(
-        text.contains(HOSTED_ENTRY) || text.contains(SANDBOX_ENTRY) || text.contains(&backup_name()),
+        text.contains(HOSTED_ENTRY)
+            || text.contains(SANDBOX_ENTRY)
+            || text.contains(&backup_name()),
         "{text}"
     );
 }
@@ -667,7 +710,13 @@ fn golden(name: &str) -> Value {
     serde_json::from_str(&raw).expect("golden json")
 }
 
-fn inventory(logical: &str, target: &str, keys: &[&str], owner: RotationOwner, rotated: &[&str]) -> InventoryEntry {
+fn inventory(
+    logical: &str,
+    target: &str,
+    keys: &[&str],
+    owner: RotationOwner,
+    rotated: &[&str],
+) -> InventoryEntry {
     InventoryEntry {
         logical_name: logical.to_string(),
         class: InventoryClass::External,
@@ -684,7 +733,13 @@ fn inventory(logical: &str, target: &str, keys: &[&str], owner: RotationOwner, r
 
 fn golden_static() -> SyncEntry {
     SyncEntry::from_inventory(
-        &inventory("platform", "curie-platform", &["A", "B"], RotationOwner::Sm, &[]),
+        &inventory(
+            "platform",
+            "curie-platform",
+            &["A", "B"],
+            RotationOwner::Sm,
+            &[],
+        ),
         "curie/test",
     )
     .unwrap()
@@ -738,8 +793,14 @@ fn labelled_external_secret_adds_metadata_and_template_labels() {
     );
     // Everything else is the unlabelled golden.
     let mut stripped = rendered.clone();
-    stripped["metadata"].as_object_mut().unwrap().remove("labels");
-    stripped["spec"]["target"].as_object_mut().unwrap().remove("template");
+    stripped["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("labels");
+    stripped["spec"]["target"]
+        .as_object_mut()
+        .unwrap()
+        .remove("template");
     assert_eq!(stripped, golden("external-static.json"));
 }
 
@@ -750,7 +811,10 @@ fn labelled_push_secret_adds_metadata_labels() {
     let push = render_push_secret(&entry, "curie", "curie-aws").unwrap();
     assert_eq!(push["metadata"]["labels"], json!({ OWNER: AGENT }));
     let mut stripped = push.clone();
-    stripped["metadata"].as_object_mut().unwrap().remove("labels");
+    stripped["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("labels");
     assert_eq!(stripped, golden("push-backup.json"));
 }
 
@@ -771,16 +835,22 @@ fn release_store_spec_names() {
     assert_eq!(spec.service_account, "r1-secrets-sync");
     assert_eq!(spec.namespace, NS);
     assert_eq!(spec.region, "us-east-1");
-    assert_eq!(spec.role_arn, "arn:aws:iam::000000000000:role/curie-eso-test");
+    assert_eq!(
+        spec.role_arn,
+        "arn:aws:iam::000000000000:role/curie-eso-test"
+    );
 }
 
 // ---------------------------------------------------------------- apply_objects
 
 /// Accepts applies, records force-sync annotations, and answers ExternalSecret
 /// reads as Ready at exactly the annotated metadata. Target Secrets are absent.
+/// One scripted kubectl call: argv and stdin.
+type RecordedCall = (Vec<String>, Option<Vec<u8>>);
+
 #[derive(Default)]
 struct SyncKubectl {
-    calls: Mutex<Vec<(Vec<String>, Option<Vec<u8>>)>>,
+    calls: Mutex<Vec<RecordedCall>>,
     externals: Mutex<BTreeMap<String, Value>>,
 }
 
@@ -894,7 +964,10 @@ fn apply_objects_orders_store_then_entries_then_sync() {
         .find(|&i| stdin_has(&calls[i].1, "\"ExternalSecret\""))
         .expect("ExternalSecret applied");
     assert!(store_at < first_external, "store before ExternalSecrets");
-    assert!(sa_at < first_external, "service account before ExternalSecrets");
+    assert!(
+        sa_at < first_external,
+        "service account before ExternalSecrets"
+    );
     assert!(stdin_has(&calls[store_at].1, "r1-secrets-manager"));
 
     for name in [HOSTED_ENTRY, SANDBOX_ENTRY] {
@@ -907,8 +980,14 @@ fn apply_objects_orders_store_then_entries_then_sync() {
         assert_eq!(annotates.len(), 1, "one force-sync for {name}");
         assert!(annotates[0] > first_external, "sync after apply for {name}");
     }
-    assert!(stdin_has(&calls[first_external].1, OWNER), "owner label on ExternalSecret");
-    assert!(stdin_has(&calls[first_external].1, "\"refreshInterval\":\"1h\""));
+    assert!(
+        stdin_has(&calls[first_external].1, OWNER),
+        "owner label on ExternalSecret"
+    );
+    assert!(stdin_has(
+        &calls[first_external].1,
+        "\"refreshInterval\":\"1h\""
+    ));
 
     assert!(
         provider.gets().contains(&backup_name()),
@@ -916,7 +995,10 @@ fn apply_objects_orders_store_then_entries_then_sync() {
         provider.gets()
     );
     assert!(provider.gets().iter().all(|n| !n.contains('/')));
-    assert!(provider.puts().is_empty(), "apply_objects writes nothing to the provider");
+    assert!(
+        provider.puts().is_empty(),
+        "apply_objects writes nothing to the provider"
+    );
 }
 
 // ---------------------------------------------------------------- eso_prune_args
@@ -929,7 +1011,10 @@ fn eso_prune_args_uses_one_field_selector() {
     assert_ne!(args.first().map(String::as_str), Some("kubectl"));
     assert!(has(&args, "delete"), "{args:?}");
     assert!(has(&args, "externalsecret,pushsecret"), "{args:?}");
-    assert_eq!(after(&args, "-l").as_deref(), Some("curie.dev/connector-owner=bot"));
+    assert_eq!(
+        after(&args, "-l").as_deref(),
+        Some("curie.dev/connector-owner=bot")
+    );
     assert_eq!(after(&args, "-n").as_deref(), Some(NS));
     let selectors: Vec<&String> = args
         .iter()
@@ -946,7 +1031,10 @@ fn eso_prune_args_uses_one_field_selector() {
 #[test]
 fn eso_prune_args_without_keep_has_no_field_selector() {
     let args = eso_prune_args(NS, AGENT, &[]);
-    assert!(!args.iter().any(|a| a.starts_with("--field-selector")), "{args:?}");
+    assert!(
+        !args.iter().any(|a| a.starts_with("--field-selector")),
+        "{args:?}"
+    );
     assert!(has(&args, "externalsecret,pushsecret"), "{args:?}");
 }
 
@@ -998,7 +1086,10 @@ fn provider_bind_commands_set_names_only() {
     let helm = &cmds[0];
     assert_eq!(helm.program, "helm");
     let argv = helm.argv();
-    assert_eq!(&argv[..3], &["upgrade".to_string(), RELEASE.into(), "charts/curie".into()]);
+    assert_eq!(
+        &argv[..3],
+        &["upgrade".to_string(), RELEASE.into(), "charts/curie".into()]
+    );
     assert_eq!(after(&argv, "-n").as_deref(), Some(NS));
     assert!(has(&argv, "--reuse-values"), "{argv:?}");
     assert_eq!(
@@ -1066,8 +1157,14 @@ fn bind_commands_without_provider_still_write_values() {
     assert_eq!(
         pairs,
         vec![
-            ("agentSandbox.connectorSecrets.bot.TOKEN_A".to_string(), V1.to_string()),
-            ("agentSandbox.connectorSecrets.bot.TOKEN_B".to_string(), V2.to_string()),
+            (
+                "agentSandbox.connectorSecrets.bot.TOKEN_A".to_string(),
+                V1.to_string()
+            ),
+            (
+                "agentSandbox.connectorSecrets.bot.TOKEN_B".to_string(),
+                V2.to_string()
+            ),
         ]
     );
 }
@@ -1133,7 +1230,10 @@ fn into_provider_delivery_drops_the_secret_and_keeps_its_name() {
 
     let after = prepared().into_provider_delivery();
     let after_objects = after.applied_objects();
-    assert!(!after_objects.contains(&secret_object()), "{after_objects:?}");
+    assert!(
+        !after_objects.contains(&secret_object()),
+        "{after_objects:?}"
+    );
     assert!(after.keep_names().iter().any(|n| n == HOSTED_TARGET));
     assert_eq!(after.keep_names(), before_keep.as_slice());
 

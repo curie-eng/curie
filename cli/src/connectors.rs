@@ -818,6 +818,12 @@ pub struct ClusterTarget {
 }
 
 impl ClusterTarget {
+    /// The captured kubeconfig snapshot, for a driver that runs kubectl itself
+    /// (the External Secrets steps) against the same target as the apply.
+    pub fn kubeconfig_path(&self) -> &std::path::Path {
+        self.kubeconfig.path()
+    }
+
     fn args(&self, argv: &[String]) -> Vec<String> {
         let mut result = vec![
             "kubectl".into(),
@@ -1562,7 +1568,8 @@ pub struct PreparedConnectorSync {
     namespace: String,
     agent_name: String,
     keep: Vec<String>,
-    apply_document: Option<String>,
+    /// The labelled objects `sync` applies, serialized to one List there.
+    objects: Vec<Value>,
     workloads: Vec<ConnectorWorkload>,
     result: ConnectorSync,
     secret_name: Option<String>,
@@ -1576,6 +1583,12 @@ pub struct PreparedConnectorSync {
     secret_sources: BTreeMap<String, String>,
     target: SecretScope,
     bound_target: Option<ClusterTarget>,
+    /// Set by [`PreparedConnectorSync::into_provider_delivery`]: External
+    /// Secrets writes the value Secret, so `sync` neither applies nor inspects it.
+    provider_delivery: bool,
+    /// Names the prune must spare beyond what this sync applies (the ESO
+    /// sandbox Secret carries the owner label but is not a connector object).
+    prune_spare: Vec<String>,
 }
 
 impl PreparedConnectorSync {
@@ -1610,6 +1623,65 @@ impl PreparedConnectorSync {
             .iter()
             .map(|(key, source)| format!("{key}: {source}"))
             .collect()
+    }
+
+    /// The owned value Secret's name, when the API declared owned keys.
+    pub fn owned_secret_name(&self) -> Option<&str> {
+        self.secret_name.as_deref()
+    }
+
+    /// `(kind, name)` of every object `sync` would apply.
+    pub fn applied_objects(&self) -> Vec<(String, String)> {
+        self.objects
+            .iter()
+            .map(|obj| {
+                let field = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_string();
+                (
+                    field(obj.get("kind")),
+                    field(obj.get("metadata").and_then(|m| m.get("name"))),
+                )
+            })
+            .collect()
+    }
+
+    /// Names the prune keeps.
+    pub fn keep_names(&self) -> &[String] {
+        &self.keep
+    }
+
+    /// The captured kubeconfig of the bound target, once `bind_target` ran.
+    pub fn bound_kubeconfig_path(&self) -> Option<&std::path::Path> {
+        self.bound_target
+            .as_ref()
+            .map(ClusterTarget::kubeconfig_path)
+    }
+
+    /// Hand the value Secret to External Secrets (ADR 0163 decision 6).
+    ///
+    /// The rendered value Secret leaves the apply, so no value reaches kubectl
+    /// from here. Its name stays in `keep`: the ESO-created Secret carries the
+    /// owner label through the ExternalSecret template, and without the name
+    /// the prune below would delete the Secret ESO just wrote.
+    pub fn into_provider_delivery(mut self) -> Self {
+        if let Some(name) = self.secret_name.clone() {
+            self.objects.retain(|obj| {
+                !(obj.get("kind").and_then(Value::as_str) == Some("Secret")
+                    && obj
+                        .get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(Value::as_str)
+                        == Some(name.as_str()))
+            });
+        }
+        self.provider_delivery = true;
+        self
+    }
+
+    /// Spare these names from the prune too. Provider delivery labels the
+    /// sandbox Secret with the owner, and it is not among the applied objects.
+    pub fn spare_from_prune(mut self, names: Vec<String>) -> Self {
+        self.prune_spare.extend(names);
+        self
     }
 
     /// Hosted connectors with no matching mcp_entry, recorded at prepare.
@@ -1701,17 +1773,12 @@ pub fn prepare(
     let labelled = label_objects(&objects, agent_name);
     let keep = object_names(&labelled);
     let workloads = connector_workloads(manifests, mcp_entries);
-    let apply_document = if labelled.is_empty() {
-        None
-    } else {
-        Some(as_list_document(&labelled)?)
-    };
 
     Ok(PreparedConnectorSync {
         namespace: target.namespace.clone(),
         agent_name: agent_name.to_string(),
         keep,
-        apply_document,
+        objects: labelled,
         workloads,
         result,
         secret_name,
@@ -1720,6 +1787,8 @@ pub fn prepare(
         secret_sources,
         target: target.clone(),
         bound_target: None,
+        provider_delivery: false,
+        prune_spare: Vec::new(),
     })
 }
 
@@ -1733,7 +1802,7 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         namespace,
         agent_name,
         keep,
-        apply_document,
+        objects,
         workloads,
         mut result,
         secret_name,
@@ -1742,10 +1811,16 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         secret_sources,
         target,
         bound_target,
+        provider_delivery,
+        prune_spare,
     } = prepared;
     let bound_target = bound_target.context("connector sync has no captured Kubernetes target")?;
 
-    if let Some(name) = secret_name.as_deref() {
+    if let (true, Some(name)) = (provider_delivery, secret_name.as_deref()) {
+        ui.note(&format!(
+            "connectors: {name} is delivered by External Secrets"
+        ));
+    } else if let Some(name) = secret_name.as_deref() {
         ui.note(&write_intent_line(name, &secret_keys, &target));
         for (key, source) in &secret_sources {
             ui.note(&format!("{key}: {source}"));
@@ -1758,24 +1833,33 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         result.replaced_keys = replaced;
     }
 
-    if let Some(doc) = apply_document {
+    if !objects.is_empty() {
+        let doc = as_list_document(&objects)?;
         bound_target.revalidate_ambient_binding().await?;
         let (ok, _out, err) = run(&bound_target.args(&apply_args(&namespace)), Some(&doc)).await?;
         if !ok {
             anyhow::bail!("applying connectors failed: {}", err.trim());
         }
-        result.applied = keep.clone();
+        // Under provider delivery the value Secret is kept from the prune but
+        // was not applied here, so it is not reported as applied.
+        result.applied = keep
+            .iter()
+            .filter(|n| !provider_delivery || Some(n.as_str()) != secret_name.as_deref())
+            .cloned()
+            .collect();
         ui.note(&format!(
             "connectors: applied {} object(s) for {agent_name}",
-            keep.len()
+            result.applied.len()
         ));
     }
 
     // Runs even with nothing declared -- that is the case where a connector was
     // REMOVED, and the whole reason this is not a bare `kubectl apply`.
     bound_target.revalidate_ambient_binding().await?;
+    let mut prune_keep = keep;
+    prune_keep.extend(prune_spare);
     let (ok, _out, err) = run(
-        &bound_target.args(&prune_args(&namespace, &agent_name, &keep)),
+        &bound_target.args(&prune_args(&namespace, &agent_name, &prune_keep)),
         None,
     )
     .await?;
