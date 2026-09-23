@@ -560,15 +560,19 @@ def test_next_omits_kind_and_dispatch_keeps_it() -> None:
         for step in workflow["jobs"]["changes"]["steps"]
         if step.get("id") == "filter"
     )
-    assert 'github.event_name }}" = "workflow_dispatch"' in run
-    assert 'github.ref }}" = "refs/heads/next"' in run
-    assert 'github.base_ref }}" = "next"' in run
-    dispatch, next_push, next_pr, main_push = run.split("elif", 3)
-    assert "--push" in dispatch
-    assert "--omit-kind" not in dispatch
+    assert "github.event_name" in run
+    assert "refs/heads/next" in run
+    assert '"$base_ref" = "next"' in run
+    assert run.count("select_tiers.py") == 3
+    pull_request, rest = run.split("elif", 1)
+    assert "git fetch" in pull_request
+    assert "--omit-kind" in pull_request
+    next_push, main_or_dispatch = rest.split("else", 1)
     assert "--omit-kind" in next_push
-    assert "--omit-kind" in next_pr
-    assert "--omit-kind" not in main_push
+    assert "--push" in next_push
+    assert "workflow_dispatch" in main_or_dispatch
+    assert "--push" in main_or_dispatch
+    assert "--omit-kind" not in main_or_dispatch
 
 
 def test_workflow_consumes_each_selection_output_exactly() -> None:

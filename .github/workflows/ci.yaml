@@ -1800,39 +1800,33 @@ jobs:
       - id: filter
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          event="${{ github.event_name }}"
+          ref="${{ github.ref }}"
+          base_ref="${{ github.base_ref }}"
+          if [ "$event" = "pull_request" ]; then
+            git fetch --quiet origin "$base_ref"
+            extra=()
+            if [ "$base_ref" = "next" ]; then
+              extra=(--omit-kind)
+            fi
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
-              --push
-          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/next" ]; then
+              --base "origin/$base_ref" \
+              --head HEAD \
+              "${extra[@]}"
+          elif [ "$event" = "push" ] && [ "$ref" = "refs/heads/next" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push \
               --omit-kind
-          elif [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.base_ref }}" = "next" ]; then
-            base="${{ github.base_ref }}"
-            git fetch --quiet origin "$base"
-            uv run --no-project --with pyyaml==6.0.3 python \
-              tools/e2e-ci-selection/select_tiers.py \
-              --registry .github/e2e-selection.yaml \
-              --base "origin/$base" \
-              --head HEAD \
-              --omit-kind
-          elif [ "${{ github.event_name }}" = "push" ]; then
+          else
+            # workflow_dispatch and push to main. Dispatch is the nightly run.
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
-          else
-            base="${{ github.base_ref }}"
-            git fetch --quiet origin "$base"
-            uv run --no-project --with pyyaml==6.0.3 python \
-              tools/e2e-ci-selection/select_tiers.py \
-              --registry .github/e2e-selection.yaml \
-              --base "origin/$base" \
-              --head HEAD
           fi
 
   e2e-ladder-cluster:
