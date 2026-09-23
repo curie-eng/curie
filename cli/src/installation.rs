@@ -1954,8 +1954,12 @@ async fn converge_provider(
         ..Default::default()
     };
     let store = routing::store_name(&routing.release);
+    // Every read-only refusal first: Secrets Manager, the SecretStore, the
+    // target Secrets and the namespace ownership verdict.
     let to_create = routing::preflight(routing, sm)?;
     routing::check_store(&kubectl, &routing.namespace, &store)?;
+    routing::check_targets(&kubectl, routing)?;
+    crate::ops::check_primary_namespace_ownership(common, adopt).await?;
     if !to_create.is_empty() {
         routing::generate(provider, routing, &to_create)?;
         let reread = routing::read_sm_inventory(provider)?;

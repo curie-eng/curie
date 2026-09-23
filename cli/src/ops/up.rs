@@ -272,7 +272,7 @@ fn operator_set_entry(part: &str) -> Option<(&str, &str)> {
 /// want different things from it: a key is matched trimmed, while a value's
 /// surrounding whitespace is only ever shell noise. Trimming here would decide
 /// that for them.
-pub(super) fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
+pub(crate) fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
     sets.iter()
         .flat_map(|s| s.split(','))
         .filter_map(operator_set_entry)
@@ -7796,23 +7796,23 @@ fn announce_adoption_override(namespace: &str, taken: &AdoptionOverride) {
     ));
 }
 
-pub(crate) async fn establish_primary_namespace_ownership(
+/// What establishing primary namespace ownership would do, decided by reads
+/// alone. Every refusal happens here, before any mutation.
+enum NamespaceOwnershipAction {
+    Create,
+    AlreadyOwned,
+    Patch {
+        record: NamespaceRecord,
+        overridden: Option<AdoptionOverride>,
+    },
+}
+
+async fn primary_namespace_ownership_action(
     o: &CommonOpts,
     adopt: bool,
-) -> Result<()> {
+) -> Result<NamespaceOwnershipAction> {
     match namespace_probe(&o.namespace).await? {
-        NamespaceProbe::Absent => {
-            let manifest = namespace_manifest(&o.namespace, &o.release)?;
-            let command = namespace_create_cmd();
-            let (ok, _out, err) = run_capture_with_stdin(&command, &manifest).await?;
-            if !ok {
-                bail!(
-                    "could not atomically create owned namespace `{}`: {}; inspect the namespace and retry",
-                    o.namespace,
-                    failure_reason(&err)
-                );
-            }
-        }
+        NamespaceProbe::Absent => Ok(NamespaceOwnershipAction::Create),
         NamespaceProbe::Present(record) => {
             if record.terminating {
                 bail!(
@@ -7825,13 +7825,13 @@ pub(crate) async fn establish_primary_namespace_ownership(
             if created_by.map(String::as_str) == Some(o.release.as_str())
                 && created_in.map(String::as_str) == Some(o.namespace.as_str())
             {
-                return Ok(());
+                return Ok(NamespaceOwnershipAction::AlreadyOwned);
             }
             if record.labels.get(ADOPTED_BY_LABEL).map(String::as_str) == Some(o.release.as_str())
                 && record.labels.get(ADOPTED_IN_LABEL).map(String::as_str)
                     == Some(o.namespace.as_str())
             {
-                return Ok(());
+                return Ok(NamespaceOwnershipAction::AlreadyOwned);
             }
             if (created_by.is_some() || created_in.is_some()) && !adopt {
                 let by = created_by.map(String::as_str).unwrap_or("<missing>");
@@ -7878,6 +7878,38 @@ pub(crate) async fn establish_primary_namespace_ownership(
             } else {
                 None
             };
+            Ok(NamespaceOwnershipAction::Patch { record, overridden })
+        }
+    }
+}
+
+/// The read-only half of [`establish_primary_namespace_ownership`]: refuses
+/// exactly what it would refuse, and mutates nothing.
+pub(crate) async fn check_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> Result<()> {
+    primary_namespace_ownership_action(o, adopt)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn establish_primary_namespace_ownership(
+    o: &CommonOpts,
+    adopt: bool,
+) -> Result<()> {
+    match primary_namespace_ownership_action(o, adopt).await? {
+        NamespaceOwnershipAction::Create => {
+            let manifest = namespace_manifest(&o.namespace, &o.release)?;
+            let command = namespace_create_cmd();
+            let (ok, _out, err) = run_capture_with_stdin(&command, &manifest).await?;
+            if !ok {
+                bail!(
+                    "could not atomically create owned namespace `{}`: {}; inspect the namespace and retry",
+                    o.namespace,
+                    failure_reason(&err)
+                );
+            }
+        }
+        NamespaceOwnershipAction::AlreadyOwned => {}
+        NamespaceOwnershipAction::Patch { record, overridden } => {
             let command =
                 namespace_adoption_cmd(&o.namespace, &o.release, &record, overridden.as_ref())?;
             let (ok, _out, err) = run_capture(&command).await?;

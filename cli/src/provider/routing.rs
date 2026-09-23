@@ -15,7 +15,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::eso::Kubectl;
-use super::{ProviderError, PutRequest, SecretMaterial, SecretsProvider, Store};
+use super::{ProviderError, SecretMaterial, SecretsProvider, Store};
 use crate::exit::CliError;
 use crate::installation::Installation;
 
@@ -135,6 +135,30 @@ const MAIL_CREDENTIAL_KEYS: &[&str] = &[
 
 const PROJECT_KEY_ENTRY: &str = "langfuse-init-project-secret-key";
 const OTLP_ENTRY: &str = "otlp-auth-header";
+
+/// Non-generated entries a live reference to their target keeps routed.
+fn routable_by_reference(logical: &str) -> bool {
+    matches!(
+        logical,
+        "runner-model-credentials"
+            | "slack-app-token"
+            | "slack-bot-token"
+            | "slack-signing-secret"
+            | "github-token"
+            | "github-app-private-key"
+            | "sealing-previous-private-key"
+    )
+}
+
+/// Every assignment key in one Helm set expression, so a comma-joined value
+/// cannot smuggle a second assignment past a key check.
+fn assignment_keys(expression: &str) -> Vec<String> {
+    let expressions = [expression.to_string()];
+    crate::ops::operator_set_entries(&expressions)
+        .into_iter()
+        .map(|(key, _)| key.trim().to_string())
+        .collect()
+}
 
 /// Chart value keys that must never carry a value with a provider declared.
 pub fn dropped_value_keys() -> &'static [&'static str] {
@@ -271,6 +295,17 @@ pub fn plan_routing(inputs: &RoutingInputs<'_>) -> Result<RoutingPlan> {
                 _ => None,
             }
         };
+        // A live reference to this release's own synced Secret (left by an
+        // earlier provider apply) keeps the entry routed after the file stops
+        // declaring it, so preflight still requires its Secrets Manager source.
+        let target = row.target.replace("{release}", &release);
+        let referenced = row.chart.as_ref().is_some_and(|chart| {
+            chart.knobs.iter().any(|knob| {
+                live_leaf(live, &knob.secret).and_then(Value::as_str) == Some(target.as_str())
+            })
+        });
+        let reason = reason
+            .or((referenced && routable_by_reference(logical)).then_some(RouteReason::Optional));
         let Some(reason) = reason else { continue };
         let chart = row
             .chart
@@ -291,12 +326,16 @@ pub fn plan_routing(inputs: &RoutingInputs<'_>) -> Result<RoutingPlan> {
         });
     }
 
-    let conflicts: Vec<&str> = cfg
-        .set
-        .keys()
-        .map(String::as_str)
-        .filter(|key| knob_paths.contains(*key) || DROPPED_VALUE_KEYS.contains(key))
-        .collect();
+    let mut conflicts: Vec<String> = Vec::new();
+    for (key, value) in &cfg.set {
+        for assigned in assignment_keys(&format!("{key}={value}")) {
+            if (knob_paths.contains(&assigned) || DROPPED_VALUE_KEYS.contains(&assigned.as_str()))
+                && !conflicts.contains(&assigned)
+            {
+                conflicts.push(assigned);
+            }
+        }
+    }
     if !conflicts.is_empty() {
         return Err(refuse(
             format!(
@@ -354,12 +393,6 @@ pub fn plan_routing(inputs: &RoutingInputs<'_>) -> Result<RoutingPlan> {
     })
 }
 
-fn expression_key(expression: &str) -> &str {
-    expression
-        .split_once('=')
-        .map_or(expression, |(key, _)| key)
-}
-
 /// Rewrite a completed `up` so it passes Secret names instead of values:
 /// drop every [`dropped_value_keys`] entry (from `secrets`, `set` and
 /// `set_string`), clear the model credential and GitHub token plans, drop
@@ -372,8 +405,13 @@ pub fn route_up_opts(up: &mut crate::ops::UpOpts, plan: &RoutingPlan) {
         .chain(plan.knob_sets.iter().map(|(key, _)| key.as_str()))
         .collect();
     up.secrets.retain(|(key, _)| !owned.contains(key.as_str()));
-    up.set.retain(|e| !owned.contains(expression_key(e)));
-    up.set_string.retain(|e| !owned.contains(expression_key(e)));
+    let keeps = |e: &String| {
+        !assignment_keys(e)
+            .iter()
+            .any(|key| owned.contains(key.as_str()))
+    };
+    up.set.retain(keeps);
+    up.set_string.retain(keeps);
     up.credentials = None;
     up.github_token = crate::ops::GithubTokenPlan::Untouched;
     up.set_string.extend(
@@ -532,6 +570,9 @@ pub fn generate(
     for logical in ordered {
         let remote_id = format!("{}/{logical}", plan.remote_prefix);
         if exists(provider, logical).with_context(|| format!("could not read {remote_id}"))? {
+            if logical == PROJECT_KEY_ENTRY {
+                project_secret_key = None;
+            }
             continue;
         }
         if logical == OTLP_ENTRY && project_secret_key.is_none() {
@@ -568,19 +609,26 @@ pub fn generate(
             project_secret_key.as_deref(),
             &plan.langfuse_public_key,
         )?;
-        if logical == PROJECT_KEY_ENTRY {
-            project_secret_key = body.get("langfuseInitProjectSecretKey").cloned();
-        }
         let material = SecretMaterial::new(serde_json::to_string(&body)?);
-        provider
-            .put(&PutRequest {
-                name: logical,
-                material: &material,
-                expected_version: None,
-            })
-            .map_err(anyhow::Error::new)
-            .with_context(|| format!("could not create {remote_id}"))?;
-        created.push(logical.clone());
+        match provider.create(logical, &material) {
+            Ok(_) => {
+                if logical == PROJECT_KEY_ENTRY {
+                    project_secret_key = body.get("langfuseInitProjectSecretKey").cloned();
+                }
+                created.push(logical.clone());
+            }
+            // Another apply created it first. Its value stands; the OTLP
+            // header is then derived from the STORED project key.
+            Err(ProviderError::Conflict { .. }) => {
+                if logical == PROJECT_KEY_ENTRY {
+                    project_secret_key = None;
+                }
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("could not create {remote_id}"));
+            }
+        }
     }
     Ok(created)
 }
@@ -682,11 +730,28 @@ pub fn sync(
     timeout: Duration,
     poll: Duration,
 ) -> Result<()> {
+    check_targets(k, plan)?;
     let rendered = render_external_secrets(plan, store);
     let names: Vec<String> = rendered
         .iter()
         .filter_map(|es| es["metadata"]["name"].as_str().map(str::to_string))
         .collect();
+    super::eso::apply(k, &plan.namespace, &rendered)?;
+    for name in &names {
+        super::eso::force_sync_and_wait(k, &plan.namespace, name, timeout, poll)?;
+    }
+    Ok(())
+}
+
+/// Refuse, read only, a target Secret that exists but is not owned by the
+/// ExternalSecret of the same name.
+pub fn check_targets(k: &dyn Kubectl, plan: &RoutingPlan) -> Result<()> {
+    let mut names: Vec<&str> = Vec::new();
+    for entry in &plan.entries {
+        if !names.contains(&entry.target.as_str()) {
+            names.push(&entry.target);
+        }
+    }
     let namespace = plan.namespace.as_str();
     let mut foreign = Vec::new();
     for name in &names {
@@ -715,7 +780,7 @@ pub fn sync(
         let secret: Value = serde_json::from_str(&out.stdout)
             .with_context(|| format!("Secret {namespace}/{name} returned invalid JSON"))?;
         if !owned_by_external_secret(&secret, name) {
-            foreign.push(name.clone());
+            foreign.push(*name);
         }
     }
     if !foreign.is_empty() {
@@ -726,10 +791,6 @@ pub fn sync(
             ),
             "Move the existing Secret aside (or delete it once its values are in Secrets Manager), then re-run apply.",
         ));
-    }
-    super::eso::apply(k, namespace, &rendered)?;
-    for name in &names {
-        super::eso::force_sync_and_wait(k, namespace, name, timeout, poll)?;
     }
     Ok(())
 }

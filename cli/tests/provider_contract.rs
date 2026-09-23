@@ -762,3 +762,70 @@ fn expiry_tag_and_not_implemented_are_declared() {
         redact(&rendered)
     );
 }
+
+// ------------------------------------------------------- AWS atomic create
+
+static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+/// `AwsSecretsProvider::create` against a stub `aws` that logs each
+/// operation and answers `create-secret` per `mode`: `ok` returns a version,
+/// `exists` fails with ResourceExistsException. Any other operation succeeds
+/// with a describable object so a stray describe/put would be recorded.
+fn aws_create(mode: &str) -> (Result<ObjectVersion, ProviderError>, Vec<String>) {
+    use curie::provider::aws::AwsSecretsProvider;
+
+    let _lock = PATH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = tempfile::tempdir().expect("tempdir");
+    let log = root.path().join("ops.log");
+    let create_reply = if mode == "exists" {
+        "printf '%s\\n' 'An error occurred (ResourceExistsException) when calling the CreateSecret operation' >&2\n    exit 254"
+    } else {
+        "printf '%s\\n' '{\"VersionId\":\"00000000-0000-4000-8000-000000000001\"}'"
+    };
+    let script = format!(
+        "#!/bin/sh\nif [ \"${{1:-}}\" = '--version' ]; then\n  printf '%s\\n' 'aws-cli/2.31.0 Python/3.13.7 Linux/fixture exe/x86_64'\n  exit 0\nfi\nprintf '%s\\n' \"$2\" >> '{}'\ncase \" $* \" in\n  *\" secretsmanager create-secret \"*)\n    {create_reply}\n    ;;\n  *)\n    printf '%s\\n' '{{\"VersionId\":\"v-other\",\"VersionIdsToStages\":{{\"v-other\":[\"AWSCURRENT\"]}}}}'\n    ;;\nesac\n",
+        log.display()
+    );
+    write_exec(root.path(), "aws", &script);
+    let previous = std::env::var_os("PATH");
+    let mut paths = vec![root.path().to_path_buf()];
+    if let Some(current) = &previous {
+        paths.extend(std::env::split_paths(current));
+    }
+    std::env::set_var("PATH", std::env::join_paths(paths).expect("join PATH"));
+    let result = AwsSecretsProvider::new("us-east-1", "tenant/platform", "a").map(|provider| {
+        let material = SecretMaterial::new(format!("{{\"k\":\"{}\"}}", "v"));
+        provider.create("installation-id", &material)
+    });
+    match previous {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
+    let result = result.expect("construct AWS provider");
+    let ops = fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (result, ops)
+}
+
+#[test]
+fn aws_create_issues_only_create_secret() {
+    let (result, ops) = aws_create("ok");
+    let version = result.expect("create succeeds");
+    assert_eq!(version.id, "00000000-0000-4000-8000-000000000001");
+    assert_eq!(ops, vec!["create-secret".to_string()], "{ops:?}");
+}
+
+#[test]
+fn aws_create_of_an_existing_name_is_a_conflict() {
+    let (result, ops) = aws_create("exists");
+    assert!(
+        matches!(result, Err(ProviderError::Conflict { ref name, .. }) if name == "installation-id"),
+        "{result:?}"
+    );
+    assert_eq!(ops, vec!["create-secret".to_string()], "{ops:?}");
+}

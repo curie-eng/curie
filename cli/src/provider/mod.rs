@@ -173,6 +173,21 @@ impl std::error::Error for ProviderError {}
 pub trait SecretsProvider {
     fn put(&self, request: &PutRequest<'_>) -> Result<ObjectVersion, ProviderError>;
 
+    /// Create `name` only if it does not exist, atomically. An existing
+    /// object is never replaced: the call fails with `Conflict`. The default
+    /// is a create-only `put`; a backend with a native create overrides it.
+    fn create(
+        &self,
+        name: &str,
+        material: &SecretMaterial,
+    ) -> Result<ObjectVersion, ProviderError> {
+        self.put(&PutRequest {
+            name,
+            material,
+            expected_version: None,
+        })
+    }
+
     /// Read the current object when `version` is `None`, or that version id.
     fn get(&self, name: &str, version: Option<&str>) -> Result<StoredObject, ProviderError>;
 
