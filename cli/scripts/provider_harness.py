@@ -823,13 +823,29 @@ class HarnessCase:
             signal.signal(watched, record_only)
 
     def _run_body(self) -> None:
+        if os.environ.get("CURIE_SECRETS_CLI_ONLY") == "1":
+            self.create_cluster()
+            self.create_namespace_and_rbac()
+            if self.real_aws:
+                raise HarnessError("the secrets command proof uses the emulator")
+            self.start_moto()
+            self.install_eso()
+            self.kubectl(
+                "-n",
+                ESO_NAMESPACE,
+                "rollout",
+                "status",
+                "deployment/external-secrets",
+                "--timeout=180s",
+                action="wait for External Secrets to reload its endpoint",
+                timeout=200,
+            )
+            self.prove_secrets_commands()
+            return
         self.write_seed_files()
         self.build_images()
         self.create_cluster()
         self.load_and_verify_images()
-        if self.mode == "none":
-            self.prove_eso_absent()
-            return
         self.create_namespace_and_rbac()
         if self.real_aws:
             self.create_real_aws_identity()
@@ -1006,52 +1022,555 @@ class HarnessCase:
                 f"kind loaded exact image {record['tag']}", record["id"] in loaded
             )
 
-    def prove_eso_absent(self) -> None:
-        self.kubectl(
-            "get",
-            "--raw=/readyz",
-            action="verify Kubernetes API health before ESO absence proof",
+    def prove_secrets_commands(self) -> None:
+        """Standalone set, check, and rm against the emulator.
+
+        Values stay in private files and process environment. Evidence records
+        sha256 prefixes, object names, and pod uids only.
+        """
+        if self.aws_endpoint is None:
+            raise HarnessError("emulator endpoint is unavailable")
+        release = "acme"
+        prefix = f"{OWNED_PREFIX}{self.suffix}"
+        logical = "github-webhook-secret"
+        key = "githubWebhookSecret"
+        secret_id = f"{prefix}/{release}/{logical}"
+        home = self.work / "cli-home"
+        home.mkdir(mode=0o700)
+        install = (
+            "version: 1\n"
+            "install:\n"
+            "  namespace: curie-aws-secrets-e2e\n"
+            "  release: acme\n"
+            f"  context: {self.context}\n"
+            "secrets:\n"
+            "  provider: aws\n"
+            "  region: us-east-1\n"
+            f"  prefix: {prefix}\n"
+            "  role_arn: arn:aws:iam::000000000000:role/curie-sync\n"
+        )
+        write_private_file(home / "curie.yaml", install)
+        trip = self.work / "trip-bin"
+        trip.mkdir(mode=0o700)
+        marker = self.work / "kubectl-called"
+        write_private_file(
+            trip / "kubectl",
+            "#!/bin/sh\nprintf x > " + shlex.quote(str(marker)) + "\nexit 86\n",
+        )
+        os.chmod(trip / "kubectl", 0o755)
+        value = secrets.token_hex(16)
+        write_private_file(self.work / "webhook.value", value)
+
+        def curie_env(
+            *,
+            kube: bool,
+            path_prefix: str | None = None,
+            hold: str = value,
+        ) -> dict[str, str]:
+            env = {
+                "HOME": str(home),
+                "CURIE_CONFIG_DIR": str(home),
+                "AWS_ACCESS_KEY_ID": "test",
+                "AWS_SECRET_ACCESS_KEY": "test",
+                "AWS_DEFAULT_REGION": REGION,
+                "AWS_REGION": REGION,
+                "AWS_ENDPOINT_URL": self.aws_endpoint or "",
+                "AWS_EC2_METADATA_DISABLED": "true",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "CURIE_HOLD": hold,
+            }
+            if path_prefix is not None:
+                env["PATH"] = f"{path_prefix}:{env['PATH']}"
+            if kube:
+                env["KUBECONFIG"] = str(self.admin_kubeconfig)
+            return env
+
+        def run_curie(
+            args: list[str],
+            action: str,
+            *,
+            kube: bool,
+            path_prefix: str | None = None,
+            hold: str = value,
+        ) -> tuple[int, str]:
+            result = self.runner.run(
+                [str(self.curie_bin), *args],
+                action,
+                env=curie_env(kube=kube, path_prefix=path_prefix, hold=hold),
+                allow_failure=True,
+                timeout=240,
+            )
+            # ToolRunner has no cwd. The installation is discovered from --file.
+            text = result.stdout.decode("utf-8", "replace") + result.stderr_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            if hold in text:
+                raise HarnessError(f"{action} printed a secret value")
+            return result.status, text
+
+        status, text = run_curie(
+            [
+                "secrets",
+                "set",
+                f"{logical}/{key}",
+                "--from-env",
+                "CURIE_HOLD",
+                "--file",
+                str(home / "curie.yaml"),
+            ],
+            "set on an unprovisioned install",
+            kube=False,
+            path_prefix=str(trip),
+        )
+        self.record_assertion(
+            "unprovisioned set succeeds and names Secrets Manager only",
+            status == 0 and "Secrets Manager only" in text and "not provisioned" in text,
+        )
+        self.record_assertion("unprovisioned set makes no kubectl call", not marker.exists())
+        observed = self.provider_key_digest(secret_id, key)
+        self.record_assertion(
+            "unprovisioned set wrote the provider key",
+            observed == digest_prefix(value),
+            digest_prefix(value),
+        )
+
+        denied, denied_text = run_curie(
+            [
+                "secrets",
+                "set",
+                "postgres-password/postgresPassword",
+                "--from-env",
+                "CURIE_HOLD",
+                "--file",
+                str(home / "curie.yaml"),
+            ],
+            "set an immutable inventory entry",
+            kube=False,
+            path_prefix=str(trip),
+        )
+        immutable_id = f"{prefix}/{release}/postgres-password"
+        absent = self.aws(
+            "secretsmanager",
+            "describe-secret",
+            "--secret-id",
+            immutable_id,
+            action="confirm immutable entry was not written",
+            allow_failure=True,
+        )
+        self.record_assertion(
+            "immutable set is refused and writes nothing",
+            denied != 0
+            and "immutable" in denied_text
+            and tool_error_has_code(absent, "ResourceNotFoundException"),
+        )
+
+        missing_id = f"{prefix}/{release}/slack-app-token"
+        missing_body = write_private_file(
+            self.work / "missing.json",
+            json.dumps({"unused": "synthetic"}),
+        )
+        self.aws(
+            "secretsmanager",
+            "create-secret",
+            "--name",
+            missing_id,
+            "--secret-string",
+            f"file://{missing_body}",
+            action="create an object missing its inventory key",
+        )
+        missing_status, missing_text = run_curie(
+            ["secrets", "check", "slack-app-token", "--file", str(home / "curie.yaml"), "--json"],
+            "check a missing inventory key",
+            kube=False,
+        )
+        self.record_assertion(
+            "check reports a missing key",
+            missing_status != 0 and "missing" in missing_text and "slackAppToken" in missing_text,
+        )
+
+        warn_at = (dt.datetime.now(dt.UTC) + dt.timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        warn_status, warn_text = run_curie(
+            [
+                "secrets",
+                "set",
+                f"{logical}/{key}",
+                "--from-env",
+                "CURIE_HOLD",
+                "--expires",
+                warn_at,
+                "--file",
+                str(home / "curie.yaml"),
+            ],
+            "set an expiry inside 30 days",
+            kube=False,
+        )
+        check_warn, check_warn_text = run_curie(
+            ["secrets", "check", logical, "--file", str(home / "curie.yaml"), "--json"],
+            "check warns inside 30 days",
+            kube=False,
+        )
+        self.record_assertion(
+            "check warns 30 days out and still succeeds",
+            warn_status == 0 and check_warn == 0 and "warning" in check_warn_text,
+        )
+        expired_status, _expired_text = run_curie(
+            [
+                "secrets",
+                "set",
+                f"{logical}/{key}",
+                "--from-env",
+                "CURIE_HOLD",
+                "--expires",
+                "2020-01-01T00:00:00Z",
+                "--file",
+                str(home / "curie.yaml"),
+            ],
+            "set an expired timestamp",
+            kube=False,
+        )
+        check_expired, check_expired_text = run_curie(
+            ["secrets", "check", logical, "--file", str(home / "curie.yaml"), "--json"],
+            "check fails when expired",
+            kube=False,
+        )
+        self.record_assertion(
+            "check fails when the provider timestamp is expired",
+            expired_status == 0 and check_expired != 0 and "expired" in check_expired_text,
+        )
+
+        self.install_command_store(release)
+        self.install_pause_consumer(release)
+        before = self.pod_uid(release)
+        refreshed = secrets.token_hex(16)
+        write_private_file(self.work / "webhook-next.value", refreshed)
+        provisioned, provisioned_text = run_curie(
+            [
+                "secrets",
+                "set",
+                f"{logical}/{key}",
+                "--from-env",
+                "CURIE_HOLD",
+                "--expires",
+                "2027-06-01T00:00:00Z",
+                "--file",
+                str(home / "curie.yaml"),
+            ],
+            "set on a provisioned install",
+            kube=True,
+            hold=refreshed,
+        )
+        after = self.pod_uid(release)
+        version = self.provider_version(secret_id)
+        stamped = self.deployment_stamp(release)
+        synced = self.provider_key_digest(secret_id, key)
+        self.record_assertion(
+            "provisioned set syncs and rolls only the inventory consumer",
+            provisioned == 0
+            and "rolled api" in provisioned_text
+            and before != after
+            and stamped == version
+            and synced == digest_prefix(refreshed),
+            f"uid changed={before != after} stamp_matches={stamped == version}",
+        )
+
+        edited = secrets.token_hex(16)
+        edited_body = write_private_file(
+            self.work / "webhook-edited.json",
+            json.dumps({key: edited}),
+        )
+        self.aws(
+            "secretsmanager",
+            "put-secret-value",
+            "--secret-id",
+            secret_id,
+            "--secret-string",
+            f"file://{edited_body}",
+            action="edit the provider object outside the CLI",
+            sensitive=True,
         )
         self.kubectl(
-            "get",
-            "namespaces",
-            "-o",
-            "name",
-            action="inventory namespaces before ESO absence proof",
+            "-n",
+            NAMESPACE,
+            "annotate",
+            "externalsecret",
+            logical,
+            "force-sync=harness-stale",
+            "--overwrite",
+            action="ask External Secrets to read the edited object",
         )
+        wait_until(
+            "External Secrets to publish the edited key",
+            lambda: self.secret_key_digest(release, key) == digest_prefix(edited),
+            timeout=180,
+        )
+        stale_status, stale_text = run_curie(
+            ["secrets", "check", logical, "--file", str(home / "curie.yaml"), "--json"],
+            "check a stale consumer after sync",
+            kube=True,
+        )
+        self.record_assertion(
+            "check reports a stale consumer after the provider edit synced",
+            stale_status != 0 and "stale" in stale_text and "api" in stale_text,
+        )
+
+        removed, removed_text = run_curie(
+            ["secrets", "rm", logical, "--file", str(home / "curie.yaml")],
+            "remove the provider entry",
+            kube=True,
+        )
+        gone = self.aws(
+            "secretsmanager",
+            "describe-secret",
+            "--secret-id",
+            secret_id,
+            "--output",
+            "json",
+            action="confirm the provider entry is gone",
+            allow_failure=True,
+        )
+        if gone.status == 0:
+            described = parse_json(gone.stdout, "deleted provider object")
+            provider_gone = bool(described.get("DeletedDate"))
+        else:
+            provider_gone = tool_error_has_code(gone, "ResourceNotFoundException")
+        external = self.kubectl(
+            "-n",
+            NAMESPACE,
+            "get",
+            "externalsecret",
+            logical,
+            action="confirm the ExternalSecret is gone",
+            allow_failure=True,
+        )
+        self.record_assertion(
+            "rm removes the provider entry and its ExternalSecret",
+            removed == 0
+            and "ExternalSecret" in removed_text
+            and provider_gone
+            and external.status != 0,
+        )
+
+        bare = self.work / "local-home"
+        bare.mkdir(mode=0o700)
+        write_private_file(
+            bare / "curie.yaml",
+            "version: 1\ninstall:\n  namespace: curie-aws-secrets-e2e\n  release: acme\n",
+        )
+        local_value = secrets.token_hex(8)
+        local_env = curie_env(kube=False, path_prefix=str(trip))
+        local_env["HOME"] = str(bare)
+        local_env["CURIE_CONFIG_DIR"] = str(bare)
+        local_env["CURIE_LOCAL"] = local_value
+        local = self.runner.run(
+            [
+                str(self.curie_bin),
+                "secrets",
+                "set",
+                "MODEL_KEY",
+                "--from-env",
+                "CURIE_LOCAL",
+                "--file",
+                str(bare / "curie.yaml"),
+            ],
+            "set without a provider",
+            env=local_env,
+            allow_failure=True,
+        )
+        local_text = local.stdout.decode("utf-8", "replace") + local.stderr_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        stored = (bare / "credentials.json").read_text(encoding="utf-8")
+        self.record_assertion(
+            "provider-absent set stays in private storage",
+            local.status == 0
+            and "Curie private storage" in local_text
+            and "MODEL_KEY" in stored
+            and local_value not in local_text
+            and not marker.exists(),
+        )
+
+    def provider_version(self, secret_id: str) -> str:
+        result = self.aws(
+            "secretsmanager",
+            "get-secret-value",
+            "--secret-id",
+            secret_id,
+            "--output",
+            "json",
+            action="read provider version",
+            sensitive=True,
+        )
+        return str(parse_json(result.stdout, "provider version").get("VersionId", ""))
+
+    def provider_key_digest(self, secret_id: str, key: str) -> str:
+        result = self.aws(
+            "secretsmanager",
+            "get-secret-value",
+            "--secret-id",
+            secret_id,
+            "--output",
+            "json",
+            action="read provider key digest",
+            sensitive=True,
+        )
+        body = json.loads(parse_json(result.stdout, "provider object")["SecretString"])
+        return digest_prefix(str(body[key]))
+
+    def install_command_store(self, release: str) -> None:
+        provider = self.apply_emulator_credentials(NAMESPACE)
+        store = {
+            "apiVersion": "external-secrets.io/v1",
+            "kind": "SecretStore",
+            "metadata": {"name": f"{release}-aws", "namespace": NAMESPACE},
+            "spec": {"provider": provider},
+        }
+        self.apply(yaml_document(store), "create the install SecretStore")
+        wait_until(
+            "SecretStore readiness",
+            lambda: self.resource_ready("secretstore", f"{release}-aws", NAMESPACE),
+            timeout=180,
+        )
+
+    def install_pause_consumer(self, release: str) -> None:
+        name = f"{release}-curie-api"
+        deployment = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name, "namespace": NAMESPACE},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": name}},
+                "template": {
+                    "metadata": {"labels": {"app": name}},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "pause",
+                                "image": "registry.k8s.io/pause:3.10",
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+        self.apply(yaml_document(deployment), "create the inventory consumer")
         self.kubectl(
-            "get",
-            "crds",
-            "-o",
-            "name",
-            action="inventory CRDs before ESO absence proof",
+            "-n",
+            NAMESPACE,
+            "rollout",
+            "status",
+            f"deployment/{name}",
+            "--timeout=180s",
+            action="wait for the inventory consumer",
+            timeout=200,
         )
-        checks = [
-            ("namespace", ESO_NAMESPACE, None),
-            ("deployment", "external-secrets", ESO_NAMESPACE),
-            ("crd", "externalsecrets.external-secrets.io", None),
-            ("crd", "secretstores.external-secrets.io", None),
-            ("crd", "pushsecrets.external-secrets.io", None),
-            ("secretstore", "acme-harness", NAMESPACE),
-            ("externalsecret", "acme-harness-static", NAMESPACE),
-            ("pushsecret", "acme-harness-rotated", NAMESPACE),
-        ]
-        for kind, name, namespace in checks:
-            args: list[str] = []
-            if namespace:
-                args.extend(["-n", namespace])
-            args.extend(["get", kind, name])
+
+    def pod_uid(self, release: str) -> str:
+        name = f"{release}-curie-api"
+
+        def running() -> str:
             result = self.kubectl(
-                *args,
-                action=f"prove {kind} absent",
+                "-n",
+                NAMESPACE,
+                "get",
+                "pod",
+                "-l",
+                f"app={name}",
+                "-o",
+                "json",
+                action="read consumer pod uid",
                 allow_failure=True,
             )
-            absent = result.status != 0 and tool_error_has_code(
-                result,
-                "NotFound",
-                "the server doesn't have a resource type",
-            )
-            self.record_assertion(f"{kind}/{name} is absent", absent)
+            if result.status != 0:
+                return ""
+            document = parse_json(result.stdout, "consumer pods")
+            uids = [
+                str(item.get("metadata", {}).get("uid", ""))
+                for item in document.get("items", [])
+                if item.get("status", {}).get("phase") == "Running"
+                and not item.get("metadata", {}).get("deletionTimestamp")
+            ]
+            return uids[0] if len(uids) == 1 else ""
+
+        wait_until("one running consumer pod", lambda: running() != "", timeout=120)
+        return running()
+
+    def deployment_stamp(self, release: str) -> str:
+        name = f"{release}-curie-api"
+        result = self.kubectl(
+            "-n",
+            NAMESPACE,
+            "get",
+            "deployment",
+            name,
+            "-o",
+            "json",
+            action="read consumer provider stamp",
+        )
+        document = parse_json(result.stdout, "consumer deployment")
+        annotations = document["spec"]["template"]["metadata"].get("annotations", {})
+        return str(annotations.get("curie.dev/provider-version", ""))
+
+    def secret_key_digest(self, release: str, key: str) -> str:
+        name = f"{release}-curie-github-webhook"
+        result = self.kubectl(
+            "-n",
+            NAMESPACE,
+            "get",
+            "secret",
+            name,
+            "-o",
+            "json",
+            action="read synced key digest",
+            allow_failure=True,
+            sensitive=True,
+        )
+        if result.status != 0:
+            return ""
+        document = parse_json(result.stdout, "synced secret")
+        encoded = document.get("data", {}).get(key)
+        if not isinstance(encoded, str):
+            return ""
+        return digest_prefix(base64.b64decode(encoded))
+
+    def helm_eso_revision(self) -> str:
+        result = self.runner.run(
+            [
+                "helm",
+                "--kubeconfig",
+                str(self.admin_kubeconfig),
+                "--kube-context",
+                self.context,
+                "list",
+                "-n",
+                ESO_NAMESPACE,
+                "-o",
+                "json",
+                "-f",
+                "external-secrets",
+            ],
+            "read External Secrets helm revision",
+        )
+        releases = parse_json(result.stdout, "External Secrets helm list")
+        if not isinstance(releases, list):
+            raise HarnessError("External Secrets helm list was not a list")
+        for release in releases:
+            if isinstance(release, dict) and release.get("name") == "external-secrets":
+                return str(release.get("revision", ""))
+        raise HarnessError("External Secrets helm release is absent")
+
+    def deployment_resource_version(self) -> str:
+        result = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            "-o",
+            "jsonpath={.metadata.resourceVersion}",
+            action="read External Secrets deployment version",
+        )
+        return result.stdout.decode().strip()
 
     def create_namespace_and_rbac(self) -> None:
         assert self.ledger is not None
@@ -1190,6 +1709,8 @@ class HarnessCase:
                 "set",
                 "env",
                 "deployment/external-secrets",
+                f"AWS_ENDPOINT_URL={endpoint}",
+                f"AWS_ENDPOINT_URL_STS={endpoint}",
                 f"AWS_SECRETSMANAGER_ENDPOINT={endpoint}",
                 action="configure moto endpoint for External Secrets",
             )
@@ -2892,10 +3413,15 @@ class HarnessCase:
             "cleanup_status": cleanup_status,
             "commands": self.commands,
         }
-        write_private_file(
-            self.evidence_root / "evidence.json",
-            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
-        )
+        body = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+        write_private_file(self.evidence_root / "evidence.json", body)
+        if os.environ.get("CURIE_SECRETS_CLI_ONLY") == "1":
+            cli_root = (
+                self.repo_root / ".projects/aws-secrets/evidence/aws-sec-secrets-cli" / self.suffix
+            )
+            cli_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+            os.chmod(cli_root, 0o700)
+            write_private_file(cli_root / "evidence.json", body)
 
 
 ROUTING_RELEASE = "rt"
@@ -3094,17 +3620,19 @@ class RoutingHarnessCase(HarnessCase):
         self.load_and_verify_images()
         self.preload_chart_images()
         self.start_moto()
-        self.install_eso()
-        self.create_routing_namespace_and_store()
+        self.create_routing_namespace()
         self.make_values()
         config = self.write_config(provider=True)
         self.seed_object("runner-model-credentials", {"agentCredentials": "model"})
         self.prove_negative_apply(config)
         self.seed_object("github-token", {"githubToken": "github"})
         self.apply_repeatedly(config)
+        self.prove_apply_installed_eso()
         self.scan_release_storage()
         self.prove_pods_carry_values()
+        self.prove_incompatible_eso_refuses(config)
         self.prove_provider_absent_control()
+        self.prove_teardown_removes_installed_eso()
 
     def scale_coredns(self) -> None:
         self.kubectl(
@@ -3179,7 +3707,7 @@ class RoutingHarnessCase(HarnessCase):
     def eso_moto_endpoint(self) -> str:
         return f"http://{self.moto_ip}:5000"
 
-    def create_routing_namespace_and_store(self) -> None:
+    def create_routing_namespace(self) -> None:
         assert self.ledger is not None
         row = self.ledger.record_intent("kubernetes_namespace", ROUTING_NAMESPACE)
         namespace = {
@@ -3195,22 +3723,181 @@ class RoutingHarnessCase(HarnessCase):
         }
         self.apply(yaml_document(namespace), "create labelled routing namespace", namespace=None)
         self.ledger.mark_created(row, ROUTING_NAMESPACE)
-        provider = self.apply_emulator_credentials(ROUTING_NAMESPACE)
-        store = {
-            "apiVersion": "external-secrets.io/v1",
-            "kind": "SecretStore",
-            "metadata": {"name": f"{ROUTING_RELEASE}-curie-sm"},
-            "spec": {"provider": provider},
-        }
-        self.apply(yaml_document(store), "create routing SecretStore", namespace=ROUTING_NAMESPACE)
-        self.kubectl(
+
+    def eso_installed(self) -> bool:
+        result = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            action="look for the External Secrets controller",
+            allow_failure=True,
+        )
+        return result.status == 0
+
+    def prove_apply_installed_eso(self) -> None:
+        image = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+            action="read installed External Secrets image",
+        ).stdout.decode()
+        self.record_assertion("apply installed External Secrets 2.11", "2.11" in image, image)
+        marker = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "configmap",
+            "curie-eso-install",
+            action="read the Curie ownership marker",
+            allow_failure=True,
+        )
+        self.record_assertion(
+            "installed controller carries the ownership marker", marker.status == 0
+        )
+        store = self.kubectl(
             "-n",
             ROUTING_NAMESPACE,
-            "wait",
-            "--for=condition=Ready",
-            f"secretstore/{ROUTING_RELEASE}-curie-sm",
-            "--timeout=120s",
-            action="wait for routing SecretStore",
+            "get",
+            "secretstore",
+            f"{ROUTING_RELEASE}-aws",
+            "-o",
+            "json",
+            action="read provider SecretStore",
+        )
+        status = parse_json(store.stdout, "provider SecretStore").get("status", {})
+        ready = any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in status.get("conditions", [])
+        )
+        self.record_assertion("provider SecretStore is Ready", ready)
+        account = self.kubectl(
+            "-n",
+            ROUTING_NAMESPACE,
+            "get",
+            "serviceaccount",
+            f"{ROUTING_RELEASE}-aws-eso",
+            "-o",
+            "json",
+            action="read provider service account",
+        )
+        metadata = parse_json(account.stdout, "provider service account").get("metadata", {})
+        annotation = metadata.get("annotations", {}).get("eks.amazonaws.com/role-arn", "")
+        self.record_assertion(
+            "service account is annotated with role_arn", annotation == ROUTING_ROLE_ARN
+        )
+
+    def prove_incompatible_eso_refuses(self, config: pathlib.Path) -> None:
+        original = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+            action="read the External Secrets image",
+        ).stdout.decode().strip()
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "scale",
+            "deploy/external-secrets",
+            "--replicas=0",
+            action="stop External Secrets before the incompatible image patch",
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "patch",
+            "deploy",
+            "external-secrets",
+            "--type=json",
+            "-p",
+            '[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"ghcr.io/external-secrets/external-secrets:v2.10.0"}]',
+            action="present an incompatible External Secrets image",
+        )
+        version = self.deployment_resource_version()
+        revision = self.helm_eso_revision()
+        status, text = self.curie_apply(config, allow_failure=True)
+        self.record_assertion(
+            "incompatible controller is refused",
+            status != 0 and b"Nothing was changed" in text,
+        )
+        self.record_assertion(
+            "refused apply did not change the deployment",
+            self.deployment_resource_version() == version,
+        )
+        self.record_assertion(
+            "refused apply did not change the helm revision",
+            self.helm_eso_revision() == revision,
+            revision,
+        )
+        restored = json.dumps(
+            [
+                {
+                    "op": "replace",
+                    "path": "/spec/template/spec/containers/0/image",
+                    "value": original,
+                }
+            ]
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "patch",
+            "deploy",
+            "external-secrets",
+            "--type=json",
+            "-p",
+            restored,
+            action="restore the pinned External Secrets image",
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "scale",
+            "deploy/external-secrets",
+            "--replicas=1",
+            action="start the restored External Secrets controller",
+        )
+        self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "rollout",
+            "status",
+            "deploy/external-secrets",
+            "--timeout=180s",
+            action="wait for the restored External Secrets controller",
+        )
+
+    def prove_teardown_removes_installed_eso(self) -> None:
+        self.runner.run(
+            [
+                str(self.curie_bin),
+                "cluster",
+                "down",
+                "--yes",
+                "--namespace",
+                ROUTING_NAMESPACE,
+                "--release",
+                ROUTING_RELEASE,
+                "--context",
+                self.context,
+            ],
+            "curie cluster down removes the controller apply installed",
+            env=self.curie_env,
+            timeout=900,
+        )
+        self.record_assertion(
+            "teardown removed the controller Curie installed", not self.eso_installed()
         )
 
     def make_values(self) -> None:
@@ -3224,6 +3911,8 @@ class RoutingHarnessCase(HarnessCase):
         assert self.aws_endpoint is not None
         env["AWS_ENDPOINT_URL"] = self.aws_endpoint
         env["KUBECONFIG"] = str(self.admin_kubeconfig)
+        # `curie apply` installs External Secrets and points it at the emulator.
+        env["CURIE_ESO_AWS_ENDPOINT"] = self.eso_moto_endpoint()
         env[ROUTING_MODEL_ENV] = self.decoys["model"]
         env[ROUTING_GITHUB_ENV] = self.decoys["github"]
         self.curie_env = env
@@ -3369,13 +4058,21 @@ class RoutingHarnessCase(HarnessCase):
             "refusal applied no ExternalSecret", self.owned_absent("externalsecrets")
         )
         self.record_assertion("refusal generated no provider entry", self.sm_names() == before)
+        self.record_assertion("refusal installed no External Secrets", not self.eso_installed())
 
     def apply_repeatedly(self, config: pathlib.Path) -> None:
         versions: dict[str, str] = {}
+        revision = ""
         for attempt in range(1, ROUTING_APPLY_COUNT + 1):
             self.curie_apply(config)
             if attempt == 1:
                 versions = {name: self.sm_version(name) for name in self.sm_names()}
+                revision = self.helm_eso_revision()
+        self.record_assertion(
+            "reapplies reuse the External Secrets controller apply installed",
+            self.helm_eso_revision() == revision,
+            revision,
+        )
         after = {name: self.sm_version(name) for name in self.sm_names()}
         self.record_assertion(
             "provider entries are generated once across four applies",
@@ -3709,11 +4406,9 @@ def main() -> int:
     except ValueError as exc:
         safe_print(f"seed error: {exc}", error=True)
         return 2
-    tools = {"git", "docker", "kind", "kubectl", "uv"}
+    tools = {"git", "docker", "kind", "kubectl", "uv", "helm", "aws"}
     if args.suite == "routing":
         tools = {"git", "docker", "kind", "kubectl", "helm", "aws"}
-    elif args.real_aws or args.eso != "none" or args.ci:
-        tools.update({"aws", "helm"})
     if args.suite == "rotation" and args.eso != "none" and not args.real_aws:
         # The emulator run drives the rotation suite, which builds a Rust example.
         tools.add("cargo")
@@ -3731,8 +4426,12 @@ def main() -> int:
     setup_guard = install_signal_handlers()
     try:
         modes = ["preinstalled", "none"] if args.ci else [args.eso or "preinstalled"]
-        case_class = RoutingHarnessCase if args.suite == "routing" else HarnessCase
         for mode in modes:
+            # With External Secrets absent, `curie apply` installs it: that is
+            # the routing suite's full apply.
+            case_class = (
+                RoutingHarnessCase if args.suite == "routing" or mode == "none" else HarnessCase
+            )
             case_guard = install_signal_handlers()
             try:
                 case_class(

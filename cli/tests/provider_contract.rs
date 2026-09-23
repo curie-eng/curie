@@ -73,6 +73,7 @@ struct Isolated {
     _root: tempfile::TempDir,
     config: PathBuf,
     marker: PathBuf,
+    kubectl_marker: PathBuf,
     path: OsString,
 }
 
@@ -86,6 +87,12 @@ fn isolated() -> Isolated {
         marker.display()
     );
     write_exec(&bin_dir, "aws", &script);
+    let kubectl_marker = root.path().join("kubectl-marker");
+    let kubectl = format!(
+        "#!/bin/sh\nprintf x > '{}'\nexit 86\n",
+        kubectl_marker.display()
+    );
+    write_exec(&bin_dir, "kubectl", &kubectl);
     let mut paths = vec![bin_dir];
     if let Some(current) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&current));
@@ -94,6 +101,7 @@ fn isolated() -> Isolated {
     Isolated {
         config: root.path().to_path_buf(),
         marker,
+        kubectl_marker,
         path,
         _root: root,
     }
@@ -129,6 +137,10 @@ fn credentials(env: &Isolated) -> PathBuf {
 
 fn assert_aws_not_called(env: &Isolated) {
     assert!(!env.marker.exists(), "aws must not be called");
+}
+
+fn assert_kubectl_not_called(env: &Isolated) {
+    assert!(!env.kubectl_marker.exists(), "kubectl must not be called");
 }
 
 fn assert_string_error(output: &Output, needle: &str) {
@@ -431,6 +443,139 @@ fn secrets_set_discovers_the_current_directory_provider() {
         !credentials(&env).exists(),
         "provider set must not write the local store"
     );
+    assert_kubectl_not_called(&env);
+}
+
+#[test]
+fn secrets_set_on_an_unprovisioned_install_writes_the_provider_and_does_not_call_kubectl() {
+    let env = isolated();
+    fs::write(env.config.join("curie.yaml"), aws_install()).expect("write install");
+    let output = command(&env)
+        .args([
+            "secrets",
+            "set",
+            "github-webhook-secret/githubWebhookSecret",
+            "--from-env",
+            "HOLD_VALUE",
+        ])
+        .output()
+        .expect("run curie");
+    let text = raw_output(&output);
+    assert!(output.status.success(), "unprovisioned set failed\n{text}");
+    assert!(
+        text.contains("Secrets Manager only") && text.contains("not provisioned"),
+        "unprovisioned set must say it stopped after Secrets Manager: {text}"
+    );
+    assert!(
+        env.marker.exists(),
+        "unprovisioned set must write the provider"
+    );
+    assert_kubectl_not_called(&env);
+    assert!(!text.contains(PLANTED), "unprovisioned set leaked material");
+}
+
+#[test]
+fn secrets_set_refuses_an_immutable_inventory_entry_without_calling_aws_or_kubectl() {
+    let env = isolated();
+    fs::write(env.config.join("curie.yaml"), aws_install()).expect("write install");
+    let output = command(&env)
+        .args([
+            "secrets",
+            "set",
+            "postgres-password/postgresPassword",
+            "--from-env",
+            "HOLD_VALUE",
+        ])
+        .output()
+        .expect("run curie");
+    let text = raw_output(&output);
+    assert!(
+        !output.status.success(),
+        "immutable set was accepted\n{text}"
+    );
+    assert!(
+        text.contains("immutable"),
+        "refusal must name the policy: {text}"
+    );
+    assert_aws_not_called(&env);
+    assert_kubectl_not_called(&env);
+    assert!(!text.contains(PLANTED), "immutable refusal leaked material");
+}
+
+#[test]
+fn provider_absent_set_still_uses_private_storage_without_aws_or_kubectl() {
+    let env = isolated();
+    let output = run(
+        &env,
+        &["secrets", "set", "MODEL_KEY", "--from-env", "HOLD_VALUE"],
+    );
+    assert!(
+        output.status.success(),
+        "local set failed\n{}",
+        panic_text(&output)
+    );
+    let body = fs::read_to_string(credentials(&env)).expect("read local store");
+    assert!(body.contains("MODEL_KEY"), "local store must name the key");
+    assert_aws_not_called(&env);
+    assert_kubectl_not_called(&env);
+}
+
+#[test]
+fn apply_with_a_provider_does_not_call_aws_when_helm_is_absent() {
+    let env = isolated();
+    fs::write(env.config.join("curie.yaml"), aws_install()).expect("write install");
+    let empty_path = env.config.join("no-tools");
+    fs::create_dir(&empty_path).expect("create empty path");
+
+    let live = command(&env)
+        .env("PATH", &empty_path)
+        .args(["apply", "--json"])
+        .output()
+        .expect("run apply");
+    assert_eq!(live.status.code(), Some(1), "{}", panic_text(&live));
+    let live_text = raw_output(&live);
+    assert!(
+        live_text.contains("`helm` is not on PATH"),
+        "apply must stop before a cluster write: {}",
+        panic_text(&live)
+    );
+    assert!(
+        !live_text.contains("cannot yet converge a declared secrets provider"),
+        "the old refusal must be gone: {}",
+        panic_text(&live)
+    );
+    assert_aws_not_called(&env);
+}
+
+#[test]
+fn apply_without_a_provider_does_not_mention_external_secrets() {
+    let env = isolated();
+    fs::write(env.config.join("curie.yaml"), BARE_INSTALL).expect("write install");
+    let empty_path = env.config.join("no-tools");
+    fs::create_dir(&empty_path).expect("create empty path");
+
+    for args in [
+        vec!["apply", "--json"],
+        vec!["apply", "--dry-run", "--json"],
+    ] {
+        let output = command(&env)
+            .env("PATH", &empty_path)
+            .args(args)
+            .output()
+            .expect("run apply");
+        let text = raw_output(&output);
+        assert!(
+            !text.contains("external-secrets"),
+            "provider-absent apply must not install External Secrets: {}",
+            panic_text(&output)
+        );
+        assert!(
+            !text.contains("2.11.0"),
+            "provider-absent apply must not name the External Secrets pin: {}",
+            panic_text(&output)
+        );
+        assert_aws_not_called(&env);
+    }
 }
 
 #[test]

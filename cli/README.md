@@ -655,11 +655,16 @@ pass `--chart <path-or-tgz>` explicitly for now.
 Local secrets are stored in `~/.config/curie/credentials.json` with mode 0600,
 not in the repo, shell history, command argv, `.env`, or Curie state files.
 Curie keeps a separate non-secret index so secret names can be listed without
-opening values. `curie secrets check`, `curie secrets rm`, and `curie
-secrets set --expires` are declared for a provider install and return not
-implemented in this build. `set` and `list`
-keep this local store unless `--file` points at a `curie.yaml` that sets
-`secrets.provider`.
+opening values. When `curie.yaml` declares `secrets.provider`, `set`, `list`,
+`check`, and `rm` use that provider. `set` writes Secrets Manager. If the
+install namespace and SecretStore are absent, or no kubeconfig is present, it
+stops there and says so. Otherwise it ensures the ExternalSecret, forces a
+sync, and rolls the inventory consumers for that entry. `check` warns within
+30 days of `curie:expires-at`, and fails when a key is missing, a consumer is
+still on an older provider version, or the timestamp has passed. `rm` deletes
+the provider object and, once the install is provisioned, its ExternalSecret.
+An inventory entry marked `immutable` is refused. Without a provider, `set`
+and `list` keep this local store.
 
 ```bash
 curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN
@@ -775,8 +780,10 @@ curie dev secrets-e2e --seed path/to/seed.json
 ```
 
 `--ci` runs the emulator once with External Secrets and once without it.
-`--eso none` performs the image load and bundle validation case without
-installing External Secrets. `--seed` replaces the checked in synthetic fixture;
+`--eso none` loads images, then `curie apply` installs External Secrets
+2.11.0 because the harness did not install it. `--eso preinstalled` installs
+that chart first and checks that apply reuses it, refuses an incompatible
+image without writes, and leaves the controller in place on `cluster down`. `--seed` replaces the checked in synthetic fixture;
 the file must be a flat JSON object containing exactly `STATIC_KEY` and
 `ROTATED_KEY`, both with nonempty string values.
 

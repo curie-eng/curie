@@ -18,8 +18,8 @@ use curie::ops::{up_commands, CommonOpts, GithubTokenPlan, UpOpts};
 use curie::provider::eso::{synced_version, Kubectl, KubectlOutput, FORCE_SYNC_ANNOTATION};
 use curie::provider::routing::{
     check_store, dropped_value_keys, dry_run_lines, generate, plan_routing, preflight,
-    render_external_secrets, route_up_opts, store_name, sync, RouteReason, RoutingInputs,
-    RoutingPlan, DEFAULT_LANGFUSE_PUBLIC_KEY, HISTORY_MAX, REFRESH_INTERVAL,
+    render_external_secrets, route_up_opts, sync, RouteReason, RoutingInputs, RoutingPlan,
+    DEFAULT_LANGFUSE_PUBLIC_KEY, HISTORY_MAX, REFRESH_INTERVAL,
 };
 use curie::provider::{
     platform_inventory, InventoryEntry, ObjectMetadata, ObjectVersion, ProviderError, PutRequest,
@@ -29,7 +29,7 @@ use curie::provider::{
 const RELEASE: &str = "rel";
 const NAMESPACE: &str = "ns-rel";
 const REMOTE_PREFIX: &str = "curie/test/rel";
-const STORE: &str = "rel-curie-sm";
+const STORE: &str = "rel-aws";
 
 const MODEL_VALUE: &str = "sentinel-model-value-7f3a";
 const GITHUB_VALUE: &str = "sentinel-github-value-7f3a";
@@ -118,7 +118,7 @@ fn err_text(error: &anyhow::Error) -> String {
 
 #[test]
 fn store_name_is_release_scoped() {
-    assert_eq!(store_name("rel"), "rel-curie-sm");
+    assert_eq!(curie::provider::reconcile::store_name("rel"), "rel-aws");
     assert_eq!(HISTORY_MAX, 3);
 }
 
