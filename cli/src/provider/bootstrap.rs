@@ -529,7 +529,14 @@ fn mark_owned(kubectl: &dyn Kubectl, install: &InstallRef) -> Result<()> {
     apply_raw(kubectl, None, &body)
 }
 
+/// Create the namespace only when it is missing. Applying a bare Namespace
+/// over one that was itself applied would strip its labels, including the
+/// ownership labels `curie apply` relies on.
 fn ensure_namespace(kubectl: &dyn Kubectl, namespace: &str) -> Result<()> {
+    let existing = kubectl.run(&argv(&["get", "namespace", namespace, "-o", "name"]), None)?;
+    if existing.success {
+        return Ok(());
+    }
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
