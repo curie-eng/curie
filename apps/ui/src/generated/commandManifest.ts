@@ -5731,7 +5731,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "External Secrets setup for an emulator run",
+              "help": "External Secrets setup for an emulator run. `none` leaves it for `curie apply` to install, which runs the routing proof",
               "id": "eso",
               "long": "eso",
               "positional": false,
@@ -5743,7 +5743,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Run the emulator once with External Secrets and once without it",
+              "help": "Run the emulator once with External Secrets preinstalled (rotation) and once with `curie apply` installing it (routing)",
               "id": "ci",
               "long": "ci",
               "positional": false,
@@ -5762,6 +5762,21 @@ export const commandManifest = {
               "possible_values": [
                 "true",
                 "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "rotation"
+              ],
+              "global": false,
+              "help": "Which proof to run. `routing` drives `curie apply` with a declared provider against an emulator and cannot be combined with --ci, --real-aws or --eso",
+              "id": "suite",
+              "long": "suite",
+              "positional": false,
+              "possible_values": [
+                "rotation",
+                "routing"
               ],
               "required": false
             }

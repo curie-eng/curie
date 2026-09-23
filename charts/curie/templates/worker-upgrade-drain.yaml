@@ -120,7 +120,17 @@ spec:
             - name: CURIE_UPGRADE_QUIESCE_TTL_S
               value: {{ $quiesceTtl | quote }}
             - name: CURIE_INSTALLATION_ID
+              {{- if include "curie.installation.idSecretName" . }}
+              # A BYO identity is read by reference so it never lands in a
+              # stored upgrade revision.
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.installation.idSecretName" . | quote }}
+                  key: {{ include "curie.installation.idSecretKey" . | quote }}
+                  optional: false
+              {{- else }}
               value: {{ $installationId | quote }}
+              {{- end }}
             - name: CURIE_UPGRADE_REVISION
               value: {{ $upgradeRevision | quote }}
             - name: CURIE_UPGRADE_LEGACY_QUIESCE
@@ -189,7 +199,17 @@ spec:
             - name: CURIE_UPGRADE_QUIESCE_TTL_S
               value: {{ $quiesceTtl | quote }}
             - name: CURIE_INSTALLATION_ID
+              {{- if include "curie.installation.idSecretName" . }}
+              # A BYO identity is read by reference so it never lands in a
+              # stored upgrade revision.
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.installation.idSecretName" . | quote }}
+                  key: {{ include "curie.installation.idSecretKey" . | quote }}
+                  optional: false
+              {{- else }}
               value: {{ $installationId | quote }}
+              {{- end }}
             - name: CURIE_UPGRADE_REVISION
               value: {{ $upgradeRevision | quote }}
             - name: CURIE_UPGRADE_LEGACY_QUIESCE

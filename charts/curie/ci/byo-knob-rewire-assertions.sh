@@ -12,6 +12,8 @@
 #   (c) A BYO installation id the render cannot read (client-only upgrade)
 #       leaves the drain hook fenced: it is told the identity is unobserved,
 #       and a render with the knob keys absent (retained values) still works.
+#       With the knob set, both drain hooks read CURIE_INSTALLATION_ID
+#       through secretKeyRef, never a literal; without it the literal stays.
 #       The lookup-dependent paths (identity read back, switch refusals, the
 #       legacy bridge) need a cluster and are proven outside this script.
 #   (d) Connector BYO validation fails closed: reserved key names, a missing
@@ -129,6 +131,27 @@ elif mode == "unobserved":
         for c in h["spec"]["template"]["spec"]["containers"]:
             if "--installation-id-observed=false" not in c.get("command", []):
                 fail(f"{h['metadata']['name']} is not told the BYO identity is unobserved: {c.get('command')}")
+elif mode in ("drain-byo", "drain-literal"):
+    # Both upgrade-drain hook Jobs. A BYO (provider-synced) identity must reach
+    # them by reference: a literal would land in every stored upgrade revision.
+    hooks = [d for d in docs if d.get("kind") == "Job" and "upgrade-drain" in d["metadata"]["name"]]
+    if len(hooks) != 2:
+        fail(f"expected both upgrade-drain Jobs, found {[h['metadata']['name'] for h in hooks]}")
+    for h in hooks:
+        envs = [e for c in h["spec"]["template"]["spec"]["containers"] for e in c.get("env", []) if e.get("name") == "CURIE_INSTALLATION_ID"]
+        if len(envs) != 1:
+            fail(f"{h['metadata']['name']} carries {len(envs)} CURIE_INSTALLATION_ID entries")
+            continue
+        env = envs[0]
+        if mode == "drain-byo":
+            ref = (env.get("valueFrom") or {}).get("secretKeyRef") or {}
+            if "value" in env:
+                fail(f"{h['metadata']['name']} inlines the BYO installation id as a literal value")
+            if ref.get("name") != "byo-installation" or ref.get("key") != "installationId":
+                fail(f"{h['metadata']['name']} CURIE_INSTALLATION_ID reads {ref}, expected byo-installation/installationId")
+        else:
+            if "valueFrom" in env or not str(env.get("value", "")).strip():
+                fail(f"{h['metadata']['name']} CURIE_INSTALLATION_ID is not a literal value without the knob: {env}")
 sys.exit(1 if failed else 0)
 PY
 }
@@ -156,6 +179,12 @@ python_check byo "$TMP/byo.yaml" || FAILED=1
 # -- (c) unreadable BYO identity stays fenced ----------------------------------
 render --is-upgrade --set-string installation.idExistingSecret=sm-identity > "$TMP/unobserved.yaml"
 python_check unobserved "$TMP/unobserved.yaml" && echo "ok: an unreadable BYO identity leaves the drain hook fenced" || FAILED=1
+
+# -- (c1) the drain hooks read a BYO identity by reference --------------------
+render --is-upgrade --set-string installation.idExistingSecret=byo-installation > "$TMP/drain-byo.yaml"
+python_check drain-byo "$TMP/drain-byo.yaml" && echo "ok: both drain hooks read a BYO installation id through secretKeyRef" || FAILED=1
+render --is-upgrade > "$TMP/drain-literal.yaml"
+python_check drain-literal "$TMP/drain-literal.yaml" && echo "ok: without the knob the drain hooks keep the literal installation id" || FAILED=1
 
 # -- (c2) retained values that predate the knobs -----------------------------
 #

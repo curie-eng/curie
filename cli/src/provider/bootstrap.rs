@@ -194,17 +194,34 @@ pub fn ensure(
             EnsureOutcome::Installed
         }
         Decision::Reuse => EnsureOutcome::Reused,
-        Decision::Refuse(reason) => {
-            bail!(
-                "refusing to change External Secrets: {reason}. Nothing was changed. Install External Secrets {ESO_VERSION} with ExternalSecret v1 and PushSecret v1alpha1, watching this namespace, or remove the other controller first."
-            )
-        }
+        Decision::Refuse(reason) => bail!("{}", refusal(&reason)),
     };
     ensure_namespace(kubectl, &spec.namespace)?;
     let objects = vec![render_service_account(spec), render_secret_store(spec)];
     apply(kubectl, &spec.namespace, &objects)?;
     wait_until_ready(kubectl, &spec.namespace, &spec.name, READY_TIMEOUT)?;
     Ok(outcome)
+}
+
+fn refusal(reason: &str) -> String {
+    format!(
+        "refusing to change External Secrets: {reason}. Nothing was changed. Install External Secrets {ESO_VERSION} with ExternalSecret v1 and PushSecret v1alpha1, watching this namespace, or remove the other controller first."
+    )
+}
+
+/// The read-only half of [`ensure`]: refuse an incompatible controller before
+/// the caller writes anything.
+pub fn check(kubectl: &dyn Kubectl, helm: &dyn Helm, install_namespace: &str) -> Result<()> {
+    if let Decision::Refuse(reason) = decide(&inspect(kubectl, helm)?, install_namespace) {
+        bail!("{}", refusal(&reason));
+    }
+    Ok(())
+}
+
+pub fn check_system(install_namespace: &str) -> Result<()> {
+    crate::ops::require_on_path("helm")?;
+    crate::ops::require_on_path("kubectl")?;
+    check(&SystemKubectl::default(), &SystemHelm, install_namespace)
 }
 
 pub fn ensure_system(spec: &StoreSpec, install: &InstallRef) -> Result<EnsureOutcome> {
@@ -512,7 +529,14 @@ fn mark_owned(kubectl: &dyn Kubectl, install: &InstallRef) -> Result<()> {
     apply_raw(kubectl, None, &body)
 }
 
+/// Create the namespace only when it is missing. Applying a bare Namespace
+/// over one that was itself applied would strip its labels, including the
+/// ownership labels `curie apply` relies on.
 fn ensure_namespace(kubectl: &dyn Kubectl, namespace: &str) -> Result<()> {
+    let existing = kubectl.run(&argv(&["get", "namespace", namespace, "-o", "name"]), None)?;
+    if existing.success {
+        return Ok(());
+    }
     let body = json!({
         "apiVersion": "v1",
         "kind": "Namespace",

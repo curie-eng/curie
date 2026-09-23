@@ -883,6 +883,7 @@ pub async fn dev_secrets_e2e(
     eso: Option<&str>,
     ci: bool,
     real_aws: bool,
+    suite: &str,
 ) -> Result<()> {
     let current_exe = std::env::current_exe().context("resolve current curie executable")?;
     let mut args = vec![
@@ -905,6 +906,8 @@ pub async fn dev_secrets_e2e(
     if real_aws {
         args.push("--real-aws".to_string());
     }
+    args.push("--suite".to_string());
+    args.push(suite.to_string());
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     dev_script("cli/scripts/provider-e2e.sh", &borrowed).await
 }
