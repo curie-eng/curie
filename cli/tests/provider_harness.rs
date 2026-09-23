@@ -35,7 +35,7 @@ fn secrets_e2e_help_exposes_only_the_approved_surface_and_valid_modes_reach_seed
     let leaf_help = run(&["dev", "secrets-e2e", "--help"], &root);
     let leaf_text = output_text(&leaf_help);
     assert!(leaf_help.status.success(), "leaf help failed: {leaf_text}");
-    for option in ["--seed", "--eso", "--ci", "--real-aws"] {
+    for option in ["--seed", "--eso", "--ci", "--real-aws", "--suite"] {
         assert!(
             leaf_text.contains(option),
             "leaf help omitted {option}: {leaf_text}"
@@ -82,6 +82,16 @@ fn conflicting_modes_are_rejected_by_clap_before_dispatch() {
         &["dev", "secrets-e2e", "--ci", "--real-aws"],
         &["dev", "secrets-e2e", "--ci", "--eso", "preinstalled"],
         &["dev", "secrets-e2e", "--real-aws", "--eso", "none"],
+        &["dev", "secrets-e2e", "--suite", "routing", "--ci"],
+        &["dev", "secrets-e2e", "--suite", "routing", "--real-aws"],
+        &[
+            "dev",
+            "secrets-e2e",
+            "--suite",
+            "routing",
+            "--eso",
+            "preinstalled",
+        ],
     ];
 
     for args in cases {
