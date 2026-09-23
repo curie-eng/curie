@@ -3645,15 +3645,13 @@ async fn provider_bind_and_apply_cluster_connectors(
         sandbox_values: &sandbox_values,
     })?;
     drop(sandbox_values);
-    let kubeconfig = prepared
-        .bound_kubeconfig_path()
-        .context("connector sync has no captured Kubernetes target")?
-        .to_path_buf();
-    let kubectl = curie::provider::eso::SystemKubectl {
-        context: None,
-        kubeconfig: Some(kubeconfig),
-        call_timeout: Some(std::time::Duration::from_secs(60)),
-    };
+    // Held until the ESO prune below: the clone keeps the captured kubeconfig
+    // file alive after `apply_connectors` consumes `prepared`. Without it the
+    // prune ran kubectl with a deleted KUBECONFIG and fell back to localhost.
+    let bound_target = prepared
+        .bound_target()
+        .context("connector sync has no captured Kubernetes target")?;
+    let kubectl = provider_kubectl(&bound_target);
 
     // The provider and kubectl drivers block; run them off the async workers.
     let plan = {
@@ -3686,12 +3684,10 @@ async fn provider_bind_and_apply_cluster_connectors(
         .await
         .context("connector credential sync did not finish")??
     };
-    let mut spared = Vec::new();
     if let Some((secret_name, keys)) = plan.sandbox_target() {
         ui.note(&format!(
             "connectors: {secret_name} is delivered by External Secrets"
         ));
-        spared.push(secret_name.to_string());
         let resolved = artifacts::resolve_chart(
             chart,
             artifacts::Channel::current(),
@@ -3714,7 +3710,7 @@ async fn provider_bind_and_apply_cluster_connectors(
         .await?;
     }
 
-    apply_connectors(prepared.into_provider_delivery().spare_from_prune(spared)).await?;
+    apply_connectors(prepared.into_provider_delivery()).await?;
 
     let args = connector_deploy::eso_prune_args(namespace, agent_name, &plan.object_names());
     let pruned = tokio::task::spawn_blocking(move || {
@@ -3722,6 +3718,7 @@ async fn provider_bind_and_apply_cluster_connectors(
     })
     .await
     .context("pruning stale External Secrets objects did not finish")?;
+    drop(bound_target);
     match pruned {
         Ok(out) if out.success => {}
         Ok(out) => ui.warn(&format!(
@@ -3733,6 +3730,48 @@ async fn provider_bind_and_apply_cluster_connectors(
         )),
     }
     Ok(())
+}
+
+/// The External Secrets kubectl driver for a captured connector target. The
+/// caller must keep `target` alive while the driver runs.
+fn provider_kubectl(
+    target: &curie::connectors::ClusterTarget,
+) -> curie::provider::eso::SystemKubectl {
+    curie::provider::eso::SystemKubectl {
+        context: None,
+        kubeconfig: Some(target.kubeconfig_path().to_path_buf()),
+        call_timeout: Some(std::time::Duration::from_secs(60)),
+    }
+}
+
+/// Provider mode only: the names-only collision preflight for one agent,
+/// run before its deployment is activated (ADR 0163 AC5), so a refusal leaves
+/// the API, Secrets Manager and the cluster untouched.
+async fn preflight_provider_targets(
+    target: &curie::connectors::ClusterTarget,
+    namespace: &str,
+    release: &str,
+    agent_name: &str,
+    sandbox: bool,
+) -> Result<()> {
+    use anyhow::Context as _;
+    let kubectl = provider_kubectl(target);
+    let (namespace, release, agent_name) = (
+        namespace.to_string(),
+        release.to_string(),
+        agent_name.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        curie::provider::connector_deploy::preflight_targets(
+            &kubectl,
+            &namespace,
+            &release,
+            &agent_name,
+            sandbox,
+        )
+    })
+    .await
+    .context("connector credential preflight did not finish")?
 }
 
 async fn materialize_artifact(
@@ -5599,6 +5638,32 @@ async fn run(command: Option<Command>) -> Result<()> {
                         prepared_deploy.emit_cron_trigger_warning();
                     }
 
+                    // Provider mode: refuse a colliding target Secret before
+                    // the first deployment is activated.
+                    let binds_sandbox =
+                        !secret.is_empty() || !connector_env_secret_names.is_empty();
+                    if connector_provider.is_some() {
+                        for (target, prepared_deploy, _) in &prepared_targets {
+                            if let Err(err) = preflight_provider_targets(
+                                &connector_target,
+                                &namespace,
+                                &release,
+                                prepared_deploy.agent_name(),
+                                binds_sandbox,
+                            )
+                            .await
+                            {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        }
+                    }
+
                     // Activate and reconcile in the API's declared target order.
                     let mut completed = Vec::new();
                     for (target, prepared_deploy, prepared_connectors) in prepared_targets {
@@ -5650,7 +5715,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                         .into_iter()
                         .next()
                         .expect("the target list is never empty");
-                    let deployed = commands::deploy(DeployOpts {
+                    // Prepared and activated as two halves, exactly what
+                    // `commands::deploy` does, so provider mode can run its
+                    // collision preflight before the deployment is activated.
+                    let prepared_deploy = commands::prepare_deploy(DeployOpts {
                         delivery,
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
@@ -5668,6 +5736,20 @@ async fn run(command: Option<Command>) -> Result<()> {
                         tier: commands::DeployTier::Cluster,
                     })
                     .await?;
+                    prepared_deploy.emit_cron_trigger_warning();
+                    if connector_provider.is_some() {
+                        let preflight_target =
+                            curie::connectors::bind_current_cluster(&namespace, &release).await?;
+                        preflight_provider_targets(
+                            &preflight_target,
+                            &namespace,
+                            &release,
+                            prepared_deploy.agent_name(),
+                            !secret.is_empty() || !connector_env_secret_names.is_empty(),
+                        )
+                        .await?;
+                    }
+                    let deployed = commands::deploy_prepared(prepared_deploy).await?;
 
                     // Stand up whatever the bundle's connectors.yaml declares
                     // (ADR-0086, #1063). After the deploy, so the objects exist

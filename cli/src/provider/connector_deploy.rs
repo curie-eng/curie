@@ -3,7 +3,7 @@
 //! them into the cluster, instead of the CLI writing value Secrets itself.
 //!
 //! The steps are split so the caller can order them: [`plan`] is pure,
-//! [`preflight`] only reads, and only then do [`write_provider`] and
+//! [`preflight_targets`] and [`preflight`] only read, and only then do [`write_provider`] and
 //! [`apply_objects`] write. Values live in [`SecretMaterial`] so a `Debug` of
 //! the plan cannot print them, and no error here carries a value.
 
@@ -49,7 +49,8 @@ pub struct PlanInput<'a> {
 /// One synced Secret: its ESO entry and the values Secrets Manager must hold.
 #[derive(Debug)]
 pub struct PlannedEntry {
-    /// Target already expanded; labels carry the connector owner.
+    /// Target already expanded; labels carry the connector owner. Only a
+    /// hosted entry stamps the owner on its target Secret too.
     pub sync: SyncEntry,
     /// Keys ESO pulls from `<logical>`.
     pub static_values: BTreeMap<String, SecretMaterial>,
@@ -61,6 +62,7 @@ pub struct PlannedEntry {
 /// Every Secret one agent's connector deploy syncs.
 #[derive(Debug)]
 pub struct Plan {
+    pub agent: String,
     pub hosted: Vec<PlannedEntry>,
     pub sandbox: Option<PlannedEntry>,
 }
@@ -72,7 +74,10 @@ impl Plan {
     }
 
     /// Every ExternalSecret and PushSecret name this plan applies, so the ESO
-    /// prune keeps exactly these.
+    /// prune keeps exactly these. `<agent>.sandbox` is always kept: a deploy
+    /// that drops its sandbox credentials leaves the Helm binding in place, and
+    /// deleting the ExternalSecret would leave it pointing at a Secret that
+    /// never returns.
     pub fn object_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for entry in self.entries() {
@@ -80,6 +85,10 @@ impl Plan {
             if !entry.sync.rotated_keys.is_empty() {
                 names.push(format!("{}-rotated-backup", entry.sync.name));
             }
+        }
+        let sandbox = sandbox_entry_name(&self.agent);
+        if !names.contains(&sandbox) {
+            names.push(sandbox);
         }
         names
     }
@@ -92,6 +101,19 @@ impl Plan {
             (entry.sync.target.as_str(), keys)
         })
     }
+}
+
+fn sandbox_entry_name(agent: &str) -> String {
+    format!("{agent}.sandbox")
+}
+
+fn hosted_target_name(release: &str, agent: &str) -> String {
+    format!("{release}-{agent}-connector-secrets")
+}
+
+fn sandbox_target_name(release: &str, agent: &str) -> String {
+    let fullname = crate::ops::chart_fullname(release);
+    format!("{}-agent-{agent}-connector-secrets", fullname.as_str())
 }
 
 fn owner_labels(agent: &str) -> BTreeMap<String, String> {
@@ -117,12 +139,10 @@ fn materials(
 }
 
 fn planned(
+    sync: SyncEntry,
     entry: &InventoryEntry,
-    remote_prefix: &str,
-    agent: &str,
     values: &BTreeMap<String, String>,
 ) -> Result<PlannedEntry> {
-    let sync = SyncEntry::from_inventory(entry, remote_prefix)?.with_labels(owner_labels(agent));
     let what = format!("connector credential {}", entry.logical_name);
     let static_values = materials(&sync.static_keys, values, &what)?;
     let rotated_values = materials(&sync.rotated_keys, values, &what)?;
@@ -142,7 +162,7 @@ fn planned(
 /// connector does not read or leave one it does read undelivered.
 pub fn plan(input: &PlanInput) -> Result<Plan> {
     let agent = input.agent;
-    let hosted_pattern = format!("{{release}}-{agent}-connector-secrets");
+    let hosted_pattern = hosted_target_name("{release}", agent);
     let mut hosted = Vec::new();
     let mut declared = BTreeSet::new();
     for mut entry in bundle_entries(input.decl, agent)? {
@@ -169,19 +189,29 @@ pub fn plan(input: &PlanInput) -> Result<Plan> {
             list(&owned)
         );
     }
+    let hosted = collapse_static_hosted(hosted, agent);
+    // Every ExternalSecret on the shared hosted Secret merges once any entry
+    // rotates: a rotating entry must merge, and only one may own the target.
+    let merge = hosted.iter().any(|entry| !entry.rotated_keys.is_empty());
     let hosted = hosted
         .iter()
-        .map(|entry| planned(entry, input.remote_prefix, agent, input.hosted_values))
+        .map(|entry| {
+            let mut sync = SyncEntry::from_inventory(entry, input.remote_prefix)?
+                .with_labels(owner_labels(agent));
+            if merge {
+                sync = sync.merging_into_target();
+            }
+            planned(sync, entry, input.hosted_values)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let sandbox = if input.sandbox_values.is_empty() {
         None
     } else {
-        let fullname = crate::ops::chart_fullname(input.release);
         let entry = InventoryEntry {
-            logical_name: format!("{agent}.sandbox"),
+            logical_name: sandbox_entry_name(agent),
             class: InventoryClass::External,
-            target: format!("{}-agent-{agent}-connector-secrets", fullname.as_str()),
+            target: sandbox_target_name(input.release, agent),
             keys: input.sandbox_values.keys().cloned().collect(),
             consumers: vec!["runner".to_string()],
             rotation_owner: RotationOwner::Sm,
@@ -190,29 +220,52 @@ pub fn plan(input: &PlanInput) -> Result<Plan> {
             rotated_keys: Vec::new(),
             chart: None,
         };
-        Some(planned(
-            &entry,
-            input.remote_prefix,
-            agent,
-            input.sandbox_values,
-        )?)
+        // The owner label stays on the ExternalSecret (the CLI prune finds
+        // it) but not on the Secret: the worker's reconcile deletes any
+        // owner-labelled Secret it did not declare.
+        let sync = SyncEntry::from_inventory(&entry, input.remote_prefix)?
+            .with_labels(owner_labels(agent))
+            .with_target_labels(BTreeMap::new());
+        Some(planned(sync, &entry, input.sandbox_values)?)
     };
-    Ok(Plan { hosted, sandbox })
+    Ok(Plan {
+        agent: agent.to_string(),
+        hosted,
+        sandbox,
+    })
+}
+
+/// Fold every static-only hosted entry into one `<agent>.hosted` entry, so
+/// exactly one ExternalSecret carries all static keys of the shared Secret.
+/// Rotating entries keep their own names. Order: the static entry first, then
+/// the rotating entries in inventory order.
+fn collapse_static_hosted(entries: Vec<InventoryEntry>, agent: &str) -> Vec<InventoryEntry> {
+    let (statics, rotating): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|entry| entry.rotated_keys.is_empty());
+    let mut out = Vec::new();
+    if let Some(first) = statics.first() {
+        let mut keys = BTreeSet::new();
+        let mut consumers = BTreeSet::new();
+        for entry in &statics {
+            keys.extend(entry.keys.iter().cloned());
+            consumers.extend(entry.consumers.iter().cloned());
+        }
+        let mut merged = first.clone();
+        merged.logical_name = format!("{agent}.hosted");
+        merged.keys = keys.into_iter().collect();
+        merged.consumers = consumers.into_iter().collect();
+        out.push(merged);
+    }
+    out.extend(rotating);
+    out
 }
 
 fn is_not_found(stderr: &str) -> bool {
     stderr.contains("(NotFound)") || stderr.contains("not found")
 }
 
-/// Read-only check that nothing this deploy would write collides with state
-/// it does not own. Runs before any provider, kubectl or helm write, so a
-/// refusal leaves Secrets Manager and the cluster untouched.
-///
-/// A present target Secret is ours only when ESO already manages it for one of
-/// this plan's ExternalSecrets. Anything else (a kubectl-applied Secret from a
-/// provider-less deploy, a helm-rendered one) would be silently taken over by
-/// `CreateOrMerge` or fight `Owner`, so it is refused by name.
-pub fn preflight(k: &dyn Kubectl, namespace: &str, plan: &Plan) -> Result<()> {
+fn check_crd(k: &dyn Kubectl) -> Result<()> {
     let args: Vec<String> = ["get", "crd", EXTERNAL_SECRET_CRD, "-o", "name"]
         .iter()
         .map(|a| a.to_string())
@@ -233,7 +286,105 @@ pub fn preflight(k: &dyn Kubectl, namespace: &str, plan: &Plan) -> Result<()> {
             out.stderr.trim()
         );
     }
+    Ok(())
+}
 
+/// Read one target Secret's field managers and refuse it unless `ours`
+/// accepts one of them. An absent Secret is fine: ESO will create it.
+fn check_target(
+    k: &dyn Kubectl,
+    namespace: &str,
+    target: &str,
+    ours: &dyn Fn(&str) -> bool,
+) -> Result<()> {
+    let args: Vec<String> = [
+        "-n",
+        namespace,
+        "get",
+        "secret",
+        target,
+        "--show-managed-fields",
+        "-o",
+        "json",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    let out = k.run(&args, None)?;
+    if !out.success {
+        if is_not_found(&out.stderr) {
+            return Ok(());
+        }
+        bail!(
+            "could not read Secret {namespace}/{target}: {}",
+            out.stderr.trim()
+        );
+    }
+    // Only metadata is read; the data map is never looked at.
+    let secret: Value = serde_json::from_str(&out.stdout)
+        .map_err(|_| anyhow!("Secret {namespace}/{target} returned invalid JSON"))?;
+    let managers: Vec<String> = secret["metadata"]["managedFields"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|f| f["manager"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if managers.iter().any(|m| ours(m)) {
+        return Ok(());
+    }
+    let seen = if managers.is_empty() {
+        "none".to_string()
+    } else {
+        managers.join(", ")
+    };
+    Err(crate::exit::CliError::failure(format!(
+        "Secret {namespace}/{target} already exists and External Secrets does not \
+         manage it (field managers: {seen}); refusing to take it over. Nothing was \
+         written."
+    ))
+    .with_fix(format!(
+        "delete it (`kubectl -n {namespace} delete secret {target}`) or move it under \
+         External Secrets, then re-run `curie cluster deploy`"
+    ))
+    .into())
+}
+
+/// Names-only, read-only check that runs before any deployment is activated,
+/// so a refusal leaves the API, Secrets Manager and the cluster untouched.
+///
+/// Checks the ESO CRD, then the hosted target Secret and, when this deploy
+/// binds sandbox credentials, the sandbox target Secret. A present target is
+/// accepted only when one of this agent's ExternalSecrets
+/// (`externalsecrets.external-secrets.io/<agent>.`) already manages it.
+pub fn preflight_targets(
+    k: &dyn Kubectl,
+    namespace: &str,
+    release: &str,
+    agent: &str,
+    sandbox: bool,
+) -> Result<()> {
+    check_crd(k)?;
+    let prefix = format!("{ESO_MANAGER_PREFIX}{agent}.");
+    let ours = |manager: &str| manager.starts_with(&prefix);
+    check_target(k, namespace, &hosted_target_name(release, agent), &ours)?;
+    if sandbox {
+        check_target(k, namespace, &sandbox_target_name(release, agent), &ours)?;
+    }
+    Ok(())
+}
+
+/// Read-only check that nothing this plan would write collides with state it
+/// does not own. Runs before any provider, kubectl or helm write.
+///
+/// A present target Secret is ours only when ESO already manages it for one of
+/// this plan's ExternalSecrets. Anything else (a kubectl-applied Secret from a
+/// provider-less deploy, a helm-rendered one) would be silently taken over by
+/// `CreateOrMerge` or fight `Owner`, so it is refused by name.
+pub fn preflight(k: &dyn Kubectl, namespace: &str, plan: &Plan) -> Result<()> {
+    check_crd(k)?;
     // target -> the ExternalSecret names allowed to manage it
     let mut targets: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for entry in plan.entries() {
@@ -243,62 +394,12 @@ pub fn preflight(k: &dyn Kubectl, namespace: &str, plan: &Plan) -> Result<()> {
             .push(entry.sync.name.as_str());
     }
     for (target, owners) in targets {
-        let args: Vec<String> = [
-            "-n",
-            namespace,
-            "get",
-            "secret",
-            target,
-            "--show-managed-fields",
-            "-o",
-            "json",
-        ]
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
-        let out = k.run(&args, None)?;
-        if !out.success {
-            if is_not_found(&out.stderr) {
-                continue;
-            }
-            bail!(
-                "could not read Secret {namespace}/{target}: {}",
-                out.stderr.trim()
-            );
-        }
-        // Only metadata is read; the data map is never looked at.
-        let secret: Value = serde_json::from_str(&out.stdout)
-            .map_err(|_| anyhow!("Secret {namespace}/{target} returned invalid JSON"))?;
-        let managers: Vec<String> = secret["metadata"]["managedFields"]
-            .as_array()
-            .map(|fields| {
-                fields
-                    .iter()
-                    .filter_map(|f| f["manager"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let ours = owners.iter().any(|owner| {
-            let manager = format!("{ESO_MANAGER_PREFIX}{owner}");
-            managers.iter().any(|m| m == &manager)
-        });
-        if !ours {
-            let seen = if managers.is_empty() {
-                "none".to_string()
-            } else {
-                managers.join(", ")
-            };
-            return Err(crate::exit::CliError::failure(format!(
-                "Secret {namespace}/{target} already exists and External Secrets does not \
-                 manage it (field managers: {seen}); refusing to take it over. Nothing was \
-                 written."
-            ))
-            .with_fix(format!(
-                "delete it (`kubectl -n {namespace} delete secret {target}`) or move it under \
-                 External Secrets, then re-run `curie cluster deploy`"
-            ))
-            .into());
-        }
+        let ours = |manager: &str| {
+            owners
+                .iter()
+                .any(|owner| manager == format!("{ESO_MANAGER_PREFIX}{owner}"))
+        };
+        check_target(k, namespace, target, &ours)?;
     }
     Ok(())
 }

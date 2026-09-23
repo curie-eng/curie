@@ -94,16 +94,36 @@ pub struct SyncEntry {
     pub remote_key: String,
     pub static_keys: Vec<String>,
     pub rotated_keys: Vec<String>,
-    /// Labels for the ESO objects and, through the ExternalSecret's target
-    /// template, for the Secret ESO creates. Empty renders exactly as before.
+    /// Labels for the ESO objects' own metadata. Empty renders exactly as before.
     pub labels: BTreeMap<String, String>,
+    /// Labels for the Secret ESO creates, through the ExternalSecret's target
+    /// template. Empty emits no template.
+    pub target_labels: BTreeMap<String, String>,
+    /// Render `CreateOrMerge` even without rotated keys, because another
+    /// ExternalSecret merges into the same target and none may claim Owner.
+    pub merge_into_target: bool,
 }
 
 impl SyncEntry {
     /// Attach labels. A connector deploy labels its objects with the owner so
     /// the worker's reconcile and the CLI prune recognise them.
+    /// The target Secret gets the same labels unless [`Self::with_target_labels`]
+    /// overrides them.
     pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.target_labels = labels.clone();
         self.labels = labels;
+        self
+    }
+
+    /// Labels for the target Secret only.
+    pub fn with_target_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.target_labels = labels;
+        self
+    }
+
+    /// Merge into the target instead of owning it (see [`Self::merge_into_target`]).
+    pub fn merging_into_target(mut self) -> Self {
+        self.merge_into_target = true;
         self
     }
 
@@ -138,6 +158,8 @@ impl SyncEntry {
             static_keys,
             rotated_keys: rotated,
             labels: BTreeMap::new(),
+            target_labels: BTreeMap::new(),
+            merge_into_target: false,
         })
     }
 
@@ -165,7 +187,7 @@ pub fn render_external_secret(
             })
         })
         .collect();
-    let policy = if entry.rotated_keys.is_empty() {
+    let policy = if entry.rotated_keys.is_empty() && !entry.merge_into_target {
         "Owner"
     } else {
         "CreateOrMerge"
@@ -183,13 +205,15 @@ pub fn render_external_secret(
     });
     if !entry.labels.is_empty() {
         rendered["metadata"]["labels"] = json!(entry.labels);
+    }
+    if !entry.target_labels.is_empty() {
         // `Merge` keeps the data keys ESO writes; the template only adds the
         // labels to the Secret it creates or merges into (probed on ESO 2.11.0
         // under both Owner and CreateOrMerge).
         rendered["spec"]["target"]["template"] = json!({
             "engineVersion": "v2",
             "mergePolicy": "Merge",
-            "metadata": { "labels": entry.labels },
+            "metadata": { "labels": entry.target_labels },
         });
     }
     rendered
