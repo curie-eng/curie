@@ -10184,7 +10184,7 @@
         ]
       },
       "post": {
-        "description": "Create a pending approval; idempotent on ``dedupe_key``.\n\nA redelivered worker turn that re-requests the same approval gets the\nexisting record back (200) instead of forking a second pending record for\none human decision.",
+        "description": "Create a pending approval; idempotent on ``dedupe_key``.\n\nA redelivered worker turn that re-requests the same approval gets the\nexisting record back (200) instead of forking a second pending record for\none human decision.\n\nA request for an approval a person rejected in this thread, raised with no\nperson asking since, is refused with 409 and audited on the rejected record\n(#2885, ``crud.find_rejected_reraise``). Decided here rather than in the\nrunner, so a sandbox cannot talk its way past it.",
         "operationId": "create_approval_approvals_post",
         "parameters": [
           {
