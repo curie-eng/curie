@@ -89,6 +89,8 @@ CHART_COMPONENTS = {
 }
 RUNNER_IMAGE = "curie-runner"
 RELEASE = "curie"
+# The chart's DB_SCHEMA; the in-chart role's search_path does not include it.
+DB_SCHEMA = "curie"
 DEFAULT_LABEL = "curie-factory"
 NAMESPACE_PREFIX = "test-factory-"
 APP_KEY_REF = "factory-e2e-github-app"
@@ -1135,7 +1137,8 @@ class Preflight:
         """Rows from this install's own Postgres, tab-separated, NULL as ''."""
 
         script = (
-            'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 '
+            f"PGOPTIONS=-csearch_path={DB_SCHEMA} "
+            'psql -qU "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 '
             '-tAF "$(printf "\\t")" -f -'
         )
         out = run(
@@ -1155,7 +1158,7 @@ class Preflight:
             ],
             input_text=query,
         )
-        return [line.split("\t") for line in out.splitlines() if line.strip()]
+        return parse_sql_rows(out)
 
     def step(self, name: str, **facts: Any) -> None:
         log(name)
@@ -2276,6 +2279,12 @@ def usage_record(
     return {"source": "unverified", "usd": None, "caveat": caveat}
 
 
+def parse_sql_rows(out: str) -> list[list[str]]:
+    """psql -tA tab-separated output as rows. Pure. An all-NULL row is kept."""
+
+    return [line.split("\t") for line in out.splitlines() if line != ""]
+
+
 def judge_lineage(link: Mapping[str, Any] | None, prs: Sequence[Mapping[str, Any]]) -> list[str]:
     """Every way a pull request ending is not owned by its WorkItem. Pure.
 
@@ -2290,11 +2299,9 @@ def judge_lineage(link: Mapping[str, Any] | None, prs: Sequence[Mapping[str, Any
         return ["the WorkItem row could not be read"]
     if not link.get("publication_lineage_id"):
         return ["the WorkItem's publication_lineage_id is not set"]
-    number = prs[0].get("number")
-    if str(link.get("pr_number") or "") != str(number):
-        return [
-            f"the WorkItem's lineage records pull request {link.get('pr_number')!r}, not #{number}"
-        ]
+    number, url = prs[0].get("number"), prs[0].get("url")
+    if str(link.get("pr_number") or "") != str(number) or link.get("pr_url") != url:
+        return [f"the WorkItem's lineage records pull request {link.get('pr_url')!r}, not {url!r}"]
     return []
 
 
