@@ -22,6 +22,7 @@ struct Scripted {
     ownership: String,
     store_body: String,
     fail_writes: bool,
+    namespace_exists: bool,
 }
 
 impl Scripted {
@@ -35,6 +36,7 @@ impl Scripted {
             ownership: "Error from server (NotFound): configmaps \"curie-eso-install\" not found\n".to_string(),
             store_body: ready_store(),
             fail_writes: false,
+            namespace_exists: false,
         }
     }
 
@@ -105,6 +107,15 @@ impl Kubectl for Scripted {
                 Ok(fail(&self.ownership))
             } else {
                 Ok(ok(&self.ownership))
+            };
+        }
+        if joined.contains("get namespace") {
+            return if self.namespace_exists {
+                Ok(ok("namespace/acme-harness"))
+            } else {
+                Ok(fail(
+                    "Error from server (NotFound): namespaces \"acme-harness\" not found",
+                ))
             };
         }
         if joined.contains("get secretstore") {
@@ -324,6 +335,33 @@ fn check_refuses_an_incompatible_controller_with_reads_only() {
             .all(|call| !call.contains("apply") && !call.contains("upgrade")),
         "{:?}",
         script.calls()
+    );
+}
+
+#[test]
+fn ensure_leaves_an_existing_namespace_and_its_labels_alone() {
+    let mut script = Scripted::absent();
+    compatible(&mut script);
+    script.namespace_exists = true;
+    ensure(&script, &script, &spec(), &this_install(), None).expect("reuse");
+    assert!(
+        !script
+            .calls()
+            .iter()
+            .any(|call| call == "kubectl: apply -f -"),
+        "an existing namespace must not be re-applied: {:?}",
+        script.calls()
+    );
+    let mut fresh = Scripted::absent();
+    compatible(&mut fresh);
+    ensure(&fresh, &fresh, &spec(), &this_install(), None).expect("reuse");
+    assert!(
+        fresh
+            .calls()
+            .iter()
+            .any(|call| call == "kubectl: apply -f -"),
+        "a missing namespace is created: {:?}",
+        fresh.calls()
     );
 }
 
