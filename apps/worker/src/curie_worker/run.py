@@ -40,7 +40,7 @@ from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
 from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
-from .cron_loop import CronSchedulerLoop
+from .cron_loop import BundleTriggerSource, CronSchedulerLoop
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
@@ -575,12 +575,11 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         cron_loop=CronSchedulerLoop(
             engine=engine,
             redis=async_redis,
-            source=HttpManifestSource(
-                api_base_url=config.api_base_url,
-                api_key=config.api_key,
-                release=config.connector_release,
-                namespace=config.connector_namespace,
-                app_name=config.connector_app_name,
+            source=BundleTriggerSource(
+                BundleStore(config),
+                max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+                max_compression_ratio=config.bundle_max_compression_ratio,
+                max_members=config.bundle_max_members,
             ),
             is_killed=killswitch.is_killed,
             db_schema=config.db_schema,

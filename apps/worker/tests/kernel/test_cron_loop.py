@@ -54,6 +54,7 @@ class _Seed:
     version_id: uuid.UUID
     address: str
     slot: datetime
+    bundle_ref: str
 
     async def runs(self) -> list[Any]:
         async with self.engine.connect() as conn:
@@ -109,10 +110,15 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
             await conn.execute(
                 text(
                     "INSERT INTO curie.agent_versions "
-                    "(id, agent_id, version_label, created_by) "
-                    "VALUES (:id, :agent_id, :label, 'kernel-test')"
+                    "(id, agent_id, version_label, bundle_ref, created_by) "
+                    "VALUES (:id, :agent_id, :label, :ref, 'kernel-test')"
                 ),
-                {"id": version_id, "agent_id": agent_id, "label": f"cron_{token}"},
+                {
+                    "id": version_id,
+                    "agent_id": agent_id,
+                    "label": f"cron_{token}",
+                    "ref": f"bundles/cron_{token}.tar.gz",
+                },
             )
             await conn.execute(
                 text(
@@ -137,7 +143,7 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
                     "adapter": ADAPTER,
                 },
             )
-        yield _Seed(engine, agent_id, version_id, address, _slot())
+        yield _Seed(engine, agent_id, version_id, address, _slot(), f"bundles/cron_{token}.tar.gz")
     finally:
         async with engine.begin() as conn:
             await conn.execute(
@@ -159,12 +165,12 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
 class _Triggers:
     """The fake trigger source: only this seed's version declares the hook."""
 
-    def __init__(self, seed: _Seed, trigger: dict[str, Any]) -> None:
-        self._version = str(seed.version_id)
-        self._trigger = trigger
+    def __init__(self, seed: _Seed, *triggers: dict[str, Any]) -> None:
+        self._bundle_ref = seed.bundle_ref
+        self._triggers = triggers
 
-    def triggers(self, agent_id: str, version_id: str) -> list[dict[str, Any]]:
-        return [dict(self._trigger)] if version_id == self._version else []
+    def triggers(self, bundle_ref: str) -> list[dict[str, Any]]:
+        return [dict(t) for t in self._triggers] if bundle_ref == self._bundle_ref else []
 
 
 def _trigger(seed: _Seed, **overrides: Any) -> dict[str, Any]:
@@ -390,5 +396,70 @@ def test_target_not_bound_to_the_agent_records_failed(
             rows = await seed.runs()
             assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "failed")]
             assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+def test_loops_resolving_adjacent_slots_of_one_hook_admit_exactly_once(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """Replicas with different watermarks resolve different slots of one hook.
+
+    The per-hook advisory lock plus the any-other-open-row check must leave one
+    admitted event and the other slot recorded skipped, whichever wins.
+    """
+
+    async def body() -> None:
+        async with _seed() as seed:
+            earlier = seed.slot - timedelta(minutes=1)
+            trigger = _trigger(seed, schedule="* * * * *")
+            engine_b = create_async_engine(_DB_URL)
+            client_a, client_b = _async_redis(), _async_redis()
+            try:
+                stream = names["stream"]
+                a = _loop(seed.engine, client_a, _Triggers(seed, trigger), stream, earlier)
+                b = _loop(engine_b, client_b, _Triggers(seed, trigger), stream, seed.slot)
+                await asyncio.gather(
+                    a.one_pass(now=earlier + timedelta(seconds=30)),
+                    b.one_pass(now=seed.slot + timedelta(seconds=30)),
+                )
+            finally:
+                await client_a.aclose()
+                await client_b.aclose()
+                await engine_b.dispose()
+
+            rows = await seed.runs()
+            assert [r.slot_utc for r in rows] == [earlier, seed.slot]
+            assert sorted(str(r.outcome) for r in rows) == ["None", "skipped"]
+            assert len(_entries(sync_redis, names["stream"])) == 1
+
+    asyncio.run(body())
+
+
+def test_a_raising_hook_does_not_stop_the_agents_later_hooks(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """``0 0 31 2 *`` passes validation but cronsim raises on it; the valid due
+    hook after it on the same agent still fires."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            bad = _trigger(seed, name="never", schedule="0 0 31 2 *")
+            client = _async_redis()
+            try:
+                loop = _loop(
+                    seed.engine,
+                    client,
+                    _Triggers(seed, bad, _trigger(seed)),
+                    names["stream"],
+                    seed.slot,
+                )
+                summary = await loop.one_pass(now=seed.slot + timedelta(seconds=30))
+            finally:
+                await client.aclose()
+            assert summary.failed == 1
+            assert summary.admitted == 1
+            assert [(r.slot_utc, r.outcome) for r in await seed.runs()] == [(seed.slot, None)]
+            assert len(_entries(sync_redis, names["stream"])) == 1
 
     asyncio.run(body())

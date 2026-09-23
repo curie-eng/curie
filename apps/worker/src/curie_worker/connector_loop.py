@@ -148,20 +148,6 @@ class HttpManifestSource:
             owned_secret_keys=list(body.get("owned_secret_keys") or []),
         )
 
-    def triggers(self, agent_id: str, version_id: str) -> list[dict[str, Any]]:
-        """The version's declared ``plugin.json`` triggers, from the same route.
-
-        The cron scheduler reads these; the connector objects alongside them are
-        ignored here. Non-mapping entries are dropped rather than trusted.
-        """
-
-        url = f"{self._base}/agents/{agent_id}/versions/{version_id}/connectors"
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.get(url, params=self._params, headers=self._headers)
-        response.raise_for_status()
-        body: dict[str, Any] = response.json()
-        return [t for t in body.get("triggers") or [] if isinstance(t, dict)]
-
 
 @dataclass
 class PassSummary:

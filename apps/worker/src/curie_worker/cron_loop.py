@@ -10,17 +10,20 @@ Four choices make this safe to run on every replica, unattended:
 
 **The row is the claim.** ``hook_runs`` is unique on ``(agent_id, name,
 slot_utc)``. Every replica computes the same slots, and exactly one INSERT
-wins; the losers see no returned row and stop. No leader election, no lock.
+wins; the losers see no returned row and stop. No leader election. Replicas
+whose watermarks differ can resolve different slots of one hook, so admission
+also takes a transaction-scoped advisory lock per ``(agent, name)`` and treats
+any other open row for that hook as in flight.
 
 **Missed slots are slept through, not replayed.** A pass covers (watermark,
 now] and considers only the latest due slot per hook. A worker that was down
 for a day fires once when it returns, not once per missed slot, and a fresh
 worker never fires a slot from before it started.
 
-**One agent's failure ends with that agent.** An exception while scheduling one
-agent is caught and logged, and the rest of the pass continues, for the same
-reason as the connector loop: the order is arbitrary, so aborting would starve
-whichever agents happened to sort later.
+**One hook's failure ends with that hook.** An exception while reading one
+agent's triggers, or resolving or admitting one hook, is caught and logged, and
+the rest of the pass continues, for the same reason as the connector loop: the
+order is arbitrary, so aborting would starve whichever hooks sorted later.
 
 **A pass never kills the worker.** ``run_forever`` wraps the pass whole. The
 loop shares a process with the kernel, so a scheduling problem fails loudly
@@ -35,11 +38,14 @@ occurrence.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -47,9 +53,12 @@ from aci_protocol import HookRunRef, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol import hook_conversation_id
 from cronsim import CronSim
+from plugin_format import resolve_manifest
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
+from .bundle_store import BundleReader, extract_bundle
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +108,64 @@ def resolve_slots(
 
 
 class TriggerSource(Protocol):
-    def triggers(self, agent_id: str, version_id: str) -> list[dict[str, Any]]: ...
+    def triggers(self, bundle_ref: str) -> list[dict[str, Any]]: ...
+
+
+def read_bundle_triggers(root: Path) -> list[Any]:
+    """``plugin.json`` ``triggers`` as stored under an extracted plugin root.
+
+    Mirrors the API's ``bundles.read_manifest_triggers``: a missing manifest or
+    key, unreadable JSON, or a non-list value is an empty list.
+    """
+
+    manifest_path = resolve_manifest(root)
+    if manifest_path is None:
+        return []
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    triggers = raw.get("triggers")
+    return triggers if isinstance(triggers, list) else []
+
+
+class BundleTriggerSource:
+    """Reads a version's declared triggers straight from its stored bundle.
+
+    The bundle is the immutable record of what a version declares, so this
+    needs no connector render route, release parameters, or API call; a bundle
+    carrying any kind of connector lock reads the same. Synchronous on purpose:
+    the loop runs it in a worker thread. Extraction goes through
+    ``extract_bundle``, so the traversal and size guards apply here too.
+    """
+
+    def __init__(
+        self,
+        reader: BundleReader,
+        *,
+        max_uncompressed_bytes: int,
+        max_compression_ratio: float,
+        max_members: int,
+    ) -> None:
+        self._reader = reader
+        self._max_uncompressed_bytes = max_uncompressed_bytes
+        self._max_compression_ratio = max_compression_ratio
+        self._max_members = max_members
+
+    def triggers(self, bundle_ref: str) -> list[dict[str, Any]]:
+        data = self._reader.get(bundle_ref)
+        with tempfile.TemporaryDirectory(prefix="curie-cron-bundle-") as tmp:
+            root = extract_bundle(
+                data,
+                Path(tmp),
+                max_uncompressed_bytes=self._max_uncompressed_bytes,
+                max_compression_ratio=self._max_compression_ratio,
+                max_members=self._max_members,
+            )
+            declared = read_bundle_triggers(root)
+        return [t for t in declared if isinstance(t, dict)]
 
 
 # Ranked exactly as connector_loop._TARGETS_SQL (and binding.py's _RESOLVE_SQL):
@@ -111,6 +177,7 @@ SELECT DISTINCT ON (a.id)
        a.id AS agent_id,
        a.name AS agent_name,
        v.id AS version_id,
+       v.bundle_ref AS bundle_ref,
        a.max_usd_per_day AS max_usd_per_day,
        a.max_output_tokens_per_run AS max_output_tokens_per_run
 FROM {schema}.agents a
@@ -134,16 +201,25 @@ ON CONFLICT (agent_id, name, slot_utc) DO NOTHING
 RETURNING id
 """
 
+# Serializes admission per (agent, name) across replicas for the length of the
+# admission transaction, so two passes resolving different slots of one hook
+# cannot both see "nothing in flight" and both admit.
+_LOCK_SQL = """
+SELECT pg_advisory_xact_lock(hashtextextended(CAST(:agent_id AS text) || ':' || :name, 0))
+"""
+
 _CLOSE_STALE_SQL = """
 UPDATE {schema}.hook_runs
 SET outcome = 'failed', ended_at = now()
 WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL
-  AND slot_utc < :slot AND started_at < :cutoff
+  AND slot_utc <> :slot AND started_at < :cutoff
 """
 
+# Any other open row for this hook blocks, whichever slot it holds: a later
+# slot admitted by a replica with a newer watermark is just as much in flight.
 _IN_FLIGHT_SQL = """
 SELECT 1 FROM {schema}.hook_runs
-WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL AND slot_utc < :slot
+WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL AND slot_utc <> :slot
 LIMIT 1
 """
 
@@ -158,6 +234,7 @@ class _Target:
     agent_id: uuid.UUID
     agent_name: str
     version_id: uuid.UUID
+    bundle_ref: str | None
     max_usd_per_day: float | None
     max_output_tokens_per_run: int | None
 
@@ -214,6 +291,7 @@ class CronSchedulerLoop:
         self._bindings_sql = text(_BINDINGS_SQL.format(schema=db_schema))
         self._insert_sql = text(_INSERT_SQL.format(schema=db_schema))
         self._close_stale_sql = text(_CLOSE_STALE_SQL.format(schema=db_schema))
+        self._lock_sql = text(_LOCK_SQL)
         self._in_flight_sql = text(_IN_FLIGHT_SQL.format(schema=db_schema))
         self._fail_run_sql = text(_FAIL_RUN_SQL.format(schema=db_schema))
 
@@ -225,6 +303,7 @@ class CronSchedulerLoop:
                 agent_id=row["agent_id"],
                 agent_name=row["agent_name"],
                 version_id=row["version_id"],
+                bundle_ref=row["bundle_ref"],
                 max_usd_per_day=row["max_usd_per_day"],
                 max_output_tokens_per_run=row["max_output_tokens_per_run"],
             )
@@ -234,8 +313,11 @@ class CronSchedulerLoop:
     async def _cron_triggers(self, target: _Target) -> list[dict[str, Any]]:
         cached = self._triggers.get(target.version_id)
         if cached is None:
-            fetched = await asyncio.to_thread(
-                self._source.triggers, str(target.agent_id), str(target.version_id)
+            # A version with no stored bundle declares no triggers.
+            fetched = (
+                await asyncio.to_thread(self._source.triggers, target.bundle_ref)
+                if target.bundle_ref
+                else []
             )
             cached = [t for t in fetched if isinstance(t, dict) and t.get("type") == "cron"]
             self._triggers[target.version_id] = cached
@@ -329,6 +411,7 @@ class CronSchedulerLoop:
             )
 
         async with self._engine.begin() as conn:
+            await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
             await conn.execute(
                 self._close_stale_sql,
                 {
@@ -384,27 +467,36 @@ class CronSchedulerLoop:
         summary = CronPassSummary()
         for target in await self._targets():
             try:
-                for trigger in await self._cron_triggers(target):
-                    name, schedule, prompt = (
-                        trigger.get("name"),
-                        trigger.get("schedule"),
-                        trigger.get("prompt"),
-                    )
-                    if not name or not schedule or not prompt:
-                        continue
-                    zone = trigger.get("timezone") or "UTC"
-                    slots = resolve_slots(str(schedule), str(zone), window_start, now)
-                    if not slots:
-                        continue
-                    await self._admit(target, trigger, slots[-1], now, summary)
+                triggers = await self._cron_triggers(target)
             except Exception:
-                # Ends with this agent. Aborting would leave every later agent
-                # unscheduled, and the order is arbitrary.
                 summary.failed += 1
                 logger.exception(
-                    "cron scheduling raised for agent=%s; continuing with the rest",
+                    "cron trigger read raised for agent=%s; continuing with the rest",
                     target.agent_name,
                 )
+                continue
+            for trigger in triggers:
+                name, schedule, prompt = (
+                    trigger.get("name"),
+                    trigger.get("schedule"),
+                    trigger.get("prompt"),
+                )
+                if not name or not schedule or not prompt:
+                    continue
+                try:
+                    zone = trigger.get("timezone") or "UTC"
+                    slots = resolve_slots(str(schedule), str(zone), window_start, now)
+                    if slots:
+                        await self._admit(target, trigger, slots[-1], now, summary)
+                except Exception:
+                    # Ends with this hook. The agent's other hooks, and every
+                    # later agent, still run: the order is arbitrary.
+                    summary.failed += 1
+                    logger.exception(
+                        "cron hook %s raised for agent=%s; continuing with the rest",
+                        name,
+                        target.agent_name,
+                    )
 
         log = logger.info if summary.did_work else logger.debug
         log(
