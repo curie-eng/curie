@@ -50,6 +50,23 @@ in code now:
   a past-SLA record flips to expired (410) and now also enqueues the expiry resume turn
   (#412, below) so the late resolver's dead end no longer strands the session. Creation is
   idempotent on `dedupe_key` (the triggering event id).
+- **No re-raise after a rejection (landed, #2885).** `POST /approvals` refuses, with 409
+  code `approval.rejected_in_thread` (frozen with the worker in
+  `tests/vectors/approval-reraise-refusal.json`), a request for an approval a person
+  rejected in the same thread when nobody has asked for it since
+  (`apps/api/src/curie_api/crud.py::find_rejected_reraise`). "The same approval" is the
+  same agent, conversation, route, gate kind and gated tool; the model-authored summary is
+  deliberately not part of it, so a reworded retry is still a retry. "Nobody has asked" is
+  read off the request's `dedupe_key`: a resume turn's event id is
+  `resume_event_id(<approval id>)`, so the guard walks those ids back through every
+  approval raised since the last turn a person started, and refuses when one of them is a
+  matching rejection. A request from a person's turn (any other event id) is the explicit
+  ask and is created as before. The refusal appends a `reraise_refused` audit row to the
+  rejected record, and the worker posts the API-authored message (the rejected approval,
+  who rejected it and when, and how to ask again) to the thread and ends the turn instead
+  of pausing or escalating (`apps/worker/src/curie_worker/approvals.py::ApprovalRefused`).
+  One consequence to know: a steer a person sends into a resumed turn does not count as
+  asking, because it joins that platform-authored turn rather than starting one.
 - **The `awaiting-approval` status (landed, #244).** `SessionStatus.AWAITING_APPROVAL` plus
   the optional `Final.approval_summary` field
   (`packages/aci-protocol/src/aci_protocol/events.py`), regenerated across all three language

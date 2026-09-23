@@ -67,6 +67,15 @@ logger = logging.getLogger(__name__)
 # to a generic "Not Found" -- that is how an ingress/proxy miss would read.
 APPROVAL_NOT_FOUND_DETAIL = "approval not found"
 
+# Frozen with the worker in tests/vectors/approval-reraise-refusal.json. The
+# 409 code for an agent re-raising an approval a person rejected in the same
+# thread with nobody asking since (#2885); the worker posts the detail's
+# message to the thread instead of escalating.
+APPROVAL_REJECTED_IN_THREAD_CODE = "approval.rejected_in_thread"
+# The summary is model-authored and unbounded; the refusal quotes a bounded,
+# single-line prefix of it so the thread message stays one readable sentence.
+_REFUSAL_SUMMARY_MAX = 200
+
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
 
@@ -207,11 +216,23 @@ async def create_approval(
     A redelivered worker turn that re-requests the same approval gets the
     existing record back (200) instead of forking a second pending record for
     one human decision.
+
+    A request for an approval a person rejected in this thread, raised with no
+    person asking since, is refused with 409 and audited on the rejected record
+    (#2885, ``crud.find_rejected_reraise``). Decided here rather than in the
+    runner, so a sandbox cannot talk its way past it.
     """
 
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
+    rejected = await crud.find_rejected_reraise(session, data)
+    # An existing row for this dedupe_key is a replay of a request this route
+    # already accepted, so the idempotent 200 below still owns it.
+    if rejected is not None and await crud.get_approval_by_dedupe_key(
+        session, data.dedupe_key
+    ) is None:
+        raise await _refuse_rejected_reraise(session, data, rejected)
     try:
         approval = await crud.create_approval(session, data, traceparent=traceparent)
     except IntegrityError as exc:
@@ -224,6 +245,76 @@ async def create_approval(
         response.status_code = status.HTTP_200_OK
         return ApprovalOut.model_validate(existing)
     return ApprovalOut.model_validate(approval)
+
+
+async def _refuse_rejected_reraise(
+    session: SessionDep, data: ApprovalRequestBody, rejected: Approval
+) -> HTTPException:
+    """Audit a refused re-raise on the rejected record and build its 409 (#2885).
+
+    Args:
+        session: the request's database session.
+        data: the refused request.
+        rejected: the rejected approval it would have raised again.
+
+    Returns:
+        The 409 to raise. Its detail carries the frozen code, the rejected
+        approval's id, who rejected it and when, and the one-line message the
+        worker posts to the thread.
+    """
+
+    # Plain values first: the audit append commits, and nothing below should
+    # depend on reloading ``rejected`` afterwards.
+    rejected_id = rejected.id
+    rejected_by = rejected.resolved_by or "an approver"
+    rejected_at = rejected.resolved_at
+    when = f" at {rejected_at:%Y-%m-%d %H:%M} UTC" if rejected_at is not None else ""
+    summary = " ".join(rejected.summary.split())
+    if len(summary) > _REFUSAL_SUMMARY_MAX:
+        summary = summary[: _REFUSAL_SUMMARY_MAX - 1] + "\u2026"
+    message = (
+        f'Not requesting approval again: "{summary}" (approval {rejected_id}) was '
+        f"rejected by {rejected_by}{when}, and nobody has asked for it since. Nothing "
+        "was done. To raise it again, a person must ask for it in this thread."
+    )
+    await crud.append_approval_audit(
+        session,
+        approval_id=rejected_id,
+        action="reraise_refused",
+        actor="system",
+        actor_channel=None,
+        decision="",
+        authorizer="RejectedReraiseGuard",
+        authorized=False,
+        reason=(
+            f"refused a new request for this rejected approval from turn "
+            f"{data.dedupe_key}, raised with no person asking since the rejection"
+        ),
+        evidence={
+            "dedupe_key": data.dedupe_key,
+            "author": data.author,
+            "summary": data.summary,
+            "route": data.route,
+            "gate_kind": data.gate_kind,
+            "granted_tool": data.granted_tool,
+        },
+    )
+    logger.info(
+        "approval re-raise refused: rejected=%s conversation=%s dedupe_key=%s",
+        rejected_id,
+        data.conversation_id,
+        data.dedupe_key,
+    )
+    return HTTPException(
+        status.HTTP_409_CONFLICT,
+        {
+            "code": APPROVAL_REJECTED_IN_THREAD_CODE,
+            "message": message,
+            "approval_id": str(rejected_id),
+            "rejected_by": rejected.resolved_by,
+            "rejected_at": rejected_at.isoformat() if rejected_at is not None else None,
+        },
+    )
 
 
 @router.get("", response_model=list[ApprovalOut])
