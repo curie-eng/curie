@@ -55,7 +55,14 @@ short of an operator deleting it, and no way to scope memory to a channel.
 
 ## Decision
 
-What we add or change.
+What we add or change. The design copies how Claude Code keeps memory: a
+short index that is always loaded, detail that is read only when needed, a
+size check on every write, and no compaction or version history. When the
+index grows, information moves into detail; it is not compressed or dropped.
+It adds three things Claude Code does not need, because a Claude Code memory
+has one writer and a channel has many people in it: the bundle declares what
+may be saved (B), every entry records who stated it (F), and anyone in a
+channel can correct a fact (H).
 
 **A. Two tiers by default: per agent and per channel. Bundles can add more.**
 The agent tier belongs to one agent and is shared by every channel that agent
@@ -63,13 +70,13 @@ works in. The channel tier belongs to one agent in one channel. "Channel" here
 means the platform's generic binding, the `agent_channels` row: a kind and an
 address, treated as an opaque string (#1459, following
 [ADR-0096](0096-port-adapters-are-deployed-services.md)'s channel-neutral
-port). A Slack channel, a mailbox, and a direct message
-are all channels. Two agents in the same channel do not share memory: each has
-its own channel tier there. No key, API or runner code names a specific surface. A direct message
-is a channel whose address is the person, so private chats get their own memory
-with no extra mechanism. Each tier holds an optional document an operator
-wrote (J) and the entries the agent saved. A bundle that needs another tier
-can declare one; this needs to be possible, not visible.
+port). A Slack channel, a mailbox, and a direct message are all channels. Two
+agents in the same channel do not share memory: each has its own channel tier
+there. No key, API or runner code names a specific surface. A direct message
+is a channel whose address is the person, so private chats get their own
+memory with no extra mechanism. Each tier holds an operator's document (J)
+and the agent's own memory (C). A bundle that needs another tier can declare
+one; this needs to be possible, not visible.
 
 **B. The bundle declares what kinds of fact the agent may save.**
 The agent cannot save whatever it wants. A bundle lists the kinds of fact it
@@ -81,20 +88,26 @@ remember something that is not a declared kind, or that the bundle forbids,
 the agent does not save it and says it cannot remember that kind of thing. An
 operator can still add it to the tier's document from a file (J).
 
-**C. The agent gets a `remember` / `forget` tool, bound to the current channel.**
-`remember` names one of the declared kinds and the platform refuses any other.
-`forget` removes an entry by its id; injected entries carry their ids so the
-agent can name one. The declared kinds and their descriptions are the tool's
-instructions, so the model sees exactly what it may save. The tool writes only
-to the channel the message came from; if the model passes a channel name, it is
-ignored. The tool is mounted only when memory is turned on for the deployment
-and the bundle declares at least one kind.
+**C. The agent's memory is an index plus entry bodies.**
+Each entry has an id, a kind, a one-line summary, and an optional body for
+detail: the conditions attached to a fact, or the reason behind a decision.
+The summaries form the tier's index, which is injected at boot. Bodies are not
+injected; the agent reads one when it needs the detail. This is Claude Code's
+`MEMORY.md` index and topic files. It keeps what every session carries small,
+while detail that would be lost by squeezing it into one line has somewhere to
+live.
 
-**D. Memory is read once, at boot.**
-Everything in both tiers is injected when the session starts. There is no
-tool to read memory mid-session: the session already has it, and it knows
-what it saved itself. A running thread keeps the memory it booted with; a fact
-another thread saved in the meantime appears at this thread's next boot.
+**D. The agent gets a `remember` / `read` / `forget` tool, bound to the
+current channel.**
+`remember` creates or updates an entry of a declared kind; the platform
+refuses any other kind. `read` returns one entry's body by id. `forget`
+removes an entry by id. Index lines carry their ids so the agent can name
+one. There is no tool to search memory or re-read the index: the index is
+already in the session. The declared kinds and their descriptions are the
+tool's instructions, so the model sees exactly what it may save. The tool
+writes only to the channel the message came from; if the model passes a
+channel name, it is ignored. The tool is mounted only when memory is turned on
+for the deployment and the bundle declares at least one kind.
 
 **E. Saves are silent unless the person asked.**
 When someone explicitly says "remember this" or "forget that," the reply
@@ -113,11 +126,12 @@ argument, so the model cannot label its own inference with a person's name. A
 turn with no person behind it (a scheduled job, an eval) gets a marker no
 caller can type.
 
-**G. One id per fact. A correction replaces it.**
-An entry has an id, a kind, its text, and its provenance. A correction
-overwrites the entry under the same id and updates its provenance to the
-person who corrected it. No version history is kept in the store. Saving the
-exact same text again is refused.
+**G. One id per fact. A correction replaces it. No version history.**
+A correction overwrites the entry under the same id and updates its
+provenance to the person who corrected it. Saving the exact same text again
+is refused. Claude Code keeps no memory history either; the old value
+survives only in the trace of the turn that changed it, while that trace is
+retained.
 
 **H. Anyone in a channel can correct any fact in it.**
 The corrected entry records who made the correction (F). Accountability comes
@@ -130,46 +144,52 @@ store figures"). The platform can check mechanically that a save names a
 declared kind. It cannot check that the text really is that kind of fact;
 that stays a model judgment, backed by provenance and open correction.
 
-**J. Operators seed from a file. No seeding from channel history.**
-`curie` writes either tier's document from a file, addressed by agent name.
-An agent with no channel binding is refused a channel-tier write and told why.
-[ADR-0095](0095-tiered-memory-lifecycle.md)'s plan to read a channel's history
-to build starting memory is dropped: it needs new Slack permissions and a
-re-consent in every workspace, and channel history is the least trustworthy
-input available. A channel starts empty.
+**J. Operators seed a document from a file. No seeding from channel history.**
+Each tier can have one operator-written document, the equivalent of
+Claude Code's `CLAUDE.md`. `curie` writes it from a file, addressed by agent
+name. It is injected in full at boot, is never changed by the agent, and has
+its own size cap. An agent with no channel binding is refused a channel-tier
+write and told why. [ADR-0095](0095-tiered-memory-lifecycle.md)'s plan to read
+a channel's history to build starting memory is dropped: it needs new Slack
+permissions and a re-consent in every workspace, and channel history is the
+least trustworthy input available. A channel starts empty.
 
 **K. Refused saves are reported as refused.**
 The tool call is marked failed in the trace, and the reply does not claim the
 fact was saved.
 
-**L. A hard size cap per tier, enforced by the API.**
-Writes over the cap are refused with the limit named. It lives in the API so
-operator and agent writes hit the same check.
+**L. The index is capped, and measured on every save.**
+The cap is Claude Code's: 200 lines or 25 KB, whichever comes first. The API
+measures the index after every save. Near the cap, the save succeeds and the
+tool's reply tells the agent to shorten the index by moving detail out of
+summary lines and into bodies, keeping each summary to one short line. That is
+the only change the agent makes to shorten the index: it does not merge or
+drop entries on its own. Over the cap, the save still succeeds, the reply
+tells the agent to move detail now, and the operator is told, because index
+lines past the cap are not loaded at the next boot. They stay in the store and
+in the console, and the boot log says how many were left out (O). If the index
+is still over the cap once every summary is one short line, a person decides
+what to remove.
+Each body is capped at the state store's per-value limit. If a tier reaches
+the store's per-namespace limit, saves are refused and the operator decides
+what to delete.
 
-**M. Compaction runs when a tier nears its cap.**
-When a save takes a tier past 80% of its cap, the session compacts that tier
-after its reply has been sent, so the person does not wait for it. Compaction
-reads the tier's entries and the bundle's declared kinds, and rewrites the
-entries: it merges duplicates, combines entries that say the same thing, and
-drops entries that later ones made obsolete. Merged entries keep the
-provenance of every entry they came from. It never changes the operator's
-document. It writes back with compare-and-set and removes only the entries it
-read, so a save made by another thread while it runs survives. If compaction
-fails, the entries are left as they were. If the tier is still over the cap
-afterwards, new saves are refused (K and L) and the operator is told. No
-scheduler is needed; a nightly pass can be added later through
-[ADR-0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md).
+**M. No compaction.**
+Nothing compresses or rewrites memory. An entry changes only when the agent
+saves, corrects or forgets it, when the agent moves detail from its summary
+into its body (L), or when an operator or person edits it. Entries are removed
+only by a correction, a `forget`, or a person. Compaction is for a session's
+own context, not for memory.
 
 **N. Deleted entries stay deleted.**
 Otherwise the agent re-saves the fact on the next turn, because the message
 that produced it is still in the conversation. The store has to remember what
-a person or operator removed; the agent has no way to know. Entries merged
-away by compaction are not treated as deleted.
+a person or operator removed; the agent has no way to know.
 
 **O. Boots log what they loaded.**
-"Found agent tier," "found channel tier," or "found nothing," distinguishably.
-Without this, a tier that was never written and a tier the runner cannot read
-look the same.
+"Found agent tier," "found channel tier," or "found nothing," distinguishably,
+plus how many index lines were left out for being past the cap. Without this,
+a tier that was never written and a tier the runner cannot read look the same.
 
 ## Alternatives considered
 
@@ -183,21 +203,18 @@ look the same.
 - **A platform-wide content rule** ("never store comments about people").
   No. The code can't judge whether a sentence is about a person, and a rule
   enforced only by a prompt isn't enforced.
-- **A `recall` tool to read memory mid-session.** No, see D. Everything is
-  already injected at boot.
-- **Version history on every fact.** No. It adds storage and queries to undo
-  a bad correction, which another correction already does. The old value
-  survives only in the trace of the turn that changed it, if that trace is
-  still retained.
-- **Refuse saves at the cap until an operator acts, with no compaction.** No.
-  The agent would stop learning as soon as a tier filled.
-- **Drop the oldest entries at the cap.** No. Facts nobody chose to lose would
-  disappear.
-- **Compaction on a schedule, from transcripts**
-  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). Not as the
-  default. It needs scheduled turns, and the transcripts it reads are raw
-  conversation rather than facts the bundle declared worth keeping. A
-  size-triggered pass over entries needs neither.
+- **Inject every entry in full, with no bodies.** No. Every session would
+  carry every detail, and the only way to stay under the cap would be to
+  squeeze detail into one line or drop it.
+- **A tool to search memory or re-read the index mid-session.** No. The index
+  is already in the session; only bodies need reading.
+- **Refuse saves over the cap.** No. The fact being saved right now would be
+  lost, while the agent can shorten the index in the same turn. Lines past the
+  cap are left out of the next boot, not deleted.
+- **Compaction, on a schedule or when a tier fills**
+  ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). No, see M.
+  A rewrite nobody asked for can lose a fact nobody remembers existed.
+- **Version history on every fact.** No, see G.
 - **Seeding from channel history.** No, see J.
 - **An operator instructions layer above memory**
   ([ADR-0095](0095-tiered-memory-lifecycle.md)). Not included. The bundle's
@@ -208,8 +225,9 @@ look the same.
 - **Model supplies the author.** No. The writer should not control the field
   that says who asserted a fact.
 - **Only the author can correct a fact.** No, see H.
-- **Vector database or knowledge graph.** No. One bounded document per tier
-  fits in context, and an index is a second copy with no clean delete.
+- **Vector database or knowledge graph.** No. The index fits in context and
+  bodies are read by id, and an embedding index is a second copy with no
+  clean delete.
 
 ## Consequences
 
@@ -223,20 +241,19 @@ look the same.
 - Writer and reader must compose the same key for every address, including
   odd characters. They live in different packages, so this is a test, not
   shared code.
-- The existing `log` row becomes the agent tier's entries. Rename, not
-  rewrite. Existing entries have no author; they are shown as unknown rather
-  than guessed.
-- Compaction is a model call made by the session that crossed the line, with
-  the agent's configured model, after its reply. That session holds its
-  sandbox slightly longer, and the cost is attributed to that agent like any
-  other turn. Compaction is rare: it runs only when a tier nears its cap.
+- Storage per tier is one index row (under the 25 KB cap, well within the
+  store's 64 KiB value limit) and one row per body. Loading at boot stays a
+  single read per tier.
+- The existing `log` row becomes the agent tier's index, one line per
+  existing entry, with no bodies. Existing entries have no author; they are
+  shown as unknown rather than guessed.
 - [ADR-0095](0095-tiered-memory-lifecycle.md) and
   [ADR-0111](0111-the-default-memory-compaction-algorithm.md) are marked as
   folded into this one. The acceptance PR sets them to
   `Superseded by ADR-0167`.
-- Known gaps: no time-based expiry; compaction merges and drops by model
-  judgment, so it can lose a nuance; the channel tier assumes one agent per
-  channel until multi-channel lands.
+- Known gaps: no time-based expiry; index lines past the cap are left out
+  until detail is moved into bodies or a person removes entries; the channel tier assumes
+  one agent per channel until multi-channel lands.
 
 ## Before this can be accepted
 
@@ -247,16 +264,19 @@ look the same.
 3. A save naming an undeclared kind is refused and reported as refused.
 4. Writer and reader keys match for addresses with `@`, `:`, `/`, spaces, and
    non-ASCII.
-5. Unit tests for the size cap and the compare-and-set conflict path.
-6. A correction replaces the entry under the same id and records the new
+5. An entry's summary is injected at boot and its body is not; `read` returns
+   the body by id.
+6. A save near the cap succeeds with a shorten reminder; a save over the cap
+   succeeds with a rewrite error; the next boot leaves the excess lines out
+   and logs how many.
+7. A correction replaces the entry under the same id and records the new
    author; the next boot shows only the corrected text.
-7. A forgotten or deleted entry stays gone on the next turn, even though the
+8. A forgotten or deleted entry stays gone on the next turn, even though the
    message that produced it is still in the conversation.
-8. A save that takes a tier past 80% triggers compaction after the reply; the
-   tier shrinks; every remaining entry is a declared kind; a save made during
-   compaction survives; a failed compaction leaves the tier unchanged.
-9. A planted instruction disguised as memory is saved as an entry, shows its
-   author in the console, and does not affect any approval.
+9. Unit tests for the index cap at the API and the compare-and-set conflict
+   path.
+10. A planted instruction disguised as memory is saved as an entry, shows its
+    author in the console, and does not affect any approval.
 
 ## Related ADRs
 
@@ -264,7 +284,7 @@ look the same.
 |---|---|---|
 | [0025](0025-memory-port-and-first-loader.md) (Accepted) | The store, loading at boot, the entry format | Unchanged. This builds on it. |
 | [0095](0095-tiered-memory-lifecycle.md) (Draft) | Everything at once: tiers, history seeding, compaction, instructions layer, cap, Slack lookup | Folded in. Becomes `Superseded by ADR-0167` on acceptance. |
-| [0111](0111-the-default-memory-compaction-algorithm.md) (Draft) | Scheduled compaction | Folded in. Compaction here runs over a tier's entries when it nears its cap (M), not over transcripts on a schedule. |
+| [0111](0111-the-default-memory-compaction-algorithm.md) (Draft) | Scheduled compaction | Folded in. Memory is not compacted at all (M). |
 | [0029](0029-conversation-history-port-and-first-loader.md) (Accepted) | Thread transcripts | Unchanged. Transcripts are not memory. |
-| [0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) | Scheduled turns | Unchanged. Not needed; a nightly compaction pass could use it later. |
+| [0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) | Scheduled turns | Unchanged. Not needed here. |
 | [0100](0100-agents-search-their-own-surface-through-the-channel-port.md) (Draft) | Searching raw channel history | Unchanged. Not needed here. |
