@@ -5,6 +5,7 @@
 
 pub mod aws;
 pub mod binding;
+pub mod bootstrap;
 mod catalog;
 pub mod connector_deploy;
 pub mod eso;
