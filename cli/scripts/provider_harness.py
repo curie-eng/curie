@@ -1462,18 +1462,33 @@ class HarnessCase:
 
     def pod_uid(self, release: str) -> str:
         name = f"{release}-curie-api"
-        result = self.kubectl(
-            "-n",
-            NAMESPACE,
-            "get",
-            "pod",
-            "-l",
-            f"app={name}",
-            "-o",
-            "jsonpath={.items[0].metadata.uid}",
-            action="read consumer pod uid",
-        )
-        return result.stdout.decode("utf-8", "strict").strip()
+
+        def running() -> str:
+            result = self.kubectl(
+                "-n",
+                NAMESPACE,
+                "get",
+                "pod",
+                "-l",
+                f"app={name}",
+                "-o",
+                "json",
+                action="read consumer pod uid",
+                allow_failure=True,
+            )
+            if result.status != 0:
+                return ""
+            document = parse_json(result.stdout, "consumer pods")
+            uids = [
+                str(item.get("metadata", {}).get("uid", ""))
+                for item in document.get("items", [])
+                if item.get("status", {}).get("phase") == "Running"
+                and not item.get("metadata", {}).get("deletionTimestamp")
+            ]
+            return uids[0] if len(uids) == 1 else ""
+
+        wait_until("one running consumer pod", lambda: running() != "", timeout=120)
+        return running()
 
     def deployment_stamp(self, release: str) -> str:
         name = f"{release}-curie-api"
