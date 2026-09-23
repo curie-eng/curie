@@ -238,7 +238,7 @@ impl std::fmt::Debug for GithubTokenPlan {
 /// chars). Hex keeps the value shell-, env- and URL-safe and satisfies every
 /// backing store's charset/min-length rule, and a hex `langfuse.encryptionKey`
 /// is the exact `openssl rand -hex 32` shape the chart documents.
-fn random_hex(n_bytes: usize) -> Result<String> {
+pub(crate) fn random_hex(n_bytes: usize) -> Result<String> {
     use std::fmt::Write;
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf)
@@ -3374,6 +3374,10 @@ fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
         plain(&o.common.namespace),
         plain("--create-namespace"),
     ];
+    if let Some(history_max) = o.history_max {
+        args.push(plain("--history-max"));
+        args.push(plain(history_max.to_string()));
+    }
     plan.append_command_args(&mut args);
     vec![OpsCommand::new("helm", args)]
 }
@@ -4094,6 +4098,9 @@ async fn run_prepared_up(
             &operator_sets,
             opts.common.dry_run,
         ) {
+            // A provider release keeps its sealing key in Secrets Manager
+            // (ADR 0163); the chart value generated here is dropped.
+            SealingPrivateKeyDisposition::Generated if opts.history_max.is_some() => {}
             SealingPrivateKeyDisposition::Generated => {
                 ui.note("generated a sealing private key for this release; later cluster up runs preserve it");
             }
@@ -7789,7 +7796,10 @@ fn announce_adoption_override(namespace: &str, taken: &AdoptionOverride) {
     ));
 }
 
-async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> Result<()> {
+pub(crate) async fn establish_primary_namespace_ownership(
+    o: &CommonOpts,
+    adopt: bool,
+) -> Result<()> {
     match namespace_probe(&o.namespace).await? {
         NamespaceProbe::Absent => {
             let manifest = namespace_manifest(&o.namespace, &o.release)?;
