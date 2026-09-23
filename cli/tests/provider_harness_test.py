@@ -1029,15 +1029,21 @@ class RoutingSuiteHelpers(unittest.TestCase):
             for name in ("api", "worker", "dispatcher", "runner")
         }
         document = provider_harness.routing_installation(
-            "curie-aws-secrets-e2e-routing", "rt", "kind-x", "curie-aws-secrets-e2e-s", images
+            "curie-aws-secrets-e2e-routing",
+            "rt",
+            "kind-x",
+            "curie-aws-secrets-e2e-s",
+            images,
+            "arn:aws:iam::123456789012:role/r",
         )
+        self.assertEqual(document["secrets"]["role_arn"], "arn:aws:iam::123456789012:role/r")
         self.assertEqual(document["secrets"]["provider"], "aws")
         self.assertNotIn("comms", document)
         self.assertEqual(document["set"]["api.image.repository"], "curie-aws-secrets-e2e-api")
         self.assertEqual(document["set"]["agentSandbox.runner.tag"], "abc-123")
         self.assertTrue(all(isinstance(value, str) for value in document["set"].values()))
         control = provider_harness.routing_installation(
-            "n", "rt", "kind-x", "p", images, provider=False
+            "n", "rt", "kind-x", "p", images, "arn:aws:iam::123456789012:role/r", provider=False
         )
         self.assertNotIn("secrets", control)
 
