@@ -741,3 +741,30 @@ def test_same_tenant_membership_in_second_tenant_accepted(migrated: None) -> Non
     (row,) = _rolled_back(body)
     assert row["tenant_id"] is not None
     assert row["tenant_id"] != uuid.UUID(DEFAULT_TENANT_ID)
+
+
+def test_membership_without_tenant_rejected(migrated: None) -> None:
+    async def body(conn: AsyncConnection) -> None:
+        principal_id = await _insert_principal(conn)
+        team_id = await _insert_team(conn)
+        savepoint = await conn.begin_nested()
+        try:
+            with pytest.raises(IntegrityError) as exc_info:
+                await conn.execute(
+                    text(_INSERT_MEMBERSHIP),
+                    {
+                        "tenant_id": None,
+                        "principal_id": principal_id,
+                        "team_id": team_id,
+                        "source": "curie_managed",
+                    },
+                )
+        finally:
+            if savepoint.is_active:
+                await savepoint.rollback()
+        # A NOT NULL violation names the column, not a constraint.
+        cause = exc_info.value.orig.__cause__
+        assert type(cause).__name__ == "NotNullViolationError", str(exc_info.value)
+        assert getattr(cause, "column_name", None) == "tenant_id"
+
+    _rolled_back(body)
