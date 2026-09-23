@@ -109,7 +109,7 @@ def test_principal_model_shape() -> None:
     # (tenant_id, id) is the composite target principal_teams' tenant-scoped
     # FK points at, so a membership can never link across tenants.
     assert {
-        "principals_tenant_idp_subject_key",
+        "principals_tenant_issuer_subject_key",
         "principals_tenant_id_id_key",
     } <= _unique_constraint_names(Principal.__table__)
 
