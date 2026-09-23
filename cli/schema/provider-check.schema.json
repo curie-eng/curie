@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/provider-check/v1.0.json",
+  "title": "curie secrets check --json",
+  "description": "Expiry and provider version metadata for the checked install objects. Values are never emitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "checked": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "status": { "enum": ["ok", "warning", "expired"] }
+        },
+        "required": ["name", "version", "expires_at", "status"]
+      }
+    }
+  },
+  "required": ["checked"]
+}

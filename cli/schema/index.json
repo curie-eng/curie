@@ -244,6 +244,12 @@
       "version": "1.0"
     },
     {
+      "result": "ProviderCheckOutput",
+      "kind": "CliOutput",
+      "schema": "provider-check.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ReleaseAcceptOutput",
       "kind": "CliOutput",
       "schema": "release-accept.schema.json",
