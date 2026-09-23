@@ -1233,6 +1233,31 @@ class HarnessCase:
             revision,
         )
         self.assert_ready_store()
+        self.run_curie(
+            "cluster",
+            "down",
+            "--yes",
+            "--namespace",
+            NAMESPACE,
+            "--release",
+            "acme-harness",
+            "--context",
+            self.context,
+            action="curie cluster down removes the controller it installed",
+        )
+        removed = self.kubectl(
+            "-n",
+            ESO_NAMESPACE,
+            "get",
+            "deploy",
+            "external-secrets",
+            action="prove the installed controller was removed",
+            allow_failure=True,
+        )
+        self.record_assertion(
+            "teardown removed the controller Curie installed",
+            removed.status != 0,
+        )
         self.publish_bootstrap_evidence()
 
     def prove_apply_reuses_eso(self) -> None:
