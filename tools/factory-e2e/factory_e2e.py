@@ -89,6 +89,8 @@ CHART_COMPONENTS = {
 }
 RUNNER_IMAGE = "curie-runner"
 RELEASE = "curie"
+# The chart's DB_SCHEMA; the in-chart role's search_path does not include it.
+DB_SCHEMA = "curie"
 DEFAULT_LABEL = "curie-factory"
 NAMESPACE_PREFIX = "test-factory-"
 APP_KEY_REF = "factory-e2e-github-app"
@@ -110,6 +112,10 @@ NEVER_STARTED_CAP_SECONDS = 3600
 # The judged bound: the execution deadline plus terminal settlement slack.
 ELAPSED_LIMIT_SECONDS = EXECUTION_BOUND_SECONDS + 300
 POLL_SECONDS = 15
+# The notice reconciler ticks every few seconds; a rerun that has not
+# recorded the notice within this wait failed.
+NOTICE_RERUN_WAIT_SECONDS = 120
+NOTICE_RERUN_SETTLE_SECONDS = 30
 EXPECTATIONS = ("pr", "comment", "any")
 # The terminus causes docs/operations.md documents for a factory comment.
 TERMINUS_CAUSES = (
@@ -1126,6 +1132,33 @@ class Preflight:
 
     def kubectl(self, *args: str, check: bool = True) -> str:
         return run(["kubectl", "--context", self.config.kube_context, *args], check=check)
+
+    def sql(self, query: str) -> list[list[str]]:
+        """Rows from this install's own Postgres, tab-separated, NULL as ''."""
+
+        script = (
+            f"PGOPTIONS=-csearch_path={DB_SCHEMA} "
+            'psql -qU "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 '
+            '-tAF "$(printf "\\t")" -f -'
+        )
+        out = run(
+            [
+                "kubectl",
+                "--context",
+                self.config.kube_context,
+                "-n",
+                self.namespace,
+                "exec",
+                "-i",
+                f"statefulset/{RELEASE}-postgres",
+                "--",
+                "sh",
+                "-c",
+                script,
+            ],
+            input_text=query,
+        )
+        return parse_sql_rows(out)
 
     def step(self, name: str, **facts: Any) -> None:
         log(name)
@@ -2246,6 +2279,125 @@ def usage_record(
     return {"source": "unverified", "usd": None, "caveat": caveat}
 
 
+def parse_sql_rows(out: str) -> list[list[str]]:
+    """psql -tA tab-separated output as rows. Pure. An all-NULL row is kept."""
+
+    return [line.split("\t") for line in out.splitlines() if line != ""]
+
+
+def judge_lineage(link: Mapping[str, Any] | None, prs: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Every way a pull request ending is not owned by its WorkItem. Pure.
+
+    ``link`` is the WorkItem's stored ``publication_lineage_id`` joined to its
+    lineage row. The read route falls back to the conversation's newest
+    lineage when the column is NULL, so only the column proves ownership.
+    """
+
+    if len(prs) != 1:
+        return []
+    if link is None:
+        return ["the WorkItem row could not be read"]
+    if not link.get("publication_lineage_id"):
+        return ["the WorkItem's publication_lineage_id is not set"]
+    number, url = prs[0].get("number"), prs[0].get("url")
+    if str(link.get("pr_number") or "") != str(number) or link.get("pr_url") != url:
+        return [f"the WorkItem's lineage records pull request {link.get('pr_url')!r}, not {url!r}"]
+    return []
+
+
+def judge_notice_rerun(
+    before: Mapping[str, Any] | None, after: Mapping[str, Any] | None, comments: int
+) -> list[str]:
+    """Every way a second notice pass fell short of recording, not reposting. Pure.
+
+    ``before`` and ``after`` are the notice row (comment_id, posted_at) before
+    its delivery was cleared and after the reconciler ran again; ``comments``
+    is the App's marked comment count on the issue afterwards.
+    """
+
+    if before is None or not before.get("comment_id"):
+        return ["the terminus notice was not recorded as posted before the rerun"]
+    failures: list[str] = []
+    if after is None or not after.get("posted_at"):
+        failures.append("the reconciler did not record the notice again after the rerun")
+    elif str(after.get("comment_id")) != str(before["comment_id"]):
+        failures.append(
+            f"the rerun recorded comment {after.get('comment_id')}, not the original "
+            f"{before['comment_id']}"
+        )
+    if comments != 1:
+        failures.append(
+            f"{comments} terminus comments exist after the rerun; exactly one is allowed"
+        )
+    return failures
+
+
+def _work_item_link(p: Preflight, work_item_id: str) -> dict[str, Any] | None:
+    uuid.UUID(work_item_id)
+    rows = p.sql(
+        "SELECT w.publication_lineage_id, l.pr_number, l.pr_url FROM work_items w "
+        "LEFT JOIN thread_publication_lineages l ON l.id = w.publication_lineage_id "
+        f"WHERE w.id = '{work_item_id}'"
+    )
+    if len(rows) != 1:
+        return None
+    lineage, number, url = (rows[0] + ["", "", ""])[:3]
+    return {
+        "publication_lineage_id": lineage or None,
+        "pr_number": number or None,
+        "pr_url": url or None,
+    }
+
+
+def _notice_row(p: Preflight, request_id: str) -> dict[str, Any] | None:
+    uuid.UUID(request_id)
+    rows = p.sql(
+        "SELECT comment_id, posted_at FROM factory_terminal_notices "
+        f"WHERE execution_request_id = '{request_id}'"
+    )
+    if len(rows) != 1:
+        return None
+    comment, posted = (rows[0] + ["", ""])[:2]
+    return {"comment_id": comment or None, "posted_at": posted or None}
+
+
+def rerun_notice_reconciler(p: Preflight) -> dict[str, Any]:
+    """Clear the posted notice's delivery and let the reconciler run again.
+
+    A notice whose delivery is lost after GitHub accepted the comment must be
+    recorded from the existing marked comment, never posted twice.
+    """
+
+    request_id = str(p.evidence.get("execution_request_id") or "")
+    before = _notice_row(p, request_id)
+    if before is None or not before.get("comment_id"):
+        return {
+            "before": before,
+            "after": None,
+            "comments": None,
+            "failures": judge_notice_rerun(before, None, 0),
+        }
+    uuid.UUID(request_id)
+    p.sql(
+        "UPDATE factory_terminal_notices SET posted_at = NULL, comment_id = NULL "
+        f"WHERE execution_request_id = '{request_id}'"
+    )
+    deadline = time.time() + NOTICE_RERUN_WAIT_SECONDS
+    after = _notice_row(p, request_id)
+    while time.time() < deadline and not (after or {}).get("posted_at"):
+        time.sleep(POLL_SECONDS)
+        after = _notice_row(p, request_id)
+    # A few more ticks so a late second post would be visible.
+    time.sleep(NOTICE_RERUN_SETTLE_SECONDS)
+    comments = len(_terminus_comments(p))
+    return {
+        "before": before,
+        "after": after,
+        "comments": comments,
+        "failures": judge_notice_rerun(before, after, comments),
+    }
+
+
 def _await_ending(
     p: Preflight,
     work_item_id: str,
@@ -2344,6 +2496,11 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         expect_reasons=p.expect_reasons,
         secrets=known,
     )
+    link = _work_item_link(p, str(work_item_id)) if len(prs) == 1 else None
+    failures += judge_lineage(link, prs)
+    rerun = rerun_notice_reconciler(p) if comments and not prs else None
+    if rerun is not None:
+        failures += rerun["failures"]
     result = {
         "expect": p.expect,
         "expect_causes": sorted(p.expect_causes),
@@ -2354,6 +2511,9 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         "request_status": latest.get("status"),
         "terminal_cause": latest.get("terminal_cause"),
         "work_item_pr": pr,
+        "work_item_link": link,
+        "notice_rerun": rerun,
+        "issue_url": f"https://github.com/{p.config.repo}/issues/{p.issue_number}",
         "pull_requests": [pr_evidence(item, known) for item in prs],
         "ci": detail.get("ci"),
         "terminus_comments": comments,

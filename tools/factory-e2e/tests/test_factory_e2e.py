@@ -1319,3 +1319,109 @@ def test_github_path_failure_never_echoes_a_credential_in_the_file_name() -> Non
     assert any(".github/" in f for f in failures)
     assert secret not in joined
     assert shaped not in joined
+
+
+# --- WorkItem lineage and notice rerun ------------------------------------
+
+
+def _link(**overrides: Any) -> dict[str, Any]:
+    link = {
+        "publication_lineage_id": str(uuid.uuid4()),
+        "pr_number": "5",
+        "pr_url": "https://github.com/acme/fixture/pull/5",
+    }
+    link.update(overrides)
+    return link
+
+
+def _scenario_pr() -> dict[str, Any]:
+    return {"number": 5, "url": "https://github.com/acme/fixture/pull/5"}
+
+
+def test_judge_lineage_passes_when_the_work_item_owns_the_pull_request() -> None:
+    assert fe.judge_lineage(_link(), [_scenario_pr()]) == []
+
+
+def test_judge_lineage_fails_an_unlinked_work_item() -> None:
+    failures = fe.judge_lineage(_link(publication_lineage_id=None), [_scenario_pr()])
+    assert failures == ["the WorkItem's publication_lineage_id is not set"]
+
+
+def test_judge_lineage_fails_a_lineage_for_another_pull_request() -> None:
+    assert fe.judge_lineage(_link(pr_number="9"), [_scenario_pr()])
+
+
+def test_judge_lineage_fails_the_same_number_in_another_repository() -> None:
+    other = _link(pr_url="https://github.com/acme/other/pull/5")
+    assert fe.judge_lineage(other, [_scenario_pr()]) == [
+        "the WorkItem's lineage records pull request "
+        "'https://github.com/acme/other/pull/5', not 'https://github.com/acme/fixture/pull/5'"
+    ]
+
+
+def test_judge_lineage_fails_an_unreadable_work_item() -> None:
+    assert fe.judge_lineage(None, [_scenario_pr()]) == ["the WorkItem row could not be read"]
+
+
+def test_judge_lineage_ignores_a_comment_ending() -> None:
+    assert fe.judge_lineage(None, []) == []
+
+
+def test_judge_notice_rerun_passes_when_the_original_comment_is_recorded() -> None:
+    before = {"comment_id": "77", "posted_at": "t0"}
+    after = {"comment_id": "77", "posted_at": "t1"}
+    assert fe.judge_notice_rerun(before, after, 1) == []
+
+
+def test_judge_notice_rerun_fails_a_second_comment() -> None:
+    before = {"comment_id": "77", "posted_at": "t0"}
+    after = {"comment_id": "78", "posted_at": "t1"}
+    failures = fe.judge_notice_rerun(before, after, 2)
+    assert len(failures) == 2
+    assert "not the original 77" in failures[0]
+    assert "2 terminus comments" in failures[1]
+
+
+def test_judge_notice_rerun_fails_when_the_notice_is_never_recorded_again() -> None:
+    failures = fe.judge_notice_rerun(
+        {"comment_id": "77"}, {"comment_id": None, "posted_at": None}, 1
+    )
+    assert failures == ["the reconciler did not record the notice again after the rerun"]
+
+
+def test_judge_notice_rerun_fails_without_a_posted_notice() -> None:
+    assert fe.judge_notice_rerun(None, None, 0) == [
+        "the terminus notice was not recorded as posted before the rerun"
+    ]
+
+
+def test_judge_notice_rerun_fails_a_duplicate_even_when_the_original_is_recorded() -> None:
+    before = {"comment_id": "77", "posted_at": "t0"}
+    after = {"comment_id": "77", "posted_at": "t1"}
+    assert fe.judge_notice_rerun(before, after, 2) == [
+        "2 terminus comments exist after the rerun; exactly one is allowed"
+    ]
+
+
+def test_parse_sql_rows_keeps_an_all_null_row() -> None:
+    assert fe.parse_sql_rows("\t\t\nabc\t5\thttps://x\n") == [
+        ["", "", ""],
+        ["abc", "5", "https://x"],
+    ]
+
+
+def test_sql_sets_the_chart_schema_on_the_install_postgres(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        seen["argv"], seen["input"] = argv, input_text
+        return "\t\n"
+
+    monkeypatch.setattr(fe, "run", fake_run)
+    p = object.__new__(fe.Preflight)
+    p.config = type("C", (), {"kube_context": "k"})()
+    p.namespace = "test-factory-x"
+    assert p.sql("SELECT 1") == [["", ""]]
+    assert "statefulset/curie-postgres" in seen["argv"]
+    assert "-csearch_path=curie" in seen["argv"][-1]
+    assert seen["input"] == "SELECT 1"
