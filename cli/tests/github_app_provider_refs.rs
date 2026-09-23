@@ -37,7 +37,11 @@ const TOOL_SHIM: &str = r#"#!/usr/bin/env bash
 tool=$(basename "$0")
 echo "$tool $*" >> "$SHIM_LOG"
 if [ "$tool" = "helm" ] && [ "$1" = "get" ] && [ "$2" = "values" ]; then
-  echo "$FAKE_VALUES"
+  if [ -n "${VALUES_JSON:-}" ]; then
+    cat "$VALUES_JSON"
+  else
+    echo "$FAKE_VALUES"
+  fi
   exit 0
 fi
 if [ "$tool" = "helm" ] && [ "$1" = "history" ]; then
@@ -359,6 +363,7 @@ struct Rig {
     dir: tempfile::TempDir,
     _github: MockServer,
     pem_path: PathBuf,
+    values_json: Option<PathBuf>,
     sequence: PathBuf,
     aws_argv: PathBuf,
     aws_body: PathBuf,
@@ -389,6 +394,7 @@ impl Rig {
             aws_argv: dir.path().join("aws-argv.log"),
             aws_body: dir.path().join("aws-body.log"),
             pem_path,
+            values_json: None,
             sequence,
             github_url,
             _github: github,
@@ -407,7 +413,7 @@ impl Rig {
         let sequence = self.sequence.display().to_string();
         let aws_argv = self.aws_argv.display().to_string();
         let aws_body = self.aws_body.display().to_string();
-        let env = [
+        let mut env = vec![
             ("CURIE_GITHUB_API_URL", self.github_url.as_str()),
             ("FAKE_VALUES", values),
             ("FAKE_SECRET_JSON", document.as_str()),
@@ -416,6 +422,13 @@ impl Rig {
             ("AWS_BODY_LOG", aws_body.as_str()),
             ("ALLOW_MUTATION", "1"),
         ];
+        let values_json = self
+            .values_json
+            .as_ref()
+            .map(|path| path.display().to_string());
+        if let Some(path) = values_json.as_deref() {
+            env.push(("VALUES_JSON", path));
+        }
         invoke(
             self.dir.path(),
             prepend_path(&self.dir.path().join("bin")),
@@ -622,4 +635,48 @@ fn provider_github_app_live_explicit_ref_still_stores_key() {
     assert_pem_absent(&upgrade, &pem);
     assert_pem_absent(&argv, &pem);
     assert_pem_object(&read_bodies(&rig.aws_body), &pem);
+}
+
+#[test]
+fn provider_github_app_rotates_its_own_inventory_ref() {
+    let mut rig = Rig::open(200, r#"{"id":1234567}"#);
+    let values = rig.dir.path().join("values.json");
+    std::fs::write(
+        &values,
+        r#"{"api":{"githubAppExistingSecret":"acme-release-curie-github-app","githubAppExistingSecretKey":"githubAppPrivateKey"}}"#,
+    )
+    .expect("write values");
+    rig.values_json = Some(values);
+    let pem = rig.pem();
+    let output = rig.run(&private_key_args(&rig.pem_path, false));
+    assert!(
+        output.status.success(),
+        "rotating the inventory ref must exit 0: {}",
+        shown(&output, &pem)
+    );
+    assert_pem_object(&read_bodies(&rig.aws_body), &pem);
+}
+
+#[test]
+fn provider_github_app_still_refuses_an_unrelated_existing_ref() {
+    let mut rig = Rig::open(200, r#"{"id":1234567}"#);
+    let values = rig.dir.path().join("values.json");
+    std::fs::write(
+        &values,
+        r#"{"api":{"githubAppExistingSecret":"operator-owned","githubAppExistingSecretKey":"privateKey"}}"#,
+    )
+    .expect("write values");
+    rig.values_json = Some(values);
+    let pem = rig.pem();
+    let output = rig.run(&private_key_args(&rig.pem_path, false));
+    assert!(
+        !output.status.success(),
+        "an unrelated ref must be refused: {}",
+        shown(&output, &pem)
+    );
+    let body = std::fs::read_to_string(&rig.aws_body).unwrap_or_default();
+    assert!(
+        body.trim().is_empty(),
+        "unrelated ref wrote a provider object"
+    );
 }

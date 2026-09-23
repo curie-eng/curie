@@ -406,6 +406,12 @@ pub(crate) fn guard_byo_key_conflict(
     let Some((name, key)) = configured_existing_secret(existing) else {
         return Ok(());
     };
+    // The provider's own inventory Secret is not an operator-managed BYO ref.
+    // A later `--private-key` rotates that object; an unrelated name still
+    // refuses, because the chart would keep reading the operator Secret.
+    if provider_owned_ref(opts, &name)? {
+        return Ok(());
+    }
     // CliError::failure + with_fix rather than bail!, so the --json path emits
     // an actionable `fix` alongside `error` (ADR-0021) instead of an untyped
     // anyhow the agent driving the CLI cannot act on.
@@ -420,6 +426,21 @@ pub(crate) fn guard_byo_key_conflict(
          to go back to the chart-held key"
     ))
     .into())
+}
+
+fn provider_owned_ref(opts: &GithubAppOpts, name: &str) -> Result<bool> {
+    let Some(installation) = crate::secrets::cwd_installation()? else {
+        return Ok(false);
+    };
+    if installation.secrets.is_none()
+        || installation.install.release != opts.common.release
+        || installation.install.namespace != opts.common.namespace
+    {
+        return Ok(false);
+    }
+    let binding =
+        crate::provider::binding::helm_ref("github-app-private-key", &opts.common.release)?;
+    Ok(name == binding.target)
 }
 
 /// The refusal for a release whose `api.githubAppExistingSecret` is truthy to
