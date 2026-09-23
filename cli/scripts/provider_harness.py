@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -55,7 +57,21 @@ STATIC_KEY = "STATIC_KEY"
 ROTATED_KEY = "ROTATED_KEY"
 INTERRUPTED_EXIT = 75
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+ROTATION_MAX_BLIND_SECONDS = 1.0
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
+ROTATION_NAMESPACE = "curie-aws-secrets-e2e-rotation"
+ROTATION_LOGICAL_NAME = "acme-harness-fixture"
+ROTATION_PUSH_SECRET = f"{ROTATION_LOGICAL_NAME}-rotated-backup"
+ROTATION_OWNER_EXTERNAL_SECRET = f"{ROTATION_LOGICAL_NAME}-owner"
+ROTATION_WORKLOAD = "acme-harness-rotation-workload"
+ROTATION_COUNT = 15
+ROTATION_SPACING_SECONDS = 3.0
+ROTATION_SAMPLE_INTERVAL = 0.25
+ROTATION_BACKUP_BOUND_SECONDS = 15.0
+ROTATION_REVERT_BOUND_SECONDS = 3.0
+ROTATION_SEED_OUTCOMES = frozenset(
+    {"no_backup", "not_in_backup", "created", "added", "already_present"}
+)
 
 
 class HarnessError(RuntimeError):
@@ -116,6 +132,114 @@ def require_owned_name(name: str) -> str:
     if not name.startswith(OWNED_PREFIX) or len(name) > 253 or SAFE_NAME.fullmatch(name) is None:
         raise ValueError(f"resource name is outside the harness prefix: {name!r}")
     return name
+
+
+def require_owned_secret_path(name: str) -> str:
+    """Accept exactly `<owned prefix>/<leaf>` for a Secrets Manager entry name."""
+    prefix, separator, leaf = name.partition("/")
+    if (
+        separator != "/"
+        or "/" in leaf
+        or ".." in name
+        or len(name) > 512
+        or SAFE_NAME.fullmatch(leaf) is None
+    ):
+        raise ValueError(f"provider entry name is outside the harness prefix: {name!r}")
+    require_owned_name(prefix)
+    return name
+
+
+ROTATION_SLOT_TOLERANCE_SECONDS = 1.0
+
+
+def first_rotation_sample_violation(
+    samples: Sequence[tuple[float, float, str | None]],
+    initial: str,
+    rotations: Sequence[tuple[float, float, str]],
+) -> dict[str, Any] | None:
+    """Return the first sample that saw a value other than the live rotation.
+
+    ``samples`` are (read_began, read_ended, digest) from a continuous reader;
+    ``rotations`` are (write_began, write_returned, digest) in order, with
+    ``initial`` live before the first write. Value r_k can be live from the
+    start of write k until write k+1 returns, so a read whose span overlaps an
+    in-flight write may see either side; any other digest is a revert.
+    """
+    starts = [float("-inf")] + [began for began, _, _ in rotations]
+    ends = [returned for _, returned, _ in rotations] + [float("inf")]
+    digests = [initial] + [digest for _, _, digest in rotations]
+    for index, (began, ended, digest) in enumerate(samples):
+        allowed = {
+            digests[k]
+            for k in range(len(digests))
+            if starts[k] <= ended and began <= ends[k]
+        }
+        if digest not in allowed:
+            return {
+                "sample_index": index,
+                "at": began,
+                "observed": None if digest is None else digest[:12],
+                "allowed": sorted(value[:12] for value in allowed),
+            }
+    return None
+
+
+def max_sampling_blind_seconds(
+    samples: Sequence[tuple[float, float, str | None]], phase_start: float, phase_end: float
+) -> float:
+    """Longest stretch of the phase no bounded read observed.
+
+    A read only pins the value somewhere inside its own span, so a long read
+    counts as blind for its full duration, as do the gaps before the first
+    read, between read starts, and after the last read ends.
+    """
+    if not samples:
+        return phase_end - phase_start
+    begins = [began for began, _, _ in samples]
+    blind = [begins[0] - phase_start, phase_end - samples[-1][1]]
+    blind.extend(ended - began for began, ended, _ in samples)
+    blind.extend(later - earlier for earlier, later in zip(begins, begins[1:], strict=False))
+    return max(blind)
+
+
+def parse_rotation_report(stdout: bytes, expected_keys: Sequence[str]) -> dict[str, str]:
+    """Parse the value free rotation_apply report into {key: outcome}."""
+    lines = [line for line in stdout.decode("utf-8", "strict").splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise HarnessError("rotation apply report must be exactly one JSON line")
+    parsed = parse_json(lines[0].encode(), "rotation apply report")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("entry"), str):
+        raise HarnessError("rotation apply report has no entry")
+    seeds = parsed.get("seeds")
+    if not isinstance(seeds, list) or not seeds:
+        raise HarnessError("rotation apply report has no seeds")
+    outcomes: dict[str, str] = {}
+    for seed in seeds:
+        if not isinstance(seed, dict):
+            raise HarnessError("rotation apply seed has an invalid shape")
+        key = seed.get("key")
+        outcome = seed.get("outcome")
+        if not isinstance(key, str) or key in outcomes:
+            raise HarnessError("rotation apply seed key is invalid")
+        if outcome not in ROTATION_SEED_OUTCOMES:
+            raise HarnessError("rotation apply seed outcome is unknown")
+        outcomes[key] = outcome
+    if set(outcomes) != set(expected_keys):
+        raise HarnessError("rotation apply seeds do not match the rotated keys")
+    return outcomes
+
+
+def decoded_document_key(document: dict[str, Any] | None, key: str) -> bytes | None:
+    if document is None:
+        return None
+    data = document.get("data")
+    encoded = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(encoded, str):
+        return None
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except ValueError:
+        return None
 
 
 def write_private_file(path: pathlib.Path | str, value: str | bytes) -> pathlib.Path:
@@ -259,6 +383,7 @@ class ToolRunner:
         self.private_dir = private_dir
         self.evidence_commands = evidence_commands
         self.counter = 0
+        self._lock = threading.Lock()
 
     def _command_for_evidence(self, argv: Sequence[str]) -> str:
         rendered: list[str] = []
@@ -280,31 +405,46 @@ class ToolRunner:
         env: dict[str, str] | None = None,
         timeout: int = 300,
         allow_failure: bool = False,
+        sensitive: bool = False,
     ) -> ToolResult:
-        self.counter += 1
-        stdout_path = self.private_dir / f"tool-{self.counter:04d}.stdout"
-        stderr_path = self.private_dir / f"tool-{self.counter:04d}.stderr"
-        write_private_file(stdout_path, b"")
+        """Run a tool, recording the command for evidence.
+
+        ``sensitive`` keeps stdout in memory only: nothing the tool prints is
+        written under the private directory, so a retained diagnostics
+        directory cannot hold Secret values read through this path.
+        """
+        with self._lock:
+            self.counter += 1
+            number = self.counter
+            self.evidence_commands.append(self._command_for_evidence(argv))
+        stdout_path = self.private_dir / f"tool-{number:04d}.stdout"
+        stderr_path = self.private_dir / f"tool-{number:04d}.stderr"
+        if not sensitive:
+            write_private_file(stdout_path, b"")
         write_private_file(stderr_path, b"")
-        self.evidence_commands.append(self._command_for_evidence(argv))
-        with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
+        captured: bytes | None = None
+        with contextlib.ExitStack() as stack:
+            stderr_stream = stack.enter_context(stderr_path.open("wb"))
+            stdout_target: Any = (
+                subprocess.PIPE if sensitive else stack.enter_context(stdout_path.open("wb"))
+            )
             process = subprocess.Popen(
                 list(argv),
                 stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
-                stdout=stdout_stream,
+                stdout=stdout_target,
                 stderr=stderr_stream,
                 env=env,
                 start_new_session=True,
             )
             try:
-                process.communicate(input=input_data, timeout=timeout)
+                captured, _ = process.communicate(input=input_data, timeout=timeout)
             except subprocess.TimeoutExpired:
                 self._stop_group(process)
                 raise HarnessError(format_tool_error(action, 124)) from None
             except BaseException:
                 self._stop_group(process)
                 raise
-        stdout = stdout_path.read_bytes()
+        stdout = (captured or b"") if sensitive else stdout_path.read_bytes()
         result = ToolResult(process.returncode, stdout, stderr_path)
         if process.returncode != 0 and not allow_failure:
             raise HarnessError(format_tool_error(action, process.returncode))
@@ -326,6 +466,46 @@ class ToolRunner:
             except ProcessLookupError:
                 pass
             process.wait(timeout=10)
+
+
+class RotationSampler:
+    """Background reader of the rotation Secret for the 15 rotation phase."""
+
+    def __init__(self, harness: Any, static_digest: str) -> None:
+        self.harness = harness
+        self.static_digest = static_digest
+        self.samples: list[tuple[float, float, str | None]] = []
+        self.static_ok = True
+        self.error: BaseException | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="rotation-sampler", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=120)
+        if self._thread.is_alive():
+            raise HarnessError("rotation sampler did not stop")
+        if self.error is not None:
+            raise HarnessError("rotation sampler failed") from self.error
+
+    def _loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                began = time.monotonic()
+                document = self.harness.secret_document(TARGET_SECRET, ROTATION_NAMESPACE)
+                ended = time.monotonic()
+                rotated = decoded_document_key(document, ROTATED_KEY)
+                static = decoded_document_key(document, STATIC_KEY)
+                digest = None if rotated is None else full_digest(rotated)
+                self.samples.append((began, ended, digest))
+                if static is None or full_digest(static) != self.static_digest:
+                    self.static_ok = False
+                self._stop.wait(max(0.0, ROTATION_SAMPLE_INTERVAL - (ended - began)))
+        except BaseException as exc:  # surfaced by stop()
+            self.error = exc
 
 
 def safe_print(message: str, *, error: bool = False) -> None:
@@ -473,6 +653,7 @@ class HarnessCase:
         input_data: bytes | None = None,
         allow_failure: bool = False,
         timeout: int = 180,
+        sensitive: bool = False,
     ) -> ToolResult:
         return self.runner.run(
             self.kargs(*args),
@@ -480,6 +661,7 @@ class HarnessCase:
             input_data=input_data,
             timeout=timeout,
             allow_failure=allow_failure,
+            sensitive=sensitive,
         )
 
     def aws(
@@ -490,6 +672,7 @@ class HarnessCase:
         action: str,
         allow_failure: bool = False,
         timeout: int = 180,
+        sensitive: bool = False,
     ) -> ToolResult:
         if not self.real_aws and self.aws_endpoint is None:
             raise HarnessError("emulator AWS endpoint is unavailable")
@@ -511,6 +694,7 @@ class HarnessCase:
             env=self.aws_env,
             timeout=timeout,
             allow_failure=allow_failure,
+            sensitive=sensitive,
         )
 
     def apply(self, manifest: bytes, action: str, namespace: str | None = NAMESPACE) -> None:
@@ -670,6 +854,8 @@ class HarnessCase:
         )
         self.verify_static_key()
         self.wait_for_backup(full_digest(rotated_value))
+        if not self.real_aws:
+            self.run_rotation_suite()
 
     def write_seed_files(self) -> None:
         for key, filename in ((STATIC_KEY, "static.value"), (ROTATED_KEY, "rotated.value")):
@@ -1309,6 +1495,34 @@ class HarnessCase:
         require_private_file(path)
         return path
 
+    def apply_emulator_credentials(self, namespace: str) -> dict[str, Any]:
+        """Apply the synthetic moto credential Secret and return the store provider."""
+        dummy = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "acme-harness-aws"},
+            "stringData": {"access-key": "test", "secret-key": "test"},
+        }
+        self.apply(yaml_document(dummy), "apply isolated moto credentials", namespace=namespace)
+        return {
+            "aws": {
+                "service": "SecretsManager",
+                "region": REGION,
+                "auth": {
+                    "secretRef": {
+                        "accessKeyIDSecretRef": {
+                            "name": "acme-harness-aws",
+                            "key": "access-key",
+                        },
+                        "secretAccessKeySecretRef": {
+                            "name": "acme-harness-aws",
+                            "key": "secret-key",
+                        },
+                    }
+                },
+            }
+        }
+
     def apply_sync_objects(self) -> None:
         # Provider shape follows the official AWS and PushSecret references:
         # https://external-secrets.io/latest/provider/aws-secrets-manager/
@@ -1322,31 +1536,7 @@ class HarnessCase:
                 }
             }
         else:
-            dummy = {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {"name": "acme-harness-aws"},
-                "stringData": {"access-key": "test", "secret-key": "test"},
-            }
-            self.apply(yaml_document(dummy), "apply isolated moto credentials")
-            provider = {
-                "aws": {
-                    "service": "SecretsManager",
-                    "region": REGION,
-                    "auth": {
-                        "secretRef": {
-                            "accessKeyIDSecretRef": {
-                                "name": "acme-harness-aws",
-                                "key": "access-key",
-                            },
-                            "secretAccessKeySecretRef": {
-                                "name": "acme-harness-aws",
-                                "key": "secret-key",
-                            },
-                        }
-                    },
-                }
-            }
+            provider = self.apply_emulator_credentials(NAMESPACE)
         store = {
             "apiVersion": "external-secrets.io/v1",
             "kind": "SecretStore",
@@ -1409,10 +1599,12 @@ class HarnessCase:
             "apply External Secrets sync objects",
         )
 
-    def secret_document(self, name: str) -> dict[str, Any] | None:
+    def secret_document(
+        self, name: str, namespace: str = NAMESPACE
+    ) -> dict[str, Any] | None:
         result = self.kubectl(
             "-n",
-            NAMESPACE,
+            namespace,
             "get",
             "secret",
             name,
@@ -1420,23 +1612,17 @@ class HarnessCase:
             "json",
             action="read owned Secret",
             allow_failure=True,
+            sensitive=True,
         )
         if result.status != 0:
             return None
         parsed = parse_json(result.stdout, "owned Secret")
         return parsed if isinstance(parsed, dict) else None
 
-    def decoded_secret_key(self, name: str, key: str) -> bytes | None:
-        document = self.secret_document(name)
-        if document is None:
-            return None
-        encoded = document.get("data", {}).get(key)
-        if not isinstance(encoded, str):
-            return None
-        try:
-            return base64.b64decode(encoded, validate=True)
-        except ValueError:
-            return None
+    def decoded_secret_key(
+        self, name: str, key: str, namespace: str = NAMESPACE
+    ) -> bytes | None:
+        return decoded_document_key(self.secret_document(name, namespace), key)
 
     def wait_for_static_key(self) -> None:
         expected = self.seed[STATIC_KEY].encode()
@@ -1469,20 +1655,20 @@ class HarnessCase:
             }
         )
 
-    def start_rotation_pod(self) -> None:
+    def start_rotation_pod(self, namespace: str = NAMESPACE) -> None:
         self.kubectl(
             "-n",
-            NAMESPACE,
+            namespace,
             "delete",
             "pod",
             ROTATION_POD,
             "--ignore-not-found",
             action="clear rotation pod",
         )
-        self.apply(self.rotation_pod_manifest(), "start rotation pod")
+        self.apply(self.rotation_pod_manifest(), "start rotation pod", namespace=namespace)
         self.kubectl(
             "-n",
-            NAMESPACE,
+            namespace,
             "wait",
             "--for=condition=Ready",
             f"pod/{ROTATION_POD}",
@@ -1665,6 +1851,7 @@ class HarnessCase:
                 "json",
                 action="read rotated backup",
                 allow_failure=True,
+                sensitive=True,
             )
             if result.status != 0:
                 return None
@@ -1736,6 +1923,622 @@ class HarnessCase:
             raise HarnessError("backup ledger intent is missing")
         self.ledger.mark_created(target.id, self.backup_name)
         self.record_assertion("PushSecret backed up rotated key", True, expected_digest[:12])
+
+    # Rotation owner suite (ADR 0163 decision 7). Emulator mode only; it drives
+    # the Rust library through the rotation_apply example binary.
+
+    def run_rotation_suite(self) -> None:
+        assert self.ledger is not None
+        prefix = require_owned_name(f"{OWNED_PREFIX}{self.suffix}")
+        primary = require_owned_secret_path(f"{prefix}/{ROTATION_LOGICAL_NAME}")
+        backup = require_owned_secret_path(f"{prefix}/{ROTATION_LOGICAL_NAME}-rotated")
+        report: dict[str, Any] = {
+            "namespace": ROTATION_NAMESPACE,
+            "primary_entry": primary,
+            "backup_entry": backup,
+            "rotations": [],
+        }
+        try:
+            self._rotation_suite(prefix, primary, backup, report)
+            report["status"] = "passed"
+        except BaseException:
+            report["status"] = "failed"
+            raise
+        finally:
+            write_private_file(
+                self.evidence_root / "rotation-suite.json",
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+            )
+
+    def _rotation_suite(
+        self, prefix: str, primary: str, backup: str, report: dict[str, Any]
+    ) -> None:
+        assert self.ledger is not None
+        binary = self.build_rotation_apply()
+        static_value = self.seed[STATIC_KEY]
+        static_digest = full_digest(static_value)
+        report["static_digest"] = static_digest[:12]
+
+        # 1. Namespace, store, primary entry, first apply with no backup, bootstrap.
+        row = self.ledger.record_intent("kubernetes_namespace", ROTATION_NAMESPACE)
+        self.setup_rotation_namespace()
+        self.ledger.mark_created(row, ROTATION_NAMESPACE)
+        primary_row = self.ledger.record_intent("secretsmanager", primary)
+        self.write_rotation_primary(primary, {STATIC_KEY: static_value}, create=True)
+        self.ledger.mark_created(primary_row, primary)
+        backup_row = self.ledger.record_intent("secretsmanager", backup)
+        backup_file = self.rotation_backup_file(backup, "backup-initial.json")
+        self.record_assertion("rotation backup absent before first apply", backup_file is None)
+        outcomes = self.run_rotation_apply(binary, prefix, backup_file)
+        report["first_apply"] = outcomes
+        self.record_assertion(
+            "first apply reports no_backup",
+            all(outcome == "no_backup" for outcome in outcomes.values()),
+        )
+        self.wait_rotation_key(STATIC_KEY, static_digest, "rotation static key sync")
+        self.start_rotation_pod(ROTATION_NAMESPACE)
+        r0_path, r0_digest = self.rotation_value("rotation-r0.value")
+        self.exec_rotator(r0_path, r0_digest, bootstrap=True)
+        self.wait_rotation_backup(backup, r0_digest, timeout=60)
+        self.ledger.mark_created(backup_row, backup)
+        report["r0"] = r0_digest[:12]
+
+        # 2. Fifteen rotations on a fixed 3 s schedule while a background reader
+        # samples the Secret continuously. The primary entry is deleted for
+        # rotations 6 to 10 and the library re-applied at rotation 12; that
+        # maintenance runs inside each slot so it never pauses the reader.
+        sampler = RotationSampler(self, static_digest)
+        rotations: list[tuple[float, float, str]] = []
+        max_drift = 0.0
+        slots_ok = True
+        t0 = time.monotonic() + ROTATION_SPACING_SECONDS
+        sampler.start()
+        try:
+            for index in range(1, ROTATION_COUNT + 1):
+                record: dict[str, Any] = {"index": index}
+                if index == 6:
+                    self.delete_rotation_primary(primary)
+                    record["primary_entry"] = "deleted"
+                if index == 11:
+                    self.write_rotation_primary(primary, {STATIC_KEY: static_value}, create=True)
+                    record["primary_entry"] = "recreated"
+                if index == 12:
+                    reapply_file = self.rotation_backup_file(backup, "backup-reapply.json")
+                    reapply = self.run_rotation_apply(binary, prefix, reapply_file)
+                    record["reapply"] = reapply
+                    self.record_assertion(
+                        "re-apply at rotation 12 reports already_present",
+                        all(outcome == "already_present" for outcome in reapply.values()),
+                    )
+                self.kubectl(
+                    "-n",
+                    ROTATION_NAMESPACE,
+                    "annotate",
+                    "externalsecret",
+                    ROTATION_LOGICAL_NAME,
+                    f"force-sync={self.suffix}-{index}-{secrets.token_hex(4)}",
+                    "--overwrite",
+                    action="force ExternalSecret reconcile",
+                )
+                value_path, expected = self.rotation_value(f"rotation-r{index}.value")
+                slot = t0 + ROTATION_SPACING_SECONDS * (index - 1)
+                wait = slot - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                began = time.monotonic()
+                self.exec_rotator(value_path, expected)
+                returned = time.monotonic()
+                rotations.append((began, returned, expected))
+                drift = began - slot
+                max_drift = max(max_drift, abs(drift))
+                if abs(drift) > ROTATION_SLOT_TOLERANCE_SECONDS:
+                    slots_ok = False
+                current = expected
+                record.update(
+                    {
+                        "digest": current[:12],
+                        "start_offset_seconds": round(began - t0, 3),
+                        "slot_drift_seconds": round(drift, 3),
+                        "write_seconds": round(returned - began, 3),
+                    }
+                )
+                report["rotations"].append(record)
+            last_return = rotations[-1][1]
+            hold = last_return + ROTATION_SPACING_SECONDS - time.monotonic()
+            if hold > 0:
+                time.sleep(hold)
+        finally:
+            sampler.stop()
+        samples = sampler.samples
+        begins = [began for began, _, _ in samples]
+        gaps = [later - earlier for earlier, later in zip(begins, begins[1:], strict=False)]
+        violation = first_rotation_sample_violation(samples, r0_digest, rotations)
+        starts = [began for began, _, _ in rotations]
+        spacing = [later - earlier for earlier, later in zip(starts, starts[1:], strict=False)]
+        report["sampling"] = {
+            "samples": len(samples),
+            "max_sample_gap_seconds": round(max(gaps, default=0.0), 3),
+            "first_violation": violation,
+            "max_slot_drift_seconds": round(max_drift, 3),
+            "min_start_spacing_seconds": round(min(spacing, default=0.0), 3),
+            "max_start_spacing_seconds": round(max(spacing, default=0.0), 3),
+        }
+        blind = max_sampling_blind_seconds(samples, t0, time.monotonic())
+        report["sampling"]["max_blind_seconds"] = round(blind, 3)
+        self.record_assertion(
+            f"sampling left no blind stretch over {ROTATION_MAX_BLIND_SECONDS} s",
+            blind <= ROTATION_MAX_BLIND_SECONDS,
+            f"max blind {blind:.3f}s",
+        )
+        self.record_assertion(
+            "no rotation was reverted across the continuous sample",
+            bool(samples) and violation is None,
+            "" if violation is None else f"sample {violation['sample_index']}",
+        )
+        self.record_assertion(
+            "rotations started on the 3 s schedule within 1 s",
+            slots_ok,
+            f"max drift {max_drift:.3f}s",
+        )
+        self.record_assertion(
+            "static key kept for the whole rotation phase", sampler.static_ok
+        )
+        r15_digest = current
+
+        # 3. Backup convergence after the final rotation.
+        deadline = last_return + 60
+        converged: float | None = None
+        while time.monotonic() < deadline:
+            if self.rotation_backup_digest(backup) == r15_digest:
+                converged = time.monotonic() - last_return
+                break
+            time.sleep(0.25)
+        report["backup_convergence_seconds"] = None if converged is None else round(converged, 3)
+        self.record_assertion(
+            "backup equals final rotation within 10 s + 5 s",
+            converged is not None and converged <= ROTATION_BACKUP_BOUND_SECONDS,
+            "" if converged is None else f"{converged:.3f}s",
+        )
+
+        # 4. Seed restore into a static only Secret, then never overwrite.
+        restore_file = self.rotation_backup_file(backup, "backup-restore.json")
+        self.record_assertion("restore backup holds final rotation", restore_file is not None)
+        self.kubectl(
+            "-n",
+            ROTATION_NAMESPACE,
+            "patch",
+            "secret",
+            TARGET_SECRET,
+            "--type=json",
+            "-p",
+            json.dumps([{"op": "remove", "path": f"/data/{ROTATED_KEY}"}]),
+            action="remove rotated key from Secret",
+        )
+        self.record_assertion(
+            "rotated key removed before restore",
+            self.rotation_key_digest(ROTATED_KEY) is None,
+        )
+        restored = self.run_rotation_apply(binary, prefix, restore_file)
+        report["restore_apply"] = restored
+        self.record_assertion(
+            "restore apply reports added",
+            all(outcome == "added" for outcome in restored.values()),
+        )
+        self.record_assertion(
+            "restore seeded final rotation", self.rotation_key_digest(ROTATED_KEY) == r15_digest
+        )
+        self.record_assertion(
+            "restore kept static key", self.rotation_key_digest(STATIC_KEY) == static_digest
+        )
+        decoy_value = f"synthetic-decoy-{secrets.token_hex(24)}"
+        decoy_file = write_private_file(
+            self.work / "backup-decoy.json", json.dumps({ROTATED_KEY: decoy_value})
+        )
+        report["decoy"] = digest_prefix(decoy_value)
+        decoy = self.run_rotation_apply(binary, prefix, decoy_file)
+        report["decoy_apply"] = decoy
+        self.record_assertion(
+            "decoy apply reports already_present",
+            all(outcome == "already_present" for outcome in decoy.values()),
+        )
+        self.record_assertion(
+            "decoy never overwrote live value",
+            self.rotation_key_digest(ROTATED_KEY) == r15_digest,
+        )
+
+        # 5. Namespace delete and rebuild: seed before any workload exists.
+        self.kubectl(
+            "delete",
+            "namespace",
+            ROTATION_NAMESPACE,
+            "--wait=false",
+            action="delete rotation namespace",
+        )
+        wait_until(
+            "rotation namespace deletion",
+            lambda: self.kubectl_reports_absent("namespace", ROTATION_NAMESPACE, None),
+            timeout=300,
+        )
+        self.setup_rotation_namespace()
+        rebuild_file = self.rotation_backup_file(backup, "backup-rebuild.json")
+        self.record_assertion("rebuild backup holds final rotation", rebuild_file is not None)
+        rebuilt = self.run_rotation_apply(binary, prefix, rebuild_file)
+        report["rebuild_apply"] = rebuilt
+        pods = self.kubectl(
+            "-n", ROTATION_NAMESPACE, "get", "pods", "-o", "name", action="inventory rebuild pods"
+        ).stdout.strip()
+        self.record_assertion("no workload exists at rebuild seed", not pods)
+        self.record_assertion(
+            "rebuild apply reports created",
+            all(outcome == "created" for outcome in rebuilt.values()),
+        )
+        self.record_assertion(
+            "rebuild seeded final rotation before any workload",
+            self.rotation_key_digest(ROTATED_KEY) == r15_digest,
+        )
+        self.wait_rotation_key(STATIC_KEY, static_digest, "rebuild static key sync")
+        self.deploy_rotation_workload()
+        observed = self.kubectl(
+            "-n",
+            ROTATION_NAMESPACE,
+            "exec",
+            f"deployment/{ROTATION_WORKLOAD}",
+            "--",
+            "python",
+            "-c",
+            "import hashlib,os;"
+            f"print(hashlib.sha256(os.environ['{ROTATED_KEY}'].encode()).hexdigest())",
+            action="read workload rotated key digest",
+            sensitive=True,
+        ).stdout.decode("ascii", "strict").strip()
+        report["workload_digest"] = observed[:12]
+        self.record_assertion("rebuilt workload reads final rotation", observed == r15_digest)
+
+        # 6. Negative control: an Owner ExternalSecret over every key reverts a rotation.
+        for kind, name in (
+            ("deployment", ROTATION_WORKLOAD),
+            ("externalsecret", ROTATION_LOGICAL_NAME),
+            ("pushsecret", ROTATION_PUSH_SECRET),
+            ("secret", TARGET_SECRET),
+        ):
+            self.kubectl(
+                "-n",
+                ROTATION_NAMESPACE,
+                "delete",
+                kind,
+                name,
+                "--ignore-not-found",
+                "--wait=true",
+                action=f"delete {kind} for negative control",
+            )
+        final_value = json.loads(require_private_file(rebuild_file).read_text(encoding="utf-8"))[
+            ROTATED_KEY
+        ]
+        self.write_rotation_primary(
+            primary, {STATIC_KEY: static_value, ROTATED_KEY: final_value}, create=False
+        )
+        del final_value
+        owner = {
+            "apiVersion": "external-secrets.io/v1",
+            "kind": "ExternalSecret",
+            "metadata": {"name": ROTATION_OWNER_EXTERNAL_SECRET},
+            "spec": {
+                "refreshInterval": "1s",
+                "secretStoreRef": {"name": "acme-harness", "kind": "SecretStore"},
+                "target": {"name": TARGET_SECRET, "creationPolicy": "Owner"},
+                "data": [
+                    {"secretKey": key, "remoteRef": {"key": primary, "property": key}}
+                    for key in (STATIC_KEY, ROTATED_KEY)
+                ],
+            },
+        }
+        self.apply(
+            yaml_document(owner), "apply Owner ExternalSecret control", namespace=ROTATION_NAMESPACE
+        )
+        self.wait_rotation_key(STATIC_KEY, static_digest, "Owner control static key")
+        self.wait_rotation_key(ROTATED_KEY, r15_digest, "Owner control rotated key")
+        self.start_rotation_pod(ROTATION_NAMESPACE)
+        control_path, control_digest = self.rotation_value("rotation-control.value")
+        self.exec_rotator(control_path, control_digest)
+        returned = time.monotonic()
+        reverted: float | None = None
+        while time.monotonic() - returned <= ROTATION_REVERT_BOUND_SECONDS:
+            if self.rotation_key_digest(ROTATED_KEY) == r15_digest:
+                reverted = time.monotonic() - returned
+                break
+            time.sleep(0.1)
+        report["negative_control_revert_seconds"] = (
+            None if reverted is None else round(reverted, 3)
+        )
+        self.record_assertion(
+            "Owner ExternalSecret reverted the rotation within 3 s",
+            reverted is not None,
+            "" if reverted is None else f"{reverted:.3f}s",
+        )
+        self.kubectl(
+            "-n",
+            ROTATION_NAMESPACE,
+            "delete",
+            "externalsecret",
+            ROTATION_OWNER_EXTERNAL_SECRET,
+            "--ignore-not-found",
+            action="delete Owner ExternalSecret control",
+        )
+
+    def build_rotation_apply(self) -> pathlib.Path:
+        target_dir = self.repo_root / "cli/target/provider-harness"
+        environment = os.environ.copy()
+        environment["CARGO_TARGET_DIR"] = str(target_dir)
+        self.runner.run(
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--manifest-path",
+                str(self.snapshot / "cli/Cargo.toml"),
+                "--example",
+                "rotation_apply",
+            ],
+            "build rotation apply driver",
+            env=environment,
+            timeout=1800,
+        )
+        binary = target_dir / "debug/examples/rotation_apply"
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise HarnessError("rotation apply driver was not built")
+        return binary
+
+    def setup_rotation_namespace(self) -> None:
+        self.apply(
+            yaml_document(
+                {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ROTATION_NAMESPACE}}
+            ),
+            "create rotation namespace",
+            namespace=None,
+        )
+        rbac_path = (
+            self.snapshot / "cli/tests/fixtures/provider-bundle/manifests/rotation-rbac.yaml"
+        )
+        self.apply(
+            rbac_path.read_bytes(), "apply rotation namespace RBAC", namespace=ROTATION_NAMESPACE
+        )
+        provider = self.apply_emulator_credentials(ROTATION_NAMESPACE)
+        store = {
+            "apiVersion": "external-secrets.io/v1",
+            "kind": "SecretStore",
+            "metadata": {"name": "acme-harness"},
+            "spec": {"provider": provider},
+        }
+        self.apply(yaml_document(store), "apply rotation SecretStore", namespace=ROTATION_NAMESPACE)
+        wait_until(
+            "rotation SecretStore Ready=True",
+            lambda: self.resource_ready("secretstore", "acme-harness", ROTATION_NAMESPACE),
+            timeout=120,
+        )
+
+    def resource_ready(self, kind: str, name: str, namespace: str) -> bool:
+        result = self.kubectl(
+            "-n",
+            namespace,
+            "get",
+            kind,
+            name,
+            "-o",
+            "json",
+            action=f"read {kind} readiness",
+            allow_failure=True,
+        )
+        if result.status != 0:
+            return False
+        document = parse_json(result.stdout, f"{kind} readiness")
+        conditions = document.get("status", {}).get("conditions", [])
+        return isinstance(conditions, list) and any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in conditions
+        )
+
+    def kubectl_reports_absent(self, kind: str, name: str, namespace: str | None) -> bool:
+        args: list[str] = []
+        if namespace is not None:
+            args.extend(["-n", namespace])
+        args.extend(["get", kind, name])
+        result = self.kubectl(*args, action=f"verify {kind} absent", allow_failure=True)
+        return tool_error_has_code(result, "NotFound")
+
+    def write_rotation_primary(self, name: str, payload: dict[str, str], *, create: bool) -> None:
+        document = write_private_file(self.work / "rotation-primary.json", json.dumps(payload))
+        self.aws(
+            "secretsmanager",
+            "create-secret" if create else "put-secret-value",
+            "--name" if create else "--secret-id",
+            require_owned_secret_path(name),
+            "--secret-string",
+            f"file://{document}",
+            action="write rotation primary entry",
+        )
+
+    def delete_rotation_primary(self, name: str) -> None:
+        self.aws(
+            "secretsmanager",
+            "delete-secret",
+            "--secret-id",
+            require_owned_secret_path(name),
+            "--force-delete-without-recovery",
+            action="force delete rotation primary entry",
+        )
+        wait_until(
+            "rotation primary entry deletion",
+            lambda: self.aws_reports_absent(
+                "secretsmanager",
+                "describe-secret",
+                ["--secret-id", name],
+                "verify rotation primary entry absent",
+                ["ResourceNotFoundException"],
+            ),
+            timeout=60,
+            interval=0.5,
+        )
+
+    def read_provider_json(self, name: str) -> dict[str, Any] | None:
+        result = self.aws(
+            "secretsmanager",
+            "get-secret-value",
+            "--secret-id",
+            require_owned_secret_path(name),
+            "--output",
+            "json",
+            action="read rotation backup",
+            allow_failure=True,
+            sensitive=True,
+        )
+        if result.status != 0:
+            if tool_error_has_code(result, "ResourceNotFoundException"):
+                return None
+            raise HarnessError(format_tool_error("read rotation backup", result.status))
+        raw = parse_json(result.stdout, "rotation backup").get("SecretString")
+        if not isinstance(raw, str):
+            raise HarnessError("rotation backup has no string value")
+        parsed = parse_json(raw.encode(), "rotation backup value")
+        if not isinstance(parsed, dict):
+            raise HarnessError("rotation backup value has an invalid shape")
+        return parsed
+
+    def rotation_backup_digest(self, name: str) -> str | None:
+        parsed = self.read_provider_json(name)
+        value = parsed.get(ROTATED_KEY) if parsed is not None else None
+        return full_digest(value) if isinstance(value, str) else None
+
+    def rotation_backup_file(self, name: str, filename: str) -> pathlib.Path | None:
+        parsed = self.read_provider_json(name)
+        if parsed is None:
+            return None
+        return write_private_file(self.work / filename, json.dumps(parsed))
+
+    def wait_rotation_backup(self, name: str, expected: str, timeout: int) -> None:
+        wait_until(
+            "rotation PushSecret backup",
+            lambda: self.rotation_backup_digest(name) == expected,
+            timeout=timeout,
+            interval=0.5,
+        )
+        self.record_assertion("rotation backup reached bootstrap value", True, expected[:12])
+
+    def run_rotation_apply(
+        self, binary: pathlib.Path, prefix: str, backup_file: pathlib.Path | None
+    ) -> dict[str, str]:
+        command = [
+            str(binary),
+            "--kubeconfig",
+            str(self.admin_kubeconfig),
+            "--context",
+            self.context,
+            "--namespace",
+            ROTATION_NAMESPACE,
+            "--store",
+            "acme-harness",
+            "--prefix",
+            prefix,
+            "--logical-name",
+            ROTATION_LOGICAL_NAME,
+            "--target",
+            TARGET_SECRET,
+            "--static-key",
+            STATIC_KEY,
+            "--rotated-key",
+            ROTATED_KEY,
+            "--refresh",
+            "10s",
+        ]
+        if backup_file is not None:
+            command.extend(["--backup-file", str(require_private_file(backup_file))])
+        result = self.runner.run(command, "run rotation apply driver", timeout=180)
+        return parse_rotation_report(result.stdout, [ROTATED_KEY])
+
+    def rotation_value(self, filename: str) -> tuple[pathlib.Path, str]:
+        value = f"synthetic-rotation-{secrets.token_hex(24)}"
+        return write_private_file(self.work / filename, value), full_digest(value)
+
+    def exec_rotator(
+        self, value_path: pathlib.Path, expected_digest: str, *, bootstrap: bool = False
+    ) -> None:
+        arguments = [
+            "-n",
+            ROTATION_NAMESPACE,
+            "exec",
+            "-i",
+            ROTATION_POD,
+            "--",
+            "python",
+            "/app/rotate.py",
+        ]
+        if bootstrap:
+            arguments.append("--bootstrap")
+        result = self.kubectl(
+            *arguments,
+            action="run long lived rotation",
+            sensitive=True,
+            input_data=require_private_file(value_path).read_bytes(),
+            timeout=60,
+        )
+        observed = result.stdout.decode("ascii", "strict").strip()
+        if observed != expected_digest:
+            self.record_assertion("long lived rotation digest matches local value", False)
+
+    def rotation_key_digest(self, key: str) -> str | None:
+        value = self.decoded_secret_key(TARGET_SECRET, key, ROTATION_NAMESPACE)
+        return None if value is None else full_digest(value)
+
+    def wait_rotation_key(self, key: str, expected: str, action: str) -> None:
+        wait_until(action, lambda: self.rotation_key_digest(key) == expected, timeout=180)
+        self.record_assertion(action, True, expected[:12])
+
+    def deploy_rotation_workload(self) -> None:
+        image = self.image_records["connector"]["tag"]
+        deployment = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": ROTATION_WORKLOAD},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": ROTATION_WORKLOAD}},
+                "template": {
+                    "metadata": {"labels": {"app": ROTATION_WORKLOAD}},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "workload",
+                                "image": image,
+                                "imagePullPolicy": "Never",
+                                "command": ["python", "-c", "import time; time.sleep(3600)"],
+                                "env": [
+                                    {
+                                        "name": key,
+                                        "valueFrom": {
+                                            "secretKeyRef": {"name": TARGET_SECRET, "key": key}
+                                        },
+                                    }
+                                    for key in (STATIC_KEY, ROTATED_KEY)
+                                ],
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+        self.apply(
+            yaml_document(deployment), "deploy rotation workload", namespace=ROTATION_NAMESPACE
+        )
+        self.kubectl(
+            "-n",
+            ROTATION_NAMESPACE,
+            "rollout",
+            "status",
+            f"deployment/{ROTATION_WORKLOAD}",
+            "--timeout=180s",
+            action="wait for rotation workload",
+        )
 
     def delete_cleanup_target(
         self, target: CleanupTarget, *, real_cluster_already_attempted: bool
@@ -2216,6 +3019,9 @@ def main() -> int:
     tools = {"git", "docker", "kind", "kubectl", "uv"}
     if args.real_aws or args.eso != "none" or args.ci:
         tools.update({"aws", "helm"})
+    if args.eso != "none" and not args.real_aws:
+        # The emulator run drives the rotation suite, which builds a Rust example.
+        tools.add("cargo")
     try:
         require_tools(tools)
         setup_context = tempfile.TemporaryDirectory(prefix="curie-provider-setup-")
