@@ -623,6 +623,8 @@ class HarnessCase:
         self.issuer = ""
         self.aws_env = aws_environment()
         self.aws_endpoint: str | None = None
+        self.moto_container = require_owned_name(f"{OWNED_PREFIX}{self.suffix}-moto")
+        self.moto_ip = ""
         self.cleanup_log = evidence_root / "cleanup.log"
         self.cleanup_signals: list[int] = []
         write_private_file(self.cleanup_log, b"")
@@ -1589,6 +1591,8 @@ class HarnessCase:
         self.apply(rbac_path.read_bytes(), "apply scoped rotation RBAC")
 
     def start_moto(self) -> None:
+        """Moto as a container on the kind network: no port-forward to lose."""
+        assert self.ledger is not None
         credentials = write_private_file(
             self.work / "aws-credentials",
             "[theconnman]\naws_access_key_id = test\naws_secret_access_key = test\n",
@@ -1597,46 +1601,34 @@ class HarnessCase:
             self.work / "aws-config", "[profile theconnman]\nregion = us-east-1\n"
         )
         self.aws_env = aws_environment(credentials, config)
-        manifest = {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {"name": "motosm"},
-            "spec": {
-                "replicas": 1,
-                "selector": {"matchLabels": {"app": "motosm"}},
-                "template": {
-                    "metadata": {"labels": {"app": "motosm"}},
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "motosm",
-                                "image": MOTO_IMAGE,
-                                "args": ["-H", "0.0.0.0", "-p", "5000"],
-                                "ports": [{"containerPort": 5000}],
-                            }
-                        ]
-                    },
-                },
-            },
-        }
-        service = {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {"name": "motosm"},
-            "spec": {"selector": {"app": "motosm"}, "ports": [{"port": 5000}]},
-        }
-        self.apply(yaml_document(manifest) + b"\n---\n" + yaml_document(service), "start moto")
-        self.kubectl(
-            "-n",
-            NAMESPACE,
-            "rollout",
-            "status",
-            "deployment/motosm",
-            "--timeout=180s",
-            action="wait for moto",
-        )
         port = free_loopback_port()
-        self.start_port_forward("service/motosm", 5000, port, "moto")
+        row = self.ledger.record_intent("docker_container", self.moto_container)
+        self.runner.run(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--name",
+                self.moto_container,
+                "--network",
+                "kind",
+                "--publish",
+                f"127.0.0.1:{port}:5000",
+                MOTO_IMAGE,
+                "-H",
+                "0.0.0.0",
+                "-p",
+                "5000",
+            ],
+            "start emulator container",
+            timeout=600,
+        )
+        self.ledger.mark_created(row, self.moto_container)
+        inspected = self.runner.run(
+            ["docker", "container", "inspect", self.moto_container],
+            "inspect emulator container",
+        )
+        self.moto_ip = moto_kind_ip(parse_json(inspected.stdout, "emulator container"))
         self.aws_endpoint = f"http://127.0.0.1:{port}"
         wait_until("moto endpoint", lambda: self.tcp_ready(port), timeout=60, interval=0.5)
 
@@ -1725,7 +1717,7 @@ class HarnessCase:
             )
 
     def eso_moto_endpoint(self) -> str:
-        return f"http://motosm.{NAMESPACE}.svc.cluster.local:5000"
+        return f"http://{self.moto_ip}:5000"
 
     def create_provider_entry(self) -> None:
         assert self.ledger is not None
@@ -3610,8 +3602,6 @@ class RoutingHarnessCase(HarnessCase):
         self.hash_prefixes: dict[str, str] = {}
         self.curie_env: dict[str, str] = {}
         self.chart = str(self.snapshot / "charts/curie")
-        self.moto_container = require_owned_name(f"{OWNED_PREFIX}{self.suffix}-moto")
-        self.moto_ip = ""
 
     def _run_body(self) -> None:
         self.build_platform_images()
@@ -3661,51 +3651,6 @@ class RoutingHarnessCase(HarnessCase):
                 "load chart image into kind",
                 timeout=300,
             )
-
-    def start_moto(self) -> None:
-        """Moto as a container on the kind network: no port-forward to lose."""
-        assert self.ledger is not None
-        credentials = write_private_file(
-            self.work / "aws-credentials",
-            "[theconnman]\naws_access_key_id = test\naws_secret_access_key = test\n",
-        )
-        config = write_private_file(
-            self.work / "aws-config", "[profile theconnman]\nregion = us-east-1\n"
-        )
-        self.aws_env = aws_environment(credentials, config)
-        port = free_loopback_port()
-        row = self.ledger.record_intent("docker_container", self.moto_container)
-        self.runner.run(
-            [
-                "docker",
-                "run",
-                "--detach",
-                "--name",
-                self.moto_container,
-                "--network",
-                "kind",
-                "--publish",
-                f"127.0.0.1:{port}:5000",
-                MOTO_IMAGE,
-                "-H",
-                "0.0.0.0",
-                "-p",
-                "5000",
-            ],
-            "start emulator container",
-            timeout=600,
-        )
-        self.ledger.mark_created(row, self.moto_container)
-        inspected = self.runner.run(
-            ["docker", "container", "inspect", self.moto_container],
-            "inspect emulator container",
-        )
-        self.moto_ip = moto_kind_ip(parse_json(inspected.stdout, "emulator container"))
-        self.aws_endpoint = f"http://127.0.0.1:{port}"
-        wait_until("moto endpoint", lambda: self.tcp_ready(port), timeout=60, interval=0.5)
-
-    def eso_moto_endpoint(self) -> str:
-        return f"http://{self.moto_ip}:5000"
 
     def create_routing_namespace(self) -> None:
         assert self.ledger is not None
