@@ -885,6 +885,11 @@ is posted as a linked PR comment. PR review feedback reaches the factory only
 when `api.githubFactoryIngressEnabled` is true. A PR no work item owns keeps
 the existing review behavior.
 
+A factory run on a `github` binding streams no chat replies to GitHub. The
+worker acknowledges them locally, and the pull request or the one reconciler
+comment is the run's only GitHub response, so a `github` binding needs no
+endpoint or adapter.
+
 ### Driving the factory end to end
 
 `curie dev factory-e2e preflight` proves the signed intake loop against a real
