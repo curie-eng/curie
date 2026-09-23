@@ -587,7 +587,11 @@ pub fn remove_discovered(file: Option<&Path>, name: &str) -> Result<()> {
     }
     let provider = provider_for_installation(&installation)?
         .context("declared secrets provider could not be constructed")?;
-    provider.delete(name, None)?;
+    match provider.delete(name, None) {
+        Ok(_) => {}
+        Err(ProviderError::NotFound { .. }) => {}
+        Err(error) => return Err(error.into()),
+    }
     let namespace = installation.install.namespace.as_str();
     let release = installation.install.release.as_str();
     let store = reconcile::store_name(release);
