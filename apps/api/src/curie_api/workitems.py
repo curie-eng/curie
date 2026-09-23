@@ -20,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from .config import get_settings
-from .factory_reply_target import parse_reply_target
 from .models import (
     ExecutionRequest,
     FactoryTerminalNotice,
@@ -185,20 +184,11 @@ def _queue_notice(
 ) -> None:
     """Stage the owed comment in the terminal transaction. The caller commits.
 
-    A completed run owes nothing, unless review feedback on its pull request
-    asked for it (#2798): that revision answers on the pull request.
+    Reply routing is resolved when the durable notice is delivered.
     """
 
     if request.terminal_at is None:
         return
-    if request.status == "completed":
-        target = parse_reply_target(
-            request.objective,
-            repo_full_name=work_item.repo_full_name,
-            clone_base=get_settings().github_clone_base,
-        )
-        if target.kind == "issue":
-            return
     cause = request.terminal_cause
     if cause is None or not cause.strip():
         return

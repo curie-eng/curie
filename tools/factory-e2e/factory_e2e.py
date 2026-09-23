@@ -22,16 +22,18 @@ another) with the 1800 second execution bound; without it the model is fake.
 the preflight. `issue-to-pr --issue-file <file> [--expect pr|comment|any]`
 (and `--expect-cause CAUSE`, repeatable)
 opens the operator's ticket as the one labelled issue, waits for the run to
-end, and judges the ending: exactly one pull request or one terminus comment,
-an accepted terminus cause, no `.github/` file or credential in the diff,
-the default branch untouched, and
-the run inside its bound.
+end, and judges the ending: exactly one final issue comment, an optional single
+pull request, an accepted failure cause, no `.github/` file or credential in
+the diff, the default branch untouched, and the run inside its bound. A success
+comment must name the exact pull request URL. A failure comment must state
+`Could not complete:` followed by a reason.
 
 `revision --issue-file <file> [--revision-file <file>]` waits for that run to
-open a pull request, posts an ordinary PR comment (it must be ignored), then
-a mention comment, and judges that the mention adds a second request to the
-same WorkItem that pushes a new commit to the same pull request and gets one
-linked App reply. `cancel-waiting` installs with a sandbox pod quota of 0 so
+open a pull request and post its final issue comment, posts an ordinary PR
+comment (it must be ignored), then a mention comment, and judges that the
+mention adds a second request to the same WorkItem that pushes a new commit to
+the same pull request and gets one linked App reply. `cancel-waiting` installs
+with a sandbox pod quota of 0 so
 the request waits on capacity, removes the label, and judges a direct
 `cancelled` with cause `issue_cancelled`. `cancel-running [--issue-file]`
 removes the label once the request runs and judges `cancellation_requested`
@@ -135,6 +137,9 @@ DEFAULT_ANY_COMMENT_CAUSES = frozenset({"no_pull_request", "execution_deadline"}
 FINAL_REPLY_LIMIT = 4000
 # The dark-factory bundle's contract for a run that opens no pull request.
 _REASON_CONTRACT = re.compile(r"could not complete:\s*\S", re.IGNORECASE)
+_PULL_REQUEST_URL = re.compile(
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"
+)
 # Mirrors marker_for and comment_body in apps/api/src/curie_api/factory_notices.py.
 _NOTICE_MARKER = re.compile(r"<!-- curie-execution-request:([0-9a-fA-F-]{36}) -->")
 _NOTICE_CAUSE = re.compile(r"^Cause: (\S+)\s*$", re.MULTILINE)
@@ -570,12 +575,17 @@ def judge_outcome(
 ) -> list[str]:
     """Every way an issue-to-pr ending falls short. Empty means it passed.
 
-    Pure. ``outcome`` carries terminal, pull_requests (each with number,
-    files and diff), terminus_comments (a count), ending_cause,
-    default_branch_moved and elapsed_seconds. A comment ending passes only
-    when its cause is in ``expect_causes``; the default is no_pull_request for
-    expect "comment" and no_pull_request or execution_deadline for "any".
-    A credential match is reported by pattern, never quoted.
+    Pure. ``outcome`` carries terminal, pull_requests (each with number, URL,
+    files and diff), terminus_comments (a count), terminus_comment_bodies,
+    ending_cause, default_branch_moved and elapsed_seconds. Every ending needs
+    exactly one final comment. A successful comment names the exact opened pull
+    request URL. A failure comment states ``Could not complete:`` followed by a
+    reason, and its cause must be in ``expect_causes``. A no_pull_request ending
+    also requires the agent's final transcript reply to state its reason, and
+    ``expect_reasons`` applies to that reply. The default accepted cause is
+    no_pull_request for expect "comment", and no_pull_request or
+    execution_deadline for "any". A credential match is reported by pattern,
+    never quoted.
     """
 
     if expect not in EXPECTATIONS:
@@ -585,29 +595,43 @@ def judge_outcome(
         failures.append("the run did not reach a terminal ending within the wait")
     prs = list(outcome.get("pull_requests") or [])
     comments = int(outcome.get("terminus_comments") or 0)
+    comment_bodies = [str(body) for body in outcome.get("terminus_comment_bodies") or []]
     if len(prs) > 1:
         failures.append(f"{len(prs)} pull requests were opened; at most one is allowed")
-    if prs and comments:
-        failures.append("the run both opened a pull request and posted a terminus comment")
-    if not prs and not comments:
-        failures.append("the run ended with neither a pull request nor a terminus comment")
+    if comments == 0:
+        failures.append("the run did not post its final comment")
+    elif comments > 1:
+        failures.append(f"{comments} final comments were posted; exactly one is allowed")
     if expect == "pr" and not prs:
         failures.append("expected a pull request, none was opened")
-    if comments > 1:
-        failures.append(f"{comments} terminus comments were posted; at most one is allowed")
-    if expect == "comment" and (prs or not comments):
-        failures.append("expected a terminus comment and no pull request")
-    if comments and not prs and expect != "pr":
-        if expect_causes:
-            allowed = frozenset(expect_causes)
-        elif expect == "comment":
-            allowed = DEFAULT_COMMENT_CAUSES
-        else:
-            allowed = DEFAULT_ANY_COMMENT_CAUSES
-        cause = outcome.get("ending_cause")
-        if cause not in allowed:
-            failures.append(f"the run ended with cause {cause!r}, not one of {sorted(allowed)}")
-        if cause == "no_pull_request":
+    if expect == "comment" and prs:
+        failures.append("expected no pull request, but one was opened")
+    if comments == 1 and len(comment_bodies) != 1:
+        failures.append("the final comment body is unverified")
+    final_body = comment_bodies[0] if len(comment_bodies) == 1 else None
+    if prs and final_body is not None:
+        pr_url = str(prs[0].get("url") or "")
+        if not pr_url or pr_url not in _PULL_REQUEST_URL.findall(final_body):
+            failures.append(f"the final comment does not name the opened pull request {pr_url!r}")
+    if comments and not prs:
+        if expect != "pr":
+            if expect_causes:
+                allowed = frozenset(expect_causes)
+            elif expect == "comment":
+                allowed = DEFAULT_COMMENT_CAUSES
+            else:
+                allowed = DEFAULT_ANY_COMMENT_CAUSES
+            cause = outcome.get("ending_cause")
+            if cause not in allowed:
+                failures.append(
+                    f"the run ended with cause {cause!r}, not one of {sorted(allowed)}"
+                )
+        if final_body is not None:
+            if not _REASON_CONTRACT.search(final_body):
+                failures.append(
+                    "the final comment does not state 'Could not complete:' and a reason"
+                )
+        if expect != "pr" and outcome.get("ending_cause") == "no_pull_request":
             reply = outcome.get("agent_final_reply")
             if reply is None:
                 failures.append(
@@ -2149,8 +2173,8 @@ def ending_times(
     """(elapsed_seconds, execution_seconds) for one run. Pure.
 
     Elapsed runs from the request's start (or labelling) to the observed
-    ending: the pull request's creation or the terminus comment. Execution
-    runs from start to the request's terminal_at, when both exist.
+    final issue comment. Execution runs from start to the request's
+    terminal_at, when both exist.
     """
 
     started = _parse_time(request.get("started_at"))
@@ -2441,13 +2465,13 @@ def _await_ending(
 def _await_first_ending(
     p: Preflight, work_item_id: str, what: str
 ) -> tuple[dict[str, Any], bool, list[dict[str, Any]]]:
-    """The labelled run's ending: a pull request or a terminus comment."""
+    """The labelled run's ending, including its required final issue comment."""
 
     comments: list[dict[str, Any]] = []
 
-    def ended(detail: dict[str, Any]) -> bool:
+    def ended(_detail: dict[str, Any]) -> bool:
         comments[:] = _terminus_comments(p)
-        return bool(detail.get("pr") or comments)
+        return bool(comments)
 
     detail, terminal = _await_ending(p, work_item_id, since=p.labelled_at, ended=ended, what=what)
     if not terminal:
@@ -2462,9 +2486,7 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
     detail, terminal, comments = _await_first_ending(p, work_item_id, "issue-to-pr")
     prs = _scenario_pull_requests(p)
     latest = _latest_request(detail) or {}
-    if prs:
-        ended_at = min((str(pr.get("created_at") or "") for pr in prs), default=None)
-    elif comments:
+    if comments:
         ended_at = min(str(c.get("created_at") or "") for c in comments)
     else:
         ended_at = None
@@ -2472,15 +2494,18 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
     ending_cause = latest.get("terminal_cause") or (comments[-1]["cause"] if comments else None)
     raw_reply, reply_source = _agent_final_reply(p)
     known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
-    reply, disclosed = record_agent_text(raw_reply, known)
+    reply, reply_disclosed = record_agent_text(raw_reply, known)
+    comment_disclosed = False
     for comment in comments:
         comment["body"], hit = record_agent_text(comment["body"], known)
-        disclosed = disclosed or hit
+        comment_disclosed = comment_disclosed or hit
+    disclosed = reply_disclosed or comment_disclosed
     moved = p.default_branch_head() != p.head_before
     outcome = {
         "terminal": terminal,
         "pull_requests": prs,
         "terminus_comments": len(comments),
+        "terminus_comment_bodies": [comment["body"] for comment in comments],
         "ending_cause": ending_cause,
         "agent_final_reply": reply,
         "agent_reply_disclosed_credential": disclosed,
@@ -2498,7 +2523,7 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
     )
     link = _work_item_link(p, str(work_item_id)) if len(prs) == 1 else None
     failures += judge_lineage(link, prs)
-    rerun = rerun_notice_reconciler(p) if comments and not prs else None
+    rerun = rerun_notice_reconciler(p) if comments else None
     if rerun is not None:
         failures += rerun["failures"]
     result = {
@@ -2523,6 +2548,7 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         "agent_final_reply": reply,
         "agent_final_reply_source": reply_source,
         "agent_reply_disclosed_credential": disclosed,
+        "final_comment_disclosed_credential": comment_disclosed,
         "expect_reasons": list(p.expect_reasons),
         "model": p.config.model if p.config.model_api_key else "fake",
         "usage": usage,
@@ -2672,18 +2698,57 @@ def revision(p: Preflight) -> dict[str, Any]:
     log("revision: waiting for the labelled run to open a pull request")
     detail, terminal, comments = _await_first_ending(p, work_item_id, "revision first run")
     pr = detail.get("pr") if isinstance(detail.get("pr"), dict) else None
+    initial_prs = _scenario_pull_requests(p)
+    latest = _latest_request(detail) or {}
+    known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
+    disclosed = False
+    for comment in comments:
+        comment["body"], hit = record_agent_text(comment["body"], known)
+        disclosed = disclosed or hit
+    ended_at = min(
+        (str(comment.get("created_at") or "") for comment in comments),
+        default=None,
+    )
+    elapsed, _execution = ending_times(
+        latest, labelled_at=p.labelled_at, ended_at=ended_at
+    )
+    initial_outcome = {
+        "terminal": terminal,
+        "pull_requests": initial_prs,
+        "terminus_comments": len(comments),
+        "terminus_comment_bodies": [comment["body"] for comment in comments],
+        "ending_cause": latest.get("terminal_cause")
+        or (comments[-1]["cause"] if comments else None),
+        "agent_reply_disclosed_credential": disclosed,
+        "default_branch_moved": p.default_branch_head() != p.head_before,
+        "elapsed_seconds": round(elapsed, 1),
+    }
+    initial_failures = judge_outcome(initial_outcome, "pr", secrets=known)
+    initial_link = _work_item_link(p, str(work_item_id)) if len(initial_prs) == 1 else None
+    initial_failures += judge_lineage(initial_link, initial_prs)
+    if pr is None or not pr.get("number"):
+        initial_failures.append("the WorkItem does not record the opened pull request")
+    elif len(initial_prs) == 1 and (
+        str(pr.get("number")) != str(initial_prs[0].get("number"))
+        or pr.get("url") != initial_prs[0].get("url")
+    ):
+        initial_failures.append("the WorkItem records a different pull request")
     obs["first_run_terminal"] = terminal
     obs["first_run_state"] = detail.get("state")
     obs["first_run_statuses"] = _ordered_statuses(detail)
     obs["first_run_terminus_causes"] = [c.get("cause") for c in comments]
-    if not terminal or pr is None or not pr.get("number"):
-        raw_reply, _ = _agent_final_reply(p)
-        known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
-        obs["first_run_agent_final_reply"], _ = record_agent_text(raw_reply, known)
+    obs["first_run_final_comments"] = comments
+    obs["first_run_pull_requests"] = [pr_evidence(item, known) for item in initial_prs]
+    obs["first_run_work_item_link"] = initial_link
+    obs["first_run_elapsed_seconds"] = initial_outcome["elapsed_seconds"]
+    obs["first_run_final_comment_disclosed_credential"] = disclosed
+    obs["first_run_failures"] = initial_failures
+    if initial_failures:
         raise PreflightFailed(
-            "revision needs the labelled run to end in a pull request; it ended "
-            f"terminal={terminal} with pr={pr} and {len(comments)} terminus comment(s)"
+            "revision needs the labelled run to end in one owned pull request and one "
+            f"matching final issue comment: {'; '.join(initial_failures)}"
         )
+    assert pr is not None
     pr_number = int(pr["number"])
     obs["pr_number_before"] = pr_number
     obs["pr_url"] = pr.get("url")
@@ -2771,7 +2836,6 @@ def revision(p: Preflight) -> dict[str, Any]:
     obs["head_sha_after"], obs["commits_after"] = p.pr_head(pr_number)
     obs["pull_request_numbers"] = _scenario_pr_numbers(p)
     pr_comments = p._paged(f"/repos/{repo}/issues/{pr_number}/comments")
-    known = [p.issue_token, p.api_key, p.worker_token, p.config.model_api_key]
     replies = match_terminus_comments(
         pr_comments, mention=p.config.mention, app_id=p.config.app_id, request_ids=[revision_id]
     )

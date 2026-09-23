@@ -1122,7 +1122,8 @@ class _ThrottledReply:
 
     async def _emit(self, text: str) -> None:
         if self._target is None:
-            # A targetless turn (#2963): the stream is consumed, never sent.
+            # A targetless turn (#2963) or factory execution (#2991): the stream
+            # is consumed, never sent to the requesting chat.
             return
         ack = await self._sink.emit(
             ReplyUpdate(
@@ -1227,6 +1228,12 @@ class Kernel:
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
         self._held_work_items: dict[str, WorkItemRun] = {}
         self._active_work_item_request_id: uuid.UUID | None = None
+        # Approval resume ids that were mapped to a factory execution.
+        # The live run can be removed before a later delivery failure reaches
+        # ``notify_turn_not_started``, so the exact event identity survives to
+        # that boundary. Successful and cancelled turns clear it in
+        # ``process_event``. A failed turn is cleared by the notice path.
+        self._factory_work_item_events: set[str] = set()
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
@@ -1322,9 +1329,14 @@ class Kernel:
         Returns:
             The adapter's acknowledgement.
         """
-        if _is_targetless(qevent):
-            # No egress for a targetless turn (#2963): nobody is waiting, and the
-            # hook run row is where its outcome is recorded.
+        if _is_targetless(qevent) or self._is_factory_work_item_turn(
+            qevent.event_id
+        ):
+            # No requesting chat egress for a targetless turn (#2963) or a
+            # factory execution (#2991). A hook run records its outcome on its
+            # row. A factory run is reported by the API's notice writer after
+            # the WorkItem settles, so the kernel must not create a competing
+            # boot, approval, refusal, escalation, or final message here.
             return ReplyAck()
         if terminal:
             # Marked BEFORE the send, never after, so an exception from ``_reply``
@@ -1375,6 +1387,15 @@ class Kernel:
         # notice must not overwrite it with an invitation to resend.
         attempted = event_id in self._terminal_reply_attempted
         self._terminal_reply_attempted.discard(event_id)
+        factory_work_item_turn = self._is_factory_work_item_turn(event_id)
+        self._factory_work_item_events.discard(event_id)
+
+        if factory_work_item_turn:
+            logger.debug(
+                "event %s belongs to a factory execution; no not started notice",
+                event_id,
+            )
+            return
 
         handle = qevent.reply_handle
         if handle is None:
@@ -1536,6 +1557,7 @@ class Kernel:
                     # ``CancelledError`` is a ``BaseException``, so it clears here
                     # too: a cancelled turn is a shutdown, not a lost answer.
                     self._terminal_reply_attempted.discard(qevent.event_id)
+                    self._factory_work_item_events.discard(qevent.event_id)
                 outcome = _LIFECYCLE_OUTCOME.get()
                 if outcome is None:
                     # A normal early return is the already-terminal skip. An
@@ -1568,6 +1590,23 @@ class Kernel:
             ):
                 return candidate
         return None
+
+    def _is_factory_work_item_turn(self, event_id: str) -> bool:
+        """Whether this turn's requesting chat belongs to a factory execution.
+
+        Execute wake ids are platform minted and fully parsed. Approval resumes
+        have their own id namespace, so they count only after WorkItem ownership
+        ties the exact event to a factory conversation. Message text and channel
+        kind confer no factory identity.
+        """
+
+        parsed = parse_work_item_event_id(event_id)
+        if parsed is not None:
+            return parsed.kind in {"execute"}
+        return (
+            event_id in self._factory_work_item_events
+            or self._run_for_event(event_id) is not None
+        )
 
     def _work_item_repository(self, event_id: str) -> str | None:
         """The WorkItem repository for an acquired execute wake, else None."""
@@ -1626,6 +1665,7 @@ class Kernel:
         held.event_id = event_id
         self._work_item_runs[held.request_id] = held
         self._active_work_item_request_id = held.request_id
+        self._factory_work_item_events.add(event_id)
         return held.request_id
 
     async def _process_event(
@@ -1803,6 +1843,7 @@ class Kernel:
                         event_id, thread_key
                     )
                 except _FactoryExecutionEnded:
+                    self._factory_work_item_events.add(event_id)
                     await self._markers.mark_done(event_id)
                     return
 
@@ -6001,15 +6042,21 @@ class Kernel:
         workspace_inferred_repo: str | None,
     ) -> TurnOutcome:
         acc = _StreamAccumulator(workspace_inferred_repo=workspace_inferred_repo)
+        silent_requesting_chat = self._is_factory_work_item_turn(qevent.event_id)
         reply = _ThrottledReply(
             self._sink,
-            target=None if _is_targetless(qevent) else self._target_for(qevent),
+            target=(
+                None
+                if _is_targetless(qevent) or silent_requesting_chat
+                else self._target_for(qevent)
+            ),
             route=route,
             min_interval_s=self._config.slack_edit_min_interval_s,
             nav=nav,
             no_edit=(
                 self._config.slack_no_edit_streaming
                 or qevent.source is TurnSource.CRON
+                or silent_requesting_chat
             ),
             # Reply delivery is best-effort ONLY on an approval-resume turn (the
             # granted tool has already executed in the runner): a dead reply
@@ -6024,7 +6071,11 @@ class Kernel:
             # plan-ratified, not an oversight.
             best_effort=self._is_approval_resume(qevent.event_id),
             on_ref=lambda ref: self._adopt_ref(qevent, ReplyAck(ref=ref)),
-            on_final=lambda: self._terminal_reply_attempted.add(qevent.event_id),
+            on_final=(
+                None
+                if silent_requesting_chat
+                else lambda: self._terminal_reply_attempted.add(qevent.event_id)
+            ),
         )
         try:
             # ``async with`` releases the aiohttp response on every exit path

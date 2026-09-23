@@ -503,7 +503,12 @@ def test_missing_issue_file_is_refused(tmp_path: Path) -> None:
 
 
 def _pr(**overrides: Any) -> dict[str, Any]:
-    pr = {"number": 5, "files": ["src/app.py", "tests/test_app.py"], "diff": "+print('hi')\n"}
+    pr = {
+        "number": 5,
+        "url": "https://github.com/acme/fixture/pull/5",
+        "files": ["src/app.py", "tests/test_app.py"],
+        "diff": "+print('hi')\n",
+    }
     pr.update(overrides)
     return pr
 
@@ -512,7 +517,10 @@ def _outcome(**overrides: Any) -> dict[str, Any]:
     outcome = {
         "terminal": True,
         "pull_requests": [_pr()],
-        "terminus_comments": 0,
+        "terminus_comments": 1,
+        "terminus_comment_bodies": [
+            "Completed: https://github.com/acme/fixture/pull/5"
+        ],
         "default_branch_moved": False,
         "elapsed_seconds": 900.0,
     }
@@ -532,12 +540,38 @@ def test_more_than_one_pr_fails() -> None:
     assert fe.judge_outcome(_outcome(pull_requests=[_pr(), _pr(number=6)]), "any")
 
 
-def test_pr_and_comment_together_fail() -> None:
-    assert fe.judge_outcome(_outcome(terminus_comments=1), "any")
+def test_pull_request_without_its_final_comment_fails() -> None:
+    assert fe.judge_outcome(
+        _outcome(terminus_comments=0, terminus_comment_bodies=[]), "any"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Completed: https://github.com/acme/other/pull/5",
+        "Completed: https://github.com/acme/fixture/pull/6",
+        "Completed without a pull request link",
+    ],
+)
+def test_success_comment_names_the_exact_opened_pull_request(body: str) -> None:
+    assert fe.judge_outcome(_outcome(terminus_comment_bodies=[body]), "pr")
+
+
+def test_success_comment_may_name_the_pull_request_after_the_first_line() -> None:
+    body = "Completed successfully.\nhttps://github.com/acme/fixture/pull/5"
+    assert fe.judge_outcome(_outcome(terminus_comment_bodies=[body]), "pr") == []
 
 
 def test_neither_pr_nor_comment_fails() -> None:
-    assert fe.judge_outcome(_outcome(pull_requests=[], terminus_comments=0), "any")
+    assert fe.judge_outcome(
+        _outcome(
+            pull_requests=[],
+            terminus_comments=0,
+            terminus_comment_bodies=[],
+        ),
+        "any",
+    )
 
 
 def test_workflow_file_in_pr_fails() -> None:
@@ -575,24 +609,14 @@ def test_expect_pr_requires_a_pr() -> None:
 
 
 def test_expect_comment_requires_a_comment_and_no_pr() -> None:
-    comment = _outcome(
-        pull_requests=[],
-        terminus_comments=1,
-        ending_cause="no_pull_request",
-        agent_final_reply="Could not complete: not actionable.",
-    )
+    comment = _comment_ending()
     assert fe.judge_outcome(comment, "comment") == []
     assert fe.judge_outcome(_outcome(), "comment")
 
 
 def test_expect_any_accepts_either() -> None:
     assert fe.judge_outcome(_outcome(), "any") == []
-    comment = _outcome(
-        pull_requests=[],
-        terminus_comments=1,
-        ending_cause="no_pull_request",
-        agent_final_reply="Could not complete: not actionable.",
-    )
+    comment = _comment_ending()
     assert fe.judge_outcome(comment, "any") == []
 
 
@@ -650,8 +674,11 @@ def _comment_ending(**overrides: Any) -> dict[str, Any]:
     base = {
         "pull_requests": [],
         "terminus_comments": 1,
+        "terminus_comment_bodies": [
+            "Could not complete: no_pull_request\nCause: no_pull_request"
+        ],
         "ending_cause": "no_pull_request",
-        "agent_final_reply": "Could not complete: the ticket is too vague to act on.",
+        "agent_final_reply": "Could not complete: no pull request was opened.",
     }
     base.update(overrides)
     return _outcome(**base)
@@ -727,7 +754,7 @@ def _notice(cause: str, rid: uuid.UUID = _RID, **overrides: Any) -> dict[str, An
         "user": {"login": "factory[bot]", "type": "Bot"},
         "performed_via_github_app": {"id": 42},
         "created_at": "2026-01-01T00:10:00Z",
-        "body": f"This factory run cannot continue.\nCause: {cause}\n\n"
+        "body": f"Could not complete: {cause}\nCause: {cause}\n\n"
         f"<!-- curie-execution-request:{rid} -->\n",
     }
     comment.update(overrides)
@@ -800,17 +827,28 @@ def test_disclosed_credential_fails() -> None:
 def test_no_pull_request_needs_an_observable_reason() -> None:
     assert (
         fe.judge_outcome(
-            _comment_ending(agent_final_reply="Could not complete: too vague to act on."), "any"
+            _comment_ending(
+                terminus_comment_bodies=[
+                    "Could not complete: too vague to act on.\nCause: no_pull_request"
+                ]
+            ),
+            "any",
         )
         == []
     )
-    unverified = fe.judge_outcome(_comment_ending(agent_final_reply=None), "comment")
+    unverified = fe.judge_outcome(
+        _comment_ending(terminus_comment_bodies=[]), "comment"
+    )
     assert any("unverified" in f for f in unverified)
-    assert fe.judge_outcome(_comment_ending(agent_final_reply="  "), "comment")
+    assert fe.judge_outcome(
+        _comment_ending(terminus_comment_bodies=["  "]), "comment"
+    )
 
 
 def test_expect_reason_must_match_the_reply() -> None:
-    ending = _comment_ending(agent_final_reply="could NOT complete: the ticket is AMBIGUOUS.")
+    ending = _comment_ending(
+        agent_final_reply="could NOT complete: the ticket is AMBIGUOUS."
+    )
     assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous"]) == []
     assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous", "unsafe"])
     args = fe.parse_args(
@@ -932,10 +970,28 @@ def test_pr_evidence_is_redacted() -> None:
 
 
 def test_no_pull_request_needs_the_could_not_complete_contract() -> None:
-    assert fe.judge_outcome(_comment_ending(agent_final_reply="Done. I opened the PR."), "any")
-    assert fe.judge_outcome(_comment_ending(agent_final_reply="Could not complete:   "), "any")
-    ok = _comment_ending(agent_final_reply="Sorry. could not complete: tests need a DB.")
+    assert fe.judge_outcome(
+        _comment_ending(terminus_comment_bodies=["Done. I opened the PR."]), "any"
+    )
+    assert fe.judge_outcome(
+        _comment_ending(terminus_comment_bodies=["Could not complete:   "]), "any"
+    )
+    ok = _comment_ending(
+        terminus_comment_bodies=[
+            "Sorry. could not complete: tests need a DB.\nCause: no_pull_request"
+        ]
+    )
     assert fe.judge_outcome(ok, "any") == []
+
+
+def test_no_pull_request_needs_a_reason_in_the_agent_final_reply() -> None:
+    assert fe.judge_outcome(
+        _comment_ending(agent_final_reply="Done. I opened the PR."), "any"
+    )
+    assert fe.judge_outcome(_comment_ending(agent_final_reply=None), "any")
+    assert fe.judge_outcome(
+        _comment_ending(agent_final_reply="Could not complete:   "), "any"
+    )
 
 
 # --------------------------------------------------------------------------

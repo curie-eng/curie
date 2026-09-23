@@ -54,6 +54,11 @@ from test_github_factory_ingress import (
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 
+def test_completed_issue_comment_body_requires_pull_request_url() -> None:
+    with pytest.raises(ValueError, match="requires its pull request URL"):
+        comment_body(uuid.uuid4(), "completed", pr_url=None)
+
+
 class _Credentials:
     def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
         if repo != REPO or installation_id != INSTALLATION_ID:
@@ -343,8 +348,10 @@ def test_capacity_wait_expiry_posts_one_comment(admitted: Any) -> None:
     assert notices[0]["terminal_cause"] == "capacity_wait_expired"
     assert notices[0]["posted_at"] is not None
     assert sink.posts == 1
-    assert marker_for(row["id"]) in sink.comments[0]["body"]
-    assert "capacity_wait_expired" in sink.comments[0]["body"]
+    body = sink.comments[0]["body"]
+    assert body.startswith("Could not complete:")
+    assert "Cause: capacity_wait_expired" in body
+    assert marker_for(row["id"]) in body
     _reconcile()
     assert sink.posts == 1
     assert len(_notices(row["id"])) == 1
@@ -427,7 +434,10 @@ def test_a_crash_between_commit_and_post_still_posts_once(admitted: Any) -> None
     _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     row = _request(number)
     sink.comments.append(
-        {"id": 7444, "body": comment_body(row["id"], "issue_cancelled")}
+        {
+            "id": 7444,
+            "body": comment_body(row["id"], "issue_cancelled", pr_url=None),
+        }
     )
     _reconcile()
     assert sink.posts == 0
@@ -585,7 +595,7 @@ def test_publication_expiry_and_failure_each_post_one_comment(admitted: Any) -> 
         assert len(_notices(row["id"])) == 1
 
 
-def test_a_denied_publication_fails_and_a_pull_request_completes_without_a_comment(
+def test_failure_and_opened_pull_request_each_post_one_final_comment(
     admitted: Any,
 ) -> None:
     client, github, sink = admitted
@@ -607,9 +617,12 @@ def test_a_denied_publication_fails_and_a_pull_request_completes_without_a_comme
         "publication_denied",
     )
     assert (opened_row["status"], opened_row["terminal_cause"]) == ("completed", "completed")
-    assert sink.posts == 1
-    assert "publication_denied" in sink.comments[0]["body"]
-    assert _notices(opened_row["id"]) == []
+    assert sink.posts == 2
+    bodies = [comment["body"] for comment in sink.comments]
+    assert sum("Cause: publication_denied" in body for body in bodies) == 1
+    opened_url = f"https://github.com/{REPO}/pull/77"
+    assert sum(opened_url in body for body in bodies) == 1
+    assert len(_notices(opened_row["id"])) == 1
     assert len(_notices(denied_row["id"])) == 1
 
 
@@ -920,7 +933,7 @@ def _attach_revision_publication(work_item_id: uuid.UUID, request_id: uuid.UUID)
 
 
 def _published_issue(client: Any, github: GitHubAPI, sink: _CommentServer) -> tuple[int, int, Any]:
-    """An issue whose first run opened a PR and completed without a comment."""
+    """An issue whose first run opened a PR and posted its one final comment."""
 
     number = next(_REVISION_ISSUES)
     pr = next(_REVISION_PR)
@@ -931,8 +944,14 @@ def _published_issue(client: Any, github: GitHubAPI, sink: _CommentServer) -> tu
     _reconcile()
     done = _request(number)
     assert (done["status"], done["terminal_cause"]) == ("completed", "completed")
-    assert _notices(first["id"]) == []
-    assert sink.posts == 0
+    notices = _notices(first["id"])
+    assert len(notices) == 1
+    assert notices[0]["posted_at"] is not None
+    assert sink.posts == 1
+    path = f"/repos/{REPO}/issues/{number}/comments"
+    body = sink.lists[path][0]["body"]
+    assert f"https://github.com/{REPO}/pull/{pr}" in body
+    assert marker_for(first["id"]) in body
     return number, pr, first
 
 
@@ -943,6 +962,7 @@ def _complete_revision(
     client: Any, github: GitHubAPI, sink: _CommentServer, fragment: str
 ) -> tuple[int, int, uuid.UUID]:
     number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
     objective = _revision_objective(pr, fragment)
     revision = _insert_revision(first["work_item_id"], number, objective)
     _start_running(revision)
@@ -960,11 +980,19 @@ def _posts(sink: _CommentServer) -> list[tuple[str, str | None]]:
     return [(path, body) for method, path, body in sink.requests if method == "POST"]
 
 
-def test_a_completed_first_request_still_owes_no_comment(admitted: Any) -> None:
+def test_a_completed_first_request_posts_one_comment_naming_its_pull_request(
+    admitted: Any,
+) -> None:
     client, github, sink = admitted
     sink.by_path = True
-    _published_issue(client, github, sink)
-    assert _posts(sink) == []
+    number, pr, _first = _published_issue(client, github, sink)
+    posts = _posts(sink)
+    assert [path for path, _body in posts] == [
+        f"/repos/{REPO}/issues/{number}/comments"
+    ]
+    assert f"https://github.com/{REPO}/pull/{pr}" in (posts[0][1] or "")
+    _reconcile()
+    assert len(_posts(sink)) == 1
 
 
 def test_a_completed_revision_queues_exactly_one_notice(admitted: Any) -> None:
@@ -1049,11 +1077,20 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
     client, github, sink = admitted
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
     revision = _insert_revision(
         first["work_item_id"], number, _revision_objective(pr, fragment)
     )
     sink.lists[f"/repos/{REPO}/{listed.format(pr=pr)}"] = [
-        {"id": 7555, "body": comment_body(revision, "completed")}
+        {
+            "id": 7555,
+            "body": comment_body(
+                revision,
+                "completed",
+                pr_url=None,
+                feedback_url=_revision_objective(pr, fragment),
+            ),
+        }
     ]
     _start_running(revision)
     _attach_revision_publication(first["work_item_id"], revision)
@@ -1085,6 +1122,7 @@ def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
     client, github, sink = admitted
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
     fragment = "discussion_r88109"
     revision = _insert_revision(
         first["work_item_id"], number, _revision_objective(pr, fragment)
@@ -1111,7 +1149,7 @@ def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
     assert [path for path, _ in _posts(sink)] == [reply_path]
     notices = _notices(revision)
     assert notices[0]["posted_at"] is not None
-    assert notices[0]["comment_id"] == 8001
+    assert notices[0]["comment_id"] == 8002
 
 
 def test_an_issue_originated_notice_still_comments_on_the_issue(admitted: Any) -> None:

@@ -846,7 +846,7 @@ class ExecutionRequest(Base):
 
 
 class FactoryTerminalNotice(Base):
-    """One issue comment owed by a non-PR execution terminus.
+    """One GitHub comment owed by a factory execution terminus.
 
     Inserted in the same transaction as the terminal UPDATE. The reconciler
     posts it later. A refusal is recorded here and does not rewrite the request.

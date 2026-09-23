@@ -10,12 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TurnSource
+import pytest
+from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta, TurnSource
+from channel_protocol.reply import ReplyAck, ReplyEvent
+from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.config import WorkerConfig
+from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
 from curie_worker.workitem_dispatch import WorkItemAcquireGrant, WorkItemStartGrant
+from redis.exceptions import ResponseError
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -77,6 +84,7 @@ class _WorkItems:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.after_finish: Callable[[], Awaitable[None]] | None = None
 
     async def acquire(
         self, request_id: uuid.UUID, *, owner: str, generation: int
@@ -99,6 +107,11 @@ class _WorkItems:
             heartbeat_interval_s=60.0,
         )
 
+    async def finish(self, _request_id: uuid.UUID, **_: object) -> None:
+        self.calls.append("finish")
+        if self.after_finish is not None:
+            await self.after_finish()
+
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
             self.calls.append(name)
@@ -106,13 +119,46 @@ class _WorkItems:
         return record
 
 
-def _turn(event_id: str, text: str) -> QueuedTurn:
+class _Approvals:
+    async def create(self, _request: ApprovalRequest) -> CreatedApproval:
+        return CreatedApproval(id="appr-1", status="pending")
+
+
+class _RecordingSink:
+    def __init__(self, delegate: ReplySink) -> None:
+        self.delegate = delegate
+        self.events: list[str] = []
+
+    async def emit(
+        self,
+        event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        self.events.append(event.event)
+        return await self.delegate.emit(
+            event,
+            route=route,
+            best_effort_unreachable=best_effort_unreachable,
+        )
+
+
+def _turn(
+    event_id: str, text: str, *, kind: str = "slack", placeholder: str | None = None
+) -> QueuedTurn:
     return QueuedTurn(
         event_id=event_id,
         conversation_id="1700000000.000001",
         author="U0EXAMPLE1",
         text=text,
-        reply_handle=ReplyHandle(kind="slack", channel=CHANNEL, placeholder=None),
+        reply_handle=ReplyHandle(
+            kind=kind,
+            channel=WORK_ITEM_REPO if kind == "github" else CHANNEL,
+            placeholder=placeholder,
+            endpoint=None,
+            adapter=None,
+        ),
         received_at="2026-09-23T01:00:00+00:00",
         source=TurnSource.SLACK,
     )
@@ -123,7 +169,10 @@ def test_work_item_execution_checks_out_the_work_item_repository(make_harness) -
         async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
-            h.runner.default_script = [Final(text="Working.", status=SessionStatus.DONE)]
+            h.runner.default_script = [
+                TextDelta(text="Working. "),
+                Final(text="Working. Done.", status=SessionStatus.DONE),
+            ]
             request_id = uuid.uuid4()
 
             await h.kernel.process_event(
@@ -133,6 +182,100 @@ def test_work_item_execution_checks_out_the_work_item_repository(make_harness) -
             assert "acquire" in work_items.calls
             assert h.kernel._workspace.selections == [WORK_ITEM_REPO]
             assert h.kernel._workspace.claimed == [WORK_ITEM_REPO]
+            assert h.sink.updates == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("completion_write_fails", [False, True])
+def test_work_item_approval_resume_emits_no_requesting_turn_reply(
+    make_harness, completion_write_fails: bool
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+            h.runner.default_script = [
+                Final(
+                    text="Requesting approval.",
+                    status=SessionStatus.AWAITING_APPROVAL,
+                    approval_summary="Run the requested publication",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="Bash",
+                )
+            ]
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+            assert h.sink.updates == []
+
+            h.runner.default_script = [
+                TextDelta(text="Resuming. "),
+                Final(text="Resuming. Done.", status=SessionStatus.DONE),
+            ]
+            resumed = _turn(
+                f"approval-{uuid.uuid4()}-resolved",
+                "[approval resolved] approved",
+                placeholder="approval-placeholder",
+            )
+            if completion_write_fails:
+                async def corrupt_completion_after_finish() -> None:
+                    await h.async_redis.set(
+                        h.config.completion_key(resumed.event_id), "wrong-type"
+                    )
+
+                work_items.after_finish = corrupt_completion_after_finish
+                with pytest.raises(ResponseError, match="WRONGTYPE"):
+                    await h.kernel.process_event(resumed)
+                await h.kernel.notify_turn_not_started(resumed)
+            else:
+                await h.kernel.process_event(resumed)
+
+            assert h.sink.updates == []
+            assert work_items.calls.count("start") == 1
+            assert work_items.calls.count("finish") == 1
+
+    asyncio.run(exercise())
+
+
+def test_github_work_item_reaches_the_model_without_chat_replies(make_harness) -> None:
+    async def exercise() -> None:
+        sink = build_reply_sink(WorkerConfig())
+        github = _RecordingSink(sink._adapters["github"])
+        sink._adapters["github"] = github
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                sink=sink,
+            ) as h:
+                work_items = _WorkItems()
+                h.kernel._work_items = work_items
+                h.runner.default_script = [
+                    TextDelta(text="Working. "),
+                    Final(text="Working. Done.", status=SessionStatus.DONE),
+                ]
+                request_id = uuid.uuid4()
+
+                await h.kernel.process_event(
+                    _turn(
+                        f"work-item-{request_id}-execute-1",
+                        f"Resolve {ISSUE_URL}",
+                        kind="github",
+                    )
+                )
+
+                assert h.runner.opened
+                assert "start" in work_items.calls
+                assert "reply.update" not in github.events
+        finally:
+            await sink.aclose()
 
     asyncio.run(exercise())
 

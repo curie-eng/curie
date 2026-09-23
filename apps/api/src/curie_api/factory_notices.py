@@ -30,7 +30,12 @@ from starlette.concurrency import run_in_threadpool
 from .config import Settings
 from .factory_reply_target import ReplyTarget, parse_reply_target
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
-from .models import ExecutionRequest, FactoryTerminalNotice, WorkItem
+from .models import (
+    ExecutionRequest,
+    FactoryTerminalNotice,
+    ThreadPublicationLineage,
+    WorkItem,
+)
 from .repo_full_name import repo_url_path
 
 _REFUSED_STATUSES = {401, 403, 404}
@@ -54,11 +59,22 @@ def marker_for(request_id: uuid.UUID) -> str:
     return f"<!-- curie-execution-request:{request_id} -->"
 
 
-def comment_body(request_id: uuid.UUID, cause: str, *, feedback_url: str | None = None) -> str:
+def comment_body(
+    request_id: uuid.UUID,
+    cause: str,
+    *,
+    pr_url: str | None,
+    feedback_url: str | None = None,
+) -> str:
     if cause == "completed":
-        text = "The requested revision is pushed to this pull request.\n"
+        if feedback_url is not None:
+            text = "The requested revision is pushed to this pull request.\n"
+        elif isinstance(pr_url, str) and pr_url.strip():
+            text = f"Completed: {pr_url.strip()}\n"
+        else:
+            raise ValueError("a completed issue notice requires its pull request URL")
     else:
-        text = f"This factory run cannot continue.\nCause: {cause}\n"
+        text = f"Could not complete: {cause}\nCause: {cause}\n"
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
     return f"{text}\n{marker_for(request_id)}\n"
@@ -74,11 +90,20 @@ async def post_due_notices(session: AsyncSession, settings: Settings, *, limit: 
 
     rows = (
         await session.execute(
-            select(FactoryTerminalNotice, WorkItem, ExecutionRequest.objective)
+            select(
+                FactoryTerminalNotice,
+                WorkItem,
+                ExecutionRequest.objective,
+                ThreadPublicationLineage.pr_url,
+            )
             .join(WorkItem, WorkItem.id == FactoryTerminalNotice.work_item_id)
             .join(
                 ExecutionRequest,
                 ExecutionRequest.id == FactoryTerminalNotice.execution_request_id,
+            )
+            .outerjoin(
+                ThreadPublicationLineage,
+                ThreadPublicationLineage.id == WorkItem.publication_lineage_id,
             )
             .where(
                 FactoryTerminalNotice.posted_at.is_(None),
@@ -97,13 +122,20 @@ async def post_due_notices(session: AsyncSession, settings: Settings, *, limit: 
         return 0
     delivered = 0
     async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
-        for notice, work_item, objective in rows:
+        for notice, work_item, objective, pr_url in rows:
             target = parse_reply_target(
                 objective,
                 repo_full_name=work_item.repo_full_name,
                 clone_base=settings.github_clone_base,
             )
-            outcome = await _deliver(client, settings, work_item, notice, target)
+            outcome = await _deliver(
+                client,
+                settings,
+                work_item,
+                notice,
+                target,
+                pr_url=pr_url,
+            )
             now = await _clock(session)
             notice.attempts += 1
             if outcome is None:
@@ -132,7 +164,15 @@ async def _deliver(
     work_item: WorkItem,
     notice: FactoryTerminalNotice,
     target: ReplyTarget,
+    *,
+    pr_url: str | None,
 ) -> tuple[str, str] | None:
+    if (
+        notice.terminal_cause == "completed"
+        and target.kind == "issue"
+        and (not isinstance(pr_url, str) or not pr_url.strip())
+    ):
+        return None
     try:
         token = await run_in_threadpool(
             credentials_for(settings).token_for_verified_installation,
@@ -173,7 +213,12 @@ async def _deliver(
         if existing.next_page is not None:
             notice.scan_page = existing.next_page + offset
             return None
-    body = comment_body(notice.execution_request_id, notice.terminal_cause, feedback_url=target.url)
+    body = comment_body(
+        notice.execution_request_id,
+        notice.terminal_cause,
+        pr_url=pr_url,
+        feedback_url=target.url,
+    )
     if target.kind == "thread":
         assert target.comment_id is not None
         root = await _thread_root(client, api, repo_path, headers, target.comment_id)
