@@ -33,7 +33,8 @@ import json
 import secrets
 import time
 import urllib.parse
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -121,6 +122,9 @@ class OidcClaims:
     subject: str
     email: str | None
     display_name: str | None
+    #: Every claim of the validated token, for :func:`meets_required_claims`.
+    #: Excluded from equality and repr: it is evidence, not identity.
+    raw: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -279,7 +283,7 @@ def authorization_url(
             "response_type": "code",
             "client_id": settings.oidc_audience,
             "redirect_uri": settings.oidc_redirect_uri,
-            "scope": "openid email profile",
+            "scope": settings.oidc_scopes,
             "state": state,
             "nonce": nonce,
             "code_challenge": challenge,
@@ -471,4 +475,28 @@ async def validate_id_token(token: str, *, nonce: str) -> OidcClaims:
         subject=subject,
         email=email if isinstance(email, str) and email else None,
         display_name=name if isinstance(name, str) and name else None,
+        raw=claims,
     )
+
+
+def meets_required_claims(claims: OidcClaims, required: Mapping[str, str]) -> bool:
+    """Whether a validated token carries every ``CURIE_OIDC_REQUIRED_CLAIMS`` entry.
+
+    A string claim must equal the required value exactly (no case folding: an
+    IdP that sends ``EXAMPLE.COM`` for a domain rule is not the IdP the rule was
+    written for). A list claim must contain it as a string element. Any other
+    type, or an absent claim, fails: coercing ``true`` or ``1`` into a match
+    would admit on a value the operator never wrote.
+    """
+
+    for name, value in required.items():
+        presented = claims.raw.get(name)
+        if isinstance(presented, str):
+            if presented != value:
+                return False
+        elif isinstance(presented, list):
+            if not any(isinstance(item, str) and item == value for item in presented):
+                return False
+        else:
+            return False
+    return True
