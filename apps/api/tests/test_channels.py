@@ -1287,6 +1287,9 @@ def _other_routes() -> list[tuple[str, str]]:
         # the state cookie and the IdP's authorization code are the credential.
         "/console/oidc/login",
         "/console/oidc/callback",
+        # Logout takes no credential beyond the session cookie it revokes, and
+        # always answers 204 so it is not an oracle for which tokens are live.
+        "/console/logout",
     }
     routes: list[tuple[str, str]] = []
     for route in _walk(create_app().routes):
