@@ -1192,6 +1192,9 @@ struct EffectiveInstallationPlan {
     github_token: Option<String>,
     comms: Option<crate::comms::CommsOpts>,
     live: Option<serde_json::Value>,
+    /// The provider routing, `Some` exactly when `curie.yaml` declares a
+    /// secrets provider. `up` is already rewritten from it.
+    routing: Option<crate::provider::routing::RoutingPlan>,
     desired: BTreeMap<String, String>,
     preserves_undeclared_github_token: bool,
     /// What the stateful probe learned about THIS plan, or `None` when the plan
@@ -1219,7 +1222,13 @@ pub fn plan_installation(cfg: Installation, dry_run: bool) -> Result<LocalInstal
 pub fn plan_installation_lenient(
     cfg: Installation,
 ) -> Result<(LocalInstallationPlan, Vec<String>)> {
-    let (_, missing) = resolve_credentials_lenient(&cfg, &resolve_credential)?;
+    // With a declared provider no credential is resolved locally: every one
+    // lives in Secrets Manager and reaches the chart by Secret name.
+    let missing = if cfg.secrets.is_some() {
+        Vec::new()
+    } else {
+        resolve_credentials_lenient(&cfg, &resolve_credential)?.1
+    };
     let plan = plan_installation_inner(cfg, false, true)?;
     Ok((plan, missing))
 }
@@ -1229,7 +1238,11 @@ fn plan_installation_inner(
     dry_run: bool,
     lenient: bool,
 ) -> Result<LocalInstallationPlan> {
-    let resolved = if lenient {
+    let resolved = if cfg.secrets.is_some() {
+        // A declared provider owns every credential (ADR 0163): nothing is
+        // read from the environment or the local vault.
+        BTreeMap::new()
+    } else if lenient {
         resolve_credentials_lenient(&cfg, &resolve_credential)?.0
     } else {
         resolve_credentials(&cfg, &resolve_credential)?
@@ -1299,9 +1312,20 @@ enum StatefulProbe {
     Skip,
 }
 
+#[cfg(test)]
 async fn complete_installation_plan(
     local: LocalInstallationPlan,
     probe: StatefulProbe,
+) -> Result<EffectiveInstallationPlan> {
+    complete_installation_plan_with(local, probe, None).await
+}
+
+/// [`complete_installation_plan`] with the Secrets Manager snapshot a
+/// provider-backed plan routes against (`None` when it was not read).
+async fn complete_installation_plan_with(
+    local: LocalInstallationPlan,
+    probe: StatefulProbe,
+    sm: Option<&BTreeMap<String, Vec<String>>>,
 ) -> Result<EffectiveInstallationPlan> {
     let LocalInstallationPlan {
         cfg,
@@ -1318,7 +1342,9 @@ async fn complete_installation_plan(
     } else {
         None
     };
-    let preserves_undeclared_github_token = cfg.credentials.github_token.is_none()
+    let provider = cfg.secrets.is_some();
+    let preserves_undeclared_github_token = !provider
+        && cfg.credentials.github_token.is_none()
         && !cfg.set.contains_key(crate::ops::GITHUB_TOKEN_KEY)
         && live
             .as_ref()
@@ -1326,13 +1352,27 @@ async fn complete_installation_plan(
             .and_then(|api| api.get("githubToken"))
             .and_then(serde_json::Value::as_str)
             .is_some_and(|token| !token.is_empty());
-    let up = crate::ops::complete_up_opts(
+    let mut up = crate::ops::complete_up_opts(
         up,
         live.as_ref(),
         github_token.as_deref(),
         false,
         complete_live_state,
     )?;
+    // Routed before the value plan, so `diff` and `apply` read one plan with
+    // Secret names in place of every provider-backed value.
+    let routing = if provider {
+        let routing =
+            crate::provider::routing::plan_routing(&crate::provider::routing::RoutingInputs {
+                cfg: &cfg,
+                live: live.as_ref(),
+                sm,
+            })?;
+        crate::provider::routing::route_up_opts(&mut up, &routing);
+        Some(routing)
+    } else {
+        None
+    };
     let up_values = crate::ops::up_value_plan(&up);
     // Deliberately NOT gated on `complete_live_state`. `apply --dry-run` sets
     // that false, but the guard is documented to run under `--dry-run` anyway:
@@ -1354,17 +1394,19 @@ async fn complete_installation_plan(
             .entry(crate::ops::FAKE_MODEL_KEY.to_string())
             .or_insert_with(|| "false".to_string());
     }
-    let comms = cfg
-        .comms
-        .slack
-        .as_ref()
-        .map(|slack| crate::comms::CommsOpts {
-            common: up.common.clone(),
-            chart: up.chart.clone(),
-            app_token: resolved.get(&slack.app_token).cloned().unwrap_or_default(),
-            bot_token: resolved.get(&slack.bot_token).cloned().unwrap_or_default(),
-            disconnect: false,
-        });
+    // With a provider the Slack tokens are folded into the knob sets.
+    let comms =
+        cfg.comms
+            .slack
+            .as_ref()
+            .filter(|_| !provider)
+            .map(|slack| crate::comms::CommsOpts {
+                common: up.common.clone(),
+                chart: up.chart.clone(),
+                app_token: resolved.get(&slack.app_token).cloned().unwrap_or_default(),
+                bot_token: resolved.get(&slack.bot_token).cloned().unwrap_or_default(),
+                disconnect: false,
+            });
     if let Some(comms) = &comms {
         desired.insert(
             "dispatcher.slack.appToken".to_string(),
@@ -1391,6 +1433,7 @@ async fn complete_installation_plan(
         github_token,
         comms,
         live,
+        routing,
         desired,
         preserves_undeclared_github_token,
         stateful,
@@ -1681,16 +1724,28 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     // live component as gone.
     local.up.chart = chart;
     let dry_run = local.up.common.dry_run;
+    // A declared provider is read (list only) before the plan, so optional
+    // routing sees what Secrets Manager holds. A dry run stays offline.
+    let provider = if dry_run {
+        None
+    } else {
+        crate::secrets::provider_for_installation(&local.cfg)?
+    };
+    let sm = provider
+        .as_ref()
+        .map(|p| crate::provider::routing::read_sm_inventory(p))
+        .transpose()?;
     // `Skip` is the only path that reads no cluster state, and it is reserved
     // for the operator who already overrode the verdict. Everything else --
     // including `--dry-run` and `--migrate-store` -- probes (#1352).
-    let plan = complete_installation_plan(
+    let plan = complete_installation_plan_with(
         local,
         if allow_stateful_removal {
             StatefulProbe::Skip
         } else {
             StatefulProbe::Run
         },
+        sm.as_ref(),
     )
     .await?;
     let EffectiveInstallationPlan {
@@ -1700,6 +1755,7 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         github_token,
         comms,
         live,
+        routing,
         stateful,
         ..
     } = plan;
@@ -1783,6 +1839,13 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         }
     };
 
+    // Provider routing: every check before the first mutation, then the
+    // one-time generation, the namespace, and the ExternalSecret sync, all
+    // before Helm renders against the synced Secrets (ADR 0163).
+    if let (Some(routing), Some(provider), Some(sm)) = (&routing, &provider, &sm) {
+        converge_provider(routing, provider, sm, &up.common, up.adopt).await?;
+    }
+
     // Stage BEFORE the upgrade deletes the old store. A failure here leaves the
     // cluster untouched.
     if migrating {
@@ -1804,12 +1867,20 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
 
     let up_out = crate::ops::up_prepared(up, up_values, live, github_token).await?;
 
-    let mut lines = match up_out {
-        crate::ops::ClusterUpOutput::DryRun(plan) => plan.lines,
-        crate::ops::ClusterUpOutput::Up { .. } => vec![],
+    let mut lines = match (&routing, dry_run) {
+        (Some(routing), true) => crate::provider::routing::dry_run_lines(
+            routing,
+            &crate::provider::routing::store_name(&routing.release),
+        ),
+        _ => vec![],
     };
+    match up_out {
+        crate::ops::ClusterUpOutput::DryRun(plan) => lines.extend(plan.lines),
+        crate::ops::ClusterUpOutput::Up { .. } => {}
+    }
 
-    let mut configured_comms = false;
+    // With a provider the Slack tokens were synced with the platform.
+    let mut configured_comms = routing.is_some() && cfg.comms.slack.is_some();
     if let Some(comms) = comms {
         let comms_out = crate::comms::comms(comms).await?;
         configured_comms = true;
@@ -1860,6 +1931,50 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         release: cfg.install.release,
         comms: configured_comms,
     })
+}
+
+/// How long one ExternalSecret may take to report a fresh sync.
+const PROVIDER_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const PROVIDER_SYNC_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Converge a declared provider before Helm runs. Order is load bearing:
+/// Secrets Manager and the SecretStore are checked (read only) before any
+/// write, so a refusal changes nothing; generation happens only after that,
+/// and the snapshot is re-read and re-checked before the cluster is touched.
+async fn converge_provider(
+    routing: &crate::provider::routing::RoutingPlan,
+    provider: &dyn crate::provider::SecretsProvider,
+    sm: &BTreeMap<String, Vec<String>>,
+    common: &crate::ops::CommonOpts,
+    adopt: bool,
+) -> Result<()> {
+    use crate::provider::routing;
+    let kubectl = crate::provider::eso::SystemKubectl {
+        call_timeout: Some(std::time::Duration::from_secs(60)),
+        ..Default::default()
+    };
+    let store = routing::store_name(&routing.release);
+    let to_create = routing::preflight(routing, sm)?;
+    routing::check_store(&kubectl, &routing.namespace, &store)?;
+    if !to_create.is_empty() {
+        routing::generate(provider, routing, &to_create)?;
+        let reread = routing::read_sm_inventory(provider)?;
+        let still_missing = routing::preflight(routing, &reread)?;
+        if !still_missing.is_empty() {
+            bail!(
+                "Secrets Manager does not list generated entries yet: {}",
+                still_missing.join(", ")
+            );
+        }
+    }
+    crate::ops::establish_primary_namespace_ownership(common, adopt).await?;
+    routing::sync(
+        &kubectl,
+        routing,
+        &store,
+        PROVIDER_SYNC_TIMEOUT,
+        PROVIDER_SYNC_POLL,
+    )
 }
 
 /// The refusal for removals `--migrate-store` cannot carry.
@@ -2480,10 +2595,15 @@ pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
     // THIS chart, and an empty ref would render nothing and call every live
     // component gone.
     local.up.chart = chart;
+    // A declared provider is listed (read only) so the diff shows the same
+    // optional routing apply would take.
+    let sm = crate::secrets::provider_for_installation(&local.cfg)?
+        .map(|p| crate::provider::routing::read_sm_inventory(&p))
+        .transpose()?;
     // `Run` unconditionally. `diff` has no `--allow-stateful-removal` to opt
     // out with, and skipping the probe on, say, an absent release would
     // recreate the disagreement: `apply` does not skip it either (#1352).
-    let plan = complete_installation_plan(local, StatefulProbe::Run).await?;
+    let plan = complete_installation_plan_with(local, StatefulProbe::Run, sm.as_ref()).await?;
     // A second, independent read: the values plan says nothing about WHICH
     // chart consumes them, and a component renamed between chart versions
     // shows up in the entries below as an ordinary reset.

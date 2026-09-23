@@ -5906,15 +5906,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                 });
             }
             let cfg = curie::installation::Installation::load(&file)?;
-            if cfg.secrets.is_some() {
-                return Err(curie::exit::CliError::failure(
-                    "curie apply cannot yet converge a declared secrets provider without placing provider values in Helm",
-                )
-                .with_fix(
-                    "Use standalone curie secrets commands to populate the provider. Apply support lands with External Secrets convergence.",
-                )
-                .into());
-            }
             if let Some(target) =
                 curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
                     context.as_deref(),
