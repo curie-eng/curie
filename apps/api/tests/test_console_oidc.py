@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import sys
 import urllib.parse
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
@@ -1172,3 +1175,524 @@ def test_partial_oidc_settings_error_does_not_print_the_client_secret(
     assert _SECRET_SENTINEL not in repr(caught.value)
     for name in missing:
         assert name in message, (name, message)
+
+# =============================================================================
+# Admission, scopes, logout and issuer-bound sessions (scope addition to #2908)
+# =============================================================================
+
+_REQUIRED_CLAIMS = "CURIE_OIDC_REQUIRED_CLAIMS"
+_ADMIT_ALL = "CURIE_OIDC_ADMIT_ALL_AUTHENTICATED"
+_SCOPES = "CURIE_OIDC_SCOPES"
+
+
+@contextlib.contextmanager
+def _required_claims_client(idp: TestIdP, required: dict[str, str]) -> Iterator[TestClient]:
+    with _booted_app({**enabled_env(idp), _REQUIRED_CLAIMS: json.dumps(required)}) as client:
+        yield client
+
+
+# --- required claims: admitted -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "required, extra",
+    [
+        ({"groups": "curie-admins"}, {"groups": ["staff", "curie-admins"]}),
+        ({"hd": "example.com"}, {"hd": "example.com"}),
+        (
+            {"groups": "curie-admins", "hd": "example.com"},
+            {"groups": ["curie-admins"], "hd": "example.com"},
+        ),
+    ],
+    ids=["list-contains", "string-equals", "two-entries-both-match"],
+)
+def test_required_claims_that_match_are_admitted(
+    _disposable_db: Any,
+    clean_db: None,
+    runs_stream: str,
+    idp: TestIdP,
+    required: dict[str, str],
+    extra: dict[str, Any],
+) -> None:
+    idp.extra_claims = extra
+    with _required_claims_client(idp, required) as client:
+        assert dict(get_settings().oidc_required_claims) == required
+        token = _session_token(_login(client))
+        response = client.get("/console/principal", headers=_cookie(SESSION_COOKIE, token))
+        assert response.status_code == 200, response.text
+        assert len(_principal_rows()) == 1
+
+
+# --- required claims: refused --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "required, extra",
+    [
+        ({"groups": "curie-admins"}, {"groups": ["staff", "contractors"]}),
+        ({"groups": "curie-admins"}, {"groups": []}),
+        ({"hd": "example.com"}, {"hd": "evil.example"}),
+        ({"hd": "example.com"}, {"hd": "EXAMPLE.COM"}),
+        (
+            {"groups": "curie-admins", "hd": "example.com"},
+            {"groups": ["curie-admins"], "hd": "evil.example"},
+        ),
+        ({"groups": "curie-admins"}, {}),
+        ({"hd": "example.com"}, {"groups": ["example.com"]}),
+        # Any type other than a string or a list is a failure, never coerced.
+        ({"email_verified": "true"}, {"email_verified": True}),
+        ({"level": "1"}, {"level": 1}),
+        ({"groups": "curie-admins"}, {"groups": {"curie-admins": True}}),
+        # A list must contain the value as a string element.
+        ({"groups": "1"}, {"groups": [1]}),
+        ({"groups": "curie-admins"}, {"groups": [["curie-admins"]]}),
+    ],
+    ids=[
+        "list-lacks",
+        "list-empty",
+        "string-differs",
+        "string-differs-by-case",
+        "two-entries-one-fails",
+        "claim-absent",
+        "claim-under-another-name",
+        "bool-claim",
+        "number-claim",
+        "object-claim",
+        "list-of-non-strings",
+        "nested-list",
+    ],
+)
+def test_required_claims_that_do_not_match_are_refused(
+    _disposable_db: Any,
+    clean_db: None,
+    runs_stream: str,
+    idp: TestIdP,
+    required: dict[str, str],
+    extra: dict[str, Any],
+) -> None:
+    idp.extra_claims = extra
+    with _required_claims_client(idp, required) as client:
+        assert dict(get_settings().oidc_required_claims) == required
+        response = _login(client)
+
+        _assert_refused(response)
+        assert response.json() == _refusal_body(client)
+        assert _principal_rows() == []
+        assert _sql("SELECT id FROM curie.console_sessions") == []
+
+
+def test_required_claims_refusal_leaves_an_existing_principal_untouched(
+    _disposable_db: Any, clean_db: None, runs_stream: str, idp: TestIdP
+) -> None:
+    idp.extra_claims = {"groups": ["curie-admins"]}
+    with _required_claims_client(idp, {"groups": "curie-admins"}) as client:
+        _session_token(_login(client))
+        (before,) = _principal_rows()
+        sessions_before = _sql("SELECT id FROM curie.console_sessions")
+
+        # Removed from the group at the IdP, and renamed while at it.
+        idp.extra_claims = {"groups": ["staff"]}
+        idp.email = "alice.moved@example.com"
+        idp.name = "Alice Moved"
+        _assert_refused(_login(client))
+
+        (after,) = _principal_rows()
+        assert after == before
+        assert _sql("SELECT id FROM curie.console_sessions") == sessions_before
+
+
+def test_required_claims_default_to_no_requirement() -> None:
+    from curie_api.config import Settings
+
+    with oidc_env(_FULL):
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert dict(settings.oidc_required_claims) == {}
+
+
+def test_required_claims_parse_from_json() -> None:
+    from curie_api.config import Settings
+
+    value = {"groups": "curie-admins", "hd": "example.com"}
+    with oidc_env({**_FULL, _REQUIRED_CLAIMS: json.dumps(value)}):
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert dict(settings.oidc_required_claims) == value
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "groups=curie-admins",
+        "{not json",
+        '["groups", "curie-admins"]',
+        '"curie-admins"',
+        "42",
+        '{"groups": 1}',
+        '{"groups": ["curie-admins"]}',
+        '{"groups": null}',
+        '{"groups": true}',
+        '{"": "curie-admins"}',
+    ],
+    ids=[
+        "not-json",
+        "truncated-json",
+        "json-array",
+        "json-string",
+        "json-number",
+        "int-value",
+        "list-value",
+        "null-value",
+        "bool-value",
+        "empty-key",
+    ],
+)
+def test_malformed_required_claims_refuse_to_load(raw: str) -> None:
+    from curie_api.config import Settings
+    from pydantic import ValidationError
+
+    with oidc_env({**_FULL, _REQUIRED_CLAIMS: raw}), pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+# --- scopes ---------------------------------------------------------------------
+
+
+def _authorize_scope(client: TestClient) -> str:
+    response = client.get("/console/oidc/login", follow_redirects=False)
+    client.cookies.clear()
+    assert response.status_code == 302, response.text
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(response.headers["location"]).query))
+    return query["scope"]
+
+
+def test_scopes_default_to_openid_email_profile(oidc_client: TestClient) -> None:
+    assert get_settings().oidc_scopes == "openid email profile"
+    assert _authorize_scope(oidc_client) == "openid email profile"
+
+
+def test_configured_scopes_are_what_the_authorize_redirect_requests(
+    _disposable_db: Any, clean_db: None, runs_stream: str, idp: TestIdP
+) -> None:
+    scopes = "openid email groups"
+    with _booted_app({**enabled_env(idp), _SCOPES: scopes}) as client:
+        assert get_settings().oidc_scopes == scopes
+        assert _authorize_scope(client) == scopes
+        # And the IdP (which requires openid) completes the login with them.
+        _session_token(_login(client))
+
+
+@pytest.mark.parametrize("scopes", ["email profile", "profile", "openidx email"])
+def test_scopes_without_openid_refuse_to_load(scopes: str) -> None:
+    from curie_api.config import Settings
+    from pydantic import ValidationError
+
+    with oidc_env({**_FULL, _SCOPES: scopes}), pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+# --- production admission gate ----------------------------------------------------
+
+
+def _prod_settings(env: dict[str, str | None], environment: str = "prod") -> Any:
+    """Settings under ``environment`` with real secrets (as test_config_prod_gate)."""
+
+    from curie_api.config import Settings
+
+    with oidc_env(env):
+        return Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            environment=environment,
+            api_key="a-real-key",
+            approval_chat_attester_secret="a-real-chat-attester-secret",
+            github_webhook_secret="a-real-secret",
+            internal_worker_token="a-real-worker-token",
+        )
+
+
+def test_prod_oidc_without_an_admission_policy_refuses_to_boot() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as caught:
+        _prod_settings(dict(_FULL))
+    message = str(caught.value)
+    assert _REQUIRED_CLAIMS in message, message
+    assert _ADMIT_ALL in message, message
+
+
+def test_prod_oidc_with_admit_all_false_and_no_claims_refuses_to_boot() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as caught:
+        _prod_settings({**_FULL, _ADMIT_ALL: "false", _REQUIRED_CLAIMS: "{}"})
+    message = str(caught.value)
+    assert _REQUIRED_CLAIMS in message and _ADMIT_ALL in message, message
+
+
+def test_prod_oidc_with_required_claims_boots() -> None:
+    settings = _prod_settings({**_FULL, _REQUIRED_CLAIMS: '{"groups": "curie-admins"}'})
+    assert dict(settings.oidc_required_claims) == {"groups": "curie-admins"}
+    assert settings.oidc_admit_all_authenticated is False
+
+
+def test_prod_oidc_with_explicit_admit_all_boots() -> None:
+    settings = _prod_settings({**_FULL, _ADMIT_ALL: "true"})
+    assert settings.oidc_admit_all_authenticated is True
+    assert dict(settings.oidc_required_claims) == {}
+
+
+def test_prod_oidc_with_admit_all_and_required_claims_is_contradictory() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as caught:
+        _prod_settings(
+            {**_FULL, _ADMIT_ALL: "true", _REQUIRED_CLAIMS: '{"groups": "curie-admins"}'}
+        )
+    message = str(caught.value)
+    assert _REQUIRED_CLAIMS in message and _ADMIT_ALL in message, message
+
+
+def test_prod_without_oidc_needs_no_admission_policy() -> None:
+    settings = _prod_settings({})
+    assert settings.oidc_enabled is False
+    assert settings.oidc_admit_all_authenticated is False
+
+
+def test_dev_oidc_without_an_admission_policy_is_open() -> None:
+    settings = _prod_settings(dict(_FULL), environment="dev")
+    assert settings.oidc_enabled
+    assert dict(settings.oidc_required_claims) == {}
+    assert settings.oidc_admit_all_authenticated is False
+
+
+# --- logout -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def plain_client(_disposable_db: Any, clean_db: None, runs_stream: str) -> Iterator[TestClient]:
+    """The app with OIDC NOT configured: logout must not depend on it."""
+
+    with _booted_app({}) as client:
+        assert not get_settings().oidc_enabled
+        yield client
+
+
+def _assert_clears_session_cookie(response: httpx.Response) -> None:
+    morsel = _set_cookies(response).get(SESSION_COOKIE)
+    assert morsel is not None, response.headers
+    # Only a Set-Cookie with the same path/flags replaces the browser's cookie.
+    assert morsel["path"] == "/"
+    assert morsel["secure"]
+    assert morsel["httponly"]
+    assert morsel["samesite"].lower() == "strict"
+    assert morsel["domain"] == ""
+    expired = morsel["max-age"] == "0"
+    if not expired and morsel["expires"]:
+        expired = parsedate_to_datetime(morsel["expires"]) <= datetime.now(UTC)
+    assert expired, morsel.OutputString()
+    assert morsel.value in ("", '""'), morsel.OutputString()
+
+
+def _assert_logged_out(response: httpx.Response) -> None:
+    assert response.status_code == 204, response.text
+    assert response.headers.get("cache-control") == "no-store"
+    assert response.content == b""
+    _assert_clears_session_cookie(response)
+
+
+def _logout(client: TestClient, headers: dict[str, str] | None = None) -> httpx.Response:
+    response = client.post("/console/logout", headers=headers or {})
+    client.cookies.clear()
+    return response
+
+
+def _login_code_session(client: TestClient, auth_headers: dict[str, str]) -> str:
+    minted = client.post(
+        "/console/login-codes", json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+    )
+    assert minted.status_code == 201, minted.text
+    exchanged = client.post("/console/session", json={"code": minted.json()["code"]})
+    assert exchanged.status_code == 200, exchanged.text
+    token = str(_set_cookies(exchanged)[SESSION_COOKIE].value)
+    client.cookies.clear()
+    return token
+
+
+def test_logout_revokes_an_oidc_session(oidc_client: TestClient) -> None:
+    token = _session_token(_login(oidc_client))
+    headers = _cookie(SESSION_COOKIE, token)
+    assert oidc_client.get("/console/principal", headers=headers).status_code == 200
+
+    _assert_logged_out(_logout(oidc_client, headers))
+
+    (row,) = _sql("SELECT revoked_at FROM curie.console_sessions")
+    assert row["revoked_at"] is not None
+    after = oidc_client.get("/console/principal", headers=headers)
+    assert after.status_code == 401, after.text
+    # Revocation, not principal state: the principal is still active.
+    (principal,) = _principal_rows()
+    assert principal["status"] == "active"
+
+
+def test_logout_revokes_a_login_code_session_without_oidc(
+    plain_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    token = _login_code_session(plain_client, auth_headers)
+    headers = _cookie(SESSION_COOKIE, token)
+    assert plain_client.get("/console/session", headers=headers).status_code == 200
+
+    _assert_logged_out(_logout(plain_client, headers))
+
+    (row,) = _sql("SELECT revoked_at FROM curie.console_sessions")
+    assert row["revoked_at"] is not None
+    after = plain_client.get("/console/session", headers=headers)
+    assert after.status_code == 401, after.text
+
+
+def test_logout_revokes_only_the_presented_session(
+    plain_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    mine = _login_code_session(plain_client, auth_headers)
+    theirs = _login_code_session(plain_client, auth_headers)
+
+    _assert_logged_out(_logout(plain_client, _cookie(SESSION_COOKIE, mine)))
+
+    assert (
+        plain_client.get("/console/session", headers=_cookie(SESSION_COOKIE, mine)).status_code
+        == 401
+    )
+    assert (
+        plain_client.get("/console/session", headers=_cookie(SESSION_COOKIE, theirs)).status_code
+        == 200
+    )
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Cookie": f"{SESSION_COOKIE}=not-a-session"}],
+    ids=["no-cookie", "unknown-token"],
+)
+def test_logout_without_a_live_session_is_idempotent(
+    plain_client: TestClient, auth_headers: dict[str, str], headers: dict[str, str]
+) -> None:
+    bystander = _login_code_session(plain_client, auth_headers)
+
+    first = _logout(plain_client, headers)
+    second = _logout(plain_client, headers)
+
+    _assert_logged_out(first)
+    _assert_logged_out(second)
+    # No oracle: the same answer as a real logout, and nothing else revoked.
+    assert first.headers.get("content-length") == second.headers.get("content-length")
+    assert _sql("SELECT id FROM curie.console_sessions WHERE revoked_at IS NOT NULL") == []
+    assert (
+        plain_client.get("/console/session", headers=_cookie(SESSION_COOKIE, bystander)).status_code
+        == 200
+    )
+
+
+def test_logout_twice_with_the_same_token_is_idempotent(
+    plain_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    token = _login_code_session(plain_client, auth_headers)
+    headers = _cookie(SESSION_COOKIE, token)
+    _assert_logged_out(_logout(plain_client, headers))
+    (first,) = _sql("SELECT revoked_at FROM curie.console_sessions")
+
+    _assert_logged_out(_logout(plain_client, headers))
+    (second,) = _sql("SELECT revoked_at FROM curie.console_sessions")
+    assert second["revoked_at"] == first["revoked_at"]
+
+
+def test_logout_does_not_accept_the_platform_key_as_a_session(
+    oidc_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    oidc_token = _session_token(_login(oidc_client))
+    code_token = _login_code_session(oidc_client, auth_headers)
+
+    response = _logout(oidc_client, auth_headers)
+
+    _assert_logged_out(response)
+    assert _sql("SELECT id FROM curie.console_sessions WHERE revoked_at IS NOT NULL") == []
+    assert (
+        oidc_client.get(
+            "/console/principal", headers=_cookie(SESSION_COOKIE, oidc_token)
+        ).status_code
+        == 200
+    )
+    assert (
+        oidc_client.get("/console/session", headers=_cookie(SESSION_COOKIE, code_token)).status_code
+        == 200
+    )
+
+
+# --- issuer-bound principal sessions ------------------------------------------------
+
+
+@contextlib.contextmanager
+def _rebooted(env: dict[str, str | None]) -> Iterator[TestClient]:
+    """Boot a fresh app under ``env`` WITHOUT resetting principals or sessions.
+
+    Models an operator changing CURIE_OIDC_* and restarting the API while
+    browsers still hold session cookies minted before the restart.
+    """
+
+    with oidc_env(env):
+        from curie_api import oidc
+        from curie_api.main import create_app
+
+        oidc.reset_caches()
+        try:
+            with TestClient(create_app()) as client:
+                yield client
+        finally:
+            oidc.reset_caches()
+
+
+def _principal_status(client: TestClient, token: str) -> httpx.Response:
+    response = client.get("/console/principal", headers=_cookie(SESSION_COOKIE, token))
+    client.cookies.clear()
+    return response
+
+
+def _assert_uniform_principal_401(client: TestClient, response: httpx.Response) -> None:
+    assert response.status_code == 401, response.text
+    assert response.headers.get("cache-control") == "no-store"
+    unknown = client.get("/console/principal", headers=_cookie(SESSION_COOKIE, "not-a-session"))
+    assert response.json() == unknown.json()
+
+
+def test_session_is_refused_after_an_issuer_switch_and_readmitted_on_restore(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    token = _session_token(_login(oidc_client))
+    assert _principal_status(oidc_client, token).status_code == 200
+    (principal,) = _principal_rows()
+    assert principal["idp_issuer"] == idp.issuer
+
+    other_issuer = f"{idp.issuer}/some-other-tenant"
+    with _rebooted({**enabled_env(idp), "CURIE_OIDC_ISSUER": other_issuer}) as switched:
+        assert get_settings().oidc_issuer == other_issuer
+        _assert_uniform_principal_401(switched, _principal_status(switched, token))
+
+    # Nothing was revoked: the check compares issuers on every request.
+    (row,) = _sql("SELECT revoked_at FROM curie.console_sessions")
+    assert row["revoked_at"] is None
+    with _rebooted(enabled_env(idp)) as restored:
+        response = _principal_status(restored, token)
+        assert response.status_code == 200, response.text
+        assert response.json()["id"] == str(principal["id"])
+
+
+def test_session_is_refused_when_oidc_is_disabled_and_readmitted_on_restore(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    token = _session_token(_login(oidc_client))
+    assert _principal_status(oidc_client, token).status_code == 200
+
+    with _rebooted({}) as disabled:
+        assert get_settings().oidc_issuer == ""
+        _assert_uniform_principal_401(disabled, _principal_status(disabled, token))
+
+    (row,) = _sql("SELECT revoked_at FROM curie.console_sessions")
+    assert row["revoked_at"] is None
+    with _rebooted(enabled_env(idp)) as restored:
+        assert _principal_status(restored, token).status_code == 200

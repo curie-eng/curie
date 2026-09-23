@@ -147,6 +147,10 @@ class TestIdP:
     #: When set, ``/token`` answers a successful exchange with exactly these
     #: bytes (status 200, ``application/json``) instead of a JSON document.
     token_raw_body: bytes | None = None
+    #: Extra claims every ID token carries (e.g. ``groups`` or ``hd`` for the
+    #: required-claims admission tests). Unlike :attr:`token_claim_overrides`
+    #: these are part of :meth:`claims`, so directly minted tokens carry them too.
+    extra_claims: dict[str, Any] = field(default_factory=dict)
     subject: str = "idp-user-1"
     email: str | None = "alice@example.com"
     name: str | None = "Alice Example"
@@ -260,6 +264,7 @@ class TestIdP:
             claims["email"] = email
         if name is not None:
             claims["name"] = name
+        claims.update(self.extra_claims)
         return claims
 
     def mint_id_token(
@@ -536,6 +541,11 @@ OIDC_ENV_VARS = (
     "CURIE_OIDC_JWKS_URL",
     "CURIE_OIDC_CLIENT_SECRET",
     "CURIE_OIDC_REDIRECT_URI",
+    # Admission and scope settings: managed here too, so a test that does not
+    # name them boots with their defaults rather than an ambient value.
+    "CURIE_OIDC_REQUIRED_CLAIMS",
+    "CURIE_OIDC_ADMIT_ALL_AUTHENTICATED",
+    "CURIE_OIDC_SCOPES",
 )
 
 
