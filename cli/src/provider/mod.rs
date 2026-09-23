@@ -4,6 +4,7 @@
 //! where relevant, version ids. They do not carry material or backend stderr.
 
 pub mod aws;
+pub mod binding;
 mod catalog;
 pub mod eso;
 mod inventory;

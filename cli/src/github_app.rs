@@ -75,6 +75,30 @@ const JWT_LIFETIME_SECONDS: i64 = 480;
 /// the api pod fails to start on a Secret that is perfectly correct.
 pub const DEFAULT_APP_KEY_DATA_KEY: &str = "privateKey";
 
+fn provider_chart_held_commands(opts: &GithubAppOpts, clone_base: &str) -> Result<Vec<OpsCommand>> {
+    let binding =
+        crate::provider::binding::helm_ref("github-app-private-key", &opts.common.release)?;
+    let args = vec![
+        plain("upgrade"),
+        plain(&opts.common.release),
+        plain(&opts.chart),
+        plain("-n"),
+        plain(&opts.common.namespace),
+        plain("--reuse-values"),
+        plain("--set-string"),
+        plain(format!("api.githubAppId={}", opts.app_id.trim())),
+        plain("--set-string"),
+        plain(format!("{}={}", binding.secret_knob, binding.target)),
+        plain("--set-string"),
+        plain(format!("{}={}", binding.key_knob, binding.key)),
+        plain("--set"),
+        plain("api.githubAppPrivateKey="),
+        plain("--set"),
+        plain(format!("api.githubCloneBase={clone_base}")),
+    ];
+    Ok(vec![OpsCommand::new("helm", args)])
+}
+
 pub fn connect_commands(opts: &GithubAppOpts, clone_base: &str) -> Vec<OpsCommand> {
     let mut args = vec![
         plain("upgrade"),
@@ -382,6 +406,12 @@ pub(crate) fn guard_byo_key_conflict(
     let Some((name, key)) = configured_existing_secret(existing) else {
         return Ok(());
     };
+    // The provider's own inventory Secret is not an operator-managed BYO ref.
+    // A later `--private-key` rotates that object; an unrelated name still
+    // refuses, because the chart would keep reading the operator Secret.
+    if provider_owned_ref(opts, &name, &key)? {
+        return Ok(());
+    }
     // CliError::failure + with_fix rather than bail!, so the --json path emits
     // an actionable `fix` alongside `error` (ADR-0021) instead of an untyped
     // anyhow the agent driving the CLI cannot act on.
@@ -396,6 +426,21 @@ pub(crate) fn guard_byo_key_conflict(
          to go back to the chart-held key"
     ))
     .into())
+}
+
+fn provider_owned_ref(opts: &GithubAppOpts, name: &str, key: &str) -> Result<bool> {
+    let Some(installation) = crate::secrets::cwd_installation()? else {
+        return Ok(false);
+    };
+    if installation.secrets.is_none()
+        || installation.install.release != opts.common.release
+        || installation.install.namespace != opts.common.namespace
+    {
+        return Ok(false);
+    }
+    let binding =
+        crate::provider::binding::helm_ref("github-app-private-key", &opts.common.release)?;
+    Ok(name == binding.target && key == binding.key)
 }
 
 /// The refusal for a release whose `api.githubAppExistingSecret` is truthy to
@@ -1745,6 +1790,7 @@ pub(crate) async fn guard_app_identity(opts: &GithubAppOpts, clone_base: &str) -
 pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubAppOutput> {
     let ui = crate::ui::ui();
     require_connect_inputs(&opts)?;
+    let declared = crate::secrets::declared_scope(&opts.common.namespace, &opts.common.release)?;
 
     // On a real run helm must be on PATH before either the values read below
     // or the upgrade further down; a --dry-run has always worked with no
@@ -1759,6 +1805,8 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
 
     let cmds = if opts.disconnect {
         disconnect_commands(&opts)
+    } else if declared.is_some() && opts.existing_secret.trim().is_empty() {
+        provider_chart_held_commands(&opts, clone_base)?
     } else {
         connect_commands(&opts, clone_base)
     };
@@ -1797,6 +1845,27 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     // mutation. Disconnect has no credential to authenticate; dry-run is offline.
     if !opts.disconnect {
         guard_app_identity(&opts, clone_base).await?;
+    }
+    if let Some(installation) = &declared {
+        let provider = crate::secrets::provider_for_installation(installation)?
+            .context("declared secrets provider could not be constructed")?;
+        let binding =
+            crate::provider::binding::helm_ref("github-app-private-key", &opts.common.release)?;
+        if opts.disconnect {
+            crate::provider::binding::remove_json_key(
+                &provider,
+                binding.logical_name,
+                &binding.key,
+            )?;
+        } else {
+            let pem = load_connect_pem(&opts).await?;
+            crate::provider::binding::merge_json_key(
+                &provider,
+                binding.logical_name,
+                &binding.key,
+                &pem,
+            )?;
+        }
     }
     let expected_inventory = ExpectedSandboxInventory::from_values(revision_values.as_ref())?;
     let prior_sandboxes = read_desired_sandboxes(&opts, Some(prior_revision))
@@ -1971,6 +2040,9 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     // fullname, so a helm failure in the loop above no longer pays for a
     // discovery round-trip whose answer nothing reads (#1533). The live path
     // discovers the rendered name, which is override-proof.
+    if declared.is_some() && !opts.disconnect {
+        crate::provider::eso::sync_if_present(&opts.common.namespace, "github-app-private-key")?;
+    }
     let fullname = crate::ops::release_fullname(&opts.common.namespace, &opts.common.release).await;
     let rollout = rollout_commands(&opts.common.namespace, &fullname);
     let roll_label = format!("rolling {} to pick up the credential", opts.common.release);

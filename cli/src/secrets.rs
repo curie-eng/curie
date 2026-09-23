@@ -87,6 +87,34 @@ fn discover_provider(file: Option<&Path>) -> Result<Option<AwsSecretsProvider>> 
         .map(Option::flatten)
 }
 
+/// The installation in `./curie.yaml`, if that file exists.
+pub fn cwd_installation() -> Result<Option<crate::installation::Installation>> {
+    discover_installation(None)
+}
+
+/// The cwd installation when it declares a provider and names this release.
+///
+/// Absent file or absent `secrets:` is `Ok(None)`: callers keep today's
+/// in-cluster behavior. A declared provider whose namespace or release
+/// disagrees with the command is a usage error and writes nothing.
+pub fn declared_scope(
+    namespace: &str,
+    release: &str,
+) -> Result<Option<crate::installation::Installation>> {
+    let Some(installation) = cwd_installation()? else {
+        return Ok(None);
+    };
+    if installation.secrets.is_none() {
+        return Ok(None);
+    }
+    if installation.install.namespace != namespace || installation.install.release != release {
+        return Err(crate::exit::usage(
+            "curie.yaml install.namespace and install.release must match --namespace and --release when a secrets provider is declared",
+        ));
+    }
+    Ok(Some(installation))
+}
+
 /// Route `curie secrets set` through a declared provider or the existing local
 /// store. Provider input names one logical object and one JSON key.
 pub fn set_discovered(
