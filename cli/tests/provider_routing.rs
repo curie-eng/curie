@@ -1264,3 +1264,16 @@ fn a_preserved_slack_reference_is_routed_and_preflighted() {
         "slack-app-token",
     );
 }
+
+#[test]
+fn a_backslash_escaped_second_assignment_key_in_set_is_refused() {
+    // Helm unescapes `\T` to `T`, so `api.github\Token` assigns api.githubToken.
+    let smuggled = format!("ClusterIP,api.github\\\\Token={GITHUB_VALUE}");
+    let cfg = install(&format!("set:\n  ui.service.type: \"{smuggled}\"\n"));
+    let error = plan_with(&cfg, None, None).expect_err("escaped key must be refused");
+    let text = err_text(&error);
+    assert!(
+        !text.contains(GITHUB_VALUE),
+        "refusal leaked a value: {text}"
+    );
+}
