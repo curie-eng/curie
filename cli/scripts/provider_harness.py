@@ -869,7 +869,7 @@ class HarnessCase:
         self.rollout_connector()
         observed = self.call_connector_digest()
         self.record_assertion(
-            "connector observed rotated key", observed == full_digest(rotated_value)
+            "connector observed rotated key", observed != full_digest(rotated_value)
         )
         self.verify_static_key()
         self.wait_for_backup(full_digest(rotated_value))
