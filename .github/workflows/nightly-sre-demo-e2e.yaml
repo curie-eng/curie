@@ -244,4 +244,4 @@ jobs:
           retention-days: 7
       - name: Remove disposable local registry
         if: always()
-        run: docker rm -f sre-demo-registry || true
+        run: docker rm -fv sre-demo-registry || true
