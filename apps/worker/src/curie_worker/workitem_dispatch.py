@@ -27,6 +27,7 @@ _UUID = (
 )
 WORK_ITEM_EXECUTE_RE = re.compile(rf"^work-item-({_UUID})-execute-([1-9][0-9]*)$")
 WORK_ITEM_TERMINATE_RE = re.compile(rf"^work-item-({_UUID})-terminate$")
+WORK_ITEM_CI_RE = re.compile(rf"^work-item-({_UUID})-ci-([23])$")
 
 _HEARTBEAT_TRANSPORT_FAILURES = 3
 _MIN_HEARTBEAT_INTERVAL_S = 1.0
@@ -53,8 +54,13 @@ class WorkItemEvent:
     """Parsed work-item wake identity."""
 
     request_id: uuid.UUID
-    kind: Literal["execute", "terminate"]
+    kind: Literal["execute", "terminate", "ci"]
+    # The wake generation for ``execute``; the CI fix round for ``ci``.
     generation: int | None = None
+
+    @property
+    def is_ci_fix(self) -> bool:
+        return self.kind == "ci"
 
 
 @dataclass(frozen=True)
@@ -128,13 +134,24 @@ class TerminationObservation:
 
 
 def parse_work_item_event_id(event_id: str) -> WorkItemEvent | None:
-    """Parse execute or terminate work-item event ids; None for any other namespace."""
+    """Parse execute, CI-continuation, or terminate work-item event ids.
+
+    Returns None for any other namespace. A ``ci`` id is a continuation turn of
+    the same running request; ``generation`` carries its fix round (2 or 3).
+    """
 
     matched = WORK_ITEM_EXECUTE_RE.fullmatch(event_id)
     if matched is not None:
         return WorkItemEvent(
             request_id=uuid.UUID(matched.group(1)),
             kind="execute",
+            generation=int(matched.group(2)),
+        )
+    matched = WORK_ITEM_CI_RE.fullmatch(event_id)
+    if matched is not None:
+        return WorkItemEvent(
+            request_id=uuid.UUID(matched.group(1)),
+            kind="ci",
             generation=int(matched.group(2)),
         )
     matched = WORK_ITEM_TERMINATE_RE.fullmatch(event_id)

@@ -59,8 +59,9 @@ ConflictCode = Literal[
 ]
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
+_IN_FLIGHT_PUBLICATION = ("pending", "approved", "launching", "running")
 # Longest provider message a factory notice keeps (#3073).
-_NOTICE_DETAIL_MAX = 600
+_NOTICE_DETAIL_MAX = 1200
 
 _NO_READMIT: dict[str, Any] = {
     "readmit_request_id": None,
@@ -891,7 +892,11 @@ async def _terminalize_execution(
             session, "illegal_transition", work_item=work_item, request=request
         )
     now = await _database_now(session)
-    opened = status == "completed" and await _opened_pull_request(
+    # The CI gate's causes (#3097) end a request whose pull request already
+    # opened, so they share the opened-PR deadline exception. Keep this literal
+    # equal to ``factory_ci.CI_CAUSES`` (importing it here would be circular).
+    ci_cause = cause.strip() in {"ci_failed", "ci_timeout", "ci_unverified"}
+    opened = (status == "completed" or ci_cause) and await _opened_pull_request(
         session, work_item, request
     )
     deadline_elapsed = (
@@ -907,6 +912,38 @@ async def _terminalize_execution(
         return await _conflict(
             session, "illegal_transition", work_item=work_item, request=request
         )
+    if status == "failed" and cause.strip() == "ci_fix_unpublished":
+        # A CI fix turn that ended without a new publication is terminal, unless
+        # its publication is still in flight, or a fix publication already
+        # succeeded and awaits the CI gate's verdict; either one settles the
+        # request. Every succeeded publication after the request's first is a fix
+        # round's. The database does not record which of them the gate already
+        # judged failing, so a later round's unpublished turn defers here and the
+        # request ends at its execution deadline instead.
+        succeeded = (
+            select(Publication.id)
+            .where(
+                Publication.execution_request_id == request.id,
+                Publication.status == "succeeded",
+            )
+            .order_by(Publication.revision_number)
+            .offset(1)
+            .limit(1)
+        )
+        in_flight = await session.scalar(
+            select(Publication.id)
+            .where(
+                Publication.execution_request_id == request.id,
+                Publication.status.in_(_IN_FLIGHT_PUBLICATION),
+            )
+            .limit(1)
+        )
+        if in_flight is None:
+            in_flight = await session.scalar(succeeded)
+        if in_flight is not None:
+            return await _conflict(
+                session, "publication_pending", work_item=work_item, request=request
+            )
     if status == "failed" and cause.strip() == "no_pull_request":
         if await _publication_owns_terminus(session, work_item):
             return await _conflict(
@@ -998,6 +1035,141 @@ async def fail_execution(
         detail=None,
         extra_where=(),
     )
+
+
+async def _ci_fence_holds(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request_id: uuid.UUID,
+    publication_id: uuid.UUID,
+    head_sha: str,
+) -> bool:
+    """True while the CI gate's observation still describes the request (#3097).
+
+    Call with the WorkItem and request locked. The lineage row is locked
+    ``FOR SHARE``, which serializes against a publication advancing its head,
+    so a verdict for an older head can never be written after a newer push.
+    """
+
+    if work_item.publication_lineage_id is None:
+        return False
+    lineage_head = await session.scalar(
+        select(ThreadPublicationLineage.head_sha)
+        .where(ThreadPublicationLineage.id == work_item.publication_lineage_id)
+        .with_for_update(read=True)
+    )
+    if lineage_head != head_sha:
+        return False
+    latest = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request_id,
+            Publication.status == "succeeded",
+        )
+        .order_by(Publication.revision_number.desc())
+        .limit(1)
+    )
+    if latest != publication_id:
+        return False
+    in_flight = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request_id,
+            Publication.status.in_(_IN_FLIGHT_PUBLICATION),
+        )
+        .limit(1)
+    )
+    return in_flight is None
+
+
+async def settle_ci_verdict(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    expected_work_item_version: int,
+    expected_request_version: int,
+    expected_publication_id: uuid.UUID,
+    expected_head_sha: str,
+    status: Literal["completed", "failed"],
+    cause: str,
+    detail: str | None,
+) -> WorkItemResult:
+    """Write the CI gate's verdict, fenced to the observed publication and head.
+
+    A newer push, a publication in flight, or a moved head returns
+    ``stale_version`` and writes nothing; the next pass observes the new head.
+    """
+
+    work_item = await _lock_work_item(session, work_item_id)
+    request = (
+        await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
+        if work_item is not None
+        else None
+    )
+    if work_item is not None and request is not None and not await _ci_fence_holds(
+        session, work_item, request_id, expected_publication_id, expected_head_sha
+    ):
+        return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    return await _terminalize_execution(
+        session,
+        work_item_id=work_item_id,
+        request_id=request_id,
+        expected_work_item_version=expected_work_item_version,
+        expected_request_version=expected_request_version,
+        status=status,
+        cause=cause,
+        detail=detail,
+        extra_where=(),
+    )
+
+
+async def hold_for_ci_fix(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    expected_request_version: int,
+    expected_publication_id: uuid.UUID,
+    expected_head_sha: str,
+) -> bool:
+    """Hold a running request's lease to its deadline for a CI fix turn (#3097).
+
+    Fenced like ``settle_ci_verdict``: False, with nothing written, when the
+    observed publication or head is no longer current or the deadline passed.
+    """
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if work_item is None:
+        await session.commit()
+        return False
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
+    if (
+        request is None
+        or request.version != expected_request_version
+        or request.status != "running"
+        or not await _ci_fence_holds(
+            session, work_item, request_id, expected_publication_id, expected_head_sha
+        )
+    ):
+        await session.commit()
+        return False
+    changed_id: uuid.UUID | None = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request_id,
+            ExecutionRequest.version == expected_request_version,
+            ExecutionRequest.status == "running",
+            ExecutionRequest.execution_deadline > func.clock_timestamp(),
+        )
+        .values(
+            runtime_heartbeat_expires_at=ExecutionRequest.execution_deadline,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    await session.commit()
+    return changed_id is not None
 
 
 async def request_cancellation(
@@ -1486,6 +1658,19 @@ async def request_owner_lost_cancellation(
         return await _conflict(
             session, "illegal_transition", work_item=work_item, request=request
         )
+    published = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request.id,
+            Publication.status == "succeeded",
+        )
+        .limit(1)
+    )
+    if published is not None:
+        # A published request waits on CI; the CI gate owns its terminus.
+        return await _conflict(
+            session, "illegal_transition", work_item=work_item, request=request
+        )
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -1694,15 +1879,20 @@ class PublicationSettlement:
     work_item_version: int
     request_version: int
     cause: str
+    publication_id: uuid.UUID
 
 
 async def claim_publication_settlement(
     session: AsyncSession,
+    *,
+    exclude: frozenset[uuid.UUID],
 ) -> PublicationSettlement | None:
     """The only reader that decides a linked publication's execution terminus.
 
-    Callers then use ``complete_execution`` or ``fail_execution``. This function
-    does not commit and does not write the request.
+    Callers then use ``fail_execution``, or the CI gate for a ``completed``
+    settlement (#3097). ``exclude`` skips requests the caller already handled
+    this pass, so one request waiting on CI cannot starve the rest. This
+    function does not commit and does not write the request.
     """
 
     rows = (
@@ -1722,6 +1912,7 @@ async def claim_publication_settlement(
             .where(
                 ExecutionRequest.status == "running",
                 Publication.status.in_(("denied", "expired", "failed", "succeeded")),
+                *((ExecutionRequest.id.not_in(exclude),) if exclude else ()),
             )
             .order_by(ExecutionRequest.updated_at, Publication.revision_number.desc())
             .limit(20)
@@ -1736,7 +1927,7 @@ async def claim_publication_settlement(
         active = await session.scalar(
             select(Publication.id).where(
                 Publication.execution_request_id == request.id,
-                Publication.status.in_(("pending", "approved", "launching", "running")),
+                Publication.status.in_(_IN_FLIGHT_PUBLICATION),
             )
         )
         if active is not None:
@@ -1755,5 +1946,6 @@ async def claim_publication_settlement(
             work_item_version=work_item.version,
             request_version=request.version,
             cause=cause,
+            publication_id=publication.id,
         )
     return None
