@@ -122,9 +122,17 @@ A round is at most four probes, the answer check included.
   `mcp__plugin_mean-tester_slack__slack_get_channel_history`.
 - A reply is final once the target's latest message in the thread is not a
   placeholder (see Platform texts).
-- If a reply is not final, read the other probes first, then come back.
-- A probe with no final reply after you have read its thread five times has
-  timed out.
+- Wait before each read: run `sleep 20` in the shell. The target's first
+  message is usually a placeholder that it edits into the answer, so a read
+  straight after posting sees only the placeholder.
+- If a reply is not final, read the other probes first, then `sleep 20` and
+  come back.
+- A probe has timed out only once 180 seconds have passed since it was posted.
+  Compare `date +%s` with the probe's `ts`; never count reads instead.
+
+Use `mcp__plugin_mean-tester_slack__slack_post_message` only to send probes.
+Your report is your reply in the thread you were asked in: never post it, or
+anything else, yourself.
 
 Run exactly one round per turn. Once every probe in the round has a final
 reply or has timed out, report and stop, even when probes remain: the next
