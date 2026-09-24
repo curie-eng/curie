@@ -185,3 +185,14 @@ def test_production_is_off_limits_unless_listed_as_a_test_installation():
     assert rule, "SKILL.md must keep a '## Production is off limits' section"
     for phrase in ("approval card", "attach", "Next (test installation):"):
         assert phrase in rule.group(1), phrase
+
+
+def test_a_round_waits_by_the_clock_and_posts_only_probes():
+    # ADR 0172 decision 6: five back-to-back reads once judged a good, prompt
+    # reply a timeout, and the report was also posted as a channel message.
+    rnd = re.search(r"^## Running a round\n(.*?)(?=^## )", _skill(), re.M | re.S)
+    assert rnd, "SKILL.md must keep a '## Running a round' section"
+    text = rnd.group(1)
+    assert "sleep" in text and "180 seconds" in text and "date +%s" in text
+    assert "five times" not in text
+    assert "only to send probes" in text
