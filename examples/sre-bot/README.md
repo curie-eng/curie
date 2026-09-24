@@ -203,18 +203,25 @@ mounts its Secret through `extraVolumes` and `extraVolumeMounts` and leaves
 `extraSecretMounts` alone, so your token mount survives. Helm replaces lists,
 so an overlay of yours that sets `extraVolumes` or `extraVolumeMounts`, or
 restates the routes or receivers, collides with it whichever comes last: apply
-yours after it, carrying the heartbeat's entries. Re-running
+yours after it, carrying the heartbeat's entries, with the heartbeat route first
+(the first matching child route wins). Re-running
 `curie example sre-bot install --observability` upgrades the release with
 `prometheus-values.yaml` alone, which removes the overlays and turns
 Alertmanager off; run the command above again after it.
 
 The overlay adds `CurieAlertPathHeartbeat`, which always fires, and routes it
 only to that URL; it never reaches the bot. Without it, nothing watches the
-alert path. Posts stop within about a minute and a half of Prometheus stopping,
-so a service with a five-minute period alarms about six to seven minutes after
-the stop, plus its grace. The Secret's volume is optional: without the Secret or
-its `url` key Alertmanager still runs and every alert still reaches the bot;
-only the heartbeat posts fail, so the external service alarms.
+alert path. Posts stop within a few minutes of Prometheus stopping: one measured
+run saw the last post about a minute and a half after the stop, and Prometheus
+lets a firing alert stand in Alertmanager up to four minutes after its last
+send. With a five-minute period, allow about nine minutes plus the service's
+grace before it alarms.
+
+The Secret's volume is optional: without the Secret or its `url` key
+Alertmanager still runs and every alert still reaches the bot; only the
+heartbeat posts fail. A dead man's switch that never received a post usually
+does not alarm, so after the upgrade confirm the external service shows a first
+post. Only then does a stop in the posts raise its alarm.
 
 The heartbeat cannot see the last leg, from Alertmanager to the bot. Check that
 with one synthetic alert posted to Alertmanager's API:
@@ -227,8 +234,9 @@ kubectl -n observability exec prometheus-alertmanager-0 -- \
 ```
 
 Then wait for the bot's reply in the bound channel (`C0EXAMPLE1` above). The
-reply says coding is stopped, because the alert names no workload, and a
-second, resolved delivery follows about five minutes later. A missing reply
+alert names no workload, so the hook runs the investigation with coding
+stopped and the reply should say so. Because `curie-sre` sets `send_resolved`,
+expect a second, resolved delivery about five minutes later. A missing reply
 means the path is broken somewhere between Alertmanager and the bot.
 
 ## Verification

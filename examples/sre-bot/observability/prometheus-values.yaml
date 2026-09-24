@@ -578,10 +578,11 @@ serverFiles:
               summary: A kube-state-metrics scrape is failing
               description: >-
                 A kube-state-metrics target has failed its scrape, or none has
-                been scraped, for 5 minutes. The rules that read it then read
-                nothing and stay quiet whatever the cluster does: the mail
-                adapter, connector, dispatcher, core workload, state store and
-                crash loop rules, and the node rule's Ready term.
+                been scraped, for 5 minutes. The rules that read it may then
+                see nothing, or only part of what they read, and can stay
+                quiet whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
           - alert: CurieNodeMemoryHeadroomLow
             expr: |
               100 * (

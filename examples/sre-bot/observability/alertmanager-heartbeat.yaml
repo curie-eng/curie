@@ -18,14 +18,18 @@
 # extraSecretMounts, so it leaves the operator's token mount alone in either
 # order. An operator overlay that itself sets extraVolumes or extraVolumeMounts,
 # or restates the routes or receivers, collides with this file whichever is
-# applied last: apply it after this one, carrying the heartbeat's entries.
+# applied last: apply it after this one, carrying the heartbeat's entries, with
+# the heartbeat route first, since the first matching child route wins.
 #
 # Reads the Secret alertmanager-heartbeat, key `url`, in Alertmanager's
 # namespace, holding the external service's URL. The volume is optional:
 # without the Secret or its key Alertmanager still runs and every alert still
-# reaches the bot; only the heartbeat posts fail, so the external service
-# alarms. Posts arrive about every two minutes, not every repeat_interval, so
-# the external service should allow at least five minutes between posts.
+# reaches the bot; only the heartbeat posts fail. A dead man's switch that never
+# received a post usually does not alarm, so after the upgrade confirm the
+# external service shows a first post; only then does a stop in the posts
+# raise its alarm. Posts arrive about every two minutes, not every
+# repeat_interval, so the external service should allow at least five minutes
+# between posts.
 #
 # rule_files is a list too: the chart's four defaults, in order, so
 # alerting_rules.yml keeps loading, then heartbeat_rules.yml.
