@@ -430,6 +430,11 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
             assert "error: No valid patches in input" in observation.error
             assert "container exited" in observation.error
 
+            # The first pass released its lease while the Job was in flight.
+            # Reclaim before processing the terminal observation, as the drain does.
+            work = await store.claim_next()
+            assert work is not None
+            assert work.publication_id == FAILURE_ID
             await reconciler.reconcile(work)
             async with engine.connect() as connection:
                 terminal = (
