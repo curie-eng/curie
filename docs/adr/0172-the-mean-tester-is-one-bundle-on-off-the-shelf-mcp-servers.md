@@ -64,6 +64,11 @@ MCP servers preinstalled in the runner image, and it reports without filing.**
   - the GitHub server the image already carries.
 - The tester's Slack bot token, its team id and a read-only Git token are bundle
   secrets forwarded into the sandbox, as in `examples/github-issues`.
+- The channels it probes in and the repositories it reads are an
+  operator-edited list in the skill ("Where you work"). They replace the
+  connector's `MEAN_TESTER_CHANNELS` and `MEAN_TESTER_REPOS`. The runner does
+  not tell the agent which channel a request came from, so with several
+  channels the request names one.
 
 ### 2. Where the guardrails live now
 
@@ -107,9 +112,12 @@ reading Slack are the off-the-shelf server's.
   reads. Scope the Git token read-only to the listed repositories, and invite
   the tester only where it should probe.
 - The sandbox needs egress to Slack's API and GitHub's API:
-  `agentSandbox.connectorEgress.<agent>`, as for `examples/dark-factory`. Slack
-  publishes no stable range for its API, so that entry is in practice wider than
-  a connector's egress was.
+  `agentSandbox.connectorEgress.<agent>`, as for `examples/dark-factory`.
+  - The chart refuses a default route there, and any IPv4 prefix wider than
+    `/8`.
+  - GitHub publishes its API ranges.
+  - Slack publishes none for its API, so the operator adds `slack.com`'s
+    resolved addresses as `/32`s and refreshes them when they change.
 - Marking, caps and the Slack Connect refusal are now instructions, not code. A
   tester that disobeys its skill is seen in its own posts; nothing stops it.
 - Waiting for a final reply is the model rereading a thread. A slow target is
