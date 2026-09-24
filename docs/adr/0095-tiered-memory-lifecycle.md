@@ -4,7 +4,7 @@ Date: 2026-08-04
 
 Status: Draft
 
-**Folded into [ADR-0167](0167-agent-memory-is-an-index-with-detail-on-demand-and-private-spaces-keep-their-own.md). Not proposed for acceptance on its own.** ADR-0167
+**Folded into [ADR-0167](0167-agent-and-channel-memory-are-an-index-the-agent-writes-limited-by-an-inclusion-list.md). Not proposed for acceptance on its own.** ADR-0167
 carries forward agent and channel memory, the hard cap enforced at the API,
 and the trust posture, and decides them there. It drops the backlog bootstrap and the
 operator instructions layer, leaves the escape valve with
