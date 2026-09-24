@@ -1,14 +1,15 @@
-"""The parity ladder must run under the bash macOS ships.
+"""Curie's host scripts must run under the bash macOS ships.
 
-``curie dev e2e-ladder`` runs ``bash cli/scripts/e2e-ladder.sh`` with whatever
-``bash`` PATH names first, which on a stock Mac is ``/bin/bash`` 3.2. Two things
-3.2 refuses and bash 4.4+ accepts reached the local rung: ``[[ -v NAME ]]`` is a
-parse error that kills the whole script before any rung starts, and expanding an
-empty array under ``set -u`` is an ``unbound variable`` error at the point it
-runs. The executing tests need a 3.x interpreter, so they run where one exists:
-macOS ``/bin/bash``, or any interpreter named by ``CURIE_TEST_BASH3``. The
-source scan runs everywhere, so a Linux CI with bash 5 still refuses a known
-bash-4-only construct.
+``curie dev <verb>`` runs its script with whatever ``bash`` PATH names first,
+which on a stock Mac is ``/bin/bash`` 3.2, and the hand-run e2e scripts are
+started the same way. Two things 3.2 refuses and bash 4.4+ accepts reached the
+parity ladder's local rung: ``[[ -v NAME ]]`` is a parse error that kills the
+whole script before any rung starts, and expanding an empty array under
+``set -u`` is an ``unbound variable`` error at the point it runs. The executing
+tests need a 3.x interpreter, so they run where one exists: macOS
+``/bin/bash``, or any interpreter named by ``CURIE_TEST_BASH3``. The source scan
+runs everywhere, so a Linux CI with bash 5 still refuses a known bash-4-only
+construct in any script listed in ``HOST_SCRIPTS``.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LADDER_PATH = REPO_ROOT / "cli" / "scripts" / "e2e-ladder.sh"
+# Scripts a contributor runs on their own host, whose bash may be 3.2.
+HOST_SCRIPTS = [LADDER_PATH]
 
 
 def _bash3() -> str | None:
@@ -46,9 +49,9 @@ needs_bash3 = pytest.mark.skipif(
 )
 
 
-def _shell_function(source: str, name: str) -> str:
+def _shell_function(source: str, name: str, path: Path = LADDER_PATH) -> str:
     start_marker = f"{name}() {{"
-    assert start_marker in source, f"{LADDER_PATH}: missing {name}"
+    assert start_marker in source, f"{path}: missing {name}"
     start = source.index(start_marker)
     end = source.index("\n}\n", start) + len("\n}\n")
     return source[start:end]
@@ -66,19 +69,24 @@ BASH4_ONLY = {
 }
 
 
-def _bash4_only_lines(source: str) -> list[str]:
+def _bash4_only_lines(source: str, name: str = "<source>") -> list[str]:
     hits = []
     for number, line in enumerate(source.splitlines(), start=1):
         if line.lstrip().startswith("#"):
             continue
         for pattern, construct in BASH4_ONLY.items():
             if re.search(pattern, line):
-                hits.append(f"{LADDER_PATH.name}:{number}: {construct}: {line.strip()}")
+                hits.append(f"{name}:{number}: {construct}: {line.strip()}")
     return hits
 
 
-def test_ladder_uses_no_construct_bash_3_2_rejects() -> None:
-    hits = _bash4_only_lines(LADDER_PATH.read_text())
+def _script_id(path: Path) -> str:
+    return str(path.relative_to(REPO_ROOT))
+
+
+@pytest.mark.parametrize("script", HOST_SCRIPTS, ids=_script_id)
+def test_script_uses_no_construct_bash_3_2_rejects(script: Path) -> None:
+    hits = _bash4_only_lines(script.read_text(), _script_id(script))
     assert not hits, "bash 3.2 rejects:\n" + "\n".join(hits)
 
 
@@ -103,16 +111,17 @@ def test_the_source_scan_ignores_a_comment_that_names_a_construct() -> None:
 
 
 @needs_bash3
-def test_ladder_parses_under_bash_3_2() -> None:
+@pytest.mark.parametrize("script", HOST_SCRIPTS, ids=_script_id)
+def test_script_parses_under_bash_3_2(script: Path) -> None:
     result = subprocess.run(
-        [BASH3, "-n", str(LADDER_PATH)],
+        [BASH3, "-n", str(script)],
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 0, (
-        f"{LADDER_PATH} does not parse under {BASH3}, so every rung dies "
-        f"before it starts: {result.stderr}"
+        f"{script} does not parse under {BASH3}, so it dies before its first "
+        f"command: {result.stderr}"
     )
 
 
