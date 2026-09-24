@@ -65,6 +65,28 @@ ceiling. Kubernetes RBAC cannot restrict a patch to a friendly field, and there
 is no generic rollback for those changes. Approval controls the agent, not the
 credential: if the credential leaks, only RBAC remains.
 
+### Operator grant (opt-in)
+
+An operator who wants approved writes to reach workloads outside `sre-demo`
+applies `manifests/kubernetes-operator-access.yaml` after the default file. It
+binds the same `sre-bot-kubernetes` ServiceAccount to the aggregated
+ClusterRole `sre-bot-kubernetes-operator`: get, list, watch, create, update,
+patch, delete and deletecollection on every built-in kind in every namespace
+and at cluster scope, plus Curie's sandbox groups and the add-on groups the
+default reads. The six mutations above still require approval; RBAC is still
+the ceiling, now a much higher one.
+
+It withholds reading or writing Secrets, `serviceaccounts/token`, and the
+`escalate`, `bind`, `impersonate`, `approve` and `sign` verbs, so the credential
+cannot bind itself to `cluster-admin` or grant more than it holds. Several paths
+to Secret contents stay open behind approval: `pods/exec` and the kubelet's
+`nodes/proxy`, which can exec into any container; a pod that mounts a Secret or
+runs as any ServiceAccount and so acts with its grant; admission webhooks, which
+see the objects they match; and APIServices, which can redirect an API group.
+Under this grant approval is the real protection for Secret contents, and a
+leaked connector credential carries the whole grant with no approval in front
+of it. The file's header lists each path and the `kubectl auth can-i` checks.
+
 ## Platform publication
 
 Tool: `mcp__curie__publish_changes` through the `sre-approvals` route.

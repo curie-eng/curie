@@ -27,6 +27,21 @@ blast-radius ceiling: within `sre-demo`, an approved call can replace workload
 images, commands, and environment. Approval records intent; it does not narrow
 arguments. Review the manifest before widening that Role.
 
+An installation whose SRE bot should act on the workloads it diagnoses can opt
+in to the operator grant, after the default file:
+
+```bash
+kubectl apply -f examples/sre-bot/manifests/kubernetes-operator-access.yaml
+```
+
+It widens the same ServiceAccount's writes to every built-in kind in the
+cluster except Secrets and ServiceAccount tokens, with every write still
+behind approval. Read the file's header first: it lists what the grant
+withholds, the indirect paths to Secret contents that approval alone then
+guards, how a cluster adds its own CRD groups, the `kubectl auth can-i` checks,
+and the subject namespace to change for an install outside `curie`. The CLI
+does not apply it.
+
 ## Install
 
 Use this order for a fresh cluster. The example installer creates the platform
@@ -133,9 +148,10 @@ and traces. To diagnose a failed synthetic request:
 - Kubernetes writes have no general rollback. Scaling can be reversed only when
   the prior replica count was observed; deletes, execs, raw manifest updates,
   and pod runs need workload-specific recovery.
-- An approved call outside `sre-demo` still receives a Kubernetes 403. Fixing
-  that by widening RBAC is an operator security decision, never an approval
-  retry.
+- With the default grant, an approved call outside `sre-demo` still receives a
+  Kubernetes 403. Widening it is the operator grant
+  (`manifests/kubernetes-operator-access.yaml`), an operator security decision,
+  never an approval retry.
 
 ## Platform upgrades remain separate
 

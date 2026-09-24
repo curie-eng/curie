@@ -1,0 +1,207 @@
+# Opt-in operator grant for the pinned upstream Kubernetes MCP connector.
+#
+# kubernetes-access.yaml confines writes to workload APIs in `sre-demo`, so an
+# approved restart of a workload in any other namespace receives a 403 from
+# the API server. This file lets an installation's SRE bot act on the workloads
+# it diagnoses: it binds the same `curie:sre-bot-kubernetes` ServiceAccount to
+# one aggregated ClusterRole that can get, list, watch, create, update, patch,
+# delete and deletecollection every built-in kind, in every namespace and at
+# cluster scope, except what is withheld below. Every write still waits for
+# Curie's per-call approval; RBAC is still the ceiling, and this file raises
+# it. Applying it is an operator security decision, not an approval setting.
+#
+# Apply it after kubernetes-access.yaml, which owns the ServiceAccount, its
+# token and the read grant. The CLI never applies this file:
+#
+#   kubectl apply -f examples/sre-bot/manifests/kubernetes-access.yaml
+#   kubectl apply -f examples/sre-bot/manifests/kubernetes-operator-access.yaml
+#
+# An install outside namespace `curie` changes the binding subject's namespace
+# at the end of this file to its own.
+#
+# Withheld. RBAC has no deny rule, so each is withheld by never being granted:
+#
+# - Secrets: no verb on `secrets` in any namespace, so no Secret is read.
+# - serviceaccounts/token: no token is minted for any ServiceAccount, the
+#   bot's own included.
+# - escalate and bind: the API server refuses a Role, ClusterRole or binding
+#   that grants more than this file holds, a binding to cluster-admin included.
+#   A role or binding within what it already holds is still allowed.
+# - impersonate: the bot cannot act as another user, group or ServiceAccount.
+# - approve and sign: it cannot approve or issue a CertificateSigningRequest.
+#
+# Paths to Secret contents this grant leaves open, each still behind Curie's
+# approval:
+#
+# - pods/exec, pods/attach and pods/ephemeralcontainers, and the kubelet API
+#   through nodes/proxy, which can exec into any container on a node. A
+#   container's environment and files often carry Secret values.
+# - creating a Pod, or any workload that creates one, that mounts a Secret, or
+#   that runs as any ServiceAccount in its namespace and so acts with that
+#   account's grant.
+# - admission webhooks: a MutatingWebhookConfiguration or
+#   ValidatingWebhookConfiguration sends the objects it matches, Secrets
+#   included, to a service the bot names.
+# - apiregistration.k8s.io: an APIService can redirect a whole API group to a
+#   service the bot names.
+#
+# Approval is therefore the real protection under this grant, and approvers
+# should read each card as a call that could reach Secret contents. Approval
+# controls the agent, not the credential: a leaked connector credential
+# carries this whole grant, with no approval in front of it.
+#
+# A cluster's own CRD groups and cloud groups are not listed here, because
+# they belong to that installation. Add them with a ClusterRole of the
+# cluster's own carrying the label
+# curie.dev/aggregate-to-sre-bot-operator: "true"; the aggregation controller
+# folds its rules into sre-bot-kubernetes-operator. Never edit this file for
+# that. Keep such a role to the same verbs, and away from Secrets and tokens.
+#
+# Verify the ceiling after applying (the aggregated role fills within seconds):
+#
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     patch deployments -n kube-system                                # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     delete pods -n curie                                            # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     patch nodes                                                     # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     get secrets --all-namespaces                                    # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     create serviceaccounts --subresource=token -n curie             # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     escalate clusterroles                                           # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     bind clusterroles                                               # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     impersonate serviceaccounts                                     # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     approve signers.certificates.k8s.io                             # no
+#   kubectl create clusterrolebinding sre-bot-self-admin \
+#     --clusterrole=cluster-admin \
+#     --serviceaccount=curie:sre-bot-kubernetes \
+#     --as=system:serviceaccount:curie:sre-bot-kubernetes             # Forbidden
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-bot-kubernetes-operator
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        curie.dev/aggregate-to-sre-bot-operator: "true"
+# The aggregation controller writes the union of the labelled roles here.
+rules: []
+---
+# Core kinds and subresources, each by name: RBAC reads `pods/*` literally and
+# grants nothing through it. `secrets` and `serviceaccounts/token` are absent.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-bot-kubernetes-operator-core
+  labels:
+    curie.dev/aggregate-to-sre-bot-operator: "true"
+rules:
+  - apiGroups: [""]
+    resources:
+      - bindings
+      - componentstatuses
+      - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - namespaces/finalize
+      - namespaces/status
+      - nodes
+      - nodes/proxy
+      - nodes/status
+      - persistentvolumeclaims
+      - persistentvolumeclaims/status
+      - persistentvolumes
+      - persistentvolumes/status
+      - pods
+      - pods/attach
+      - pods/binding
+      - pods/ephemeralcontainers
+      - pods/eviction
+      - pods/exec
+      - pods/log
+      - pods/portforward
+      - pods/proxy
+      - pods/resize
+      - pods/status
+      - podtemplates
+      - replicationcontrollers
+      - replicationcontrollers/scale
+      - replicationcontrollers/status
+      - resourcequotas
+      - resourcequotas/status
+      - serviceaccounts
+      - services
+      - services/proxy
+      - services/status
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+---
+# Every built-in non-core group of current Kubernetes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-bot-kubernetes-operator-builtin
+  labels:
+    curie.dev/aggregate-to-sre-bot-operator: "true"
+rules:
+  - apiGroups:
+      - admissionregistration.k8s.io
+      - apiextensions.k8s.io
+      - apiregistration.k8s.io
+      - apps
+      - authentication.k8s.io
+      - authorization.k8s.io
+      - autoscaling
+      - batch
+      - certificates.k8s.io
+      - coordination.k8s.io
+      - discovery.k8s.io
+      - events.k8s.io
+      - flowcontrol.apiserver.k8s.io
+      - networking.k8s.io
+      - node.k8s.io
+      - policy
+      - rbac.authorization.k8s.io
+      - resource.k8s.io
+      - scheduling.k8s.io
+      - storage.k8s.io
+    resources: ["*"]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+---
+# Curie's own sandbox groups, and the add-on groups the default grant reads:
+# metrics-server's metrics.k8s.io and Argo CD's argoproj.io.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-bot-kubernetes-operator-addons
+  labels:
+    curie.dev/aggregate-to-sre-bot-operator: "true"
+rules:
+  - apiGroups:
+      - agents.x-k8s.io
+      - extensions.agents.x-k8s.io
+      - metrics.k8s.io
+      - argoproj.io
+    resources: ["*"]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-bot-kubernetes-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-bot-kubernetes-operator
+subjects:
+  - kind: ServiceAccount
+    name: sre-bot-kubernetes
+    # An install outside namespace `curie` changes this to its own.
+    namespace: curie
