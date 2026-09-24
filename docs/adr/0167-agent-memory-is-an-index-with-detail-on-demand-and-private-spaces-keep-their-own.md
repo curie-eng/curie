@@ -240,21 +240,26 @@ readable when asked for, and restorable. When the agent can't tell whether a
 fact is wrong or only outdated, it archives it, because archiving can be
 undone. Each topic's index line says how many archived facts it holds.
 
-**O. Conflicting instructions.** Two instructions can conflict while both are
-true records of what someone wants: Bob wants replies in threads, Alice wants
-them at the top level. (Two facts that conflict, like two different approvers,
-are not this: one is wrong, and that's a correction.) When a new instruction
-contradicts one already in the index, the agent raises it before saving: "Bob
-asked for replies in threads on 09-01. Record yours anyway?" If the person
-insists and the kind is allowed, both are recorded, each with its author and
-date, linked as conflicting, and loaded together under a note naming both
-people so the model doesn't silently pick one. An operator can bind an
-approval route whose approver set
-([ADR-0034](0034-approval-authorizers-resolve-membership-in-the-api.md)) settles
-conflicts: it's sent a card asking which instruction stands, and the other is
-archived. Without one, both stay, the agent mentions the conflict when it
-matters, and an operator can settle it through the document (J). A general
-notion of who outranks whom is future work.
+**O. Conflicting instructions: an explicit overwrite, with no tie-breaker.**
+Two instructions can conflict while both are true records of what someone
+wants: Bob wants replies in threads, Alice wants them at the top level. (Two
+facts that conflict, like two different approvers, are not this: one is wrong,
+and that's a correction.) Curie has no roles or hierarchy, so there is nobody
+to break the tie. Instead:
+
+- When a new instruction contradicts one already in memory, the agent does not
+  save it. It tells the person what they would be replacing and who asked for
+  it: "Bob asked for replies in threads on 09-01. Replace it with yours?"
+- Only an explicit yes overwrites it. The new instruction is saved under the
+  new person's name, and the earlier one is archived with its author and date
+  (N), since it was a true record of what someone wanted.
+- Without an explicit yes, nothing changes.
+
+Any person in the space can do this. So the last person to decide
+deliberately wins, and two people can keep replacing each other's
+instructions. That is a limit of having no roles, not something memory should
+solve on its own; roles and hierarchy are
+[#3063](https://github.com/curie-eng/curie/issues/3063).
 
 **P. Nothing comes back on its own, and removal is deliberate.** The store
 remembers facts that were corrected away or deleted, and refuses a save that
@@ -313,6 +318,12 @@ and one the runner can't read look the same.
 - **Let agent memory learn from private spaces, trusting the model to skip
   private facts.** No. A misjudgement there reaches the most people, so the
   rule is mechanical (C).
+- **Record both conflicting instructions, or have an approver set pick one.**
+  No. Recording both leaves the model to choose between them. An approver set
+  would be a stand-in for roles that Curie doesn't have yet; that belongs to
+  [#3063](https://github.com/curie-eng/curie/issues/3063). An explicit
+  overwrite, with the person told what they're replacing, is honest about the
+  missing tie-breaker.
 - **Require operator approval for agent-memory writes.** No. Writes are
   common, approval would make agent memory impractical, and it would put a
   third party in front of facts people didn't address to them.
@@ -372,6 +383,9 @@ and one the runner can't read look the same.
 - "Who owns what" stores people's names as role facts, which is personal data.
   Asking the agent to forget only archives; a person who wants a fact removed
   asks an operator (P).
+- There is no tie-breaker for conflicting instructions. The last explicit
+  overwrite wins, and two people can keep overwriting each other until roles
+  exist ([#3063](https://github.com/curie-eng/curie/issues/3063)).
 - "How to work here" lets anyone in a space give the agent standing
   instructions. Q marks them, but an agent whose side effects aren't behind
   approvals is exposed to a harmful one.
@@ -413,8 +427,9 @@ and one the runner can't read look the same.
 11. "Forget that" archives the fact and says so; `restore` brings it back; a
     save matching an archived fact is refused with a pointer; a corrected-away
     or deleted fact isn't re-saved from the conversation.
-12. A conflicting instruction is raised before saving, both are recorded when
-    the person insists, and a bound approver set's choice archives the other.
+12. A conflicting instruction is not saved until the person is told what it
+    replaces and who asked for it; an explicit yes saves it under their name
+    and archives the earlier one; anything else leaves memory unchanged.
 13. "How to work here" facts load under the header for people's requests, with
     author and date, below the bundle's prompt.
 14. A reply containing the exact statement of a fact its destination can't see
@@ -431,6 +446,5 @@ and one the runner can't read look the same.
 | [0095](0095-tiered-memory-lifecycle.md) (Draft) | Everything at once: tiers, history seeding, compaction, instructions layer, cap, Slack lookup | Folded in. Becomes `Superseded by ADR-0167` on acceptance. |
 | [0111](0111-the-default-memory-compaction-algorithm.md) (Draft) | Scheduled compaction | Folded in. Memory is not compacted at all. |
 | [0029](0029-conversation-history-port-and-first-loader.md) (Accepted) | Thread transcripts | Unchanged. Transcripts are not memory. |
-| [0034](0034-approval-authorizers-resolve-membership-in-the-api.md) (Accepted) | Approver sets | Reused to settle conflicting instructions (O). |
 | [0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) | Scheduled turns | Unchanged. Not needed here. |
 | [0100](0100-agents-search-their-own-surface-through-the-channel-port.md) (Draft) | Searching raw channel history | Unchanged. Not needed here. |
