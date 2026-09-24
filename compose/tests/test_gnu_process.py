@@ -204,16 +204,24 @@ def test_timeout_on_expiry_reaches_the_command_group_unless_foreground(
 
 @pytest.mark.parametrize("implementation", _implementations("timeout"))
 @pytest.mark.parametrize(
-    ("command", "status"),
+    ("command", "shell_status"),
     [
-        (["sh", "-c", "echo ready; exec sleep 30"], -15),
+        (["sh", "-c", "echo ready; exec sleep 30"], 128 + 15),
         (["sh", "-c", "trap 'exit 7' TERM; echo ready; sleep 30 & wait"], 7),
     ],
     ids=["the-command-dies-of-it", "the-command-traps-it"],
 )
 def test_timeout_passes_a_term_it_receives_to_the_command(
-    implementation: list[str], command: list[str], status: int
+    implementation: list[str], command: list[str], shell_status: int
 ) -> None:
+    """Every caller is a shell, so this is the status a shell reads.
+
+    When the command dies of the TERM passed to it, GNU coreutils 9.1 and 9.7
+    in Debian images re-raise it (a returncode of -15), while the GNU timeout
+    on the ubuntu-24.04 Actions runner exits 143 without a warning (CI run
+    36041307028). A shell reads 143 from both.
+    """
+
     _require_a_group_of_its_own(implementation)
     process = subprocess.Popen(
         [*implementation, "30", *command], stdout=subprocess.PIPE, text=True
@@ -222,7 +230,8 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
         assert process.stdout is not None
         assert process.stdout.readline() == "ready\n"
         process.terminate()
-        assert process.wait(timeout=10) == status
+        returncode = process.wait(timeout=10)
+        assert (128 - returncode if returncode < 0 else returncode) == shell_status
     finally:
         process.kill()
         process.wait()
