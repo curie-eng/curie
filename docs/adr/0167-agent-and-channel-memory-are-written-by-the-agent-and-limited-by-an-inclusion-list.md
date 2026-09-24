@@ -1,4 +1,4 @@
-# 167. Agent and channel memory are an index the agent writes, limited by an inclusion list
+# 167. Agent and channel memory are written by the agent and limited by an inclusion list
 
 Date: 2026-09-21
 
@@ -39,7 +39,7 @@ same way. Two agents in the same channel do not share memory.
 **Give the agent tools and let it keep its own memory.** The platform provides
 a small set of tools (below), stores what the agent writes, and loads it at
 the start of every session. Deciding what is worth saving, correcting a fact
-that turned out wrong, and archiving one that no longer applies are the
+that turned out wrong, and forgetting one that no longer applies are the
 agent's job, taught through the tools' descriptions. The platform doesn't
 police them.
 
@@ -52,17 +52,20 @@ controls what may travel between channels: agent memory's default list is
 empty, so nothing the agent learns reaches every channel unless an operator
 allows it.
 
-**How memory is kept: Claude Code's design, made more proactive.** Claude Code
-keeps a short index that is always loaded, holds detail that is read only when
-needed, checks the index's size on every write, and never compacts memory. We
-copy that. The difference is that a Curie agent saves facts of the allowed
-kinds whenever they come up, not only when someone says "remember this,"
-because its work is ongoing and its memory is its only durable record.
+**How memory is kept as it grows is left to the user.** The core stores facts
+and loads them at boot, within the store's existing limits. How memory is
+organised once it outgrows the prompt, and whether it is ever compacted, are
+separate choices an operator makes per agent, delivered as optional packages:
 
-**No compaction.** Compaction lets a model decide which facts to drop. It will
-sometimes drop correct ones, and a fact that is irrelevant today can matter
-again. A fact that no longer belongs in the index can instead stay stored and
-simply not be loaded, which gives the same result without the loss.
+- an index with detail read on demand, the way Claude Code keeps memory
+  ([#3112](https://github.com/curie-eng/curie/issues/3112));
+- scheduled compaction from past conversations, the way ChatGPT keeps memory
+  ([#3113](https://github.com/curie-eng/curie/issues/3113)).
+
+The two make different trade-offs between cost, recall, and the risk of
+dropping a correct fact, so neither is the platform's default to impose. Two
+real strategies are also what [ADR-0016](0016-swappable-jobs-around-an-opinionated-core.md)
+asks for before a plug-in point is built.
 
 ### The tools
 
@@ -71,15 +74,15 @@ memory on for the agent; upgrading does not turn it on.
 
 | Tool | What it does |
 |---|---|
-| `remember` | Saves a fact to agent or channel memory: a kind, a one-line statement, and optional detail. Given the id of an existing fact, it replaces it. |
-| `read` | Returns one fact with its detail, or all facts of one kind, newest first. Archived facts are returned only when asked for. |
-| `archive` | Moves a fact out of the loaded index, keeping it stored and readable. |
-| `restore` | Moves an archived fact back into the index. |
+| `remember` | Saves a fact to agent or channel memory: a kind and a statement. Given the id of an existing fact, it replaces it. |
+| `forget` | Removes a fact by id. |
 
 Channel memory always means the channel the current message came from; the
 tools take no channel argument. The tools' descriptions list the kinds the
 inclusion list allows for each memory, so the model sees exactly what it may
-save.
+save. The agent saves facts of the allowed kinds whenever they come up, not
+only when someone says "remember this," because its work is ongoing and its
+memory is its only durable record. A memory package can add tools of its own.
 
 ### The inclusion list
 
@@ -104,20 +107,15 @@ secrets.
 
 ### What the platform stores and loads
 
-- **One row per fact:** its id, memory, kind, statement, optional detail,
-  whether it is archived, and its provenance: who stated it and when. The
-  platform fills in the author from the message sender, because memory is used
-  far from where it was said and the source keeps it accountable. The model
-  cannot set the author.
-- **At boot,** the session gets an index of agent memory and of this channel's
-  memory: each current fact's statement, with its id and the date it was
-  stated. Detail and archived facts are not loaded; the agent reads them when
-  it needs them.
-- **The index is capped** at Claude Code's limit, 200 lines or 25 KB, measured
-  on every save. Near the cap, the save succeeds and the tool tells the agent
-  to shorten the index by moving detail out of statements or archiving facts
-  that no longer apply. Past the cap, the oldest facts leave the index at the
-  next boot and stay readable.
+- **One row per fact:** its id, memory, kind, statement, and provenance: who
+  stated it and when. The platform fills in the author from the message
+  sender, because memory is used far from where it was said and the source
+  keeps it accountable. The model cannot set the author.
+- **At boot,** the session gets agent memory and this channel's memory, with
+  each fact's id and the date it was stated.
+- **Size** is bounded by the state store's existing limits. A save that would
+  exceed them is refused and reported to the agent as refused. Keeping memory
+  within them as it grows is what the packages above are for.
 - **The operator's `curie cluster memory` command** writes to agent or channel
   memory from a file, and can list and delete facts.
 
@@ -128,24 +126,24 @@ secrets.
   checking replies on the way out). Rejected as over-design. The inclusion
   list already decides what may reach agent memory, and an operator who allows
   agent-memory kinds is choosing to let those facts travel.
-- **Compaction, or ChatGPT-style background rewriting of memory.** Rejected:
-  both let a model drop correct facts, and background rewriting depends on
-  re-reading every raw conversation on a schedule.
+- **Choose one growth strategy for every agent.** Rejected. An index with
+  detail on demand never drops a fact but loads less as memory grows;
+  scheduled compaction recalls more but costs more and can drop correct facts.
+  Which matters more depends on the agent, so both are optional packages
+  (#3112, #3113).
 - **The bundle declares the inclusion list.** Rejected in favour of an
   operator setting: what may be remembered is a policy for the deployment,
   like approval routes, and keeping it off the bundle manifest avoids a frozen
   contract change.
 - **Save only when a person says "remember this."** Rejected: an agent whose
   only durable record is its memory would forget most of what it's told.
-- **Version history on facts.** Rejected. Replacing a fact overwrites it;
-  archiving keeps facts that stopped applying.
+- **Version history on facts.** Rejected. Replacing a fact overwrites it.
 - **A per-person memory.** Rejected. A direct message is already a channel with
   its own channel memory.
 - **Seeding memory from a channel's history**
   ([ADR-0095](0095-tiered-memory-lifecycle.md)). Rejected: it needs new Slack
   permissions and a re-consent in every workspace.
-- **A vector database.** Rejected: the index fits in context and facts are
-  read by id or kind.
+- **A vector database.** Not part of the core. A package could add one.
 
 ## Consequences
 
@@ -168,6 +166,9 @@ secrets.
   the inclusion list, not a platform guarantee. An operator who adds kinds to
   agent memory accepts that a fact from any channel, including a direct
   message, may reach every channel.
+- Loading every fact at boot is fine while memory is small. An agent that
+  saves often will outgrow it and need one of the packages; until then, saves
+  are refused at the store's limit.
 - The existing single `log` row migrates into agent memory as facts with no
   kind restriction and no author.
 - [ADR-0095](0095-tiered-memory-lifecycle.md) and
@@ -182,12 +183,10 @@ secrets.
    tools are mounted.
 3. With the default list, nothing can be written to agent memory; after an
    operator adds a kind, facts of that kind can.
-4. The index loads each fact's statement and date, not its detail; `read`
-   returns the detail.
-5. Near the cap, a save succeeds with a reminder; past it, the oldest facts
-   leave the index and stay readable.
-6. `archive` removes a fact from the index and `restore` returns it.
-7. A fact records its author from the message sender, and the model cannot set
+4. `remember` with an existing id replaces that fact, and `forget` removes it.
+5. A save past the store's limit is refused and reported to the agent as
+   refused.
+6. A fact records its author from the message sender, and the model cannot set
    it.
 
 ## Related ADRs
@@ -196,5 +195,5 @@ secrets.
 |---|---|---|
 | [0025](0025-memory-port-and-first-loader.md) (Accepted) | The store, loading at boot, the entry format | Unchanged. This builds on it. |
 | [0095](0095-tiered-memory-lifecycle.md) (Draft) | A larger memory lifecycle: tiers, history seeding, compaction, an instructions layer, a cap, Slack lookup | Folded in. Becomes `Superseded by ADR-0167` on acceptance. |
-| [0111](0111-the-default-memory-compaction-algorithm.md) (Draft) | Scheduled compaction | Folded in. Memory is not compacted. |
+| [0111](0111-the-default-memory-compaction-algorithm.md) (Draft) | Scheduled compaction | Folded in. Compaction becomes an optional package (#3113). |
 | [0029](0029-conversation-history-port-and-first-loader.md) (Accepted) | Thread transcripts | Unchanged. Transcripts are not memory. |
