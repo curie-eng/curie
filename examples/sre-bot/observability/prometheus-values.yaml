@@ -359,6 +359,131 @@ serverFiles:
                 A dispatcher container restarted three or more times in 30
                 minutes. While it is down no Slack message reaches any agent,
                 and every other pod still looks healthy.
+          - alert: CurieNodeNotReady
+            # Testing the status="true" series for 0 catches Unknown as well
+            # as False. A node that stops reporting goes Unknown, which a
+            # status="false" rule would miss.
+            expr: |
+              kube_node_status_condition{condition="Ready",status="true"} == 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-node
+            annotations:
+              summary: A node is not Ready
+              description: >-
+                A node has not reported Ready for 5 minutes. Pods on it stop
+                being scheduled, and a sandbox placed there cannot start.
+          - alert: CuriePodCrashLooping
+            # max_over_time, not the raw series: the waiting series exists
+            # only while the container waits, so each brief run between
+            # back-offs would drop it and restart the `for` clock. Held over
+            # 5m, a container that flaps between waiting and running stays
+            # firing.
+            expr: |
+              max_over_time(
+                kube_pod_container_status_waiting_reason{
+                  reason="CrashLoopBackOff"
+                }[5m]
+              ) >= 1
+            for: 10m
+            labels:
+              severity: page
+              component: curie-pod
+            annotations:
+              summary: A container is crash-looping
+              description: >-
+                A container has been in CrashLoopBackOff for 10 minutes. It
+                keeps failing on start and waits longer before each retry.
+          - alert: CurieCoreWorkloadNotReady
+            # Same two terms as the mail adapter, for the same reason. The
+            # role regex also matches `<release>-langfuse-worker`, which is
+            # Langfuse's worker and not Curie's, and a connector whose name
+            # ends in a role, which CurieConnectorNotReady already owns. The
+            # second matcher drops both.
+            expr: |
+              (
+                kube_deployment_status_replicas_unavailable{
+                  deployment=~".+-(api|worker|dispatcher)",
+                  deployment!~".*-(mcp|langfuse)-.*"
+                } > 0
+              )
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment=~".+-(api|worker|dispatcher)",
+                  deployment!~".*-(mcp|langfuse)-.*"
+                } == 0
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-core
+            annotations:
+              summary: A core Curie Deployment is not serving
+              description: >-
+                The api, worker or dispatcher has no available replica, or has
+                been scaled to zero. The api readiness probe queries the
+                database, so a database outage, including one outside the
+                cluster, surfaces here as an unavailable api.
+          - alert: CurieStateStoreNotReady
+            # Two terms, because ready < replicas is 0 < 0 at zero replicas.
+            # No `on (...)`: both series share every label but __name__, so
+            # both terms yield the same label set, and a store going from not
+            # ready to scaled to zero keeps firing instead of restarting the
+            # 5m wait under new labels.
+            expr: |
+              (
+                kube_statefulset_status_replicas_ready{
+                  statefulset=~".+-(valkey|postgres)"
+                }
+                <
+                kube_statefulset_replicas{
+                  statefulset=~".+-(valkey|postgres)"
+                }
+              )
+              or
+              (
+                kube_statefulset_replicas{
+                  statefulset=~".+-(valkey|postgres)"
+                } == 0
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-state
+            annotations:
+              summary: Valkey or Postgres is not ready
+              description: >-
+                A Valkey or Postgres StatefulSet has fewer ready replicas than
+                it asks for, or has been scaled to zero. Every agent depends
+                on both: Valkey carries the run queue and Postgres the agents
+                and their state.
+          - alert: CuriePersistentVolumeSpaceLow
+            # Filtered on the curie_source stamp like the node rules below:
+            # these come from the kubelet via the node-role scrape, which is
+            # not namespace bounded, so the stamp is what marks a series as
+            # this stack's own. An unstamped series belongs to another source.
+            expr: |
+              (
+                kubelet_volume_stats_available_bytes{
+                  curie_source="curie-sre-bot"
+                }
+                /
+                kubelet_volume_stats_capacity_bytes{
+                  curie_source="curie-sre-bot"
+                }
+              ) < 0.10
+            for: 15m
+            labels:
+              severity: page
+              component: curie-storage
+            annotations:
+              summary: A persistent volume has less than 10 percent free
+              description: >-
+                A curie_source=curie-sre-bot volume series has stayed below 10
+                percent free for 15 minutes. A full volume stops the workload
+                that writes to it.
           - alert: CurieNodeMemoryHeadroomLow
             expr: |
               100 * (
