@@ -4,7 +4,7 @@ Date: 2026-08-17
 
 Status: Draft
 
-**Folded into [ADR-0167](0167-two-memory-tiers-written-by-the-agent-capped-by-the-platform-and-policed-by-the-bundle.md). Not proposed for acceptance on its own.** ADR-0167
+**Folded into [ADR-0167](0167-agent-memory-is-an-index-with-detail-on-demand-and-private-spaces-keep-their-own.md). Not proposed for acceptance on its own.** ADR-0167
 decides the write path this document assumed was unnecessary (clause 2) and
 does not compact memory at all: a capped index with detail read on demand
 keeps what each session loads small. When ADR-0167 is Accepted, this line becomes

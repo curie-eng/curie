@@ -4,9 +4,9 @@ Date: 2026-08-04
 
 Status: Draft
 
-**Folded into [ADR-0167](0167-two-memory-tiers-written-by-the-agent-capped-by-the-platform-and-policed-by-the-bundle.md). Not proposed for acceptance on its own.** ADR-0167
-carries forward the two tiers, the hard cap enforced at the API, and the trust
-posture, and decides them there. It drops the backlog bootstrap and the
+**Folded into [ADR-0167](0167-agent-memory-is-an-index-with-detail-on-demand-and-private-spaces-keep-their-own.md). Not proposed for acceptance on its own.** ADR-0167
+carries forward agent and channel memory, the hard cap enforced at the API,
+and the trust posture, and decides them there. It drops the backlog bootstrap and the
 operator instructions layer, leaves the escape valve with
 [ADR-0100](0100-agents-search-their-own-surface-through-the-channel-port.md),
 and sequences compaction behind the cap. When ADR-0167 is Accepted, this line
