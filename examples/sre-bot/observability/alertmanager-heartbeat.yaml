@@ -1,5 +1,6 @@
 # Opt-in heartbeat for the alert path (#3059). Apply this overlay last, after
-# alertmanager-webhook.yaml and any overlay of your own. It adds
+# prometheus-values.yaml, alertmanager-webhook.yaml and your own overlay (the
+# one that mounts the alert-signer token through extraSecretMounts). It adds
 # CurieAlertPathHeartbeat, a rule that always fires, and routes it only to a
 # `heartbeat` receiver that posts to a dead man's switch outside the cluster,
 # which alarms when the posts stop. The heartbeat never reaches curie-sre, the
@@ -13,29 +14,32 @@
 #
 # Helm replaces lists instead of merging them, so this file restates the route
 # tree and receivers, with curie-sre exactly as alertmanager-webhook.yaml has
-# it. An operator overlay applied after this one replaces them again and must
-# keep the heartbeat route and receiver. extraSecretMounts is replaced the same
-# way: any mount already there, such as the alert-signer token that curie-sre's
-# credentials_file needs, must be carried in the overlay applied last, which in
-# the README's order is this one, so add it to the list below.
+# it. The Secret is mounted through extraVolumes and extraVolumeMounts, not
+# extraSecretMounts, so it leaves the operator's token mount alone in either
+# order. An operator overlay that itself sets extraVolumes or extraVolumeMounts,
+# or restates the routes or receivers, collides with this file whichever is
+# applied last: apply it after this one, carrying the heartbeat's entries.
 #
 # Reads the Secret alertmanager-heartbeat, key `url`, in Alertmanager's
-# namespace, holding the external service's URL. The mount is optional: without
-# the Secret or its key Alertmanager still runs and every alert still reaches
-# the bot; only the heartbeat posts fail, so the external service alarms. Posts
-# arrive about every two minutes, not every repeat_interval, so the external
-# service should allow at least five minutes between posts.
+# namespace, holding the external service's URL. The volume is optional:
+# without the Secret or its key Alertmanager still runs and every alert still
+# reaches the bot; only the heartbeat posts fail, so the external service
+# alarms. Posts arrive about every two minutes, not every repeat_interval, so
+# the external service should allow at least five minutes between posts.
 #
 # rule_files is a list too: the chart's four defaults, in order, so
 # alerting_rules.yml keeps loading, then heartbeat_rules.yml.
 alertmanager:
   enabled: true
-  extraSecretMounts:
+  extraVolumes:
+    - name: alertmanager-heartbeat
+      secret:
+        secretName: alertmanager-heartbeat
+        optional: true
+  extraVolumeMounts:
     - name: alertmanager-heartbeat
       mountPath: /etc/alertmanager-heartbeat
-      secretName: alertmanager-heartbeat
       readOnly: true
-      optional: true
   config:
     route:
       receiver: curie-sre

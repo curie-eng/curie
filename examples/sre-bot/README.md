@@ -185,8 +185,8 @@ kubectl -n observability create secret generic alertmanager-heartbeat \
 ```
 
 Then upgrade the Prometheus release with the overlays in this order, the
-heartbeat overlay last. `my-alertmanager.yaml` stands for your own overlay, if
-you have one:
+heartbeat overlay last. `my-alertmanager.yaml` stands for your own overlay, the
+one that mounts the alert-signer token through `extraSecretMounts`:
 
 ```bash
 helm upgrade prometheus prometheus-community/prometheus --version 29.27.0 \
@@ -198,11 +198,12 @@ helm upgrade prometheus prometheus-community/prometheus --version 29.27.0 \
 ```
 
 The heartbeat overlay goes after the webhook overlay: the other way round the
-config is invalid (`undefined receiver "heartbeat"`). Helm replaces lists, so
-the heartbeat overlay's `extraSecretMounts` replaces yours. Add each mount you
-already have, such as the alert-signer token the `curie-sre` receiver's
-`credentials_file` reads, to that list in `alertmanager-heartbeat.yaml`, or the
-bot's receiver loses it while the heartbeat keeps arriving. Re-running
+config is invalid (`undefined receiver "heartbeat"`). The heartbeat overlay
+mounts its Secret through `extraVolumes` and `extraVolumeMounts` and leaves
+`extraSecretMounts` alone, so your token mount survives. Helm replaces lists,
+so an overlay of yours that sets `extraVolumes` or `extraVolumeMounts`, or
+restates the routes or receivers, collides with it whichever comes last: apply
+yours after it, carrying the heartbeat's entries. Re-running
 `curie example sre-bot install --observability` upgrades the release with
 `prometheus-values.yaml` alone, which removes the overlays and turns
 Alertmanager off; run the command above again after it.
@@ -211,7 +212,7 @@ The overlay adds `CurieAlertPathHeartbeat`, which always fires, and routes it
 only to that URL; it never reaches the bot. Without it, nothing watches the
 alert path. Posts stop within about a minute and a half of Prometheus stopping,
 so a service with a five-minute period alarms about six to seven minutes after
-the stop, plus its grace. The Secret mount is optional: without the Secret or
+the stop, plus its grace. The Secret's volume is optional: without the Secret or
 its `url` key Alertmanager still runs and every alert still reaches the bot;
 only the heartbeat posts fail, so the external service alarms.
 
