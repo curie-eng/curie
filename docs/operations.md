@@ -838,8 +838,10 @@ other bundle can take its place; the platform does not require this one.
 The bundle reads the issue through the GitHub MCP server the runner image
 preinstalls, with its own `GITHUB_PERSONAL_ACCESS_TOKEN` bound at deploy
 (`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). Give it a token
-limited to **Issues: Read**. Its `toolPolicy` allows only `github/get_issue`, so
-the runner denies every GitHub write tool. Open runner egress to the GitHub API
+limited to **Issues: Read and write**. Its `toolPolicy` allows `github/get_issue`
+and `github/add_issue_comment`, and the bundle's review gate hook allows that
+comment only once, to post unresolved findings after a failed or capped review,
+so the runner denies every other GitHub write tool. Open runner egress to the GitHub API
 CIDRs (`agentSandbox.connectorEgress.<agent>`), and raise
 `worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` to 1800
 so the execution deadline, not the 600 s default, bounds a run. Whether a run

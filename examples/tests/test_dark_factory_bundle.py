@@ -2,8 +2,10 @@
 
 Pins the parts of ``examples/dark-factory`` that must not drift: the bundle
 validates, its only MCP server is GitHub, its toolPolicy (classified by the real
-plugin_format classifier) grants exactly ``get_issue``, the one skill states the
-factory discipline, the evals are falsifiable, and no private identifier ships.
+plugin_format classifier) grants exactly ``get_issue`` and ``add_issue_comment``
+(the review gate hook narrows the comment to capped or failed reviews, #3092),
+the one skill states the factory discipline and its nine phases, the evals are
+falsifiable, and no private identifier ships.
 """
 
 from __future__ import annotations
@@ -75,12 +77,12 @@ def test_mcp_declares_only_github() -> None:
     assert github["env"] == {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}
 
 
-def test_get_issue_is_allowed() -> None:
-    assert classify_tool(_policy(), "github/get_issue") == ToolPolicyDecision.ALLOW
+@pytest.mark.parametrize("tool", ["get_issue", "add_issue_comment"])
+def test_allowed_tools(tool: str) -> None:
+    assert classify_tool(_policy(), f"github/{tool}") == ToolPolicyDecision.ALLOW
 
 
 DENIED_TOOLS = [
-    "add_issue_comment",
     "create_branch",
     "create_issue",
     "create_or_update_file",
@@ -136,14 +138,10 @@ DISCIPLINE = {
         r"|test suite"
         r"|linters?)"
     ),
-    "self-review-against-every-criterion": (
-        r"(review"
-        r"|re-read"
-        r"|reread"
-        r"|check)\w* (the "
-        r"|your "
-        r"|its )?(own )?diff.{0,120}(every"
-        r"|each) acceptance criteri"
+    "diff-review-against-every-criterion": (
+        r"diff-reviewer.{0,200}(every"
+        r"|each"
+        r"|numbered) acceptance criteri"
     ),
     "publishes-through-publish-changes": r"mcp__curie__publish_changes",
     "ends-with-reason-not-pr": (
@@ -176,14 +174,8 @@ DISCIPLINE = {
         r"|don'?t"
         r"|must not) push\w* with git"
     ),
-    "no-sub-agents": (
-        r"(no"
-        r"|never"
-        r"|do not"
-        r"|don'?t"
-        r"|must not)\s+(use\s+)?(the\s+)?(`?task`?\s+tool"
-        r"|sub-?agents?)"
-    ),
+    "only-the-reviewer-sub-agents": r"only sub-agents you may start",
+    "review-loops-capped-at-3": r"at most 3 rounds",
     "no-workflow-edits": r"\.github/",
 }
 
@@ -193,6 +185,25 @@ def test_skill_states_the_discipline(pattern: str) -> None:
     assert re.search(pattern, "", re.IGNORECASE | re.DOTALL) is None
     _, body = _skill_parts()
     assert re.search(pattern, body, re.IGNORECASE | re.DOTALL), pattern
+
+
+PHASES = [
+    "read_issue",
+    "pin_criteria",
+    "plan",
+    "plan_review",
+    "failing_test",
+    "implement",
+    "review_diff",
+    "publish",
+    "wait_ci",
+]
+
+
+def test_skill_defines_the_nine_phases_in_order() -> None:
+    _, body = _skill_parts()
+    headings = re.findall(r"^## \d+\. .*\(phase `(\w+)`", body, re.MULTILINE)
+    assert headings == PHASES
 
 
 def test_untrusted_covers_issue_and_repository_and_instructions() -> None:

@@ -355,7 +355,7 @@ def test_a_refused_read_and_an_answered_one_carry_different_is_error_flags(monke
     assert refusal_text.startswith(prefix)
     # ...and what follows it is _proxy's sentence verbatim, so rewording the
     # refusal fails here too, not just changing the prefix.
-    assert refusal_text[len(prefix):] == (
+    assert refusal_text[len(prefix) :] == (
         "Grafana refused the request (403). The service account token is "
         "missing or lacks access to the Tempo datasource. This will not fix "
         "itself on retry."

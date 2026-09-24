@@ -287,9 +287,7 @@ def test_insecure_skip_tls_verify_is_refused(tmp_path):
     srv = _load(
         tmp_path,
         kubeconfig={
-            "clusters": [
-                {"cluster": {"server": "https://k8s", "insecure-skip-tls-verify": True}}
-            ],
+            "clusters": [{"cluster": {"server": "https://k8s", "insecure-skip-tls-verify": True}}],
             "users": [{"user": {"token": "upgrade-token"}}],
         },
     )
@@ -559,9 +557,7 @@ def test_the_two_verbs_do_not_block_each_other(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, jobs=(200, running_self)))
     srv.upgrade_platform()
-    assert seen["jobs_params"]["labelSelector"] == (
-        "curie.dev/self-upgrade-of=platform-upgrade"
-    )
+    assert seen["jobs_params"]["labelSelector"] == ("curie.dev/self-upgrade-of=platform-upgrade")
 
 
 def test_the_platform_tool_exposes_no_parameters(tmp_path):

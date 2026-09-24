@@ -3,26 +3,53 @@
 This is the agent Curie runs for a labelled GitHub issue. One issue goes in.
 One pull request, or one stated reason, comes out.
 
-It is a single agent with one skill,
-[`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md). The skill
-carries the whole workflow, so there are no sub-agents and no outside
-reviewers:
+One agent does the work with one skill,
+[`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
+reviewer subagents check it on a stronger model. The skill walks nine phases:
 
-1. Read the issue by link.
-2. Pin the acceptance criteria, or stop and list the questions when the
-   request is ambiguous.
-3. Read the repository's own guidance and find its test commands.
-4. Write a plan.
-5. Write a failing test first where one is feasible.
-6. Implement the smallest change.
-7. Run the repository's own checks.
-8. Review the diff against every acceptance criterion.
-9. Publish one pull request, or end with `Could not complete:` and the reason.
+1. `read_issue`: read the issue by link.
+2. `pin_criteria`: pin the acceptance criteria, or stop and list the
+   questions when the request is ambiguous.
+3. `plan`: read the repository's own guidance, find its test commands, and
+   write a plan.
+4. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
+   approves the plan or sends it back to `plan`.
+5. `failing_test`: write a failing test first where one is feasible.
+6. `implement`: make the smallest change and run the repository's own checks.
+7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
+   the working diff against every criterion, and approves it or sends it back
+   to `implement` (never to `plan`).
+8. `publish`: publish one pull request, or end with `Could not complete:` and
+   the reason.
+9. `wait_ci`: the pull request's checks run. The bundle names this phase
+   and does not act on the checks yet.
 
 The skill budgets its own time against the platform's 1800 second execution
 bound and treats the issue text and repository files as untrusted data.
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
+
+## Review loops
+
+Each loop (`plan` and `plan_review`, `implement` and `review_diff`) runs at
+most 3 rounds. When a reviewer still asks for changes on round 3, or a review
+call fails, the run publishes nothing. It posts the reviewer's unresolved
+findings and open questions on the issue and ends with `Could not complete:`.
+
+[`hooks/review_gate.py`](hooks/review_gate.py) enforces this, because the main
+model does not follow the protocol reliably. It routes every sub-agent call to
+the right reviewer, strips `isolation` and `model`, forces
+`run_in_background: false`, refuses reviews out of order, counts rounds and
+applies the cap, stops the run on a reviewer reply without a verdict, and
+refuses `publish_changes` until the diff reviewer approves. It also writes the
+`plan_review` and `review_diff` phase lines, with the round, to the pod log.
+
+Both reviewers default to `anthropic/claude-opus-5.5`, served through the same
+OpenRouter key as the main loop. The Agent tool's own `model` argument only
+takes Claude aliases, so the per-deployment override is the `model:` line in
+each file under `agents/`: change it in the bundle you deploy. Opus 5.5 needs
+the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
+0.2.158 or later).
 
 ## What the bundle can reach
 
@@ -32,19 +59,23 @@ does not enforce it, and a different bundle can choose differently.
 - **The issue.** `.mcp.json` declares the GitHub MCP server that the runner
   image preinstalls, authenticated with the bundle's own
   `GITHUB_PERSONAL_ACCESS_TOKEN` (ADR 0145: reading the ticket is the bundle's
-  job). The manifest's `toolPolicy` allows only `github/get_issue`. Every other
-  GitHub tool, including every write tool, is denied by the runner, and so is
-  any tool the server adds later.
+  job). The manifest's `toolPolicy` allows `github/get_issue` and
+  `github/add_issue_comment`. The review gate hook refuses the comment tool
+  except for one comment on the run's own issue, after a failed or capped
+  review, to post the unresolved findings. Every other GitHub tool, including every other write tool, is
+  denied by the runner, and so is any tool the server adds later.
 - **Publication.** The built-in `mcp__curie__publish_changes` tool. The platform
   captures the patch and publishes it from a separate trusted job. The agent
   never pushes.
 
-Give the bundle a read-only token: a fine-grained token (or a GitHub App
-installation token) limited to the factory repositories with **Issues: Read**
-and nothing else. That token is in the sandbox's environment, so any tool
-in the session can read it. The tool policy limits which GitHub MCP tools the
-agent can call; it does not hide the credential from other tools. The token
-scope is the real bound.
+Give the bundle a narrow token: a fine-grained token (or a GitHub App
+installation token) limited to the factory repositories with **Issues: Read
+and write** and nothing else. Write is for the findings comment. With a
+read-only token a capped run still stops and states its findings in its final
+reply, but they do not reach the issue. That token is in the sandbox's
+environment, so any tool in the session can read it. The tool policy limits
+which GitHub MCP tools the agent can call; it does not hide the credential
+from other tools. The token scope is the real bound.
 
 ## Deploy it as the factory agent
 
