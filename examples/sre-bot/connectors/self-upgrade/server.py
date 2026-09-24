@@ -395,9 +395,7 @@ def latest_release() -> str:
         payload = response.json()
         tag = payload["tag_name"]
     except (ValueError, KeyError, TypeError) as exc:
-        raise ToolError(
-            "the releases API returned a body with no tag_name"
-        ) from exc
+        raise ToolError("the releases API returned a body with no tag_name") from exc
 
     return json.dumps(
         {
@@ -456,9 +454,7 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
                 f"({existing.status_code}). It needs get on that cronjob."
             )
         if existing.status_code >= 400:
-            raise ToolError(
-                f"could not read {namespace}/{cronjob}: {existing.status_code}"
-            )
+            raise ToolError(f"could not read {namespace}/{cronjob}: {existing.status_code}")
 
         try:
             template = (existing.json().get("spec") or {}).get("jobTemplate") or {}
@@ -467,8 +463,7 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
         job_spec = template.get("spec")
         if not job_spec:
             raise ToolError(
-                f"{namespace}/{cronjob} has no jobTemplate.spec to run; the CronJob "
-                "is malformed."
+                f"{namespace}/{cronjob} has no jobTemplate.spec to run; the CronJob is malformed."
             )
 
         running = _active_job(client, namespace, cronjob)

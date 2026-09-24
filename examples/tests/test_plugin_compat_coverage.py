@@ -45,9 +45,7 @@ def test_every_extension_field_is_exercised_by_some_bundle() -> None:
     manifests = _discover_manifests()
     assert manifests, "no example bundles discovered; the gate would pass vacuously"
     uncovered = [
-        field
-        for field in _EXTENSION_FIELDS
-        if not any(field in manifest for manifest in manifests)
+        field for field in _EXTENSION_FIELDS if not any(field in manifest for manifest in manifests)
     ]
     assert not uncovered, (
         "these Curie extension fields appear in NO example bundle, so the "

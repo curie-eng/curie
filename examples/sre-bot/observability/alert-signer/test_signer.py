@@ -33,9 +33,10 @@ def test_prepare_injects_partition_and_stable_delivery_id(
     }
     body, signature, delivery = signer.prepare(payload)
     forwarded = json.loads(body)
-    assert forwarded["curie_partition"] == hashlib.sha256(
-        payload["groupKey"].encode()
-    ).hexdigest()[:32]
+    assert (
+        forwarded["curie_partition"]
+        == hashlib.sha256(payload["groupKey"].encode()).hexdigest()[:32]
+    )
     assert len(forwarded["curie_partition"]) == 32
     expected = "sha256=" + hmac.new(b"hook-secret", body, hashlib.sha256).hexdigest()
     assert signature == expected

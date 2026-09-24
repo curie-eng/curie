@@ -73,11 +73,7 @@ def _load(name: str) -> dict:
 
 
 def _alert_rules(values: dict) -> list[dict]:
-    groups = (
-        values.get("serverFiles", {})
-        .get("alerting_rules.yml", {})
-        .get("groups", [])
-    )
+    groups = values.get("serverFiles", {}).get("alerting_rules.yml", {}).get("groups", [])
     rules: list[dict] = []
     for group in groups or []:
         rules.extend(group.get("rules") or [])
@@ -88,9 +84,7 @@ def test_curie_values_append_prometheus_remote_write_without_replacing_nop() -> 
     values = _load("curie-values.yaml")
     collector = values["otelCollector"]
     exporter = collector["extraExporters"][EXPORTER_NAME]
-    assert exporter["endpoint"].endswith(
-        ".observability.svc.cluster.local/api/v1/write"
-    )
+    assert exporter["endpoint"].endswith(".observability.svc.cluster.local/api/v1/write")
     assert exporter["retry_on_failure"]["enabled"] is True
     assert exporter["remote_write_queue"]["enabled"] is True
     assert 0 < exporter["remote_write_queue"]["queue_size"] <= 100000
@@ -101,9 +95,7 @@ def test_curie_values_append_prometheus_remote_write_without_replacing_nop() -> 
 
 
 def test_curie_values_allow_prometheus_metrics_ingress() -> None:
-    peer = _load("curie-values.yaml")["security"]["otelCollectorNetworkPolicy"][
-        "metricsIngress"
-    ]
+    peer = _load("curie-values.yaml")["security"]["otelCollectorNetworkPolicy"]["metricsIngress"]
     assert peer == [
         {
             "namespaceSelector": {
@@ -183,9 +175,7 @@ def test_rollout_doc_separates_render_runtime_and_deployed_evidence() -> None:
         "rollback",
         "does not authorize",
     ):
-        assert required in text.lower() or required in text, (
-            f"rollout doc is missing {required!r}"
-        )
+        assert required in text.lower() or required in text, f"rollout doc is missing {required!r}"
     assert "source-only" in text.lower()
     assert "C0EXAMPLE1" in text
     assert not re.search(r"C0(?!EXAMPLE1)[A-Z0-9]{8,}", text)
@@ -218,11 +208,7 @@ def test_promtool_unit_file_covers_fire_and_recovery() -> None:
     names = {item["name"] for item in tests}
     assert any("fire" in name for name in names)
     assert any("recover" in name or "quiet" in name for name in names)
-    alerts = {
-        case["alertname"]
-        for item in tests
-        for case in item.get("alert_rule_test") or []
-    }
+    alerts = {case["alertname"] for item in tests for case in item.get("alert_rule_test") or []}
     missing = sorted(REQUIRED_ALERTS - alerts)
     assert not missing, f"promtool tests omit alerts: {missing}"
     firing = [

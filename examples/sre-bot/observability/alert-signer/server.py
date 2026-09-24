@@ -27,9 +27,7 @@ def partition_value(group_key: str) -> str:
     return hashlib.sha256(group_key.encode()).hexdigest()[:32]
 
 
-def delivery_id(
-    group_key: str, status: str, fingerprints: list[str], starts_at: list[str]
-) -> str:
+def delivery_id(group_key: str, status: str, fingerprints: list[str], starts_at: list[str]) -> str:
     material = "|".join([group_key, status, *fingerprints, *starts_at])
     return hashlib.sha256(material.encode()).hexdigest()
 
@@ -41,16 +39,16 @@ def sign(secret: str, body: bytes) -> str:
 def prepare(payload: dict[str, Any]) -> tuple[bytes, str, str]:
     group_key = str(payload.get("groupKey") or "")
     status = str(payload.get("status") or "")
-    alerts = [
-        alert for alert in payload.get("alerts") or [] if isinstance(alert, dict)
-    ]
+    alerts = [alert for alert in payload.get("alerts") or [] if isinstance(alert, dict)]
     fingerprints = sorted(str(alert.get("fingerprint") or "") for alert in alerts)
     starts_at = sorted(str(alert.get("startsAt") or "") for alert in alerts)
     forwarded = dict(payload)
     forwarded["curie_partition"] = partition_value(group_key)
     body = json.dumps(forwarded, separators=(",", ":")).encode()
-    return body, sign(os.environ["CURIE_HOOK_SECRET"], body), delivery_id(
-        group_key, status, fingerprints, starts_at
+    return (
+        body,
+        sign(os.environ["CURIE_HOOK_SECRET"], body),
+        delivery_id(group_key, status, fingerprints, starts_at),
     )
 
 
