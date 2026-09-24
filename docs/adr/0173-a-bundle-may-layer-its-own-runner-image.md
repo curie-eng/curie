@@ -34,8 +34,14 @@ There is one runner image per release today:
 Curie's per-bundle extension point today is the hosted connector
 ([ADR-0086](0086-bundles-declare-connectors-the-platform-hosts-them.md),
 ADR-0113, ADR-0158). It is built per bundle and runs for that agent alone. It
-fits only a server that speaks HTTP, and each one is another pod with its own
-release rows.
+fits only a server that speaks HTTP, and it is heavy: every connector of every
+agent is its own Deployment, Service and NetworkPolicies, and an example's is
+also its own release rows. Hosted connectors should stay limited to servers
+that need their own process, or must hold a credential away from the sandbox.
+
+`curie build --plugin-dir <dir> --registry <ref>` already builds a bundle's
+declared connector sources. It pushes them and records each digest in
+`connectors.lock.yaml` beside the bundle.
 
 ## Decision
 
@@ -47,26 +53,41 @@ runner. Every other agent keeps the platform image.**
    passed in as a build argument rather than written as a tag. The bundle adds
    layers: typically one pinned `npm install -g` or `pip install` for a stdio
    server.
-2. **Built and pinned like a connector.** Built from the declaration as ADR-0113
-   builds connector source. It is pushed to a configured registry and recorded
-   by digest. A deploy renders only that digest, never a tag.
+2. **Built by the Curie CLI, and pinned like a connector.**
+   - `curie build --plugin-dir <dir> --registry <ref>` builds the layer too.
+   - It records two digests in the bundle's lock: the layered image's, and the
+     platform runner's that it was built on.
+   - Whoever owns the bundle runs that build. A deploy renders only the
+     recorded digest, never a tag.
 3. **Only that agent runs it.** That agent's SandboxTemplate renders the
    bundle's digest. Every other template keeps `agentSandbox.runner.image`.
 4. **Prewarmed per image.** Cold boot never pulls, so the prewarm covers each
    distinct runner digest a release renders, not only the platform's.
-5. **Rebuilt with the platform.** The layer sits on a specific runner, so a
-   platform upgrade rebuilds every declared image on the new base before any
-   agent runs it. A layered image built on another runner version is refused
-   at deploy, not discovered at boot.
+5. **Checked by the CLI, rebuilt by the bundle's owner.** The platform cannot
+   rebuild bundles it never sees, since people build their own, so nothing
+   rebuilds on their behalf.
+   - `curie cluster deploy` refuses a bundle whose recorded base is not the
+     installation's runner. Its message is the `curie build` command that
+     fixes it.
+   - `curie cluster upgrade` names every deployed agent whose layered image
+     will stop matching, before it upgrades. Those bundles are rebuilt and
+     redeployed by their owners.
+   - How such an agent runs between the upgrade and its redeploy is an open
+     question for the implementation issue. It must not silently run a runner
+     the worker cannot serve.
 
 ## Consequences
 
-- A bundle-specific stdio server stops being a platform change. `runner/Dockerfile`
-  keeps only what every agent needs.
-- Each declared image costs registry storage, a prewarm pull on every node, and
-  a rebuild on every platform upgrade.
-- The version check in decision 5 is new work. It is what keeps a layered image
-  from running an old runner under a new worker.
+- A bundle-specific stdio server stops being a platform change. When this is
+  implemented, the servers `runner/Dockerfile` blesses for particular bundles
+  leave it, along with its "Add a line here" invitation:
+  - `mcp-server-github` moves to the bundles that use it (`examples/github-issues`
+    and `examples/dark-factory`);
+  - the mean tester's Slack server moves to `examples/mean-tester`.
+- Each declared image costs registry storage and a prewarm pull on every node.
+  It also costs its owner a `curie build` on every platform upgrade.
+- The deploy and upgrade checks in decision 5 are new CLI work. They keep a
+  layered image from running an old runner under a new worker.
 - The bundle's layers run inside the sandbox, under the runner's security rails
   and egress policy. A declared image widens what one agent's sandbox contains,
   not what it can reach.
@@ -87,6 +108,7 @@ runner. Every other agent keeps the platform image.**
 ## Tracking
 
 On acceptance, file an issue each for:
-- the bundle declaration and its build (decisions 1 and 2);
+- the bundle declaration and its `curie build` (decisions 1 and 2);
 - per-agent template rendering and prewarm (decisions 3 and 4);
-- the rebuild and version check on upgrade (decision 5).
+- the deploy refusal and the upgrade report (decision 5);
+- moving the bundle-specific servers out of `runner/Dockerfile`.
