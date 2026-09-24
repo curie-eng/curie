@@ -3,12 +3,16 @@
 The reserved ``transcript`` namespace of ``workflow_state_entries`` held every
 thread's transcript under one per-(agent, namespace) byte cap, so a factory
 agent stopped for good after enough issues. Upgrade creates
-``thread_transcripts``, copies every transcript row into it, and deletes the
-copied rows from the state store. No operator step is needed.
+``thread_transcripts`` and copies every transcript row into it. It is an expand:
+the legacy rows stay, so an older API instance still serving during a rolling
+upgrade keeps reading and writing them. The new API adopts a legacy row the
+first time it touches that thread and deletes it then; a later contract
+migration removes the rest. No operator step is needed.
 
-Downgrade copies the rows back and drops the table. A row larger than the old
-state caps is still copied back; the state store then refuses further appends
-to it until it is compacted or deleted, which is the pre-0052 behavior.
+Downgrade writes each thread's newer copy back to the state store and drops the
+table. A row larger than the old state caps is still written back; the state
+store then refuses further appends to it until it is compacted or deleted,
+which is the pre-0052 behavior.
 
 Revision ID: 0052
 Revises: 0051
@@ -66,7 +70,6 @@ def upgrade() -> None:
         WHERE namespace = 'transcript'
         """
     )
-    op.execute(f"DELETE FROM {SCHEMA}.workflow_state_entries WHERE namespace = 'transcript'")
 
 
 def downgrade() -> None:
@@ -74,9 +77,13 @@ def downgrade() -> None:
         f"""
         INSERT INTO {SCHEMA}.workflow_state_entries
             (id, agent_id, binding_scope, namespace, key, value, version, created_at, updated_at)
-        SELECT id, agent_id, binding_scope, 'transcript', thread_key, value, version,
-               created_at, updated_at
+        SELECT gen_random_uuid(), agent_id, binding_scope, 'transcript', thread_key, value,
+               version, created_at, updated_at
         FROM {SCHEMA}.thread_transcripts
+        ON CONFLICT ON CONSTRAINT uq_state_agent_scope_ns_key DO UPDATE
+        SET value = EXCLUDED.value, version = EXCLUDED.version,
+            updated_at = EXCLUDED.updated_at
+        WHERE EXCLUDED.updated_at > {SCHEMA}.workflow_state_entries.updated_at
         """
     )
     op.drop_index(
