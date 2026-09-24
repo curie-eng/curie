@@ -254,10 +254,9 @@ def test_work_item_approval_resume_emits_no_requesting_turn_reply(
                 placeholder="approval-placeholder",
             )
             if completion_write_fails:
+
                 async def corrupt_completion_after_finish() -> None:
-                    await h.async_redis.set(
-                        h.config.completion_key(resumed.event_id), "wrong-type"
-                    )
+                    await h.async_redis.set(h.config.completion_key(resumed.event_id), "wrong-type")
 
                 work_items.after_finish = corrupt_completion_after_finish
                 with pytest.raises(ResponseError, match="WRONGTYPE"):
@@ -467,9 +466,7 @@ def test_approval_hold_keeps_its_sandbox_claim(make_harness) -> None:
 
 
 @pytest.mark.parametrize("path", ["owner_stop", "reconciler_terminate"])
-def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(
-    make_harness, path: str
-) -> None:
+def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(make_harness, path: str) -> None:
     """A run held for approval idles into a SUSPENDED route, then is cancelled.
     Both termination paths delete the suspended claim and drop the route, so
     the orphan reaper's routed-claim skip cannot strand it (#3075)."""
@@ -718,5 +715,116 @@ def test_chat_never_opens_a_turn_on_a_runner_with_the_factory_budget(
             envs = h.fake_k8s.claim_envs
             assert len(envs) == 2
             assert "CURIE_MAX_TURNS" not in (envs[1] or {})
+
+    asyncio.run(exercise())
+
+
+# --- #3076: a restarted worker tears down an orphan it never ran -----------
+
+
+class _OrphanWorkItems:
+    """Dispatch double for a request a previous incarnation started."""
+
+    CLAIM = "curie-thread-orphan-claim"
+    SANDBOX = "sbx-curie-thread-orphan-claim"
+
+    def __init__(self) -> None:
+        self.claimed: list[tuple[uuid.UUID, str]] = []
+        self.recorded: list[tuple[uuid.UUID, int, str]] = []
+
+    async def claim_termination(self, request_id: uuid.UUID, *, owner: str) -> int:
+        self.claimed.append((request_id, owner))
+        return 7
+
+    async def get_request(self, _request_id: uuid.UUID) -> object:
+        return SimpleNamespace(
+            status="cancellation_requested",
+            runtime_epoch=7,
+            runtime_claim_name=self.CLAIM,
+            runtime_sandbox_name=self.SANDBOX,
+        )
+
+    async def record_termination(
+        self, request_id: uuid.UUID, *, runtime_epoch: int, observation: str
+    ) -> None:
+        self.recorded.append((request_id, runtime_epoch, observation))
+
+
+def test_terminate_wake_for_an_orphan_tears_down_its_stored_claim(make_harness) -> None:
+    from curie_worker.workitem_dispatch import TerminationObservation
+
+    async def exercise() -> None:
+        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+            work_items = _OrphanWorkItems()
+            h.kernel._work_items = work_items
+            terminated: list[dict[str, object]] = []
+
+            def terminate_thread(thread_key: str, **kwargs: object) -> object:
+                terminated.append(kwargs)
+                return TerminationObservation(
+                    claims=(str(kwargs["claim_name"]),),
+                    sandboxes=(str(kwargs["sandbox_name"]),),
+                    observed_at=datetime.now(UTC),
+                    observer=str(kwargs["observer"]),
+                )
+
+            h.substrate.terminate_thread = terminate_thread  # type: ignore[method-assign]
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(_turn(f"work-item-{request_id}-terminate", "terminate"))
+
+            assert [c[0] for c in work_items.claimed] == [request_id]
+            assert len(terminated) == 1
+            assert terminated[0]["claim_name"] == _OrphanWorkItems.CLAIM
+            assert terminated[0]["sandbox_name"] == _OrphanWorkItems.SANDBOX
+            assert [(r[0], r[1]) for r in work_items.recorded] == [(request_id, 7)]
+            assert _OrphanWorkItems.CLAIM in work_items.recorded[0][2]
+
+    asyncio.run(exercise())
+
+
+def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            running = uuid.uuid4()
+            seen_during_run: list[bool] = []
+
+            async def observe() -> None:
+                seen_during_run.append(h.kernel.owns_work_item(running))
+
+            work_items.after_finish = observe
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+            assert h.kernel.owns_work_item(running) is False
+            await h.kernel.process_event(
+                _turn(f"work-item-{running}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+            assert seen_during_run == [True]
+            assert h.kernel.owns_work_item(running) is False
+
+            work_items.after_finish = None
+            h.runner.default_script = [
+                Final(
+                    text="Requesting approval.",
+                    status=SessionStatus.AWAITING_APPROVAL,
+                    approval_summary="Run the requested publication",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="Bash",
+                )
+            ]
+            held = uuid.uuid4()
+            await h.kernel.process_event(
+                _turn(
+                    f"work-item-{held}-execute-1",
+                    f"Resolve {ISSUE_URL}",
+                    conversation_id="1700000000.000002",
+                )
+            )
+            assert h.kernel._held_work_items
+            assert h.kernel.owns_work_item(held) is True
+            assert h.kernel.owns_work_item(uuid.uuid4()) is False
 
     asyncio.run(exercise())

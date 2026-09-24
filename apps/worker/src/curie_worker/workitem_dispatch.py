@@ -100,6 +100,13 @@ class WorkItemRequestView:
 
 
 @dataclass(frozen=True)
+class WorkItemRuntimeOwner:
+    request_id: uuid.UUID
+    runtime_owner: str
+    runtime_epoch: int
+
+
+@dataclass(frozen=True)
 class TerminationObservation:
     """Observed absence of the named claims and sandboxes."""
 
@@ -364,6 +371,49 @@ class WorkItemDispatchClient:
         await self._post(
             f"/v1/internal/work-items/requests/{request_id}/termination",
             {"runtime_epoch": runtime_epoch, "observation": observation},
+        )
+
+    async def runtime_owners(
+        self, after: uuid.UUID | None = None
+    ) -> list[WorkItemRuntimeOwner]:
+        """One page of running requests and their owners, ordered by id."""
+
+        try:
+            response = await self._client.get(
+                f"{self._base}/v1/internal/work-items/runtime-owners",
+                params={"after": str(after)} if after is not None else None,
+                headers=self._headers,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise WorkItemTransportError(
+                "work-item dispatch endpoint is unreachable"
+            ) from exc
+        if response.status_code != 200:
+            raise WorkItemTransportError(
+                f"work-item runtime owners returned HTTP {response.status_code}"
+            )
+        try:
+            body = response.json()
+            return [
+                WorkItemRuntimeOwner(
+                    request_id=uuid.UUID(str(row["request_id"])),
+                    runtime_owner=str(row["runtime_owner"]),
+                    runtime_epoch=int(row["runtime_epoch"]),
+                )
+                for row in body["requests"]
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkItemTransportError(
+                "work-item runtime owners returned an unusable body"
+            ) from exc
+
+    async def declare_owner_lost(
+        self, request_id: uuid.UUID, *, owner: str, runtime_epoch: int
+    ) -> None:
+        await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/owner-lost",
+            {"owner": owner, "runtime_epoch": runtime_epoch},
         )
 
     async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:

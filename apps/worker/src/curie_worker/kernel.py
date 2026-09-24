@@ -1322,6 +1322,18 @@ class Kernel:
         # a FAILED one is cleared by the notice that reads it.
         self._terminal_reply_attempted: set[str] = set()
 
+    def owns_work_item(self, request_id: uuid.UUID) -> bool:
+        """Whether this process still holds the WorkItem run (#3076).
+
+        A live run that has not finished, or one parked for approval, is ours;
+        the orphan sweeper must never declare either lost.
+        """
+
+        run = self._work_item_runs.get(request_id)
+        if run is not None and not run.finished:
+            return True
+        return any(held.request_id == request_id for held in self._held_work_items.values())
+
     def _target_for(self, qevent: QueuedTurn) -> ReplyTarget:
         """This turn's reply target, including any ref minted during the turn.
 

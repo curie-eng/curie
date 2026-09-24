@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 from channel_protocol import scoped_conversation_id
-from curie_api import workitems
+from curie_api import workitem_dispatch, workitems
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.routers import work_items
@@ -758,3 +758,278 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
     assert unchanged.json()["status"] == "running"
     assert unchanged.json()["runtime_epoch"] == 1
 
+
+
+# --- #3076: recover WorkItem runs orphaned by a worker restart -------------
+
+
+@pytest.fixture
+def short_runtime_ttl(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.setenv("CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS", "3")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+async def _running(
+    session: AsyncSession, agent_id: uuid.UUID, *, issue: int = 2573
+) -> SimpleNamespace:
+    facts = _facts(agent_id, github_issue_number=issue)
+    await admit(session, facts)
+    await acquire(session, facts.request_id, owner=OWNER, generation=1)
+    await start(
+        session,
+        facts.request_id,
+        owner=OWNER,
+        generation=1,
+        claim_name=CLAIM_NAME,
+        sandbox_name=SANDBOX_NAME,
+    )
+    return facts
+
+
+async def _notice_causes(session: AsyncSession, request_id: uuid.UUID) -> list[str]:
+    rows = await session.execute(
+        text(
+            "SELECT terminal_cause FROM curie.factory_terminal_notices "
+            "WHERE execution_request_id = :id"
+        ),
+        {"id": request_id},
+    )
+    return [row[0] for row in rows]
+
+
+def test_declare_owner_lost_drives_the_terminate_chain_to_failed(
+    clean_db: None, allowlisted: None, short_runtime_ttl: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running(session, agent_id)
+        before = await _request_row(session, facts.request_id)
+        assert before.runtime_heartbeat_expires_at > await _now(session)
+
+        owners = await workitem_dispatch.list_runtime_owners(session, limit=50)
+        assert [
+            (o.request_id, o.runtime_owner, o.runtime_epoch) for o in owners
+        ] == [(facts.request_id, OWNER, 1)]
+
+        await workitem_dispatch.declare_owner_lost(
+            session, facts.request_id, owner=OWNER, runtime_epoch=1
+        )
+        row = await _request_row(session, facts.request_id)
+        assert row.status == "cancellation_requested"
+        assert row.terminal_cause == "owner_lost"
+        assert row.version == before.version + 1
+        assert row.runtime_heartbeat_expires_at <= await _now(session)
+        assert await workitem_dispatch.list_runtime_owners(session, limit=50) == []
+
+        published = await workitem_dispatch.claim_terminate_publishes(
+            session, retry_seconds=60, limit=50
+        )
+        assert [p.request_id for p in published] == [facts.request_id]
+
+        claimed = await claim_termination(
+            session, facts.request_id, owner=OTHER_OWNER
+        )
+        assert claimed.runtime_epoch == 2
+        await record_termination(
+            session,
+            facts.request_id,
+            runtime_epoch=claimed.runtime_epoch,
+            observation=TERMINATION_OBSERVATION,
+        )
+        final = await _request_row(session, facts.request_id)
+        assert final.status == "failed"
+        assert final.terminal_cause == "owner_lost"
+        assert await _notice_causes(session, facts.request_id) == ["owner_lost"]
+
+    with_session(body)
+
+
+@pytest.mark.parametrize(
+    "owner, epoch", [(OWNER, 2), (OTHER_OWNER, 1)], ids=["wrong_epoch", "wrong_owner"]
+)
+def test_declare_owner_lost_refuses_a_mismatched_owner_or_epoch(
+    clean_db: None, allowlisted: None, owner: str, epoch: int
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running(session, agent_id)
+        before = await _request_row(session, facts.request_id)
+        refused = await workitem_dispatch.declare_owner_lost(
+            session, facts.request_id, owner=owner, runtime_epoch=epoch
+        )
+        assert _code(refused) == "stale_owner"
+        assert await _request_row(session, facts.request_id) == before
+
+    with_session(body)
+
+
+def test_declare_owner_lost_unknown_request_is_not_found(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        refused = await workitem_dispatch.declare_owner_lost(
+            session, uuid.uuid4(), owner=OWNER, runtime_epoch=1
+        )
+        assert _code(refused) == "not_found"
+
+    with_session(body)
+
+
+def test_approval_hold_is_not_an_orphan(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        held = await _running(session, agent_id)
+        live = await _running(session, agent_id, issue=2574)
+        await workitem_dispatch.hold_for_approval(
+            session, held.request_id, runtime_epoch=1
+        )
+        before = await _request_row(session, held.request_id)
+        assert before.runtime_heartbeat_expires_at == before.execution_deadline
+
+        owners = await workitem_dispatch.list_runtime_owners(session, limit=50)
+        assert [o.request_id for o in owners] == [live.request_id]
+
+        refused = await workitem_dispatch.declare_owner_lost(
+            session, held.request_id, owner=OWNER, runtime_epoch=1
+        )
+        assert _code(refused) == "stale_owner"
+        assert await _request_row(session, held.request_id) == before
+
+    with_session(body)
+
+
+def test_http_runtime_owners_and_owner_lost(
+    dispatch_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    created = dispatch_client.post(
+        "/agents",
+        json={
+            "name": f"acme-bot-{uuid.uuid4().hex[:8]}",
+            "channel": {"kind": "slack", "address": ADDRESS},
+            "repo_full_name": REPO,
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    facts = _facts(UUID(created.json()["id"]))
+    admitted = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/admissions",
+        json=_facts_json(facts),
+        headers=WORKER_HEADERS,
+    )
+    assert admitted.status_code == 200, admitted.text
+    request_id = admitted.json()["request"]["id"]
+    for verb, payload in (
+        ("acquire", {"owner": OWNER, "generation": 1}),
+        (
+            "start",
+            {
+                "owner": OWNER,
+                "generation": 1,
+                "claim_name": CLAIM_NAME,
+                "sandbox_name": SANDBOX_NAME,
+            },
+        ),
+    ):
+        response = dispatch_client.post(
+            f"{INTERNAL_PREFIX}/requests/{request_id}/{verb}",
+            json=payload,
+            headers=WORKER_HEADERS,
+        )
+        assert response.status_code == 200, response.text
+
+    unauth = dispatch_client.get(f"{INTERNAL_PREFIX}/runtime-owners")
+    assert unauth.status_code in {401, 403}, unauth.text
+    listed = dispatch_client.get(
+        f"{INTERNAL_PREFIX}/runtime-owners", headers=WORKER_HEADERS
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json() == {
+        "requests": [
+            {"request_id": request_id, "runtime_owner": OWNER, "runtime_epoch": 1}
+        ]
+    }
+
+    past = dispatch_client.get(
+        f"{INTERNAL_PREFIX}/runtime-owners",
+        params={"after": request_id},
+        headers=WORKER_HEADERS,
+    )
+    assert past.status_code == 200, past.text
+    assert past.json() == {"requests": []}
+    before_it = dispatch_client.get(
+        f"{INTERNAL_PREFIX}/runtime-owners",
+        params={"after": str(UUID(int=0))},
+        headers=WORKER_HEADERS,
+    )
+    assert [r["request_id"] for r in before_it.json()["requests"]] == [request_id]
+    bad = dispatch_client.get(
+        f"{INTERNAL_PREFIX}/runtime-owners",
+        params={"after": "not-a-uuid"},
+        headers=WORKER_HEADERS,
+    )
+    assert bad.status_code == 422, bad.text
+
+    path = f"{INTERNAL_PREFIX}/requests/{request_id}/owner-lost"
+    unauth_post = dispatch_client.post(
+        path, json={"owner": OWNER, "runtime_epoch": 1}
+    )
+    assert unauth_post.status_code in {401, 403}, unauth_post.text
+    stale = dispatch_client.post(
+        path, json={"owner": OTHER_OWNER, "runtime_epoch": 1}, headers=WORKER_HEADERS
+    )
+    assert stale.status_code == 409, stale.text
+    assert _http_code(stale) == "stale_owner"
+    declared = dispatch_client.post(
+        path, json={"owner": OWNER, "runtime_epoch": 1}, headers=WORKER_HEADERS
+    )
+    assert declared.status_code == 200, declared.text
+    assert declared.json()["status"] == "cancellation_requested"
+    assert declared.json()["terminal_cause"] == "owner_lost"
+    viewed = dispatch_client.get(
+        f"{INTERNAL_PREFIX}/requests/{request_id}", headers=WORKER_HEADERS
+    )
+    assert viewed.json()["status"] == "cancellation_requested"
+    after = dispatch_client.get(
+        f"{INTERNAL_PREFIX}/runtime-owners", headers=WORKER_HEADERS
+    )
+    assert after.json() == {"requests": []}
+
+
+def test_list_runtime_owners_pages_by_request_id(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        running = [await _running(session, agent_id, issue=3000 + i) for i in range(5)]
+        expected = sorted(facts.request_id for facts in running)
+
+        seen: list[uuid.UUID] = []
+        after: uuid.UUID | None = None
+        pages = 0
+        while True:
+            page = await workitem_dispatch.list_runtime_owners(
+                session, limit=2, after=after
+            )
+            if not page:
+                break
+            pages += 1
+            ids = [row.request_id for row in page]
+            assert ids == sorted(ids)
+            assert after is None or ids[0] > after
+            assert len(ids) <= 2
+            seen.extend(ids)
+            after = ids[-1]
+        assert seen == expected
+        assert pages == 3
+
+        tail = await workitem_dispatch.list_runtime_owners(
+            session, limit=50, after=expected[2]
+        )
+        assert [row.request_id for row in tail] == expected[3:]
+
+    with_session(body)
