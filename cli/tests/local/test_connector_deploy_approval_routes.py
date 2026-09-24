@@ -570,7 +570,24 @@ def _start_isolated_approval_seed_worker(case: LocalCase) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         case.env["CURIE_LOCAL_STUB_PORT"] = str(probe.getsockname()[1])
+    # `local up --build` builds twice, `docker build` for the source images and
+    # then compose for the worker overlay, and both must use the daemon's own
+    # builder rather than an ambient one. In Docker Desktop's `desktop-linux`
+    # context the first refuses the `default` builder and the second refuses
+    # `desktop-linux`. Naming the current context's daemon in DOCKER_HOST puts
+    # both in the `default` context on that daemon, where `default` is its own
+    # builder. On Linux the endpoint is the default socket, so nothing changes.
+    endpoint = _require(
+        _run(
+            ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+            env=case.env,
+        ),
+        "reading the current Docker context's daemon endpoint",
+    ).strip()
+    if not endpoint:
+        raise RuntimeError("the current Docker context names no daemon endpoint")
     env = dict(case.env)
+    env["DOCKER_HOST"] = endpoint
     env["BUILDX_BUILDER"] = "default"
     env["CURIE_FAKE_MODEL"] = "1"
     result = _run(
