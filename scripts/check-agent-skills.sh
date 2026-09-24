@@ -132,28 +132,38 @@ echo "found ${#discovered[@]} skill(s)"
 
 listed=()
 listed+=("${VALID_SKILLS[@]}")
-listed+=("${INVALID_SKILLS[@]}")
+# INVALID_SKILLS may be emptied, which bash 3.2 refuses to expand under
+# `set -u` without the `+` guard.
+listed+=(${INVALID_SKILLS[@]+"${INVALID_SKILLS[@]}"})
 
 echo "== checking the allowlist covers exactly the discovered skills =="
-# Associative-array lookups turn both set differences into O(n+m): `[[ -v ...
-# ]]` tests membership without expanding the value, so it is safe under
-# `set -u` even for keys that were never assigned.
-declare -A listed_map=()
+# bash 3.2, which macOS ships, has no associative arrays. Each set is instead one
+# string with a newline before and after every entry, so the `case` pattern
+# matches whole entries only, and quoting the entry matches a path's glob
+# characters literally. `discovered` may be empty, which 3.2 refuses to expand
+# under `set -u` without the `+` guard.
+listed_lines=$'\n'
 for known in "${listed[@]}"; do
-  listed_map["$known"]=1
+  listed_lines+="$known"$'\n'
 done
 unlisted=()
-for skill in "${discovered[@]}"; do
-  [[ -v listed_map[$skill] ]] || unlisted+=("$skill")
+for skill in ${discovered[@]+"${discovered[@]}"}; do
+  case "$listed_lines" in
+    *$'\n'"$skill"$'\n'*) ;;
+    *) unlisted+=("$skill") ;;
+  esac
 done
 
-declare -A discovered_map=()
-for skill in "${discovered[@]}"; do
-  discovered_map["$skill"]=1
+discovered_lines=$'\n'
+for skill in ${discovered[@]+"${discovered[@]}"}; do
+  discovered_lines+="$skill"$'\n'
 done
 stale=()
 for known in "${listed[@]}"; do
-  [[ -v discovered_map[$known] ]] || stale+=("$known")
+  case "$discovered_lines" in
+    *$'\n'"$known"$'\n'*) ;;
+    *) stale+=("$known") ;;
+  esac
 done
 
 drifted=0
@@ -197,7 +207,7 @@ fi
 echo "== asserting the deliberately malformed fixture(s) are still rejected =="
 passed=()
 unverdicted=()
-for skill in "${INVALID_SKILLS[@]}"; do
+for skill in ${INVALID_SKILLS[@]+"${INVALID_SKILLS[@]}"}; do
   echo "-- $skill (must be rejected) --"
   # "Nonzero" is not evidence of a rejection: a missing path exits 2 and a uvx
   # resolution failure exits 1, the same as a real rejection. Only status 1

@@ -1027,6 +1027,11 @@ enum SreBotAction {
 
 #[derive(Subcommand)]
 enum DevAction {
+    /// Manage hooks for this source checkout.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
     /// Check the frozen contracts (`bash scripts/check-contracts.sh`).
     Contracts,
     /// Render-assert the Helm chart: discover and run every executable assertion
@@ -1275,6 +1280,12 @@ enum DevAction {
         #[arg(long)]
         self_test: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Install the tracked Git hooks in this checkout.
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -3811,6 +3822,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             }),
         },
         Some(Command::Dev { action }) => match action {
+            DevAction::Hooks { action } => match action {
+                HooksAction::Install => commands::dev_hooks_install(),
+            },
             DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh", &[]).await,
             DevAction::ChartCheck => commands::dev_chart_check().await,
             DevAction::VerifyFixPin { change, selector } => {

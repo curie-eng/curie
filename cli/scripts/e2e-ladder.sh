@@ -123,6 +123,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# GNU timeout, with GNU's exit statuses, on hosts that ship none (a stock Mac).
+GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 if [[ "${CURIE_E2E_HOOK_APPROVAL:-0}" == "1" ]]; then
     exec python3 "$REPO_ROOT/charts/curie/ci/hook-approval-proof.py"
 fi
@@ -359,6 +361,8 @@ GATE_CASE_NAME="curie-ladder-2094-gate-$$"
 GATE_CASE_CREATED=0
 GATE_CASE_PORT="${CURIE_E2E_GATE_PORT:-7246}"
 GATE_CASE_BUNDLE=""
+# How long that case's gated turn may run before it counts as the #1852 hang.
+GATE_CASE_TURN_SECONDS=240
 # The image that case creates its stand-in from. Already a requirement of the
 # ladder (rung 1 boots a real runner), so this adds no new prerequisite.
 RUNNER_IMAGE="curie-runner"
@@ -915,7 +919,9 @@ cluster_external_ingress_seed() {
         echo "cluster product evidence blocked: the external Slack phase did not provide CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT" >&2
         return 1
     }
-    [[ "$(stat -c '%a' "$receipt")" == "600" ]] || {
+    # GNU `stat -c` and BSD `stat -f` share no flag for this. lstat reads the
+    # path itself, as stat does without -L, so a symlink is refused too.
+    [[ "$(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.lstat(sys.argv[1]).st_mode), "o"))' "$receipt")" == "600" ]] || {
         echo "cluster product evidence blocked: the external Slack ingress receipt must be mode 0600" >&2
         return 1
     }
@@ -1551,8 +1557,9 @@ seed_approval_resume_turn() {
         echo "seed-invalid: could not create private approval pending artifact" >&2
         return 1
     fi
+    # `${scope[@]+...}`: bash 3.2 reports an empty array as unbound under `set -u`.
     local scope=()
-    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+    if ! "$BIN" --json "$tier" approvals "$agent_id" ${scope[@]+"${scope[@]}"} \
         --mint-operator-principal U0EXAMPLE1 > "$token_file"; then
         rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
         echo "seed-invalid: could not mint deterministic approval principal" >&2
@@ -1580,7 +1587,7 @@ PY
     APPROVAL_SEED_MESSAGE_PID=$!
     approval_id=""
     for attempt in $(seq 1 60); do
-        if "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" --list > "$pending_file" 2>/dev/null; then
+        if "$BIN" --json "$tier" approvals "$agent_id" ${scope[@]+"${scope[@]}"} --list > "$pending_file" 2>/dev/null; then
             approval_id="$(python3 - "$pending_file" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -1601,7 +1608,7 @@ PY
         return 1
     fi
     if ! CURIE_APPROVAL_PRINCIPAL_TOKEN="$token" "$BIN" --json "$tier" approvals "$agent_id" \
-        "${scope[@]}" --resolve "$approval_id" >/dev/null; then
+        ${scope[@]+"${scope[@]}"} --resolve "$approval_id" >/dev/null; then
         unset token
         stop_approval_seed_message terminate || true
         rm -f "$message_file" "$message_stderr_file"
@@ -2228,7 +2235,7 @@ case_leftover_runner_container() {
 # What this proves: with the gate armed on `Bash`, a turn that asks for a shell
 # command must PARK awaiting approval -- bounded, and with the command unrun.
 # Three assertions, one per observed failure mode:
-#   (a) `timeout` did not fire            -- the #1852 hang, where the deny was
+#   (a) the bound did not fire            -- the #1852 hang, where the deny was
 #       prose only and a real model simply spun until the caller gave up. This
 #       is what a revert of #2068 produces, so it is the negative control.
 #   (b) the terminal status is `awaiting-approval` -- the parked terminal that
@@ -2250,8 +2257,9 @@ case_leftover_runner_container() {
 #     out of the container environment without a word (cli/src/docker.rs), so
 #     the gate would never arm and the turn would end `done`.
 #   - `curie skill message` has no timeout of any kind, so an unbounded turn
-#     wedges the whole ladder forever instead of failing it. The `timeout` is
-#     the (a) assertion, not defensive padding.
+#     wedges the whole ladder forever instead of failing it. The bound is the
+#     (a) assertion, not defensive padding. It is gnu-process.py's timeout, not
+#     GNU's, so the case runs on a stock Mac too, which ships no timeout.
 #
 # The case gates `Bash` and not the skill's own tools on purpose: the runner
 # refuses to boot when a gate's required set intersects a skill's declared
@@ -2270,11 +2278,6 @@ case_live_approval_gate_denies() {
     if ! docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
         echo "error: image '$RUNNER_IMAGE' is not present, and the #2094 case boots its own runner from it." >&2
         echo "fix: build it with \`curie build\`, then re-run." >&2
-        return 1
-    fi
-    if ! command -v timeout >/dev/null 2>&1; then
-        echo "error: \`timeout\` (coreutils) is not on PATH, and the #2094 case's bound IS its hang assertion." >&2
-        echo "fix: install coreutils, then re-run. Running this case unbounded would wedge the ladder instead of failing it." >&2
         return 1
     fi
     # Same shape as assert_stub_port_free, against this case's own port.
@@ -2314,14 +2317,14 @@ case_live_approval_gate_denies() {
     # two apart. Only this shape is retried: a timeout or a run canary is a real
     # failure and is never retried.
     for attempt in 1 2; do
-        out="$(cd "$GATE_CASE_BUNDLE" && timeout 240 "$BIN" --json skill message \
+        out="$(cd "$GATE_CASE_BUNDLE" && "$GNU_PROCESS" timeout "$GATE_CASE_TURN_SECONDS" "$BIN" --json skill message \
             --url "http://127.0.0.1:$GATE_CASE_PORT" "$GATE_PROMPT")" && code=0 || code=$?
 
-        # (a) bounded. `timeout` exiting 124 IS the #1852 hang: the deny reached
+        # (a) bounded. The bound exiting 124 IS the #1852 hang: the deny reached
         # the model as prose only, the model never ended its turn, and the
         # caller spun with the stream entry pending and no approval record.
         if (( code == 124 )); then
-            echo "the gated turn never ended: \`timeout\` fired at 240s. This is the #1852 hang -- the deny did not stop the turn -- and is what a revert of #2068's PreToolUse wiring produces." >&2
+            echo "the gated turn never ended: the bound fired at ${GATE_CASE_TURN_SECONDS}s. This is the #1852 hang -- the deny did not stop the turn -- and is what a revert of #2068's PreToolUse wiring produces." >&2
             return 1
         fi
 
@@ -3450,8 +3453,10 @@ case_connector_registry_missing_cluster() {
     cp "$lock" "$backup"
     # The IMAGE only, never the source_digest: moving the digest trips
     # `lock_preflight`'s staleness refusal first, and this case would then
-    # assert a green against the wrong refusal entirely.
-    sed -i "s|$good|$bad|" "$lock"
+    # assert a green against the wrong refusal entirely. Rewritten from the
+    # backup rather than with `sed -i`, which BSD sed reads differently, and
+    # in place, so the lock keeps its mode.
+    sed "s|$good|$bad|" "$backup" >"$lock"
     if ! grep -qF "$bad" "$lock"; then
         echo "cluster: connectors.lock.yaml still does not name '$bad' after the edit, so the deploy below would run against a perfectly good lock and prove nothing." >&2
         cp "$backup" "$lock"
@@ -3527,17 +3532,24 @@ start_local_otel_sink() {
         }
     ' "$REPO_ROOT/cli/scripts/fixtures/otel-e2e-sink-config.yaml" > "$sink_config"
     LOCAL_OTEL_SINK_OWNED=1
-    local start_log="$WORKDIR/otel-sink-start.log" attempt started=0
-    # Docker's ephemeral host-port allocator can race the kernel's current
-    # listeners even on a fresh CI runner. Retry only that explicit bind race;
-    # configuration/image failures remain immediately loud.
+    local start_log="$WORKDIR/otel-sink-start.log" attempt started=0 otlp_host_port
+    # Every stack container dials OTLP at gateway:host-port, so that host port
+    # is named here rather than allocated by Docker (`-p 0.0.0.0::4318`):
+    # Docker Desktop refuses a Docker-allocated host port from inside its VM,
+    # at 127.0.0.1 and at every bridge gateway alike, while a port the caller
+    # names answers there as it does on Linux. The health and self-metrics
+    # ports are read only from this host, so Docker still allocates them. Any
+    # of the three can be taken before Docker binds it, by a host process or
+    # by another container, so retry only those two refusals, with a fresh
+    # OTLP port each time; configuration and image failures remain loud.
     for attempt in $(seq 1 5); do
+        otlp_host_port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("0.0.0.0", 0)); print(s.getsockname()[1])')"
         if docker run -d \
             --name "$LOCAL_OTEL_SINK_NAME" \
             --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
             --network "$network" \
             --user 0 \
-            -p 0.0.0.0::4318 \
+            -p "0.0.0.0:$otlp_host_port:4318" \
             -p 127.0.0.1::13133 \
             -p 127.0.0.1::8888 \
             -v "$sink_config:/etc/otelcol-contrib/config.yaml:ro" \
@@ -3547,17 +3559,17 @@ start_local_otel_sink() {
             started=1
             break
         fi
-        if ! grep -Fq 'address already in use' "$start_log"; then
+        if ! grep -Eq 'address already in use|port is already allocated' "$start_log"; then
             cat "$start_log" >&2
             return 1
         fi
         docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
-        echo "local: Docker host-port allocation raced on attempt $attempt; retrying task-owned sink" >&2
+        echo "local: a sink host port was taken on attempt $attempt (OTLP tried $otlp_host_port); retrying task-owned sink" >&2
         sleep 1
     done
     if (( ! started )); then
         cat "$start_log" >&2
-        echo "local: Docker could not allocate private sink ports after 5 attempts" >&2
+        echo "local: Docker could not bind private sink ports after 5 attempts" >&2
         return 1
     fi
 
@@ -4322,7 +4334,8 @@ case_local_langfuse_invalid_auth() {
     local receipt failed_trace_id recovered_trace_id langfuse_web collector
     local accepted_baseline failed_baseline accepted failed queue_size rejection
     local attempt marker stream_start stream_end out
-    if [[ -v LANGFUSE_OTLP_AUTH_HEADER ]]; then
+    # `${NAME+x}` rather than `[[ -v NAME ]]`, which bash 3.2 cannot parse.
+    if [[ -n "${LANGFUSE_OTLP_AUTH_HEADER+x}" ]]; then
         original_set=1
         original="$LANGFUSE_OTLP_AUTH_HEADER"
     fi
@@ -4567,6 +4580,21 @@ rung_local() {
           up_args+=("$line")
         done < <(local_compose_cli_args local up)
         up_args+=(--build)
+        # The source build runs on the Docker daemon's own builder, never an
+        # ambient one, and `local up --build` builds twice: `docker build` for
+        # the source images, then compose for the worker overlay. In Docker
+        # Desktop's `desktop-linux` context the first refuses the `default`
+        # builder and the second refuses `desktop-linux`. Naming the current
+        # context's daemon in DOCKER_HOST puts both in the `default` context on
+        # that same daemon, where `default` is its own builder. On Linux the
+        # endpoint is the default socket, so nothing changes there.
+        local daemon_endpoint
+        daemon_endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')" || daemon_endpoint=""
+        if [[ -z "$daemon_endpoint" ]]; then
+            echo "local: could not read the current Docker context's daemon endpoint, so the source build cannot be pinned to that daemon's own builder." >&2
+            echo "fix: make \`docker context inspect\` succeed for the current context, then re-run." >&2
+            return 1
+        fi
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
@@ -4580,7 +4608,7 @@ rung_local() {
         # it. Claiming a stack that then fails to boot is harmless, because
         # `local down` is safe against a partial or already-stopped stack.
         LOCAL_STACK_OWNED=1
-        BUILDX_BUILDER=default "$BIN" "${up_args[@]}"
+        DOCKER_HOST="$daemon_endpoint" BUILDX_BUILDER=default "$BIN" "${up_args[@]}"
         pin_local_source_images
     fi
 
