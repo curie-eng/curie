@@ -28,8 +28,15 @@ SRE_DEMO_PATH = REPO_ROOT / "cli" / "scripts" / "sre-demo-e2e.sh"
 IDLE_ROUTE_PATH = (
     REPO_ROOT / "cli" / "scripts" / "e2e-cluster-idle-route-reclamation.sh"
 )
+MAIL_ADAPTER_PATH = REPO_ROOT / "scripts" / "e2e-mail-adapter.sh"
 # Scripts a contributor runs on their own host, whose bash may be 3.2.
-HOST_SCRIPTS = [LADDER_PATH, AGENT_SKILLS_PATH, SRE_DEMO_PATH, IDLE_ROUTE_PATH]
+HOST_SCRIPTS = [
+    LADDER_PATH,
+    AGENT_SKILLS_PATH,
+    SRE_DEMO_PATH,
+    IDLE_ROUTE_PATH,
+    MAIL_ADAPTER_PATH,
+]
 
 
 def _bash3() -> str | None:
@@ -85,7 +92,8 @@ BASH4_ONLY = {
     r"\b(mapfile|readarray)\b": "mapfile/readarray (bash 4.0)",
     r"\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(,,?|\^\^?)\}": "case conversion (bash 4.0)",
     r"\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?@[QEPAKaULuk]\}": "${NAME@op} (bash 4.4)",
-    r"\bwait\s+-n\b": "wait -n (bash 4.3)",
+    # The builtin in command position only: `kubectl wait -n NAMESPACE` is not it.
+    r"(^|[;&|(!{]|\b(then|do|else|if|while|until)\b)\s*wait\s+-n\b": "wait -n (bash 4.3)",
 }
 
 
@@ -120,10 +128,18 @@ def test_script_uses_no_construct_bash_3_2_rejects(script: Path) -> None:
         '    case "${observed,,}" in',
         '    echo "${value@Q}"',
         "    wait -n",
+        '    if ! wait -n "$pid"; then',
+        "    sleep 1 & wait -n",
     ],
 )
 def test_the_source_scan_refuses_each_construct(line: str) -> None:
     assert _bash4_only_lines(line + "\n"), line
+
+
+def test_the_source_scan_ignores_kubectl_wait_with_a_namespace() -> None:
+    assert not _bash4_only_lines(
+        'kubectl --context "$CONTEXT" wait -n "$NAMESPACE" --for=condition=Ready \\\n'
+    )
 
 
 def test_the_source_scan_ignores_a_comment_that_names_a_construct() -> None:
@@ -458,4 +474,75 @@ exit 3
     assert (kube_log.read_text().splitlines() if kube_log.exists() else []) == [
         f"-n acme-ns label pod {pod} curie-e2e-idle-route-reclamation- --overwrite"
         for pod in pods
+    ], result.stderr
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_mail_adapter_namespace_is_its_run_id_lowercased(
+    interpreter: str,
+) -> None:
+    line = _top_level_block(
+        MAIL_ADAPTER_PATH.read_text(),
+        'NAMESPACE="curie-mail-e2e-',
+        'RELEASE="curie-mail-e2e"',
+        MAIL_ADAPTER_PATH,
+    )
+    result = subprocess.run(
+        [
+            interpreter,
+            "-c",
+            f'set -euo pipefail\nRUN_ID=20260924T120000Z-4242\n{line}printf %s "$NAMESPACE"',
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "curie-mail-e2e-20260924t120000z-4242"
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize(
+    ("pids", "inbox_files"),
+    [([], []), ([], ["inbox-a.id"]), (["4242"], ["inbox-a.id", "inbox-b.id"])],
+    ids=["nothing-started", "inbox-only", "forwards-and-inboxes"],
+)
+def test_mail_adapter_cleanup_deletes_every_inbox_it_created(
+    interpreter: str, pids: list[str], inbox_files: list[str], tmp_path: Path
+) -> None:
+    """A run that fails before a port-forward starts still deletes its inboxes."""
+
+    cleanup = _shell_function(
+        MAIL_ADAPTER_PATH.read_text(), "cleanup", MAIL_ADAPTER_PATH
+    )
+    run_tmp = tmp_path / "run"
+    run_tmp.mkdir()
+    log = tmp_path / "cleanup.log"
+    script = f"""set -euo pipefail
+TMP="$1"
+CONTEXT=k8
+KEEP=0
+RELEASE=curie-mail-e2e
+NAMESPACE=curie-mail-e2e-acme
+PF_PIDS=({" ".join(pids)})
+INBOX_ID_FILES=({" ".join(inbox_files)})
+kill() {{ printf 'kill %s\\n' "$*" >> "$CLEANUP_LOG"; }}
+delete_inbox() {{ printf 'delete %s\\n' "$1" >> "$CLEANUP_LOG"; }}
+namespace_is_owned() {{ return 1; }}
+{cleanup}
+trap cleanup EXIT INT TERM
+exit 3
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(run_tmp)],
+        env={**os.environ, "CLEANUP_LOG": str(log)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 3, result.stderr
+    assert not run_tmp.exists(), result.stderr
+    assert (log.read_text().splitlines() if log.exists() else []) == [
+        *(f"kill {pid}" for pid in pids),
+        *(f"delete {inbox}" for inbox in inbox_files),
     ], result.stderr
