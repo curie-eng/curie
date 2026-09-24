@@ -24,8 +24,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LADDER_PATH = REPO_ROOT / "cli" / "scripts" / "e2e-ladder.sh"
 AGENT_SKILLS_PATH = REPO_ROOT / "scripts" / "check-agent-skills.sh"
+SRE_DEMO_PATH = REPO_ROOT / "cli" / "scripts" / "sre-demo-e2e.sh"
 # Scripts a contributor runs on their own host, whose bash may be 3.2.
-HOST_SCRIPTS = [LADDER_PATH, AGENT_SKILLS_PATH]
+HOST_SCRIPTS = [LADDER_PATH, AGENT_SKILLS_PATH, SRE_DEMO_PATH]
 
 
 def _bash3() -> str | None:
@@ -308,3 +309,49 @@ def test_agent_skills_gate_names_every_listed_skill_when_none_is_found(
         f"{len(listed)} listed skill(s) no longer exist: {' '.join(listed)}"
         in result.stderr
     ), result.stderr
+
+
+# One phrase from each row's own BLOCKED reason, so a reason printed under
+# another row's name is caught.
+SRE_DEMO_BLOCK_REASONS = {
+    "read": "named every observed namespace",
+    "scale": "post-approve replica change are required",
+    "rearm": "a new request whose pending row is distinct",
+    "configuration-denial": "MCP endpoint could not be reached",
+    "rbac-ceiling": "with the platform deployment unchanged",
+}
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_sre_demo_names_each_blocked_rows_own_reason(
+    interpreter: str, tmp_path: Path
+) -> None:
+    rows = "\n".join(f"run_assertion {row} blocked" for row in SRE_DEMO_BLOCK_REASONS)
+    result = subprocess.run(
+        [
+            interpreter,
+            "-c",
+            'source "$SCRIPT" prereqs >/dev/null\n'
+            'evidence_dir="$HOME"\nOBSERVATION_FAILURES=0\n'
+            "blocked() { return 3; }\n"
+            f"{rows}\n"
+            '[[ "$OBSERVATION_FAILURES" == 5 ]]',
+        ],
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "CURIE_CREDENTIALS": "test-placeholder",
+            "SCRIPT": str(SRE_DEMO_PATH),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    blocked = [line for line in result.stderr.splitlines() if ": BLOCKED. " in line]
+    assert [line.split(":")[0] for line in blocked] == [
+        f"- {row}" for row in SRE_DEMO_BLOCK_REASONS
+    ], result.stderr
+    for line, reason in zip(blocked, SRE_DEMO_BLOCK_REASONS.values(), strict=True):
+        assert reason in line, line
