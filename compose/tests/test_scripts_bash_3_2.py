@@ -297,12 +297,14 @@ seed_approval_resume_turn local acme-bot
 
 
 def _bash_array(source: str, name: str) -> list[str]:
-    match = re.search(rf"^{name}=\((.*?)^\)", source, re.MULTILINE | re.DOTALL)
+    match = re.search(rf"^{name}=\(([^)]*)\)", source, re.MULTILINE)
     assert match, f"{AGENT_SKILLS_PATH}: missing {name}"
     return re.findall(r'^\s*"([^"]+)"', match.group(1), re.MULTILINE)
 
 
-def _agent_skills_tree(tmp_path: Path) -> tuple[Path, list[str], list[str]]:
+def _agent_skills_tree(
+    tmp_path: Path, source: str | None = None
+) -> tuple[Path, list[str], list[str]]:
     """A copy of the gate over a tree holding exactly the skills it lists.
 
     The reference validator is replaced by a uvx that answers only the pinned
@@ -310,7 +312,8 @@ def _agent_skills_tree(tmp_path: Path) -> tuple[Path, list[str], list[str]]:
     skills-ref does.
     """
 
-    source = AGENT_SKILLS_PATH.read_text()
+    if source is None:
+        source = AGENT_SKILLS_PATH.read_text()
     valid = _bash_array(source, "VALID_SKILLS")
     invalid = _bash_array(source, "INVALID_SKILLS")
     root = tmp_path / "repo"
@@ -432,6 +435,31 @@ def test_agent_skills_gate_matches_a_glob_character_literally(
     result = _run_agent_skills(interpreter, root, invalid, tmp_path)
     assert result.returncode == 1, result.stderr
     assert f"1 skill(s) escaped the gate: {globbed}" in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_agent_skills_gate_runs_with_no_asserted_invalid_fixture(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """An empty INVALID_SKILLS, which 3.2 refuses to expand under set -u."""
+
+    source, emptied = re.subn(
+        r"^INVALID_SKILLS=\(.*?^\)",
+        "INVALID_SKILLS=()",
+        AGENT_SKILLS_PATH.read_text(),
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    assert emptied == 1, f"{AGENT_SKILLS_PATH}: missing INVALID_SKILLS"
+    root, valid, invalid = _agent_skills_tree(tmp_path, source)
+    assert not invalid
+    result = _run_agent_skills(interpreter, root, invalid, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (
+        f"allowlist covers exactly the {len(valid)} discovered skill(s)" in result.stdout
+    ), result.stdout
+    assert "0 asserted-invalid fixture(s) still rejected." in result.stdout, (
+        result.stdout
+    )
 
 
 @pytest.mark.parametrize("interpreter", EVERY_BASH)
