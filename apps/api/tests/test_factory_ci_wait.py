@@ -1056,7 +1056,6 @@ def test_a_claim_lost_during_a_slow_dispatch_enqueues_the_round_once(
     """The round claim expires mid-dispatch and a second reconciler runs meanwhile."""
 
     import redis.asyncio as aioredis
-
     from curie_api import factory_ci
 
     client, github, sink = admitted

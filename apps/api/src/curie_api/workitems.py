@@ -914,7 +914,22 @@ async def _terminalize_execution(
         )
     if status == "failed" and cause.strip() == "ci_fix_unpublished":
         # A CI fix turn that ended without a new publication is terminal, unless
-        # its publication is still in flight; that one settles the request.
+        # its publication is still in flight, or a fix publication already
+        # succeeded and awaits the CI gate's verdict; either one settles the
+        # request. Every succeeded publication after the request's first is a fix
+        # round's. The database does not record which of them the gate already
+        # judged failing, so a later round's unpublished turn defers here and the
+        # request ends at its execution deadline instead.
+        succeeded = (
+            select(Publication.id)
+            .where(
+                Publication.execution_request_id == request.id,
+                Publication.status == "succeeded",
+            )
+            .order_by(Publication.revision_number)
+            .offset(1)
+            .limit(1)
+        )
         in_flight = await session.scalar(
             select(Publication.id)
             .where(
@@ -923,6 +938,8 @@ async def _terminalize_execution(
             )
             .limit(1)
         )
+        if in_flight is None:
+            in_flight = await session.scalar(succeeded)
         if in_flight is not None:
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request

@@ -354,6 +354,15 @@ return 0
 """
 
 
+_CONFIRM_CLAIM = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0
+"""
+
+
 Dispatch = Callable[[ExecutionRequest, int, str], Awaitable[bool]]
 
 
@@ -367,11 +376,15 @@ async def gate(
     owner: str,
     next_poll: dict[uuid.UUID, datetime],
     dispatch: Dispatch,
+    may_observe: Callable[[], bool],
 ) -> GateResult:
     """Observe one published request's CI and act on the verdict.
 
     ``dispatch`` enqueues the continuation turn; it runs only after the round's
     claim and the fenced lease hold, and a failure releases the claim.
+    ``may_observe`` spends the caller's per-pass observation budget; it is asked
+    only when a CI read is actually due, so a request that is not due never
+    takes a later request's slot.
     """
 
     async with sessionmaker() as session:
@@ -389,6 +402,8 @@ async def gate(
         return "fixing"
     due = next_poll.get(request.id)
     if due is not None and now < due:
+        return "waiting"
+    if not may_observe():
         return "waiting"
     latest = facts.publications[-1]
     observed_sha = lineage.head_sha
@@ -473,10 +488,19 @@ async def _continue(
     now: datetime,
     dispatch: Dispatch,
 ) -> GateResult:
-    """Claim the round, hold the lease, publish the turn, then confirm the claim."""
+    """Claim the round, hold the lease, publish the turn, then confirm the claim.
+
+    The claim can expire during a slow hold or dispatch, so it alone cannot keep
+    a round to one turn. An enqueue marker, set NX just before the stream write,
+    is the idempotency key: a reconciler that finds it set never enqueues the
+    round again, and one whose claim was lost does not report the continuation.
+    """
 
     key = ci_key(request.id, round_)
+    marker = f"{key}:enqueued"
     token = f"claimed:{owner}"
+    assert request.execution_deadline is not None
+    ttl = max(int((request.execution_deadline - now).total_seconds()) + 60, CI_CLAIM_SECONDS)
     if not await valkey.set(key, token, nx=True, ex=CI_CLAIM_SECONDS):
         return "fixing"
     try:
@@ -489,14 +513,28 @@ async def _continue(
                 expected_publication_id=publication_id,
                 expected_head_sha=head_sha,
             )
-        published = held and await dispatch(request, round_, text)
+        if not held:
+            await valkey.eval(_RELEASE_CLAIM, 1, key, token)
+            return "waiting"
+        if not await valkey.set(marker, owner, nx=True, ex=ttl):
+            # Another reconciler already enqueued this round.
+            await valkey.set(key, "published", ex=ttl)
+            return "fixing"
+        try:
+            published = await dispatch(request, round_, text)
+        except Exception:
+            await valkey.delete(marker)
+            raise
     except Exception:
         await valkey.eval(_RELEASE_CLAIM, 1, key, token)
         raise
     if not published:
+        await valkey.delete(marker)
         await valkey.eval(_RELEASE_CLAIM, 1, key, token)
         return "waiting"
-    assert request.execution_deadline is not None
-    ttl = max(int((request.execution_deadline - now).total_seconds()) + 60, CI_CLAIM_SECONDS)
-    await valkey.set(key, "published", xx=True, ex=ttl)
+    confirmed = await valkey.eval(_CONFIRM_CLAIM, 1, key, token, "published", ttl)
+    if not confirmed:
+        # The claim expired mid-dispatch; the marker still holds the round.
+        await valkey.set(key, "published", ex=ttl)
+        return "fixing"
     return "continued"

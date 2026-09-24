@@ -292,6 +292,14 @@ class WorkItemReconciler:
 
         skip: set[uuid.UUID] = set()
         observations = 0
+
+        def may_observe() -> bool:
+            nonlocal observations
+            if observations >= factory_ci.CI_OBSERVATIONS_PER_PASS:
+                return False
+            observations += 1
+            return True
+
         client: httpx.AsyncClient | None = None
         try:
             for _ in range(self._settings.work_item_batch_limit):
@@ -315,9 +323,6 @@ class WorkItemReconciler:
                         continue
                     # No network call under the claim's row lock.
                     await session.rollback()
-                if observations >= factory_ci.CI_OBSERVATIONS_PER_PASS:
-                    continue
-                observations += 1
                 if client is None:
                     client = httpx.AsyncClient(
                         timeout=self._settings.github_app_timeout_seconds
@@ -331,6 +336,7 @@ class WorkItemReconciler:
                     owner=self._owner,
                     next_poll=self._ci_next_poll,
                     dispatch=self._dispatch_ci_turn,
+                    may_observe=may_observe,
                 )
         finally:
             if client is not None:

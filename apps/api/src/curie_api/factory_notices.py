@@ -128,6 +128,8 @@ def comment_body(
     if cause == "completed":
         if feedback_url is not None:
             text = "The requested revision is pushed to this pull request.\n"
+            if detail is not None and detail.strip():
+                text += f"Note: {detail.strip()}\n"
         elif isinstance(pr_url, str) and pr_url.strip():
             text = f"Completed: {pr_url.strip()}\n"
             if detail is not None and detail.strip():
