@@ -8,12 +8,6 @@
 {{- if gt (float64 $workspaceStageBudget) (float64 .Values.worker.workspace.totalTimeoutSeconds) }}
 {{- fail "worker.workspace stage timeouts must sum to no more than totalTimeoutSeconds" }}
 {{- end }}
-{{/* ADR-0131: grace must cover deliveryBudget + deliveryShutdownReserve. Render
-     time is the ONLY place this can fail usefully -- values.schema.json cannot
-     express cross-field arithmetic, and the worker's own boot check raises
-     before its supervisor exists, so a bad value that reaches a Pod is a
-     CrashLoopBackOff after a green `helm upgrade`. */}}
-{{- include "curie.worker.validateDrainBudget" . }}
 {{/* A runner request ceiling above the overall delivery budget is internally
      inconsistent. Refuse it before creating a worker Pod; the worker boot
      validator remains the backstop outside Helm. */}}
@@ -157,7 +151,9 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
-      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      # ADR-0131: grace = max(configured, deliveryBudget + shutdownReserve),
+      # derived once in curie.worker.terminationGrace (#3071).
+      terminationGracePeriodSeconds: {{ include "curie.worker.terminationGrace" . }}
       {{- with .Values.worker.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -394,16 +390,21 @@ spec:
             - name: CURIE_DELIVERY_LEASE_HEARTBEAT_S
               value: {{ .Values.worker.deliveryLeaseHeartbeatSeconds | quote }}
             # Budget reserved for terminal settlement after the runner work is
-            # done; terminationGracePeriodSeconds below must be at least the
-            # delivery budget plus this reserve.
+            # done; the rendered termination grace is at least the delivery
+            # budget plus this reserve (curie.worker.terminationGrace).
             - name: CURIE_DELIVERY_SHUTDOWN_RESERVE_S
               value: {{ .Values.worker.deliveryShutdownReserveSeconds | quote }}
             # The platform's own voluntary termination grace, injected from the
-            # SAME value that renders onto this Pod's spec.terminationGracePeriodSeconds
-            # (line ~145) so the worker's boot validator and the platform can
-            # never disagree about how long a drain is allowed to take.
+            # SAME helper that renders this Pod's spec.terminationGracePeriodSeconds
+            # so the worker's boot validator and the platform can never
+            # disagree about how long a drain is allowed to take.
             - name: CURIE_TERMINATION_GRACE_PERIOD_S
-              value: {{ .Values.worker.terminationGracePeriodSeconds | quote }}
+              value: {{ include "curie.worker.terminationGrace" . | quote }}
+            # Turn budget for a work-item (factory) delivery (#3071), written
+            # into that delivery's sandbox as CURIE_MAX_TURNS. Chat keeps the
+            # runner default.
+            - name: CURIE_WORK_ITEM_MAX_TURNS
+              value: {{ .Values.worker.workItemMaxTurns | quote }}
             # Slack assistant-thread "shimmer" (#1182). Rendered on the WORKER
             # only: it both raises the caption and lowers it, so one value
             # governs the feature release-wide and the two halves cannot be

@@ -81,6 +81,13 @@ def _iso(value: datetime | None) -> str:
     return value.isoformat() if value is not None else "unknown"
 
 
+def _deadline_seconds(req: ExecutionRequest) -> str:
+    """The execution deadline this row was started with, in whole seconds (#3071)."""
+    if req.started_at is None or req.execution_deadline is None:
+        return "unknown"
+    return str(int((req.execution_deadline - req.started_at).total_seconds()))
+
+
 def _cause(
     state: WorkItemOutcomeState,
     req: ExecutionRequest | None,
@@ -100,7 +107,9 @@ def _cause(
     if state == "cancellation_requested":
         reasons = {
             "issue_cancelled": "the issue was cancelled (label removed or issue closed)",
-            "execution_deadline": "the 1800 s execution deadline elapsed",
+            "execution_deadline": (
+                f"the {_deadline_seconds(req)} s execution deadline elapsed"
+            ),
             "owner_lost": "the runtime owner stopped heartbeating",
         }
         return (
@@ -137,7 +146,8 @@ def _cause(
                 "waiting deadline"
             )
         return (
-            f"expired: {cause}, the execution exceeded 1800 s and termination "
+            f"expired: {cause}, the execution exceeded {_deadline_seconds(req)} s "
+            "and termination "
             "was observed"
         )
     if state == "failed":

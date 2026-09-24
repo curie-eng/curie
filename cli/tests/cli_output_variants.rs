@@ -292,6 +292,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 agent: "a".to_string(),
                 model: Some("kimi-k2".to_string()),
                 thinking: Some("adaptive".to_string()),
+                execution_deadline_seconds: Some(90),
                 changed: true,
             },
         ],

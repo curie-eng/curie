@@ -221,6 +221,11 @@ pub struct Agent {
     /// explicit null clears it.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Per-agent execution deadline in seconds for factory work items (#3071),
+    /// 60 to 10800. `None` means the 1800 s default. Same three-way PATCH
+    /// semantics as `model`.
+    #[serde(default)]
+    pub execution_deadline_seconds: Option<u32>,
     /// Whether this agent's bindings share one workflow-state namespace
     /// (`true`) or each get their own (`false`, the default) (#1525 follow-up,
     /// ADR-0118). Cardinality alone opts an agent into multiple surfaces; this

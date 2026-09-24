@@ -37,6 +37,8 @@ fn bin() -> &'static str {
 const MODEL_SENTINEL: &str = "curie-test-model-alpha";
 /// A thinking value that could never be mistaken for a model name.
 const THINKING_SENTINEL: &str = "enabled:31337";
+/// An execution-deadline value inside the accepted 60..10800 range (issue #3071).
+const DEADLINE_SENTINEL: &str = "120";
 
 /// Run the binary with `argv` and return the single `plan` line of its
 /// `--dry-run --json` output.
@@ -210,5 +212,158 @@ fn cluster_overrides_set_model_and_clear_thinking_bind_to_their_own_patch_fields
         patch_body(&plan),
         serde_json::json!({"model": MODEL_SENTINEL, "thinking": null}),
         "--clear-thinking must null `thinking` while --model sets `model`: {plan}"
+    );
+}
+
+// --- `--execution-deadline`/`--clear-execution-deadline` (issue #3071) ------
+//
+// Mirrors the `--model`/`--clear-model` coverage above: the wire field is
+// `execution_deadline_seconds`, and unlike `model`/`thinking` it carries a
+// JSON NUMBER, not a string -- the DTO field is an int
+// (`execution_deadline_seconds: <int>`), so a stringified `"120"` in the PATCH
+// body would be as wrong as sending `--clear-execution-deadline` as `""`.
+
+#[test]
+fn local_overrides_set_execution_deadline_binds_to_its_own_patch_field() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--execution-deadline",
+        DEADLINE_SENTINEL,
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"execution_deadline_seconds": 120}),
+        "--execution-deadline must send a JSON number under its own key: {plan}"
+    );
+}
+
+#[test]
+fn local_overrides_clear_execution_deadline_sends_explicit_null() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--clear-execution-deadline",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"execution_deadline_seconds": null}),
+        "--clear-execution-deadline must null `execution_deadline_seconds`: {plan}"
+    );
+}
+
+#[test]
+fn cluster_overrides_set_execution_deadline_binds_to_its_own_patch_field() {
+    let plan = dry_run_plan_line(&[
+        "cluster",
+        "overrides",
+        "deal-desk",
+        "--api-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "curie-test-key",
+        "--execution-deadline",
+        DEADLINE_SENTINEL,
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"execution_deadline_seconds": 120}),
+        "--execution-deadline must send a JSON number under its own key: {plan}"
+    );
+}
+
+#[test]
+fn cluster_overrides_clear_execution_deadline_sends_explicit_null() {
+    let plan = dry_run_plan_line(&[
+        "cluster",
+        "overrides",
+        "deal-desk",
+        "--api-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "curie-test-key",
+        "--clear-execution-deadline",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"execution_deadline_seconds": null}),
+        "--clear-execution-deadline must null `execution_deadline_seconds`: {plan}"
+    );
+}
+
+#[test]
+fn execution_deadline_and_clear_execution_deadline_together_is_a_usage_error() {
+    let output = Command::new(bin())
+        .args([
+            "local",
+            "overrides",
+            "deal-desk",
+            "--execution-deadline",
+            DEADLINE_SENTINEL,
+            "--clear-execution-deadline",
+            "--dry-run",
+            "--json",
+        ])
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .output()
+        .expect("run curie");
+    assert!(
+        !output.status.success(),
+        "--execution-deadline and --clear-execution-deadline must contradict each other"
+    );
+}
+
+#[test]
+fn execution_deadline_below_the_minimum_is_refused_client_side() {
+    let output = Command::new(bin())
+        .args([
+            "local",
+            "overrides",
+            "deal-desk",
+            "--execution-deadline",
+            "30",
+            "--dry-run",
+            "--json",
+        ])
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .output()
+        .expect("run curie");
+    assert!(
+        !output.status.success(),
+        "a deadline below 60 seconds must be refused before any request"
+    );
+}
+
+#[test]
+fn execution_deadline_above_the_maximum_is_refused_client_side() {
+    let output = Command::new(bin())
+        .args([
+            "local",
+            "overrides",
+            "deal-desk",
+            "--execution-deadline",
+            "15000",
+            "--dry-run",
+            "--json",
+        ])
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .output()
+        .expect("run curie");
+    assert!(
+        !output.status.success(),
+        "a deadline above 10800 seconds must be refused before any request"
     );
 }

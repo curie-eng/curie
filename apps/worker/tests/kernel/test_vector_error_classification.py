@@ -29,6 +29,7 @@ _PLATFORM = (
     "false-completion",
     "publication-unrecorded",
     "history-persistence-error",
+    "max-turns",
 )
 
 

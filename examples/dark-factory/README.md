@@ -24,8 +24,8 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
 9. `wait_ci`: the pull request's checks run. The bundle names this phase
    and does not act on the checks yet.
 
-The skill budgets its own time against the platform's 1800 second execution
-bound and treats the issue text and repository files as untrusted data.
+The skill budgets its own time against the platform's 10800 second (3 hour)
+execution bound and treats the issue text and repository files as untrusted data.
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
@@ -83,10 +83,13 @@ Enable factory intake first (see "Admitting a labelled GitHub issue" in
 [`docs/operations.md`](../../docs/operations.md)). Then:
 
 ```bash
-# Execution runs up to 1800 s; the worker budget defaults to 600 s.
+# The skill plans for a 3 hour run. The execution deadline defaults to 1800 s
+# and the worker budget to 600 s, so raise all three. The chart raises the
+# worker termination grace with the budget.
 helm upgrade curie <chart> -n curie --reuse-values \
-  --set worker.deliveryBudgetSeconds=1800 \
-  --set worker.runnerTotalTimeoutSeconds=1800
+  --set worker.deliveryBudgetSeconds=10800 \
+  --set worker.runnerTotalTimeoutSeconds=10800
+curie cluster overrides dark-factory --execution-deadline 10800
 
 # The factory's default model: GLM 5.3 Flash through OpenRouter.
 helm upgrade curie <chart> -n curie --reuse-values \

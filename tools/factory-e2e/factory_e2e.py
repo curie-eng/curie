@@ -16,7 +16,8 @@ short-lived issues:read installation token as the bundle's GitHub MCP
 credential, and sets the agent's publication policy to auto so an unattended
 run publishes without a human. With CURIE_FACTORY_MODEL_API_KEY set the
 install runs a real model (DEFAULT_MODEL unless CURIE_FACTORY_MODEL names
-another) with the 1800 second execution bound; without it the model is fake.
+another) with the 10800 second execution bound; without it the model is fake.
+The bound is set on the factory agent as its execution deadline (#3071).
 
 `curie dev factory-e2e run --scenario <name>` runs one scenario driver after
 the preflight. `issue-to-pr --issue-file <file> [--expect pr|comment|any]`
@@ -127,8 +128,10 @@ _PR_CASE_IDS = frozenset({"positive", "failing-test"})
 DEFAULT_BUNDLE = Path(__file__).resolve().parents[2] / "examples" / "dark-factory"
 OPENROUTER_HOST = "openrouter.ai"
 OPENROUTER_KEY_URL = f"https://{OPENROUTER_HOST}/api/v1/key"
-# The ExecutionRequest deadline (ADR 0162) and the chart's maximum budget.
-EXECUTION_BOUND_SECONDS = 1800
+# The factory agent's per-agent execution deadline (#3071, ADR 0171; the
+# maximum), which the ExecutionRequest deadline follows, and the chart's
+# maximum worker delivery budget.
+EXECUTION_BOUND_SECONDS = 10800
 # Wait allowance after the execution deadline for publication and the notice.
 PUBLICATION_ALLOWANCE_SECONDS = 600
 # A run that never starts is still given up on after this long from labelling.
@@ -598,7 +601,7 @@ def install_values(
         values["agentSandbox"]["runner"]["extraEnv"] = [
             {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"},
         ]
-        # The chart maximum, so the 1800 s ExecutionRequest deadline and not
+        # The chart maximum, so the agent's 10800 s execution deadline and not
         # the default 600 s worker budget bounds the run. The runner ceiling
         # must not exceed the delivery budget.
         values["worker"]["deliveryBudgetSeconds"] = EXECUTION_BOUND_SECONDS
@@ -1670,6 +1673,18 @@ class Preflight:
             raise PreflightFailed(f"agent creation failed (HTTP {status}): {body}")
         self.evidence["agent_id"] = body.get("id")
         self.step("factory agent bound to the fixture repository", agent_id=body.get("id"))
+        agent_id = body.get("id")
+        status, patched = self.api(
+            "PATCH",
+            f"/agents/{agent_id}",
+            headers={"X-API-Key": self.api_key},
+            body={"execution_deadline_seconds": EXECUTION_BOUND_SECONDS},
+        )
+        if status != 200:
+            raise PreflightFailed(
+                f"setting the agent execution deadline failed (HTTP {status}): {patched}"
+            )
+        self.step("factory agent execution deadline set", seconds=EXECUTION_BOUND_SECONDS)
         self.deploy_bundle()
 
     def _write_kubeconfig(self) -> Path:

@@ -36,12 +36,12 @@ Start no other sub-agent, and ask for no other outside review.
 
 ## Time budget
 
-The platform stops this run 1800 seconds (30 minutes) after it starts, and a
+The platform stops this run 10800 seconds (3 hours) after it starts, and a
 stopped run publishes nothing. Keep your own clock:
 
-- By about minute 5, you have read the issue and know the acceptance criteria.
-- By about minute 20, the change is implemented and the focused test passes.
-- At about minute 25, stop working on the change. Publish only if the diff
+- By about minute 15, you have read the issue and know the acceptance criteria.
+- By about minute 150, the change is implemented and the focused test passes.
+- At about minute 165, stop working on the change. Publish only if the diff
   reviewer approved and every criterion is met and verified; otherwise end
   with a stated reason.
 

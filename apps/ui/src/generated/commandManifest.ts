@@ -2212,6 +2212,26 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pin this agent's run deadline in seconds (60-10800; platform default is 1800s)",
+              "id": "execution_deadline",
+              "long": "execution-deadline",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the execution-deadline override back to the platform default",
+              "id": "clear_execution_deadline",
+              "long": "clear-execution-deadline",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -4499,6 +4519,26 @@ export const commandManifest = {
               "help": "Clear the thinking override back to the platform default",
               "id": "clear_thinking",
               "long": "clear-thinking",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin this agent's run deadline in seconds (60-10800; platform default is 1800s)",
+              "id": "execution_deadline",
+              "long": "execution-deadline",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the execution-deadline override back to the platform default",
+              "id": "clear_execution_deadline",
+              "long": "clear-execution-deadline",
               "positional": false,
               "possible_values": [
                 "true",

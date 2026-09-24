@@ -904,6 +904,17 @@
             "title": "Created At",
             "type": "string"
           },
+          "execution_deadline_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Deadline Seconds"
+          },
           "hook_partitions": {
             "anyOf": [
               {
@@ -1072,6 +1083,19 @@
               }
             ],
             "title": "Approval Routes"
+          },
+          "execution_deadline_seconds": {
+            "anyOf": [
+              {
+                "maximum": 10800.0,
+                "minimum": 60.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Deadline Seconds"
           },
           "hook_partitions": {
             "anyOf": [

@@ -325,6 +325,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
         #   decided before any sandbox exists.
         "CURIE_DELIVERY_BUDGET_S",
+        # The factory turn budget (#3071): a worker setting whose VALUE the
+        # worker writes into a work-item claim under the BootEnv key
+        # CURIE_MAX_TURNS. This name itself never enters a sandbox.
+        "CURIE_WORK_ITEM_MAX_TURNS",
         "CURIE_RUNNER_TOTAL_TIMEOUT_S",
         "CURIE_DELIVERY_LEASE_TTL_S",
         "CURIE_DELIVERY_LEASE_HEARTBEAT_S",

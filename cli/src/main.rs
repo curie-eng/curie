@@ -2069,6 +2069,13 @@ enum LocalAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -2907,6 +2914,13 @@ enum ClusterAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -4476,6 +4490,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
                 api_url,
                 api_key,
                 dry_run,
@@ -4489,6 +4505,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
+                    commands::OverrideChange::resolve_execution_deadline(
+                        execution_deadline,
+                        clear_execution_deadline,
+                    )?,
                 )
                 .await?,
             ),
@@ -5574,6 +5594,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
                 conn,
                 dry_run,
             } => {
@@ -5584,6 +5606,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
+                let execution_deadline = commands::OverrideChange::resolve_execution_deadline(
+                    execution_deadline,
+                    clear_execution_deadline,
+                )?;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
@@ -5596,6 +5622,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         model,
                         thinking,
+                        execution_deadline,
                     )
                     .await?,
                 )

@@ -60,6 +60,7 @@ worker:
   CURIE_UPGRADE_LEGACY_QUIESCE: the Helm-managed mixed-version upgrade mode (remove this override)
   CURIE_UPGRADE_REVISION: the Helm release revision (remove this override)
   CURIE_WARM_POOL: worker.warmPool
+  CURIE_WORK_ITEM_MAX_TURNS: worker.workItemMaxTurns
   CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS: worker.workspace.archiveTimeoutSeconds
   CURIE_WORKSPACE_BUCKET: worker.workspace.bucket
   CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS: worker.workspace.cloneTimeoutSeconds
