@@ -1189,3 +1189,64 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
     assert _terminal(9759) == ("completed", "completed")
     assert _body(sink, later["id"]).startswith(f"Completed: {later['pr_url']}")
     assert all(_terminal(9750 + i) == ("running", None) for i in range(4))
+
+
+# --- A CI wait is not an orphan (#3097 x #3076) --------------------------------
+
+_OWNERS_URL = "/v1/internal/work-items/runtime-owners"
+
+
+def _owner_lost(client: Any, request_id: uuid.UUID, epoch: int) -> Any:
+    return client.post(
+        f"/v1/internal/work-items/requests/{request_id}/owner-lost",
+        headers=WORKER,
+        json={"owner": "factory-owner", "runtime_epoch": epoch},
+    )
+
+
+def _listed_owner_ids(client: Any) -> list[str]:
+    listed = client.get(_OWNERS_URL, headers=WORKER)
+    assert listed.status_code == 200, listed.text
+    return [row["request_id"] for row in listed.json()["requests"]]
+
+
+@pytest.mark.parametrize("check", ["listed", "declared"])
+@pytest.mark.parametrize("publication", ["succeeded", "pending"])
+def test_a_request_awaiting_ci_is_not_an_orphan(
+    admitted: Any, publication: str, check: str
+) -> None:
+    """The worker released the run at publish; its orphan sweep must not kill the CI wait."""
+
+    client, github, sink = admitted
+    number = {"succeeded": 9790, "pending": 9791}[publication] + (10 if check == "declared" else 0)
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    _attach_publication(
+        row["work_item_id"],
+        status=publication,
+        pr=next(_PRS) if publication == "succeeded" else None,
+    )
+
+    if check == "listed":
+        assert str(row["id"]) not in _listed_owner_ids(client)
+    else:
+        refused = _owner_lost(client, row["id"], epoch)
+        assert refused.status_code == 409, refused.text
+        assert _terminal(number) == ("running", None)
+
+
+def test_a_request_with_no_publication_is_still_an_orphan_candidate(
+    admitted: Any,
+) -> None:
+    client, github, _sink = admitted
+    number = 9792
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+
+    assert str(row["id"]) in _listed_owner_ids(client)
+
+    declared = _owner_lost(client, row["id"], epoch)
+    assert declared.status_code == 200, declared.text
+    assert _terminal(number) == ("cancellation_requested", "owner_lost")
