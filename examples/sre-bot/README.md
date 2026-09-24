@@ -161,6 +161,84 @@ signed source is opt-in: apply `observability/alertmanager-webhook.yaml`, run
 investigation. Missing, ambiguous, or unauthorized mappings visibly stop
 coding. Invalid signatures and replayed delivery ids do not multiply work.
 
+## What watches the alert path
+
+A broken alert path looks exactly like a quiet cluster: every rule goes quiet
+and nothing says so. Healthy means the heartbeat keeps arriving outside the
+cluster and no alert is firing; either one alone proves nothing.
+
+`CurieKubeStateMetricsDown` pages when a kube-state-metrics target of this stack
+has failed its scrape, or none has been scraped, for 5 minutes. Most workload
+rules read kube-state-metrics, and without it they stay quiet whatever the
+cluster does.
+
+The heartbeat is opt-in. Set up a check in an external dead man's switch that
+alarms when posts stop, with a period of at least 5 minutes (posts arrive about
+every two minutes). Store its URL in a Secret in Alertmanager's namespace
+(`observability` unless `--observability-namespace` named another):
+
+```bash
+read -rsp 'Heartbeat URL: ' HEARTBEAT_URL   # e.g. https://heartbeat.example.com/ping/EXAMPLE
+printf '\n'
+kubectl -n observability create secret generic alertmanager-heartbeat \
+  --from-literal=url="$HEARTBEAT_URL"
+```
+
+Then upgrade the Prometheus release with the overlays in this order, the
+heartbeat overlay last. `my-alertmanager.yaml` stands for your own overlay, the
+one that mounts the alert-signer token through `extraSecretMounts`:
+
+```bash
+helm upgrade prometheus prometheus-community/prometheus --version 29.27.0 \
+  -n observability \
+  -f examples/sre-bot/observability/prometheus-values.yaml \
+  -f examples/sre-bot/observability/alertmanager-webhook.yaml \
+  -f my-alertmanager.yaml \
+  -f examples/sre-bot/observability/alertmanager-heartbeat.yaml
+```
+
+The heartbeat overlay goes after the webhook overlay: the other way round the
+config is invalid (`undefined receiver "heartbeat"`). The heartbeat overlay
+mounts its Secret through `extraVolumes` and `extraVolumeMounts` and leaves
+`extraSecretMounts` alone, so your token mount survives. Helm replaces lists,
+so an overlay of yours that sets `extraVolumes` or `extraVolumeMounts`, or
+restates the routes or receivers, collides with it whichever comes last: apply
+yours after it, carrying the heartbeat's entries, with the heartbeat route first
+(the first matching child route wins). Re-running
+`curie example sre-bot install --observability` upgrades the release with
+`prometheus-values.yaml` alone, which removes the overlays and turns
+Alertmanager off; run the command above again after it.
+
+The overlay adds `CurieAlertPathHeartbeat`, which always fires, and routes it
+only to that URL; it never reaches the bot. Without it, nothing watches the
+alert path. Posts stop within a few minutes of Prometheus stopping: one measured
+run saw the last post about a minute and a half after the stop, and Prometheus
+lets a firing alert stand in Alertmanager up to four minutes after its last
+send. With a five-minute period, allow about nine minutes plus the service's
+grace before it alarms.
+
+The Secret's volume is optional: without the Secret or its `url` key
+Alertmanager still runs and every alert still reaches the bot; only the
+heartbeat posts fail. A dead man's switch that never received a post usually
+does not alarm, so after the upgrade confirm the external service shows a first
+post. Only then does a stop in the posts raise its alarm.
+
+The heartbeat cannot see the last leg, from Alertmanager to the bot. Check that
+with one synthetic alert posted to Alertmanager's API:
+
+```bash
+kubectl -n observability exec prometheus-alertmanager-0 -- \
+  amtool alert add CurieSyntheticDeliveryCheck \
+  --annotation=summary='Synthetic delivery check' \
+  --alertmanager.url=http://localhost:9093
+```
+
+Then wait for the bot's reply in the bound channel (`C0EXAMPLE1` above). The
+alert names no workload, so the hook runs the investigation with coding
+stopped and the reply should say so. Because `curie-sre` sets `send_resolved`,
+expect a second, resolved delivery about five minutes later. A missing reply
+means the path is broken somewhere between Alertmanager and the bot.
+
 ## Verification
 
 Use the real pinned image and a disposable cluster. A complete pass proves:

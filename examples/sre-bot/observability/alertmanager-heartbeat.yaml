@@ -1,0 +1,95 @@
+# Opt-in heartbeat for the alert path (#3059). Apply this overlay last, after
+# prometheus-values.yaml, alertmanager-webhook.yaml and your own overlay (the
+# one that mounts the alert-signer token through extraSecretMounts). It adds
+# CurieAlertPathHeartbeat, a rule that always fires, and routes it only to a
+# `heartbeat` receiver that posts to a dead man's switch outside the cluster,
+# which alarms when the posts stop. The heartbeat never reaches curie-sre, the
+# bot; every other alert still does.
+#
+# The rule lives here and not in the default rules, so nothing changes until an
+# operator opts in. In alerting_rules.yml it would reach every Alertmanager
+# already installed with alertmanager-webhook.yaml, and any overlay that
+# restates the routes would send it to the bot every repeat_interval, starting
+# an agent turn each time.
+#
+# Helm replaces lists instead of merging them, so this file restates the route
+# tree and receivers, with curie-sre exactly as alertmanager-webhook.yaml has
+# it. The Secret is mounted through extraVolumes and extraVolumeMounts, not
+# extraSecretMounts, so it leaves the operator's token mount alone in either
+# order. An operator overlay that itself sets extraVolumes or extraVolumeMounts,
+# or restates the routes or receivers, collides with this file whichever is
+# applied last: apply it after this one, carrying the heartbeat's entries, with
+# the heartbeat route first, since the first matching child route wins.
+#
+# Reads the Secret alertmanager-heartbeat, key `url`, in Alertmanager's
+# namespace, holding the external service's URL. The volume is optional:
+# without the Secret or its key Alertmanager still runs and every alert still
+# reaches the bot; only the heartbeat posts fail. A dead man's switch that never
+# received a post usually does not alarm, so after the upgrade confirm the
+# external service shows a first post; only then does a stop in the posts
+# raise its alarm. Posts arrive about every two minutes, not every
+# repeat_interval, so the external service should allow at least five minutes
+# between posts.
+#
+# rule_files is a list too: the chart's four defaults, in order, so
+# alerting_rules.yml keeps loading, then heartbeat_rules.yml.
+alertmanager:
+  enabled: true
+  extraVolumes:
+    - name: alertmanager-heartbeat
+      secret:
+        secretName: alertmanager-heartbeat
+        optional: true
+  extraVolumeMounts:
+    - name: alertmanager-heartbeat
+      mountPath: /etc/alertmanager-heartbeat
+      readOnly: true
+  config:
+    route:
+      receiver: curie-sre
+      group_by: ["alertname", "curie_workload"]
+      routes:
+        - receiver: heartbeat
+          matchers: ['alertname = "CurieAlertPathHeartbeat"']
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 1m
+    receivers:
+      - name: curie-sre
+        webhook_configs:
+          - url: "http://alert-signer:8080/"
+            send_resolved: true
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/alert-signer/token
+      - name: heartbeat
+        webhook_configs:
+          - url_file: /etc/alertmanager-heartbeat/url
+            send_resolved: false
+serverFiles:
+  heartbeat_rules.yml:
+    groups:
+      - name: curie-alert-path
+        rules:
+          - alert: CurieAlertPathHeartbeat
+            expr: vector(1)
+            labels:
+              severity: none
+              component: curie-alert-path
+            annotations:
+              summary: Always firing, so the alert path can be seen working
+              description: >-
+                This alert fires by design and never pages. The heartbeat
+                receiver posts it to a dead man's switch outside the cluster
+                about every two minutes; that service alarms when the posts
+                stop, which means Prometheus, rule evaluation, Alertmanager or
+                the way out of the cluster has stopped. A receiver inside the
+                cluster cannot report its own death.
+  prometheus.yml:
+    rule_files:
+      - /etc/config/recording_rules.yml
+      - /etc/config/alerting_rules.yml
+      - /etc/config/rules
+      - /etc/config/alerts
+      - /etc/config/heartbeat_rules.yml
