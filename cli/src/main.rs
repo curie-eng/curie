@@ -4125,8 +4125,8 @@ async fn run(command: Option<Command>) -> Result<()> {
             ),
         },
         Some(Command::Cluster { action, context }) => {
-            if let Some(target) = curie::kube_context::pin_for_cluster_command(context.as_deref())?
-            {
+            let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
+            if let Some(target) = &target {
                 ui::ui().note(&format!(
                     "Kubernetes context: {} (cluster {})",
                     target.context, target.cluster
@@ -4288,11 +4288,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 release,
                 dry_run,
             } => emit(
-                ops::status(CommonOpts {
-                    namespace,
-                    release,
-                    dry_run,
-                })
+                ops::status(
+                    CommonOpts {
+                        namespace,
+                        release,
+                        dry_run,
+                    },
+                    target.is_some(),
+                )
                 .await?,
             ),
             ClusterAction::Observability {
