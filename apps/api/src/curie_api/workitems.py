@@ -1012,6 +1012,10 @@ async def request_cancellation(
         )
         active = await _reload_request(session, active.id)
     work_item = await _reload_work_item(session, work_item_id)
+    if active is None:
+        # Nothing is left to run, so the cancelled WorkItem is terminal now. A
+        # waiting or running request expires the transcript when it settles.
+        await transcripts.expire_for_work_item(session, work_item)
     return await _outcome(session, work_item, active)
 
 

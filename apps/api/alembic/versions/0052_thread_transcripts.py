@@ -5,9 +5,10 @@ thread's transcript under one per-(agent, namespace) byte cap, so a factory
 agent stopped for good after enough issues. Upgrade creates
 ``thread_transcripts`` and copies every transcript row into it. It is an expand:
 the legacy rows stay, so an older API instance still serving during a rolling
-upgrade keeps reading and writing them. The new API adopts a legacy row the
-first time it touches that thread and deletes it then; a later contract
-migration removes the rest. No operator step is needed.
+upgrade keeps reading and writing them. The new API adopts a legacy row newer
+than its copy without deleting it; a later contract migration (#3088) removes
+the legacy rows. A copied row gets the default 30 day idle expiry. No operator
+step is needed.
 
 Downgrade writes each thread's newer copy back to the state store and drops the
 table. A row larger than the old state caps is still written back; the state
@@ -64,8 +65,10 @@ def upgrade() -> None:
     op.execute(
         f"""
         INSERT INTO {SCHEMA}.thread_transcripts
-            (id, agent_id, binding_scope, thread_key, value, version, created_at, updated_at)
-        SELECT id, agent_id, binding_scope, key, value, version, created_at, updated_at
+            (id, agent_id, binding_scope, thread_key, value, version, expires_at,
+             created_at, updated_at)
+        SELECT id, agent_id, binding_scope, key, value, version,
+               now() + interval '30 days', created_at, updated_at
         FROM {SCHEMA}.workflow_state_entries
         WHERE namespace = 'transcript'
         """

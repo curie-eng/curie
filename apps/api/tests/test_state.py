@@ -1834,11 +1834,14 @@ def test_a_legacy_transcript_row_is_adopted_on_first_access(
     assert appended.status_code == 200, appended.text
     assert appended.json()["value"] == [{"text": "old"}, {"text": "new"}]
     assert appended.json()["version"] == 8
-    assert _legacy_keys(aid) == ["thread-listed"]
 
     listed = client.get(base, headers=auth_headers).json()
     assert {row["key"] for row in listed} == {"thread-read", "thread-append", "thread-listed"}
-    assert _legacy_keys(aid) == []
+    # An older API instance still serving mid-rollout keeps every legacy row.
+    assert _legacy_keys(aid) == ["thread-append", "thread-listed", "thread-read"]
+    # The new API's own append is not undone by re-reading the older legacy row.
+    again = client.get(f"{base}/thread-append", headers=auth_headers).json()
+    assert again["value"] == [{"text": "old"}, {"text": "new"}]
 
 
 def test_a_legacy_row_newer_than_the_copy_wins_and_an_older_one_does_not(
@@ -1860,4 +1863,42 @@ def test_a_legacy_row_newer_than_the_copy_wins_and_an_older_one_does_not(
     assert newer["version"] == 8
     older = client.get(f"{base}/thread-older", headers=auth_headers).json()
     assert older["value"] == [{"text": "copy"}]
-    assert _legacy_keys(aid) == []
+
+
+def test_ending_a_thread_deletes_its_legacy_row_so_it_is_not_adopted_back(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/transcript"
+    _legacy_transcript(aid, "thread-deleted", [{"text": "old"}])
+    _legacy_transcript(aid, "thread-versioned", [{"text": "old"}])
+    _legacy_transcript(aid, "thread-idle", [{"text": "old"}])
+    _legacy_transcript(aid, "thread-kept", [{"text": "old"}])
+
+    assert client.delete(f"{base}/thread-deleted", headers=auth_headers).status_code == 204
+    assert client.get(f"{base}/thread-deleted", headers=auth_headers).status_code == 404
+
+    stored = client.get(f"{base}/thread-versioned", headers=auth_headers).json()
+    versioned = client.delete(
+        f"{base}/thread-versioned",
+        params={"expected_version": stored["version"]},
+        headers=auth_headers,
+    )
+    assert versioned.status_code == 204, versioned.text
+    assert client.get(f"{base}/thread-versioned", headers=auth_headers).status_code == 404
+
+    settings = get_settings()
+    settings.transcript_idle_ttl_seconds = 0
+    try:
+        # Adopted with a zero idle window, the thread is already expired.
+        idle = client.get(f"{base}/thread-idle", headers=auth_headers)
+        assert idle.status_code == 404, idle.text
+    finally:
+        get_settings.cache_clear()
+    # Any later write for the agent sweeps the expired thread and its legacy row.
+    swept = client.post(
+        f"{base}/thread-other/append", json={"item": {"text": "x"}}, headers=auth_headers
+    )
+    assert swept.status_code == 200, swept.text
+    assert client.get(f"{base}/thread-idle", headers=auth_headers).status_code == 404
+    assert _legacy_keys(aid) == ["thread-kept"]

@@ -2049,3 +2049,22 @@ def test_cancelling_a_waiting_work_item_expires_its_transcript(clean_db: None) -
         assert await _transcript_threads(session, agent_id) == set()
 
     with_session(body)
+
+
+def test_cancelling_a_work_item_with_no_active_request_expires_its_transcript(
+    clean_db: None,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item = (await _item(session, agent_id)).work_item
+        await _seed_transcript(session, agent_id, CONVERSATION)
+
+        cancelled = await workitems.request_cancellation(
+            session, work_item_id=item.id, expected_work_item_version=item.version
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        assert cancelled.request is None
+        assert cancelled.work_item.cancelled_at is not None
+        assert await _transcript_threads(session, agent_id) == set()
+
+    with_session(body)
