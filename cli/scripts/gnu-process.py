@@ -96,10 +96,20 @@ def timeout(arguments: list[str]) -> int:
 
     for signum in (signal.SIGALRM, *FORWARDED_SIGNALS):
         signal.signal(signum, forward)
+    # Held until the child is recorded: a command can start before Popen
+    # returns, and a signal that arrived then would otherwise be lost with it.
+    held = {signal.SIGALRM, *FORWARDED_SIGNALS}
+    signal.pthread_sigmask(signal.SIG_BLOCK, held)
     try:
-        state["child"] = subprocess.Popen(command, close_fds=False)
+        state["child"] = subprocess.Popen(
+            command,
+            close_fds=False,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, held),
+        )
     except OSError as error:
         return _cannot_run("timeout", command[0], error)
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
     # Not stopped when a command in a background group touches the terminal.
     signal.signal(signal.SIGTTIN, signal.SIG_IGN)
     signal.signal(signal.SIGTTOU, signal.SIG_IGN)
