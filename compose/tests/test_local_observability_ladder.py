@@ -255,9 +255,16 @@ case "$1 $2" in
         ;;
     "run -d")
         printf '%s\\n' "$*" >> "$STUB_RUNS"
-        if [[ -n "$STUB_FIRST_RUN_ERROR" && "$(wc -l < "$STUB_RUNS")" -eq 1 ]]; then
-            echo "docker: Error response from daemon: $STUB_FIRST_RUN_ERROR" >&2
-            exit 125
+        host_port="$(printf '%s\\n' "$*" \\
+            | sed -nE 's/.*-p 0\\.0\\.0\\.0:([0-9]*):4318.*/\\1/p')"
+        # The first port tried stays taken, as a port another container
+        # holds would, so only a fresh choice per attempt can start.
+        if [[ -n "$STUB_FIRST_RUN_ERROR" ]]; then
+            [[ -s "$STUB_TAKEN" ]] || printf '%s' "$host_port" > "$STUB_TAKEN"
+            if [[ "$host_port" == "$(cat "$STUB_TAKEN")" ]]; then
+                echo "docker: Error response from daemon: $STUB_FIRST_RUN_ERROR" >&2
+                exit 125
+            fi
         fi
         echo stub-sink-id
         exit 0
@@ -307,6 +314,7 @@ printf 'worker=%s\\n' "$CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT"
             **os.environ,
             "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
             "STUB_RUNS": str(runs),
+            "STUB_TAKEN": str(tmp_path / "taken-port"),
             "STUB_FIRST_RUN_ERROR": first_run_error or "",
         },
         text=True,
@@ -360,9 +368,12 @@ def test_local_sink_retries_a_chosen_port_that_is_taken(
     """A chosen port can be taken by a container or by a host process."""
 
     result, runs = _start_sink_with_stub_docker(tmp_path, first_run_error=collision)
-    assert len(runs) == 2, f"a taken port must be retried, not fatal: {result.stderr}"
-    host_port = _published_otlp_host_port(runs[1])
-    assert host_port.isdigit(), runs[1]
+    assert len(runs) >= 2, f"a taken port must be retried, not fatal: {result.stderr}"
+    taken = _published_otlp_host_port(runs[0])
+    host_port = _published_otlp_host_port(runs[-1])
+    assert host_port.isdigit() and host_port != taken, (
+        f"each attempt must choose its port afresh, not retry {taken}: {runs}"
+    )
     assert result.returncode == 0, result.stderr
     assert f"endpoint=http://172.30.0.1:{host_port}" in result.stdout
 
