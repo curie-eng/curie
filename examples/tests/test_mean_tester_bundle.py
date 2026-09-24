@@ -1,144 +1,153 @@
-"""The mean tester bundle agrees with its own connector and with the platform."""
+"""The mean tester is one bundle on off-the-shelf MCP servers (ADR 0172).
+
+Pins what must not drift: the bundle validates, its only MCP servers are the
+Slack and GitHub servers the runner image preinstalls, its toolPolicy (classified
+by the real plugin_format classifier) grants exactly the tools ADR 0172 names,
+nothing is filed, and every eval case judges a recorded exchange.
+"""
+
+from __future__ import annotations
 
 import json
 import re
-import subprocess
-import sys
 from pathlib import Path
+
+import pytest
+from plugin_format import (
+    TOOL_POLICY_ENFORCEMENT,
+    PluginManifest,
+    ToolPolicyDecision,
+    classify_tool,
+    load_tool_policy,
+    validate_bundle,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 BUNDLE = REPO / "examples" / "mean-tester"
-sys.path.insert(0, str(BUNDLE / "connectors" / "probes"))
+SLACK_MCP = "@zencoderai/slack-mcp-server@0.0.1"
 
-from mean_tester_probes.observe import PLACEHOLDER_TEXTS, PLATFORM_FAILURE_MARKERS  # noqa: E402
-
-TOOLS = {"read_target", "send_probes", "collect_replies", "find_open_issue", "file_issue"}
+ALLOWED = [
+    "slack/slack_post_message",
+    "slack/slack_get_thread_replies",
+    "slack/slack_get_channel_history",
+    "github/search_code",
+    "github/get_file_contents",
+    "github/list_commits",
+]
+# Every other tool the two servers exposed when measured (ADR 0172, Context).
+DENIED = [
+    "slack/slack_list_channels",
+    "slack/slack_reply_to_thread",
+    "slack/slack_add_reaction",
+    "slack/slack_get_users",
+    "slack/slack_get_user_profile",
+    "github/create_issue",
+    "github/add_issue_comment",
+    "github/create_or_update_file",
+    "github/push_files",
+    "github/create_pull_request",
+    "github/get_issue",
+    "github/search_repositories",
+    "github/some_tool_added_later",
+]
 
 
 def _manifest() -> dict:
     return json.loads((BUNDLE / ".claude-plugin" / "plugin.json").read_text())
 
 
-def test_tool_policy_names_every_tool_and_nothing_else():
-    policy = _manifest()["toolPolicy"]
-    named = {
-        entry.split("/", 1)[1]
-        for key in ("allow", "approvalRequired")
-        for entry in policy.get(key, [])
-    }
-    assert named == TOOLS
-
-
-def test_the_skill_uses_every_tool_and_states_the_three_verdicts():
-    skill = (BUNDLE / "skills" / "mean-tester" / "SKILL.md").read_text()
-    for tool in TOOLS:
-        assert f"mcp__probes__{tool}" in skill
-    for verdict in ("PASS", "FAIL", "UNCLEAR"):
-        assert re.search(rf"\b{verdict}\b", skill)
-    assert "never" in skill and "approval" in skill.lower()
-
-
-def test_every_platform_text_the_connector_matches_still_exists_in_the_platform():
-    sources = "\n".join(
-        p.read_text()
-        for p in [
-            REPO / "apps/dispatcher/src/curie_dispatcher/config.py",
-            REPO / "apps/worker/src/curie_worker/config.py",
-            REPO / "apps/worker/src/curie_worker/kernel.py",
-        ]
+def _policy():
+    policy = load_tool_policy(
+        PluginManifest.model_validate(_manifest()), enforces=TOOL_POLICY_ENFORCEMENT
     )
-    joined = re.sub(r'"\s*\n\s*"', "", sources)  # join implicitly concatenated literals
-    for text in (*PLACEHOLDER_TEXTS, *PLATFORM_FAILURE_MARKERS):
-        assert text in joined, f"{text!r} no longer appears in the platform; update observe.py"
+    assert policy is not None
+    return policy
 
 
-def test_the_bundle_validates():
-    # This tolerates exactly the error code `connectors.lock_missing`, or no
-    # error at all, and fails on any other code. A source bundle with a
-    # `build:` connector and no committed `connectors.lock.yaml` reports that
-    # one code, because the lock is rendered by `curie build`/`curie cluster
-    # deploy` and never committed to source (see this bundle's `.gitignore`);
-    # `examples/sre-bot` reports the same single code with no lock present.
-    #
-    # `probes` carries its two tokens as ONE SecretRef,
-    # `MEAN_TESTER_CREDENTIALS` (a JSON blob the connector splits itself in
-    # `mean_tester_probes.config`). Two SecretRefs with no `bearer_secret` are
-    # refused by the hosted-connector check in
-    # `packages/plugin-format/src/plugin_format/connectors.py` (#2559) as
-    # `connectors.bearer_secret_required`, which would fire before the lock is
-    # even checked.
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import json, sys, plugin_format as p; "
-            "r = p.validate_bundle(sys.argv[1], enforces_tool_policy='curie/mcp-tool-policy@1'); "
-            "print(json.dumps([e.code for e in r.errors]))",
-            str(BUNDLE),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert out.returncode == 0, out.stdout + out.stderr
-    codes = json.loads(out.stdout)
-    assert codes in ([], ["connectors.lock_missing"]), codes
-
-
-FIXTURES = BUNDLE / "evals" / "fixtures"
+def _skill() -> str:
+    return (BUNDLE / "skills" / "mean-tester" / "SKILL.md").read_text()
 
 
 def _cases() -> list[dict]:
     return json.loads((BUNDLE / "evals" / "cases.json").read_text())["cases"]
 
 
-def test_every_fixture_has_exactly_one_case_and_every_case_a_fixture():
-    fixtures = {p.name for p in FIXTURES.iterdir() if p.is_dir()}
-    named = {c["id"] for c in _cases()}
-    assert named == fixtures
+def test_the_bundle_validates():
+    result = validate_bundle(BUNDLE, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+
+
+def test_there_is_no_custom_connector():
+    assert not (BUNDLE / "connectors.yaml").exists()
+    assert not (BUNDLE / "connectors").exists()
+
+
+def test_the_only_servers_are_the_preinstalled_slack_and_github_ones():
+    servers = json.loads((BUNDLE / ".mcp.json").read_text())["mcpServers"]
+    assert sorted(servers) == ["github", "slack"]
+    assert servers["slack"]["command"] == "slack-mcp"
+    assert servers["slack"]["env"] == {
+        "SLACK_BOT_TOKEN": "${MEAN_TESTER_SLACK_BOT_TOKEN}",
+        "SLACK_TEAM_ID": "${MEAN_TESTER_SLACK_TEAM_ID}",
+    }
+    assert servers["github"]["command"] == "mcp-server-github"
+    assert servers["github"]["env"] == {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+
+
+def test_the_runner_image_pins_the_slack_server():
+    dockerfile = (REPO / "runner" / "Dockerfile").read_text()
+    assert f"RUN npm install -g {SLACK_MCP}\n" in dockerfile
+
+
+def test_the_manifest_declares_the_three_secrets_and_no_approval_route():
+    manifest = _manifest()
+    assert manifest["secrets"] == [
+        "MEAN_TESTER_SLACK_BOT_TOKEN",
+        "MEAN_TESTER_SLACK_TEAM_ID",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+    ]
+    assert "approvalPolicy" not in manifest
+    assert manifest["toolPolicy"]["approvalRequired"] == []
+
+
+@pytest.mark.parametrize("tool", ALLOWED)
+def test_the_named_tools_are_allowed(tool: str):
+    assert classify_tool(_policy(), tool) == ToolPolicyDecision.ALLOW
+
+
+@pytest.mark.parametrize("tool", DENIED)
+def test_everything_else_is_denied(tool: str):
+    assert classify_tool(_policy(), tool) == ToolPolicyDecision.DENY
+
+
+def test_the_skill_names_every_allowed_tool_and_files_nothing():
+    skill = _skill()
+    for tool in ALLOWED:
+        server, name = tool.split("/", 1)
+        assert f"mcp__{server}__{name}" in skill, tool
+    for verdict in ("PASS", "FAIL", "UNCLEAR"):
+        assert re.search(rf"\b{verdict}\b", skill)
+    assert "file_issue" not in skill and "create_issue" not in skill
+
+
+def test_every_case_judges_a_recorded_exchange():
+    for case in _cases():
+        assert case["input"].startswith("Judge this recorded exchange"), case["id"]
+        for part in ("Target bundle:", "Probe:", "Reply:"):
+            assert part in case["input"], (case["id"], part)
+        assert case["grader"]["kind"] == "regex", case["id"]
 
 
 def test_the_suite_demands_both_verdicts():
-    # A suite of only FAIL cases passes a tester that always says FAIL (#1649).
-    #
-    # A case is classified by the count its regex demands to be nonzero: a
-    # FAIL count (`[1-4] FAIL`) or a PASS count (`[1-4] PASS`). Searching for
-    # the bare word would not do, because every PASS-expecting regex also
-    # contains the literal "0 FAIL".
     expected = [c["grader"]["expected"] for c in _cases()]
-    demands_fail = [bool(re.search(r"\[1-4\] FAIL", e)) for e in expected]
-    demands_pass = [bool(re.search(r"\[1-4\] PASS", e)) for e in expected]
-    assert any(demands_fail), expected
-    assert any(demands_pass), expected
-    assert not any(f and p for f, p in zip(demands_fail, demands_pass, strict=True)), expected
-
-
-def test_every_case_names_the_replay_channel_and_the_exact_probe():
-    # The eval turn is not asked in a Slack channel, and a tester left to pick
-    # its own probe may pick one the recorded reply does not answer.
-    shape = re.compile(
-        r'^test <@U0TARGET01> (?P<id>[a-z-]+) in <#C0EXAMPLE4> '
-        r'with exactly this probe: "(?P<probe>[^"]+)"$'
-    )
-    for case in _cases():
-        match = shape.match(case["input"])
-        assert match, case["input"]
-        assert match["id"] == case["id"]
+    assert any(e.startswith("0 PASS") for e in expected)
+    assert any(e.endswith("0 FAIL") for e in expected)
 
 
 def test_every_fail_case_also_demands_zero_passes():
     for case in _cases():
         expected = case["grader"]["expected"]
-        if re.search(r"\[1-4\] FAIL", expected):
+        if "FAIL" in expected and not expected.endswith("0 FAIL"):
             assert expected.startswith("0 PASS"), case["id"]
-
-
-def test_a_fixture_with_no_reply_expects_a_fail_within_a_short_timeout():
-    silent = [
-        p.name for p in FIXTURES.iterdir()
-        if p.is_dir() and not json.loads((p / "thread.json").read_text())["messages"]
-    ]
-    assert silent == ["never-answers"]
-    [case] = [c for c in _cases() if c["id"] == "never-answers"]
-    assert case["grader"]["expected"].startswith("0 PASS")
-    script = (BUNDLE / "evals" / "prove-it-can-fail.sh").read_text()
-    assert re.search(r"MEAN_TESTER_REPLY_TIMEOUT_S=\d+\b", script)
