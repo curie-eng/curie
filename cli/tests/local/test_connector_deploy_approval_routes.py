@@ -177,7 +177,19 @@ class LocalCase:
     env: dict[str, str]
 
 
-def _write_override(path: pathlib.Path, api_image: str) -> None:
+def _kernel_picked_ports(count: int) -> list[int]:
+    # Every probe stays bound until all are picked, so the ports are distinct.
+    probes = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
+    try:
+        for probe in probes:
+            probe.bind(("127.0.0.1", 0))
+        return [probe.getsockname()[1] for probe in probes]
+    finally:
+        for probe in probes:
+            probe.close()
+
+
+def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, int]) -> None:
     worker_database = (
         "postgresql+asyncpg://postgres:postgres@127.0.0.1:"
         "${CURIE_LOCAL_POSTGRES_PORT}/postgres"
@@ -185,11 +197,11 @@ def _write_override(path: pathlib.Path, api_image: str) -> None:
     path.write_text(
         f"""services:
   postgres:
-    ports: !override [\"127.0.0.1::5432\"]
+    ports: !override [\"127.0.0.1:{host_ports['postgres']}:5432\"]
   valkey:
-    ports: !override [\"127.0.0.1::6379\"]
+    ports: !override [\"127.0.0.1:{host_ports['valkey']}:6379\"]
   rustfs:
-    ports: !override [\"127.0.0.1::9000\", \"127.0.0.1::9001\"]
+    ports: !override [\"127.0.0.1:{host_ports['rustfs']}:9000\", \"127.0.0.1::9001\"]
   curie-migrate:
     image: {api_image}
     pull_policy: never
@@ -205,7 +217,7 @@ def _write_override(path: pathlib.Path, api_image: str) -> None:
       SLACK_BOT_TOKEN: \"\"
       OTEL_EXPORTER_OTLP_ENDPOINT: \"\"
       OTEL_EXPORTER_OTLP_PROTOCOL: \"\"
-    ports: !override [\"127.0.0.1::8000\"]
+    ports: !override [\"127.0.0.1:{host_ports['curie-api']}:8000\"]
   curie-worker:
     environment:
       DATABASE_URL: {worker_database}
@@ -284,7 +296,16 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
     bundle = root / ("bundle-release" if tier == "local-release" else "bundle")
     override = root / "compose.override.yaml"
     release = root / "compose.release.yaml"
-    _write_override(override, api_image)
+    # Named rather than Docker-allocated so the host-network worker can dial
+    # them on Docker Desktop too; the render check below says why.
+    host_ports = dict(
+        zip(
+            ("postgres", "valkey", "rustfs", "curie-api"),
+            _kernel_picked_ports(4),
+            strict=True,
+        )
+    )
+    _write_override(override, api_image, host_ports)
     if tier == "local-release":
         generated = _run(["python3", "compose/generate_release_compose.py"])
         release.write_text(_require(generated, "generating release Compose"))
@@ -300,16 +321,16 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             "COMPOSE_FILE": f"{base}:{override}",
             "COMPOSE_PROJECT_NAME": project,
             "CURIE_API_KEY": API_KEY,
-            "CURIE_API_URL": "http://127.0.0.1:1",
+            "CURIE_API_URL": f"http://127.0.0.1:{host_ports['curie-api']}",
             "CURIE_DOCKER_NETWORK": f"{project}_runner",
             "CURIE_LOCAL_IMAGE_TAG": f"test-{suffix}",
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
-            "CURIE_LOCAL_POSTGRES_PORT": "1",
+            "CURIE_LOCAL_POSTGRES_PORT": str(host_ports["postgres"]),
             "CURIE_LOCAL_STAGING_DIR": str(staging),
             "CURIE_LOCAL_STUB_PORT": "9",
-            "S3_ENDPOINT_URL": "http://127.0.0.1:1",
+            "S3_ENDPOINT_URL": f"http://127.0.0.1:{host_ports['rustfs']}",
             "VALKEY_HOST": "127.0.0.1",
-            "VALKEY_PORT": "1",
+            "VALKEY_PORT": str(host_ports["valkey"]),
         }
     )
     env.update(_provision_connector_credentials(source, root, env))
@@ -389,25 +410,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             ),
             "starting the private API stack",
         )
-        port_specs = {
-            "CURIE_API_URL": ("curie-api", "8000"),
-            "CURIE_LOCAL_POSTGRES_PORT": ("postgres", "5432"),
-            "VALKEY_PORT": ("valkey", "6379"),
-            "S3_ENDPOINT_URL": ("rustfs", "9000"),
-        }
-        discovered: dict[str, str] = {}
-        for name, (service, container_port) in port_specs.items():
-            port_result = _run(compose + ["port", service, container_port], env=env)
-            discovered[name] = (
-                _require(port_result, f"finding the private {service} port")
-                .strip()
-                .rsplit(":", 1)[1]
-            )
-        port = discovered["CURIE_API_URL"]
-        api_url = f"http://127.0.0.1:{port}"
-        env.update(discovered)
-        env["CURIE_API_URL"] = api_url
-        env["S3_ENDPOINT_URL"] = f"http://127.0.0.1:{discovered['S3_ENDPOINT_URL']}"
+        api_url = env["CURIE_API_URL"]
         build = _run(
             [str(binary), "--json", "build", "--plugin-dir", str(bundle)],
             env=env,
