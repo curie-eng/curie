@@ -309,6 +309,10 @@ def test_script_uses_no_gnu_only_userland(script: Path) -> None:
         "    mktemp --suffix=.json",
         "    ps --no-headers -o pid",
         "    cut --complement -c1 file",
+        "if ! flock -n 9; then",
+        "    if ! flock -n 9; then",
+        '    flock -w 30 "$LOCK_FILE" make',
+        'exec 9>"$lock" && flock 9',
     ],
 )
 def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
@@ -336,6 +340,8 @@ def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
         "    stat -f '%Lp' \"$receipt\"",
         "    grep -c pattern file",
         '    cp -a "$WORKDIR/bundle" "$GATE_CASE_BUNDLE"',
+        'if ! "$GNU_PROCESS" flock -n 9; then',
+        "    fcntl.flock(log, fcntl.LOCK_EX)",
     ],
 )
 def test_the_userland_scan_ignores_portable_forms(line: str) -> None:
