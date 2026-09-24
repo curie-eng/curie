@@ -167,18 +167,18 @@ pub fn check_outcome(report: &CheckReport) -> std::result::Result<(), crate::exi
             "read the printed reason(s): fix the server's command/args, forward its credential with curie skill up --secret <NAME>, or raise --timeout if MCP init ran long",
         )),
         "invalid_bundle" => {
-            // An invalid bundle is a deterministic input error (exit 2, Usage),
-            // matching the runner's own `check.py` exit-2 for this verdict: the
-            // bundle dir exists but fails structural validation, so retrying the
-            // same argv fails identically. Surface the structural `reasons` so
-            // the user sees WHY the bundle is invalid.
-            let mut message = String::from("MCP load check reported an invalid bundle");
-            if !report.reasons.is_empty() {
-                message.push_str(": ");
-                message.push_str(&report.reasons.join("; "));
-            }
+            // Bundle validation, not an MCP load failure. A reason that already
+            // starts with the bundle headline is kept as the message.
+            let joined = report.reasons.join("; ");
+            let message = if report.reasons.is_empty() {
+                "invalid plugin bundle".to_string()
+            } else if joined.starts_with("invalid plugin bundle") {
+                joined
+            } else {
+                format!("invalid plugin bundle: {joined}")
+            };
             Err(crate::exit::CliError::usage(message).with_fix(
-                "fix the reported bundle-structure errors (.claude-plugin/plugin.json and skills/) and run curie skill check again",
+                "correct the invalid bundle declaration named in the error and run curie skill check again",
             ))
         }
         verdict => Err(crate::exit::CliError {
