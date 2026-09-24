@@ -109,14 +109,14 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0045");
-    assert_eq!(target.schema_head, "0051");
+    assert_eq!(target.schema_head, "0052");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
-        ["0045", "0046", "0047", "0048", "0049", "0050", "0051"]
+        ["0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052"]
     );
     assert!(pending.iter().all(|step| step.kind == "expand"));
 

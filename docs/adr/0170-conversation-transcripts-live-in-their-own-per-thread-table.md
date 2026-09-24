@@ -2,7 +2,7 @@
 
 Date: 2026-09-24
 
-Status: Draft
+Status: Accepted
 
 This ADR would amend the storage choice in
 [ADR-0029](0029-conversation-history-port-and-first-loader.md): the
@@ -13,6 +13,11 @@ identity of [ADR-0162](0162-work-items-own-durable-execution-identity.md) and
 keeps the replay shape of
 [ADR-0119](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md).
 Tracking issue: [#3070](https://github.com/curie-eng/curie/issues/3070).
+
+Accepted alongside its implementation under ADR-0102, with explicit maintainer
+approval from Brian Conn on 2026-09-24. Realizing code path: the
+`ThreadTranscript` model and its Alembic revision, the transcript routes in
+`apps/api/src/curie_api/routers/state.py`, and the WorkItem terminal expiry.
 
 ## Context
 
@@ -43,47 +48,55 @@ threads, and a lifetime tied to the work that produced it.
 thread, and expire when their thread ends.**
 
 1. **Storage.** A new Postgres table holds one row per thread, keyed by
-   `(agent_id, binding_scope, thread_key)`, with the ordered record array, its
-   byte size, a version for compare-and-set, and `created_at`, `updated_at` and
-   `expires_at`. There is no new datastore. The state store stops accepting the
-   `transcript` namespace: it stays reserved there, and writes to it are refused.
+   `(agent_id, binding_scope, thread_key)`. Each row has the ordered record
+   array, a version for compare-and-set, and `created_at`, `updated_at` and
+   `expires_at`. There is no new datastore. No transcript row stays in
+   `workflow_state_entries`, and the state store's byte caps no longer apply to
+   transcripts.
 2. **Wire.** The runner keeps its `TranscriptStore` port and its
    `CURIE_HISTORY_REF` URL. The API serves the existing
-   `/agents/<id>/state/transcript/<thread>` GET and `/append` paths from the new
-   table, so runner images already in the field keep working unchanged. The
-   capacity error body and the `curie.history.persistence.failure` metric keep
-   their current shape, with `limit` set to `thread`.
+   `/agents/<id>/state/transcript/...` routes (get, put, append, delete and
+   list) from the new table, so runner images already in the field keep working
+   unchanged. The `transcript` namespace stays reserved from the bundle token.
+   The capacity refusal stays a 413, and `curie.history.persistence.failure`
+   keeps `limit=value` for the per-thread cap.
 3. **Limit.** One setting, `transcript_max_thread_bytes`, caps one thread's
    serialized transcript. It replaces both state caps for transcripts. There is
-   no agent-wide transcript cap, so one agent running many threads cannot starve a
-   new thread. The runner's existing compaction keeps a thread under its cap. The
-   default is sized for a three hour factory run (proposed: 8 MiB).
-4. **Expiry.** When a WorkItem reaches a terminal state (cancelled, or its last
-   execution request is terminal with no successor), the transition deletes the
-   transcript whose `thread_key` is that WorkItem's `conversation_id`, in the same
-   transaction. A thread with no WorkItem (a Slack or cluster-message thread)
-   gets an `expires_at` that each append moves forward by an idle window
-   (`transcript_idle_ttl`, proposed: 30 days), and a periodic sweep deletes
-   expired rows. A deleted transcript resumes as an empty history, which is the
-   behavior a thread with no prior turns already has.
+   no agent-wide transcript cap, so one agent running many threads cannot starve
+   a new thread. The runner's existing compaction keeps a thread under its cap,
+   so a long run keeps a compacted history, not its full history. The default is
+   64 KiB, the same as the runner's own bound, and an operator can raise it.
+4. **Expiry.** When an execution request of a WorkItem becomes terminal
+   (completed, failed, expired or cancelled), the same transaction deletes the
+   transcript whose `thread_key` is that WorkItem's `conversation_id`. Every
+   write also moves the thread's `expires_at` forward by an idle window
+   (`transcript_idle_ttl_seconds`, default 30 days). That window covers a thread
+   with no WorkItem, such as a Slack or cluster-message thread. An expired row
+   reads as absent, and the agent's next transcript write deletes it. A deleted
+   transcript resumes as an empty history, which is how a thread with no prior
+   turns already behaves.
 5. **Upgrade.** One Alembic revision creates the table, copies every
    `transcript` namespace row from `workflow_state_entries` into it, and deletes
-   the copied rows. Rows over the new thread cap are copied as-is and compacted by
-   the runner on their next append, the same way an oversized value is handled
-   today. Existing installs need no operator step.
+   the copied rows. A row over the per-thread cap is copied as-is. Its next
+   append is refused and the runner compacts it, as it does with an oversized
+   value today. The revision is classed `expand`, so existing installs need no
+   operator step.
 
 ## Consequences
 
 - The factory no longer stops after a fixed number of issues, and a long run is
   bounded by a per-thread limit an operator can size.
-- The state store keeps its small caps and its "not a database product" goal;
-  its caps no longer have to be raised to keep transcripts alive.
-- WorkItem terminal transitions gain one delete. A defect there leaks rows rather
-  than failing a run; the idle sweep also covers WorkItem threads as a backstop.
-- A second store now holds conversation data. Retention and export questions for
-  transcripts are answered in one table rather than inside a generic namespace.
-- The migration is a data move. A downgrade copies rows back only while they fit
-  the old caps.
+- The state store keeps its small caps and its "not a database product" goal.
+  Its caps no longer have to be raised to keep transcripts alive.
+- WorkItem terminal transitions gain one delete. A defect there leaks rows
+  rather than failing a run, and the idle window also covers WorkItem threads.
+- A WorkItem that gets a new execution request after a terminal one starts with
+  an empty history.
+- A second table now holds conversation data. Questions about keeping or
+  exporting transcripts now concern one table, not a generic namespace.
+- The migration is a data move. A downgrade copies every row back, and the old
+  caps apply to them again. An N-1 API serving the new schema during a rollback
+  sees no transcript history.
 
 ## Alternatives considered
 
@@ -97,6 +110,5 @@ thread, and expire when their thread ends.**
   datastore every install must provision and back up, and loses the
   compare-and-set append the runner relies on. It can be revisited if transcripts
   outgrow Postgres rows.
-- **Expire by age only.** Simpler, but a live factory thread older than the
-  window would lose its history mid-run, and finished threads would hold space
-  for the whole window.
+- **Expire by age only.** Simpler, but finished factory threads would hold space
+  for the whole window. The idle window is kept only as the backstop.

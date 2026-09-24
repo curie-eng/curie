@@ -15,21 +15,21 @@ platform key.
 
 import enum
 import hashlib
-import json
 import uuid
 from typing import Annotated, Any
 
-from curie_telemetry import record_metric
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, sandbox_token
+from .. import crud, sandbox_token, transcripts
 from ..auth import verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import AgentChannel, WorkflowStateEntry
+from ..models import AgentChannel, ThreadTranscript, WorkflowStateEntry
 from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespaceOut
+from ..transcripts import TRANSCRIPT_NAMESPACE
+from ..transcripts import json_size as _json_size
 
 # Two scoped-token scopes the state router accepts (ADR-0033). The BROAD scope is
 # minted for the runner's own memory/history loaders, which MUST read and write
@@ -51,7 +51,7 @@ STATE_APP_SCOPE = "state.app"
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
 # tool, not raw state. A future fixed namespace must be added here too.
-RESERVED_NAMESPACES = frozenset({"memory", "transcript"})
+RESERVED_NAMESPACES = frozenset({"memory", TRANSCRIPT_NAMESPACE})
 
 
 class StateCaller(enum.Enum):
@@ -153,11 +153,6 @@ router = APIRouter(
 )
 
 
-def _json_size(value: Any) -> int:
-    """Serialized-JSON byte length, the unit both size caps are measured in."""
-    return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
-
-
 # Advisory-lock class for the per-agent namespace-count cap (#933). The
 # TWO-argument ``pg_advisory_xact_lock(int4, int4)`` form is used deliberately:
 # Postgres keeps the two-int4 lock space entirely separate from the
@@ -237,16 +232,6 @@ async def _enforce_caps(
     settings = get_settings()
     value_bytes = _json_size(value)
     if value_bytes > settings.state_max_value_bytes:
-        if namespace == "transcript":
-            record_metric(
-                "curie.history.persistence.failure",
-                attributes={
-                    "service.name": "curie-api",
-                    "source": "state-api",
-                    "outcome": "capacity",
-                    "limit": "value",
-                },
-            )
         raise HTTPException(
             413,
             f"value for key {key!r} is {value_bytes} bytes, over the "
@@ -301,20 +286,9 @@ async def _enforce_caps(
         sizes.update((other_key, _json_size(v)) for other_key, v in others)
         namespace_bytes = sum(sizes.values())
         if namespace_bytes > settings.state_max_namespace_bytes:
-            # Name the key holding the most bytes (#2820): in the transcript
-            # namespace that is the runaway thread to recover, which is often
-            # not the thread whose append was refused.
+            # Name the key holding the most bytes (#2820), which is often not
+            # the key whose write was refused.
             largest = max(sizes, key=lambda k: (sizes[k], k == key))
-            if namespace == "transcript":
-                record_metric(
-                    "curie.history.persistence.failure",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "state-api",
-                        "outcome": "capacity",
-                        "limit": "namespace",
-                    },
-                )
             raise HTTPException(
                 413,
                 f"namespace {namespace!r} would be {namespace_bytes} bytes, over the "
@@ -393,6 +367,17 @@ async def _enforce_caps(
         )
 
 
+def _transcript_out(row: ThreadTranscript) -> StateEntryOut:
+    """A transcript row in the state API's entry shape (ADR-0170)."""
+    return StateEntryOut(
+        namespace=TRANSCRIPT_NAMESPACE,
+        key=row.thread_key,
+        value=row.value,
+        version=row.version,
+        updated_at=row.updated_at,
+    )
+
+
 async def _get_entry(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, namespace: str, key: str
 ) -> WorkflowStateEntry | None:
@@ -442,6 +427,11 @@ async def _put_state(
     # signal). expected_version opts into compare-and-set.
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    if namespace == TRANSCRIPT_NAMESPACE:
+        row = await transcripts.put(
+            session, agent_id, scope, key, data.value, data.expected_version
+        )
+        return _transcript_out(row)
     await _enforce_caps(session, agent_id, scope, namespace, key, data.value)
     entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
@@ -514,6 +504,11 @@ async def _append_state(
     """
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    if namespace == TRANSCRIPT_NAMESPACE:
+        row = await transcripts.append(
+            session, agent_id, scope, key, data.item, data.reserve_bytes
+        )
+        return _transcript_out(row)
     entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         new_value = [data.item]
@@ -603,7 +598,7 @@ async def _list_namespaces(
         .order_by(func.max(WorkflowStateEntry.updated_at).desc())
     )
     rows = await session.execute(query)
-    return [
+    listed = [
         StateNamespaceOut(
             namespace=row.namespace,
             key_count=row.key_count,
@@ -615,6 +610,20 @@ async def _list_namespaces(
         # the state.app scope fences off (#856).
         if not (caller is StateCaller.APP and row.namespace in RESERVED_NAMESPACES)
     ]
+    # Transcripts live in their own table (ADR-0170) but are still listed here
+    # as the reserved namespace the operator's inspector already knows.
+    if caller is not StateCaller.APP:
+        threads = await transcripts.summary(session, agent_id, scope)
+        if threads is not None:
+            listed.append(
+                StateNamespaceOut(
+                    namespace=TRANSCRIPT_NAMESPACE,
+                    key_count=threads[0],
+                    last_updated=threads[1],
+                )
+            )
+            listed.sort(key=lambda row: row.last_updated, reverse=True)
+    return listed
 
 
 @router.get("/{agent_id}/state", response_model=list[StateNamespaceOut])
@@ -641,6 +650,11 @@ async def list_namespaces_for_binding(
 async def _get_state(
     agent_id: uuid.UUID, scope: str | None, namespace: str, key: str, session: AsyncSession
 ) -> StateEntryOut:
+    if namespace == TRANSCRIPT_NAMESPACE:
+        row = await transcripts.get(session, agent_id, scope, key)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "state entry not found")
+        return _transcript_out(row)
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "state entry not found")
@@ -676,6 +690,9 @@ async def _list_state(
     # Which scope this lists is a function of which URL was called, same as
     # _list_namespaces above -- uniform for every caller, no caller-type
     # branching here either.
+    if namespace == TRANSCRIPT_NAMESPACE:
+        rows = await transcripts.list_threads(session, agent_id, scope)
+        return [_transcript_out(row) for row in rows]
     query = select(WorkflowStateEntry).where(
         WorkflowStateEntry.agent_id == agent_id,
         WorkflowStateEntry.binding_scope == scope,
@@ -720,6 +737,9 @@ async def _delete_state(
     # that exported a transcript never deletes turns appended after the export.
     # The version is a predicate of the DELETE itself, so an append that
     # commits between the read and the delete cannot be removed with it.
+    if namespace == TRANSCRIPT_NAMESPACE:
+        await transcripts.remove(session, agent_id, scope, key, expected_version)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if expected_version is None:
         if entry is not None:
