@@ -8,8 +8,9 @@ whole script before any rung starts, and expanding an empty array under
 ``set -u`` is an ``unbound variable`` error at the point it runs. The executing
 tests need a 3.x interpreter, so they run where one exists: macOS
 ``/bin/bash``, or any interpreter named by ``CURIE_TEST_BASH3``. The source scan
-runs everywhere, so a Linux CI with bash 5 still refuses a known bash-4-only
-construct in any script listed in ``HOST_SCRIPTS``.
+runs everywhere, so a Linux CI with bash 5 still refuses the constructs listed
+in ``BASH4_ONLY`` in any script listed in ``HOST_SCRIPTS``. It cannot see an
+empty array expanded under ``set -u``; only the executing tests catch that.
 """
 
 from __future__ import annotations
@@ -84,16 +85,37 @@ def _top_level_block(source: str, start: str, end: str, path: Path) -> str:
     return source[begin : source.index(end, begin)]
 
 
-# Constructs bash 3.2 rejects, with the release that introduced each.
+# A variable name, or a positional or special parameter.
+_PARAMETER = r"([A-Za-z_][A-Za-z0-9_]*|[0-9]|[@*])"
+# declare and its siblings, with any option groups before the one that matters.
+_DECLARE = r"\b(declare|local|typeset|readonly)(\s+-[a-zA-Z]+)*\s+-[a-zA-Z]*"
+# A builtin in command position, so `kubectl wait -n NAMESPACE` is not it.
+_COMMAND = r"(^|[;&|(!{`]|\b(then|do|else|elif|if|while|until|time|command|builtin)\b)\s*"
+
+# Constructs bash 3.2 rejects or reads differently, with the release that
+# introduced each.
 BASH4_ONLY = {
-    r"\[\[\s+-v\s": "[[ -v NAME ]] (bash 4.2)",
-    r"\b(declare|local|typeset)\s+-[a-zA-Z]*A": "associative arrays (bash 4.0)",
-    r"\b(declare|local|typeset)\s+-[a-zA-Z]*n\b": "namerefs (bash 4.3)",
+    r"(\[\[|&&|\|\||!)\s*(!\s*)?-v\s": "-v NAME inside [[ ]] (bash 4.2)",
+    r"(\[|\btest)\s+(!\s+)?-v\s": "[ -v NAME ], always false under 3.2 (bash 4.2)",
+    _DECLARE + "A": "associative arrays (bash 4.0)",
+    _DECLARE + r"n\b": "namerefs (bash 4.3)",
+    _DECLARE + "[lu]": "case-converting attributes (bash 4.0)",
     r"\b(mapfile|readarray)\b": "mapfile/readarray (bash 4.0)",
-    r"\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(,,?|\^\^?)\}": "case conversion (bash 4.0)",
-    r"\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?@[QEPAKaULuk]\}": "${NAME@op} (bash 4.4)",
-    # The builtin in command position only: `kubectl wait -n NAMESPACE` is not it.
-    r"(^|[;&|(!{]|\b(then|do|else|if|while|until)\b)\s*wait\s+-n\b": "wait -n (bash 4.3)",
+    r"\$\{" + _PARAMETER + r"(\[[^]]*\])?(,,?|\^\^?)\}": "case conversion (bash 4.0)",
+    r"\$\{" + _PARAMETER + r"(\[[^]]*\])?@[QEPAKaULuk]\}": "${NAME@op} (bash 4.4)",
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*\[-[0-9]": "negative array subscript (bash 4.3)",
+    r"\$\{" + _PARAMETER + r":[^}:]*:\s*-[0-9]": "negative substring length (bash 4.2)",
+    r"\|&": "|& (bash 4.0)",
+    r"&>>": "&>> (bash 4.0)",
+    r";;&": ";;& (bash 4.0)",
+    r"(^|\s)\{[A-Za-z_][A-Za-z0-9_]*\}[<>]": "{fd}> descriptor allocation (bash 4.1)",
+    r"\bcoproc\b": "coproc (bash 4.0)",
+    r"\bBASHPID\b": "BASHPID (bash 4.0)",
+    r"\binherit_errexit\b": "inherit_errexit (bash 4.4)",
+    r"\bread\b[^;|&]*\s-t\s*[0-9]*\.[0-9]": "read -t with a fraction (bash 4.0)",
+    r"%\([^)]*\)T": "printf %(...)T (bash 4.2)",
+    r"\{0[0-9]+\.\.[0-9]+\}": "zero-padded brace range (bash 4.0)",
+    _COMMAND + r"wait\s+-n\b": "wait -n (bash 4.3)",
 }
 
 
@@ -130,16 +152,55 @@ def test_script_uses_no_construct_bash_3_2_rejects(script: Path) -> None:
         "    wait -n",
         '    if ! wait -n "$pid"; then',
         "    sleep 1 & wait -n",
+        "    elif wait -n; then",
+        "    x=`wait -n`",
+        "    command wait -n",
+        "    builtin wait -n",
+        "    time wait -n",
+        "    if [[ ! -v NAME ]]; then",
+        '    [[ -n "$a" && -v NAME ]]',
+        "    if [ -v NAME ]; then",
+        "    test -v NAME",
+        "    declare -g -A seen=()",
+        "    local -r -A seen=()",
+        "    readonly -A seen=()",
+        "    local -l lower",
+        "    declare -u upper",
+        '    echo "${1,,}"',
+        '    echo "${@^^}"',
+        '    echo "${rows[-1]}"',
+        '    echo "${value:0:-1}"',
+        "    run |& tee log",
+        "    run &>> log",
+        "    a) echo a ;;&",
+        "    exec {fd}>file",
+        "    coproc worker { sleep 1; }",
+        '    echo "$BASHPID"',
+        "    shopt -s inherit_errexit",
+        "    read -t 0.5 line",
+        "    printf '%(%s)T' -1",
+        "    for n in {01..10}; do",
     ],
 )
 def test_the_source_scan_refuses_each_construct(line: str) -> None:
     assert _bash4_only_lines(line + "\n"), line
 
 
-def test_the_source_scan_ignores_kubectl_wait_with_a_namespace() -> None:
-    assert not _bash4_only_lines(
-        'kubectl --context "$CONTEXT" wait -n "$NAMESPACE" --for=condition=Ready \\\n'
-    )
+@pytest.mark.parametrize(
+    "line",
+    [
+        'kubectl --context "$CONTEXT" wait -n "$NAMESPACE" --for=condition=Ready \\',
+        "    grep -v pattern file",
+        "    if ! grep -qv pattern file; then",
+        "    local -r name=value",
+        '    echo "${value:0:1}"',
+        '    printf %s "${OUT}">"$file"',
+        '    assert el, f"<{t}> is missing"',
+        "    for n in {1..10}; do",
+    ],
+)
+def test_the_source_scan_ignores_what_bash_3_2_accepts(line: str) -> None:
+    assert not _bash4_only_lines(line + "\n"), line
 
 
 def test_the_source_scan_ignores_a_comment_that_names_a_construct() -> None:
