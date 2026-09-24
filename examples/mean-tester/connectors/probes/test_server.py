@@ -515,3 +515,65 @@ def test_collect_replies_refuses_a_probe_old_enough_to_have_been_pruned():
         "channel": "C0EXAMPLE2", "target_user": TARGET, "probe_ts": ["1790000000.000102"],
     })
     assert kept.is_error is False
+
+
+# The runner hands the agent no Slack channel id, so a request carries only the
+# target's mention. With one listed channel, a tool called without `channel`
+# works in that one; with several, it is refused and the choice is named.
+class FakeSlackRecordingChannels(FakeSlack):
+    def __init__(self):
+        super().__init__()
+        self.channels = []
+
+    def channel_info(self, channel):
+        self.channels.append(channel)
+        return super().channel_info(channel)
+
+    def members(self, channel):
+        self.channels.append(channel)
+        return super().members(channel)
+
+    def post(self, channel, text):
+        self.channels.append(channel)
+        return super().post(channel, text)
+
+    def replies(self, channel, ts):
+        self.channels.append(channel)
+        return super().replies(channel, ts)
+
+
+class FakeSourcesRecordingChannels(FakeSources):
+    def __init__(self):
+        self.channels = []
+
+    def find(self, channel, hint):
+        self.channels.append(channel)
+        return super().find(channel, hint)
+
+
+def test_without_a_channel_every_tool_uses_the_one_listed_channel():
+    slack, sources = FakeSlackRecordingChannels(), FakeSourcesRecordingChannels()
+    server = build(CONFIG, slack, sources)
+    read = call(server, "read_target", {"target_user": TARGET})
+    assert read.is_error is False, text(read)
+    sent = call(server, "send_probes", {"target_user": TARGET, "probes": ["what can you search?"]})
+    assert sent.is_error is False, text(sent)
+    got = call(server, "collect_replies", {
+        "target_user": TARGET, "probe_ts": ["1790000000.000101"],
+    })
+    assert got.is_error is False, text(got)
+    assert "I can search videos." in text(got)
+    assert sources.channels == ["C0EXAMPLE2"]
+    assert slack.channels and set(slack.channels) == {"C0EXAMPLE2"}
+
+
+def test_without_a_channel_several_listed_channels_are_refused_and_named():
+    server = build(TWO_REPOS, FakeSlackNoChannelInfo(), RefuseEverySource())
+    for name, args in (
+        ("read_target", {"target_user": TARGET}),
+        ("send_probes", {"target_user": TARGET, "probes": ["hi"]}),
+        ("collect_replies", {"target_user": TARGET, "probe_ts": ["1790000000.000101"]}),
+    ):
+        refused = call(server, name, args)
+        assert refused.is_error is True, name
+        assert "C0EXAMPLE2" in text(refused) and "C0EXAMPLE3" in text(refused), name
