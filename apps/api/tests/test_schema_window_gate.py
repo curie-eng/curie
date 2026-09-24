@@ -181,9 +181,16 @@ def test_release_candidate_precedes_stable_in_catalog_order(tmp_path: Path) -> N
 
 @pytest.mark.parametrize(
     "version",
-    ["0.10.0-rc", "0.10.0-rc.x", "0.10.0-rc.01", "0.10.0-rc.1.extra"],
+    [
+        "0.10.0-rc",
+        "0.10.0-rc.x",
+        "0.10.0-rc.01",
+        "0.10.0-rc.1.extra",
+        "v0.10.0",
+        " 0.10.0",
+    ],
 )
-def test_malformed_release_candidate_catalog_key_fails(
+def test_malformed_or_noncanonical_catalog_key_fails(
     tmp_path: Path, version: str
 ) -> None:
     _write_chart(tmp_path, app_version="0.9.9")
@@ -205,7 +212,12 @@ def test_release_candidate_chart_window_matches_alembic_head(tmp_path: Path) -> 
     _write_catalog(
         tmp_path,
         revisions=["0001", "0002"],
-        window_heads={"0.9.9": "0001", "0.10.0-rc.1": "0002"},
+        window_heads={
+            "0.9.9": "0001",
+            "0.10.0-rc.1": "0002",
+            "0.10.0": "0002",
+            "0.10.1": "0002",
+        },
     )
     _write_linear_migrations(tmp_path)
 
@@ -213,7 +225,7 @@ def test_release_candidate_chart_window_matches_alembic_head(tmp_path: Path) -> 
 
     assert result.returncode == 0, result.stderr
     assert "chart appVersion 0.10.0-rc.1" in result.stdout
-    assert "catalog appVersion 0.10.0-rc.1 schema_head 0002" in result.stdout
+    assert "catalog appVersion 0.10.1 schema_head 0002" in result.stdout
 
 
 def test_release_candidate_window_must_match_alembic_head(tmp_path: Path) -> None:
@@ -221,14 +233,19 @@ def test_release_candidate_window_must_match_alembic_head(tmp_path: Path) -> Non
     _write_catalog(
         tmp_path,
         revisions=["0001", "0002"],
-        window_heads={"0.9.9": "0001", "0.10.0-rc.1": "0001"},
+        window_heads={
+            "0.9.9": "0001",
+            "0.10.0-rc.1": "0001",
+            "0.10.0": "0002",
+            "0.10.1": "0002",
+        },
     )
     _write_linear_migrations(tmp_path)
 
     result = _run_gate(tmp_path)
 
     assert result.returncode == 1, result.stdout
-    assert "0.10.0-rc.1" in result.stderr
+    assert "windows['0.10.0-rc.1']" in result.stderr
     assert "schema_head" in result.stderr
     assert "0002" in result.stderr
 

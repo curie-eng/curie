@@ -89,12 +89,9 @@ def _load_catalog(path: Path) -> tuple[object, str | None]:
 
 
 def _semantic_version_key(version: str) -> tuple[int, int, int, int, int] | None:
-    normalized = version.strip()
-    if normalized[:1] in {"v", "V"}:
-        normalized = normalized[1:]
     match = re.fullmatch(
         r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.(0|[1-9][0-9]*))?",
-        normalized,
+        version,
     )
     if match is None:
         return None
