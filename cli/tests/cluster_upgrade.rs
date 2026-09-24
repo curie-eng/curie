@@ -383,3 +383,61 @@ fn upgrade_phase_parse_matches_as_str_and_rejects_unknown() {
     assert_eq!(UpgradePhase::parse("not-a-phase"), None);
     assert_eq!(UpgradePhase::parse(""), None);
 }
+
+/// #2862: a dry run exists to be checked before the real run, so a plan that
+/// ends in a Validate refusal must fail exactly like the real run does, still
+/// without mutating anything.
+#[tokio::test]
+async fn dry_run_whose_plan_refuses_validation_is_an_error() {
+    for (label, host) in [
+        ("schema", FakeUpgradeHost::installed("0.8.6").refuse_schema()),
+        ("config", FakeUpgradeHost::installed("0.8.6").refuse_config()),
+    ] {
+        let mut host = host;
+        let err = run_lifecycle(dry_opts("0.9.0"), &mut host)
+            .await
+            .expect_err(label);
+        assert!(
+            format!("{err:#}").contains("before mutation"),
+            "{label}: the dry-run error must carry the Validate refusal: {err:#}"
+        );
+        assert_eq!(host.mutate_calls, 0, "{label}");
+        assert_eq!(host.drain_calls, 0, "{label}");
+        assert_eq!(host.current_version(), "0.8.6", "{label}");
+    }
+}
+
+/// #2863: the printed apply line carries `--install` and the retained values
+/// argument exactly when Apply passes them, with a placeholder for the path.
+#[tokio::test]
+async fn dry_run_apply_line_carries_install_and_retained_values_only_when_passed() {
+    let apply_line = |out: ClusterUpgradeOutput| match out {
+        ClusterUpgradeOutput::DryRun(plan) => plan
+            .lines
+            .into_iter()
+            .find(|l| l.starts_with("helm upgrade "))
+            .expect("plan has an apply line"),
+        other => panic!("dry-run must not mutate: {other:?}"),
+    };
+
+    let mut fresh = FakeUpgradeHost::empty().with_retained_values();
+    let line = apply_line(run_lifecycle(dry_opts("0.9.0"), &mut fresh).await.unwrap());
+    assert_eq!(
+        line,
+        "helm upgrade curie charts/curie -n curie --wait --timeout 15m --install -f <retained values>"
+    );
+
+    let mut existing = FakeUpgradeHost::installed("0.8.6").with_retained_values();
+    let line = apply_line(run_lifecycle(dry_opts("0.9.0"), &mut existing).await.unwrap());
+    assert_eq!(
+        line,
+        "helm upgrade curie charts/curie -n curie --wait --timeout 15m -f <retained values>"
+    );
+
+    let mut bare = FakeUpgradeHost::installed("0.8.6");
+    let line = apply_line(run_lifecycle(dry_opts("0.9.0"), &mut bare).await.unwrap());
+    assert_eq!(
+        line,
+        "helm upgrade curie charts/curie -n curie --wait --timeout 15m"
+    );
+}
