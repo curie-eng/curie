@@ -123,6 +123,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# GNU timeout, with GNU's exit statuses, on hosts that ship none (a stock Mac).
+GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 if [[ "${CURIE_E2E_HOOK_APPROVAL:-0}" == "1" ]]; then
     exec python3 "$REPO_ROOT/charts/curie/ci/hook-approval-proof.py"
 fi
@@ -359,6 +361,8 @@ GATE_CASE_NAME="curie-ladder-2094-gate-$$"
 GATE_CASE_CREATED=0
 GATE_CASE_PORT="${CURIE_E2E_GATE_PORT:-7246}"
 GATE_CASE_BUNDLE=""
+# How long that case's gated turn may run before it counts as the #1852 hang.
+GATE_CASE_TURN_SECONDS=240
 # The image that case creates its stand-in from. Already a requirement of the
 # ladder (rung 1 boots a real runner), so this adds no new prerequisite.
 RUNNER_IMAGE="curie-runner"
@@ -2231,7 +2235,7 @@ case_leftover_runner_container() {
 # What this proves: with the gate armed on `Bash`, a turn that asks for a shell
 # command must PARK awaiting approval -- bounded, and with the command unrun.
 # Three assertions, one per observed failure mode:
-#   (a) `timeout` did not fire            -- the #1852 hang, where the deny was
+#   (a) the bound did not fire            -- the #1852 hang, where the deny was
 #       prose only and a real model simply spun until the caller gave up. This
 #       is what a revert of #2068 produces, so it is the negative control.
 #   (b) the terminal status is `awaiting-approval` -- the parked terminal that
@@ -2253,8 +2257,9 @@ case_leftover_runner_container() {
 #     out of the container environment without a word (cli/src/docker.rs), so
 #     the gate would never arm and the turn would end `done`.
 #   - `curie skill message` has no timeout of any kind, so an unbounded turn
-#     wedges the whole ladder forever instead of failing it. The `timeout` is
-#     the (a) assertion, not defensive padding.
+#     wedges the whole ladder forever instead of failing it. The bound is the
+#     (a) assertion, not defensive padding. It is gnu-process.py's timeout, not
+#     GNU's, so the case runs on a stock Mac too, which ships no timeout.
 #
 # The case gates `Bash` and not the skill's own tools on purpose: the runner
 # refuses to boot when a gate's required set intersects a skill's declared
@@ -2273,11 +2278,6 @@ case_live_approval_gate_denies() {
     if ! docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
         echo "error: image '$RUNNER_IMAGE' is not present, and the #2094 case boots its own runner from it." >&2
         echo "fix: build it with \`curie build\`, then re-run." >&2
-        return 1
-    fi
-    if ! command -v timeout >/dev/null 2>&1; then
-        echo "error: \`timeout\` (coreutils) is not on PATH, and the #2094 case's bound IS its hang assertion." >&2
-        echo "fix: install coreutils, then re-run. Running this case unbounded would wedge the ladder instead of failing it." >&2
         return 1
     fi
     # Same shape as assert_stub_port_free, against this case's own port.
@@ -2317,14 +2317,14 @@ case_live_approval_gate_denies() {
     # two apart. Only this shape is retried: a timeout or a run canary is a real
     # failure and is never retried.
     for attempt in 1 2; do
-        out="$(cd "$GATE_CASE_BUNDLE" && timeout 240 "$BIN" --json skill message \
+        out="$(cd "$GATE_CASE_BUNDLE" && "$GNU_PROCESS" timeout "$GATE_CASE_TURN_SECONDS" "$BIN" --json skill message \
             --url "http://127.0.0.1:$GATE_CASE_PORT" "$GATE_PROMPT")" && code=0 || code=$?
 
-        # (a) bounded. `timeout` exiting 124 IS the #1852 hang: the deny reached
+        # (a) bounded. The bound exiting 124 IS the #1852 hang: the deny reached
         # the model as prose only, the model never ended its turn, and the
         # caller spun with the stream entry pending and no approval record.
         if (( code == 124 )); then
-            echo "the gated turn never ended: \`timeout\` fired at 240s. This is the #1852 hang -- the deny did not stop the turn -- and is what a revert of #2068's PreToolUse wiring produces." >&2
+            echo "the gated turn never ended: the bound fired at ${GATE_CASE_TURN_SECONDS}s. This is the #1852 hang -- the deny did not stop the turn -- and is what a revert of #2068's PreToolUse wiring produces." >&2
             return 1
         fi
 
