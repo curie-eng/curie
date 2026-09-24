@@ -137,6 +137,10 @@ route. It had to be rejected by hand.
   - GitHub publishes its API ranges.
   - Slack publishes none for its API, so the operator adds `slack.com`'s
     resolved addresses as `/32`s and refreshes them when they change.
+  - Those addresses must be resolved inside the cluster. `slack.com` is
+    geo-DNS: measured on 2026-09-24, a laptop in another region resolved nine
+    addresses and the cluster resolved fifteen others, so an allowlist built
+    from the laptop blocked every Slack call.
 - Marking, caps and the Slack Connect refusal are now instructions, not code. A
   tester that disobeys its skill is seen in its own posts; nothing stops it.
 - Waiting for a final reply is the model rereading a thread. A slow target is

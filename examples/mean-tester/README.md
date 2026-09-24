@@ -42,9 +42,10 @@ The sandbox needs egress to Slack's API and GitHub's API. Add one
 `agentSandbox.connectorEgress.<agent>` entry per CIDR, for TCP 443:
 - GitHub publishes its API ranges in the `api` list at
   <https://api.github.com/meta>.
-- Slack publishes none for its API. Resolve `slack.com` and add each address as
-  a `/32`, and refresh the entries when they change. The chart refuses a
-  default route.
+- Slack publishes none for its API. Resolve `slack.com` **from inside the
+  cluster** and add each address as a `/32`. It is geo-DNS: a laptop elsewhere
+  resolves a different set, which matches nothing. Refresh the entries when
+  they change. The chart refuses a default route.
 
 ## Deploy
 
