@@ -126,7 +126,9 @@ def test_the_skill_names_every_allowed_tool_and_files_nothing():
     skill = _skill()
     for tool in ALLOWED:
         server, name = tool.split("/", 1)
-        assert f"mcp__{server}__{name}" in skill, tool
+        # The runner names a bundle's own servers mcp__plugin_<bundle>_<server>__<tool>
+        # (measured on a live turn, 2026-09-24).
+        assert f"mcp__plugin_mean-tester_{server}__{name}" in skill, tool
     for verdict in ("PASS", "FAIL", "UNCLEAR"):
         assert re.search(rf"\b{verdict}\b", skill)
     assert "file_issue" not in skill and "create_issue" not in skill
@@ -173,3 +175,13 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
     assert len(texts) >= 6
     for text in texts:
         assert text in joined, f"{text!r} no longer appears in the platform; update SKILL.md"
+
+
+def test_production_is_off_limits_unless_listed_as_a_test_installation():
+    skill = _skill()
+    where = re.search(r"^## Where you work\n(.*?)(?=^## )", skill, re.M | re.S)
+    assert where and re.search(r"^- Test installations: ", where.group(1), re.M)
+    rule = re.search(r"^## Production is off limits\n(.*?)(?=^## )", skill, re.M | re.S)
+    assert rule, "SKILL.md must keep a '## Production is off limits' section"
+    for phrase in ("approval card", "attach", "Next (test installation):"):
+        assert phrase in rule.group(1), phrase
