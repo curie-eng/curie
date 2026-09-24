@@ -93,6 +93,7 @@ class _Store:
         self.cleanup_retries: list[tuple[uuid.UUID, str]] = []
         self.lineage_terminals: list[dict[str, Any]] = []
         self.history_ready: set[uuid.UUID] = set()
+        self.releases: list[uuid.UUID] = []
 
     def claim_pending_card(self) -> Any | None:
         return self.card_pending
@@ -213,6 +214,9 @@ class _Store:
             }
             self.cleanup_pending.add(publication_id)
 
+    def release(self, publication_id: uuid.UUID) -> None:
+        self.releases.append(publication_id)
+
     def mark_lineage_terminal(
         self,
         lineage_id: uuid.UUID,
@@ -236,7 +240,7 @@ class _Store:
             }
         )
 
-    async def claim_next(self) -> None:
+    async def claim_next(self, *, exclude: Any = ()) -> None:
         return None
 
 
@@ -2285,7 +2289,7 @@ async def test_claim_next_failure_names_the_cause_and_still_escapes(
 ) -> None:
     reconciler, store, *_ = _loop(publication)
 
-    async def boom() -> None:
+    async def boom(*, exclude: Any = ()) -> None:
         raise RuntimeError("publication claim CAS was lost")
 
     store.claim_next = boom
@@ -2315,9 +2319,9 @@ async def test_idle_publication_loop_does_not_page(
     claims = {"n": 0}
     original = store.claim_next
 
-    async def idle_claim() -> None:
+    async def idle_claim(*, exclude: Any = ()) -> None:
         claims["n"] += 1
-        return await original()
+        return await original(exclude=exclude)
 
     store.claim_next = idle_claim
 
@@ -2596,3 +2600,196 @@ async def test_lineage_refusal_is_charged_without_an_uncharged_escape(
     assert store.retries == [
         (PUBLICATION_ID, "publication lineage advance was refused")
     ]
+
+
+_TRIPLE_LOGS = (
+    f"CURIE_PR_URL={PR_URL}\nCURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
+)
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+async def test_running_job_with_full_success_markers_settles_immediately(
+    publication: Any, preexisting: bool
+) -> None:
+    """#3074: the PR exists once the final marker prints; do not wait on Job exit."""
+
+    lineage = _Lineage()
+    loop, store, _, cluster, _, replies = _loop(publication, lineage=lineage)
+    work = _work(publication)
+    if preexisting:
+        cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=_TRIPLE_LOGS
+    )
+
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert [advance["head_sha"] for advance in lineage.advances] == [REVISION_HEAD]
+    assert store.retries == []
+    assert store.releases == []
+    assert PR_URL in replies.events[0][0].text
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+async def test_running_job_with_only_url_marker_waits_and_releases_lease(
+    publication: Any, preexisting: bool
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    work = _work(publication)
+    if preexisting:
+        cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=f"CURIE_PR_URL={PR_URL}\n"
+    )
+
+    await loop.reconcile(work)
+
+    assert store.completed == {}
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
+    assert replies.events == []
+
+
+async def test_running_job_with_state_marker_is_not_settled_early(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, _ = _loop(publication)
+    cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=_TRIPLE_LOGS + "CURIE_PR_STATE=closed\n"
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert store.completed == {}
+    assert store.lineage_terminals == []
+    assert store.releases == [PUBLICATION_ID]
+
+
+async def test_running_job_without_markers_releases_lease_uncharged_then_settles(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, _, _ = _loop(publication)
+    work = _work(publication)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=""
+    )
+
+    await loop.reconcile(work)
+
+    assert store.releases == [PUBLICATION_ID]
+    assert store.retries == []
+    assert store.completed == {}
+
+    cluster.observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=_TRIPLE_LOGS
+    )
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID], "re-claim adopts, never re-redeems"
+    assert len(cluster.applied) == 1
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+class _QueueStore(_Store):
+    def __init__(
+        self, works: list[Any], shutdown: asyncio.Event, *, sticky: bool = False
+    ) -> None:
+        super().__init__()
+        self.queue = list(works)
+        self.shutdown = shutdown
+        # Sticky models the real store after an uncharged release: the work
+        # stays claimable and is returned oldest first unless excluded.
+        self.sticky = sticky
+
+    async def claim_next(self, *, exclude: Any = ()) -> Any:
+        claimable = [w for w in self.queue if w.publication_id not in exclude]
+        if not claimable:
+            self.shutdown.set()
+            return None
+        if not self.sticky:
+            self.queue.remove(claimable[0])
+        return claimable[0]
+
+
+class _RecordingReconciler:
+    def __init__(self) -> None:
+        self.reconciled: list[uuid.UUID] = []
+
+    async def deliver_pending_card(self) -> bool:
+        return False
+
+    async def deliver_pending_cleanup(self) -> bool:
+        return False
+
+    async def deliver_pending_result(self) -> bool:
+        return False
+
+    async def reconcile(self, work: Any, *, allow_launch: bool = True) -> None:
+        self.reconciled.append(work.publication_id)
+
+
+def _distinct_works(module: Any, count: int) -> list[Any]:
+    return [
+        _lineage_work(module, publication_id=uuid.uuid4()) for _ in range(count)
+    ]
+
+
+async def test_supervisor_drains_every_claimable_publication_in_one_pass(
+    publication: Any,
+) -> None:
+    shutdown = asyncio.Event()
+    works = _distinct_works(publication, 3)
+    store = _QueueStore(works, shutdown)
+    reconciler = _RecordingReconciler()
+    supervisor = publication.PublicationReconcileLoop(
+        store=store, reconciler=reconciler, interval_seconds=60
+    )
+
+    await asyncio.wait_for(supervisor.run_forever(shutdown), timeout=5)
+
+    assert reconciler.reconciled == [work.publication_id for work in works]
+
+
+async def test_supervisor_pass_stops_at_batch_limit(publication: Any) -> None:
+    shutdown = asyncio.Event()
+    works = _distinct_works(publication, 3)
+    store = _QueueStore(works, shutdown)
+    reconciler = _RecordingReconciler()
+    supervisor = publication.PublicationReconcileLoop(
+        store=store, reconciler=reconciler, interval_seconds=0.5, batch_limit=2
+    )
+    task = asyncio.create_task(supervisor.run_forever(shutdown))
+    await asyncio.sleep(0.1)
+
+    assert reconciler.reconciled == [work.publication_id for work in works[:2]]
+    assert len(store.queue) == 1
+
+    await asyncio.wait_for(task, timeout=5)
+    assert reconciler.reconciled == [work.publication_id for work in works]
+
+
+async def test_supervisor_pass_reaches_newer_work_behind_a_released_publication(
+    publication: Any,
+) -> None:
+    shutdown = asyncio.Event()
+    works = _distinct_works(publication, 3)
+    # Every work stays claimable, as a released in-flight Job does in the real
+    # store, so the oldest must not be handed back ahead of the newer ones.
+    store = _QueueStore(works, shutdown, sticky=True)
+    reconciler = _RecordingReconciler()
+    supervisor = publication.PublicationReconcileLoop(
+        store=store, reconciler=reconciler, interval_seconds=0.01
+    )
+
+    await asyncio.wait_for(supervisor.run_forever(shutdown), timeout=5)
+
+    assert reconciler.reconciled == [work.publication_id for work in works]
+
+
+def test_supervisor_rejects_non_positive_batch_limit(publication: Any) -> None:
+    with pytest.raises(ValueError, match="batch limit"):
+        publication.PublicationReconcileLoop(
+            store=_Store(), reconciler=_RecordingReconciler(), batch_limit=0
+        )

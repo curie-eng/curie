@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -329,7 +330,9 @@ class PostgresPublicationStore:
                     {"approval_id": row["approval_id"]},
                 )
 
-    async def claim_next(self) -> PublicationWork | None:
+    async def claim_next(
+        self, *, exclude: Collection[uuid.UUID] = ()
+    ) -> PublicationWork | None:
         statement = text(
             f"""
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
@@ -358,6 +361,7 @@ class PostgresPublicationStore:
                AND p.reconcile_attempts < :max_attempts
                AND p.reconcile_dead_lettered_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
+               AND NOT (p.id = ANY(CAST(:exclude AS uuid[])))
                AND (
                     p.execution_request_id IS NULL
                     OR EXISTS (
@@ -375,7 +379,11 @@ class PostgresPublicationStore:
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
-                    statement, {"max_attempts": self._reconcile_max_attempts}
+                    statement,
+                    {
+                        "max_attempts": self._reconcile_max_attempts,
+                        "exclude": [str(item) for item in exclude],
+                    },
                 )
             ).mappings().first()
             if row is None:
@@ -1006,6 +1014,41 @@ class PostgresPublicationStore:
             ).scalar_one_or_none()
         if updated is None:
             raise PublicationStoreError("publication retry CAS was lost")
+        self._versions.pop(publication_id, None)
+
+    async def release(self, publication_id: uuid.UUID) -> None:
+        """Release an owned reconcile lease without charging an attempt.
+
+        Used while the deterministic Job is still in flight, so the next pass
+        observes it promptly instead of waiting out the lease.
+        """
+
+        version = self._versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication has no owned lease version")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET lease_owner = NULL,
+                               lease_expires_at = NULL,
+                               version = version + 1,
+                               updated_at = now()
+                         WHERE id = :id AND version = :version AND lease_owner = :owner
+                     RETURNING version
+                        """
+                    ),
+                    {
+                        "id": publication_id,
+                        "version": version,
+                        "owner": self._lease_owner,
+                    },
+                )
+            ).scalar_one_or_none()
+        if updated is None:
+            raise PublicationStoreError("publication release CAS was lost")
         self._versions.pop(publication_id, None)
 
     async def _terminal_cas(
