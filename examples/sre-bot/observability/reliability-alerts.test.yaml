@@ -605,12 +605,19 @@ tests:
   # series its node's instance and job. Those change when kube-state-metrics
   # is rescheduled, so each alert is expected with its identity labels only.
 
+  # The pending checks (exp_alerts: [] one evaluation before `for` elapses)
+  # pin each `for` only to this file's 5m evaluation step, which the
+  # pre-existing cases share. Production evaluates every 60s, so a `for` a few
+  # minutes short of its value would still pass here. Pinning `for` to the
+  # minute needs a separate file with a 1m step.
+
   # CurieNodeNotReady has two terms. kube-state-metrics reports three Ready
   # series per node, one per status, and the rule reads status="true" for 0,
   # so a node reporting false and one gone unknown both fire. The kubelet term
-  # reads the node-role scrape, so it still fires when kube-state-metrics ran
-  # on the failed node and its series are gone. Both terms reduce to the node,
-  # so a node failing both ways is one alert.
+  # reads `up` for the kubernetes-nodes job only, so it still fires when
+  # kube-state-metrics ran on the failed node and its series are gone, and a
+  # pod target that stops answering is not a node. Both terms reduce to the
+  # node, so a node failing both ways is one alert.
   - name: a node reporting NotReady fires
     interval: 1m
     input_series:
@@ -636,10 +643,11 @@ tests:
             exp_annotations:
               summary: A node is not Ready or its kubelet is unreachable
               description: >-
-                A node has not reported Ready, or its kubelet has not answered
-                a scrape, for 5 minutes. New pods are not scheduled onto it,
-                pods already on it are evicted after five minutes, and a
-                sandbox placed there cannot start.
+                A node has not reported Ready, or this Prometheus has not
+                reached its kubelet, for 5 minutes. A node that is not Ready
+                takes no new pods, evicts the ones it has after five minutes,
+                and cannot start a sandbox. If every node fires at once,
+                suspect this Prometheus's own network rather than the nodes.
 
   - name: a node whose Ready condition is unknown fires
     interval: 1m
@@ -663,10 +671,11 @@ tests:
             exp_annotations:
               summary: A node is not Ready or its kubelet is unreachable
               description: >-
-                A node has not reported Ready, or its kubelet has not answered
-                a scrape, for 5 minutes. New pods are not scheduled onto it,
-                pods already on it are evicted after five minutes, and a
-                sandbox placed there cannot start.
+                A node has not reported Ready, or this Prometheus has not
+                reached its kubelet, for 5 minutes. A node that is not Ready
+                takes no new pods, evicts the ones it has after five minutes,
+                and cannot start a sandbox. If every node fires at once,
+                suspect this Prometheus's own network rather than the nodes.
 
   - name: a node whose kubelet stops answering fires without kube-state-metrics
     interval: 1m
@@ -689,10 +698,11 @@ tests:
             exp_annotations:
               summary: A node is not Ready or its kubelet is unreachable
               description: >-
-                A node has not reported Ready, or its kubelet has not answered
-                a scrape, for 5 minutes. New pods are not scheduled onto it,
-                pods already on it are evicted after five minutes, and a
-                sandbox placed there cannot start.
+                A node has not reported Ready, or this Prometheus has not
+                reached its kubelet, for 5 minutes. A node that is not Ready
+                takes no new pods, evicts the ones it has after five minutes,
+                and cannot start a sandbox. If every node fires at once,
+                suspect this Prometheus's own network rather than the nodes.
 
   - name: a node failing both terms fires once
     interval: 1m
@@ -716,10 +726,11 @@ tests:
             exp_annotations:
               summary: A node is not Ready or its kubelet is unreachable
               description: >-
-                A node has not reported Ready, or its kubelet has not answered
-                a scrape, for 5 minutes. New pods are not scheduled onto it,
-                pods already on it are evicted after five minutes, and a
-                sandbox placed there cannot start.
+                A node has not reported Ready, or this Prometheus has not
+                reached its kubelet, for 5 minutes. A node that is not Ready
+                takes no new pods, evicts the ones it has after five minutes,
+                and cannot start a sandbox. If every node fires at once,
+                suspect this Prometheus's own network rather than the nodes.
 
   - name: a Ready and scraped node stays quiet
     interval: 1m
@@ -737,14 +748,26 @@ tests:
         alertname: CurieNodeNotReady
         exp_alerts: []
 
+  - name: a pod target that stops answering stays quiet
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-nodes",instance="acme-node-1"}'
+        values: '1x15'
+      - series: 'up{job="kubernetes-pods",instance="10.0.0.20:9090",namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",node="acme-node-1"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieNodeNotReady
+        exp_alerts: []
+
   # kube-state-metrics emits a waiting_reason series only while a container
   # waits, so a container that crashes, runs briefly and crashes again drops
   # out between scrapes, and the scrape that misses it writes a staleness
   # marker. The flapping case alternates a sample and a marker each minute, so
   # a rule on the raw series would see nothing at the 5m evaluation and
-  # restart its `for`. An init container reports on a metric of its own, and
-  # the app container behind it waits on PodInitializing, which is not a
-  # crash.
+  # restart its `for`. An init container reports on a metric of its own and
+  # flaps the same way, and the app container behind it waits on
+  # PodInitializing, which is not a crash.
   - name: a crash-looping container fires
     interval: 1m
     input_series:
@@ -819,10 +842,44 @@ tests:
                 CrashLoopBackOff for 10 minutes. It keeps failing on start and
                 waits longer before each retry.
 
+  - name: a flapping init container fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_init_container_status_waiting_reason{namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",uid="00000000-0000-0000-0000-000000000001",container="migrate",reason="CrashLoopBackOff",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1'
+      - series: 'kube_pod_container_status_waiting_reason{namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",uid="00000000-0000-0000-0000-000000000001",container="api",reason="PodInitializing",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CuriePodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-pod
+              namespace: acme
+              pod: acme-curie-api-7dfc698888-q9nr5
+              container: migrate
+            exp_annotations:
+              summary: A container is crash-looping
+              description: >-
+                A container or init container in any namespace has been in
+                CrashLoopBackOff for 10 minutes. It keeps failing on start and
+                waits longer before each retry.
+
   - name: a container waiting for another reason stays quiet
     interval: 1m
     input_series:
       - series: 'kube_pod_container_status_waiting_reason{namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",uid="00000000-0000-0000-0000-000000000001",container="api",reason="ContainerCreating",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CuriePodCrashLooping
+        exp_alerts: []
+
+  - name: an init container waiting for another reason stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_init_container_status_waiting_reason{namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",uid="00000000-0000-0000-0000-000000000001",container="migrate",reason="ContainerCreating",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
         values: '1x20'
     alert_rule_test:
       - eval_time: 10m
@@ -1008,6 +1065,20 @@ tests:
         alertname: CurieCoreWorkloadNotReady
         exp_alerts: []
 
+  - name: an api from another chart with an unavailable replica stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="acme",deployment="acme-payments-api",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '1x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="acme",deployment="acme-payments-api",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '1x15'
+      - series: 'kube_deployment_labels{namespace="acme",deployment="acme-payments-api",label_app_kubernetes_io_component="api",label_helm_sh_chart="payments-1.0.0",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieCoreWorkloadNotReady
+        exp_alerts: []
+
   - name: a curie-named api with no labels series stays quiet
     interval: 1m
     input_series:
@@ -1176,10 +1247,26 @@ tests:
         alertname: CurieStateStoreNotReady
         exp_alerts: []
 
+  - name: a postgres from another chart scaled to zero stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_statefulset_replicas{namespace="acme",statefulset="keycloak-postgres",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '0x15'
+      - series: 'kube_statefulset_status_replicas_ready{namespace="acme",statefulset="keycloak-postgres",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '0x15'
+      - series: 'kube_statefulset_labels{namespace="acme",statefulset="keycloak-postgres",label_helm_sh_chart="keycloak-1.0.0",instance="10.0.0.10:8080",job="kubernetes-service-endpoints",node="acme-node-1",curie_source="curie-sre-bot"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieStateStoreNotReady
+        exp_alerts: []
+
   # Kubelet volume stats come from the node-role scrape, which carries the
   # curie_source stamp like the node rules above, for a volume in any
-  # namespace. The threshold is strictly under 10 percent. A second stack's
-  # series for the same claim has no stamp and must not page this one.
+  # namespace. The threshold is strictly under 10 percent. A claim mounted on
+  # two nodes is reported by both kubelets, and the lower free share decides
+  # one alert. A second stack's series for the same claim has no stamp and
+  # must not page this one.
   - name: a persistent volume at 5 percent free fires
     interval: 1m
     input_series:
@@ -1222,6 +1309,33 @@ tests:
               component: curie-storage
               namespace: acme-payments
               persistentvolumeclaim: data-acme-payments-db-0
+            exp_annotations:
+              summary: A persistent volume has less than 10 percent free
+              description: >-
+                A persistent volume mounted on any node has stayed below 10
+                percent free for 15 minutes. A full volume stops the workload
+                that writes to it.
+
+  - name: a claim reported by two nodes fires once
+    interval: 1m
+    input_series:
+      - series: 'kubelet_volume_stats_available_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",instance="acme-node-1",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '5x20'
+      - series: 'kubelet_volume_stats_capacity_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",instance="acme-node-1",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '100x20'
+      - series: 'kubelet_volume_stats_available_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",instance="acme-node-2",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '50x20'
+      - series: 'kubelet_volume_stats_capacity_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",instance="acme-node-2",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '100x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CuriePersistentVolumeSpaceLow
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-storage
+              namespace: acme
+              persistentvolumeclaim: data-acme-curie-valkey-0
             exp_annotations:
               summary: A persistent volume has less than 10 percent free
               description: >-
