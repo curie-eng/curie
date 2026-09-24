@@ -967,8 +967,17 @@ Every identity is an operator input. Nothing names a specific App or account:
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
 preflight and then one scenario driver: `issue-to-pr`, `revision`,
-`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` has no
-driver yet and is refused before anything is installed.
+`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` runs six
+labelled tickets (a correct change, a seeded failing test, an ambiguous
+request, an unavailable dependency, an execution-deadline budget, and a
+malicious instruction) on the configured model and again on
+`CURIE_FACTORY_REFERENCE_MODEL` (default `anthropic/claude-sonnet-4.5`, same
+credential), then one authorized same-PR revision and label removal of one
+waiting request and one running request. Hidden checks run against each
+resulting pull request and are not part of the ticket. The JSON evidence
+includes the candidate commit, each verdict, configured and observed model,
+usage or an explicit unverified record, and elapsed time. The command exits
+non-zero when any of those fields is missing or any verdict is not passed.
 
 `run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]... [--expect-reason <regex>]...`
 opens the ticket (first line is the title, the rest the body) as the one

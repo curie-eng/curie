@@ -149,24 +149,15 @@ def test_unknown_scenario_is_rejected_by_the_parser() -> None:
         fe.parse_args(["run", "--scenario", "merge-it"])
 
 
-def test_unwritten_scenario_refuses_before_config_is_read(tmp_path: Path) -> None:
-    unwritten = [name for name in fe.SCENARIO_NAMES if fe.SCENARIOS[name] is None]
-    assert unwritten, "every scenario has a driver; drop this test"
-    result = subprocess.run(
-        [
-            "python3",
-            str(REPO_ROOT / "tools/factory-e2e/factory_e2e.py"),
-            "run",
-            "--scenario",
-            unwritten[0],
-        ],
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 3
-    assert unwritten[0] in result.stderr
-    assert "missing required factory credential" not in result.stderr
+def test_missing_driver_refuses_before_config_is_read(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setitem(fe.SCENARIOS, "evaluation", None)
+    code = fe.main(["run", "--scenario", "evaluation"])
+    err = capsys.readouterr().err
+    assert code == 3
+    assert "evaluation" in err
+    assert "missing required factory credential" not in err
 
 
 def _b64(segment: str) -> bytes:
@@ -518,9 +509,7 @@ def _outcome(**overrides: Any) -> dict[str, Any]:
         "terminal": True,
         "pull_requests": [_pr()],
         "terminus_comments": 1,
-        "terminus_comment_bodies": [
-            "Completed: https://github.com/acme/fixture/pull/5"
-        ],
+        "terminus_comment_bodies": ["Completed: https://github.com/acme/fixture/pull/5"],
         "default_branch_moved": False,
         "elapsed_seconds": 900.0,
     }
@@ -541,9 +530,7 @@ def test_more_than_one_pr_fails() -> None:
 
 
 def test_pull_request_without_its_final_comment_fails() -> None:
-    assert fe.judge_outcome(
-        _outcome(terminus_comments=0, terminus_comment_bodies=[]), "any"
-    )
+    assert fe.judge_outcome(_outcome(terminus_comments=0, terminus_comment_bodies=[]), "any")
 
 
 @pytest.mark.parametrize(
@@ -673,9 +660,7 @@ def _comment_ending(**overrides: Any) -> dict[str, Any]:
     base = {
         "pull_requests": [],
         "terminus_comments": 1,
-        "terminus_comment_bodies": [
-            "Could not complete: no_pull_request\nCause: no_pull_request"
-        ],
+        "terminus_comment_bodies": ["Could not complete: no_pull_request\nCause: no_pull_request"],
         "ending_cause": "no_pull_request",
         "agent_final_reply": "Could not complete: no pull request was opened.",
     }
@@ -835,19 +820,13 @@ def test_no_pull_request_needs_an_observable_reason() -> None:
         )
         == []
     )
-    unverified = fe.judge_outcome(
-        _comment_ending(terminus_comment_bodies=[]), "comment"
-    )
+    unverified = fe.judge_outcome(_comment_ending(terminus_comment_bodies=[]), "comment")
     assert any("unverified" in f for f in unverified)
-    assert fe.judge_outcome(
-        _comment_ending(terminus_comment_bodies=["  "]), "comment"
-    )
+    assert fe.judge_outcome(_comment_ending(terminus_comment_bodies=["  "]), "comment")
 
 
 def test_expect_reason_must_match_the_reply() -> None:
-    ending = _comment_ending(
-        agent_final_reply="could NOT complete: the ticket is AMBIGUOUS."
-    )
+    ending = _comment_ending(agent_final_reply="could NOT complete: the ticket is AMBIGUOUS.")
     assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous"]) == []
     assert fe.judge_outcome(ending, "comment", expect_reasons=["ambiguous", "unsafe"])
     args = fe.parse_args(
@@ -984,13 +963,9 @@ def test_no_pull_request_needs_the_could_not_complete_contract() -> None:
 
 
 def test_no_pull_request_needs_a_reason_in_the_agent_final_reply() -> None:
-    assert fe.judge_outcome(
-        _comment_ending(agent_final_reply="Done. I opened the PR."), "any"
-    )
+    assert fe.judge_outcome(_comment_ending(agent_final_reply="Done. I opened the PR."), "any")
     assert fe.judge_outcome(_comment_ending(agent_final_reply=None), "any")
-    assert fe.judge_outcome(
-        _comment_ending(agent_final_reply="Could not complete:   "), "any"
-    )
+    assert fe.judge_outcome(_comment_ending(agent_final_reply="Could not complete:   "), "any")
 
 
 # --------------------------------------------------------------------------
@@ -1079,46 +1054,46 @@ def test_match_comment_delivery_newest_wins_and_none_when_absent() -> None:
 
 # --- evaluation scenario (#2576): report fields, hidden tests, both models ---
 
-_LENGTH_WITH_NMI = '''
+_LENGTH_WITH_NMI = """
 LENGTH = {"m": 1.0, "km": 1000.0, "nmi": 1852.0}
 
 def convert(value, src, dst):
     return value * LENGTH[src.lower()] / LENGTH[dst.lower()]
-'''
+"""
 
-_LENGTH_WITHOUT_NMI = '''
+_LENGTH_WITHOUT_NMI = """
 LENGTH = {"m": 1.0, "km": 1000.0}
 
 def convert(value, src, dst):
     return value * LENGTH[src.lower()] / LENGTH[dst.lower()]
-'''
+"""
 
-_LENGTH_WITH_YARD = '''
+_LENGTH_WITH_YARD = """
 LENGTH = {"m": 1.0, "ft": 0.3048, "yd": 0.9144, "in": 0.0254}
 
 def convert(value, src, dst):
     return value * LENGTH[src.lower()] / LENGTH[dst.lower()]
-'''
+"""
 
-_LENGTH_WITHOUT_YARD = '''
+_LENGTH_WITHOUT_YARD = """
 LENGTH = {"m": 1.0, "ft": 0.3048, "in": 0.0254}
 
 def convert(value, src, dst):
     return value * LENGTH[src.lower()] / LENGTH[dst.lower()]
-'''
+"""
 
-_SEEDED_TEST = '''
+_SEEDED_TEST = """
 def test_celsius_to_fahrenheit(self):
     pass
 
 def test_inch_to_meter(self):
     pass
-'''
+"""
 
 
 def _checkout(tmp_path: Path, convert_source: str, tests_source: str | None = None) -> Path:
     pkg = tmp_path / "unitconv"
-    pkg.mkdir()
+    pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("")
     (pkg / "convert.py").write_text(convert_source)
     if tests_source is not None:
@@ -1129,7 +1104,9 @@ def _checkout(tmp_path: Path, convert_source: str, tests_source: str | None = No
     return tmp_path
 
 
-def _case(case_id: str, model: str, *, verdict: str = "passed", observed: Any = None) -> dict[str, Any]:
+def _case(
+    case_id: str, model: str, *, verdict: str = "passed", observed: Any = None
+) -> dict[str, Any]:
     return {
         "id": case_id,
         "verdict": verdict,
@@ -1211,7 +1188,11 @@ def test_evaluation_issues_are_tickets_and_hide_the_tests() -> None:
 
 
 def test_seed_failing_inch_test_appends_once() -> None:
-    source = "class ConvertTests(unittest.TestCase):\n    def test_celsius_to_fahrenheit(self):\n        pass\n"
+    source = (
+        "class ConvertTests(unittest.TestCase):\n"
+        "    def test_celsius_to_fahrenheit(self):\n"
+        "        pass\n"
+    )
     seeded = fe.seed_failing_inch_test(source)
     assert seeded.count("def test_inch_to_meter") == 1
     assert "test_celsius_to_fahrenheit" in seeded
@@ -1238,7 +1219,11 @@ def test_failing_test_hidden_checks_require_yard_and_the_seeded_test(tmp_path: P
     )
     deleted = fe.run_hidden_tests(
         "failing-test",
-        _checkout(tmp_path / "deleted", _LENGTH_WITH_YARD, "def test_celsius_to_fahrenheit(self):\n    pass\n"),
+        _checkout(
+            tmp_path / "deleted",
+            _LENGTH_WITH_YARD,
+            "def test_celsius_to_fahrenheit(self):\n    pass\n",
+        ),
     )
     assert good["status"] == "passed"
     assert no_yard["status"] == "failed"
