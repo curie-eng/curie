@@ -96,7 +96,11 @@ BUILT_IN_GROUPS = (
     "scheduling.k8s.io",
     "storage.k8s.io",
 )
-CURIE_AND_READER_GROUPS = ("agents.x-k8s.io", "extensions.agents.x-k8s.io", "argoproj.io")
+READER_GROUPS = ("argoproj.io",)
+# Curie's sandbox groups: a Sandbox or SandboxClaim spec carries per-run
+# credentials, so the grant may clear one and never read one.
+SANDBOX_GROUPS = ("agents.x-k8s.io", "extensions.agents.x-k8s.io")
+SANDBOX_VERBS = frozenset({"delete", "deletecollection"})
 INSTALLATION_GROUPS = ("crd.k8s.amazonaws.com", "networking.k8s.aws", "vpcresources.k8s.aws")
 
 FORBIDDEN_RESOURCES = frozenset(
@@ -198,6 +202,8 @@ def _violations(rules: list[dict]) -> list[str]:
             found.append(f"{where}: reaches {reached}")
         if set(verbs) - VERBS:
             found.append(f"{where}: verbs {sorted(set(verbs) - VERBS)}")
+        if set(groups) & set(SANDBOX_GROUPS) and set(verbs) - SANDBOX_VERBS:
+            found.append(f"{where}: sandbox groups take {sorted(set(verbs) - SANDBOX_VERBS)}")
     return found
 
 
@@ -256,11 +262,13 @@ def test_every_component_role_carries_the_aggregation_label() -> None:
     assert unlabelled == [], f'missing {LABEL}: "true" on {unlabelled}'
 
 
-def _missing(rules: list[dict], group: str, resources: tuple[str, ...]) -> list[str]:
+def _missing(
+    rules: list[dict], group: str, resources: tuple[str, ...], verbs: frozenset = VERBS
+) -> list[str]:
     return [
         f"{resource}:{verb}"
         for resource in resources
-        for verb in sorted(VERBS)
+        for verb in sorted(verbs)
         if not _grants(rules, group, resource, verb)
     ]
 
@@ -275,10 +283,23 @@ def test_components_cover_every_core_subresource_but_the_token() -> None:
     assert _missing(rules, "", CORE_SUBRESOURCES) == []
 
 
-@pytest.mark.parametrize("group", BUILT_IN_GROUPS + CURIE_AND_READER_GROUPS)
+@pytest.mark.parametrize("group", BUILT_IN_GROUPS + READER_GROUPS)
 def test_components_cover_every_resource_in_each_group(group: str) -> None:
     rules = _every_rule(_components(_documents()))
     assert _missing(rules, group, ("*",)) == []
+
+
+@pytest.mark.parametrize("group", SANDBOX_GROUPS)
+def test_sandbox_groups_carry_exactly_delete_and_deletecollection(group: str) -> None:
+    documents = _documents()
+    granted = {
+        verb
+        for rule in _every_rule(documents)
+        if group in rule.get("apiGroups", [])
+        for verb in rule.get("verbs", [])
+    }
+    assert granted == SANDBOX_VERBS
+    assert _missing(_every_rule(_components(documents)), group, ("*",), SANDBOX_VERBS) == []
 
 
 def test_installation_cloud_groups_stay_out_of_upstream() -> None:
@@ -314,6 +335,7 @@ INTENDED_SHAPE = [
         "verbs": sorted(VERBS),
     },
     {"apiGroups": ["apps", RBAC_API], "resources": ["*"], "verbs": sorted(VERBS)},
+    {"apiGroups": list(SANDBOX_GROUPS), "resources": ["*"], "verbs": sorted(SANDBOX_VERBS)},
 ]
 
 
@@ -353,6 +375,18 @@ def test_the_guard_accepts_the_intended_shape() -> None:
         ),
         pytest.param(
             {"apiGroups": [""], "resources": ["*/proxy"], "verbs": ["get"]}, id="any-proxy"
+        ),
+        pytest.param(
+            {"apiGroups": list(SANDBOX_GROUPS), "resources": ["*"], "verbs": ["get"]},
+            id="sandbox-get",
+        ),
+        pytest.param(
+            {
+                "apiGroups": ["apps", "extensions.agents.x-k8s.io"],
+                "resources": ["*"],
+                "verbs": ["delete", "list"],
+            },
+            id="sandbox-list-beside-a-group",
         ),
         pytest.param(
             {"apiGroups": ["*"], "resources": ["deployments"], "verbs": ["get"]}, id="every-group"
