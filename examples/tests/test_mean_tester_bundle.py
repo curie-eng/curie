@@ -30,6 +30,7 @@ ALLOWED = [
     "slack/slack_post_message",
     "slack/slack_get_thread_replies",
     "slack/slack_get_channel_history",
+    "slack/slack_reply_to_thread",
     "github/search_code",
     "github/get_file_contents",
     "github/list_commits",
@@ -37,7 +38,6 @@ ALLOWED = [
 # Every other tool the two servers exposed when measured (ADR 0172, Context).
 DENIED = [
     "slack/slack_list_channels",
-    "slack/slack_reply_to_thread",
     "slack/slack_add_reaction",
     "slack/slack_get_users",
     "slack/slack_get_user_profile",
@@ -246,11 +246,73 @@ def test_production_is_off_limits_unless_listed_as_a_test_installation():
 def test_a_round_waits_by_the_clock_and_posts_only_probes():
     # ADR 0172 decision 6: five back-to-back reads once judged a good, prompt
     # reply a timeout, and the report was also posted as a channel message.
-    rnd = re.search(r"^## Running a round\n(.*?)(?=^## )", _skill(), re.M | re.S)
-    assert rnd, "SKILL.md must keep a '## Running a round' section"
+    rnd = re.search(r"^## Running a campaign\n(.*?)(?=^## )", _skill(), re.M | re.S)
+    assert rnd, "SKILL.md must keep a '## Running a campaign' section"
     text = " ".join(rnd.group(1).split())  # prose wraps anywhere; compare words
     assert "sleep" in text and "180 seconds" in text and "date +%s" in text
     assert "five times" not in text
     assert "only to send probes" in text
     # A second live round still posted its report itself: the rule must be countable.
     assert "exactly once per probe" in text and "posts your final answer for you" in text
+
+
+def test_where_you_work_sets_the_campaign_numbers():
+    where = _section("Where you work")
+    assert re.search(r"- New threads per 15 minutes: \d+\b", where), where
+    assert re.search(r"- Turn budget: \d+ seconds\b", where), where
+    # Follow-ups need the target installation's threaded-bot allowlist (#2440),
+    # which the example cannot assume: it ships with none.
+    assert "- Follow-ups per thread: 0" in where
+
+
+def test_a_campaign_plans_every_kind_of_thread_before_it_sends():
+    plan = _section("Planning a campaign")
+    for kind in ("ordinary use", "boundaries", "refusals", "authority", "conversation"):
+        assert kind in plan, kind
+    assert "before you send anything" in plan
+
+
+def test_a_campaign_paces_new_threads_and_stops_before_the_budget():
+    run = _section("Running a campaign")
+    for phrase in ("New threads per 15 minutes", "Turn budget", "five minutes", "date +%s"):
+        assert phrase in run, phrase
+
+
+def test_follow_ups_stay_in_the_testers_own_threads():
+    run = _section("Running a campaign")
+    assert "mcp__plugin_mean-tester_slack__slack_reply_to_thread" in run
+    assert "only in a thread your own probe opened" in run
+    # A follow-up the target's installation does not admit is not the agent's
+    # failure: the root probe in the same thread was answered.
+    verdicts = _section("Verdicts")
+    assert "not admitted" in verdicts and "UNCLEAR" in verdicts
+
+
+def test_every_probe_carries_the_campaign_id():
+    skill = _skill()
+    assert "[mean test <id>]" in skill
+    assert "`[mean test] <@target>" not in skill
+
+
+def test_a_rerun_sends_the_same_messages_in_the_same_order():
+    rerun = _section('"rerun"')
+    for phrase in ("word for word", "same order"):
+        assert phrase in rerun, phrase
+    for outcome in ("fixed", "still failing", "newly failing", "unchanged"):
+        assert outcome in rerun, outcome
+
+
+def test_the_report_ranks_findings_and_fits_one_reply():
+    report = _section("Reporting")
+    assert "worst first" in report and "3,000 characters" in report
+
+
+def test_the_suite_judges_a_conversation_inside_a_thread():
+    in_thread = [c for c in _cases() if "Earlier in the thread:" in c["input"]]
+    demanded = {
+        verdict
+        for c in in_thread
+        for verdict in ("FAIL", "UNCLEAR")
+        if (_demanded(c["grader"]["expected"], verdict) or 0) > 0
+    }
+    assert demanded == {"FAIL", "UNCLEAR"}
