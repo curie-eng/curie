@@ -1008,6 +1008,41 @@ class PostgresPublicationStore:
             raise PublicationStoreError("publication retry CAS was lost")
         self._versions.pop(publication_id, None)
 
+    async def release(self, publication_id: uuid.UUID) -> None:
+        """Release an owned reconcile lease without charging an attempt.
+
+        Used while the deterministic Job is still in flight, so the next pass
+        observes it promptly instead of waiting out the lease.
+        """
+
+        version = self._versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication has no owned lease version")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET lease_owner = NULL,
+                               lease_expires_at = NULL,
+                               version = version + 1,
+                               updated_at = now()
+                         WHERE id = :id AND version = :version AND lease_owner = :owner
+                     RETURNING version
+                        """
+                    ),
+                    {
+                        "id": publication_id,
+                        "version": version,
+                        "owner": self._lease_owner,
+                    },
+                )
+            ).scalar_one_or_none()
+        if updated is None:
+            raise PublicationStoreError("publication release CAS was lost")
+        self._versions.pop(publication_id, None)
+
     async def _terminal_cas(
         self,
         publication_id: uuid.UUID,
