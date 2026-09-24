@@ -1539,6 +1539,27 @@ fn local_source_build_uses_the_current_contexts_daemon_builder() {
 }
 
 #[test]
+fn local_source_build_refuses_an_unreadable_daemon_endpoint() {
+    // An empty DOCKER_HOST is no DOCKER_HOST: the build would run in the
+    // ambient context, whose builder need not be `default`.
+    let (output, invocations, _, _) =
+        run_local_observability_control(&[("STUB_DOCKER_ENDPOINT_EMPTY", "1")]);
+    let transcript = transcript(&output);
+    assert!(
+        !output.status.success(),
+        "an unreadable daemon endpoint must fail the rung: {transcript}"
+    );
+    assert!(
+        transcript.contains("could not read the current Docker context's daemon endpoint"),
+        "the refusal must say what it could not read: {transcript}"
+    );
+    assert!(
+        !invocations.lines().any(is_current_source_local_up),
+        "the rung must refuse before `local up --build`: {invocations}"
+    );
+}
+
+#[test]
 fn cluster_product_observability_is_private_preflight_and_query_only() {
     let preflight = ladder_function("preflight_cluster_product_observability");
     for required in [
@@ -2584,7 +2605,11 @@ fi
 case "$*" in
     "context inspect --format {{.Endpoints.docker.Host}}")
         # The daemon the current context names.
-        printf '%s\n' "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
+        if [ "${STUB_DOCKER_ENDPOINT_EMPTY:-0}" = "1" ]; then
+            echo
+        else
+            printf '%s\n' "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
+        fi
         ;;
     "inspect curie-runner-local")
         # e2e.sh's ownership precondition: the standard interactive runner is
