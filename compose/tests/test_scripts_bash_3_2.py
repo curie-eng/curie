@@ -11,12 +11,21 @@ tests need a 3.x interpreter, so they run where one exists: macOS
 runs everywhere, so a Linux CI with bash 5 still refuses the constructs listed
 in ``BASH4_ONLY`` in any script listed in ``HOST_SCRIPTS``. It cannot see an
 empty array expanded under ``set -u``; only the executing tests catch that.
+
+The same scripts must run on the userland macOS ships, too: it has no GNU
+``timeout`` and no ``setsid``, and its BSD ``sed`` reads the argument after a
+bare ``-i`` as a backup suffix. The executing tests for those sites put
+stand-ins on PATH that fail the way a stock Mac's tools do, so they fail on a
+Linux host as well.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
+import shutil
+import socket
 import subprocess
 from pathlib import Path
 
@@ -687,3 +696,150 @@ exit 3
         *(f"kill {pid}" for pid in pids),
         *(f"delete {inbox}" for inbox in inbox_files),
     ], result.stderr
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.write_text(body)
+    path.chmod(0o700)
+
+
+def _stock_mac_userland(bin_dir: Path) -> None:
+    """Stand-ins that fail the way a stock Mac's tools do (Darwin 25.6)."""
+
+    real_sed = shutil.which("sed")
+    assert real_sed, "no sed on PATH"
+    for tool in ("timeout", "setsid"):
+        _write_executable(
+            bin_dir / tool,
+            f'#!/bin/sh\necho "bash: {tool}: command not found" >&2\nexit 127\n',
+        )
+    _write_executable(
+        bin_dir / "sed",
+        "#!/bin/sh\n"
+        'for argument in "$@"; do\n'
+        '    case "$argument" in\n'
+        "        -i|-[!-]*i)\n"
+        "            echo 'sed: 1: \"...\": invalid command code f' >&2\n"
+        "            exit 1 ;;\n"
+        "    esac\n"
+        "done\n"
+        f'exec {shlex.quote(real_sed)} "$@"\n',
+    )
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _top_level_assignments(source: str, names: list[str]) -> str:
+    """The script's own assignments of ``names``, for a function run alone."""
+
+    return "\n".join(
+        line
+        for name in names
+        for line in re.findall(rf"^{name}=.*$", source, re.MULTILINE)
+    )
+
+
+def _pid_is_gone(pid_file: Path) -> bool:
+    try:
+        os.kill(int(pid_file.read_text()), 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+GATE_PARKED_REPLY = (
+    '{"status":"awaiting-approval","finalized":false,'
+    '"approval_summary":"Bash: echo curie-2094-canary"}'
+)
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize("turn", ["parks", "hangs"])
+def test_live_approval_gate_case_bounds_its_turn_on_a_stock_mac(
+    interpreter: str, turn: str, tmp_path: Path
+) -> None:
+    """The bound is the case's hang assertion, so a Mac must still have one.
+
+    A turn that parks passes. A turn that never ends is cut off at the bound
+    and named as the #1852 hang, and the bound reaches what the turn started:
+    a child left holding the captured stdout would stall the case instead.
+    """
+
+    source = LADDER_PATH.read_text()
+    case = _shell_function(source, "case_live_approval_gate_denies")
+    state = tmp_path / "state"
+    state.mkdir()
+    (tmp_path / "work" / "bundle").mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    _write_executable(
+        bin_dir / "docker",
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '    "image inspect") ;;\n'
+        '    "ps -q") echo 0123456789ab ;;\n'
+        '    "ps -aq") [ -e "$STUB_STATE/down" ] || echo 0123456789ab ;;\n'
+        '    "exec "*) echo CANARY_ABSENT ;;\n'
+        '    *) echo "unexpected docker invocation: $*" >&2; exit 97 ;;\n'
+        "esac\n",
+    )
+    curie = tmp_path / "curie"
+    _write_executable(
+        curie,
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '    "skill up "*) ;;\n'
+        '    "--json skill message "*)\n'
+        '        if [ "$STUB_TURN" = hangs ]; then\n'
+        '            sleep 30 & echo "$!" > "$STUB_STATE/turn.pid"; wait\n'
+        "        fi\n"
+        f"        echo {shlex.quote(GATE_PARKED_REPLY)} ;;\n"
+        '    "skill down") touch "$STUB_STATE/down" ;;\n'
+        '    *) echo "unexpected curie invocation: $*" >&2; exit 97 ;;\n'
+        "esac\n",
+    )
+    definitions = _top_level_assignments(
+        source, ["GNU_PROCESS", "GATE_CASE_TURN_SECONDS"]
+    )
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{definitions}
+LIVE=1
+WORKDIR="$1"
+BIN="$2"
+RUNNER_IMAGE=curie-runner:test
+GATE_CASE_NAME=curie-ladder-2094-gate-test
+GATE_CASE_CREATED=0
+GATE_CASE_PORT={_free_port()}
+GATE_CASE_BUNDLE=""
+GATE_CASE_TURN_SECONDS=1
+GATE_PROMPT="Use the Bash tool."
+{case}
+case_live_approval_gate_denies
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path / "work"), str(curie)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(state),
+            "STUB_TURN": turn,
+        },
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    if turn == "parks":
+        assert result.returncode == 0, result.stderr
+        assert "the gated turn parked" in result.stdout, result.stdout
+        assert "the gated command did not run" in result.stdout, result.stdout
+    else:
+        assert result.returncode == 1, result.stderr
+        assert "the gated turn never ended" in result.stderr, result.stderr
+        assert _pid_is_gone(state / "turn.pid"), "the bound left the turn's child running"
