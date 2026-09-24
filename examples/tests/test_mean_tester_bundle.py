@@ -196,3 +196,5 @@ def test_a_round_waits_by_the_clock_and_posts_only_probes():
     assert "sleep" in text and "180 seconds" in text and "date +%s" in text
     assert "five times" not in text
     assert "only to send probes" in text
+    # A second live round still posted its report itself: the rule must be countable.
+    assert "exactly once per probe" in text and "posts your final answer for you" in text
