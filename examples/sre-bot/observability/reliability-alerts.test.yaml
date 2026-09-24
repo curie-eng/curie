@@ -1378,3 +1378,181 @@ tests:
       - eval_time: 15m
         alertname: CuriePersistentVolumeSpaceLow
         exp_alerts: []
+
+  # kube-state-metrics' own scrape target, as the kubernetes-service-endpoints
+  # job presents it through the Service labelmap. Prometheus synthesizes `up`
+  # after metric relabeling, so it carries no curie_source stamp. The node
+  # exporter shares the job, and its target going down is not kube-state-metrics
+  # going down. kube-state-metrics can answer on two targets, its metrics port
+  # and its self-monitoring port, and one failing pages while the other answers.
+  # absent() of a comparison and count() without `by` take no labels from the
+  # selector, so the alert carries only its own.
+  - name: kube-state-metrics gone from the scrape fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-kube-state-metrics
+            exp_annotations:
+              summary: A kube-state-metrics scrape is failing
+              description: >-
+                A kube-state-metrics target has failed its scrape, or none has
+                been scraped, for 5 minutes. The rules that read it may then
+                see nothing, or only part of what they read, and can stay quiet
+                whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
+
+  - name: kube-state-metrics failing its scrape fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8080",namespace="observability",node="acme-node-1"}'
+        values: '0x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-kube-state-metrics
+            exp_annotations:
+              summary: A kube-state-metrics scrape is failing
+              description: >-
+                A kube-state-metrics target has failed its scrape, or none has
+                been scraped, for 5 minutes. The rules that read it may then
+                see nothing, or only part of what they read, and can stay quiet
+                whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
+
+  - name: kube-state-metrics recovering its scrape clears the alert
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8080",namespace="observability",node="acme-node-1"}'
+        values: '0x5 1x10'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-kube-state-metrics
+            exp_annotations:
+              summary: A kube-state-metrics scrape is failing
+              description: >-
+                A kube-state-metrics target has failed its scrape, or none has
+                been scraped, for 5 minutes. The rules that read it may then
+                see nothing, or only part of what they read, and can stay quiet
+                whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
+      - eval_time: 10m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts: []
+
+  - name: kube-state-metrics scraped successfully stays quiet
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8080",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts: []
+
+  - name: only the node exporter failing its scrape stays quiet
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8080",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts: []
+
+  - name: kube-state-metrics scraped only by another job fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-pods",app_kubernetes_io_name="kube-state-metrics",instance="10.0.0.10:8080",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-kube-state-metrics
+            exp_annotations:
+              summary: A kube-state-metrics scrape is failing
+              description: >-
+                A kube-state-metrics target has failed its scrape, or none has
+                been scraped, for 5 minutes. The rules that read it may then
+                see nothing, or only part of what they read, and can stay quiet
+                whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
+
+  - name: one kube-state-metrics target failing while the other answers fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8080",namespace="observability",node="acme-node-1"}'
+        values: '0x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8081",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-kube-state-metrics
+            exp_annotations:
+              summary: A kube-state-metrics scrape is failing
+              description: >-
+                A kube-state-metrics target has failed its scrape, or none has
+                been scraped, for 5 minutes. The rules that read it may then
+                see nothing, or only part of what they read, and can stay quiet
+                whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
+
+  - name: both kube-state-metrics targets answering stays quiet
+    interval: 1m
+    input_series:
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8080",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="kube-state-metrics",service="prometheus-kube-state-metrics",instance="10.0.0.10:8081",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+      - series: 'up{job="kubernetes-service-endpoints",app_kubernetes_io_name="prometheus-node-exporter",service="prometheus-prometheus-node-exporter",instance="10.0.0.11:9100",namespace="observability",node="acme-node-1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieKubeStateMetricsDown
+        exp_alerts: []

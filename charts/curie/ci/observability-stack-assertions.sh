@@ -1286,3 +1286,185 @@ cp "$ASSETS/reliability-alerts.test.yaml" "$TMP/reliability-alerts.test.yaml"
   "$promtool_bin" test rules reliability-alerts.test.yaml
 )
 echo "PASS: reliability alerts render, check, fire, and recover under promtool"
+
+# The opt-in alert path heartbeat (#3059), through Alertmanager's own router and
+# promtool on what Helm actually renders with the overlays in their documented
+# order. The heartbeat must reach only its own receiver, every other alert must
+# still reach the bot, and the chart's default rule files must stay loaded
+# beside the heartbeat's: Helm replaces lists, so an overlay that restates
+# rule_files or receivers can drop what it did not restate.
+for asset in alertmanager-webhook.yaml alertmanager-heartbeat.yaml; do
+  [[ -f "$ASSETS/$asset" ]] || fail "missing alert path overlay $ASSETS/$asset"
+done
+# An operator's own overlay sits between the two, carrying the alert-signer token
+# mount that curie-sre's credentials_file reads. It lives in extraSecretMounts,
+# a list the heartbeat overlay must not set, or one of the two mounts is lost.
+cat >"$TMP/operator-alertmanager.yaml" <<'YAML'
+alertmanager:
+  extraSecretMounts:
+    - name: alert-signer-token
+      mountPath: /etc/alert-signer
+      secretName: alertmanager-signer-token
+      readOnly: true
+YAML
+helm template prometheus prometheus-community/prometheus \
+  --version "$PROMETHEUS_CHART_VERSION" \
+  --namespace observability \
+  -f "$ASSETS/prometheus-values.yaml" \
+  -f "$ASSETS/alertmanager-webhook.yaml" \
+  -f "$TMP/operator-alertmanager.yaml" \
+  -f "$ASSETS/alertmanager-heartbeat.yaml" >"$TMP/prometheus-heartbeat.yaml"
+# The same install without the heartbeat overlay, so the rule_files it must keep
+# are the chart's own rendered defaults, not a list copied into this script.
+helm template prometheus prometheus-community/prometheus \
+  --version "$PROMETHEUS_CHART_VERSION" \
+  --namespace observability \
+  -f "$ASSETS/prometheus-values.yaml" \
+  -f "$ASSETS/alertmanager-webhook.yaml" >"$TMP/prometheus-no-heartbeat.yaml"
+
+python3 - "$TMP/prometheus-heartbeat.yaml" "$TMP/prometheus-no-heartbeat.yaml" "$TMP" <<'PY'
+import json
+from pathlib import Path
+import sys
+import yaml
+
+heartbeat_render, base_render, out = (Path(arg) for arg in sys.argv[1:])
+
+
+def rendered(render_path: Path, key: str) -> str:
+    carriers = [
+        doc
+        for doc in yaml.safe_load_all(render_path.read_text())
+        if doc and doc.get("kind") == "ConfigMap" and key in (doc.get("data") or {})
+    ]
+    if len(carriers) != 1:
+        names = [doc["metadata"]["name"] for doc in carriers]
+        sys.exit(
+            f"FAIL: expected one ConfigMap carrying {key} in {render_path.name}, got {names}"
+        )
+    return carriers[0]["data"][key]
+
+
+(out / "heartbeat-alertmanager.yml").write_text(
+    rendered(heartbeat_render, "alertmanager.yml")
+)
+rules_text = rendered(heartbeat_render, "heartbeat_rules.yml")
+(out / "heartbeat-rules.yml").write_text(rules_text)
+(out / "heartbeat-prometheus.yml").write_text(rendered(heartbeat_render, "prometheus.yml"))
+(out / "no-heartbeat-prometheus.yml").write_text(rendered(base_render, "prometheus.yml"))
+
+# The image the chart's Alertmanager runs, so the amtool pin below cannot drift
+# from it when PROMETHEUS_CHART_VERSION moves.
+alertmanager_pods = [
+    (doc["spec"]["template"]["spec"], container)
+    for doc in yaml.safe_load_all(heartbeat_render.read_text())
+    if doc and doc.get("kind") == "StatefulSet"
+    for container in doc["spec"]["template"]["spec"].get("containers") or []
+    if container.get("name") == "alertmanager"
+]
+if len(alertmanager_pods) != 1:
+    sys.exit(f"FAIL: expected one rendered alertmanager container, got {len(alertmanager_pods)}")
+pod, alertmanager = alertmanager_pods[0]
+(out / "heartbeat-alertmanager-image.txt").write_text(alertmanager["image"])
+
+# Both the operator's token and the heartbeat URL reach the container, and the
+# heartbeat Secret is optional, so a missing one fails only the heartbeat posts.
+volumes = {volume["name"]: volume for volume in pod.get("volumes") or []}
+mounted = {
+    mount["mountPath"]: volumes.get(mount["name"])
+    for mount in alertmanager.get("volumeMounts") or []
+}
+for path, secret_name in (
+    ("/etc/alert-signer", "alertmanager-signer-token"),
+    ("/etc/alertmanager-heartbeat", "alertmanager-heartbeat"),
+):
+    volume = mounted.get(path)
+    if not volume or (volume.get("secret") or {}).get("secretName") != secret_name:
+        sys.exit(
+            f"FAIL: the rendered Alertmanager does not mount Secret {secret_name} at "
+            f"{path}; its mounts are {sorted(mounted)}"
+        )
+if mounted["/etc/alertmanager-heartbeat"]["secret"].get("optional") is not True:
+    sys.exit("FAIL: the rendered heartbeat Secret volume is not optional")
+
+# The routes test below sends the alert exactly as the rendered rule labels it,
+# so a renamed rule or a label the route cannot see fails here, not in cluster.
+alerts = [
+    rule
+    for group in (yaml.safe_load(rules_text) or {}).get("groups") or []
+    for rule in group.get("rules") or []
+    if "alert" in rule
+]
+if len(alerts) != 1:
+    sys.exit(f"FAIL: expected one rendered heartbeat alert, got {[a.get('alert') for a in alerts]}")
+labels = {"alertname": alerts[0]["alert"], **(alerts[0].get("labels") or {})}
+(out / "heartbeat-labels.txt").write_text(
+    "".join(f"{name}={json.dumps(str(value))}\n" for name, value in labels.items())
+)
+PY
+
+# The Alertmanager the chart runs at PROMETHEUS_CHART_VERSION.
+AM_VERSION=0.34.0
+alertmanager_image="$(cat "$TMP/heartbeat-alertmanager-image.txt")"
+[[ "${alertmanager_image##*:}" == "v${AM_VERSION}" ]] \
+  || fail "the chart's Alertmanager image is $alertmanager_image, but amtool is pinned to v${AM_VERSION}"
+if [[ -n "${AMTOOL:-}" ]]; then
+  [[ -f "$AMTOOL" && -x "$AMTOOL" ]] || fail "AMTOOL=$AMTOOL is not an executable file"
+  amtool_bin="$AMTOOL"
+elif command -v amtool >/dev/null 2>&1; then
+  amtool_bin="$(command -v amtool)"
+else
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) fail "unsupported architecture for amtool: $arch" ;;
+  esac
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  tarball="alertmanager-${AM_VERSION}.${os}-${arch}.tar.gz"
+  curl -fsSL "https://github.com/prometheus/alertmanager/releases/download/v${AM_VERSION}/${tarball}" \
+    | tar -xz -C "$TMP" --strip-components=1 "alertmanager-${AM_VERSION}.${os}-${arch}/amtool"
+  amtool_bin="$TMP/amtool"
+fi
+[[ -x "$amtool_bin" ]] || fail "amtool is not executable"
+amtool_version="$("$amtool_bin" --version 2>&1 | head -n 1)" || true
+[[ "$amtool_version" == "amtool, version ${AM_VERSION} "* ]] \
+  || fail "$amtool_bin reports '$amtool_version', not amtool ${AM_VERSION}"
+
+"$amtool_bin" check-config "$TMP/heartbeat-alertmanager.yml" \
+  || fail "rendered alertmanager.yml fails amtool check-config"
+heartbeat_labels=()
+while IFS= read -r label; do
+  heartbeat_labels+=("$label")
+done <"$TMP/heartbeat-labels.txt"
+heartbeat_route="$("$amtool_bin" config routes test \
+  --config.file="$TMP/heartbeat-alertmanager.yml" \
+  "${heartbeat_labels[@]}")" \
+  || fail "amtool could not route the rendered heartbeat alert ${heartbeat_labels[*]}"
+[[ "$heartbeat_route" == "heartbeat" ]] \
+  || fail "the rendered heartbeat alert ${heartbeat_labels[*]} routes to '$heartbeat_route', not only to heartbeat"
+ordinary_route="$("$amtool_bin" config routes test \
+  --config.file="$TMP/heartbeat-alertmanager.yml" \
+  alertname=CurieConnectorNotReady)" \
+  || fail "amtool could not route CurieConnectorNotReady"
+[[ "$ordinary_route" == "curie-sre" ]] \
+  || fail "CurieConnectorNotReady routes to '$ordinary_route', not only to curie-sre"
+
+"$promtool_bin" check rules "$TMP/heartbeat-rules.yml" \
+  || fail "rendered heartbeat_rules.yml fails promtool check rules"
+
+python3 - "$TMP/heartbeat-prometheus.yml" "$TMP/no-heartbeat-prometheus.yml" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+heartbeat, base = (
+    yaml.safe_load(Path(arg).read_text()).get("rule_files") or [] for arg in sys.argv[1:]
+)
+if "/etc/config/alerting_rules.yml" not in base:
+    sys.exit(f"FAIL: the render without the heartbeat does not load alerting_rules.yml: {base}")
+expected = [*base, "/etc/config/heartbeat_rules.yml"]
+if heartbeat != expected:
+    sys.exit(f"FAIL: rendered rule_files with the heartbeat are {heartbeat}, not {expected}")
+PY
+echo "PASS: alert path heartbeat routes only to its own receiver beside the reliability rules"
