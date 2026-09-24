@@ -1551,8 +1551,9 @@ seed_approval_resume_turn() {
         echo "seed-invalid: could not create private approval pending artifact" >&2
         return 1
     fi
+    # `${scope[@]+...}`: bash 3.2 reports an empty array as unbound under `set -u`.
     local scope=()
-    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+    if ! "$BIN" --json "$tier" approvals "$agent_id" ${scope[@]+"${scope[@]}"} \
         --mint-operator-principal U0EXAMPLE1 > "$token_file"; then
         rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
         echo "seed-invalid: could not mint deterministic approval principal" >&2
@@ -1580,7 +1581,7 @@ PY
     APPROVAL_SEED_MESSAGE_PID=$!
     approval_id=""
     for attempt in $(seq 1 60); do
-        if "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" --list > "$pending_file" 2>/dev/null; then
+        if "$BIN" --json "$tier" approvals "$agent_id" ${scope[@]+"${scope[@]}"} --list > "$pending_file" 2>/dev/null; then
             approval_id="$(python3 - "$pending_file" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -1601,7 +1602,7 @@ PY
         return 1
     fi
     if ! CURIE_APPROVAL_PRINCIPAL_TOKEN="$token" "$BIN" --json "$tier" approvals "$agent_id" \
-        "${scope[@]}" --resolve "$approval_id" >/dev/null; then
+        ${scope[@]+"${scope[@]}"} --resolve "$approval_id" >/dev/null; then
         unset token
         stop_approval_seed_message terminate || true
         rm -f "$message_file" "$message_stderr_file"
@@ -3527,17 +3528,23 @@ start_local_otel_sink() {
         }
     ' "$REPO_ROOT/cli/scripts/fixtures/otel-e2e-sink-config.yaml" > "$sink_config"
     LOCAL_OTEL_SINK_OWNED=1
-    local start_log="$WORKDIR/otel-sink-start.log" attempt started=0
-    # Docker's ephemeral host-port allocator can race the kernel's current
-    # listeners even on a fresh CI runner. Retry only that explicit bind race;
-    # configuration/image failures remain immediately loud.
+    local start_log="$WORKDIR/otel-sink-start.log" attempt started=0 otlp_host_port
+    # Every stack container dials OTLP at gateway:host-port, so the host port
+    # is named here rather than allocated by Docker (`-p 0.0.0.0::4318`).
+    # Docker Desktop refuses a Docker-allocated host port from inside its VM,
+    # at 127.0.0.1 and at every bridge gateway alike, while a port the caller
+    # names answers there as it does on Linux. A named port can be taken
+    # between this probe and Docker's bind, by a host process or by another
+    # container, so retry only those two refusals; configuration and image
+    # failures remain immediately loud.
     for attempt in $(seq 1 5); do
+        otlp_host_port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("0.0.0.0", 0)); print(s.getsockname()[1])')"
         if docker run -d \
             --name "$LOCAL_OTEL_SINK_NAME" \
             --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
             --network "$network" \
             --user 0 \
-            -p 0.0.0.0::4318 \
+            -p "0.0.0.0:$otlp_host_port:4318" \
             -p 127.0.0.1::13133 \
             -p 127.0.0.1::8888 \
             -v "$sink_config:/etc/otelcol-contrib/config.yaml:ro" \
@@ -3547,17 +3554,17 @@ start_local_otel_sink() {
             started=1
             break
         fi
-        if ! grep -Fq 'address already in use' "$start_log"; then
+        if ! grep -Eq 'address already in use|port is already allocated' "$start_log"; then
             cat "$start_log" >&2
             return 1
         fi
         docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
-        echo "local: Docker host-port allocation raced on attempt $attempt; retrying task-owned sink" >&2
+        echo "local: host port $otlp_host_port was taken on attempt $attempt; retrying task-owned sink" >&2
         sleep 1
     done
     if (( ! started )); then
         cat "$start_log" >&2
-        echo "local: Docker could not allocate private sink ports after 5 attempts" >&2
+        echo "local: Docker could not bind private sink ports after 5 attempts" >&2
         return 1
     fi
 
@@ -4322,7 +4329,8 @@ case_local_langfuse_invalid_auth() {
     local receipt failed_trace_id recovered_trace_id langfuse_web collector
     local accepted_baseline failed_baseline accepted failed queue_size rejection
     local attempt marker stream_start stream_end out
-    if [[ -v LANGFUSE_OTLP_AUTH_HEADER ]]; then
+    # `${NAME+x}` rather than `[[ -v NAME ]]`, which bash 3.2 cannot parse.
+    if [[ -n "${LANGFUSE_OTLP_AUTH_HEADER+x}" ]]; then
         original_set=1
         original="$LANGFUSE_OTLP_AUTH_HEADER"
     fi
@@ -4567,6 +4575,12 @@ rung_local() {
           up_args+=("$line")
         done < <(local_compose_cli_args local up)
         up_args+=(--build)
+        # The source build runs on the Docker daemon's own builder, never an
+        # ambient one. buildx names that builder after its context, so it is
+        # `default` only in the default context: Docker Desktop's context is
+        # `desktop-linux`, and there buildx refuses `default`.
+        local daemon_builder
+        daemon_builder="$(docker context show)"
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
@@ -4580,7 +4594,7 @@ rung_local() {
         # it. Claiming a stack that then fails to boot is harmless, because
         # `local down` is safe against a partial or already-stopped stack.
         LOCAL_STACK_OWNED=1
-        BUILDX_BUILDER=default "$BIN" "${up_args[@]}"
+        BUILDX_BUILDER="$daemon_builder" "$BIN" "${up_args[@]}"
         pin_local_source_images
     fi
 
