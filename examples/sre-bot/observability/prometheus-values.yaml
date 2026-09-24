@@ -544,6 +544,33 @@ serverFiles:
                 A persistent volume mounted on any node has stayed below 10
                 percent free for 15 minutes. A full volume stops the workload
                 that writes to it.
+          - alert: CurieKubeStateMetricsDown
+            # `== 1` inside absent(), so one term covers both failures: a
+            # scrape that fails reads up 0 and is filtered out, and a target
+            # that vanished has no up series at all. The job matcher keeps it
+            # to this stack's own kubernetes-service-endpoints scrape, so a
+            # kube-state-metrics scraped by another job cannot hold it quiet.
+            # `up` carries no curie_source stamp (see the header), so it is
+            # qualified by job instead.
+            expr: |
+              absent(
+                up{
+                  job="kubernetes-service-endpoints",
+                  app_kubernetes_io_name="kube-state-metrics"
+                } == 1
+              )
+            for: 5m
+            labels:
+              severity: page
+              component: curie-kube-state-metrics
+            annotations:
+              summary: kube-state-metrics is not being scraped
+              description: >-
+                No kube-state-metrics scrape has succeeded for 5 minutes.
+                Every rule that reads it now reads nothing and stays quiet
+                whatever the cluster does: the mail adapter, connector,
+                dispatcher, core workload, state store and crash loop rules,
+                and the node rule's Ready term.
           - alert: CurieNodeMemoryHeadroomLow
             expr: |
               100 * (

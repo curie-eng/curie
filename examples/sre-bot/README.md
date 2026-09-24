@@ -161,6 +161,47 @@ signed source is opt-in: apply `observability/alertmanager-webhook.yaml`, run
 investigation. Missing, ambiguous, or unauthorized mappings visibly stop
 coding. Invalid signatures and replayed delivery ids do not multiply work.
 
+## What watches the alert path
+
+A broken alert path looks exactly like a quiet cluster: every rule goes quiet
+and nothing says so. Healthy means the heartbeat keeps arriving outside the
+cluster and no alert is firing; either one alone proves nothing.
+
+`CurieKubeStateMetricsDown` pages when this stack has had no successful
+kube-state-metrics scrape for 5 minutes. Most workload rules read
+kube-state-metrics, and without it they stay quiet whatever the cluster does.
+
+The heartbeat is opt-in. Set up a check in an external dead man's switch that
+alarms when posts stop, with a period of at least 5 minutes (posts arrive about
+every two minutes). Store its URL in a Secret, then apply
+`observability/alertmanager-heartbeat.yaml` after
+`observability/alertmanager-webhook.yaml`:
+
+```bash
+read -rsp 'Heartbeat URL: ' HEARTBEAT_URL   # e.g. https://heartbeat.example.com/ping/EXAMPLE
+printf '\n'
+kubectl -n observability create secret generic alertmanager-heartbeat \
+  --from-literal=url="$HEARTBEAT_URL"
+```
+
+The overlay adds `CurieAlertPathHeartbeat`, which always fires, and routes it
+only to that URL; it never reaches the bot. Without it, nothing watches the
+alert path.
+
+The heartbeat cannot see the last leg, from Alertmanager to the bot. Check that
+with one synthetic alert posted to Alertmanager's API:
+
+```bash
+kubectl -n observability exec prometheus-alertmanager-0 -- \
+  amtool alert add CurieSyntheticDeliveryCheck \
+  --annotation=summary='Synthetic delivery check' \
+  --alertmanager.url=http://localhost:9093
+```
+
+Then wait for the bot's reply in the bound channel (`C0EXAMPLE1` above). A
+missing reply means the path is broken somewhere between Alertmanager and the
+bot.
+
 ## Verification
 
 Use the real pinned image and a disposable cluster. A complete pass proves:
