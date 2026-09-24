@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "f3ee20ceba539b2549c8fb4c039e6d235c1233a8",
-    "shortCommit": "f3ee20ce",
+    "commit": "d72611c7292e414ebd31d1450d317149de343abc",
+    "shortCommit": "d72611c7",
     "release": "v0.9.3"
   },
   "title": "Curie architecture atlas",
@@ -1024,6 +1024,20 @@
       "title": "Bundle PreToolUse hook execution",
       "path": "runner/src/curie_runner/hooks.py",
       "href": "https://github.com/curie-eng/curie/blob/f3ee20ceba539b2549c8fb4c039e6d235c1233a8/runner/src/curie_runner/hooks.py"
+    },
+    {
+      "id": "cli-schema-window-catalog-code",
+      "type": "code",
+      "title": "Application version schema windows",
+      "path": "cli/src/application_schema_windows.json",
+      "href": "https://github.com/curie-eng/curie/blob/d72611c7292e414ebd31d1450d317149de343abc/cli/src/application_schema_windows.json"
+    },
+    {
+      "id": "cli-schema-window-tests",
+      "type": "code",
+      "title": "Schema window catalog tests",
+      "path": "cli/src/schema_window.rs",
+      "href": "https://github.com/curie-eng/curie/blob/d72611c7292e414ebd31d1450d317149de343abc/cli/src/schema_window.rs"
     }
   ],
   "documentationDrift": [
@@ -1265,7 +1279,7 @@
       "zone": "surfaces",
       "x": 0.075,
       "y": 0.61,
-      "description": "Drives skill, local, and cluster loops. The local/cluster message verbs can replace Slack ingress and reply transport without changing the worker path. Operators can mint and rotate row-scoped channel tokens, while status and doctor expose bounded completion-outbox and mail-delivery health without identifiers. The checkout-only release-accept evaluator reads a private evidence ledger and fails closed unless one unchanged candidate has seven days of accounted canaries and every recovery criterion. Push delivery diagnosis distinguishes configured, reachable, observed, and verified states instead of treating repository binding as delivery proof. A bare curie doctor discovers the platform API from cluster state, cluster up --dev preserves recorded comms and sealing values, and release builds embed the exact source commit used to resolve installer artifacts. Plain cluster up, apply, and diff retain installed typed mail settings, external Secret pairs, paired worker adapter credentials, and installed local inference. Explicit namespace adoption records prior labels and objects, and cluster down retains the adopted namespace. Hosted connector deploys wait for current revision readiness; skill and local connector startup share one configurable bounded deadline. Explicit source decisions take precedence without replaying stale inline credentials. Offline dry-run plans do not read an installed release. Cluster up and apply wait for the installed Helm target workloads to converge; cluster status returns failure with redacted generation, replica, image and hook diagnoses when the target is unhealthy. Cluster upgrade resolves the selected release chart or explicit local/ref target, pins it to the requested version, validates declared chart version and rendered target schema metadata before mutation, and requires explicit forward-only admission for pending contract or irreversible migrations. One namespaced ConfigMap owns the operation and its durable nine-phase checkpoint through resourceVersion and holder compare-and-set. A resumed upgrade proves exact target images, generations, replicas, hooks, queues, and manifest state, then runs a target-version canary and records known-good from the observed release version. The CLI rollback catalog for v0.9.0 spans migrations 0001 through 0044; it is distinct from the API image serving compatibility window of 0044 through 0044. CI refuses a new migration unless the release windows advance consistently. The restore and upgrade drills exercise stable installation survival and recovery. Sibling tag image reports require a unique serving Node inventory binding and conditional Node read; this does not prove mutable tag freshness. An explicit cluster context pins every Helm and kubectl child. Channel token operations refuse failed release discovery instead of guessing a Secret name. Retained up escapes literal dotted object keys, while upgrade preserves scalar types through JSON values. Ambiguous 0.8.8 and 0.8.9 rollback identities require retained schema metadata. Local commands and ladder runs honor explicit Compose project and endpoint settings.",
+      "description": "Drives skill, local, and cluster loops. The local/cluster message verbs can replace Slack ingress and reply transport without changing the worker path. Operators can mint and rotate row-scoped channel tokens, while status and doctor expose bounded completion-outbox and mail-delivery health without identifiers. The checkout-only release-accept evaluator reads a private evidence ledger and fails closed unless one unchanged candidate has seven days of accounted canaries and every recovery criterion. Push delivery diagnosis distinguishes configured, reachable, observed, and verified states instead of treating repository binding as delivery proof. A bare curie doctor discovers the platform API from cluster state, cluster up --dev preserves recorded comms and sealing values, and release builds embed the exact source commit used to resolve installer artifacts. Plain cluster up, apply, and diff retain installed typed mail settings, external Secret pairs, paired worker adapter credentials, and installed local inference. Explicit namespace adoption records prior labels and objects, and cluster down retains the adopted namespace. Hosted connector deploys wait for current revision readiness; skill and local connector startup share one configurable bounded deadline. Explicit source decisions take precedence without replaying stale inline credentials. Offline dry-run plans do not read an installed release. Cluster up and apply wait for the installed Helm target workloads to converge; cluster status returns failure with redacted generation, replica, image and hook diagnoses when the target is unhealthy. Cluster upgrade resolves the selected release chart or explicit local/ref target, pins it to the requested version, validates declared chart version and rendered target schema metadata before mutation, and requires explicit forward-only admission for pending contract or irreversible migrations. One namespaced ConfigMap owns the operation and its durable nine-phase checkpoint through resourceVersion and holder compare-and-set. A resumed upgrade proves exact target images, generations, replicas, hooks, queues, and manifest state, then runs a target-version canary and records known-good from the observed release version. The CLI rollback catalog for v0.9.0 spans migrations 0001 through 0044; it is distinct from the API image serving compatibility window of 0044 through 0044. The 0.9.2 and 0.9.3 release identities each carry the exact 0045 through 0045 schema window because no migration landed between them. CI refuses a new migration unless the release windows advance consistently. The restore and upgrade drills exercise stable installation survival and recovery. Sibling tag image reports require a unique serving Node inventory binding and conditional Node read; this does not prove mutable tag freshness. An explicit cluster context pins every Helm and kubectl child. Channel token operations refuse failed release discovery instead of guessing a Secret name. Retained up escapes literal dotted object keys, while upgrade preserves scalar types through JSON values. Ambiguous 0.8.8 and 0.8.9 rollback identities require retained schema metadata. Local commands and ladder runs honor explicit Compose project and endpoint settings.",
       "technology": [
         "Rust",
         "structured --json"
@@ -1291,7 +1305,9 @@
         "cli-context-code",
         "cli-retained-up-code",
         "cli-retained-upgrade-code",
-        "cli-local-code"
+        "cli-local-code",
+        "cli-schema-window-catalog-code",
+        "cli-schema-window-tests"
       ],
       "adrIds": [
         "ADR-0021",
