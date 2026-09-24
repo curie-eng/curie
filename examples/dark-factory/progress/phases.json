@@ -1,0 +1,17 @@
+{
+  "phases": [
+    {"id": "read_issue", "label": "Read issue"},
+    {"id": "pin_criteria", "label": "Pin acceptance criteria"},
+    {"id": "plan", "label": "Plan"},
+    {"id": "plan_review", "label": "Plan review"},
+    {"id": "failing_test", "label": "Failing test"},
+    {"id": "implement", "label": "Implement"},
+    {"id": "review_diff", "label": "Review diff"},
+    {"id": "publish", "label": "Publish PR"},
+    {"id": "wait_ci", "label": "Wait for CI"}
+  ],
+  "loops": [
+    {"start": "plan", "review": "plan_review", "cap": 3},
+    {"start": "implement", "review": "review_diff", "cap": 3}
+  ]
+}

@@ -8,6 +8,7 @@ agent_versions.commit_sha, deployments.bot_identity/commit_sha).
 from __future__ import annotations
 
 import enum
+import secrets
 import uuid
 from datetime import datetime
 from typing import Any
@@ -18,6 +19,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Identity,
     Index,
     LargeBinary,
     String,
@@ -890,17 +892,27 @@ class ExecutionRequest(Base):
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 
 
-class FactoryTerminalNotice(Base):
-    """One GitHub comment owed by a factory execution terminus.
+def new_card_token() -> str:
+    """A fresh unguessable card capability: 32 random bytes as lowercase hex."""
 
-    Inserted in the same transaction as the terminal UPDATE. The reconciler
-    posts it later. A refusal is recorded here and does not rewrite the request.
+    return secrets.token_hex(32)
+
+
+class FactoryStatusComment(Base):
+    """One bot-authored GitHub status comment per factory execution request.
+
+    Inserted at admission and edited in place by the reconciler as the request
+    progresses (#3077). The terminus fills ``terminal_cause`` and ``detail``. A
+    refusal is recorded here and does not rewrite the request. ``posted_at``
+    means the comment was created; ``finalized_at`` means it will not be edited
+    again.
     """
 
+    # Keeps its pre-#3077 table name so 0055 stays an expand revision.
     __tablename__ = "factory_terminal_notices"
     __table_args__ = (
         CheckConstraint(
-            "length(btrim(terminal_cause)) > 0",
+            "terminal_cause IS NULL OR length(btrim(terminal_cause)) > 0",
             name="factory_terminal_notices_cause_ck",
         ),
         CheckConstraint("attempts >= 0", name="factory_terminal_notices_attempts_ck"),
@@ -917,10 +929,37 @@ class FactoryTerminalNotice(Base):
             "(refusal IS NULL) = (refused_at IS NULL)",
             name="factory_terminal_notices_refusal_ck",
         ),
+        CheckConstraint(
+            "comment_list IS NULL OR comment_list IN ('issue', 'review')",
+            name="factory_terminal_notices_comment_list_ck",
+        ),
+        CheckConstraint(
+            "comment_list IS NULL OR comment_id IS NOT NULL",
+            name="factory_terminal_notices_comment_list_pair_ck",
+        ),
+        CheckConstraint(
+            "finalized_at IS NULL OR posted_at IS NOT NULL",
+            name="factory_terminal_notices_finalized_ck",
+        ),
+        CheckConstraint(
+            "subject_title IS NULL OR length(subject_title) <= 256",
+            name="factory_terminal_notices_subject_title_ck",
+        ),
+        CheckConstraint(
+            "applied_label IS NULL OR applied_label IN "
+            "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human')",
+            name="factory_terminal_notices_applied_label_ck",
+        ),
+        # Application N-1's delivery scan still reads this one.
         Index(
             "ix_factory_terminal_notices_pending",
             "created_at",
             postgresql_where=text("posted_at IS NULL AND refused_at IS NULL"),
+        ),
+        Index(
+            "ix_factory_terminal_notices_unfinalized",
+            "created_at",
+            postgresql_where=text("finalized_at IS NULL AND refused_at IS NULL"),
         ),
     )
 
@@ -932,7 +971,17 @@ class FactoryTerminalNotice(Base):
     work_item_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
     )
-    terminal_cause: Mapped[str] = mapped_column(Text)
+    # The capability in the card URL camo fetches: 64 lowercase hex characters.
+    card_token: Mapped[str] = mapped_column(
+        Text,
+        unique=True,
+        default=new_card_token,
+        server_default=text(
+            "replace(gen_random_uuid()::text, '-', '') "
+            "|| replace(gen_random_uuid()::text, '-', '')"
+        ),
+    )
+    terminal_cause: Mapped[str | None] = mapped_column(Text, default=None)
     # The provider's own failure message, redacted before it is stored (#3073).
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0, server_default="0")
@@ -941,12 +990,63 @@ class FactoryTerminalNotice(Base):
         DateTime(timezone=True), default=None
     )
     comment_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # Which GitHub comment list ``comment_id`` lives in: issue or PR review.
+    comment_list: Mapped[str | None] = mapped_column(Text, default=None)
+    rendered_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    subject_title: Mapped[str | None] = mapped_column(Text, default=None)
+    # NULL: never applied. '': backfilled by 0055, never touch.
+    applied_label: Mapped[str | None] = mapped_column(Text, default=None)
+    declaration: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    activity: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     refused_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     refusal: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExecutionRequestPhaseReport(Base):
+    """One ``report_progress`` call from the sandbox, on its active request (#3077)."""
+
+    __tablename__ = "execution_request_phase_reports"
+    __table_args__ = (
+        CheckConstraint(
+            "phase ~ '^[a-z][a-z0-9_]{0,63}$'",
+            name="execution_request_phase_reports_phase_ck",
+        ),
+        CheckConstraint(
+            "note IS NULL OR length(note) BETWEEN 1 AND 280",
+            name="execution_request_phase_reports_note_ck",
+        ),
+        CheckConstraint(
+            "loop_round IS NULL OR loop_round BETWEEN 1 AND 5",
+            name="execution_request_phase_reports_round_ck",
+        ),
+        Index(
+            "ix_execution_request_phase_reports_request",
+            "execution_request_id",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+    )
+    phase: Mapped[str] = mapped_column(Text)
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+    loop_round: Mapped[int | None] = mapped_column(default=None)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
     )
 
 

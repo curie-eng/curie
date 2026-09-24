@@ -206,6 +206,55 @@ def test_skill_defines_the_nine_phases_in_order() -> None:
     assert headings == PHASES
 
 
+LOOPED_PHASES = {"plan", "plan_review", "implement", "review_diff"}
+
+
+def _phase_declaration() -> dict:
+    return json.loads((BUNDLE / "progress" / "phases.json").read_text())
+
+
+def test_progress_declaration_lists_the_skill_phases_in_order() -> None:
+    declared = _phase_declaration()
+    assert [phase["id"] for phase in declared["phases"]] == PHASES
+    for phase in declared["phases"]:
+        assert 1 <= len(phase["label"]) <= 40, phase
+    assert declared["loops"] == [
+        {"start": "plan", "review": "plan_review", "cap": 3},
+        {"start": "implement", "review": "review_diff", "cap": 3},
+    ]
+
+
+def _step_sections(body: str) -> dict[str, str]:
+    """Each numbered step's text, keyed by its phase id, up to the next heading."""
+
+    sections: dict[str, str] = {}
+    parts = re.split(r"^(## .*)$", body, flags=re.MULTILINE)
+    for index in range(1, len(parts), 2):
+        heading = parts[index]
+        match = re.match(r"^## \d+\. .*\(phase `(\w+)`", heading)
+        if match:
+            sections[match.group(1)] = parts[index + 1]
+    return sections
+
+
+def test_every_step_reports_its_own_phase_through_report_progress() -> None:
+    _, body = _skill_parts()
+    sections = _step_sections(body)
+    assert list(sections) == PHASES
+    for phase, text in sections.items():
+        assert "report_progress" in text, phase
+        assert re.search(rf"report_progress[^\n]*\b{phase}\b", text), phase
+        if phase in LOOPED_PHASES:
+            assert re.search(r"report_progress[^\n]*\bround\b", text), phase
+
+
+def test_phases_section_names_the_platform_progress_tool() -> None:
+    _, body = _skill_parts()
+    phases = body.split("## Phases", 1)[1].split("\n## ", 1)[0]
+    assert "mcp__curie__report_progress" in phases
+    assert re.search(r"never blocks|continue the work", phases, re.IGNORECASE)
+
+
 def test_untrusted_covers_issue_and_repository_and_instructions() -> None:
     _, body = _skill_parts()
     text = body.lower()

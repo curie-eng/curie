@@ -740,8 +740,9 @@ def _notice(cause: str, rid: uuid.UUID = _RID, **overrides: Any) -> dict[str, An
         "user": {"login": "factory[bot]", "type": "Bot"},
         "performed_via_github_app": {"id": 42},
         "created_at": "2026-01-01T00:10:00Z",
-        "body": f"Could not complete: {cause}\nCause: {cause}\n\n"
-        f"<!-- curie-execution-request:{rid} -->\n",
+        "updated_at": "2026-01-01T00:12:00Z",
+        "body": f"Could not complete: {cause}\nCause: {cause}\n\nStatus: FAILED\n"
+        f"<!-- curie-status:final -->\n<!-- curie-execution-request:{rid} -->\n",
     }
     comment.update(overrides)
     return comment
@@ -768,6 +769,30 @@ def test_terminus_matcher_requires_app_author_and_marker() -> None:
     )
     assert [m["cause"] for m in matched] == ["runner_failed", "no_pull_request"]
     assert matched[0]["created_at"] == "2026-01-01T00:10:00Z"
+
+
+def test_terminus_matcher_ignores_a_live_status_comment_without_the_final_marker() -> None:
+    """#3077: the status comment exists from admission; only its final edit ends a run."""
+
+    live = _notice(
+        "no_pull_request",
+        body="- [ ] **Plan** (in progress)\nStatus: RUNNING\n"
+        f"<!-- curie-execution-request:{_RID} -->\n",
+    )
+    assert fe.match_terminus_comments(
+        [live], mention="factory", app_id="42", request_ids=[str(_RID)]
+    ) == []
+    final = _notice("runner_failed")
+    matched = fe.match_terminus_comments(
+        [live, final], mention="factory", app_id="42", request_ids=[str(_RID)]
+    )
+    assert [m["cause"] for m in matched] == ["runner_failed"]
+    assert matched[0]["created_at"] == "2026-01-01T00:10:00Z"
+    assert matched[0]["updated_at"] == "2026-01-01T00:12:00Z"
+
+
+def test_the_final_marker_mirrors_the_api_constant() -> None:
+    assert fe._NOTICE_FINAL == "<!-- curie-status:final -->"
 
 
 def test_elapsed_runs_to_the_observed_ending_not_terminal_at() -> None:

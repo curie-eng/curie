@@ -817,8 +817,9 @@ pull request stays linked, and later publication is refused.
 
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
 the review subscriptions when both gates are on. Give the App **Issues: Read and write**
-so Curie can re-read the issue and post one final comment, and **Metadata: Read** is already
-implied by repository installation discovery.
+so Curie can re-read the issue, keep its one status comment, and set the
+`curie:*` state labels. **Metadata: Read** is already implied by repository
+installation discovery.
 
 Give the App **Checks: Read** and **Commit statuses: Read**. After a factory
 run publishes, it waits on the pull request's checks inside its 1800 s
@@ -900,9 +901,17 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
-A labelled factory run posts exactly one final comment on the originating
-issue. When publication succeeds, that comment names the exact pull request
-URL. When the run cannot complete, the comment starts with `Could not complete:`
+Each factory execution request owns exactly one App-authored status comment.
+The reconciler creates it on its first pass after admission and then edits it
+in place; there is no separate final comment. While the run is live the
+comment shows a checklist of the phases the agent reports through
+`report_progress` and a `Status:` line (`QUEUED`, `RUNNING`, `PUBLISHING`,
+`STOPPING`). Its last edit adds the result, marks the comment final, and it is
+not edited again. A comment a person deletes is re-created once on the next
+pass; unlabel the issue to stop the run instead.
+
+When publication succeeds, the result names the exact pull request
+URL. When the run cannot complete, the result starts with `Could not complete:`
 and a plain sentence for the cause. When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
 of keys and tokens. A last `Cause:` line names the platform cause code
@@ -912,10 +921,27 @@ of keys and tokens. A last `Cause:` line names the platform cause code
 classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
 `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`, or
 `workspace_error`). A model provider that answers HTTP 402 or reports exhausted
-credits ends the run as `model_credit_exhausted` without retrying. The
-work item reconciler posts the comment after the terminal row and any
-publication lineage commit. A refused post is recorded on the notice and does
-not change the execution row. Waiting for approval is not an ending: the
+credits ends the run as `model_credit_exhausted` without retrying. A run that a
+relabel replaced ends with `Stopped: the label was added again, so a new run
+replaced this one.`, and the new run gets its own status comment. The
+work item reconciler writes the result after the terminal row and any
+publication lineage commit. A refused create or edit is recorded on the status
+row, stops further edits, and does not change the execution row.
+
+The same pass keeps one state label on the originating issue, for revisions
+too: `curie:queued` while waiting, `curie:running` while running or stopping,
+`curie:pr-open` after a completed run, and `curie:needs-human` after a failed
+or expired one. A cancelled run removes all four. Curie adds the desired label
+and removes the other three, and never touches any other label, including
+the factory admission label.
+
+Set `api.githubFactoryCardBaseUrl` (`GITHUB_FACTORY_CARD_BASE_URL`) to the
+API's public `https://` origin to embed a live SVG card in the status comment.
+GitHub's image proxy fetches it from `/v1/factory/cards/<token>.svg`, which
+takes no credential: the 64-hex token in the URL is the capability, and
+anyone holding the URL can read the repository, issue title, phases, model and
+elapsed time of that run. Leave the setting empty on private installs; the
+comment then carries the checklist and the result without an image. Waiting for approval is not an ending: the
 execution deadline stays fixed from start and covers that wait.
 
 Review feedback on a factory pull request asks for one more revision of that
@@ -931,15 +957,16 @@ others). An accepted mention becomes the work item's next execution request.
 The first line of that request's objective is the same-repository feedback
 URL, which keeps the existing issue, pull request, or review thread as the
 reply target.
-When that revision completes, or ends early, the reconciler answers on the pull
+A revision's status comment lives where its reply lives, on the pull
 request: in the review thread for an inline comment, otherwise as a PR comment
-that links the feedback. If GitHub refuses the thread reply with 422, the answer
-is posted as a linked PR comment. PR review feedback reaches the factory only
+that links the feedback. If GitHub refuses the thread reply with 422, the
+comment is posted as a linked PR comment. Either way it is edited in place
+until the revision ends. PR review feedback reaches the factory only
 when `api.githubFactoryIngressEnabled` is true. A PR no work item owns keeps
 the existing review behavior.
 
 A factory run on a `github` binding emits no booting, partial, or final chat
-text. The worker acknowledges runtime output locally. The one reconciler
+text. The worker acknowledges runtime output locally. The one status
 comment on a fresh issue is the run's only GitHub response, with the pull
 request URL included when publication succeeds, so a `github` binding needs no
 endpoint or adapter.

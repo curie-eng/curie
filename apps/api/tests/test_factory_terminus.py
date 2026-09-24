@@ -29,14 +29,14 @@ from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_notices import cause_text, comment_body, marker_for
+from curie_api.factory_notices import FINAL_MARKER, cause_text, marker_for, result_section
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
@@ -57,12 +57,11 @@ pytestmark = pytest.mark.usefixtures("clean_db")
 
 def test_completed_issue_comment_body_requires_pull_request_url() -> None:
     with pytest.raises(ValueError, match="requires its pull request URL"):
-        comment_body(uuid.uuid4(), "completed", pr_url=None)
+        result_section("completed", pr_url=None)
 
 
 def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None:
-    body = comment_body(
-        uuid.uuid4(),
+    body = result_section(
         "model_credit_exhausted",
         pr_url=None,
         detail="API Error: 402 This request requires more credits",
@@ -106,8 +105,24 @@ def test_every_terminus_cause_has_its_own_plain_sentence(cause: str) -> None:
     assert cause not in cause_text(cause)
 
 
+def test_the_result_section_carries_no_marker() -> None:
+    """The marker belongs to the whole status comment, not to its result lines."""
+
+    body = result_section("runner_failed", pr_url=None)
+    assert "curie-execution-request" not in body
+    assert FINAL_MARKER not in body
+
+
+def test_superseded_cancel_says_a_new_run_replaced_this_one() -> None:
+    body = result_section("issue_cancelled", pr_url=None, superseded=True)
+    assert body == (
+        "Stopped: the label was added again, so a new run replaced this one.\n"
+        "Cause: issue_cancelled\n"
+    )
+
+
 def test_unknown_cause_still_gets_a_sentence_and_its_code() -> None:
-    body = comment_body(uuid.uuid4(), "something_new", pr_url=None)
+    body = result_section("something_new", pr_url=None)
     assert body.splitlines()[0] == (
         "Could not complete: the run stopped for a reason Curie did not recognize."
     )
@@ -117,10 +132,10 @@ def test_unknown_cause_still_gets_a_sentence_and_its_code() -> None:
 
 def test_ci_failed_notice_labels_its_details_not_a_provider_message() -> None:
     detail = (
-        "Rounds: 3\nTried: round 2: \"Fix the test\" (1 files: src/app.py)\n"
+        'Rounds: 3\nTried: round 2: "Fix the test" (1 files: src/app.py)\n'
         "Failing checks: unit-tests (failure)"
     )
-    body = comment_body(uuid.uuid4(), "ci_failed", pr_url=None, detail=detail)
+    body = result_section("ci_failed", pr_url=None, detail=detail)
     assert body.startswith("Could not complete:")
     assert "3 rounds" in body.splitlines()[0]
     assert "Provider message:" not in body
@@ -130,9 +145,7 @@ def test_ci_failed_notice_labels_its_details_not_a_provider_message() -> None:
 
 
 def test_ci_unverified_notice_says_it_is_not_a_success() -> None:
-    body = comment_body(
-        uuid.uuid4(), "ci_unverified", pr_url=None, detail="Reason: github_forbidden"
-    )
+    body = result_section("ci_unverified", pr_url=None, detail="Reason: github_forbidden")
     assert body.startswith("Could not complete:")
     assert "unverified" in body.splitlines()[0]
     assert "Reason: github_forbidden" in body
@@ -141,17 +154,14 @@ def test_ci_unverified_notice_says_it_is_not_a_success() -> None:
 
 def test_completed_notice_carries_the_no_ci_note() -> None:
     url = f"https://github.com/{REPO}/pull/77"
-    body = comment_body(
-        uuid.uuid4(), "completed", pr_url=url, detail="No CI checks appeared within 120 s."
-    )
+    body = result_section("completed", pr_url=url, detail="No CI checks appeared within 120 s.")
     assert body.startswith(f"Completed: {url}")
     assert "Note: No CI checks appeared within 120 s." in body
 
 
 def test_revision_completed_notice_carries_the_no_ci_note() -> None:
     url = f"https://github.com/{REPO}/pull/77"
-    body = comment_body(
-        uuid.uuid4(),
+    body = result_section(
         "completed",
         pr_url=url,
         feedback_url=f"{url}#issuecomment-1",
@@ -260,7 +270,23 @@ class _Credentials:
         return 0, "fixture"
 
 
+_ISSUE_OR_PR = re.compile(r"^/repos/[^/]+/[^/]+/(?:issues|pulls)/(\d+)$")
+_COMMENT = re.compile(r"^/repos/[^/]+/[^/]+/(issues|pulls)/comments/(\d+)$")
+_LABELS = re.compile(r"^/repos/[^/]+/[^/]+/issues/(\d+)/labels(?:/(.+))?$")
+
+
 class _GitHubComments(BaseHTTPRequestHandler):
+    """Threaded GitHub REST fake for everything the status comment pass calls.
+
+    Comments: create (issue list, thread reply), list, and edit in place
+    https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
+    https://docs.github.com/en/rest/pulls/comments#update-a-review-comment-for-a-pull-request
+    Labels (#3077):
+    https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
+    https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+    Issue and pull request reads return a title.
+    """
+
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -274,6 +300,10 @@ class _GitHubComments(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _payload(self) -> Any:
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length) or b"{}")
+
     def do_GET(self) -> None:  # noqa: N802
         server = self.server
         assert isinstance(server, _CommentServer)
@@ -282,6 +312,22 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if self._ci_get(server, path):
             return
         server.requests.append(("GET", path, None))
+        subject = _ISSUE_OR_PR.match(path)
+        if subject is not None:
+            number = int(subject.group(1))
+            self._send(
+                200,
+                {"number": number, "title": server.titles.get(number, f"Issue {number}")},
+            )
+            return
+        single = _COMMENT.match(path)
+        if single is not None:
+            found = server.find(int(single.group(2)))
+            if found is None:
+                self._send(404, {"message": "Not Found"})
+            else:
+                self._send(200, found)
+            return
         if server.by_path:
             items = list(server.lists.get(path, []))
             # Real GitHub pages; a small fixture list is unaffected since page 1
@@ -315,12 +361,56 @@ class _GitHubComments(BaseHTTPRequestHandler):
             return True
         return False
 
+    def do_PATCH(self) -> None:  # noqa: N802
+        server = self.server
+        assert isinstance(server, _CommentServer)
+        payload = self._payload()
+        path = self.path.split("?", 1)[0]
+        server.requests.append(("PATCH", path, payload.get("body", "")))
+        edit = _COMMENT.match(path)
+        if edit is None:
+            self._send(404, {"message": "Not Found"})
+            return
+        if server.patch_statuses:
+            self._send(server.patch_statuses.pop(0), {"message": "injected"})
+            return
+        found = server.find(int(edit.group(2)))
+        if found is None:
+            self._send(404, {"message": "Not Found"})
+            return
+        found["body"] = payload.get("body", "")
+        self._send(200, found)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        server = self.server
+        assert isinstance(server, _CommentServer)
+        path = self.path.split("?", 1)[0]
+        server.requests.append(("DELETE", path, None))
+        label = _LABELS.match(path)
+        if label is None or label.group(2) is None:
+            self._send(404, {"message": "Not Found"})
+            return
+        number, name = int(label.group(1)), unquote(label.group(2))
+        present = server.issue_labels.setdefault(number, set())
+        if name not in present:
+            self._send(404, {"message": "Label does not exist"})
+            return
+        present.discard(name)
+        self._send(200, [{"name": value} for value in sorted(present)])
+
     def do_POST(self) -> None:  # noqa: N802
         server = self.server
         assert isinstance(server, _CommentServer)
-        length = int(self.headers.get("Content-Length", "0"))
-        payload = json.loads(self.rfile.read(length) or b"{}")
+        payload = self._payload()
         path = self.path.split("?", 1)[0]
+        label = _LABELS.match(path)
+        if label is not None and label.group(2) is None:
+            names = [str(name) for name in payload.get("labels", [])]
+            server.requests.append(("POST", path, json.dumps(names)))
+            present = server.issue_labels.setdefault(int(label.group(1)), set())
+            present.update(names)
+            self._send(200, [{"name": value} for value in sorted(present)])
+            return
         server.requests.append(("POST", path, payload.get("body", "")))
         if server.by_path:
             refused = server.refuse_paths.get(path)
@@ -343,7 +433,8 @@ class _GitHubComments(BaseHTTPRequestHandler):
             server.posts += 1
             self._send(server.refuse_status, {"message": "refused"})
             return
-        comment = {"id": 7000 + len(server.comments) + 1, "body": payload.get("body", "")}
+        server.next_comment_id += 1
+        comment = {"id": server.next_comment_id, "body": payload.get("body", "")}
         server.comments.append(comment)
         server.posts += 1
         self._send(201, comment)
@@ -353,6 +444,7 @@ class _CommentServer(ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), _GitHubComments)
         self.comments: list[dict[str, Any]] = []
+        self.next_comment_id = 7000
         self.posts = 0
         self.refuse_status: int | None = None
         # Path-aware mode for pull request replies. Each list endpoint keeps its
@@ -371,6 +463,30 @@ class _CommentServer(ThreadingHTTPServer):
         self.ci_cursor: dict[str, int] = {}
         self.ci_observations: list[str] = []
         self.annotations: dict[int, list[dict[str, Any]]] = {}
+
+        # Statuses the next PATCHes answer with instead of editing (#3077).
+        self.patch_statuses: list[int] = []
+        # Issue number -> label names currently on it.
+        self.issue_labels: dict[int, set[str]] = {}
+        # Issue or pull request number -> title the subject read returns.
+        self.titles: dict[int, str] = {}
+
+    def find(self, comment_id: int) -> dict[str, Any] | None:
+        for comment in self.comments:
+            if comment.get("id") == comment_id:
+                return comment
+        for listed in self.lists.values():
+            for comment in listed:
+                if comment.get("id") == comment_id:
+                    return comment
+        return None
+
+    def delete_comment(self, comment_id: int) -> None:
+        """A human deletes the comment on GitHub."""
+
+        self.comments[:] = [c for c in self.comments if c.get("id") != comment_id]
+        for listed in self.lists.values():
+            listed[:] = [c for c in listed if c.get("id") != comment_id]
 
 
 @pytest.fixture
@@ -470,7 +586,8 @@ def _request(number: int) -> dict[str, Any]:
 def _notices(request_id: uuid.UUID) -> list[dict[str, Any]]:
     return _rows(
         "SELECT execution_request_id, terminal_cause, attempts, posted_at, "
-        "comment_id, refused_at, refusal, detail "
+        "comment_id, comment_list, finalized_at, card_token, applied_label, "
+        "refused_at, refusal, detail "
         "FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
         {"id": request_id},
     )
@@ -489,9 +606,7 @@ def _reconcile() -> None:
 
         engine = create_async_engine(get_settings().database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
-        client = aioredis.Redis(
-            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None
-        )
+        client = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
         reconciler = WorkItemReconciler(maker, client, get_settings())
         try:
             await reconciler.run_once()
@@ -544,9 +659,7 @@ def _start_running(request_id: uuid.UUID) -> int:
         engine = create_async_engine(get_settings().database_url)
         try:
             async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=1
-                )
+                acquired = await acquire(session, request_id, owner="factory-owner", generation=1)
                 assert not isinstance(acquired, DispatchConflict), acquired
                 started = await start(
                     session,
@@ -580,6 +693,8 @@ def test_capacity_wait_expiry_posts_one_comment(admitted: Any) -> None:
     assert body.startswith("Could not complete:")
     assert "Cause: capacity_wait_expired" in body
     assert marker_for(row["id"]) in body
+    assert FINAL_MARKER in body
+    assert notices[0]["finalized_at"] is not None
     _reconcile()
     assert sink.posts == 1
     assert len(_notices(row["id"])) == 1
@@ -590,9 +705,7 @@ def test_label_removal_posts_one_comment(admitted: Any) -> None:
     number = 9202
     _label(client, github, number)
     github.labels = []
-    removed = _post(
-        client, "issues", _issue_event("unlabeled", number, label={"name": LABEL})
-    )
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert removed.json()["status"] == "factory_cancelled"
     row = _request(number)
     assert (row["status"], row["terminal_cause"]) == ("cancelled", "issue_cancelled")
@@ -631,6 +744,7 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     _reconcile()
     assert sink.posts == 1
     assert "runner_escalated" in sink.comments[0]["body"]
+    _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
     assert _request(number)["version"] == version
 
 
@@ -695,7 +809,8 @@ def test_a_crash_between_commit_and_post_still_posts_once(admitted: Any) -> None
     sink.comments.append(
         {
             "id": 7444,
-            "body": comment_body(row["id"], "issue_cancelled", pr_url=None),
+            "body": result_section("issue_cancelled", pr_url=None)
+            + f"\n{FINAL_MARKER}\n{marker_for(row['id'])}\n",
         }
     )
     _reconcile()
@@ -717,13 +832,12 @@ def test_a_running_cancellation_comments_only_after_the_runtime_is_observed(
     row = _request(number)
     _start_running(row["id"])
     github.labels = []
-    removed = _post(
-        client, "issues", _issue_event("unlabeled", number, label={"name": LABEL})
-    )
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert removed.json()["status"] == "factory_cancellation_requested"
     requested = _request(number)
     assert requested["status"] == "cancellation_requested"
-    assert _notices(row["id"]) == []
+    # The status row exists from admission; no terminal detail is staged yet.
+    assert _notices(row["id"])[0]["terminal_cause"] is None
     headers = {"X-Curie-Worker-Token": "factory-terminus-worker"}
     claimed = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/termination/claim",
@@ -760,7 +874,8 @@ def test_execution_deadline_posts_one_comment(admitted: Any) -> None:
         "cancellation_requested",
         "execution_deadline",
     )
-    assert _notices(row["id"]) == []
+    assert _notices(row["id"])[0]["terminal_cause"] is None
+    assert FINAL_MARKER not in sink.comments[0]["body"]
     _observe_termination(client, row["id"])
     terminal = _request(number)
     assert (terminal["status"], terminal["terminal_cause"]) == (
@@ -770,7 +885,7 @@ def test_execution_deadline_posts_one_comment(admitted: Any) -> None:
     _reconcile()
     assert sink.posts == 1
     assert "execution_deadline" in sink.comments[0]["body"]
-    assert marker_for(row["id"]) in sink.comments[0]["body"]
+    _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
     _reconcile()
     assert sink.posts == 1
 
@@ -806,14 +921,14 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
         "cancellation_requested",
         "owner_lost",
     )
-    assert _notices(row["id"]) == []
+    assert _notices(row["id"])[0]["terminal_cause"] is None
     _observe_termination(client, row["id"])
     terminal = _request(number)
     assert (terminal["status"], terminal["terminal_cause"]) == ("failed", "owner_lost")
     _reconcile()
     assert sink.posts == 1
     assert "owner_lost" in sink.comments[0]["body"]
-    assert marker_for(row["id"]) in sink.comments[0]["body"]
+    _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
 
 
 def test_runner_failure_posts_one_comment(admitted: Any) -> None:
@@ -881,6 +996,8 @@ def test_failure_and_opened_pull_request_each_post_one_final_comment(
     assert sum("Cause: publication_denied" in body for body in bodies) == 1
     opened_url = f"https://github.com/{REPO}/pull/77"
     assert sum(opened_url in body for body in bodies) == 1
+    _assert_one_final_comment(bodies, opened_row["id"])
+    _assert_one_final_comment(bodies, denied_row["id"])
     assert len(_notices(opened_row["id"])) == 1
     assert len(_notices(denied_row["id"])) == 1
 
@@ -893,24 +1010,32 @@ def _attach_publication(
         try:
             async with engine.begin() as conn:
                 item = (
-                    await conn.execute(
-                        text(
-                            "SELECT agent_id, conversation_id, repo_full_name, "
-                            "github_repository_id, github_installation_id, version "
-                            "FROM curie.work_items WHERE id = :id"
-                        ),
-                        {"id": work_item_id},
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT agent_id, conversation_id, repo_full_name, "
+                                "github_repository_id, github_installation_id, version "
+                                "FROM curie.work_items WHERE id = :id"
+                            ),
+                            {"id": work_item_id},
+                        )
                     )
-                ).mappings().one()
+                    .mappings()
+                    .one()
+                )
                 request = (
-                    await conn.execute(
-                        text(
-                            "SELECT id, version FROM curie.execution_requests "
-                            "WHERE work_item_id = :id AND status = 'running'"
-                        ),
-                        {"id": work_item_id},
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT id, version FROM curie.execution_requests "
+                                "WHERE work_item_id = :id AND status = 'running'"
+                            ),
+                            {"id": work_item_id},
+                        )
                     )
-                ).mappings().one()
+                    .mappings()
+                    .one()
+                )
                 version_id, deployment_id, lineage_id = (
                     uuid.uuid4(),
                     uuid.uuid4(),
@@ -918,9 +1043,7 @@ def _attach_publication(
                 )
                 approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
                 pr_url = (
-                    None
-                    if pr is None
-                    else f"https://github.com/{item['repo_full_name']}/pull/{pr}"
+                    None if pr is None else f"https://github.com/{item['repo_full_name']}/pull/{pr}"
                 )
                 await conn.execute(
                     text(
@@ -1048,7 +1171,7 @@ def test_concurrent_reconcilers_post_one_comment(admitted: Any) -> None:
         ]
         reconcilers = [WorkItemReconciler(maker, client, get_settings()) for client in clients]
         try:
-            await asyncio.gather(*(item._post_terminal_notices() for item in reconcilers))
+            await asyncio.gather(*(item._sync_status_comments() for item in reconcilers))
         finally:
             for client in clients:
                 await client.aclose()
@@ -1241,7 +1364,26 @@ def _complete_revision(
 
 
 def _posts(sink: _CommentServer) -> list[tuple[str, str | None]]:
-    return [(path, body) for method, path, body in sink.requests if method == "POST"]
+    """Comment creations only; label writes are asserted separately."""
+
+    return [
+        (path, body)
+        for method, path, body in sink.requests
+        if method == "POST" and not _LABELS.match(path)
+    ]
+
+
+def _patches(sink: _CommentServer) -> list[tuple[str, str | None]]:
+    return [(path, body) for method, path, body in sink.requests if method == "PATCH"]
+
+
+def _assert_one_final_comment(bodies: list[str], request_id: uuid.UUID) -> str:
+    """Exactly one comment carries this request's marker, and it is final."""
+
+    marked = [body for body in bodies if marker_for(request_id) in body]
+    assert len(marked) == 1, marked
+    assert FINAL_MARKER in marked[0]
+    return marked[0]
 
 
 def test_a_completed_first_request_posts_one_comment_naming_its_pull_request(
@@ -1251,9 +1393,7 @@ def test_a_completed_first_request_posts_one_comment_naming_its_pull_request(
     sink.by_path = True
     number, pr, _first = _published_issue(client, github, sink)
     posts = _posts(sink)
-    assert [path for path, _body in posts] == [
-        f"/repos/{REPO}/issues/{number}/comments"
-    ]
+    assert [path for path, _body in posts] == [f"/repos/{REPO}/issues/{number}/comments"]
     assert f"https://github.com/{REPO}/pull/{pr}" in (posts[0][1] or "")
     _reconcile()
     assert len(_posts(sink)) == 1
@@ -1275,18 +1415,15 @@ def test_a_review_comment_revision_replies_in_its_thread(admitted: Any) -> None:
     sink.by_path = True
     _number, pr, revision = _complete_revision(client, github, sink, "discussion_r88102")
     posts = _posts(sink)
-    assert [path for path, _ in posts] == [
-        f"/repos/{REPO}/pulls/{pr}/comments/88102/replies"
-    ]
+    assert [path for path, _ in posts] == [f"/repos/{REPO}/pulls/{pr}/comments/88102/replies"]
     assert marker_for(revision) in (posts[0][1] or "")
+    assert _notices(revision)[0]["comment_list"] == "review"
     assert _notices(revision)[0]["posted_at"] is not None
     _reconcile()
     assert len(_posts(sink)) == 1
 
 
-@pytest.mark.parametrize(
-    "fragment", ["issuecomment-88103", "pullrequestreview-88104"]
-)
+@pytest.mark.parametrize("fragment", ["issuecomment-88103", "pullrequestreview-88104"])
 def test_conversation_and_review_revisions_comment_on_the_pull_request(
     admitted: Any, fragment: str
 ) -> None:
@@ -1342,18 +1479,16 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    revision = _insert_revision(
-        first["work_item_id"], number, _revision_objective(pr, fragment)
-    )
+    revision = _insert_revision(first["work_item_id"], number, _revision_objective(pr, fragment))
     sink.lists[f"/repos/{REPO}/{listed.format(pr=pr)}"] = [
         {
             "id": 7555,
-            "body": comment_body(
-                revision,
+            "body": result_section(
                 "completed",
                 pr_url=None,
                 feedback_url=_revision_objective(pr, fragment),
-            ),
+            )
+            + f"\n{marker_for(revision)}\n",
         }
     ]
     _start_running(revision)
@@ -1368,8 +1503,7 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
 
 def _scan_page(request_id: uuid.UUID) -> int:
     return _rows(
-        "SELECT scan_page FROM curie.factory_terminal_notices "
-        "WHERE execution_request_id = :id",
+        "SELECT scan_page FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
         {"id": request_id},
     )[0]["scan_page"]
 
@@ -1388,9 +1522,7 @@ def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
     fragment = "discussion_r88109"
-    revision = _insert_revision(
-        first["work_item_id"], number, _revision_objective(pr, fragment)
-    )
+    revision = _insert_revision(first["work_item_id"], number, _revision_objective(pr, fragment))
     sink.lists[f"/repos/{REPO}/issues/{pr}/comments"] = [
         {"id": 9000 + i, "body": f"unrelated comment {i}"} for i in range(550)
     ]

@@ -77,6 +77,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from pydantic import ValidationError
 
+from . import sandbox_token
 from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import (
@@ -108,7 +109,10 @@ from .binding import (
     DECISION_ENV,
     GRANT_TOOL_ENV,
     MAX_TURNS_ENV,
+    PROGRESS_TOKEN_ENV,
+    PROGRESS_URL_ENV,
     RESUMED_KIND_ENV,
+    SANDBOX_TOKEN_TTL_SECONDS,
     BindingResolver,
 )
 from .config import WorkerConfig
@@ -2190,6 +2194,20 @@ class Kernel:
                 )
                 if grant_tool:
                     boot_env[GRANT_TOOL_ENV] = grant_tool
+                # A factory execution may report its phases for the live status
+                # card (#3077). The token is bound to this request and to the
+                # work_item.progress scope only; no other turn carries it.
+                if owned_work_item_id is not None and self._config.api_key:
+                    base = self._config.runner_facing_api_base_url.rstrip("/")
+                    boot_env[PROGRESS_URL_ENV] = (
+                        f"{base}/v1/work-item-progress/{owned_work_item_id}"
+                    )
+                    boot_env[PROGRESS_TOKEN_ENV] = sandbox_token.mint(
+                        self._config.api_key,
+                        agent=str(owned_work_item_id),
+                        scope="work_item.progress",
+                        exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
+                    )
                 # Decision A2 marker (#544): an authority-free FACT carrying the
                 # resumed approval's gate kind (the actual gate_kind column value,
                 # e.g. 'policy' or 'permission'). After the approved-only gate in

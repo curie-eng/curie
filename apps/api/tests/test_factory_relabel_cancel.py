@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
-from curie_api.factory_notices import comment_body
+from curie_api.factory_notices import FINAL_MARKER, marker_for, result_section
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -102,7 +102,7 @@ def _stream_event_ids() -> list[str]:
 
 
 def test_issue_cancelled_comment_is_a_plain_stop_notice() -> None:
-    body = comment_body(uuid.uuid4(), "issue_cancelled", pr_url=None)
+    body = result_section("issue_cancelled", pr_url=None)
     assert "Stopped:" in body
     assert "Could not complete" not in body
 
@@ -174,7 +174,7 @@ def test_unlabel_then_relabel_clears_cancelled_at_and_admits_a_new_request(
 
 
 def test_relabel_while_waiting_supersedes_the_waiting_request(admitted: Any) -> None:  # noqa: F811 (shared fixture)
-    client, github, _sink = admitted
+    client, github, sink = admitted
     number = 9604
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
 
@@ -188,7 +188,17 @@ def test_relabel_while_waiting_supersedes_the_waiting_request(admitted: Any) -> 
     ]
     assert rows[0]["work_item_id"] == rows[1]["work_item_id"]
     _reconcile()
-    assert _notices(rows[0]["id"]) == []
+    # #3077: the superseded run's own status comment is finalized, not suppressed.
+    old = _notices(rows[0]["id"])
+    assert len(old) == 1
+    assert old[0]["terminal_cause"] == "issue_cancelled"
+    assert old[0]["finalized_at"] is not None
+    bodies = [comment["body"] for comment in sink.comments]
+    (superseded,) = [body for body in bodies if marker_for(rows[0]["id"]) in body]
+    assert "a new run replaced this one" in superseded
+    assert FINAL_MARKER in superseded
+    (live,) = [body for body in bodies if marker_for(rows[1]["id"]) in body]
+    assert FINAL_MARKER not in live
 
 
 def test_relabel_while_running_readmits_after_the_termination_is_observed(
@@ -221,8 +231,16 @@ def test_relabel_while_running_readmits_after_the_termination_is_observed(
     assert rows[1]["requester"] == f"github:{SENDER_ID}:{SENDER}"
     assert rows[1]["readmit_request_id"] is None
     assert rows[1]["cancelled_at"] is None
-    assert _notices(old_id) == []
-    assert sink.posts == 0
+    # #3077: the replaced run's comment is finalized with the superseded text,
+    # and the new request gets its own comment. One comment per request.
+    assert _notices(old_id)[0]["finalized_at"] is not None
+    assert sink.posts == 2
+    bodies = [comment["body"] for comment in sink.comments]
+    (superseded,) = [body for body in bodies if marker_for(old_id) in body]
+    assert "a new run replaced this one" in superseded
+    assert "Cause: issue_cancelled" in superseded
+    (live,) = [body for body in bodies if marker_for(rows[1]["id"]) in body]
+    assert "Status: QUEUED" in live
 
 
 # AC6
@@ -350,7 +368,8 @@ def test_unlabel_after_a_suppressed_termination_still_owes_the_stop_notice(
     _start_running(old_id)
     assert _labelled(client, github, number).json()["status"] == "factory_readmit_pending"
     _observe_termination(client, old_id)
-    assert _notices(old_id) == []
+    # The terminal detail is staged at terminus; nothing is suppressed any more.
+    assert _notices(old_id)[0]["terminal_cause"] == "issue_cancelled"
 
     assert _unlabelled(client, github, number).json()["status"] == "factory_cancelled"
     _unlabelled(client, github, number)

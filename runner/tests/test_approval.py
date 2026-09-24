@@ -9,6 +9,7 @@ model's offline approval script.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import anyio
 import pytest
@@ -3079,3 +3080,63 @@ def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None
             "the deploy-time reader and the loader is the #453/#544 fail-open shape"
         )
 
+
+
+# --- #3077: the platform report_progress tool -----------------------------------
+
+
+def test_report_progress_is_a_platform_owned_tool_name() -> None:
+    from curie_runner.approval import (
+        APPROVAL_SERVER_NAME,
+        PROGRESS_TOOL_NAME,
+        is_platform_owned_tool,
+        platform_tool_names,
+    )
+
+    assert PROGRESS_TOOL_NAME == f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
+    for mounted in (False, True):
+        assert PROGRESS_TOOL_NAME in platform_tool_names(state_server_mounted=mounted)
+        assert is_platform_owned_tool(PROGRESS_TOOL_NAME, state_server_mounted=mounted)
+    # Exact names only (#2286): a lookalike on a curie-shaped prefix is not exempt.
+    assert not is_platform_owned_tool(
+        "mcp__curie__report_progress_extra", state_server_mounted=False
+    )
+
+
+def test_approval_server_lists_report_progress_only_when_a_tool_is_passed() -> None:
+    from curie_runner.progress import (
+        PROGRESS_TOKEN_ENV,
+        PROGRESS_URL_ENV,
+        ProgressActivity,
+        build_progress_tool,
+        resolve_progress,
+    )
+
+    bundle = Path(__file__).resolve().parents[2] / "examples" / "dark-factory"
+    resolved = resolve_progress(
+        {
+            PROGRESS_URL_ENV: "http://api:8000/v1/work-item-progress/example",
+            PROGRESS_TOKEN_ENV: "sbx.example.token",
+        },
+        bundle,
+    )
+    assert resolved is not None
+    client, declaration = resolved
+    progress_tool = build_progress_tool(declaration, client, ProgressActivity())
+
+    async def names(server: object) -> set[str]:
+        entry = server["instance"].get_request_handler("tools/list")  # type: ignore[index]
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {tool.name for tool in result.tools}
+
+    async def go() -> None:
+        assert "report_progress" not in await names(build_approval_server())
+        assert "report_progress" in await names(
+            build_approval_server(progress_tool=progress_tool)
+        )
+        assert await names(
+            build_approval_server(include_request_approval=False, progress_tool=progress_tool)
+        ) == {"publish_changes", "report_progress"}
+
+    anyio.run(go)

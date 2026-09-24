@@ -176,9 +176,13 @@ _REASON_CONTRACT = re.compile(r"could not complete:\s*\S", re.IGNORECASE)
 _PULL_REQUEST_URL = re.compile(
     r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"
 )
-# Mirrors marker_for and comment_body in apps/api/src/curie_api/factory_notices.py.
+# Mirrors marker_for, result_section and status_body in
+# apps/api/src/curie_api/factory_notices.py.
 _NOTICE_MARKER = re.compile(r"<!-- curie-execution-request:([0-9a-fA-F-]{36}) -->")
 _NOTICE_CAUSE = re.compile(r"^Cause: (\S+)\s*$", re.MULTILINE)
+# Mirrors FINAL_MARKER: the live status comment (#3077) exists from admission,
+# so only a body carrying this marker means the run ended.
+_NOTICE_FINAL = "<!-- curie-status:final -->"
 ACTIVE_REQUEST_STATUSES = frozenset({"waiting", "running", "cancellation_requested"})
 _CREDENTIAL_PATTERNS = tuple(
     re.compile(pattern)
@@ -2582,9 +2586,10 @@ def match_terminus_comments(
 ) -> list[dict[str, Any]]:
     """The configured App's terminus notices for these execution requests.
 
-    Pure. A comment counts only when the App authored it and it carries the
-    execution request marker for one of ``request_ids``. The cause is parsed
-    from the notice body.
+    Pure. A comment counts only when the App authored it, it carries the
+    execution request marker for one of ``request_ids``, and it carries the
+    final marker: a live status comment has not ended its run. The cause is
+    parsed from the notice body. ``updated_at`` is when the final edit landed.
     """
 
     wanted = {str(r).lower() for r in request_ids}
@@ -2596,12 +2601,15 @@ def match_terminus_comments(
         marker = _NOTICE_MARKER.search(body)
         if marker is None or marker.group(1).lower() not in wanted:
             continue
+        if _NOTICE_FINAL not in body:
+            continue
         cause = _NOTICE_CAUSE.search(body)
         matched.append(
             {
                 "body": body,
                 "cause": cause.group(1) if cause else None,
                 "created_at": comment.get("created_at"),
+                "updated_at": comment.get("updated_at"),
                 "request_id": marker.group(1),
             }
         )
@@ -2882,7 +2890,8 @@ def rerun_notice_reconciler(p: Preflight) -> dict[str, Any]:
         }
     uuid.UUID(request_id)
     p.sql(
-        "UPDATE factory_terminal_notices SET posted_at = NULL, comment_id = NULL "
+        "UPDATE factory_terminal_notices SET posted_at = NULL, comment_id = NULL, "
+        "comment_list = NULL, rendered_digest = NULL, finalized_at = NULL "
         f"WHERE execution_request_id = '{request_id}'"
     )
     deadline = time.time() + NOTICE_RERUN_WAIT_SECONDS
@@ -2966,7 +2975,8 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
     prs = _scenario_pull_requests(p)
     latest = _latest_request(detail) or {}
     if comments:
-        ended_at = min(str(c.get("created_at") or "") for c in comments)
+        # The status comment is created at admission; its final edit ends the run.
+        ended_at = min(str(c.get("updated_at") or c.get("created_at") or "") for c in comments)
     else:
         ended_at = None
     elapsed, execution = ending_times(latest, labelled_at=p.labelled_at, ended_at=ended_at)
@@ -3185,7 +3195,10 @@ def revision(p: Preflight) -> dict[str, Any]:
         comment["body"], hit = record_agent_text(comment["body"], known)
         disclosed = disclosed or hit
     ended_at = min(
-        (str(comment.get("created_at") or "") for comment in comments),
+        (
+            str(comment.get("updated_at") or comment.get("created_at") or "")
+            for comment in comments
+        ),
         default=None,
     )
     elapsed, _execution = ending_times(latest, labelled_at=p.labelled_at, ended_at=ended_at)
