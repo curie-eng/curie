@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""GNU coreutils ``timeout`` and util-linux ``setsid``, for hosts that ship neither.
+"""GNU coreutils ``timeout``, util-linux ``setsid`` and ``flock``, for hosts without them.
 
     gnu-process.py timeout [--foreground] DURATION COMMAND [ARG]...
     gnu-process.py setsid COMMAND [ARG]...
+    gnu-process.py flock -n FD
 
-A stock Mac has neither tool, and the host scripts that need them test GNU's
-exit statuses, so this reproduces those statuses and the process-group
-behaviour they rest on rather than approximating them. It accepts only the
-options those scripts use. compose/tests/test_gnu_process.py pins each status
+A stock Mac has none of these tools, and the host scripts that need them test
+GNU's exit statuses, so this reproduces those statuses and the process-group
+and lock behaviour they rest on rather than approximating them. It accepts only
+the options those scripts use. compose/tests/test_gnu_process.py pins each status
 against GNU's own tools. Python 3.9 is the floor, because that is the
 ``python3`` a stock Mac ships.
 """
@@ -15,6 +16,7 @@ against GNU's own tools. Python 3.9 is the floor, because that is the
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import re
 import resource
@@ -26,6 +28,11 @@ EXIT_TIMEDOUT = 124
 EXIT_CANCELED = 125
 EXIT_CANNOT_INVOKE = 126
 EXIT_ENOENT = 127
+# util-linux flock's: a held lock, then the sysexits.h codes it uses.
+EXIT_CONFLICT = 1
+EX_USAGE = 64
+EX_DATAERR = 65
+EX_OSERR = 71
 UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 # What GNU timeout passes on to the command it runs.
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGQUIT, signal.SIGHUP, signal.SIGTERM)
@@ -146,7 +153,27 @@ def setsid(arguments: list[str]) -> int:
     return 0
 
 
-TOOLS = {"timeout": timeout, "setsid": setsid}
+def flock(arguments: list[str]) -> int:
+    if len(arguments) != 2 or arguments[0] != "-n":
+        print("usage: flock -n FD", file=sys.stderr)
+        return EX_USAGE
+    if re.fullmatch(r"[0-9]+", arguments[1]) is None:
+        print(f"flock: bad file descriptor: '{arguments[1]}'", file=sys.stderr)
+        return EX_USAGE
+    fd = int(arguments[1])
+    try:
+        # flock(2), never fcntl's per-process record locks: it locks the open
+        # file description the shell shares, so the lock outlives this process.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return EXIT_CONFLICT
+    except OSError as error:
+        print(f"flock: {fd}: {error.strerror}", file=sys.stderr)
+        return EX_OSERR if error.errno in (errno.ENOLCK, errno.ENOMEM) else EX_DATAERR
+    return 0
+
+
+TOOLS = {"timeout": timeout, "setsid": setsid, "flock": flock}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in TOOLS:
