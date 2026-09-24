@@ -2,7 +2,7 @@
 
 Date: 2026-09-22
 
-Status: Draft
+Status: Accepted
 
 This ADR builds on [ADR-0096](0096-port-adapters-are-deployed-services.md),
 [ADR-0118](0118-binding-cardinality-is-the-multi-surface-opt-in.md),
