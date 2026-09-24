@@ -827,8 +827,9 @@ nothing else changes.
 ### The default factory agent
 
 Curie ships its factory agent as the bundle in
-[`examples/dark-factory`](../examples/dark-factory/README.md). Deploy it to the
-agent bound to the repository. It is one agent with one skill: it reads the
+[`examples/dark-factory`](../examples/dark-factory/README.md). Deploy it as the
+agent `dark-factory` bound to the repository, on the default factory model
+`z-ai/glm-5.3-flash` (`agentSandbox.runner.model`). It is one agent with one skill: it reads the
 issue by link, pins the acceptance criteria, plans, writes a failing test where
 one is feasible, implements, runs the repository's own checks, reviews its diff
 against every criterion, and ends in one pull request or a stated reason. Any
@@ -968,7 +969,7 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to 1800 s; unset, the model is fake |
-| `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3`) |
+| `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
 
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the

@@ -123,6 +123,7 @@ api:
   RESUME_RECONCILER_ENABLED: api.resumeReconciler.enabled
   RESUME_RECONCILER_GRACE_SECONDS: api.resumeReconciler.graceSeconds
   RESUME_RECONCILER_INTERVAL_SECONDS: api.resumeReconciler.intervalSeconds
+  RUNNER_NAMESPACE: the release namespace (Helm --namespace)
   S3_ACCESS_KEY: rustfs.auth.accessKey
   S3_ENDPOINT_URL: rustfs.host / rustfs.port
   S3_SECRET_KEY: rustfs.existingSecret
