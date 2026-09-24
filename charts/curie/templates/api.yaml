@@ -221,6 +221,10 @@ spec:
               value: {{ .Values.api.environment | quote }}
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
+            # Runner sandboxes are claimed in the release namespace (the
+            # worker's CURIE_NAMESPACE), so the Logs tab's pod list reads there.
+            - name: RUNNER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             - name: COMMIT_POLL_INTERVAL_S
               value: {{ .Values.api.commitPollIntervalSeconds | quote }}
             - name: GITHUB_CLONE_BASE

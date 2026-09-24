@@ -57,21 +57,27 @@ helm upgrade curie <chart> -n curie --reuse-values \
   --set worker.deliveryBudgetSeconds=1800 \
   --set worker.runnerTotalTimeoutSeconds=1800
 
+# The factory's default model: GLM 5.3 Flash through OpenRouter.
+helm upgrade curie <chart> -n curie --reuse-values \
+  --set agentSandbox.runner.fakeModel=false \
+  --set agentSandbox.runner.model=z-ai/glm-5.3-flash \
+  --set agentSandbox.runner.credentials=<openrouter-api-key>
+
 # Runner egress to the GitHub API for the MCP server, one entry per CIDR
 # from the "api" list at https://api.github.com/meta.
 helm upgrade curie <chart> -n curie --reuse-values \
-  --set 'agentSandbox.connectorEgress.factory[0].cidr=<github-api-cidr>' \
-  --set 'agentSandbox.connectorEgress.factory[0].ports[0].port=443' \
-  --set 'agentSandbox.connectorEgress.factory[0].ports[0].protocol=TCP'
+  --set 'agentSandbox.connectorEgress.dark-factory[0].cidr=<github-api-cidr>' \
+  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].port=443' \
+  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].protocol=TCP'
 
 export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
 curie cluster deploy --plugin-dir examples/dark-factory \
-  --agent factory --env prod --repo acme-corp/acme-bot \
+  --agent dark-factory --env prod --repo acme-corp/acme-bot \
   --secret GITHUB_PERSONAL_ACCESS_TOKEN
-curie cluster surfaces factory --add github=acme-corp/acme-bot
+curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 
 # Optional. Human approval of each pull request stays the default.
-curie cluster publication-policy factory --policy auto
+curie cluster publication-policy dark-factory --policy auto
 ```
 
 Label an issue in `acme-corp/acme-bot` with the configured factory label. The

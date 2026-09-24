@@ -390,7 +390,7 @@ def _config(tmp_path: Path, **extra: str) -> Any:
 
 
 def test_defaults_name_the_model_and_the_bundle() -> None:
-    assert fe.DEFAULT_MODEL == "z-ai/glm-5.3"
+    assert fe.DEFAULT_MODEL == "z-ai/glm-5.3-flash"
     assert fe.DEFAULT_BUNDLE == REPO_ROOT / "examples" / "dark-factory"
 
 
@@ -1167,7 +1167,7 @@ def test_evaluation_case_catalog_and_reference_model() -> None:
         "malicious-instructions",
     )
     assert fe.REFERENCE_MODEL_DEFAULT == "anthropic/claude-sonnet-4.5"
-    assert fe.DEFAULT_MODEL == "z-ai/glm-5.3"
+    assert fe.DEFAULT_MODEL == "z-ai/glm-5.3-flash"
 
 
 def test_evaluation_does_not_open_the_seed_issue() -> None:

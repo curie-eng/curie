@@ -2443,6 +2443,10 @@ class Kernel:
                     owned_run = self._work_item_runs.pop(owned_work_item_id, None)
                     if owned_run is not None:
                         await owned_run.close()
+                        if owned_run.finished:
+                            # The turn has ended and the request is settled, so
+                            # nothing on this thread needs the sandbox (#3075).
+                            await self._release_work_item_sandbox(owned_run.thread_key)
             _OWNED_WORK_ITEM.reset(owned_token)
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
@@ -2745,6 +2749,42 @@ class Kernel:
             return released
         finally:
             await self._lock.release(lock_key, token)
+
+    async def _release_work_item_sandbox(self, thread_key: str) -> None:
+        """Delete a settled WorkItem thread's claim, live or suspended (#3075).
+
+        Best-effort: a failure is logged and never changes the WorkItem outcome.
+        The orphan reaper skips any claim a route references, so without this a
+        suspended route kept its claim until someone deleted it by hand.
+        """
+
+        try:
+            token = await asyncio.wait_for(
+                self._lock.acquire(self._config.lock_key(thread_key)),
+                _RESET_LOCK_ACQUIRE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "work-item sandbox release could not lock thread %s; leaving the claim",
+                thread_key,
+                exc_info=True,
+            )
+            return
+        try:
+            released = await asyncio.wait_for(
+                asyncio.to_thread(self._substrate.release, thread_key),
+                _RESET_RELEASE_TIMEOUT_S,
+            )
+            if released and self._workspace is not None:
+                await asyncio.to_thread(self._workspace.release, thread_key)
+        except Exception:
+            logger.warning(
+                "work-item sandbox release failed for thread %s",
+                thread_key,
+                exc_info=True,
+            )
+        finally:
+            await self._lock.release(self._config.lock_key(thread_key), token)
 
     async def _terminate_work_item(
         self, qevent: QueuedTurn, request_id: uuid.UUID
@@ -3103,6 +3143,10 @@ class Kernel:
                     except WorkItemConflict as exc:
                         if exc.code != "publication_pending":
                             raise
+                        # The publication loop owns the terminus from here; the
+                        # execution itself is over, and publication works from
+                        # the stored patch, not the sandbox.
+                        run.finished = True
                 elif outcome == "escalated":
                     await run.finish(
                         outcome="failed",

@@ -105,7 +105,7 @@ OWNER_LABEL = "app.kubernetes.io/managed-by=curie-factory-e2e"
 RUN_ANNOTATION = "curie.dev/factory-e2e-run"
 LOCK_DIR = Path.home() / ".cache" / "curie-factory-e2e"
 FACTORY_AGENT = "factory-e2e"
-DEFAULT_MODEL = "z-ai/glm-5.3"
+DEFAULT_MODEL = "z-ai/glm-5.3-flash"
 REFERENCE_MODEL_DEFAULT = "anthropic/claude-sonnet-4.5"
 EVALUATION_CASE_IDS = (
     "positive",
