@@ -127,6 +127,11 @@ Each fact is its own row, so a busy topic never outgrows one stored value.
 This is Claude Code's index and topic files, arranged for a memory that grows
 faster.
 
+A fact is one statement by one person. When someone adds to a fact another
+person stated (an exception, a condition, a reason), that addition is saved
+as a new fact in the same topic with its own author, and the original fact is
+left as it was. Detail holds only what the fact's own author said.
+
 **E. The agent gets a `remember` / `read` / `forget` tool, bound to the
 current channel.**
 `remember` adds a fact to a declared topic, or updates one by id; the
@@ -165,8 +170,12 @@ security boundary. Approvals and policy gates stay the enforcement layer.
 
 **I. One id per fact. A correction replaces it. Anyone in a channel can
 correct any fact in it.**
-A correction overwrites the fact under the same id and updates its provenance
-to the person who corrected it. Saving the exact same text again is refused.
+A correction says a fact is wrong and replaces it: the new statement
+overwrites the fact under the same id, and its author becomes the person who
+corrected it, because the statement is now theirs. Adding to a fact is not a
+correction; it is a new fact (D). When the agent moves detail out of a
+statement to shorten the index (M), the author does not change, because no
+person said anything new. Saving the exact same text again is refused.
 No version history is kept; Claude Code keeps none either, and the old value
 survives only in the trace of the turn that changed it, while that trace is
 retained. Accountability for open correction comes from provenance, not from
@@ -207,11 +216,14 @@ state store's per-namespace limit, saves are refused and a person decides what
 to remove.
 
 **N. No compaction.**
-Nothing compresses or rewrites memory. A fact changes only when the agent
-saves, corrects or forgets it, when the agent moves its detail out of the
-statement (M), or when an operator or person edits it. Facts are removed only
-by a correction, a `forget`, or a person. Compaction is for a session's own
-context, not for memory.
+Compaction lets a model decide which facts to keep and which to drop. The
+model is capable but not perfect, so some of what it drops will be correct,
+and dropping it is needless: a fact that does not fit in the index can stay
+stored and be read when needed (M). So nothing compresses or rewrites memory.
+A fact changes only when the agent saves, corrects or forgets it, when the
+agent moves its detail out of the statement (M), or when an operator or
+person edits it. Facts are removed only by a correction, a `forget`, or a
+person. Compaction is for a session's own context, not for memory.
 
 **O. Deleted facts stay deleted.**
 Otherwise the agent re-saves the fact on the next turn, because the message
@@ -254,7 +266,10 @@ look the same.
   lost. Older facts are left out of the index instead, and stay readable.
 - **Compaction, on a schedule or when a tier fills**
   ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). No, see N.
-  A rewrite nobody asked for can lose a fact nobody remembers existed.
+  It drops correct facts that could have been kept and simply not loaded.
+- **Record both "stated by" and "last changed by" on one fact.** No. An
+  addition by a second person is its own fact (D), so a fact never has two
+  authors to track.
 - **Version history on every fact.** No, see I.
 - **Seeding from channel history.** No, see K.
 - **An operator instructions layer above memory**
@@ -318,7 +333,9 @@ look the same.
    the next boot leaves out the oldest facts per topic, says how many, and
    they remain readable.
 7. A correction replaces the fact under the same id and records the new
-   author; the next boot shows only the corrected text.
+   author; the next boot shows only the corrected text. An addition by a
+   different person becomes a new fact in the same topic, and the original
+   fact and its author are unchanged.
 8. A forgotten or deleted fact stays gone on the next turn, even though the
    message that produced it is still in the conversation.
 9. "How to work here" facts are injected under the channel-members header,
