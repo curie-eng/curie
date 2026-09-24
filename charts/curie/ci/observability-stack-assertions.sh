@@ -963,6 +963,23 @@ rendered_prom_args = [
 assert "--web.enable-remote-write-receiver" in rendered_prom_args, (
     "Prometheus must enable the remote-write receiver in the rendered server"
 )
+# CurieCoreWorkloadNotReady and CurieStateStoreNotReady select on these labels,
+# and kube-state-metrics exports none of them unless its container asks.
+_, _, kube_state_metrics_container = image_container(
+    prometheus_docs, "kube-state-metrics", "kube-state-metrics"
+)
+rendered_ksm_allowlists = [
+    argument
+    for argument in kube_state_metrics_container.get("args", [])
+    if argument.startswith("--metric-labels-allowlist=")
+]
+assert rendered_ksm_allowlists == [
+    "--metric-labels-allowlist="
+    "deployments=[app.kubernetes.io/component,helm.sh/chart],statefulsets=[helm.sh/chart]"
+], (
+    "kube-state-metrics must render the label allowlist the core and state store "
+    f"alerts select on, got {rendered_ksm_allowlists}"
+)
 
 REQUIRED_ALERTS = {
     "CurieTurnAcceptedStale",
