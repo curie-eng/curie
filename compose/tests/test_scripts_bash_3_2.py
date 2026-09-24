@@ -27,6 +27,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -843,3 +844,231 @@ case_live_approval_gate_denies
         assert result.returncode == 1, result.stderr
         assert "the gated turn never ended" in result.stderr, result.stderr
         assert _pid_is_gone(state / "turn.pid"), "the bound left the turn's child running"
+
+
+IDLE_ROUTE_KUBECTL = """#!/bin/sh
+case "$*" in
+    *--watch*)
+        echo "$$" > "$STUB_STATE/kubectl-watch.pid"
+        case "$*" in
+            *resourcequota*) echo 'ADDED|42|2|2|2' ;;
+            *) echo 'ADDED|42|uid-1' ;;
+        esac
+        exec sleep 30 ;;
+    *resourcequota*)
+        echo '{"metadata":{"resourceVersion":"41"},"status":{"used":{"pods":"2"},"hard":{"pods":"2"}},"spec":{"hard":{"pods":"2"}}}' ;;
+    *) echo '{"metadata":{"resourceVersion":"41","uid":"uid-1"}}' ;;
+esac
+"""
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize(
+    ("watch", "event"),
+    [("exact", "ADDED\t42\tuid-1"), ("quota", "ADDED\t42\t2\t2\t2")],
+)
+@pytest.mark.parametrize("ending", ["stopped", "bounded"])
+def test_idle_route_watch_leads_its_group_and_ends_on_a_stock_mac(
+    interpreter: str, watch: str, event: str, ending: str, tmp_path: Path
+) -> None:
+    """stop_pid signals the group `$!` names, and a watch ends at WAIT_SECONDS.
+
+    The session is what lets stop_pid reach the watch's kubectl, and the bound
+    is what ends a watch nobody stops. A stock Mac ships neither setsid nor
+    timeout, so both must come from somewhere else there.
+    """
+
+    source = IDLE_ROUTE_PATH.read_text()
+    functions = "".join(
+        _shell_function(source, name, IDLE_ROUTE_PATH)
+        for name in (
+            "kube",
+            "timestamp_utc",
+            "stop_pid",
+            "start_quota_watch",
+            "start_exact_resource_watch",
+        )
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    kubectl = tmp_path / "kubectl"
+    _write_executable(kubectl, IDLE_ROUTE_KUBECTL)
+    start = {
+        "exact": 'pid="$(start_exact_resource_watch sandbox acme-sandbox '
+        '"$W/watch" "$W/snapshot" "$W/stderr" "$W/raw")"',
+        "quota": 'start_quota_watch "$W/watch" "$W/snapshot" "$W/stderr" "$W/raw"\n'
+        'pid="$QUOTA_WATCH_PID"',
+    }[watch]
+    finish = {
+        "stopped": 'stop_pid "$pid"',
+        "bounded": "for _ in $(seq 1 80); do\n"
+        '    kill -0 "$pid" 2>/dev/null || break\n'
+        "    sleep 0.1\n"
+        "done\n"
+        'if kill -0 "$pid" 2>/dev/null; then\n'
+        '    echo "the watch outlived WAIT_SECONDS" >&2\n'
+        "    exit 1\n"
+        "fi",
+    }[ending]
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{_top_level_assignments(source, ["GNU_PROCESS"])}
+W="$1"
+REAL_KUBECTL="$2"
+KUBE_CONTEXT=k8
+NAMESPACE=acme-ns
+RESOURCE_QUOTA=acme-quota
+QUOTA_RESOURCE=pods
+QUOTA_FULL=2
+QUOTA_HARD=2
+QUOTA_WATCH_PID=""
+WAIT_SECONDS={1 if ending == "bounded" else 30}
+{functions}
+{start}
+for _ in $(seq 1 50); do
+    grep -q ADDED "$W/watch" && break
+    sleep 0.1
+done
+python3 -c 'import os, sys; print(sys.argv[1], os.getpgid(int(sys.argv[1])))' "$pid"
+{finish}
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path), str(kubectl)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(state),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    pid, group = result.stdout.split()
+    assert group == pid, "the watch does not lead the group stop_pid signals"
+    snapshot, *events = (tmp_path / "watch").read_text().splitlines()
+    assert snapshot.startswith("SNAPSHOT\t"), snapshot
+    assert [line.split("\t", 1)[1] for line in events] == [event]
+    assert (tmp_path / "stderr").read_text() == ""
+    deadline = time.monotonic() + 3
+    while not _pid_is_gone(state / "kubectl-watch.pid"):
+        assert time.monotonic() < deadline, "the watch's kubectl outlived it"
+        time.sleep(0.05)
+
+
+IDLE_ROUTE_CALLS = {
+    "run_message": (
+        'run_message acme-label hello "$WORKDIR/out.json"',
+        "--json cluster message hello --namespace acme-ns --release acme "
+        "--listen-host 127.0.0.1 --timeout-secs 240",
+        "acme-label cluster message failed",
+    ),
+    "reset_thread": (
+        'reset_thread curie:sandbox:route:acme-bot:1700000000.000100 "$WORKDIR/out.json"',
+        "--json cluster reset-thread acme-bot --thread-key acme-bot:1700000000.000100 "
+        "--namespace acme-ns --release acme --yes",
+        "public reset failed for curie:sandbox:route:acme-bot:1700000000.000100",
+    ),
+}
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize("outcome", ["succeeds", "fails"])
+@pytest.mark.parametrize("call", list(IDLE_ROUTE_CALLS))
+def test_idle_route_runs_each_bounded_command_on_a_stock_mac(
+    interpreter: str, outcome: str, call: str, tmp_path: Path
+) -> None:
+    invocation, argv, refusal = IDLE_ROUTE_CALLS[call]
+    source = IDLE_ROUTE_PATH.read_text()
+    functions = "".join(
+        _shell_function(source, name, IDLE_ROUTE_PATH)
+        for name in ("die", "run_message", "reset_thread")
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    curie = tmp_path / "curie"
+    _write_executable(
+        curie,
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$*" >> "$STUB_STATE/calls"\n'
+        'if [ "$STUB_OUTCOME" = fails ]; then echo "acme refusal" >&2; exit 3; fi\n'
+        "echo '{\"requested\":true}'\n",
+    )
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{_top_level_assignments(source, ["GNU_PROCESS"])}
+WORKDIR="$1"
+BIN="$2"
+NAMESPACE=acme-ns
+RELEASE=acme
+AGENT=acme-bot
+ROUTE_PREFIX="curie:sandbox:route:"
+MESSAGE_TIMEOUT_SECONDS=240
+CURIE_E2E_LISTEN_HOST=127.0.0.1
+{functions}
+{invocation}
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path), str(curie)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(tmp_path),
+            "STUB_OUTCOME": outcome,
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    calls = tmp_path / "calls"
+    assert (calls.read_text().splitlines() if calls.exists() else []) == [argv], (
+        result.stderr
+    )
+    if outcome == "succeeds":
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1, result.stderr
+        assert "acme refusal" in result.stderr, result.stderr
+        assert refusal in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_idle_route_preflight_accepts_a_host_without_gnu_userland(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """Only kubectl, helm and python3 are on PATH: no timeout, no setsid."""
+
+    source = IDLE_ROUTE_PATH.read_text()
+    block = _top_level_block(
+        source,
+        "require_command kubectl\n",
+        'REAL_KUBECTL="$(command -v kubectl)"',
+        IDLE_ROUTE_PATH,
+    )
+    functions = "".join(
+        _shell_function(source, name, IDLE_ROUTE_PATH)
+        for name in ("die", "require_command")
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("kubectl", "helm"):
+        _write_executable(bin_dir / tool, "#!/bin/sh\nexit 0\n")
+    python3 = shutil.which("python3")
+    shell = shutil.which(interpreter)
+    assert python3 and shell
+    (bin_dir / "python3").symlink_to(python3)
+    result = subprocess.run(
+        [shell, "-c", f"set -euo pipefail\n{functions}{block}echo preflight passed\n"],
+        env={"PATH": str(bin_dir)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "preflight passed\n"
