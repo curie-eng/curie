@@ -974,3 +974,135 @@ def test_a_pending_request_does_not_starve_a_green_one(admitted: Any) -> None:
     assert _terminal(9725) == ("completed", "completed")
     assert _notices(pending["id"]) == []
     assert len(_notices(green["id"])) == 1
+
+
+# --- Code review 1 regressions -------------------------------------------------------
+
+
+def test_a_fix_turn_finishing_after_its_publication_succeeded_stays_running(
+    admitted: Any,
+) -> None:
+    """The fix push landed before the turn ended; CI on it decides, not the worker."""
+
+    client, github, sink = admitted
+    number = 9720
+    sink.ci_scripts = {HEAD_A: [ci_failing()], HEAD_B: [ci_pending()]}
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the test",
+        paths=["src/widget.py"],
+        status="succeeded",
+    )
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+
+    assert finished.status_code == 409, finished.text
+    assert _terminal(number) == ("running", None)
+
+
+def _passes_on_one_reconciler(count: int) -> None:
+    """Several passes on ONE reconciler, so its CI poll schedule persists."""
+
+    async def go() -> None:
+        import redis.asyncio as aioredis
+
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+        reconciler = WorkItemReconciler(maker, valkey, get_settings())
+        try:
+            for _ in range(count):
+                await reconciler.run_once()
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_a_later_green_request_is_observed_while_older_ones_wait_on_ci(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    assert get_settings().work_item_batch_limit >= 6
+    waiting = []
+    for offset in range(5):
+        head = f"{offset + 1:02x}" * 20
+        sink.ci_scripts[head] = [ci_pending()]
+        waiting.append(_published(client, github, sink, 9730 + offset, head_sha=head))
+    green_head = "9e" * 20
+    sink.ci_scripts[green_head] = [ci_green()]
+    later = _published(client, github, sink, 9739, head_sha=green_head)
+
+    # Three passes inside one 20 s poll interval: the five pending requests are
+    # not due after their first observation, so they must not use the slots.
+    _passes_on_one_reconciler(3)
+
+    assert green_head in sink.ci_observations
+    assert _terminal(9739) == ("completed", "completed")
+    assert _body(sink, later["id"]).startswith(f"Completed: {later['pr_url']}")
+    assert all(_terminal(9730 + i) == ("running", None) for i in range(5))
+
+
+def test_a_claim_lost_during_a_slow_dispatch_enqueues_the_round_once(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The round claim expires mid-dispatch and a second reconciler runs meanwhile."""
+
+    import redis.asyncio as aioredis
+
+    from curie_api import factory_ci
+
+    client, github, sink = admitted
+    number = 9740
+    sink.ci_script = [ci_failing()]
+    published = _published(client, github, sink, number)
+    key = _ci_key(published["id"], 2)
+    original_dispatch = WorkItemReconciler._dispatch_ci_turn
+    original_gate = factory_ci.gate
+    results: list[str] = []
+    stalled: list[bool] = []
+
+    async def gate(*args: Any, **kwargs: Any) -> Any:
+        result = await original_gate(*args, **kwargs)
+        results.append(result)
+        return result
+
+    async def slow(self: WorkItemReconciler, request: Any, round_: int, text_: str) -> bool:
+        if not stalled:
+            stalled.append(True)
+            # The claim's TTL runs out while this dispatch is still in flight.
+            other = aioredis.Redis(
+                host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None
+            )
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                await other.delete(key)
+                second = WorkItemReconciler(
+                    async_sessionmaker(engine, expire_on_commit=False), other, get_settings()
+                )
+                await second.run_once()
+            finally:
+                await other.aclose()
+                await engine.dispose()
+        return await original_dispatch(self, request, round_, text_)
+
+    monkeypatch.setattr(factory_ci, "gate", gate)
+    monkeypatch.setattr(WorkItemReconciler, "_dispatch_ci_turn", slow)
+
+    _reconcile()
+
+    assert stalled == [True]
+    assert [t["event_id"] for t in _ci_turns(published["id"])] == [
+        f"work-item-{published['id']}-ci-2"
+    ]
+    # The first reconciler's gate finishes last; it lost its claim, so it must
+    # not report the continuation as its own success.
+    assert results and results[-1] != "continued", results
+    assert _terminal(number) == ("running", None)

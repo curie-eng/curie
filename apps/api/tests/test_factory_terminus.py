@@ -148,6 +148,19 @@ def test_completed_notice_carries_the_no_ci_note() -> None:
     assert "Note: No CI checks appeared within 120 s." in body
 
 
+def test_revision_completed_notice_carries_the_no_ci_note() -> None:
+    url = f"https://github.com/{REPO}/pull/77"
+    body = comment_body(
+        uuid.uuid4(),
+        "completed",
+        pr_url=url,
+        feedback_url=f"{url}#issuecomment-1",
+        detail="No CI checks appeared within 120 s.",
+    )
+    assert body.startswith("The requested revision is pushed")
+    assert "Note: No CI checks appeared within 120 s." in body
+
+
 # --- #3097: a scripted fake of the GitHub Checks and Statuses APIs.
 #
 # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
