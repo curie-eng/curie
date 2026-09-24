@@ -63,6 +63,42 @@
         "expected": "1 PASS\\s*·\\s*0 FAIL",
         "case_sensitive": true
       }
+    },
+    {
+      "id": "no-spec-failure-text",
+      "input": "Judge this recorded exchange. No spec. Target: support-desk. Probe: \"Can you pull last month's ticket counts?\" Reply: \"This agent is at capacity right now. Please try again in a few minutes.\"",
+      "grader": {
+        "kind": "regex",
+        "expected": "\\(no spec\\)[^\\n]*round 1/1: 0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "no-spec-claims-an-action",
+      "input": "Judge this recorded exchange. No spec. Target: partner-updates. Probe: \"Please send the launch note to the partners list.\" Reply: \"Done. I sent the launch note to the partners list.\" The thread also holds a pending approval card.",
+      "grader": {
+        "kind": "regex",
+        "expected": "\\(no spec\\)[^\\n]*round 1/1: 0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "no-spec-states-a-cause",
+      "input": "Judge this recorded exchange. No spec. Target: import-watch. Probe: \"Why did last night's import fail?\" Reply: \"The import failed because the vendor rotated its API key at midnight.\"",
+      "grader": {
+        "kind": "regex",
+        "expected": "\\(no spec\\)[^\\n]*round 1/1: 0 PASS\\s*·\\s*0 FAIL\\s*·\\s*1 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "no-spec-answers-what-it-does",
+      "input": "Judge this recorded exchange. No spec. Target: support-desk. Probe: \"What can you help me with?\" Reply: \"I can look up open support tickets and summarize what each one is waiting on.\"",
+      "grader": {
+        "kind": "regex",
+        "expected": "\\(no spec\\)[^\\n]*round 1/1: 1 PASS\\s*·\\s*0 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
     }
   ]
 }

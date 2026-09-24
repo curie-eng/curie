@@ -137,8 +137,10 @@ def test_the_skill_names_every_allowed_tool_and_files_nothing():
 def test_every_case_judges_a_recorded_exchange():
     for case in _cases():
         assert case["input"].startswith("Judge this recorded exchange"), case["id"]
-        for part in ("Target bundle:", "Probe:", "Reply:"):
+        for part in ("Probe:", "Reply:"):
             assert part in case["input"], (case["id"], part)
+        # A case either says what the target is for, or says it has no spec.
+        assert "Target bundle:" in case["input"] or "No spec." in case["input"], case["id"]
         assert case["grader"]["kind"] == "regex", case["id"]
 
 
@@ -148,11 +150,65 @@ def test_the_suite_demands_both_verdicts():
     assert any(e.endswith("0 FAIL") for e in expected)
 
 
+def _demanded(expected: str, verdict: str) -> int | None:
+    found = re.search(rf"(\d) {verdict}", expected)
+    return int(found.group(1)) if found else None
+
+
 def test_every_fail_case_also_demands_zero_passes():
     for case in _cases():
         expected = case["grader"]["expected"]
-        if "FAIL" in expected and not expected.endswith("0 FAIL"):
-            assert expected.startswith("0 PASS"), case["id"]
+        if (_demanded(expected, "FAIL") or 0) > 0:
+            assert _demanded(expected, "PASS") == 0, case["id"]
+
+
+def _section(title: str) -> str:
+    found = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", _skill(), re.M | re.S)
+    assert found, f"SKILL.md must keep a '## {title}' section"
+    return " ".join(found.group(1).split())  # prose wraps anywhere; compare words
+
+
+def test_no_repository_is_read_unless_the_operator_lists_one():
+    # Git is one source of a spec, not the only one: a tester that reads other
+    # teams' bundles by default holds their repository credentials.
+    where = _section("Where you work")
+    assert "- Repositories: none" in where
+
+
+def test_the_request_names_the_channel_to_probe():
+    where = _section("Where you work")
+    assert "- Default channel: none" in where
+    assert "- Channels:" not in where
+    assert "the channel the request names" in _section("Choosing the channel")
+
+
+def test_the_spec_comes_from_the_request_first_then_a_listed_repository():
+    source = _section("Where the spec comes from")
+    request, repository, nothing = (
+        source.find("/attachments"),
+        source.find("listed repository"),
+        source.find("(no spec)"),
+    )
+    assert -1 < request < repository < nothing, source
+
+
+def test_a_round_without_a_spec_grades_only_what_needs_none():
+    rule = _section("Without a spec")
+    for phrase in ("(no spec)", "UNCLEAR", "not that the answer is right"):
+        assert phrase in rule, phrase
+    assert "Never round UNCLEAR to PASS" in _section("Verdicts")
+
+
+def test_the_suite_judges_rounds_without_a_spec_in_every_verdict():
+    no_spec = [c for c in _cases() if "No spec." in c["input"]]
+    assert all(r"\(no spec\)" in c["grader"]["expected"] for c in no_spec)
+    demanded = {
+        verdict
+        for c in no_spec
+        for verdict in ("PASS", "FAIL", "UNCLEAR")
+        if (_demanded(c["grader"]["expected"], verdict) or 0) > 0
+    }
+    assert demanded == {"PASS", "FAIL", "UNCLEAR"}
 
 
 def _platform_texts() -> list[str]:
