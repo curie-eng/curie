@@ -1105,3 +1105,87 @@ def test_a_claim_lost_during_a_slow_dispatch_enqueues_the_round_once(
     # not report the continuation as its own success.
     assert results and results[-1] != "continued", results
     assert _terminal(number) == ("running", None)
+
+
+def test_a_reconciler_cancelled_after_the_enqueue_marker_still_enqueues_the_round(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation between the round marker and the stream write loses no turn."""
+
+    client, github, sink = admitted
+    number = 9741
+    sink.ci_script = [ci_failing()]
+    published = _published(client, github, sink, number)
+    original = WorkItemReconciler._dispatch_ci_turn
+    cancelled: list[int] = []
+
+    async def cancelled_before_xadd(
+        self: WorkItemReconciler, request: Any, round_: int, text_: str
+    ) -> bool:
+        if not cancelled:
+            cancelled.append(round_)
+            raise asyncio.CancelledError
+        return await original(self, request, round_, text_)
+
+    monkeypatch.setattr(WorkItemReconciler, "_dispatch_ci_turn", cancelled_before_xadd)
+
+    with contextlib.suppress(asyncio.CancelledError):
+        _reconcile()
+
+    assert cancelled == [2]
+    assert _ci_turns(published["id"]) == []
+    # The cancelled reconciler never released its claim; let its TTL run out.
+    valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+    try:
+        valkey.delete(_ci_key(published["id"], 2))
+    finally:
+        valkey.close()
+
+    _reconcile()
+    _reconcile()
+
+    assert [t["event_id"] for t in _ci_turns(published["id"])] == [
+        f"work-item-{published['id']}-ci-2"
+    ]
+    assert _terminal(number) == ("running", None)
+
+
+def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each CI read takes a full poll interval, so older requests are due every pass."""
+
+    import curie_api.workitems as workitems
+    from curie_api import factory_ci, workitem_outcomes
+
+    client, github, sink = admitted
+    assert get_settings().work_item_batch_limit >= 5
+    for offset in range(4):
+        head = f"{offset + 0x11:02x}" * 20
+        sink.ci_scripts[head] = [ci_pending()]
+        _published(client, github, sink, 9750 + offset, head_sha=head)
+    green_head = "9f" * 20
+    sink.ci_scripts[green_head] = [ci_green()]
+    later = _published(client, github, sink, 9759, head_sha=green_head)
+
+    elapsed = [0.0]
+    original_now = workitems._database_now
+    original_observe = workitem_outcomes.observe_ci_detail
+
+    async def now(session: AsyncSession) -> Any:
+        return await original_now(session) + timedelta(seconds=elapsed[0])
+
+    async def slow_observe(*args: Any, **kwargs: Any) -> Any:
+        detail = await original_observe(*args, **kwargs)
+        elapsed[0] += factory_ci.CI_POLL_SECONDS
+        return detail
+
+    monkeypatch.setattr(workitems, "_database_now", now)
+    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", slow_observe)
+
+    _passes_on_one_reconciler(3)
+
+    assert green_head in sink.ci_observations
+    assert _terminal(9759) == ("completed", "completed")
+    assert _body(sink, later["id"]).startswith(f"Completed: {later['pr_url']}")
+    assert all(_terminal(9750 + i) == ("running", None) for i in range(4))
