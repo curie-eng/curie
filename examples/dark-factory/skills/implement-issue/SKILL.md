@@ -8,8 +8,9 @@ description: Turn one labelled GitHub issue into one reviewed pull request, or s
 ## Phases
 
 Every run walks nine phases, named in each step heading below: `read_issue`,
-`pin_criteria`, `explore_repo`, `plan`, `plan_review`, `failing_test`,
-`implement` (which also runs the checks), `review_diff` and `publish`. Two
+`pin_criteria`, `plan` (which starts by exploring the repository),
+`plan_review`, `failing_test`, `implement` (which also runs the checks),
+`review_diff`, `publish` and `wait_ci`. Two
 pairs loop: `plan` and `plan_review`, then `implement` and `review_diff`. Each
 loop runs at most 3 rounds.
 
@@ -97,7 +98,7 @@ behavior, which file, which value), or the criteria contradict each other or
 the repository. End with a stated reason that lists the exact questions a
 maintainer must answer. Do not publish a guess.
 
-## 3. Look before you plan (phase `explore_repo`)
+## 3. Look, then write a plan (phase `plan`, with `round`)
 
 Read the repository's own guidance first: `AGENTS.md`, `CONTRIBUTING.md`,
 `README.md`, and the project configuration (`pyproject.toml`, `package.json`,
@@ -105,15 +106,13 @@ Read the repository's own guidance first: `AGENTS.md`, `CONTRIBUTING.md`,
 documents; a CI workflow file may show them, and you may read it, but not
 edit it. Find the code the change touches and the existing tests next to it.
 
-## 4. Write a plan (phase `plan`, with `round`)
-
 Before editing, write a short plan in your reply: the files you will change,
 the test you will add or change, and which acceptance criterion each edit
 serves. Keep the scope to the criteria. No drive-by refactors, renames,
 reformatting or dependency upgrades. On round 2 or 3, revise the plan to
 answer every finding from the previous plan review, and say how.
 
-## 5. Plan review (phase `plan_review`, same `round` as the plan)
+## 4. Plan review (phase `plan_review`, same `round` as the plan)
 
 Call the `Agent` tool (also called Task) with exactly these arguments:
 
@@ -128,8 +127,8 @@ starts with the line `REVIEWER: plan-reviewer`.
 
 Read the `VERDICT:` line that follows:
 
-- `VERDICT: APPROVE`: go to step 6.
-- `VERDICT: CHANGES`: if this was round 1 or 2, go back to step 4 with the
+- `VERDICT: APPROVE`: go to step 5.
+- `VERDICT: CHANGES`: if this was round 1 or 2, go back to step 3 with the
   next round. If this was round 3, stop (see "Loop cap" below).
 - Anything else, including an error, an empty reply, a timeout, a refused
   model, a missing `REVIEWER:` line, or a reply without a `VERDICT:` line:
@@ -138,7 +137,7 @@ Read the `VERDICT:` line that follows:
   review the plan yourself in its place, and never claim a review that did
   not return a verdict.
 
-## 6. Failing test first (phase `failing_test`)
+## 5. Failing test first (phase `failing_test`)
 
 Where a test is feasible, write the test for the new behavior first and run
 it. Confirm it fails, and fails for the reason the issue describes, before
@@ -146,7 +145,7 @@ you change the code. When a test is not feasible (documentation, pure
 configuration, or a project with no test framework), say so and say how you
 will verify the change instead.
 
-## 7. Implement and check (phase `implement`, with `round`)
+## 6. Implement and check (phase `implement`, with `round`)
 
 Make the smallest change that satisfies the criteria. Follow the style of the
 surrounding code. Rerun the focused test until it passes. On round 2 or 3,
@@ -165,9 +164,9 @@ available, do not fake it with a stub, a mock presented as real, or a
 hard-coded result. If the criterion cannot be met without it, stop with a
 stated reason that names the missing dependency.
 
-## 8. Diff review (phase `review_diff`, same `round` as the implement pass)
+## 7. Diff review (phase `review_diff`, same `round` as the implement pass)
 
-Call the `Agent` tool exactly as in step 5, with `subagent_type`
+Call the `Agent` tool exactly as in step 4, with `subagent_type`
 `"dark-factory:diff-reviewer"` (required; never omit it), `description`
 `"Diff review round <n>"`, and a `prompt` with the issue link and text, your
 numbered acceptance criteria, and each check you ran with its exit status.
@@ -178,8 +177,8 @@ A real review reply starts with `REVIEWER: diff-reviewer`.
 
 Read the `VERDICT:` line that follows:
 
-- `VERDICT: APPROVE`: go to step 9.
-- `VERDICT: CHANGES`: if this was round 1 or 2, go back to step 7 with the
+- `VERDICT: APPROVE`: go to step 8.
+- `VERDICT: CHANGES`: if this was round 1 or 2, go back to step 6 with the
   next round. If this was round 3, stop (see "Loop cap" below).
 - Anything else: the review did not happen. Stop as in "Loop cap" below,
   with `diff review failed:` and the error text. Never publish
@@ -187,7 +186,7 @@ Read the `VERDICT:` line that follows:
 
 ## Loop cap
 
-Each loop runs at most 3 rounds. A diff review rejection returns to step 7
+Each loop runs at most 3 rounds. A diff review rejection returns to step 6
 (implement), never to the plan. When a reviewer still answers
 `VERDICT: CHANGES` on round 3, or a review fails, do not publish:
 
@@ -197,7 +196,7 @@ Each loop runs at most 3 rounds. A diff review rejection returns to step 7
 2. End your final reply with `Could not complete:`, one sentence naming the
    loop that did not converge (or the review that failed), and the same list.
 
-## 9. Finish (phase `publish`)
+## 8. Finish (phase `publish`)
 
 **Publish** only when every criterion is met and verified and the diff
 reviewer's latest verdict is `VERDICT: APPROVE`. Call
@@ -218,3 +217,9 @@ from outside the sandbox.
 with `Could not complete:` and then gives the reason in one sentence, what you
 tried, and what a maintainer must provide or decide. Do not call
 `mcp__curie__publish_changes`.
+
+## 9. Wait for CI (phase `wait_ci`)
+
+This phase follows a publication. The platform opens the pull request after
+the approval, and its checks run there. This bundle does not act on them yet:
+after `publish`, end your turn as step 8 says.

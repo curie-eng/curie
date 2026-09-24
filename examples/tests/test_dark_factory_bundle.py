@@ -190,13 +190,13 @@ def test_skill_states_the_discipline(pattern: str) -> None:
 PHASES = [
     "read_issue",
     "pin_criteria",
-    "explore_repo",
     "plan",
     "plan_review",
     "failing_test",
     "implement",
     "review_diff",
     "publish",
+    "wait_ci",
 ]
 
 

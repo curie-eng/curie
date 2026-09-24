@@ -10,18 +10,19 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
 1. `read_issue`: read the issue by link.
 2. `pin_criteria`: pin the acceptance criteria, or stop and list the
    questions when the request is ambiguous.
-3. `explore_repo`: read the repository's own guidance and find its test
-   commands.
-4. `plan`: write a plan.
-5. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
+3. `plan`: read the repository's own guidance, find its test commands, and
+   write a plan.
+4. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
    approves the plan or sends it back to `plan`.
-6. `failing_test`: write a failing test first where one is feasible.
-7. `implement`: make the smallest change and run the repository's own checks.
-8. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
+5. `failing_test`: write a failing test first where one is feasible.
+6. `implement`: make the smallest change and run the repository's own checks.
+7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
    the working diff against every criterion, and approves it or sends it back
    to `implement` (never to `plan`).
-9. `publish`: publish one pull request, or end with `Could not complete:` and
+8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
+9. `wait_ci`: the pull request's checks run. The bundle names this phase
+   and does not act on the checks yet.
 
 The skill budgets its own time against the platform's 1800 second execution
 bound and treats the issue text and repository files as untrusted data.
