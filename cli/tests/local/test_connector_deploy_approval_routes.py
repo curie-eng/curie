@@ -10,6 +10,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -332,19 +333,33 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
     try:
         rendered_result = _run(compose + ["config", "--format", "json"], env=env)
         rendered = json.loads(_require(rendered_result, "rendering private Compose"))
-        for service in ("postgres", "valkey", "rustfs", "curie-api"):
+        # The host-network worker dials each of these at 127.0.0.1:<host port>.
+        # From inside Docker Desktop's VM a Docker-allocated host port refuses
+        # that connection while a host port the caller names answers, so each
+        # dialed port must be published at exactly the port the worker is given.
+        # Any other port stays Docker-allocated, and every port is loopback only.
+        dialed = {
+            "postgres": (5432, env["CURIE_LOCAL_POSTGRES_PORT"]),
+            "valkey": (6379, env["VALKEY_PORT"]),
+            "rustfs": (9000, str(urllib.parse.urlsplit(env["S3_ENDPOINT_URL"]).port)),
+            "curie-api": (8000, str(urllib.parse.urlsplit(env["CURIE_API_URL"]).port)),
+        }
+        for service, (target, host_port) in dialed.items():
             ports = rendered["services"][service].get("ports", [])
-            fixed = [
-                port
-                for port in ports
-                if port.get("published") not in {None, "", 0, "0"}
-            ]
+            published = {port["target"]: port.get("published") for port in ports}
             if (
-                not ports
-                or fixed
+                str(published.get(target)) != host_port
+                or any(
+                    value not in {None, "", 0, "0"}
+                    for key, value in published.items()
+                    if key != target
+                )
                 or any(port.get("host_ip") != "127.0.0.1" for port in ports)
             ):
-                raise RuntimeError(f"{service} does not bind only random loopback ports: {ports}")
+                raise RuntimeError(
+                    f"{service} does not publish {target} at the worker's host port "
+                    f"{host_port} with every other port Docker-allocated on loopback: {ports}"
+                )
         if rendered["networks"]["curie_runner"]["name"] != f"{project}_runner":
             raise RuntimeError("private runner network name was not applied")
         for tag in tags:
