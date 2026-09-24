@@ -23,8 +23,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LADDER_PATH = REPO_ROOT / "cli" / "scripts" / "e2e-ladder.sh"
+AGENT_SKILLS_PATH = REPO_ROOT / "scripts" / "check-agent-skills.sh"
 # Scripts a contributor runs on their own host, whose bash may be 3.2.
-HOST_SCRIPTS = [LADDER_PATH]
+HOST_SCRIPTS = [LADDER_PATH, AGENT_SKILLS_PATH]
 
 
 def _bash3() -> str | None:
@@ -47,6 +48,12 @@ needs_bash3 = pytest.mark.skipif(
     BASH3 is None,
     reason="no bash 3.x here: macOS /bin/bash, or set CURIE_TEST_BASH3",
 )
+# A script run under 3.x must behave exactly as it does under the bash on PATH,
+# which is 5.x on Linux CI, so an executing test runs under both.
+EVERY_BASH = [
+    pytest.param(BASH3, marks=needs_bash3, id="bash3"),
+    pytest.param("bash", id="path-bash"),
+]
 
 
 def _shell_function(source: str, name: str, path: Path = LADDER_PATH) -> str:
@@ -183,3 +190,121 @@ seed_approval_resume_turn local acme-bot
     # The stub refuses the resolve, so the seed must stop at its own refusal.
     assert result.returncode == 1
     assert "deterministic approval resolution command failed" in result.stderr
+
+
+def _bash_array(source: str, name: str) -> list[str]:
+    match = re.search(rf"^{name}=\((.*?)^\)", source, re.MULTILINE | re.DOTALL)
+    assert match, f"{AGENT_SKILLS_PATH}: missing {name}"
+    return re.findall(r'^\s*"([^"]+)"', match.group(1), re.MULTILINE)
+
+
+def _agent_skills_tree(tmp_path: Path) -> tuple[Path, list[str], list[str]]:
+    """A copy of the gate over a tree holding exactly the skills it lists.
+
+    The reference validator is replaced by a uvx that answers only the pinned
+    invocations the gate makes, and rejects the INVALID_SKILLS entries the way
+    skills-ref does.
+    """
+
+    source = AGENT_SKILLS_PATH.read_text()
+    valid = _bash_array(source, "VALID_SKILLS")
+    invalid = _bash_array(source, "INVALID_SKILLS")
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / AGENT_SKILLS_PATH.name).write_text(source)
+    for skill in valid + invalid:
+        (root / skill).mkdir(parents=True)
+        (root / skill / "SKILL.md").write_text("---\nname: acme\n---\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uvx = bin_dir / "uvx"
+    uvx.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $3 $5" in\n'
+        '    "--from --exclude-newer agentskills") ;;\n'
+        '    *) echo "unexpected uvx invocation: $*" >&2; exit 97 ;;\n'
+        "esac\n"
+        'case "$6" in\n'
+        '    --version) echo "agentskills, version 0.1.1" ;;\n'
+        "    validate)\n"
+        '        case ":$STUB_REJECT:" in\n'
+        '            *":$7:"*) echo "Validation failed for $7"; exit 1 ;;\n'
+        "        esac ;;\n"
+        '    *) echo "unexpected uvx invocation: $*" >&2; exit 97 ;;\n'
+        "esac\n"
+    )
+    uvx.chmod(0o700)
+    return root, valid, invalid
+
+
+def _run_agent_skills(
+    interpreter: str, root: Path, invalid: list[str], tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [interpreter, str(root / "scripts" / AGENT_SKILLS_PATH.name)],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+            "STUB_REJECT": ":".join(invalid),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_agent_skills_gate_accepts_a_tree_its_lists_cover_exactly(
+    interpreter: str, tmp_path: Path
+) -> None:
+    root, valid, invalid = _agent_skills_tree(tmp_path)
+    result = _run_agent_skills(interpreter, root, invalid, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (
+        f"allowlist covers exactly the {len(valid) + len(invalid)} discovered skill(s)"
+        in result.stdout
+    ), result.stdout
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_agent_skills_gate_names_a_skill_neither_list_covers(
+    interpreter: str, tmp_path: Path
+) -> None:
+    root, _, invalid = _agent_skills_tree(tmp_path)
+    unlisted = "examples/acme-bot/skills/acme-bot"
+    (root / unlisted).mkdir(parents=True)
+    (root / unlisted / "SKILL.md").write_text("---\nname: acme-bot\n---\n")
+    result = _run_agent_skills(interpreter, root, invalid, tmp_path)
+    assert result.returncode == 1, result.stderr
+    assert f"1 skill(s) escaped the gate: {unlisted}" in result.stderr, result.stderr
+    assert "no longer exist" not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_agent_skills_gate_names_a_listed_skill_that_is_gone(
+    interpreter: str, tmp_path: Path
+) -> None:
+    root, valid, invalid = _agent_skills_tree(tmp_path)
+    (root / valid[0] / "SKILL.md").unlink()
+    result = _run_agent_skills(interpreter, root, invalid, tmp_path)
+    assert result.returncode == 1, result.stderr
+    assert f"1 listed skill(s) no longer exist: {valid[0]}" in result.stderr, result.stderr
+    assert "escaped the gate" not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_agent_skills_gate_names_every_listed_skill_when_none_is_found(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """The discovered set is empty, which 3.2 refuses to expand under set -u."""
+
+    root, valid, invalid = _agent_skills_tree(tmp_path)
+    for skill in valid + invalid:
+        (root / skill / "SKILL.md").unlink()
+    result = _run_agent_skills(interpreter, root, invalid, tmp_path)
+    assert result.returncode == 1, result.stderr
+    listed = valid + invalid
+    assert (
+        f"{len(listed)} listed skill(s) no longer exist: {' '.join(listed)}"
+        in result.stderr
+    ), result.stderr
