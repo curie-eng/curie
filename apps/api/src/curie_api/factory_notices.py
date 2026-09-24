@@ -86,7 +86,25 @@ _CAUSE_TEXT = {
         "the request to open the pull request expired before anyone approved it."
     ),
     "publication_failed": "the pull request could not be opened.",
+    "ci_failed": (
+        "the pull request's checks still failed after 3 rounds of fixes. The pull "
+        "request stays open for a person."
+    ),
+    "ci_timeout": (
+        "the pull request's checks did not finish before the CI wait ran out. The "
+        "pull request stays open."
+    ),
+    "ci_unverified": (
+        "the pull request's checks could not be read, so CI is unverified. The pull "
+        "request stays open; check it yourself."
+    ),
+    "ci_fix_unpublished": (
+        "a CI fix round ended without pushing a fix. The pull request stays open."
+    ),
 }
+
+# The CI gate's causes (#3097) carry their own labelled lines, not a provider message.
+_CI_DETAIL_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
 
 
 def cause_text(cause: str) -> str:
@@ -110,8 +128,13 @@ def comment_body(
     if cause == "completed":
         if feedback_url is not None:
             text = "The requested revision is pushed to this pull request.\n"
+            if detail is not None and detail.strip():
+                text += f"Note: {detail.strip()}\n"
         elif isinstance(pr_url, str) and pr_url.strip():
             text = f"Completed: {pr_url.strip()}\n"
+            if detail is not None and detail.strip():
+                # The CI gate's no-CI note (#3097).
+                text += f"Note: {detail.strip()}\n"
         else:
             raise ValueError("a completed issue notice requires its pull request URL")
     elif cause == "issue_cancelled":
@@ -124,7 +147,8 @@ def comment_body(
     else:
         text = f"Could not complete: {cause_text(cause)}\n"
         if detail is not None and detail.strip():
-            text += f"Provider message: {detail.strip()}\n"
+            label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
+            text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"

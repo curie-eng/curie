@@ -15,7 +15,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from . import workitems
 from .config import get_settings
-from .models import Agent, AgentChannel, ExecutionRequest, WorkItem
+from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .workitems import (
     ExecutionRequestSnapshot,
     WorkItemConflict,
@@ -875,6 +875,15 @@ def _not_approval_hold() -> ColumnElement[bool]:
     )
 
 
+def _not_awaiting_publication() -> ColumnElement[bool]:
+    # A publication in flight or succeeded hands the request's terminus to the
+    # publication loop and the CI gate, not to runtime owner loss.
+    return ~exists().where(
+        Publication.execution_request_id == ExecutionRequest.id,
+        Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
+    )
+
+
 async def list_runtime_owners(
     session: AsyncSession, *, limit: int, after: uuid.UUID | None = None
 ) -> list[RuntimeOwnerRow]:
@@ -894,6 +903,7 @@ async def list_runtime_owners(
                 ExecutionRequest.status == "running",
                 ExecutionRequest.runtime_owner.is_not(None),
                 _not_approval_hold(),
+                _not_awaiting_publication(),
                 *(() if after is None else (ExecutionRequest.id > after,)),
             )
             .order_by(ExecutionRequest.id)
@@ -940,11 +950,20 @@ async def declare_owner_lost(
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at == request.execution_deadline
     )
+    awaiting_publication = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request.id,
+            Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
+        )
+        .limit(1)
+    )
     if (
         request.status != "running"
         or request.runtime_owner != owner
         or request.runtime_epoch != runtime_epoch
         or held
+        or awaiting_publication is not None
     ):
         return await _refuse(
             session,
@@ -961,6 +980,7 @@ async def declare_owner_lost(
             ExecutionRequest.runtime_owner == owner,
             ExecutionRequest.runtime_epoch == runtime_epoch,
             _not_approval_hold(),
+            _not_awaiting_publication(),
         )
         .values(
             status="cancellation_requested",

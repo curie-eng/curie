@@ -21,8 +21,12 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    to `implement` (never to `plan`).
 8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
-9. `wait_ci`: the pull request's checks run. The bundle names this phase
-   and does not act on the checks yet.
+9. `wait_ci`: the pull request's checks run and the platform waits on them.
+   A failure sends a new message in the same run with the failing checks, and
+   the run loops back to `implement` to fix them, then republishes to the
+   same pull request. A green result, or no checks at all, ends the run
+   successfully; an unreadable checks result or one that never settles ends
+   it unverified or timed out instead.
 
 The skill budgets its own time against the platform's 10800 second (3 hour)
 execution bound and treats the issue text and repository files as untrusted data.
@@ -31,8 +35,8 @@ does not enforce it, and a different bundle can choose differently.
 
 ## Review loops
 
-Each loop (`plan` and `plan_review`, `implement` and `review_diff`) runs at
-most 3 rounds. When a reviewer still asks for changes on round 3, or a review
+Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
+`wait_ci` back to `implement`) runs at most 3 rounds. When a reviewer still asks for changes on round 3, or a review
 call fails, the run publishes nothing. It posts the reviewer's unresolved
 findings and open questions on the issue and ends with `Could not complete:`.
 

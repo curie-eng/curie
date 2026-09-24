@@ -820,9 +820,17 @@ the review subscriptions when both gates are on. Give the App **Issues: Read and
 so Curie can re-read the issue and post one final comment, and **Metadata: Read** is already
 implied by repository installation discovery.
 
-Give the App **Checks: Read** so the work item detail can report CI for the
-published head. Without it, CI reports `unavailable` / `github_forbidden` and
-nothing else changes.
+Give the App **Checks: Read** and **Commit statuses: Read**. After a factory
+run publishes, it waits on the pull request's checks inside its 1800 s
+deadline; the request completes only when CI is green. A failure resumes the
+same run to fix the code and push to the same pull request, for at most 3
+rounds, then the issue gets `Could not complete:` with the failing checks and
+what each round tried. No checks within 120 s of the push completes with a
+note. Checks still pending when the CI wait (1200 s from the push, or the
+execution deadline if sooner) runs out end as `ci_timeout`. Unreadable CI,
+such as a missing permission, ends as `ci_unverified`, which is never success;
+the pull request stays open either way. The work item detail route still
+reports CI as `unavailable` / `github_forbidden` without the permission.
 
 ### The default factory agent
 

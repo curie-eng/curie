@@ -4,6 +4,11 @@ Date: 2026-09-22
 
 Status: Accepted
 
+**Amended by [ADR-0172](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decisions 6, 7 and 8, how decision 2 reads Git, and which probes decision 4's
+round may send.
+
 This ADR builds on [ADR-0022](0022-eval-completeness-tier-parity-and-trace-promotion.md),
 [ADR-0158](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md)
 and the identity model of ADR-0168 (Draft, #2919). It supersedes nothing.
