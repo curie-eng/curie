@@ -10,15 +10,18 @@ before a matching tool call and can block it.
 Only ``PreToolUse`` is consumed here (the deterministic before-the-tool gate the
 issue scopes); other events are validated by plugin-format but not yet wired.
 Each ``type: "command"`` hook runs the command through ``/bin/sh -c`` with the
-hook input JSON on stdin, following the Claude Code convention: exit 0 allows the
-tool call, exit 2 denies it (stderr is the reason), any other non-zero is a
-non-blocking hook error that lets the call proceed.
+hook input JSON on stdin, cwd set to the mounted bundle and ``CLAUDE_PLUGIN_ROOT``
+set to it, following the Claude Code convention: exit 2 denies the tool call
+(stderr is the reason); exit 0 allows it unless stdout is a JSON decision object
+that denies; any other non-zero is a non-blocking hook error that lets the call
+proceed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -79,11 +82,56 @@ def _load_manifest_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcherCo
         return None
 
 
-async def _run_command_hook(command: str, hook_input: Any) -> dict[str, Any]:
-    """Run one command hook and map its exit to a PreToolUse decision.
+def _decision(decision: str, reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason or "blocked by bundle PreToolUse hook",
+        }
+    }
 
-    exit 0 -> allow (empty output, proceed); exit ``_DENY_EXIT_CODE`` -> deny with
-    the command's stderr as the reason; any other exit -> non-blocking error.
+
+def _stdout_decision(out: bytes) -> dict[str, Any]:
+    """Read an exit 0 hook's stdout decision object (#2946).
+
+    Claude Code parses exit 0 stdout as JSON: ``hookSpecificOutput``
+    ``permissionDecision`` ``"deny"`` or ``"ask"`` carries through with
+    ``permissionDecisionReason``, the older top level ``decision: "block"`` with
+    ``reason`` denies, and ``continue: false`` stops with ``stopReason`` (spelled
+    ``continue_`` for the SDK). ``"allow"`` and stdout that is not a JSON object
+    are not a decision, so the call proceeds.
+    """
+
+    try:
+        data = json.loads(out.decode("utf-8", "replace"))
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, Any] = {}
+    specific = data.get("hookSpecificOutput")
+    if isinstance(specific, dict) and specific.get("permissionDecision") in ("deny", "ask"):
+        result = _decision(
+            specific["permissionDecision"], str(specific.get("permissionDecisionReason") or "")
+        )
+    elif data.get("decision") == "block":
+        result = _decision("deny", str(data.get("reason") or ""))
+    if data.get("continue") is False:
+        result["continue_"] = False
+        if isinstance(data.get("stopReason"), str):
+            result["stopReason"] = data["stopReason"]
+    return result
+
+
+async def _run_command_hook(command: str, hook_input: Any, plugin_root: Path) -> dict[str, Any]:
+    """Run one command hook and map its result to a PreToolUse decision.
+
+    The command runs in ``plugin_root`` with ``CLAUDE_PLUGIN_ROOT`` set to it, so
+    ``${CLAUDE_PLUGIN_ROOT}/hooks/x.sh`` and ``./hooks/x.sh`` both name the
+    bundle's script. exit ``_DENY_EXIT_CODE`` -> deny with stderr as the reason;
+    exit 0 -> the stdout decision object, if any, else allow; any other exit ->
+    non-blocking error.
     """
 
     try:
@@ -100,6 +148,8 @@ async def _run_command_hook(command: str, hook_input: Any) -> dict[str, Any]:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=plugin_root,
+            env={**os.environ, "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
         )
         out, err = await asyncio.wait_for(
             proc.communicate(input=payload.encode("utf-8")), timeout=_HOOK_TIMEOUT_S
@@ -126,36 +176,30 @@ async def _run_command_hook(command: str, hook_input: Any) -> dict[str, Any]:
         }
 
     if proc.returncode == _DENY_EXIT_CODE:
-        reason = err.decode("utf-8", "replace").strip() or "blocked by bundle PreToolUse hook"
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
+        return _decision("deny", err.decode("utf-8", "replace").strip())
+    if proc.returncode == 0:
+        return _stdout_decision(out)
+    context = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": f"bundle hook exited {proc.returncode}: {context}",
         }
-    if proc.returncode not in (0, _DENY_EXIT_CODE):
-        context = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": f"bundle hook exited {proc.returncode}: {context}",
-            }
-        }
-    return {}
+    }
 
 
-def _make_callback(commands: list[str]) -> Any:
+def _make_callback(commands: list[str], plugin_root: Path) -> Any:
     """Build one SDK hook callback that runs each command hook in order.
 
-    The first command to deny wins (short-circuits); otherwise the tool proceeds.
+    The first command to deny, ask, or stop wins (short-circuits); otherwise the
+    tool proceeds.
     """
 
     async def _callback(hook_input: Any, _tool_use_id: str | None, _ctx: Any) -> dict[str, Any]:
         for command in commands:
-            result = await _run_command_hook(command, hook_input)
+            result = await _run_command_hook(command, hook_input, plugin_root)
             decision = result.get("hookSpecificOutput", {}).get("permissionDecision")
-            if decision == "deny":
+            if decision in ("deny", "ask") or result.get("continue_") is False:
                 return result
         return {}
 
@@ -172,7 +216,7 @@ def load_bundle_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcher]] | 
     """
 
     parsed = _load_manifest_hooks(plugin_dir)
-    if not parsed:
+    if not parsed or not plugin_dir:
         return None
 
     pre_tool_use = parsed.get("PreToolUse")
@@ -188,7 +232,9 @@ def load_bundle_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcher]] | 
         ]
         if not commands:
             continue
-        matchers.append(HookMatcher(matcher=entry.matcher, hooks=[_make_callback(commands)]))
+        matchers.append(
+            HookMatcher(matcher=entry.matcher, hooks=[_make_callback(commands, Path(plugin_dir))])
+        )
 
     if not matchers:
         return None
