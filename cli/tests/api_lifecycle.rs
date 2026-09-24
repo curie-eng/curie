@@ -551,6 +551,7 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
             agent,
             model,
             thinking,
+            execution_deadline_seconds: _,
             changed,
         } => {
             assert_eq!(agent, "deal-desk");

@@ -11838,14 +11838,18 @@ pub fn overrides_summary(
     agent: &str,
     model: &Option<String>,
     thinking: &Option<String>,
+    execution_deadline_seconds: &Option<u32>,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
+    let deadline = execution_deadline_seconds
+        .map(|s| format!("{s} s"))
+        .unwrap_or_else(|| "platform default".to_string());
     // The verb carries its own leading space, so an inspect closes straight
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}",
+        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}",
         show(model),
         show(thinking)
     )
@@ -11866,6 +11870,7 @@ pub enum OverridesOutput {
         agent: String,
         model: Option<String>,
         thinking: Option<String>,
+        execution_deadline_seconds: Option<u32>,
         changed: bool,
     },
 }
@@ -11878,11 +11883,13 @@ impl crate::ui::CliOutput for OverridesOutput {
                 agent,
                 model,
                 thinking,
+                execution_deadline_seconds,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
                 "model": model,
                 "thinking": thinking,
+                "execution_deadline_seconds": execution_deadline_seconds,
                 "changed": changed,
             }),
         }
@@ -11895,9 +11902,16 @@ impl crate::ui::CliOutput for OverridesOutput {
                 agent,
                 model,
                 thinking,
+                execution_deadline_seconds,
                 changed,
             } => {
-                ui.payload(&overrides_summary(agent, model, thinking, *changed));
+                ui.payload(&overrides_summary(
+                    agent,
+                    model,
+                    thinking,
+                    execution_deadline_seconds,
+                    *changed,
+                ));
             }
         }
     }
@@ -11956,6 +11970,7 @@ pub async fn overrides(
             agent: agent.name,
             model: agent.model,
             thinking: agent.thinking,
+            execution_deadline_seconds: agent.execution_deadline_seconds,
             changed: false,
         });
     };
@@ -11975,6 +11990,7 @@ pub async fn overrides(
         agent: saved.name,
         model: saved.model,
         thinking: saved.thinking,
+        execution_deadline_seconds: saved.execution_deadline_seconds,
         changed: true,
     })
 }
@@ -12241,10 +12257,10 @@ mod overrides_tests {
     // verb was interpolated as an empty string before the colon.
     #[test]
     fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
-        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, false);
+        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, false);
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default"
+            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -12252,8 +12268,8 @@ mod overrides_tests {
     #[test]
     fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
         assert_eq!(
-            super::overrides_summary("a", &None, &Some("adaptive".into()), true),
-            "overrides for a now: model platform default, thinking adaptive"
+            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), true),
+            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s"
         );
     }
 
