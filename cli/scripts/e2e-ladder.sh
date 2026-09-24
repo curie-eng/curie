@@ -4576,11 +4576,15 @@ rung_local() {
         done < <(local_compose_cli_args local up)
         up_args+=(--build)
         # The source build runs on the Docker daemon's own builder, never an
-        # ambient one. buildx names that builder after its context, so it is
-        # `default` only in the default context: Docker Desktop's context is
-        # `desktop-linux`, and there buildx refuses `default`.
-        local daemon_builder
-        daemon_builder="$(docker context show)"
+        # ambient one, and `local up --build` builds twice: `docker build` for
+        # the source images, then compose for the worker overlay. In Docker
+        # Desktop's `desktop-linux` context the first refuses the `default`
+        # builder and the second refuses `desktop-linux`. Naming the current
+        # context's daemon in DOCKER_HOST puts both in the `default` context on
+        # that same daemon, where `default` is its own builder. On Linux the
+        # endpoint is the default socket, so nothing changes there.
+        local daemon_endpoint
+        daemon_endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
@@ -4594,7 +4598,7 @@ rung_local() {
         # it. Claiming a stack that then fails to boot is harmless, because
         # `local down` is safe against a partial or already-stopped stack.
         LOCAL_STACK_OWNED=1
-        BUILDX_BUILDER="$daemon_builder" "$BIN" "${up_args[@]}"
+        DOCKER_HOST="$daemon_endpoint" BUILDX_BUILDER=default "$BIN" "${up_args[@]}"
         pin_local_source_images
     fi
 
