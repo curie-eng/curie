@@ -1276,6 +1276,28 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
     )
 
 
+def test_request_has_started_ignores_a_capacity_wait() -> None:
+    assert fe.request_has_started({"status": "waiting"}) is False
+    assert fe.request_has_started({"status": "running"}) is True
+    started = {"status": "waiting", "started_at": "2026-09-24T00:00:00Z"}
+    assert fe.request_has_started(started) is True
+
+
+def test_runner_escalation_without_a_pull_request_is_a_refusal() -> None:
+    ending = _comment_ending(
+        ending_cause="runner_escalated",
+        terminus_comment_bodies=["Could not complete: runner_escalated\nCause: runner_escalated"],
+        agent_final_reply=None,
+    )
+    assert (
+        fe.judge_outcome(
+            ending, "comment", expect_causes={"no_pull_request", "runner_escalated"}
+        )
+        == []
+    )
+    assert fe.judge_outcome(ending, "comment")
+
+
 def test_classify_observed_model_uses_the_pod_and_does_not_invent() -> None:
     assert fe.classify_observed_model("z-ai/glm-5.3", "z-ai/glm-5.3") == "z-ai/glm-5.3"
     assert fe.classify_observed_model("z-ai/glm-5.3", "other-model") == "other-model"
