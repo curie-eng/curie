@@ -29,7 +29,11 @@ from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
-from curie_worker.workitem_dispatch import WorkItemAcquireGrant, WorkItemStartGrant
+from curie_worker.workitem_dispatch import (
+    WorkItemAcquireGrant,
+    WorkItemConflict,
+    WorkItemStartGrant,
+)
 from redis.exceptions import ResponseError
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -386,5 +390,117 @@ def test_credit_exhausted_escalation_finishes_with_its_cause_and_message(
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "model_credit_exhausted"
             assert finish["detail"] == message
+
+    asyncio.run(exercise())
+
+
+class _PublicationPendingWorkItems(_WorkItems):
+    """The publication loop, not this finish, owns the WorkItem terminus."""
+
+    async def finish(self, _request_id: uuid.UUID, **_: object) -> None:
+        self.calls.append("finish")
+        raise WorkItemConflict("publication_pending")
+
+
+@pytest.mark.parametrize("publication_pending", [False, True])
+def test_finished_work_item_deletes_its_sandbox_claim(
+    make_harness, publication_pending: bool
+) -> None:
+    """A WorkItem run that settles terminally leaves no claim or route behind (#3075)."""
+
+    async def exercise() -> None:
+        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+            work_items = _PublicationPendingWorkItems() if publication_pending else _WorkItems()
+            h.kernel._work_items = work_items
+            h.runner.default_script = [
+                TextDelta(text="Working. "),
+                Final(text="Working. Done.", status=SessionStatus.DONE),
+            ]
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert "finish" in work_items.calls
+            assert h.fake_k8s.deleted_claims
+            assert h.fake_k8s.claims == {}
+
+    asyncio.run(exercise())
+
+
+def test_approval_hold_keeps_its_sandbox_claim(make_harness) -> None:
+    """Awaiting approval is not a terminus: the resume turn still needs the route."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [
+                Final(
+                    text="Requesting approval.",
+                    status=SessionStatus.AWAITING_APPROVAL,
+                    approval_summary="Run the requested publication",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="Bash",
+                )
+            ]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert len(h.fake_k8s.claims) == 1
+            assert h.fake_k8s.deleted_claims == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("path", ["owner_stop", "reconciler_terminate"])
+def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(
+    make_harness, path: str
+) -> None:
+    """A run held for approval idles into a SUSPENDED route, then is cancelled.
+    Both termination paths delete the suspended claim and drop the route, so
+    the orphan reaper's routed-claim skip cannot strand it (#3075)."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            h.runner.default_script = [
+                Final(
+                    text="Requesting approval.",
+                    status=SessionStatus.AWAITING_APPROVAL,
+                    approval_summary="Run the requested publication",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="Bash",
+                )
+            ]
+            request_id = uuid.uuid4()
+            execute = _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            await h.kernel.process_event(execute)
+            [(thread_key, run)] = list(h.kernel._held_work_items.items())
+            await asyncio.to_thread(h.substrate.suspend, thread_key, history_ref="hist-1")
+            assert len(h.fake_k8s.claims) == 1
+
+            if path == "owner_stop":
+                await h.kernel._stop_owned_work_item(thread_key, run)
+            else:
+
+                async def get_request(_request_id: uuid.UUID) -> object:
+                    return SimpleNamespace(
+                        runtime_claim_name=run.claim_name,
+                        runtime_sandbox_name=run.sandbox_name,
+                    )
+
+                work_items.get_request = get_request  # type: ignore[attr-defined]
+                await h.kernel._terminate_work_item(execute, request_id)
+
+            assert "record_termination" in work_items.calls
+            assert h.fake_k8s.claims == {}
+            assert h.substrate._affinity.get(thread_key) is None
 
     asyncio.run(exercise())
