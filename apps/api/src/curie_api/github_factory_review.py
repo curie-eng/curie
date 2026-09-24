@@ -201,7 +201,7 @@ async def _admit(
         request_id=uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id),
     )
     result = await workitem_dispatch.admit(session, facts)
-    return _admission_result(result)
+    return _admission_result(result, facts.request_id)
 
 
 async def handle_factory_review_delivery(

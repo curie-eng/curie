@@ -66,6 +66,8 @@ class FinishBody(BaseModel):
     runtime_epoch: int = Field(ge=1)
     outcome: Literal["completed", "failed"]
     cause: str = Field(min_length=1)
+    # The provider's own failure message (#3073). The API redacts and clips it.
+    detail: str | None = Field(default=None, max_length=4000)
 
 
 class TerminationClaimBody(BaseModel):
@@ -263,6 +265,7 @@ async def finish_work_item_request(
         runtime_epoch=body.runtime_epoch,
         outcome=body.outcome,
         cause=body.cause,
+        detail=body.detail,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

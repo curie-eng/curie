@@ -452,6 +452,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "server-error",
     "ledger-error",
     "model-credential-rejected",
+    "model-credit-exhausted",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
@@ -467,6 +468,27 @@ def map_error_classification(raw: str | None) -> str:
     if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
         return raw
     return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+# The factory terminus cause for a classified escalation (#3073). Each cause has
+# its own operator sentence on the issue; anything unnamed stays the generic
+# ``runner_escalated``.
+_ESCALATION_CAUSES = {
+    "model-credit-exhausted": "model_credit_exhausted",
+    "model-credential-rejected": "model_credential_rejected",
+    "rate-limit": "model_rate_limited",
+    "server-error": "model_error",
+    "budget-exceeded": "budget_exceeded",
+    "runner-timeout": "runner_timeout",
+    "runner-timeout-unconfirmed": "runner_timeout",
+    "workspace-error": "workspace_error",
+}
+
+
+def _escalation_cause(failure: TurnOutcome | None) -> str:
+    if failure is None or failure.classification is None:
+        return "runner_escalated"
+    return _ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
 
 
 def _display_error_classification(raw: str | None) -> str:
@@ -939,6 +961,12 @@ _HOOK_RUN_CARRY: ContextVar[_HookRunCarry | None] = ContextVar(
     "curie_worker_hook_run_carry", default=None
 )
 
+# The WorkItem request this delivery acquired or adopted. Per delivery, never
+# kernel-global: concurrent executions each start their own request (#3069).
+_OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
+    "curie_worker_owned_work_item", default=None
+)
+
 
 def _hook_success_outcome() -> HookRunOutcome | None:
     carry = _HOOK_RUN_CARRY.get()
@@ -1227,7 +1255,6 @@ class Kernel:
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
         self._held_work_items: dict[str, WorkItemRun] = {}
-        self._active_work_item_request_id: uuid.UUID | None = None
         # Approval resume ids that were mapped to a factory execution.
         # The live run can be removed before a later delivery failure reaches
         # ``notify_turn_not_started``, so the exact event identity survives to
@@ -1664,7 +1691,6 @@ class Kernel:
         held.finished = False
         held.event_id = event_id
         self._work_item_runs[held.request_id] = held
-        self._active_work_item_request_id = held.request_id
         self._factory_work_item_events.add(event_id)
         return held.request_id
 
@@ -1712,6 +1738,7 @@ class Kernel:
                 self._release_order_entry(thread_key, entry)
 
         owned_work_item_id: uuid.UUID | None = None
+        owned_token = _OWNED_WORK_ITEM.set(None)
         try:
             if await self._markers.is_terminal(event_id):
                 # ``is_terminal``, not ``is_done``: a DONE outbox record proves
@@ -1825,7 +1852,6 @@ class Kernel:
                         exc.code,
                     )
                     return
-                self._active_work_item_request_id = parsed_work_item.request_id
                 self._work_item_runs[parsed_work_item.request_id] = WorkItemRun(
                     client=self._work_items,
                     request_id=parsed_work_item.request_id,
@@ -1846,6 +1872,7 @@ class Kernel:
                     self._factory_work_item_events.add(event_id)
                     await self._markers.mark_done(event_id)
                     return
+            _OWNED_WORK_ITEM.set(owned_work_item_id)
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
@@ -2334,6 +2361,7 @@ class Kernel:
                         telemetry_outcome="side_effect_halted",
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        failure=outcome,
                     )
                     return
 
@@ -2385,6 +2413,7 @@ class Kernel:
                         ),
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        failure=outcome,
                     )
                     return
 
@@ -2414,8 +2443,11 @@ class Kernel:
                     owned_run = self._work_item_runs.pop(owned_work_item_id, None)
                     if owned_run is not None:
                         await owned_run.close()
-                if getattr(self, "_active_work_item_request_id", None) == owned_work_item_id:
-                    self._active_work_item_request_id = None
+                        if owned_run.finished:
+                            # The turn has ended and the request is settled, so
+                            # nothing on this thread needs the sandbox (#3075).
+                            await self._release_work_item_sandbox(owned_run.thread_key)
+            _OWNED_WORK_ITEM.reset(owned_token)
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
             # path (success, escalate, drop, or error). Best-effort and
@@ -2718,6 +2750,42 @@ class Kernel:
         finally:
             await self._lock.release(lock_key, token)
 
+    async def _release_work_item_sandbox(self, thread_key: str) -> None:
+        """Delete a settled WorkItem thread's claim, live or suspended (#3075).
+
+        Best-effort: a failure is logged and never changes the WorkItem outcome.
+        The orphan reaper skips any claim a route references, so without this a
+        suspended route kept its claim until someone deleted it by hand.
+        """
+
+        try:
+            token = await asyncio.wait_for(
+                self._lock.acquire(self._config.lock_key(thread_key)),
+                _RESET_LOCK_ACQUIRE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "work-item sandbox release could not lock thread %s; leaving the claim",
+                thread_key,
+                exc_info=True,
+            )
+            return
+        try:
+            released = await asyncio.wait_for(
+                asyncio.to_thread(self._substrate.release, thread_key),
+                _RESET_RELEASE_TIMEOUT_S,
+            )
+            if released and self._workspace is not None:
+                await asyncio.to_thread(self._workspace.release, thread_key)
+        except Exception:
+            logger.warning(
+                "work-item sandbox release failed for thread %s",
+                thread_key,
+                exc_info=True,
+            )
+        finally:
+            await self._lock.release(self._config.lock_key(thread_key), token)
+
     async def _terminate_work_item(
         self, qevent: QueuedTurn, request_id: uuid.UUID
     ) -> None:
@@ -2996,8 +3064,12 @@ class Kernel:
         telemetry_outcome: str,
         lease: DeliveryLease | None = None,
         hook_outcome: HookRunOutcome | None = None,
+        failure: TurnOutcome | None = None,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
+
+        ``failure`` is the classified turn behind an escalation. A factory run
+        finishes with the cause and provider message it carries (#3073).
 
         For a valid cron run, close its Postgres row before these Valkey steps.
 
@@ -3065,14 +3137,24 @@ class Kernel:
                         run.held = True
                 elif outcome == "delivered":
                     try:
-                        await run.finish(outcome="failed", cause="no_pull_request")
+                        await run.finish(
+                            outcome="failed", cause="no_pull_request", detail=None
+                        )
                     except WorkItemConflict as exc:
                         if exc.code != "publication_pending":
                             raise
+                        # The publication loop owns the terminus from here; the
+                        # execution itself is over, and publication works from
+                        # the stored patch, not the sandbox.
+                        run.finished = True
                 elif outcome == "escalated":
-                    await run.finish(outcome="failed", cause="runner_escalated")
+                    await run.finish(
+                        outcome="failed",
+                        cause=_escalation_cause(failure),
+                        detail=failure.error_message if failure is not None else None,
+                    )
                 else:
-                    await run.finish(outcome="failed", cause="runner_failed")
+                    await run.finish(outcome="failed", cause="runner_failed", detail=None)
             except WorkItemConflict as exc:
                 logger.warning(
                     "work-item finish refused for %s: %s; writing no marker",
@@ -4727,19 +4809,18 @@ class Kernel:
         # Register before start_turn so a kill during the POST can find this
         # thread. Canned and steered returns above never register. A failed
         # start unregisters so a turn that never opened cannot leak an entry.
-        run = None
-        for candidate in getattr(self, "_work_item_runs", {}).values():
-            if (
-                candidate.thread_key == thread_key
-                and candidate.started
-                and not candidate.finished
-            ):
-                run = candidate
-                break
+        runs = getattr(self, "_work_item_runs", {})
+        owned_id = _OWNED_WORK_ITEM.get()
+        run = runs.get(owned_id) if owned_id is not None else None
         if run is None:
-            active_id = getattr(self, "_active_work_item_request_id", None)
-            runs = getattr(self, "_work_item_runs", {})
-            run = runs.get(active_id) if active_id is not None else None
+            for candidate in runs.values():
+                if (
+                    candidate.thread_key == thread_key
+                    and candidate.started
+                    and not candidate.finished
+                ):
+                    run = candidate
+                    break
         if run is not None and run.finished:
             raise WorkItemStartRefused("work item authority is finished")
         if run is not None and not run.started:

@@ -16,6 +16,7 @@ translation serve both the live HTTP turn and the conformance producer.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,6 +39,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from curie_telemetry.redact import redact_text
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
@@ -65,6 +67,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "server-error",
     "ledger-error",
     "model-credential-rejected",
+    "model-credit-exhausted",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
@@ -77,6 +80,43 @@ def map_error_classification(raw: str | None) -> str:
     if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
         return raw
     return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+# A provider refusing a request for lack of credits (#3073). The SDK names an
+# Anthropic billing refusal ``billing_error``; an OpenAI-compatible provider
+# such as OpenRouter answers HTTP 402, which the SDK reports only as
+# ``unknown`` with the provider's message as the assistant text. Terminal and
+# not retryable: more attempts cannot add credits.
+CREDIT_EXHAUSTED_CLASSIFICATION = "model-credit-exhausted"
+_BILLING_SDK_CODE = "billing_error"
+_CREDIT_EXHAUSTED_TEXT = re.compile(
+    r"\b402\b|payment required|insufficient (?:credits?|balance|funds)"
+    r"|(?:credit|spend|usage) limit|(?:more|out of|no) credits",
+    re.IGNORECASE,
+)
+# Longest provider message carried on the error event.
+_PROVIDER_TEXT_MAX = 600
+
+
+def _provider_error_text(message: AssistantMessage) -> str:
+    """The provider's own message off an errored assistant message, redacted.
+
+    Redacted before it is clipped so a truncated key still matches.
+    """
+
+    text = " ".join(
+        block.text.strip()
+        for block in message.content
+        if isinstance(block, TextBlock) and block.text.strip()
+    )
+    text = redact_text(text)
+    if len(text) > _PROVIDER_TEXT_MAX:
+        text = text[: _PROVIDER_TEXT_MAX - 3].rstrip() + "..."
+    return text
+
+
+def _is_credit_exhausted(error: str, provider_text: str) -> bool:
+    return error == _BILLING_SDK_CODE or bool(_CREDIT_EXHAUSTED_TEXT.search(provider_text))
 
 
 @dataclass
@@ -210,9 +250,16 @@ def _translate_assistant(
 
     error = getattr(message, "error", None)
     if error:
-        mapped = map_error_classification(error)
+        provider_text = _provider_error_text(message)
+        if _is_credit_exhausted(error, provider_text):
+            mapped = CREDIT_EXHAUSTED_CLASSIFICATION
+        else:
+            mapped = map_error_classification(error)
         state.error_classification = mapped
-        events.append(ErrorEvent(message=f"model error: {error}", classification=mapped))
+        detail = f"model error: {error}"
+        if provider_text:
+            detail = f"{detail}: {provider_text}"
+        events.append(ErrorEvent(message=detail, classification=mapped))
 
     for block in message.content:
         if isinstance(block, TextBlock):

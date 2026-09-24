@@ -183,6 +183,8 @@ class PublicationStore(Protocol):
         self, publication_id: uuid.UUID, *, error: str
     ) -> None | Awaitable[None]: ...
 
+    def release(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
+
     def mark_lineage_terminal(
         self,
         lineage_id: uuid.UUID,
@@ -899,14 +901,23 @@ class PublicationReconciler:
         observation: PublicationJobObservation,
         names: PublicationResourceNames,
     ) -> bool:
-        if observation.phase in {"pending", "running"}:
-            return False
         pr_url = _validated_pr_url(
             work, observation.pr_url or _marker_url(observation.logs)
         )
         pr_number = observation.pr_number or _marker_number(observation.logs)
         commit_sha = observation.commit_sha or _marker_commit(observation.logs)
         pr_state = observation.pr_state or _marker_state(observation.logs)
+        if observation.phase in {"pending", "running"} and (
+            pr_state is not None
+            or pr_url is None
+            or pr_number is None
+            or commit_sha is None
+        ):
+            # The commit marker is the script's final line, so a complete
+            # success triple already proves the pull request exists. Settle it
+            # now instead of waiting on pod exit and Job status (#3074). Any
+            # other in-flight shape waits for the terminal phase.
+            return False
         if pr_state is not None:
             if pr_url is None or pr_number is None or commit_sha is None:
                 raise PublicationReconcileError(
@@ -1023,6 +1034,19 @@ class PublicationReconciler:
                 await self._bounded_setup_failure(work, exc)
                 return
             if observation.phase in {"pending", "running"}:
+                try:
+                    if await self._finish_observation(
+                        work, observation, probe_resources.names
+                    ):
+                        return
+                except PublicationIdentityUnavailable as identity_exc:
+                    await self._identity_unavailable(work, identity_exc)
+                    return
+                except Exception as exc:
+                    if await _resolve(self._store.is_terminal(work.publication_id)):
+                        raise
+                    await self._bounded_setup_failure(work, exc)
+                    return
                 if not allow_launch:
                     await _resolve(
                         self._store.persist_result(
@@ -1032,6 +1056,8 @@ class PublicationReconciler:
                             error="the factory run already ended",
                         )
                     )
+                    return
+                await self._release_in_flight(work)
                 return
             marker_url = observation.pr_url or _marker_url(observation.logs)
             marker_number = observation.pr_number or _marker_number(observation.logs)
@@ -1300,12 +1326,13 @@ class PublicationReconciler:
                 observation = await _cluster_call(
                     self._cluster.observe, resources.names.job
                 )
-                if observation.exists and observation.phase in {"pending", "running"}:
-                    return
-                if observation.exists and await self._finish_observation(
-                    work, observation, resources.names
-                ):
-                    return
+                in_flight = False
+                if observation.exists:
+                    if await self._finish_observation(
+                        work, observation, resources.names
+                    ):
+                        return
+                    in_flight = observation.phase in {"pending", "running"}
             except PublicationIdentityUnavailable as identity_exc:
                 await self._identity_unavailable(work, identity_exc)
                 return
@@ -1319,6 +1346,9 @@ class PublicationReconciler:
                     ),
                 )
                 return
+            if in_flight:
+                await self._release_in_flight(work)
+                return
             await self._bounded_setup_failure(work, apply_exc)
             return
 
@@ -1326,7 +1356,9 @@ class PublicationReconciler:
             observation = await _cluster_call(
                 self._cluster.observe, resources.names.job
             )
-            await self._finish_observation(work, observation, resources.names)
+            finished = await self._finish_observation(
+                work, observation, resources.names
+            )
         except PublicationIdentityUnavailable as identity_exc:
             await self._identity_unavailable(work, identity_exc)
             return
@@ -1335,6 +1367,15 @@ class PublicationReconciler:
                 raise
             await self._bounded_setup_failure(work, exc)
             return
+        if not finished:
+            await self._release_in_flight(work)
+
+    async def _release_in_flight(self, work: PublicationWork) -> None:
+        # The Job is still in flight. Release the lease uncharged so the next
+        # pass observes it promptly instead of waiting out the lease. A
+        # re-claim adopts the deterministic Job and never re-redeems, because
+        # redeem runs only when no Job exists.
+        await _resolve(self._store.release(work.publication_id))
 
 
 class PublicationReconcileLoop:
@@ -1346,12 +1387,16 @@ class PublicationReconcileLoop:
         store: Any,
         reconciler: PublicationReconciler,
         interval_seconds: float = 2.0,
+        batch_limit: int = 16,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("publication reconciliation interval must be positive")
+        if batch_limit <= 0:
+            raise ValueError("publication reconciliation batch limit must be positive")
         self._store = store
         self._reconciler = reconciler
         self._interval = interval_seconds
+        self._batch_limit = batch_limit
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         while not shutdown.is_set():
@@ -1372,16 +1417,25 @@ class PublicationReconcileLoop:
                 # error escaped. Publication mutation remains terminal and is
                 # never repeated because a reply transport is unavailable.
                 logger.exception("publication result delivery failed")
-            try:
-                work = await self._store.claim_next()
-            except Exception as exc:
-                logger.exception(
-                    "publication claim_next failed cause=%s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                raise
-            if work is not None:
+            # Drain claimable work each pass so concurrent publications do not
+            # serialize one per interval, bounded so outboxes still run. An
+            # in-flight Job releases its lease, so the claim excludes what this
+            # pass already reconciled instead of returning the oldest one again
+            # and starving the rest behind it.
+            seen: set[uuid.UUID] = set()
+            for _ in range(self._batch_limit):
+                try:
+                    work = await self._store.claim_next(exclude=seen)
+                except Exception as exc:
+                    logger.exception(
+                        "publication claim_next failed cause=%s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise
+                if work is None:
+                    break
+                seen.add(work.publication_id)
                 try:
                     if not work.owner_running:
                         # Observe a pull request the job already opened.

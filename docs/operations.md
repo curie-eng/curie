@@ -827,8 +827,9 @@ nothing else changes.
 ### The default factory agent
 
 Curie ships its factory agent as the bundle in
-[`examples/dark-factory`](../examples/dark-factory/README.md). Deploy it to the
-agent bound to the repository. It is one agent with one skill: it reads the
+[`examples/dark-factory`](../examples/dark-factory/README.md). Deploy it as the
+agent `dark-factory` bound to the repository, on the default factory model
+`z-ai/glm-5.3-flash` (`agentSandbox.runner.model`). It is one agent with one skill: it reads the
 issue by link, pins the acceptance criteria, plans, writes a failing test where
 one is feasible, implements, runs the repository's own checks, reviews its diff
 against every criterion, and ends in one pull request or a stated reason. Any
@@ -864,6 +865,7 @@ until chart-owned values land):
 | `CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS` | `30` | Reconciler publish lease |
 | `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `300` | Worker acquire lease |
 | `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS` | `45` | Runtime heartbeat expiry; interval is ttl / 3 |
+| `CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS` | `120` | A cancellation with no worker teardown receipt settles as cancelled after this |
 | `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
 | `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Capacity defer backoff cap |
 | `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
@@ -881,11 +883,17 @@ dead-letter graveyard.
 
 A labelled factory run posts exactly one final comment on the originating
 issue. When publication succeeds, that comment names the exact pull request
-URL. When the run cannot complete, the comment contains `Could not complete:`
-followed by the platform cause
+URL. When the run cannot complete, the comment starts with `Could not complete:`
+and a plain sentence for the cause. When the model provider refused the run,
+a `Provider message:` line follows with the provider's own error text, redacted
+of keys and tokens. A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
-`publication_denied`, `publication_expired`, or `publication_failed`). The
+`publication_denied`, `publication_expired`, `publication_failed`, or a
+classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
+`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`, or
+`workspace_error`). A model provider that answers HTTP 402 or reports exhausted
+credits ends the run as `model_credit_exhausted` without retrying. The
 work item reconciler posts the comment after the terminal row and any
 publication lineage commit. A refused post is recorded on the notice and does
 not change the execution row. Waiting for approval is not an ending: the
@@ -962,13 +970,30 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to 1800 s; unset, the model is fake |
-| `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3`) |
+| `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
 
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
 preflight and then one scenario driver: `issue-to-pr`, `revision`,
-`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` has no
-driver yet and is refused before anything is installed.
+`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` runs six
+labelled tickets (a correct change, a seeded failing test, an ambiguous
+request, an unavailable dependency, an execution-deadline budget, and a
+malicious instruction) on the configured model and again on
+`CURIE_FACTORY_REFERENCE_MODEL` (default `anthropic/claude-sonnet-4.5`, same
+credential), then one authorized same-PR revision and label removal of one
+waiting request and one running request. After the waiting cancellation it
+raises the sandbox pod quota to the chart default with `helm upgrade
+--reuse-values`, so the per-agent sandbox warm pool survives. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` so the model session
+does not die while titling itself. A request that
+has not started, a delivery the tunnel rejected, or a run that escalates in
+the first few seconds is cancelled and opened again. A refusal still has to
+end as `no_pull_request`, and the budget case still has to end as
+`execution_deadline`. The case is given up well before the hour-long
+never-started cap. Hidden checks run
+against each resulting pull request and are not part of the ticket. The JSON evidence
+includes the candidate commit, each verdict, configured and observed model,
+usage or an explicit unverified record, and elapsed time. The command exits
+non-zero when any of those fields is missing or any verdict is not passed.
 
 `run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]... [--expect-reason <regex>]...`
 opens the ticket (first line is the title, the rest the body) as the one

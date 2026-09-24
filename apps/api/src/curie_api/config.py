@@ -375,6 +375,14 @@ class Settings(BaseSettings):
             "WORK_ITEM_RUNTIME_TTL_SECONDS",
         ),
     )
+    work_item_cancel_settle_seconds: int = Field(
+        default=120,
+        ge=1,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS",
+            "WORK_ITEM_CANCEL_SETTLE_SECONDS",
+        ),
+    )
     work_item_backoff_base_seconds: int = Field(
         default=10,
         gt=0,
@@ -431,6 +439,13 @@ class Settings(BaseSettings):
     # namespace are both bounded. Sizes are the serialized-JSON byte length.
     state_max_value_bytes: int = 64 * 1024  # 64 KiB per value
     state_max_namespace_bytes: int = 1024 * 1024  # 1 MiB per (agent, namespace)
+    # Conversation transcripts (ADR-0170, #3070) live in their own table, capped
+    # per thread with no agent-wide total, so many threads never share a budget.
+    # The default matches the runner's own transcript bound, which compacts the
+    # thread when an append is refused. A thread with no WorkItem expires after
+    # this long without an append; a WorkItem thread is deleted at its terminal.
+    transcript_max_thread_bytes: int = 64 * 1024  # 64 KiB per thread
+    transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
     # Cap on behavior-packs content per agent (#936, introduced by #883). Packs
     # are stored on the agent row and injected verbatim into the runner context
     # at each bind, so an uncapped pack bloats both the row and the prompt. Size

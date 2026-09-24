@@ -13,12 +13,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
+from curie_telemetry.redact import redact_text
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from . import transcripts
 from .config import get_settings
 from .models import (
     ExecutionRequest,
@@ -55,6 +57,14 @@ ConflictCode = Literal[
 ]
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
+# Longest provider message a factory notice keeps (#3073).
+_NOTICE_DETAIL_MAX = 600
+
+_NO_READMIT: dict[str, Any] = {
+    "readmit_request_id": None,
+    "readmit_requester": None,
+    "readmit_objective": None,
+}
 
 
 @dataclass(frozen=True)
@@ -174,17 +184,32 @@ async def _conflict(
     return result
 
 
+GITHUB_CHANNEL_KIND = "github"
+
+
+def github_reply_route(repo_full_name: str, issue_number: int) -> tuple[str, str, str]:
+    """The reply kind, address, and conversation id a GitHub issue replies on."""
+
+    return GITHUB_CHANNEL_KIND, repo_full_name, f"issue-{issue_number}"
+
+
 async def _database_now(session: AsyncSession) -> datetime:
     value = await session.scalar(select(func.clock_timestamp()))
     return cast(datetime, value)
 
 
 def _queue_notice(
-    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    detail: str | None,
 ) -> None:
     """Stage the owed comment in the terminal transaction. The caller commits.
 
-    Reply routing is resolved when the durable notice is delivered.
+    Reply routing is resolved when the durable notice is delivered. ``detail``
+    is the provider's own failure message (#3073); it is redacted before it is
+    stored, then clipped, so no key or token reaches the row or the comment.
     """
 
     if request.terminal_at is None:
@@ -192,12 +217,70 @@ def _queue_notice(
     cause = request.terminal_cause
     if cause is None or not cause.strip():
         return
+    if cause.strip() == "issue_cancelled" and work_item.readmit_request_id is not None:
+        # A relabel superseded this run. The new run speaks for the issue.
+        return
     session.add(
         FactoryTerminalNotice(
             execution_request_id=request.id,
             work_item_id=work_item.id,
             terminal_cause=cause.strip(),
+            detail=_notice_detail(detail),
         )
+    )
+
+
+def _notice_detail(detail: str | None) -> str | None:
+    # Redact before clip so a truncated key still matches the redactor.
+    text = redact_text((detail or "").strip())
+    if len(text) > _NOTICE_DETAIL_MAX:
+        text = text[: _NOTICE_DETAIL_MAX - 3].rstrip() + "..."
+    return text or None
+
+
+async def _settle_terminal(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    detail: str | None,
+) -> None:
+    """Stage everything a terminal request owes in its own transaction.
+
+    That is the factory comment and, per ADR-0170, deleting the thread's
+    transcript: a terminal WorkItem's history is not resumed again.
+    """
+
+    if request.terminal_at is None:
+        return
+    _queue_notice(session, work_item, request, detail=detail)
+    await transcripts.expire_for_work_item(session, work_item)
+
+
+async def _queue_suppressed_cancel_notice(
+    session: AsyncSession, work_item: WorkItem
+) -> None:
+    """Owe the stop notice a pending relabel suppressed, once the relabel is dropped."""
+
+    latest: ExecutionRequest | None = await session.scalar(
+        select(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.terminal_at.is_not(None),
+        )
+        .order_by(ExecutionRequest.sequence.desc())
+        .limit(1)
+    )
+    if latest is None or (latest.terminal_cause or "").strip() != "issue_cancelled":
+        return
+    await session.execute(
+        insert(FactoryTerminalNotice)
+        .values(
+            execution_request_id=latest.id,
+            work_item_id=work_item.id,
+            terminal_cause="issue_cancelled",
+        )
+        .on_conflict_do_nothing(index_elements=["execution_request_id"])
     )
 
 
@@ -607,7 +690,7 @@ async def expire_waiting(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request)
+    await _settle_terminal(session, work_item, request, detail=None)
     return await _outcome(session, work_item, request)
 
 
@@ -768,6 +851,7 @@ async def _terminalize_execution(
     expected_request_version: int,
     status: Literal["completed", "failed"],
     cause: str,
+    detail: str | None,
     extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
     work_item = await _lock_work_item(session, work_item_id)
@@ -859,7 +943,7 @@ async def _terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request)
+    await _settle_terminal(session, work_item, request, detail=detail)
     return await _outcome(session, work_item, request)
 
 
@@ -879,6 +963,7 @@ async def complete_execution(
         expected_request_version=expected_request_version,
         status="completed",
         cause="completed",
+        detail=None,
         extra_where=(),
     )
 
@@ -900,6 +985,7 @@ async def fail_execution(
         expected_request_version=expected_request_version,
         status="failed",
         cause=cause,
+        detail=None,
         extra_where=(),
     )
 
@@ -917,8 +1003,24 @@ async def request_cancellation(
         return await _conflict(session, "stale_version", work_item=work_item)
     if work_item.cancelled_at is not None:
         active = await _lock_active_request(session, work_item_id)
-        return await _outcome(session, work_item, active, replayed=True)
+        if work_item.readmit_request_id is None:
+            return await _outcome(session, work_item, active, replayed=True)
+        # The last label action wins: an unlabel drops a pending relabel.
+        await session.execute(
+            update(WorkItem)
+            .where(WorkItem.id == work_item_id)
+            .values(
+                **_NO_READMIT,
+                version=WorkItem.version + 1,
+                updated_at=func.clock_timestamp(),
+            )
+        )
+        work_item = await _reload_work_item(session, work_item_id)
+        if active is None:
+            await _queue_suppressed_cancel_notice(session, work_item)
+        return await _outcome(session, work_item, active)
 
+    dropped_readmit = work_item.readmit_request_id is not None
     now = await _database_now(session)
     changed_id: uuid.UUID | None = await session.scalar(
         update(WorkItem)
@@ -929,6 +1031,7 @@ async def request_cancellation(
         )
         .values(
             cancelled_at=now,
+            **_NO_READMIT,
             version=WorkItem.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -957,7 +1060,7 @@ async def request_cancellation(
             )
         )
         active = await _reload_request(session, active.id)
-        _queue_notice(session, work_item, active)
+        await _settle_terminal(session, work_item, active, detail=None)
     elif active is not None and active.status == "running":
         await session.execute(
             update(ExecutionRequest)
@@ -970,6 +1073,7 @@ async def request_cancellation(
             .values(
                 status="cancellation_requested",
                 terminal_cause="issue_cancelled",
+                cancellation_requested_at=now,
                 version=ExecutionRequest.version + 1,
                 updated_at=func.clock_timestamp(),
             )
@@ -995,8 +1099,269 @@ async def request_cancellation(
             )
         )
         active = await _reload_request(session, active.id)
+    elif active is None and dropped_readmit:
+        await _queue_suppressed_cancel_notice(session, work_item)
     work_item = await _reload_work_item(session, work_item_id)
+    if active is None:
+        # Nothing is left to run, so the cancelled WorkItem is terminal now. A
+        # waiting or running request expires the transcript when it settles.
+        await transcripts.expire_for_work_item(session, work_item)
     return await _outcome(session, work_item, active)
+
+
+async def readmit(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    wait_deadline: datetime,
+    objective: str,
+    requester: str,
+) -> WorkItemResult:
+    """Start a new run on an existing WorkItem because the label was added again.
+
+    A waiting request is superseded in the same transaction. A running request
+    is asked to stop, and the relabel is stored on the WorkItem until that
+    request reaches a terminus; the returned request is then the old one.
+    """
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if work_item is None:
+        return await _conflict(session, "not_found", work_item_id=work_item_id)
+    active = await _lock_active_request(session, work_item_id)
+    now = await _database_now(session)
+    if active is not None and active.status in ("running", "cancellation_requested"):
+        if active.status == "running":
+            await session.execute(
+                update(ExecutionRequest)
+                .where(
+                    ExecutionRequest.id == active.id,
+                    ExecutionRequest.version == active.version,
+                    ExecutionRequest.status == "running",
+                )
+                .values(
+                    status="cancellation_requested",
+                    terminal_cause="issue_cancelled",
+                    cancellation_requested_at=now,
+                    version=ExecutionRequest.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+        elif active.terminal_cause != "issue_cancelled":
+            await session.execute(
+                update(ExecutionRequest)
+                .where(
+                    ExecutionRequest.id == active.id,
+                    ExecutionRequest.version == active.version,
+                    ExecutionRequest.status == "cancellation_requested",
+                )
+                .values(
+                    terminal_cause="issue_cancelled",
+                    version=ExecutionRequest.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+        await session.execute(
+            update(WorkItem)
+            .where(WorkItem.id == work_item_id)
+            .values(
+                readmit_request_id=request_id,
+                readmit_requester=requester,
+                readmit_objective=objective,
+                version=WorkItem.version + 1,
+                updated_at=func.clock_timestamp(),
+            )
+        )
+        work_item = await _reload_work_item(session, work_item_id)
+        active = await _reload_request(session, active.id)
+        return await _outcome(session, work_item, active)
+    if active is not None:
+        # Superseded, not stopped: the new request speaks for the issue.
+        await session.execute(
+            update(ExecutionRequest)
+            .where(
+                ExecutionRequest.id == active.id,
+                ExecutionRequest.version == active.version,
+                ExecutionRequest.status == "waiting",
+            )
+            .values(
+                status="cancelled",
+                terminal_at=now,
+                terminal_cause="issue_cancelled",
+                version=ExecutionRequest.version + 1,
+                updated_at=func.clock_timestamp(),
+            )
+        )
+    version: int | None = await session.scalar(
+        update(WorkItem)
+        .where(WorkItem.id == work_item_id)
+        .values(
+            cancelled_at=None,
+            **_NO_READMIT,
+            version=WorkItem.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(WorkItem.version)
+    )
+    assert version is not None
+    return await create_execution_request(
+        session,
+        work_item_id=work_item_id,
+        request_id=request_id,
+        wait_deadline=wait_deadline,
+        expected_work_item_version=version,
+    )
+
+
+async def admit_pending_readmit(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    wait_deadline: datetime,
+) -> WorkItemResult | None:
+    """Create the request a relabel stored while the previous run was stopping.
+
+    Returns None when there is nothing to admit yet.
+    """
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if work_item is None or work_item.readmit_request_id is None:
+        await session.commit()
+        return None
+    if await _lock_active_request(session, work_item_id) is not None:
+        await session.commit()
+        return None
+    request_id = work_item.readmit_request_id
+    reply_kind, reply_address, reply_conversation_id = github_reply_route(
+        work_item.repo_full_name, work_item.github_issue_number
+    )
+    snapshot: dict[str, Any] = {
+        "objective": work_item.readmit_objective,
+        "requester": work_item.readmit_requester,
+        "reply_kind": reply_kind,
+        "reply_address": reply_address,
+        "reply_conversation_id": reply_conversation_id,
+    }
+    if snapshot["objective"] is None or snapshot["requester"] is None:
+        # Never commit a request that cannot be dispatched.
+        await session.rollback()
+        return None
+    version: int | None = await session.scalar(
+        update(WorkItem)
+        .where(WorkItem.id == work_item_id)
+        .values(
+            cancelled_at=None,
+            **_NO_READMIT,
+            version=WorkItem.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(WorkItem.version)
+    )
+    assert version is not None
+    result = await create_execution_request(
+        session,
+        work_item_id=work_item_id,
+        request_id=request_id,
+        wait_deadline=wait_deadline,
+        expected_work_item_version=version,
+    )
+    if isinstance(result, WorkItemOutcome):
+        await session.execute(
+            update(ExecutionRequest)
+            .where(
+                ExecutionRequest.id == request_id,
+                ExecutionRequest.objective.is_(None),
+            )
+            .values(**snapshot, updated_at=func.clock_timestamp())
+        )
+        await session.commit()
+    return result
+
+
+async def settle_overdue_cancellation(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    expected_request_version: int,
+    settle_seconds: int,
+) -> WorkItemResult:
+    """Settle an issue cancellation no worker has confirmed within the window.
+
+    The runtime epoch advances and the owner is cleared, so a late teardown
+    receipt from the old owner is refused as stale.
+    """
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if work_item is None:
+        return await _conflict(
+            session, "not_found", work_item_id=work_item_id, request_id=request_id
+        )
+    request = await _lock_request(
+        session, work_item_id=work_item_id, request_id=request_id
+    )
+    if request is None:
+        return await _conflict(
+            session, "not_found", work_item=work_item, request_id=request_id
+        )
+    if request.version != expected_request_version:
+        return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    window = timedelta(seconds=settle_seconds)
+    now = await _database_now(session)
+    if (
+        request.status != "cancellation_requested"
+        or request.terminal_cause != "issue_cancelled"
+        or request.cancellation_requested_at is None
+        or request.cancellation_requested_at + window > now
+        or request.terminate_published_at is None
+        or not (
+            request.runtime_owner is None
+            or (
+                request.runtime_heartbeat_expires_at is not None
+                and request.runtime_heartbeat_expires_at <= now
+            )
+        )
+    ):
+        return await _conflict(
+            session, "illegal_transition", work_item=work_item, request=request
+        )
+    changed_id: uuid.UUID | None = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request_id,
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.version == expected_request_version,
+            ExecutionRequest.status == "cancellation_requested",
+            ExecutionRequest.terminal_cause == "issue_cancelled",
+            ExecutionRequest.terminate_published_at.is_not(None),
+            ExecutionRequest.cancellation_requested_at <= now - window,
+            ExecutionRequest.runtime_owner.is_(None)
+            | (
+                ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)
+                & (ExecutionRequest.runtime_heartbeat_expires_at <= now)
+            ),
+        )
+        .values(
+            status="cancelled",
+            terminal_at=now,
+            termination_observation=(
+                f"settled by the control plane after {settle_seconds}s "
+                "without a worker teardown receipt"
+            ),
+            teardown_unconfirmed_at=now,
+            runtime_epoch=ExecutionRequest.runtime_epoch + 1,
+            runtime_owner=None,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        request = await _reload_request(session, request_id)
+        return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    request = await _reload_request(session, request_id)
+    await _settle_terminal(session, work_item, request, detail=None)
+    return await _outcome(session, work_item, request)
 
 
 async def request_execution_deadline_cancellation(
@@ -1049,6 +1414,7 @@ async def request_execution_deadline_cancellation(
         .values(
             status="cancellation_requested",
             terminal_cause="execution_deadline",
+            cancellation_requested_at=now,
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1138,6 +1504,7 @@ async def request_owner_lost_cancellation(
         .values(
             status="cancellation_requested",
             terminal_cause="owner_lost",
+            cancellation_requested_at=now,
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1198,6 +1565,14 @@ async def _record_runtime_termination(
         )
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    if request.status == "cancelled" and request.teardown_unconfirmed_at is not None:
+        return await _confirm_settled_teardown(
+            session,
+            work_item=work_item,
+            request=request,
+            termination_observation=termination_observation,
+            extra_where=extra_where,
+        )
     if request.status != "cancellation_requested":
         return await _conflict(
             session, "illegal_transition", work_item=work_item, request=request
@@ -1242,7 +1617,56 @@ async def _record_runtime_termination(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request)
+    await _settle_terminal(session, work_item, request, detail=None)
+    return await _outcome(session, work_item, request)
+
+
+async def _confirm_settled_teardown(
+    session: AsyncSession,
+    *,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    termination_observation: str,
+    extra_where: Sequence[ColumnElement[bool]],
+) -> WorkItemResult:
+    """Record a late worker teardown for a force-settled cancellation.
+
+    The request is already terminal and its notice already went out, so this
+    only replaces the placeholder observation and clears the flag.
+    """
+
+    if not termination_observation.strip():
+        return await _conflict(
+            session,
+            "termination_observation_required",
+            work_item=work_item,
+            request=request,
+        )
+    changed_id: uuid.UUID | None = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.version == request.version,
+            ExecutionRequest.status == "cancelled",
+            ExecutionRequest.teardown_unconfirmed_at.is_not(None),
+            *extra_where,
+        )
+        .values(
+            termination_observation=termination_observation,
+            teardown_unconfirmed_at=None,
+            runtime_owner=None,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        reloaded = await _reload_request(session, request.id)
+        return await _conflict(
+            session, "stale_version", work_item=work_item, request=reloaded
+        )
+    request = await _reload_request(session, request.id)
     return await _outcome(session, work_item, request)
 
 

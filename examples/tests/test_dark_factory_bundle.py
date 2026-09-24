@@ -251,3 +251,18 @@ def test_no_private_identifiers(needle: str) -> None:
 
 def test_operations_doc_points_at_the_bundle() -> None:
     assert "examples/dark-factory" in (REPO_ROOT / "docs" / "operations.md").read_text()
+
+
+def test_example_deploys_as_dark_factory_on_the_default_model() -> None:
+    """The shipped example deploys under the product name on GLM 5.3 Flash (#3075)."""
+
+    readme = (BUNDLE / "README.md").read_text()
+    operations = (REPO_ROOT / "docs" / "operations.md").read_text()
+    assert "--agent dark-factory " in readme
+    assert "surfaces dark-factory " in readme
+    assert "publication-policy dark-factory " in readme
+    assert "agentSandbox.connectorEgress.dark-factory[" in readme
+    assert "--agent factory " not in readme
+    assert "agentSandbox.runner.model=z-ai/glm-5.3-flash" in readme
+    assert "agent `dark-factory`" in operations
+    assert "`z-ai/glm-5.3-flash`" in operations

@@ -55,6 +55,46 @@ class _MarkerScan:
     next_page: int | None = None
 
 
+# The operator-facing sentence for each terminus cause (#3073). The raw code
+# still appears on the comment, but never as its headline.
+_CAUSE_TEXT = {
+    "model_credit_exhausted": (
+        "the model provider refused the request because the account has run "
+        "out of credits. Add credits or raise the key's limit, then retry."
+    ),
+    "model_credential_rejected": (
+        "the model provider rejected the configured API key. Check the model "
+        "credential, then retry."
+    ),
+    "model_rate_limited": (
+        "the model provider kept rate limiting the request. Retry later or raise "
+        "the provider limit."
+    ),
+    "model_error": "the model provider returned an error the run could not recover from.",
+    "budget_exceeded": "the run used its whole token budget before it finished.",
+    "runner_timeout": "the run took longer than its time limit.",
+    "workspace_error": "the repository workspace could not be prepared for the run.",
+    "runner_escalated": "the run stopped on an error and was handed to a person.",
+    "runner_failed": "the run ended without a result.",
+    "no_pull_request": "the run finished but did not open a pull request.",
+    "execution_deadline": "the run did not finish before its deadline.",
+    "capacity_wait_expired": "no runner capacity came free before the wait expired.",
+    "owner_lost": "the worker running this request stopped responding.",
+    "issue_cancelled": "the request was cancelled.",
+    "publication_denied": "a person denied the request to open the pull request.",
+    "publication_expired": (
+        "the request to open the pull request expired before anyone approved it."
+    ),
+    "publication_failed": "the pull request could not be opened.",
+}
+
+
+def cause_text(cause: str) -> str:
+    """A plain sentence for a terminus cause; unknown codes get a generic one."""
+
+    return _CAUSE_TEXT.get(cause, "the run stopped for a reason Curie did not recognize.")
+
+
 def marker_for(request_id: uuid.UUID) -> str:
     return f"<!-- curie-execution-request:{request_id} -->"
 
@@ -65,6 +105,7 @@ def comment_body(
     *,
     pr_url: str | None,
     feedback_url: str | None = None,
+    detail: str | None = None,
 ) -> str:
     if cause == "completed":
         if feedback_url is not None:
@@ -73,8 +114,18 @@ def comment_body(
             text = f"Completed: {pr_url.strip()}\n"
         else:
             raise ValueError("a completed issue notice requires its pull request URL")
+    elif cause == "issue_cancelled":
+        text = (
+            "Stopped: this run was cancelled because the factory label was removed "
+            "or the issue was closed. Add the label again to start a new run.\n"
+            # tools/factory-e2e reads the cause from this line.
+            f"Cause: {cause}\n"
+        )
     else:
-        text = f"Could not complete: {cause}\nCause: {cause}\n"
+        text = f"Could not complete: {cause_text(cause)}\n"
+        if detail is not None and detail.strip():
+            text += f"Provider message: {detail.strip()}\n"
+        text += f"Cause: {cause}\n"
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
     return f"{text}\n{marker_for(request_id)}\n"
@@ -218,6 +269,7 @@ async def _deliver(
         notice.terminal_cause,
         pr_url=pr_url,
         feedback_url=target.url,
+        detail=notice.detail,
     )
     if target.kind == "thread":
         assert target.comment_id is not None

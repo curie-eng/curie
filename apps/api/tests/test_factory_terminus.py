@@ -35,7 +35,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_notices import comment_body, marker_for
+from curie_api.factory_notices import cause_text, comment_body, marker_for
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
@@ -57,6 +57,57 @@ pytestmark = pytest.mark.usefixtures("clean_db")
 def test_completed_issue_comment_body_requires_pull_request_url() -> None:
     with pytest.raises(ValueError, match="requires its pull request URL"):
         comment_body(uuid.uuid4(), "completed", pr_url=None)
+
+
+def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None:
+    body = comment_body(
+        uuid.uuid4(),
+        "model_credit_exhausted",
+        pr_url=None,
+        detail="API Error: 402 This request requires more credits",
+    )
+    headline = body.splitlines()[0]
+    assert headline.startswith("Could not complete: the model provider refused")
+    assert "run out of credits" in headline
+    assert "model_credit_exhausted" not in headline
+    assert "Provider message: API Error: 402 This request requires more credits" in body
+    assert "Cause: model_credit_exhausted" in body
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        "model_credit_exhausted",
+        "model_credential_rejected",
+        "model_rate_limited",
+        "model_error",
+        "budget_exceeded",
+        "runner_timeout",
+        "workspace_error",
+        "runner_escalated",
+        "runner_failed",
+        "no_pull_request",
+        "execution_deadline",
+        "capacity_wait_expired",
+        "owner_lost",
+        "issue_cancelled",
+        "publication_denied",
+        "publication_expired",
+        "publication_failed",
+    ],
+)
+def test_every_terminus_cause_has_its_own_plain_sentence(cause: str) -> None:
+    assert cause_text(cause) != cause_text("not-a-cause")
+    assert cause not in cause_text(cause)
+
+
+def test_unknown_cause_still_gets_a_sentence_and_its_code() -> None:
+    body = comment_body(uuid.uuid4(), "something_new", pr_url=None)
+    assert body.splitlines()[0] == (
+        "Could not complete: the run stopped for a reason Curie did not recognize."
+    )
+    assert "Provider message" not in body
+    assert "Cause: something_new" in body
 
 
 class _Credentials:
@@ -242,7 +293,7 @@ def _request(number: int) -> dict[str, Any]:
 def _notices(request_id: uuid.UUID) -> list[dict[str, Any]]:
     return _rows(
         "SELECT execution_request_id, terminal_cause, attempts, posted_at, "
-        "comment_id, refused_at, refusal "
+        "comment_id, refused_at, refusal, detail "
         "FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
         {"id": request_id},
     )
@@ -371,7 +422,7 @@ def test_label_removal_posts_one_comment(admitted: Any) -> None:
     assert _notices(row["id"])[0]["posted_at"] is None
     _reconcile()
     assert sink.posts == 1
-    assert "issue_cancelled" in sink.comments[0]["body"]
+    assert "Stopped:" in sink.comments[0]["body"]
     assert marker_for(row["id"]) in sink.comments[0]["body"]
 
 
@@ -404,6 +455,37 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     assert sink.posts == 1
     assert "runner_escalated" in sink.comments[0]["body"]
     assert _request(number)["version"] == version
+
+
+def test_credit_exhausted_finish_comments_the_redacted_provider_message(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9213
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    key = "sk-or-v1-" + "0123456789abcdef" * 4
+    failed = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "model_credit_exhausted",
+            "detail": f"model error: unknown: API Error: 402 requires more credits {key}",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+    notice = _notices(row["id"])[0]
+    assert key not in notice["detail"]
+    assert "[REDACTED" in notice["detail"]
+    _reconcile()
+    assert sink.posts == 1
+    body = sink.comments[0]["body"]
+    assert body.startswith("Could not complete: the model provider refused")
+    assert "Provider message: model error: unknown: API Error: 402 requires more credits" in body
+    assert key not in body
 
 
 def test_a_refused_post_leaves_the_terminal_row_unchanged(admitted: Any) -> None:
@@ -485,7 +567,7 @@ def test_a_running_cancellation_comments_only_after_the_runtime_is_observed(
     assert (terminal["status"], terminal["terminal_cause"]) == ("cancelled", "issue_cancelled")
     _reconcile()
     assert sink.posts == 1
-    assert "issue_cancelled" in sink.comments[0]["body"]
+    assert "Stopped:" in sink.comments[0]["body"]
     assert marker_for(row["id"]) in sink.comments[0]["body"]
 
 
