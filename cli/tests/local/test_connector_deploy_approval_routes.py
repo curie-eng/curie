@@ -579,6 +579,37 @@ def _start_isolated_approval_seed_worker(case: LocalCase) -> None:
         timeout=1800,
     )
     _require(result, "starting the isolated local worker for the approval seed")
+    # The seed's `curie local message` enqueues through a one-shot container of
+    # the dispatcher image, which it takes from the running API's tag. This
+    # fixture runs a private API image, so no dispatcher exists at that tag and
+    # compose's own default applies: it must be the dispatcher `local up
+    # --build` just built, not whatever `curie-dispatcher:latest` is local.
+    candidate = f"ghcr.io/curie-eng/curie-dispatcher:{case.env['CURIE_LOCAL_IMAGE_TAG']}"
+    rendered = json.loads(
+        _require(
+            _run(
+                [
+                    "docker",
+                    "compose",
+                    "--profile",
+                    "core",
+                    "--profile",
+                    "slack",
+                    "config",
+                    "--format",
+                    "json",
+                ],
+                env=case.env,
+            ),
+            "rendering the one-shot dispatcher's Compose",
+        )
+    )
+    image = rendered["services"]["curie-dispatcher"].get("image")
+    if image != candidate:
+        raise RuntimeError(
+            f"the approval seed would enqueue through {image}, not the candidate {candidate}"
+        )
+    _require(_run(["docker", "image", "inspect", candidate]), "finding the candidate dispatcher")
 
 
 def _drive_dedicated_approval_seed(
