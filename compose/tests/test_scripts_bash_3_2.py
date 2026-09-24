@@ -11,13 +11,24 @@ tests need a 3.x interpreter, so they run where one exists: macOS
 runs everywhere, so a Linux CI with bash 5 still refuses the constructs listed
 in ``BASH4_ONLY`` in any script listed in ``HOST_SCRIPTS``. It cannot see an
 empty array expanded under ``set -u``; only the executing tests catch that.
+
+The same scripts must run on the userland macOS ships, too: it has no GNU
+``timeout`` and no ``setsid``, and its BSD ``sed`` reads the argument after a
+bare ``-i`` as a backup suffix. The executing tests for those sites put
+stand-ins on PATH that fail the way a stock Mac's tools do, so they fail on a
+Linux host as well, and a second scan refuses the forms listed in ``GNU_ONLY``
+in any script listed in ``HOST_SCRIPTS``.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
+import shutil
+import socket
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -120,16 +131,54 @@ BASH4_ONLY = {
     _COMMAND + r"wait\s+-n\b": "wait -n (bash 4.3)",
 }
 
+# Any options a command takes before the one that matters.
+_OPTIONS = r"(\s+-[A-Za-z]+)*\s+"
 
-def _bash4_only_lines(source: str, name: str = "<source>") -> list[str]:
+# GNU userland a stock Mac lacks or reads differently, each measured on
+# 2026-09-24 on Darwin 25.6 with only /usr/bin:/bin:/usr/sbin:/sbin on PATH.
+# flock is absent there too, but four drill scripts still call it, so it joins
+# this table once they stop.
+GNU_ONLY = {
+    _COMMAND + r"timeout\s+[-$0-9\"']": 'timeout, absent: use "$GNU_PROCESS" timeout',
+    _COMMAND + r"setsid\s+[^\s=]": 'setsid, absent: use "$GNU_PROCESS" setsid',
+    r"\bsed" + _OPTIONS + r"-[A-Za-z]*i(\s|$)": (
+        "sed -i with no suffix, which BSD sed reads from the next argument"
+    ),
+    r"\bsed" + _OPTIONS + r"-[A-Za-z]*z": "sed -z",
+    r"\bstat" + _OPTIONS + r"(-[A-Za-z]*c\b|--(format|printf)\b)": (
+        "stat -c, where BSD stat takes -f"
+    ),
+    r"\bdate" + _OPTIONS + r"(-[A-Za-z]*d\b|--date\b)": "date -d",
+    r"\bhead" + _OPTIONS + r"-n\s*-[0-9]": "head -n -N",
+    _COMMAND + r"(tac|nproc|numfmt|shuf)\b": "tac, nproc, numfmt and shuf, absent",
+    r"\bxargs" + _OPTIONS + r"(-[A-Za-z]*d\b|--delimiter\b)": "xargs -d",
+    r"\bcp\b.*\s--parents\b": "cp --parents",
+    r"\bln" + _OPTIONS + r"-[A-Za-z]*r": "ln -r",
+    r"\bdu" + _OPTIONS + r"-[A-Za-z]*b": "du -b",
+    _COMMAND + r"install" + _OPTIONS + r"-[A-Za-z]*D": "install -D",
+    r"\bmktemp\b.*\s--(suffix|tmpdir)\b": "mktemp --suffix and --tmpdir",
+    r"\bps\b.*\s--no-headers?\b": "ps --no-headers",
+    r"\bcut\b.*\s--complement\b": "cut --complement",
+}
+
+
+def _refused_lines(table: dict[str, str], source: str, name: str) -> list[str]:
     hits = []
     for number, line in enumerate(source.splitlines(), start=1):
         if line.lstrip().startswith("#"):
             continue
-        for pattern, construct in BASH4_ONLY.items():
+        for pattern, construct in table.items():
             if re.search(pattern, line):
                 hits.append(f"{name}:{number}: {construct}: {line.strip()}")
     return hits
+
+
+def _bash4_only_lines(source: str, name: str = "<source>") -> list[str]:
+    return _refused_lines(BASH4_ONLY, source, name)
+
+
+def _gnu_only_lines(source: str, name: str = "<source>") -> list[str]:
+    return _refused_lines(GNU_ONLY, source, name)
 
 
 def _script_id(path: Path) -> str:
@@ -219,6 +268,75 @@ def test_the_source_scan_ignores_what_bash_3_2_accepts(line: str) -> None:
 
 def test_the_source_scan_ignores_a_comment_that_names_a_construct() -> None:
     assert not _bash4_only_lines("    # `${NAME+x}` rather than `[[ -v NAME ]]`\n")
+
+
+@pytest.mark.parametrize("script", HOST_SCRIPTS, ids=_script_id)
+def test_script_uses_no_gnu_only_userland(script: Path) -> None:
+    hits = _gnu_only_lines(script.read_text(), _script_id(script))
+    assert not hits, "a stock Mac lacks or misreads:\n" + "\n".join(hits)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The lines this scan was written against, before their fixes.
+        '        out="$(cd "$GATE_CASE_BUNDLE" && timeout 240 "$BIN" --json skill message \\',
+        '        timeout --foreground "$1s" "$2" --context "$3" -n "$4" get "$5" "$6" \\',
+        "    setsid bash -c '",
+        '    if ! timeout "$((MESSAGE_TIMEOUT_SECONDS + 30))" "$BIN" "${args[@]}" \\',
+        '    if ! timeout 90 "$BIN" --json cluster reset-thread "$AGENT" \\',
+        '    sed -i "s|$good|$bad|" "$lock"',
+        "    sed -Ei 's/a/b/' file",
+        "    sed -n -i 's/a/b/' file",
+        "    tr -d x < f | sed -z 's/a/b/'",
+        "    mode=\"$(stat -c '%a' \"$receipt\")\"",
+        '    stat --format=%a "$receipt"',
+        '    date -u -d "@$epoch" +%s',
+        '    date --date="1 hour ago"',
+        "    head -n -1 file",
+        "    tac file",
+        '    jobs="$(nproc)"',
+        "    numfmt --to=iec 1024",
+        "    shuf -n 1 file",
+        "    printf 'a\\n' | xargs -d '\\n' rm",
+        "    cp --parents a/b dest",
+        '    ln -sr "$target" "$link"',
+        "    du -sb dir",
+        "    install -Dm644 file dest/file",
+        "    mktemp --suffix=.json",
+        "    ps --no-headers -o pid",
+        "    cut --complement -c1 file",
+    ],
+)
+def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
+    assert _gnu_only_lines(line + "\n"), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '        out="$(cd "$GATE_CASE_BUNDLE" && '
+        '"$GNU_PROCESS" timeout "$GATE_CASE_TURN_SECONDS" "$BIN" \\',
+        '        "$8" timeout --foreground "$1s" "$2" --context "$3" -n "$4" \\',
+        "    \"$GNU_PROCESS\" setsid bash -c '",
+        '    sed "s|$good|$bad|" "$backup" >"$lock"',
+        "    sed -i.bak 's/a/b/' file",
+        '    kubectl rollout status "deployment/$name" --timeout=180s >/dev/null',
+        "timeout = budget + 60",
+        '    banner "DIAGNOSTICS (timeout after ${timeout}s)"',
+        '  local ns="$1" name="$2" want="$3" timeout="${4:-180}"',
+        '    args+=(--timeout-secs "$MESSAGE_TIMEOUT_SECONDS")',
+        "require_command python3",
+        "    date -u +%Y-%m-%dT%H:%M:%S.%NZ",
+        '    touch -t 200001010000 "$lock"',
+        "    npm install -D acme-lint",
+        "    stat -f '%Lp' \"$receipt\"",
+        "    grep -c pattern file",
+        '    cp -a "$WORKDIR/bundle" "$GATE_CASE_BUNDLE"',
+    ],
+)
+def test_the_userland_scan_ignores_portable_forms(line: str) -> None:
+    assert not _gnu_only_lines(line + "\n"), line
 
 
 @needs_bash3
@@ -687,3 +805,458 @@ exit 3
         *(f"kill {pid}" for pid in pids),
         *(f"delete {inbox}" for inbox in inbox_files),
     ], result.stderr
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.write_text(body)
+    path.chmod(0o700)
+
+
+def _stock_mac_userland(bin_dir: Path) -> None:
+    """Stand-ins that fail the way a stock Mac's tools do (Darwin 25.6)."""
+
+    real_sed = shutil.which("sed")
+    assert real_sed, "no sed on PATH"
+    for tool in ("timeout", "setsid"):
+        _write_executable(
+            bin_dir / tool,
+            f'#!/bin/sh\necho "bash: {tool}: command not found" >&2\nexit 127\n',
+        )
+    _write_executable(
+        bin_dir / "sed",
+        "#!/bin/sh\n"
+        'for argument in "$@"; do\n'
+        '    case "$argument" in\n'
+        "        -i|-[!-]*i)\n"
+        "            echo 'sed: 1: \"...\": invalid command code f' >&2\n"
+        "            exit 1 ;;\n"
+        "    esac\n"
+        "done\n"
+        f'exec {shlex.quote(real_sed)} "$@"\n',
+    )
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _top_level_assignments(source: str, names: list[str]) -> str:
+    """The script's own assignments of ``names``, for a function run alone."""
+
+    return "\n".join(
+        line
+        for name in names
+        for line in re.findall(rf"^{name}=.*$", source, re.MULTILINE)
+    )
+
+
+def _pid_is_gone(pid_file: Path) -> bool:
+    try:
+        os.kill(int(pid_file.read_text()), 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+GATE_PARKED_REPLY = (
+    '{"status":"awaiting-approval","finalized":false,'
+    '"approval_summary":"Bash: echo curie-2094-canary"}'
+)
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize("turn", ["parks", "hangs"])
+def test_live_approval_gate_case_bounds_its_turn_on_a_stock_mac(
+    interpreter: str, turn: str, tmp_path: Path
+) -> None:
+    """The bound is the case's hang assertion, so a Mac must still have one.
+
+    A turn that parks passes. A turn that never ends is cut off at the bound
+    and named as the #1852 hang, and the bound reaches what the turn started:
+    a child left holding the captured stdout would stall the case instead.
+    """
+
+    source = LADDER_PATH.read_text()
+    case = _shell_function(source, "case_live_approval_gate_denies")
+    state = tmp_path / "state"
+    state.mkdir()
+    (tmp_path / "work" / "bundle").mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    _write_executable(
+        bin_dir / "docker",
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '    "image inspect") ;;\n'
+        '    "ps -q") echo 0123456789ab ;;\n'
+        '    "ps -aq") [ -e "$STUB_STATE/down" ] || echo 0123456789ab ;;\n'
+        '    "exec "*) echo CANARY_ABSENT ;;\n'
+        '    *) echo "unexpected docker invocation: $*" >&2; exit 97 ;;\n'
+        "esac\n",
+    )
+    curie = tmp_path / "curie"
+    _write_executable(
+        curie,
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '    "skill up "*) ;;\n'
+        '    "--json skill message "*)\n'
+        '        if [ "$STUB_TURN" = hangs ]; then\n'
+        '            sleep 30 & echo "$!" > "$STUB_STATE/turn.pid"; wait\n'
+        "        fi\n"
+        f"        echo {shlex.quote(GATE_PARKED_REPLY)} ;;\n"
+        '    "skill down") touch "$STUB_STATE/down" ;;\n'
+        '    *) echo "unexpected curie invocation: $*" >&2; exit 97 ;;\n'
+        "esac\n",
+    )
+    definitions = _top_level_assignments(
+        source, ["GNU_PROCESS", "GATE_CASE_TURN_SECONDS"]
+    )
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{definitions}
+LIVE=1
+WORKDIR="$1"
+BIN="$2"
+RUNNER_IMAGE=curie-runner:test
+GATE_CASE_NAME=curie-ladder-2094-gate-test
+GATE_CASE_CREATED=0
+GATE_CASE_PORT={_free_port()}
+GATE_CASE_BUNDLE=""
+GATE_CASE_TURN_SECONDS=1
+GATE_PROMPT="Use the Bash tool."
+{case}
+case_live_approval_gate_denies
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path / "work"), str(curie)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(state),
+            "STUB_TURN": turn,
+        },
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    if turn == "parks":
+        assert result.returncode == 0, result.stderr
+        assert "the gated turn parked" in result.stdout, result.stdout
+        assert "the gated command did not run" in result.stdout, result.stdout
+    else:
+        assert result.returncode == 1, result.stderr
+        assert "the gated turn never ended" in result.stderr, result.stderr
+        assert _pid_is_gone(state / "turn.pid"), "the bound left the turn's child running"
+
+
+IDLE_ROUTE_KUBECTL = """#!/bin/sh
+case "$*" in
+    *--watch*)
+        echo "$$" > "$STUB_STATE/kubectl-watch.pid"
+        case "$*" in
+            *resourcequota*) echo 'ADDED|42|2|2|2' ;;
+            *) echo 'ADDED|42|uid-1' ;;
+        esac
+        exec sleep 30 ;;
+    *resourcequota*)
+        printf '%s\\n' '{"metadata":{"resourceVersion":"41"},' \\
+            '"status":{"used":{"pods":"2"},"hard":{"pods":"2"}},"spec":{"hard":{"pods":"2"}}}' ;;
+    *) echo '{"metadata":{"resourceVersion":"41","uid":"uid-1"}}' ;;
+esac
+"""
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize(
+    ("watch", "event"),
+    [("exact", "ADDED\t42\tuid-1"), ("quota", "ADDED\t42\t2\t2\t2")],
+)
+@pytest.mark.parametrize("ending", ["stopped", "bounded"])
+def test_idle_route_watch_leads_its_group_and_ends_on_a_stock_mac(
+    interpreter: str, watch: str, event: str, ending: str, tmp_path: Path
+) -> None:
+    """stop_pid signals the group `$!` names, and a watch ends at WAIT_SECONDS.
+
+    The session is what lets stop_pid reach the watch's kubectl, and the bound
+    is what ends a watch nobody stops. A stock Mac ships neither setsid nor
+    timeout, so both must come from somewhere else there.
+    """
+
+    source = IDLE_ROUTE_PATH.read_text()
+    functions = "".join(
+        _shell_function(source, name, IDLE_ROUTE_PATH)
+        for name in (
+            "kube",
+            "timestamp_utc",
+            "stop_pid",
+            "start_quota_watch",
+            "start_exact_resource_watch",
+        )
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    kubectl = tmp_path / "kubectl"
+    _write_executable(kubectl, IDLE_ROUTE_KUBECTL)
+    start = {
+        "exact": 'pid="$(start_exact_resource_watch sandbox acme-sandbox '
+        '"$W/watch" "$W/snapshot" "$W/stderr" "$W/raw")"',
+        "quota": 'start_quota_watch "$W/watch" "$W/snapshot" "$W/stderr" "$W/raw"\n'
+        'pid="$QUOTA_WATCH_PID"',
+    }[watch]
+    finish = {
+        "stopped": 'stop_pid "$pid"',
+        "bounded": "for _ in $(seq 1 80); do\n"
+        '    kill -0 "$pid" 2>/dev/null || break\n'
+        "    sleep 0.1\n"
+        "done\n"
+        'if kill -0 "$pid" 2>/dev/null; then\n'
+        '    echo "the watch outlived WAIT_SECONDS" >&2\n'
+        "    exit 1\n"
+        "fi",
+    }[ending]
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{_top_level_assignments(source, ["GNU_PROCESS"])}
+W="$1"
+REAL_KUBECTL="$2"
+KUBE_CONTEXT=k8
+NAMESPACE=acme-ns
+RESOURCE_QUOTA=acme-quota
+QUOTA_RESOURCE=pods
+QUOTA_FULL=2
+QUOTA_HARD=2
+QUOTA_WATCH_PID=""
+WAIT_SECONDS={1 if ending == "bounded" else 30}
+{functions}
+{start}
+for _ in $(seq 1 50); do
+    grep -q ADDED "$W/watch" && break
+    sleep 0.1
+done
+python3 -c 'import os, sys; print(sys.argv[1], os.getpgid(int(sys.argv[1])))' "$pid"
+{finish}
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path), str(kubectl)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(state),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    pid, group = result.stdout.split()
+    assert group == pid, "the watch does not lead the group stop_pid signals"
+    snapshot, *events = (tmp_path / "watch").read_text().splitlines()
+    assert snapshot.startswith("SNAPSHOT\t"), snapshot
+    assert [line.split("\t", 1)[1] for line in events] == [event]
+    assert (tmp_path / "stderr").read_text() == ""
+    deadline = time.monotonic() + 3
+    while not _pid_is_gone(state / "kubectl-watch.pid"):
+        assert time.monotonic() < deadline, "the watch's kubectl outlived it"
+        time.sleep(0.05)
+
+
+IDLE_ROUTE_CALLS = {
+    "run_message": (
+        'run_message acme-label hello "$WORKDIR/out.json"',
+        "--json cluster message hello --namespace acme-ns --release acme "
+        "--listen-host 127.0.0.1 --timeout-secs 240",
+        "acme-label cluster message failed",
+    ),
+    "reset_thread": (
+        'reset_thread curie:sandbox:route:acme-bot:1700000000.000100 "$WORKDIR/out.json"',
+        "--json cluster reset-thread acme-bot --thread-key acme-bot:1700000000.000100 "
+        "--namespace acme-ns --release acme --yes",
+        "public reset failed for curie:sandbox:route:acme-bot:1700000000.000100",
+    ),
+}
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize("outcome", ["succeeds", "fails"])
+@pytest.mark.parametrize("call", list(IDLE_ROUTE_CALLS))
+def test_idle_route_runs_each_bounded_command_on_a_stock_mac(
+    interpreter: str, outcome: str, call: str, tmp_path: Path
+) -> None:
+    invocation, argv, refusal = IDLE_ROUTE_CALLS[call]
+    source = IDLE_ROUTE_PATH.read_text()
+    functions = "".join(
+        _shell_function(source, name, IDLE_ROUTE_PATH)
+        for name in ("die", "run_message", "reset_thread")
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    curie = tmp_path / "curie"
+    _write_executable(
+        curie,
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$*" >> "$STUB_STATE/calls"\n'
+        'if [ "$STUB_OUTCOME" = fails ]; then echo "acme refusal" >&2; exit 3; fi\n'
+        "echo '{\"requested\":true}'\n",
+    )
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{_top_level_assignments(source, ["GNU_PROCESS"])}
+WORKDIR="$1"
+BIN="$2"
+NAMESPACE=acme-ns
+RELEASE=acme
+AGENT=acme-bot
+ROUTE_PREFIX="curie:sandbox:route:"
+MESSAGE_TIMEOUT_SECONDS=240
+CURIE_E2E_LISTEN_HOST=127.0.0.1
+{functions}
+{invocation}
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path), str(curie)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(tmp_path),
+            "STUB_OUTCOME": outcome,
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    calls = tmp_path / "calls"
+    assert (calls.read_text().splitlines() if calls.exists() else []) == [argv], (
+        result.stderr
+    )
+    if outcome == "succeeds":
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1, result.stderr
+        assert "acme refusal" in result.stderr, result.stderr
+        assert refusal in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_idle_route_preflight_accepts_a_host_without_gnu_userland(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """Only kubectl, helm and python3 are on PATH: no timeout, no setsid."""
+
+    source = IDLE_ROUTE_PATH.read_text()
+    block = _top_level_block(
+        source,
+        "require_command kubectl\n",
+        'REAL_KUBECTL="$(command -v kubectl)"',
+        IDLE_ROUTE_PATH,
+    )
+    functions = "".join(
+        _shell_function(source, name, IDLE_ROUTE_PATH)
+        for name in ("die", "require_command")
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("kubectl", "helm"):
+        _write_executable(bin_dir / tool, "#!/bin/sh\nexit 0\n")
+    python3 = shutil.which("python3")
+    shell = shutil.which(interpreter)
+    assert python3 and shell
+    (bin_dir / "python3").symlink_to(python3)
+    result = subprocess.run(
+        [shell, "-c", f"set -euo pipefail\n{functions}{block}echo preflight passed\n"],
+        env={"PATH": str(bin_dir)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "preflight passed\n"
+
+
+REGISTRY_GOOD_IMAGE = "ghcr.io/acme/tempo@sha256:" + "a" * 64
+REGISTRY_LOCK = (
+    "connectors:\n"
+    "  tempo:\n"
+    f"    image: {REGISTRY_GOOD_IMAGE}\n"
+    f"    source_digest: sha256:{'b' * 64}\n"
+)
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_registry_missing_case_corrupts_and_restores_the_lock_on_a_stock_mac(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """The deploy sees the unresolvable image, and the bundle gets its lock back.
+
+    The restored lock must be the same bytes, mode and fixed mtime, with no
+    backup file left beside it, because the packed bundle is what
+    assert_bundle_identity compares across rungs.
+    """
+
+    case = _shell_function(
+        LADDER_PATH.read_text(), "case_connector_registry_missing_cluster"
+    )
+    bundle = tmp_path / "work" / "bundle"
+    bundle.mkdir(parents=True)
+    lock = bundle / "connectors.lock.yaml"
+    lock.write_text(REGISTRY_LOCK)
+    lock.chmod(0o644)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    _write_executable(
+        bin_dir / "kubectl", f"#!/bin/sh\necho {shlex.quote(REGISTRY_GOOD_IMAGE)}\n"
+    )
+    curie = tmp_path / "curie"
+    _write_executable(
+        curie,
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '    "--json cluster deploy --namespace acme-ns --release acme --plugin-dir "*)\n'
+        '        cp "$9/connectors.lock.yaml" "$STUB_STATE/deployed.lock.yaml"\n'
+        '        echo "error: the registry could not resolve the locked image"\n'
+        "        exit 2 ;;\n"
+        "esac\n"
+        'echo "unexpected curie invocation: $*" >&2\n'
+        "exit 97\n",
+    )
+    script = f"""set -euo pipefail
+WORKDIR="$1"
+BIN="$2"
+ns_rel=(--namespace acme-ns --release acme)
+connector_object_name() {{ echo "$1-$2-$3"; }}
+connector_image() {{ echo {shlex.quote(REGISTRY_GOOD_IMAGE)}; }}
+{case}
+case_connector_registry_missing_cluster acme acme-bot acme-ns
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path / "work"), str(curie)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(tmp_path),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    deployed = tmp_path / "deployed.lock.yaml"
+    assert deployed.read_text() == REGISTRY_LOCK.replace(
+        REGISTRY_GOOD_IMAGE, "ghcr.io/acme/tempo@sha256:" + "f" * 64
+    )
+    assert lock.read_text() == REGISTRY_LOCK
+    assert lock.stat().st_mode & 0o777 == 0o644
+    assert time.localtime(lock.stat().st_mtime)[:6] == (2000, 1, 1, 0, 0, 0)
+    assert sorted(path.name for path in bundle.iterdir()) == [lock.name]

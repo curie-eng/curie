@@ -8,8 +8,8 @@ up (#1852, #2068). That proof fires on two triggers only -- the nightly graded
 ladder's live leg, and the SDK-lock PR workflow -- so a silent collapse of the
 case would go unnoticed for a long time, and every way it can collapse is
 quiet: a dropped ``--secret`` value never arms the gate, a missing ``LIVE``
-guard runs it sealed, a missing ``timeout`` wedges the run instead of failing
-it, and an uninvoked case is simply dead code.
+guard runs it sealed, a missing bound wedges the run instead of failing it,
+and an uninvoked case is simply dead code.
 
 These fast tests pin the shape that makes the live case mean something. They
 do not run it; they keep it from becoming a green that proves nothing.
@@ -52,9 +52,9 @@ def _logical_line_at(body: str, needle: str) -> str:
     """Return the whole backslash-continued command containing ``needle``.
 
     The `skill message` invocation is wrapped across continuation lines, so a
-    per-physical-line search would not see the `timeout` that guards it, and a
-    whole-body search would happily accept the unrelated `command -v timeout`
-    preflight far above it. This reconstructs exactly the one command.
+    per-physical-line search would not see the bound that guards it, and a
+    whole-body search would happily accept an unrelated mention of the bound
+    far above it. This reconstructs exactly the one command.
     """
 
     assert needle in body, f"{LADDER_PATH}: {CASE_NAME} never invokes {needle!r}"
@@ -136,14 +136,18 @@ def test_case_arms_the_gate_with_a_name_only_secret() -> None:
 
 
 def test_case_bounds_the_turn_with_timeout() -> None:
-    """`curie skill message` has no timeout, so an unbounded turn hangs forever."""
+    """`curie skill message` has no timeout, so an unbounded turn hangs forever.
+
+    The bound is gnu-process.py's timeout rather than GNU's own, because a
+    stock Mac ships no `timeout`, and the case must still run there.
+    """
 
     body = _case_body()
     invocation = _logical_line_at(body, "skill message")
-    assert "timeout " in invocation, (
-        "the `skill message` turn must run under `timeout`; nothing on that "
-        "path bounds itself, so a #2068 revert wedges the whole ladder instead "
-        f"of failing it. Unbounded invocation: {invocation!r}"
+    assert '"$GNU_PROCESS" timeout "$GATE_CASE_TURN_SECONDS" ' in invocation, (
+        "the `skill message` turn must run under gnu-process.py's `timeout`; "
+        "nothing on that path bounds itself, so a #2068 revert wedges the whole "
+        f"ladder instead of failing it. Unbounded invocation: {invocation!r}"
     )
 
 
