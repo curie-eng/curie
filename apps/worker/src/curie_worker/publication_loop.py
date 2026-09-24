@@ -1419,13 +1419,13 @@ class PublicationReconcileLoop:
                 logger.exception("publication result delivery failed")
             # Drain claimable work each pass so concurrent publications do not
             # serialize one per interval, bounded so outboxes still run. An
-            # in-flight Job releases its lease, so the oldest one is claimable
-            # again at once; seeing it twice ends the pass instead of starving
-            # the rest behind it.
+            # in-flight Job releases its lease, so the claim excludes what this
+            # pass already reconciled instead of returning the oldest one again
+            # and starving the rest behind it.
             seen: set[uuid.UUID] = set()
             for _ in range(self._batch_limit):
                 try:
-                    work = await self._store.claim_next()
+                    work = await self._store.claim_next(exclude=seen)
                 except Exception as exc:
                     logger.exception(
                         "publication claim_next failed cause=%s: %s",
@@ -1434,15 +1434,6 @@ class PublicationReconcileLoop:
                     )
                     raise
                 if work is None:
-                    break
-                if work.publication_id in seen:
-                    try:
-                        await _resolve(self._store.release(work.publication_id))
-                    except Exception:
-                        logger.exception(
-                            "publication lease release failed publication_id=%s",
-                            work.publication_id,
-                        )
                     break
                 seen.add(work.publication_id)
                 try:

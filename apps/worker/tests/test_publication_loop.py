@@ -240,7 +240,7 @@ class _Store:
             }
         )
 
-    async def claim_next(self) -> None:
+    async def claim_next(self, *, exclude: Any = ()) -> None:
         return None
 
 
@@ -2289,7 +2289,7 @@ async def test_claim_next_failure_names_the_cause_and_still_escapes(
 ) -> None:
     reconciler, store, *_ = _loop(publication)
 
-    async def boom() -> None:
+    async def boom(*, exclude: Any = ()) -> None:
         raise RuntimeError("publication claim CAS was lost")
 
     store.claim_next = boom
@@ -2319,9 +2319,9 @@ async def test_idle_publication_loop_does_not_page(
     claims = {"n": 0}
     original = store.claim_next
 
-    async def idle_claim() -> None:
+    async def idle_claim(*, exclude: Any = ()) -> None:
         claims["n"] += 1
-        return await original()
+        return await original(exclude=exclude)
 
     store.claim_next = idle_claim
 
@@ -2693,16 +2693,24 @@ async def test_running_job_without_markers_releases_lease_uncharged_then_settles
 
 
 class _QueueStore(_Store):
-    def __init__(self, works: list[Any], shutdown: asyncio.Event) -> None:
+    def __init__(
+        self, works: list[Any], shutdown: asyncio.Event, *, sticky: bool = False
+    ) -> None:
         super().__init__()
         self.queue = list(works)
         self.shutdown = shutdown
+        # Sticky models the real store after an uncharged release: the work
+        # stays claimable and is returned oldest first unless excluded.
+        self.sticky = sticky
 
-    async def claim_next(self) -> Any:
-        if not self.queue:
+    async def claim_next(self, *, exclude: Any = ()) -> Any:
+        claimable = [w for w in self.queue if w.publication_id not in exclude]
+        if not claimable:
             self.shutdown.set()
             return None
-        return self.queue.pop(0)
+        if not self.sticky:
+            self.queue.remove(claimable[0])
+        return claimable[0]
 
 
 class _RecordingReconciler:
@@ -2762,12 +2770,14 @@ async def test_supervisor_pass_stops_at_batch_limit(publication: Any) -> None:
     assert reconciler.reconciled == [work.publication_id for work in works]
 
 
-async def test_supervisor_pass_ends_when_a_released_publication_is_reclaimed(
+async def test_supervisor_pass_reaches_newer_work_behind_a_released_publication(
     publication: Any,
 ) -> None:
     shutdown = asyncio.Event()
-    first, second = _distinct_works(publication, 2)
-    store = _QueueStore([first, first, second], shutdown)
+    works = _distinct_works(publication, 3)
+    # Every work stays claimable, as a released in-flight Job does in the real
+    # store, so the oldest must not be handed back ahead of the newer ones.
+    store = _QueueStore(works, shutdown, sticky=True)
     reconciler = _RecordingReconciler()
     supervisor = publication.PublicationReconcileLoop(
         store=store, reconciler=reconciler, interval_seconds=0.01
@@ -2775,8 +2785,7 @@ async def test_supervisor_pass_ends_when_a_released_publication_is_reclaimed(
 
     await asyncio.wait_for(supervisor.run_forever(shutdown), timeout=5)
 
-    assert reconciler.reconciled == [first.publication_id, second.publication_id]
-    assert store.releases == [first.publication_id]
+    assert reconciler.reconciled == [work.publication_id for work in works]
 
 
 def test_supervisor_rejects_non_positive_batch_limit(publication: Any) -> None:
