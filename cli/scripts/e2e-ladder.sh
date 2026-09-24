@@ -3529,14 +3529,15 @@ start_local_otel_sink() {
     ' "$REPO_ROOT/cli/scripts/fixtures/otel-e2e-sink-config.yaml" > "$sink_config"
     LOCAL_OTEL_SINK_OWNED=1
     local start_log="$WORKDIR/otel-sink-start.log" attempt started=0 otlp_host_port
-    # Every stack container dials OTLP at gateway:host-port, so the host port
-    # is named here rather than allocated by Docker (`-p 0.0.0.0::4318`).
+    # Every stack container dials OTLP at gateway:host-port, so that host port
+    # is named here rather than allocated by Docker (`-p 0.0.0.0::4318`):
     # Docker Desktop refuses a Docker-allocated host port from inside its VM,
     # at 127.0.0.1 and at every bridge gateway alike, while a port the caller
-    # names answers there as it does on Linux. A named port can be taken
-    # between this probe and Docker's bind, by a host process or by another
-    # container, so retry only those two refusals; configuration and image
-    # failures remain immediately loud.
+    # names answers there as it does on Linux. The health and self-metrics
+    # ports are read only from this host, so Docker still allocates them. Any
+    # of the three can be taken before Docker binds it, by a host process or
+    # by another container, so retry only those two refusals, with a fresh
+    # OTLP port each time; configuration and image failures remain loud.
     for attempt in $(seq 1 5); do
         otlp_host_port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("0.0.0.0", 0)); print(s.getsockname()[1])')"
         if docker run -d \
@@ -3559,7 +3560,7 @@ start_local_otel_sink() {
             return 1
         fi
         docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
-        echo "local: host port $otlp_host_port was taken on attempt $attempt; retrying task-owned sink" >&2
+        echo "local: a sink host port was taken on attempt $attempt (OTLP tried $otlp_host_port); retrying task-owned sink" >&2
         sleep 1
     done
     if (( ! started )); then
