@@ -141,9 +141,13 @@ _OPTIONS = r"(\s+-[A-Za-z]+)*\s+"
 GNU_ONLY = {
     _COMMAND + r"timeout\s+[-$0-9\"']": 'timeout, absent: use "$GNU_PROCESS" timeout',
     _COMMAND + r"setsid\s+[^\s=]": 'setsid, absent: use "$GNU_PROCESS" setsid',
-    r"\bsed" + _OPTIONS + r"-[A-Za-z]*i(\s|$)": "sed -i with no suffix, which BSD sed reads from the next argument",
+    r"\bsed" + _OPTIONS + r"-[A-Za-z]*i(\s|$)": (
+        "sed -i with no suffix, which BSD sed reads from the next argument"
+    ),
     r"\bsed" + _OPTIONS + r"-[A-Za-z]*z": "sed -z",
-    r"\bstat" + _OPTIONS + r"(-[A-Za-z]*c\b|--(format|printf)\b)": "stat -c, where BSD stat takes -f",
+    r"\bstat" + _OPTIONS + r"(-[A-Za-z]*c\b|--(format|printf)\b)": (
+        "stat -c, where BSD stat takes -f"
+    ),
     r"\bdate" + _OPTIONS + r"(-[A-Za-z]*d\b|--date\b)": "date -d",
     r"\bhead" + _OPTIONS + r"-n\s*-[0-9]": "head -n -N",
     _COMMAND + r"(tac|nproc|numfmt|shuf)\b": "tac, nproc, numfmt and shuf, absent",
@@ -311,7 +315,8 @@ def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        '        out="$(cd "$GATE_CASE_BUNDLE" && "$GNU_PROCESS" timeout "$GATE_CASE_TURN_SECONDS" "$BIN" \\',
+        '        out="$(cd "$GATE_CASE_BUNDLE" && '
+        '"$GNU_PROCESS" timeout "$GATE_CASE_TURN_SECONDS" "$BIN" \\',
         '        "$8" timeout --foreground "$1s" "$2" --context "$3" -n "$4" \\',
         "    \"$GNU_PROCESS\" setsid bash -c '",
         '    sed "s|$good|$bad|" "$backup" >"$lock"',
@@ -959,7 +964,8 @@ case "$*" in
         esac
         exec sleep 30 ;;
     *resourcequota*)
-        echo '{"metadata":{"resourceVersion":"41"},"status":{"used":{"pods":"2"},"hard":{"pods":"2"}},"spec":{"hard":{"pods":"2"}}}' ;;
+        printf '%s\\n' '{"metadata":{"resourceVersion":"41"},' \\
+            '"status":{"used":{"pods":"2"},"hard":{"pods":"2"}},"spec":{"hard":{"pods":"2"}}}' ;;
     *) echo '{"metadata":{"resourceVersion":"41","uid":"uid-1"}}' ;;
 esac
 """
