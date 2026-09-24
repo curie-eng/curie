@@ -142,6 +142,20 @@ def test_prometheus_ships_required_reliability_alerts() -> None:
     assert not missing, f"missing reliability alerts: {missing}"
 
 
+def test_kube_state_metrics_exports_the_labels_core_alerts_select_on() -> None:
+    kube_state_metrics = _load("prometheus-values.yaml")["kube-state-metrics"]
+    allowlist = kube_state_metrics.get("metricLabelsAllowlist") or []
+    assert sorted(allowlist) == sorted(
+        [
+            "deployments=[app.kubernetes.io/component,helm.sh/chart]",
+            "statefulsets=[helm.sh/chart]",
+        ]
+    ), (
+        "CurieCoreWorkloadNotReady and CurieStateStoreNotReady select on these "
+        "labels and stay silent without them"
+    )
+
+
 def test_alert_expressions_keep_identity_and_secrets_out_of_metric_labels() -> None:
     rules = _alert_rules(_load("prometheus-values.yaml"))
     dumped = yaml.safe_dump(rules)
