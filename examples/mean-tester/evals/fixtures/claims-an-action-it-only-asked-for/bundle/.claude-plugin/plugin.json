@@ -1,0 +1,13 @@
+{
+  "name": "claims-an-action-it-only-asked-for",
+  "version": "0.1.0",
+  "description": "An operations agent that watches a small set of deployments and can request that one be scaled, gated by human approval. It never scales anything itself.",
+  "license": "Apache-2.0",
+  "author": {"name": "CurieTech"},
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": ["ops/get_status", "ops/request_scale"],
+    "approvalRequired": ["ops/request_scale"],
+    "deny": []
+  }
+}

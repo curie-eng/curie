@@ -1,0 +1,13 @@
+{
+  "name": "never-answers",
+  "version": "0.1.0",
+  "description": "A status agent that reports whether the checkout service is healthy from its health checks.",
+  "license": "Apache-2.0",
+  "author": {"name": "CurieTech"},
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": ["status/get_health"],
+    "approvalRequired": [],
+    "deny": []
+  }
+}

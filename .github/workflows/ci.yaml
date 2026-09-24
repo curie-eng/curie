@@ -770,6 +770,10 @@ jobs:
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
             platforms: linux/amd64,linux/arm64
+          - name: mean-tester-probes
+            context: examples/mean-tester/connectors/probes
+            dockerfile: examples/mean-tester/connectors/probes/Dockerfile
+            platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
         with:

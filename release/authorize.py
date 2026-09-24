@@ -122,6 +122,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build ui image (no push)",
         "Build sre-bot-tempo image (no push)",
         "Build sre-bot-self-upgrade image (no push)",
+        "Build mean-tester-probes image (no push)",
         "Build worker-local overlay image (no push)",
         "Dispatcher image imports resolve",
         "Repository toolchain proof (runner image)",

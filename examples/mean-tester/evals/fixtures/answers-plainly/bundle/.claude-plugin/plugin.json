@@ -1,0 +1,13 @@
+{
+  "name": "answers-plainly",
+  "version": "0.1.0",
+  "description": "An asset library agent that searches demos, videos and images for teammates.",
+  "license": "Apache-2.0",
+  "author": {"name": "CurieTech"},
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": ["assets/search_assets"],
+    "approvalRequired": [],
+    "deny": []
+  }
+}

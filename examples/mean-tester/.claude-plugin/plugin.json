@@ -1,0 +1,21 @@
+{
+  "name": "mean-tester",
+  "version": "0.1.0",
+  "description": "Mean tests another agent the way a person does: reads its bundle from Git, plans a round of at most four probes, asks it over Slack from its own bot, and reports PASS, FAIL or UNCLEAR per probe with the reply quoted. It never repairs anything and never resolves an approval (ADR 0169).",
+  "license": "Apache-2.0",
+  "author": {"name": "CurieTech"},
+  "keywords": ["testing", "mean-testing", "quality", "slack"],
+  "starterPrompts": [
+    "test @asset-search",
+    "continue"
+  ],
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": ["probes/read_target", "probes/send_probes", "probes/collect_replies", "probes/find_open_issue"],
+    "approvalRequired": ["probes/file_issue"],
+    "deny": []
+  },
+  "approvalPolicy": {
+    "gates": [{"gate": "mcp__probes__file_issue", "route": "mean-tester-issues"}]
+  }
+}

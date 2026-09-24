@@ -182,6 +182,7 @@ testpaths = [
     # the only CI signal on the shipped images was "the Dockerfile builds"
     # (#2093).
     "examples/sre-bot/connectors",
+    "examples/mean-tester/connectors",
     "tools/doclint/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",

@@ -1,0 +1,25 @@
+# The tester's one connector (ADR 0169 d7). It holds the tester's Slack bot
+# token and a GitHub token; the sandbox sees only its tools.
+#
+# ONE SecretRef, not two. Two SecretRefs cannot be deployed: a hosted
+# connector with more than one secret is refused unless it sets
+# `bearer_secret` (`plugin_format/connectors.py`), and setting `bearer_secret`
+# would derive an `Authorization` header the sandbox can never expand -- the
+# runner only drops that unreachable header for a LONE SecretRef
+# (`runner/src/curie_runner/connectors.py`). So both tokens travel as one JSON
+# blob under a single secret name, and the connector splits them itself
+# (`mean_tester_probes.config._credentials`).
+connectors:
+  probes:
+    build:
+      context: connectors/probes
+      platforms: [linux/amd64, linux/arm64]
+    unhosted_url: ${MEAN_TESTER_PROBES_MCP_URL}
+    env:
+      # Operator-listed channels (d7) and repositories (d2, d3). Replace both.
+      MEAN_TESTER_CHANNELS: "C0EXAMPLE1"
+      MEAN_TESTER_REPOS: "curie-eng/curie@main"
+    secrets:
+      - name: MEAN_TESTER_CREDENTIALS
+        from_secret: mean-tester-probes
+        key: MEAN_TESTER_CREDENTIALS

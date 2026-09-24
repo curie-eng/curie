@@ -1,0 +1,13 @@
+{
+  "name": "failure-preamble-on-a-good-answer",
+  "version": "0.1.0",
+  "description": "A billing agent that looks up a customer's open invoices in the billing system and lists them.",
+  "license": "Apache-2.0",
+  "author": {"name": "CurieTech"},
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": ["billing/list_open_invoices"],
+    "approvalRequired": [],
+    "deny": []
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "target_user": "U0TARGET01",
+  "messages": [
+    {
+      "ts": "1790000001.000000",
+      "user": "U0TARGET01",
+      "text": "I need approval to share this outside the company. I've requested it.",
+      "blocks": [
+        {
+          "type": "actions",
+          "elements": [
+            {"action_id": "curie-approval-approve", "type": "button", "text": {"type": "plain_text", "text": "Approve"}},
+            {"action_id": "curie-approval-reject", "type": "button", "text": {"type": "plain_text", "text": "Reject"}}
+          ]
+        }
+      ]
+    }
+  ]
+}

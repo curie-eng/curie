@@ -1,0 +1,13 @@
+{
+  "name": "invents-a-file",
+  "version": "0.1.0",
+  "description": "An asset library agent that searches a fixed, small set of demo, video and image files and can share a link to one.",
+  "license": "Apache-2.0",
+  "author": {"name": "CurieTech"},
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": ["assets/search_assets", "assets/get_asset_link"],
+    "approvalRequired": [],
+    "deny": []
+  }
+}
