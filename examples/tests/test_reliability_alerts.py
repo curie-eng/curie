@@ -35,6 +35,11 @@ REQUIRED_ALERTS = {
     "CurieWorkerSupervisedTaskParked",
     "CurieConnectorNotReady",
     "CurieDispatcherRestartLoop",
+    "CurieNodeNotReady",
+    "CuriePodCrashLooping",
+    "CurieCoreWorkloadNotReady",
+    "CurieStateStoreNotReady",
+    "CuriePersistentVolumeSpaceLow",
 }
 
 FORBIDDEN_IDENTITY = (

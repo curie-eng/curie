@@ -599,3 +599,377 @@ tests:
       - eval_time: 20m
         alertname: CurieDispatcherRestartLoop
         exp_alerts: []
+
+  # kube-state-metrics reports three series per node for the Ready condition,
+  # one per status, and exactly one of them is 1. The rule reads the
+  # status="true" series, so a node that reports false and a node that stopped
+  # reporting (unknown) both fire, and the other two series never do.
+  - name: a node reporting NotReady fires
+    interval: 1m
+    input_series:
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="true"}'
+        values: '0x15'
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="false"}'
+        values: '1x15'
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="unknown"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieNodeNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-node
+              node: acme-node-1
+              condition: Ready
+              status: "true"
+            exp_annotations:
+              summary: A node is not Ready
+              description: A node has not reported Ready for 5 minutes. Pods on it stop being scheduled, and a sandbox placed there cannot start.
+
+  - name: a node whose Ready condition is unknown fires
+    interval: 1m
+    input_series:
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="true"}'
+        values: '0x15'
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="false"}'
+        values: '0x15'
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="unknown"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieNodeNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-node
+              node: acme-node-1
+              condition: Ready
+              status: "true"
+            exp_annotations:
+              summary: A node is not Ready
+              description: A node has not reported Ready for 5 minutes. Pods on it stop being scheduled, and a sandbox placed there cannot start.
+
+  - name: a Ready node stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="true"}'
+        values: '1x15'
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="false"}'
+        values: '0x15'
+      - series: 'kube_node_status_condition{node="acme-node-1",condition="Ready",status="unknown"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieNodeNotReady
+        exp_alerts: []
+
+  # kube-state-metrics emits a waiting_reason series only while the container
+  # waits, so the series exists or it does not. A container that crashes, runs
+  # briefly and crashes again drops out between scrapes, and the scrape that
+  # misses it writes a staleness marker. The flapping case alternates a sample
+  # and a marker each minute, so an instant `== 1` rule would see no series at
+  # the 5m and 15m evaluations and reset its `for` each time.
+  - name: a crash-looping container fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",container="api",reason="CrashLoopBackOff"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CuriePodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-pod
+              namespace: acme
+              pod: acme-curie-api-7dfc698888-q9nr5
+              container: api
+              reason: CrashLoopBackOff
+            exp_annotations:
+              summary: A container is crash-looping
+              description: A container has been in CrashLoopBackOff for 10 minutes. It keeps failing on start and waits longer before each retry.
+
+  - name: a container flapping between waiting and running fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",container="api",reason="CrashLoopBackOff"}'
+        values: '1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1 stale 1'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CuriePodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-pod
+              namespace: acme
+              pod: acme-curie-api-7dfc698888-q9nr5
+              container: api
+              reason: CrashLoopBackOff
+            exp_annotations:
+              summary: A container is crash-looping
+              description: A container has been in CrashLoopBackOff for 10 minutes. It keeps failing on start and waits longer before each retry.
+
+  - name: a container waiting for another reason stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{namespace="acme",pod="acme-curie-api-7dfc698888-q9nr5",container="api",reason="ContainerCreating"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CuriePodCrashLooping
+        exp_alerts: []
+
+  # The core Deployments are `<fullname>-api`, `-worker` and `-dispatcher`.
+  # Same two terms as the connector rule, for the same reason. The chart's
+  # Langfuse worker also ends in `-worker`, and a connector for an agent can
+  # end in `-api`; neither belongs to this rule.
+  - name: a core api scaled to zero fires
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="acme",deployment="acme-curie-api"}'
+        values: '0x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="acme",deployment="acme-curie-api"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieCoreWorkloadNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-core
+              namespace: acme
+              deployment: acme-curie-api
+            exp_annotations:
+              summary: A core Curie Deployment is not serving
+              description: The api, worker or dispatcher has no available replica, or has been scaled to zero. The api readiness probe queries the database, so a database outage, including one outside the cluster, surfaces here as an unavailable api.
+
+  - name: a core worker with an unavailable replica fires
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="acme",deployment="acme-curie-worker"}'
+        values: '1x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="acme",deployment="acme-curie-worker"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieCoreWorkloadNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-core
+              namespace: acme
+              deployment: acme-curie-worker
+            exp_annotations:
+              summary: A core Curie Deployment is not serving
+              description: The api, worker or dispatcher has no available replica, or has been scaled to zero. The api readiness probe queries the database, so a database outage, including one outside the cluster, surfaces here as an unavailable api.
+
+  - name: a healthy core dispatcher stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="acme",deployment="acme-curie-dispatcher"}'
+        values: '1x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="acme",deployment="acme-curie-dispatcher"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieCoreWorkloadNotReady
+        exp_alerts: []
+
+  - name: a langfuse worker scaled to zero stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="acme",deployment="acme-curie-langfuse-worker"}'
+        values: '0x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="acme",deployment="acme-curie-langfuse-worker"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieCoreWorkloadNotReady
+        exp_alerts: []
+
+  - name: a connector ending in api scaled to zero stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="acme",deployment="acme-curie-acme-bot-mcp-api"}'
+        values: '0x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="acme",deployment="acme-curie-acme-bot-mcp-api"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieCoreWorkloadNotReady
+        exp_alerts: []
+
+  # Valkey and Postgres are StatefulSets named `<fullname>-valkey` and
+  # `<fullname>-postgres`. Ready below desired is the first term. Scaled to
+  # zero is the second, since ready 0 is not below desired 0. The two terms
+  # cannot both hold for one StatefulSet.
+  - name: a valkey with no ready replica fires
+    interval: 1m
+    input_series:
+      - series: 'kube_statefulset_replicas{namespace="acme",statefulset="acme-curie-valkey"}'
+        values: '1x15'
+      - series: 'kube_statefulset_status_replicas_ready{namespace="acme",statefulset="acme-curie-valkey"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieStateStoreNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-state
+              namespace: acme
+              statefulset: acme-curie-valkey
+            exp_annotations:
+              summary: Valkey or Postgres is not ready
+              description: >-
+                A Valkey or Postgres StatefulSet has fewer ready replicas than
+                it asks for, or has been scaled to zero. Every agent depends on
+                both: Valkey carries the run queue and Postgres the agents and
+                their state.
+
+  - name: a postgres scaled to zero fires
+    interval: 1m
+    input_series:
+      - series: 'kube_statefulset_replicas{namespace="acme",statefulset="acme-curie-postgres"}'
+        values: '0x15'
+      - series: 'kube_statefulset_status_replicas_ready{namespace="acme",statefulset="acme-curie-postgres"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieStateStoreNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-state
+              namespace: acme
+              statefulset: acme-curie-postgres
+            exp_annotations:
+              summary: Valkey or Postgres is not ready
+              description: >-
+                A Valkey or Postgres StatefulSet has fewer ready replicas than
+                it asks for, or has been scaled to zero. Every agent depends on
+                both: Valkey carries the run queue and Postgres the agents and
+                their state.
+
+  - name: a valkey with every replica ready stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_statefulset_replicas{namespace="acme",statefulset="acme-curie-valkey"}'
+        values: '1x15'
+      - series: 'kube_statefulset_status_replicas_ready{namespace="acme",statefulset="acme-curie-valkey"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieStateStoreNotReady
+        exp_alerts: []
+
+  # Both StatefulSet series come from one kube-state-metrics target, so they
+  # share every label but __name__, and the alert keeps all of them whichever
+  # term holds. Matching the first term `on` a subset of labels would give it a
+  # smaller label set than the second, and a store going from not ready to
+  # scaled to zero would become a new alert whose `for` starts again. Here
+  # the scale to zero lands at 7m, so the 10m evaluation is 10 minutes into
+  # the outage but only 3 minutes into the second term.
+  - name: a valkey with no ready replica fires with every target label
+    interval: 1m
+    input_series:
+      - series: 'kube_statefulset_replicas{namespace="acme",statefulset="acme-curie-valkey",job="kubernetes-service-endpoints",instance="10.0.0.10:8080",curie_source="curie-sre-bot"}'
+        values: '1x15'
+      - series: 'kube_statefulset_status_replicas_ready{namespace="acme",statefulset="acme-curie-valkey",job="kubernetes-service-endpoints",instance="10.0.0.10:8080",curie_source="curie-sre-bot"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieStateStoreNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-state
+              namespace: acme
+              statefulset: acme-curie-valkey
+              job: kubernetes-service-endpoints
+              instance: "10.0.0.10:8080"
+              curie_source: curie-sre-bot
+            exp_annotations:
+              summary: Valkey or Postgres is not ready
+              description: >-
+                A Valkey or Postgres StatefulSet has fewer ready replicas than
+                it asks for, or has been scaled to zero. Every agent depends on
+                both: Valkey carries the run queue and Postgres the agents and
+                their state.
+
+  - name: a valkey scaled to zero while not ready keeps firing
+    interval: 1m
+    input_series:
+      - series: 'kube_statefulset_replicas{namespace="acme",statefulset="acme-curie-valkey",job="kubernetes-service-endpoints",instance="10.0.0.10:8080",curie_source="curie-sre-bot"}'
+        values: '1x6 0x9'
+      - series: 'kube_statefulset_status_replicas_ready{namespace="acme",statefulset="acme-curie-valkey",job="kubernetes-service-endpoints",instance="10.0.0.10:8080",curie_source="curie-sre-bot"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieStateStoreNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-state
+              namespace: acme
+              statefulset: acme-curie-valkey
+              job: kubernetes-service-endpoints
+              instance: "10.0.0.10:8080"
+              curie_source: curie-sre-bot
+            exp_annotations:
+              summary: Valkey or Postgres is not ready
+              description: >-
+                A Valkey or Postgres StatefulSet has fewer ready replicas than
+                it asks for, or has been scaled to zero. Every agent depends on
+                both: Valkey carries the run queue and Postgres the agents and
+                their state.
+
+  # Kubelet volume stats come from the node-role scrape, which carries the
+  # curie_source stamp like the node rules above. A second stack's series for
+  # the same claim has no stamp and must not page this one.
+  - name: a persistent volume under 10 percent free fires
+    interval: 1m
+    input_series:
+      - series: 'kubelet_volume_stats_available_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '5x25'
+      - series: 'kubelet_volume_stats_capacity_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '100x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CuriePersistentVolumeSpaceLow
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-storage
+              namespace: acme
+              persistentvolumeclaim: data-acme-curie-valkey-0
+              job: kubernetes-nodes
+              curie_source: curie-sre-bot
+            exp_annotations:
+              summary: A persistent volume has less than 10 percent free
+              description: A curie_source=curie-sre-bot volume series has stayed below 10 percent free for 15 minutes. A full volume stops the workload that writes to it.
+
+  - name: a persistent volume half free stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kubelet_volume_stats_available_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '50x25'
+      - series: 'kubelet_volume_stats_capacity_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",job="kubernetes-nodes",curie_source="curie-sre-bot"}'
+        values: '100x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CuriePersistentVolumeSpaceLow
+        exp_alerts: []
+
+  - name: an unstamped persistent volume under 10 percent free stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kubelet_volume_stats_available_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",job="kubernetes-nodes"}'
+        values: '5x25'
+      - series: 'kubelet_volume_stats_capacity_bytes{namespace="acme",persistentvolumeclaim="data-acme-curie-valkey-0",job="kubernetes-nodes"}'
+        values: '100x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CuriePersistentVolumeSpaceLow
+        exp_alerts: []
