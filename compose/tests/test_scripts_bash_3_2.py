@@ -25,8 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LADDER_PATH = REPO_ROOT / "cli" / "scripts" / "e2e-ladder.sh"
 AGENT_SKILLS_PATH = REPO_ROOT / "scripts" / "check-agent-skills.sh"
 SRE_DEMO_PATH = REPO_ROOT / "cli" / "scripts" / "sre-demo-e2e.sh"
+IDLE_ROUTE_PATH = (
+    REPO_ROOT / "cli" / "scripts" / "e2e-cluster-idle-route-reclamation.sh"
+)
 # Scripts a contributor runs on their own host, whose bash may be 3.2.
-HOST_SCRIPTS = [LADDER_PATH, AGENT_SKILLS_PATH, SRE_DEMO_PATH]
+HOST_SCRIPTS = [LADDER_PATH, AGENT_SKILLS_PATH, SRE_DEMO_PATH, IDLE_ROUTE_PATH]
 
 
 def _bash3() -> str | None:
@@ -63,6 +66,15 @@ def _shell_function(source: str, name: str, path: Path = LADDER_PATH) -> str:
     start = source.index(start_marker)
     end = source.index("\n}\n", start) + len("\n}\n")
     return source[start:end]
+
+
+def _top_level_block(source: str, start: str, end: str, path: Path) -> str:
+    """The script's own lines from ``start`` up to, not including, ``end``."""
+
+    assert source.count(start) == 1, f"{path}: expected one {start!r}"
+    begin = source.index(start)
+    assert end in source[begin:], f"{path}: missing {end!r} after {start!r}"
+    return source[begin : source.index(end, begin)]
 
 
 # Constructs bash 3.2 rejects, with the release that introduced each.
@@ -355,3 +367,95 @@ def test_sre_demo_names_each_blocked_rows_own_reason(
     ], result.stderr
     for line, reason in zip(blocked, SRE_DEMO_BLOCK_REASONS.values(), strict=True):
         assert reason in line, line
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize(
+    "routes",
+    [
+        [
+            "curie:sandbox:route:acme-bot:1700000000.000100",
+            "curie:sandbox:route:acme-bot:1700000000.000200",
+        ],
+        [],
+    ],
+    ids=["two-routes", "no-routes"],
+)
+def test_idle_route_reclamation_resets_every_route_the_ladder_left(
+    interpreter: str, routes: list[str], tmp_path: Path
+) -> None:
+    block = _top_level_block(
+        IDLE_ROUTE_PATH.read_text(),
+        'echo "=== release routes left by the required cluster ladder ==="',
+        "wait_no_resources sandboxclaims",
+        IDLE_ROUTE_PATH,
+    )
+    (tmp_path / "routes").write_text("".join(f"{route}\n" for route in routes))
+    script = f"""set -euo pipefail
+WORKDIR="$1"
+route_keys() {{ cat "$WORKDIR/routes"; }}
+reset_thread() {{ printf 'reset %s %s\\n' "$1" "${{2#"$WORKDIR"/}}" >> "$WORKDIR/calls"; }}
+wait_route_gone() {{ printf 'gone %s\\n' "$1" >> "$WORKDIR/calls"; }}
+{block}"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    calls = tmp_path / "calls"
+    expected = []
+    for index, route in enumerate(routes):
+        expected += [f"reset {route} reset-preexisting-{index}.json", f"gone {route}"]
+    assert (calls.read_text().splitlines() if calls.exists() else []) == expected
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize(
+    "pods",
+    [[], ["acme-filler-1", "acme-filler-2"]],
+    ids=["before-fillers", "with-fillers"],
+)
+def test_idle_route_reclamation_cleanup_keeps_the_exit_code_and_its_workdir_goes(
+    interpreter: str, pods: list[str], tmp_path: Path
+) -> None:
+    """A run that fails before the fillers exist still cleans up after itself."""
+
+    cleanup = _shell_function(IDLE_ROUTE_PATH.read_text(), "cleanup", IDLE_ROUTE_PATH)
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    kube_log = tmp_path / "kube.log"
+    watches = " ".join(
+        f"{kind}_WATCH_{field}=''"
+        for kind in ("QUOTA", "VICTIM_CLAIM", "VICTIM_SANDBOX")
+        for field in ("PID", "RAW", "ERROR")
+    )
+    script = f"""set -euo pipefail
+WORKDIR="$1"
+NAMESPACE=acme-ns
+FILLER_LABEL_NAME=curie-e2e-idle-route-reclamation
+{watches}
+FILLER_PODS=({" ".join(pods)})
+stop_pid() {{ :; }}
+print_watch_diagnostic() {{ :; }}
+restore_runner_ingress() {{ :; }}
+delete_unrelated_valkey_keys() {{ :; }}
+kube() {{ printf '%s\\n' "$*" >> "$KUBE_LOG"; }}
+{cleanup}
+trap cleanup EXIT
+exit 3
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(workdir)],
+        env={**os.environ, "KUBE_LOG": str(kube_log)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 3, result.stderr
+    assert not workdir.exists(), result.stderr
+    assert (kube_log.read_text().splitlines() if kube_log.exists() else []) == [
+        f"-n acme-ns label pod {pod} curie-e2e-idle-route-reclamation- --overwrite"
+        for pod in pods
+    ], result.stderr
