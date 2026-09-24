@@ -122,6 +122,44 @@ def _black_hole_api() -> Iterator[str]:
         sock.close()
 
 
+class OfflineIdentity:
+    """A principal resolver that knows no one and never touches the network.
+
+    ``register_handlers`` builds the production ``IdentityResolveClient`` when a
+    caller does not inject one (#2910), and that client POSTs to the configured
+    API (``http://localhost:8000`` by default). Every harness that builds the
+    app without an ``identity_client`` gets this instead, so no dispatcher test
+    sends traffic to a developer's running API stack.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def resolve_slack_user(self, team_id: str, user_id: str) -> dict[str, Any] | None:
+        self.calls.append((team_id, user_id))
+        return None
+
+
+@pytest.fixture(autouse=True)
+def offline_identity(monkeypatch: pytest.MonkeyPatch) -> list[OfflineIdentity]:
+    """Replace the handler module's production identity-client builder.
+
+    Only the name ``register_handlers`` resolves is patched: tests that inject
+    ``identity_client`` are unaffected, and a test that exercises
+    ``build_identity_client`` itself imports it from ``curie_dispatcher.identity``.
+    Yields every stub handed out, so a test can see the middleware got one.
+    """
+    built: list[OfflineIdentity] = []
+
+    def _offline(_config: DispatcherConfig) -> OfflineIdentity:
+        stub = OfflineIdentity()
+        built.append(stub)
+        return stub
+
+    monkeypatch.setattr("curie_dispatcher.handlers.build_identity_client", _offline)
+    return built
+
+
 # Compose defaults and connection params come from the shared curie_test_support.valkey helper.
 
 
