@@ -5008,23 +5008,71 @@ fn cluster_stream_rows() -> serde_json::Value {
     )
 }
 
+/// How the external Slack phase's receipt sits on disk.
+#[derive(Clone, Copy)]
+enum ReceiptFile {
+    /// Mode 0600, the only shape the consumers accept.
+    Private,
+    /// Mode 0644, readable by every local account.
+    WorldReadable,
+    /// A symlink whose mode-0600 target holds the receipt.
+    SymlinkToPrivate,
+}
+
 fn run_cluster_receipt_consumers(
     receipt: &serde_json::Value,
     coding_tool: &str,
     command: &str,
 ) -> (Output, String, Option<serde_json::Value>) {
+    run_cluster_receipt_consumers_from(receipt, ReceiptFile::Private, coding_tool, command)
+}
+
+fn run_cluster_receipt_consumers_from(
+    receipt: &serde_json::Value,
+    file: ReceiptFile,
+    coding_tool: &str,
+    command: &str,
+) -> (Output, String, Option<serde_json::Value>) {
     let harness = tempfile::tempdir().expect("create cluster receipt harness");
     let receipt_path = harness.path().join("receipt.json");
+    let written_path = match file {
+        ReceiptFile::SymlinkToPrivate => harness.path().join("receipt-target.json"),
+        ReceiptFile::Private | ReceiptFile::WorldReadable => receipt_path.clone(),
+    };
     fs::write(
-        &receipt_path,
+        &written_path,
         serde_json::to_vec(receipt).expect("serialize cluster receipt"),
     )
     .expect("write cluster receipt");
-    let mut receipt_permissions = fs::metadata(&receipt_path)
+    let mut receipt_permissions = fs::metadata(&written_path)
         .expect("read cluster receipt metadata")
         .permissions();
-    receipt_permissions.set_mode(0o600);
-    fs::set_permissions(&receipt_path, receipt_permissions).expect("protect cluster receipt");
+    receipt_permissions.set_mode(match file {
+        ReceiptFile::WorldReadable => 0o644,
+        ReceiptFile::Private | ReceiptFile::SymlinkToPrivate => 0o600,
+    });
+    fs::set_permissions(&written_path, receipt_permissions).expect("protect cluster receipt");
+    if let ReceiptFile::SymlinkToPrivate = file {
+        std::os::unix::fs::symlink(&written_path, &receipt_path).expect("link cluster receipt");
+    }
+
+    // macOS ships BSD stat, which refuses GNU's `-c` exactly like this. Every
+    // run sees it, so a consumer that reads the receipt's mode through one
+    // stat dialect fails on a Linux host too, not only on a Mac.
+    write_executable(
+        &harness.path().join("stat"),
+        r#"#!/bin/sh
+case "$1" in
+    -c*)
+        echo "stat: illegal option -- c" >&2
+        echo "usage: stat [-FLnq] [-f format | -l | -r | -s | -x] [-t timefmt] [file ...]" >&2
+        exit 1
+        ;;
+esac
+echo "unexpected stat invocation: $*" >&2
+exit 97
+"#,
+    );
 
     fs::write(
         harness.path().join("stream.json"),
@@ -5248,6 +5296,36 @@ printf 'membership=%s\n' "$LAST_QUERY_MEMBERSHIP""#,
         assert!(
             boundaries.is_empty(),
             "a {label} coding digest must fail before stream or telemetry access: {boundaries}"
+        );
+    }
+}
+
+#[test]
+fn cluster_external_ingress_receipt_is_refused_unless_it_is_a_private_file() {
+    let receipt = cluster_external_receipt(true, Some(&correct_cluster_coding_receipt()));
+    for (label, file) in [
+        ("mode 0644", ReceiptFile::WorldReadable),
+        ("symlinked", ReceiptFile::SymlinkToPrivate),
+    ] {
+        let (output, boundaries, _) = run_cluster_receipt_consumers_from(
+            &receipt,
+            file,
+            "Bash",
+            r#"cluster_external_ingress_seed coding "execute_tool""#,
+        );
+        assert!(
+            !output.status.success(),
+            "a {label} receipt must be refused: {}",
+            transcript(&output)
+        );
+        assert!(
+            transcript(&output).contains("the external Slack ingress receipt must be mode 0600"),
+            "a {label} receipt must be refused for its mode: {}",
+            transcript(&output)
+        );
+        assert!(
+            boundaries.is_empty(),
+            "a {label} receipt must be refused before stream or telemetry access: {boundaries}"
         );
     }
 }
