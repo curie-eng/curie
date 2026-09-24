@@ -375,7 +375,10 @@ serverFiles:
             # reschedule keeps one label set. For the Ready term the `for`
             # clock survives that only when the old and new pods overlap; a
             # restart that misses a scrape still restarts it.
-            # status="true" == 0 also catches Unknown.
+            # status="true" == 0 also catches Unknown. Known false positive: a
+            # node this Prometheus can never scrape, such as a node pool
+            # behind a stricter network rule or a virtual node, reads up == 0
+            # and pages until it is excluded from the kubernetes-nodes job.
             expr: |
               max by (node) (
                 kube_node_status_condition{
