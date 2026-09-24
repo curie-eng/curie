@@ -1342,6 +1342,14 @@ api:
 
 dispatcher:
   deploy: true
+  # The dispatcher is not a rolling workload. It deploys with strategy Recreate
+  # so a rollout never runs two Socket Mode clients on one app token: Slack
+  # delivers each event to only one connected client, and an event handed to a
+  # pod that is terminating is lost (issue #2944). The cost is a brief gap on
+  # every rollout, from the old pod exiting until the new pod reconnects, in
+  # which Slack retries events it could not deliver instead of splitting them.
+  # For the same reason keep replicas at 1: each extra replica is another
+  # client on the same tokens.
   replicas: 1
   # Platform API the dispatcher resolves Slack approval clicks against. Empty
   # (the default) derives the in-chart API Service,

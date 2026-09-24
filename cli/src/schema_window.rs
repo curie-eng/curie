@@ -406,6 +406,16 @@ mod tests {
     }
 
     #[test]
+    fn unreleased_patch_093_keeps_the_092_schema_window() {
+        let previous = window_for("0.9.2").expect("0.9.2 schema window");
+        let patch = window_for("0.9.3").expect("0.9.3 schema window");
+        assert_eq!(patch.schema_min, previous.schema_min);
+        assert_eq!(patch.schema_head, previous.schema_head);
+        assert_eq!(patch.schema_min, "0045");
+        assert_eq!(patch.schema_head, "0045");
+    }
+
+    #[test]
     fn catalog_head_matches_this_tree() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

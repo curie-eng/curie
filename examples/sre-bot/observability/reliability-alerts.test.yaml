@@ -461,3 +461,141 @@ tests:
       - eval_time: 15m
         alertname: CurieWorkerSupervisedTaskParked
         exp_alerts: []
+
+  # A mail adapter scaled to zero is stopped. kube-state-metrics reports
+  # `replicas_unavailable` as spec minus available, so at zero replicas it is
+  # 0 - 0 = 0 and a rule on `unavailable > 0` cannot see it. Found on a
+  # downstream EKS cluster by scaling one to zero on purpose: nothing fired.
+  - name: a mail adapter scaled to zero fires
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="mail-adapter"}'
+        values: '0x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="mail-adapter"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieMailAdapterNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-token
+              namespace: curie
+              deployment: mail-adapter
+            exp_annotations:
+              summary: Mail adapter replicas are unavailable
+              description: The mail adapter Deployment has unavailable replicas. An expired channel token fails /readyz and surfaces here without inspecting a token value.
+
+  # One installation can run several mail adapters, one per mailbox, named
+  # with a suffix. PromQL label matchers are fully anchored, so
+  # `deployment=~".*mail-adapter"` matches `mail-adapter` and not
+  # `mail-adapter-brand`. On the downstream cluster that measured this, two of
+  # its three adapters could never alert.
+  - name: a suffixed mail adapter with unavailable replicas fires
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="mail-adapter-brand"}'
+        values: '1x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="mail-adapter-brand"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieMailAdapterNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-token
+              namespace: curie
+              deployment: mail-adapter-brand
+            exp_annotations:
+              summary: Mail adapter replicas are unavailable
+              description: The mail adapter Deployment has unavailable replicas. An expired channel token fails /readyz and surfaces here without inspecting a token value.
+
+  # A connector is a Deployment per (agent, connector) named
+  # `<release>-<agent>-mcp-<connector>`. When one is down its agent still
+  # answers -- it says it cannot reach the systems it reads from -- so nothing
+  # else in this rule set notices. No rule watched a connector at all.
+  - name: a connector with no available replica fires
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="curie-brand-mcp-brand"}'
+        values: '1x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="curie-brand-mcp-brand"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieConnectorNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-connector
+              namespace: curie
+              deployment: curie-brand-mcp-brand
+            exp_annotations:
+              summary: A connector Deployment is not serving
+              description: A connector has no available replica, or has been scaled to zero. Its agent still answers, and tells the person it cannot reach the systems it reads from.
+
+  - name: a connector scaled to zero fires
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="curie-brand-mcp-brand"}'
+        values: '0x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="curie-brand-mcp-brand"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieConnectorNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-connector
+              namespace: curie
+              deployment: curie-brand-mcp-brand
+            exp_annotations:
+              summary: A connector Deployment is not serving
+              description: A connector has no available replica, or has been scaled to zero. Its agent still answers, and tells the person it cannot reach the systems it reads from.
+
+  - name: a healthy connector stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="curie-brand-mcp-brand"}'
+        values: '1x15'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="curie-brand-mcp-brand"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieConnectorNotReady
+        exp_alerts: []
+
+  # The dispatcher down is the quietest failure an installation has: every pod
+  # is Running, nothing errors, and no Slack message reaches any agent.
+  # CurieWorkerSupervisedRestartLoop watches the worker's own supervised-task
+  # counter, not a pod restarting, and nothing watched the dispatcher.
+  - name: a crash-looping dispatcher fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="curie",pod="curie-dispatcher-7dfc698888-q9nr5",container="dispatcher"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieDispatcherRestartLoop
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-dispatcher
+              namespace: curie
+              pod: curie-dispatcher-7dfc698888-q9nr5
+              container: dispatcher
+            exp_annotations:
+              summary: The dispatcher is crash-looping
+              description: A dispatcher container restarted three or more times in 30 minutes. While it is down no Slack message reaches any agent, and every other pod still looks healthy.
+
+  - name: a dispatcher that restarted once and settled stays quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="curie",pod="curie-dispatcher-7dfc698888-q9nr5",container="dispatcher"}'
+        values: '0 1x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieDispatcherRestartLoop
+        exp_alerts: []

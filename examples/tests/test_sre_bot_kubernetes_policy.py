@@ -205,3 +205,23 @@ def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -
         doc.get("roleRef", {}).get("name") not in {"sre-bot-upgrader", "curie-platform-upgrader"}
         for doc in documents
     )
+
+
+def test_workload_role_lets_approved_pod_server_side_apply_succeed() -> None:
+    # #2922: resources_create_or_update uses server-side apply, which Kubernetes
+    # authorizes as the `patch` verb. Without it an approved Pod apply is refused.
+    documents = list(
+        yaml.safe_load_all((BUNDLE / "manifests" / "kubernetes-access.yaml").read_text())
+    )
+    (role,) = [doc for doc in documents if doc.get("kind") == "Role"]
+    pod_verbs = {
+        verb
+        for rule in role["rules"]
+        if rule["apiGroups"] == [""] and "pods" in rule["resources"]
+        for verb in rule["verbs"]
+    }
+    assert pod_verbs == {"get", "list", "watch", "create", "patch", "delete"}
+    (cluster_role,) = [doc for doc in documents if doc.get("kind") == "ClusterRole"]
+    assert not any(
+        "patch" in rule["verbs"] for rule in cluster_role["rules"]
+    ), "patch must stay namespaced to sre-demo"
