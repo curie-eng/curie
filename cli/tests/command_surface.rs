@@ -960,3 +960,65 @@ fn retired_hint_returns_none_for_valid_starts_help_and_message_bodies() {
         assert_hint_none(argv);
     }
 }
+
+fn collect_command_paths(node: &serde_json::Value, prefix: &[String], out: &mut Vec<Vec<String>>) {
+    for sub in node["subcommands"].as_array().into_iter().flatten() {
+        let mut path = prefix.to_vec();
+        path.push(sub["name"].as_str().expect("subcommand name").to_owned());
+        out.push(path.clone());
+        collect_command_paths(sub, &path, out);
+    }
+}
+
+/// #2982: `--help` must never print the value of `CURIE_API_KEY`. Every
+/// command path is swept, so a new API key argument declared with `env` but
+/// without `hide_env_values` fails here instead of leaking the platform key.
+#[test]
+fn help_never_discloses_the_curie_api_key_value() {
+    const SENTINEL: &str = "sentinel-api-key-2982-do-not-print";
+    let mut paths = Vec::new();
+    collect_command_paths(&live_command_manifest(), &[], &mut paths);
+    assert!(
+        paths.iter().any(|p| p == &["local", "message"])
+            && paths.iter().any(|p| p == &["cluster", "message"])
+            && paths.iter().any(|p| p == &["doctor"]),
+        "manifest walk lost the #2982 commands: {paths:?}"
+    );
+
+    let mut leaks = Vec::new();
+    for path in &paths {
+        let output = Command::new(bin())
+            .args(path)
+            .arg("--help")
+            .env("CURIE_API_KEY", SENTINEL)
+            .output()
+            .expect("run curie --help");
+        let text = output_text(&output);
+        if text.contains(SENTINEL) {
+            leaks.push(path.join(" "));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "--help printed CURIE_API_KEY for: {leaks:?}"
+    );
+
+    for path in [
+        &["local", "message"][..],
+        &["cluster", "message"],
+        &["doctor"],
+    ] {
+        let mut command = Command::new(bin());
+        command
+            .args(path)
+            .arg("--help")
+            .env("CURIE_API_KEY", SENTINEL);
+        let output = command.output().expect("run curie --help");
+        let text = output_text(&output);
+        assert!(output.status.success(), "{path:?} --help failed\n{text}");
+        assert!(
+            text.contains("--api-key") && text.contains("CURIE_API_KEY"),
+            "{path:?} help lost the --api-key flag or its env name\n{text}"
+        );
+    }
+}

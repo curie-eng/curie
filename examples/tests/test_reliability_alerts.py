@@ -33,6 +33,8 @@ REQUIRED_ALERTS = {
     "CurieDuplicateNodeExporter",
     "CurieWorkerSupervisedRestartLoop",
     "CurieWorkerSupervisedTaskParked",
+    "CurieConnectorNotReady",
+    "CurieDispatcherRestartLoop",
 }
 
 FORBIDDEN_IDENTITY = (

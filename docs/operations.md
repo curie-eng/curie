@@ -411,7 +411,7 @@ and runs every target check before mutation.
 | `--to <version>` | Target Curie version. Required. |
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. |
+| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
 | `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
 
 One resumable lifecycle: inspect and plan, validate configuration and

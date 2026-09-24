@@ -534,17 +534,56 @@ def test_runtime_repo_parser_deduplicates_bare_and_url_for_the_same_repo(
     ) == "acme-corp/acme-bot"
 
 
-def test_runtime_repo_parser_rejects_two_different_bare_names(workspace: Any) -> None:
+def test_runtime_repo_parser_reads_two_bare_names_as_prose(workspace: Any) -> None:
+    """REVERSES the refusal this test asserted, for #2767.
+
+    The claim was right when those tokens really are repositories, and a bare
+    owner/repo is a guess: `P/L`, `24/7`, `him/her` and every media type match
+    the same shape. One guess reaches the allowlist and is refused there; two
+    never got that far, because the count raised in the parser first.
+    """
+    assert workspace.parse_github_repo_fact(
+        "Compare acme-corp/acme-bot with acme-corp/acme-api before changing anything."
+    ) is None
+
+
+def test_runtime_repo_parser_still_rejects_two_different_urls(workspace: Any) -> None:
+    """The half of that refusal which survives, and why.
+
+    A github.com URL is unambiguous by construction, so two of them are two
+    repositories and nothing else. #2767 reverses the bare case only.
+    """
     with pytest.raises(
         workspace.WorkspaceSelectionRefused, match="only one"
     ) as excinfo:
         workspace.parse_github_repo_fact(
-            "Compare acme-corp/acme-bot with acme-corp/acme-api before changing anything."
+            "Compare https://github.com/acme-corp/acme-bot with "
+            "https://github.com/acme-corp/acme-api before changing anything."
         )
     assert excinfo.value.public_detail == (
         "This message names more than one GitHub repository, so no repository "
         "was attached and no work started. A thread works in only one repository."
     )
+
+
+def test_two_slashed_english_pairs_name_no_repository(workspace: Any) -> None:
+    """#2767, in the words it was measured in.
+
+    The media-type row is any message naming two attachments.
+    """
+    for text in (
+        "the P/L statement and our 24/7 support desk",
+        "the file is application/pdf and the deck is image/png",
+        "him/her and 24/7 and headlines/taglines all at once",
+    ):
+        assert workspace.parse_github_repo_fact(text) is None, text
+
+
+def test_a_url_is_not_refused_by_prose_beside_it(workspace: Any) -> None:
+    """A bare token next to a URL is noise beside a plain statement. #2767."""
+    assert workspace.parse_github_repo_fact(
+        "Update https://github.com/acme-corp/acme-bot -- see the P/L statement for why."
+    ) == "acme-corp/acme-bot"
 
 
 def test_runtime_repo_parser_still_rejects_a_pull_request_url(workspace: Any) -> None:
