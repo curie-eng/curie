@@ -190,8 +190,9 @@ Run the installer with `--dry-run` first to inspect its ordered mutation plan.
 The optional `--platform-upgrade` flag adds a separate, much wider
 zero-argument Job-trigger path; read
 [the platform-upgrade Role](examples/sre-bot/manifests/platform-upgrade-role.yaml)
-before enabling it. The general Kubernetes connector never receives that Role
-or credential.
+before enabling it. Under the default grant, the general Kubernetes connector
+never receives that Role or credential; under the opt-in operator grant it can
+run a pod as the platform upgrader, one approved call away.
 
 For manual deployment, apply
 [the Kubernetes access manifest](examples/sre-bot/manifests/kubernetes-access.yaml),

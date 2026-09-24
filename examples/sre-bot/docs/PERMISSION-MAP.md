@@ -64,23 +64,29 @@ below lifts most of that.
 
 Raw manifest updates can change images, commands, and environment inside that
 ceiling. Kubernetes RBAC cannot restrict a patch to a friendly field, and there
-is no generic rollback for tho### Operator grant (opt-in)
+is no generic rollback for those changes. Approval controls the agent, not the
+credential: if the credential leaks, only RBAC remains.
+
+### Operator grant (opt-in)
 
 An operator who wants approved writes to reach workloads outside `sre-demo`
 applies `manifests/kubernetes-operator-access.yaml` after the default file. It
 binds the same `sre-bot-kubernetes` ServiceAccount to the aggregated
 ClusterRole `sre-bot-kubernetes-operator`: get, list, watch, create, update,
 patch, delete and deletecollection on every built-in kind in every namespace
-and at cluster scope, plus Curie's sandbox groups and the add-on groups the
-default reads. The six mutations above still require approval; RBAC is still
-the ceiling, now a much higher one.
+and at cluster scope, and on the add-on groups the default reads. Curie's
+sandbox groups get only delete and deletecollection: a Sandbox or SandboxClaim
+spec carries per-run credentials, so the grant can clear a stuck one but never
+read one. The six mutations above still require approval; RBAC is still the
+ceiling, now a much higher one.
 
 Reads widen as well, and reads run without approval: the read tools reach every
-non-Secret resource in every namespace, Curie's own objects and RBAC included,
-and the kubelet through `nodes/proxy`, which `nodes_log` and
-`nodes_stats_summary` use to read node logs and stats. The credential is not
-limited to that: any access to `nodes/proxy`, `get` included, reaches the
-kubelet's exec and run endpoints, so it is exec into any container on the node.
+non-Secret resource in every namespace except Curie's sandbox objects, Curie's
+other objects and RBAC included, and the kubelet through `nodes/proxy`, which
+`nodes_log` and `nodes_stats_summary` use to read node logs and stats. The
+credential is not limited to that: any access to `nodes/proxy`, `get`
+included, reaches the kubelet's exec and run endpoints, so it is exec into any
+container on the node.
 
 It withholds Secrets, `serviceaccounts/token`, `pods/proxy` and
 `services/proxy` (no tool here uses them, and they would tunnel ungated reads
@@ -99,13 +105,15 @@ Each of these stays one approved call away:
 - APIServices, which can redirect a whole API group;
 - a binding that hands this role to another subject, which outlives the
   approval;
-- changes to Curie itself (its Deployments and SandboxTemplates), including how
+- changes to Curie itself (its Deployments, SandboxTemplates, ConfigMaps and
+  NetworkPolicies, the sandbox egress policy among them), including how
   approvals are enforced, after which later writes may not reach an approval;
 - Argo CD objects, which deploy with Argo CD's own identity.
 
 Under this grant approval is the real protection for Secret contents, and a
 leaked connector credential carries the whole grant with no approval in front
-of it, exec into any container on any node through `nodes/proxy` included. The file's header lists each path and the checks to run after applying.
+of it, exec into any container on any node through `nodes/proxy` included.
+The file's header lists each path and the checks to run after applying.
 
 ## Platform publication
 
@@ -137,8 +145,9 @@ This is a second explicit gate and a separate Job-trigger path. The Job's
 short-lived projected `curie-platform-upgrader` identity can rewrite the
 platform release objects. Under the default grant the general Kubernetes
 connector never receives that identity or Role; under the operator grant it can
-run a pod as `curie-platform-upgrader`, one approved call away. A Helm rollback does not undo database migrations, so recovery
-may require restoring a backup rather than another tool call.
+run a pod as `curie-platform-upgrader`, one approved call away. A Helm rollback
+does not undo database migrations, so recovery may require restoring a backup
+rather than another tool call.
 
 ### Service-account escalation disclosure
 

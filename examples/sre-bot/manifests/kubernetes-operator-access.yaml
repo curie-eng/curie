@@ -11,10 +11,11 @@
 # it. Applying it is an operator security decision, not an approval setting.
 #
 # Reads widen too, and reads never wait for approval. The bot's ungated read
-# tools then reach every non-Secret resource in every namespace, Curie's own
-# objects and RBAC included, and the kubelet API through nodes/proxy, which the
-# ungated node reads (`nodes_log`, `nodes_stats_summary`) use: a `nodes_log`
-# read returns the node's own log files. Those tools only read logs and stats
+# tools then reach every non-Secret resource in every namespace except Curie's
+# sandbox objects, Curie's other objects and RBAC included, and the kubelet API
+# through nodes/proxy, which the ungated node reads (`nodes_log`,
+# `nodes_stats_summary`) use: a `nodes_log` read returns the node's own log
+# files. Those tools only read logs and stats
 # through it, but the credential is not limited to that: any access to
 # nodes/proxy, get included, reaches the kubelet's exec and run endpoints, so
 # it is exec into any container on the node.
@@ -41,6 +42,9 @@
 #   A role or binding within what it already holds is still allowed.
 # - impersonate: the bot cannot act as another user, group or ServiceAccount.
 # - approve and sign: it cannot approve or issue a CertificateSigningRequest.
+# - reading Curie's sandbox objects: a Sandbox or SandboxClaim carries per-run
+#   credentials in its spec, so this grant can clear a stuck Sandbox or
+#   SandboxClaim but not read one.
 #
 # What stays open, each path one approved call away:
 #
@@ -59,9 +63,10 @@
 #   service the bot names.
 # - a RoleBinding or ClusterRoleBinding that hands this role, or any part of
 #   it, to another subject. The binding outlives the approval that created it.
-# - Curie itself: its Deployments and SandboxTemplates, including the parts
-#   that enforce approval. After one such change, later writes may not reach
-#   an approval at all.
+# - Curie itself: its Deployments, SandboxTemplates, ConfigMaps and
+#   NetworkPolicies (the sandbox egress policy among them), including the
+#   parts that enforce approval. After one such change, later writes may not
+#   reach an approval at all.
 # - Argo CD: an Application or ApplicationSet deploys with Argo CD's own
 #   identity, not with this grant, and that identity can commonly write the
 #   Secrets this grant withholds.
@@ -113,6 +118,10 @@
 #   kind: SubjectAccessReview
 #   spec:
 #     user: system:serviceaccount:curie:sre-bot-kubernetes
+#     groups:
+#       - system:serviceaccounts
+#       - system:serviceaccounts:curie
+#       - system:authenticated
 #     resourceAttributes:
 #       group: certificates.k8s.io
 #       resource: signers
@@ -221,8 +230,8 @@ rules:
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete, deletecollection]
 ---
-# Curie's own sandbox groups, and the add-on groups the default grant reads:
-# metrics-server's metrics.k8s.io and Argo CD's argoproj.io.
+# The add-on groups the default grant reads: metrics-server's metrics.k8s.io
+# and Argo CD's argoproj.io.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -231,12 +240,25 @@ metadata:
     curie.dev/aggregate-to-sre-bot-operator: "true"
 rules:
   - apiGroups:
-      - agents.x-k8s.io
-      - extensions.agents.x-k8s.io
       - metrics.k8s.io
       - argoproj.io
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+---
+# Curie's own sandbox groups, delete only: their specs carry per-run
+# credentials, so no verb here reads one.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-bot-kubernetes-operator-sandboxes
+  labels:
+    curie.dev/aggregate-to-sre-bot-operator: "true"
+rules:
+  - apiGroups:
+      - agents.x-k8s.io
+      - extensions.agents.x-k8s.io
+    resources: ["*"]
+    verbs: [delete, deletecollection]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
