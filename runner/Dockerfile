@@ -45,6 +45,9 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # `"command": "mcp-server-github"` -- see examples/github-issues. Add a line here
 # to bless another authed third-party MCP server for the same shape.
 RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
+# The mean tester's Slack server (ADR 0172): bin `slack-mcp`. It is a single
+# 0.0.1 release of the fork of npm's deprecated @modelcontextprotocol/server-slack.
+RUN npm install -g @zencoderai/slack-mcp-server@0.0.1
 
 WORKDIR /app
 

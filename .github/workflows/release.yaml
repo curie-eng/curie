@@ -112,7 +112,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, mean-tester-probes]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -142,11 +142,6 @@ jobs:
           - name: sre-bot-self-upgrade
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
-          # The mean tester's only connector (ADR 0169). Unpublished, the
-          # tester cannot run on any cluster.
-          - name: mean-tester-probes
-            context: examples/mean-tester/connectors/probes
-            dockerfile: examples/mean-tester/connectors/probes/Dockerfile
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
@@ -243,7 +238,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, mean-tester-probes]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade]
     steps:
       - name: Download digests
         id: download_digests

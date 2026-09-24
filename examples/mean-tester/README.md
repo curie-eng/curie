@@ -1,81 +1,55 @@
 # Mean tester example
 
-This bundle tests another agent the way a person does: it reads the target's
-bundle from Git, plans a round of at most four probes, asks the target over
-Slack from its own bot, and reports PASS, FAIL or UNCLEAR per probe with the
-reply quoted. It holds no platform API key and no cluster credential, and it
-judges only what the target's Slack surface shows. See
-[ADR-0169](../../docs/adr/0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md).
+This bundle tests another agent the way a person does. It reads the target's
+bundle from Git and plans a round of at most four probes. It asks the target
+over Slack from its own bot, then reports PASS, FAIL or UNCLEAR per probe with
+the reply quoted. It holds no platform API key and no cluster credential. It
+judges only what the target's Slack surface shows, and it files nothing. See
+[ADR-0169](../../docs/adr/0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md)
+and [ADR-0172](../../docs/adr/0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md).
+
+It is one skill, a manifest and `.mcp.json`. It reaches Slack and GitHub through
+two off-the-shelf stdio MCP servers that the runner image preinstalls:
+`slack-mcp` (`@zencoderai/slack-mcp-server@0.0.1`) and `mcp-server-github`.
 
 ## Prerequisites
 
-- A Curie installation of its own, whose Slack app is **not** the app of any
+- **Its own Curie installation.** Its Slack app must **not** be the app of any
   agent it will test. A bot's own posts never reach its own dispatcher, so a
   shared app would make the tester invisible to itself.
-- That installation's Slack app invited to every channel it will test in. Those
-  channels must be public: the platform app's scopes
-  (`apps/dispatcher/slack-app-manifest.yaml`) have no `groups:read`, so the
-  connector cannot read a private channel's details or members. To test in a
-  private channel, the operator adds `groups:read` to the tester's own app.
-- A GitHub token, fine-grained and limited to the repositories listed in
-  `MEAN_TESTER_REPOS` below, with **contents read** (to read target bundles)
-  and **issues write** (to search and file issues), and nothing else.
+- **A runner image that carries `slack-mcp`**: the release that ships this
+  bundle, or later.
+- **Invitations.** Invite the tester's app only to the channels it should probe.
+  The invitation list is the allowlist: the bot can post anywhere it is invited.
+  Never invite it to an externally shared channel. Nothing else stops it
+  probing there.
+- **A GitHub token**, fine-grained and limited to the repositories it reads,
+  with **Contents: Read** and nothing else. The token sits in the sandbox's
+  environment, so its scope is the real bound.
 
-## The secret
+## Configure
 
-The operator creates one secret, before the first deploy, holding this
-installation's own bot token and the GitHub token together as one JSON value
-(the connector needs exactly one secret; see `connectors.yaml`):
+Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKILL.md):
+the channel ids it may probe in, and the `owner/repo@branch` repositories it
+reads target bundles from.
 
-```bash
-kubectl create secret generic mean-tester-probes \
-  --from-literal=MEAN_TESTER_CREDENTIALS='{"slack_bot_token":"xoxb-…","github_token":"…"}'
-```
-
-The `slack_bot_token` value is the tester's **own** installation's bot token,
-never a target's. If keeping the raw JSON out of shell history matters more
-than the convenience of `--from-literal`, pass it through a file instead:
-`kubectl create secret generic mean-tester-probes --from-file=MEAN_TESTER_CREDENTIALS=./credentials.json`.
+The sandbox needs egress to Slack's API and GitHub's API. Add one
+`agentSandbox.connectorEgress.<agent>` entry per CIDR, for TCP 443:
+- GitHub publishes its API ranges in the `api` list at
+  <https://api.github.com/meta>.
+- Slack publishes none for its API. Resolve `slack.com` and add each address as
+  a `/32`, and refresh the entries when they change. The chart refuses a
+  default route.
 
 ## Deploy
 
-Set the operator-listed channels and repositories in
-[`connectors.yaml`](connectors.yaml):
-
-```yaml
-MEAN_TESTER_CHANNELS: "C0…,C0…"        # channels this tester may probe
-MEAN_TESTER_REPOS: "owner/repo@main"   # repositories it reads target bundles from
-```
-
-The agent is not told which channel a request came from. With one listed
-channel it tests there without being told; with several, each request must
-name its channel as `#channel`, or the tools refuse and list the choices.
-
-A round is at most `MEAN_TESTER_MAX_PROBES` probes (default and ceiling 4) per
-target, counted over `MEAN_TESTER_REPLY_TIMEOUT_S` (default 240 seconds), and
-at most `MEAN_TESTER_MAX_CONCURRENT_ROUNDS` targets (default 2, ceiling 4) are
-probed in one channel within that window. Either can be lowered.
-
-Optionally, point a target at its specification. `MEAN_TESTER_SPEC_PATHS` is a
-JSON object from a bundle name to a repository-relative directory; the tester
-then also reads every `*.md` under that directory, at the same commit as the
-bundle, and may rest its expectations on it:
-
-```yaml
-MEAN_TESTER_SPEC_PATHS: '{"asset-search": "docs/specs/asset-search"}'
-```
-
-Filing an issue is gated: bind its route to a channel before the first deploy,
-or `curie cluster deploy` refuses the bundle as unbound.
-
 ```bash
-curie cluster approvals mean-tester --route-resolution mean-tester-issues=<channel>
-```
-
-Then:
-
-```bash
-curie cluster deploy --plugin-dir examples/mean-tester
+export MEAN_TESTER_SLACK_BOT_TOKEN=xoxb-...   # the tester's own app
+export MEAN_TESTER_SLACK_TEAM_ID=T...         # the workspace the app is installed in
+export GITHUB_PERSONAL_ACCESS_TOKEN=...       # Contents: Read, listed repositories only
+curie cluster deploy --plugin-dir examples/mean-tester --target dev \
+  --secret MEAN_TESTER_SLACK_BOT_TOKEN --secret MEAN_TESTER_SLACK_TEAM_ID \
+  --secret GITHUB_PERSONAL_ACCESS_TOKEN
 ```
 
 ## Use it
@@ -83,19 +57,29 @@ curie cluster deploy --plugin-dir examples/mean-tester
 In a listed channel:
 
 ```
-@mean-tester test @target
+@mean-tester test @asset-search bundle asset-search
 ```
 
-It posts its plan, sends up to four probes, and reports each verdict. Reply
-`continue` in the same thread to run the next round.
+It reads the bundle, sends one ordinary probe to check that the target answers,
+and then runs one round of at most four probes. It replies with the report.
+The report's `Next:` lines are the probes still planned; reply `continue` for
+the next round. For each FAIL, the report carries an eval case for the target's
+`evals/cases.json`. You file the issue.
+
+## Evals
+
+Each case in [`evals/cases.json`](evals/cases.json) hands the tester a recorded
+exchange and grades its verdict. Real failure shapes must come back FAIL, and
+good replies PASS. Run them with a model credential:
+
+```bash
+curie skill eval --plugin-dir examples/mean-tester
+```
 
 ## What it will not do
 
-- Repair anything it finds broken. It only reports.
-- Resolve, approve or reject an approval card, its own or the target's.
-- Post to, or read replies from, a channel not in `MEAN_TESTER_CHANNELS`.
-- File an issue anywhere but a repository a target's bundle was read from and
-  `MEAN_TESTER_REPOS` lists, or without a person approving the
-  `mean-tester-issues` card, which shows that repository, first.
-
-See [the permission map](docs/PERMISSION-MAP.md) for every write and its guards.
+- Resolve, approve or reject any approval card.
+- Change anything about its target, or file anything.
+- Reply inside a target's thread, react, or read Slack users: the tool policy
+  allows exactly the six tools listed in
+  [`docs/PERMISSION-MAP.md`](docs/PERMISSION-MAP.md).
