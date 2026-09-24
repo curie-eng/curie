@@ -111,6 +111,9 @@ def stack(tmp_path: pathlib.Path, source_artifacts):
       OTEL_EXPORTER_OTLP_ENDPOINT: ""
       OTEL_EXPORTER_OTLP_PROTOCOL: ""
     ports: !override ["127.0.0.1::8000"]
+networks:
+  curie_runner:
+    name: "{project}_runner"
 """
     )
     env = os.environ.copy()
@@ -148,13 +151,20 @@ def stack(tmp_path: pathlib.Path, source_artifacts):
                 f"label=com.docker.compose.project={project}",
             ]
         )
+        networks = _run(["docker", "network", "ls", "-q", "--filter", f"name=^{project}_"])
         if (
             _require(left, "listing containers").strip()
             or _require(volumes, "listing volumes").strip()
+            or _require(networks, "listing networks").strip()
         ):
             raise RuntimeError(f"private project {project} left resources behind")
 
     try:
+        rendered = json.loads(
+            _require(_run(compose + ["config", "--format", "json"], env=env), "rendering Compose")
+        )
+        if rendered["networks"]["curie_runner"]["name"] != f"{project}_runner":
+            raise RuntimeError("private runner network name was not applied")
         _require(
             _run(
                 compose
