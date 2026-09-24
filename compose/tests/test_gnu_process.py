@@ -215,16 +215,25 @@ def test_timeout_on_expiry_reaches_the_command_group_unless_foreground(
 
 @pytest.mark.parametrize("implementation", _implementations("timeout"))
 @pytest.mark.parametrize(
-    ("command", "status"),
+    ("command", "shell_status"),
     [
-        (["sh", "-c", "echo ready; exec sleep 30"], -15),
+        (["sh", "-c", "echo ready; exec sleep 30"], 128 + 15),
         (["sh", "-c", "trap 'exit 7' TERM; echo ready; sleep 30 & wait"], 7),
     ],
     ids=["the-command-dies-of-it", "the-command-traps-it"],
 )
 def test_timeout_passes_a_term_it_receives_to_the_command(
-    implementation: list[str], command: list[str], status: int
+    implementation: list[str], command: list[str], shell_status: int
 ) -> None:
+    """Every caller is a shell, so this is the status a shell reads.
+
+    When the command dies of the TERM passed to it, GNU coreutils 9.1 and 9.7
+    in Debian images re-raise it (a returncode of -15). GNU timeout on a loaded
+    ubuntu-24.04 Actions runner once exited 143 instead, without a warning (CI
+    run 36041307028), for a reason not established: timeout.c is the same
+    there in 9.1 and 9.4. A shell reads 143 from both.
+    """
+
     _require_a_group_of_its_own(implementation)
     process = subprocess.Popen(
         [*implementation, "30", *command], stdout=subprocess.PIPE, text=True
@@ -233,10 +242,74 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
         assert process.stdout is not None
         assert process.stdout.readline() == "ready\n"
         process.terminate()
-        assert process.wait(timeout=10) == status
+        returncode = process.wait(timeout=10)
+        assert (128 - returncode if returncode < 0 else returncode) == shell_status
     finally:
         process.kill()
         process.wait()
+
+
+# gnu-process.py with its Popen slowed down, so a signal is sure to arrive after
+# the command has started and before the helper has recorded it.
+SLOW_START = """
+import importlib.util, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("gnu_process", sys.argv[1])
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+class SlowPopen(subprocess.Popen):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        time.sleep(1)
+helper.subprocess.Popen = SlowPopen
+sys.exit(helper.timeout(sys.argv[2:]))
+"""
+
+
+def _group_gone_within(group: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+
+
+def test_timeout_passes_on_a_term_that_arrives_while_the_command_starts() -> None:
+    """A TERM that arrives before the child is recorded must still reach it.
+
+    Otherwise the helper exits 143 and leaves the command running. On a
+    loaded CI runner a command can print before Popen has even returned.
+    """
+
+    _require_a_group_of_its_own([str(HELPER), "timeout"])
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            SLOW_START,
+            str(HELPER),
+            "30",
+            "sh",
+            "-c",
+            "echo ready; exec sleep 30",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline() == "ready\n"
+        process.terminate()
+        assert process.wait(timeout=10) == -15, "the TERM never reached the command"
+        assert _group_gone_within(process.pid, 3), "the command outlived the helper"
+    finally:
+        process.kill()
+        process.wait()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, 9)
 
 
 @pytest.mark.parametrize("implementation", _implementations("timeout"))
