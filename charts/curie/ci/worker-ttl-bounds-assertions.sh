@@ -362,6 +362,9 @@ PY
   fi
 }
 
+# The next two helpers lift the ladder functions with `eval "$(sed ...)"`, not
+# `source <(...)`, which bash 3.2 reads short or empty; and the sed range ends
+# `!p;}`, because macOS's sed refuses a `}` straight after a command.
 run_ladder_reply_timeout() {
   local deployment_json="$1" stdout="$2" stderr="$3"
   PATH="$LADDER_STUB_DIR:$PATH" \
@@ -372,7 +375,7 @@ run_ladder_reply_timeout() {
     CURIE_RELEASE="curie" \
     bash -c '
       set -euo pipefail
-      source <(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p}" "$1")
+      eval "$(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p;}" "$1")"
       if ! declare -F cluster_reply_timeout_seconds >/dev/null; then
         echo "cluster: required cluster_reply_timeout_seconds helper is absent from the ladder source" >&2
         exit 1
@@ -385,7 +388,7 @@ assert_ladder_helper_present() {
   local stderr="$TMP/l-helper-presence.err"
   if ! bash -c '
     set -euo pipefail
-    source <(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p}" "$1")
+    eval "$(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p;}" "$1")"
     if ! declare -F cluster_reply_timeout_seconds >/dev/null; then
       echo "cluster: required cluster_reply_timeout_seconds helper is absent from the ladder source" >&2
       exit 1
