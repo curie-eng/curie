@@ -325,6 +325,7 @@ class WorkItemDispatchClient:
         runtime_epoch: int,
         outcome: str,
         cause: str,
+        detail: str | None,
     ) -> None:
         await self._post(
             f"/v1/internal/work-items/requests/{request_id}/finish",
@@ -332,6 +333,7 @@ class WorkItemDispatchClient:
                 "runtime_epoch": runtime_epoch,
                 "outcome": outcome,
                 "cause": cause,
+                "detail": detail,
             },
         )
 
@@ -519,7 +521,7 @@ class WorkItemRun:
             self.request_id, runtime_epoch=self.runtime_epoch
         )
 
-    async def finish(self, *, outcome: str, cause: str) -> None:
+    async def finish(self, *, outcome: str, cause: str, detail: str | None) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
         await self._client.finish(
@@ -527,6 +529,7 @@ class WorkItemRun:
             runtime_epoch=self.runtime_epoch,
             outcome=outcome,
             cause=cause,
+            detail=detail,
         )
         self.finished = True
 

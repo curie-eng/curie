@@ -376,3 +376,48 @@ def test_a_call_whose_result_never_arrives_leaves_its_opening_frame() -> None:
     assert len(flags) == 1
     assert flags[0].result is None
     assert state.pending_actions == {"1": "Bash"}
+
+
+# --- Provider credit exhaustion (#3073) ---------------------------------------
+
+_OPENROUTER_KEY = "sk-or-v1-" + "0123456789abcdef" * 4
+# Observed 2026-09-24: the bundled claude_agent_sdk, pointed at a stub that
+# answers OpenRouter's HTTP 402 body, emitted exactly
+# AssistantMessage(content=[TextBlock(text="API Error: 402 This request requires
+# more credits, ...")], model="<synthetic>", error="unknown"). The key is
+# appended here only to prove the provider text is redacted.
+_OPENROUTER_402 = (
+    "API Error: 402 This request requires more credits, or fewer max_tokens. You "
+    "requested up to 32000 tokens, but can only afford 1200. To increase, visit "
+    "https://openrouter.ai/settings/credits and upgrade to a paid account "
+    f"key={_OPENROUTER_KEY}"
+)
+
+
+def test_openrouter_402_is_credit_exhausted_with_redacted_provider_message() -> None:
+    state = TurnState()
+    msg = AssistantMessage(
+        content=[TextBlock(text=_OPENROUTER_402)], model="<synthetic>", error="unknown"
+    )
+    errors = [e for e in _translate(msg, state) if isinstance(e, ErrorEvent)]
+    assert len(errors) == 1
+    assert errors[0].classification == "model-credit-exhausted"
+    assert state.error_classification == "model-credit-exhausted"
+    assert "requires more credits" in errors[0].message
+    assert _OPENROUTER_KEY not in errors[0].message
+    assert "[REDACTED" in errors[0].message
+
+
+def test_sdk_billing_error_is_credit_exhausted() -> None:
+    msg = AssistantMessage(content=[], model="m", error="billing_error")
+    events = _translate(msg)
+    assert events[0].classification == "model-credit-exhausted"
+
+
+def test_unknown_error_without_credit_text_stays_unclassified() -> None:
+    msg = AssistantMessage(
+        content=[TextBlock(text="API Error: 500 upstream exploded")], model="m", error="unknown"
+    )
+    errors = [e for e in _translate(msg) if isinstance(e, ErrorEvent)]
+    assert errors[0].classification == "unclassified"
+    assert "upstream exploded" in errors[0].message

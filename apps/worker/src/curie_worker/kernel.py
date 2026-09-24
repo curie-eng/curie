@@ -452,6 +452,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "server-error",
     "ledger-error",
     "model-credential-rejected",
+    "model-credit-exhausted",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
@@ -467,6 +468,27 @@ def map_error_classification(raw: str | None) -> str:
     if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
         return raw
     return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+# The factory terminus cause for a classified escalation (#3073). Each cause has
+# its own operator sentence on the issue; anything unnamed stays the generic
+# ``runner_escalated``.
+_ESCALATION_CAUSES = {
+    "model-credit-exhausted": "model_credit_exhausted",
+    "model-credential-rejected": "model_credential_rejected",
+    "rate-limit": "model_rate_limited",
+    "server-error": "model_error",
+    "budget-exceeded": "budget_exceeded",
+    "runner-timeout": "runner_timeout",
+    "runner-timeout-unconfirmed": "runner_timeout",
+    "workspace-error": "workspace_error",
+}
+
+
+def _escalation_cause(failure: TurnOutcome | None) -> str:
+    if failure is None or failure.classification is None:
+        return "runner_escalated"
+    return _ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
 
 
 def _display_error_classification(raw: str | None) -> str:
@@ -2339,6 +2361,7 @@ class Kernel:
                         telemetry_outcome="side_effect_halted",
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        failure=outcome,
                     )
                     return
 
@@ -2390,6 +2413,7 @@ class Kernel:
                         ),
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        failure=outcome,
                     )
                     return
 
@@ -3000,8 +3024,12 @@ class Kernel:
         telemetry_outcome: str,
         lease: DeliveryLease | None = None,
         hook_outcome: HookRunOutcome | None = None,
+        failure: TurnOutcome | None = None,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
+
+        ``failure`` is the classified turn behind an escalation. A factory run
+        finishes with the cause and provider message it carries (#3073).
 
         For a valid cron run, close its Postgres row before these Valkey steps.
 
@@ -3069,14 +3097,20 @@ class Kernel:
                         run.held = True
                 elif outcome == "delivered":
                     try:
-                        await run.finish(outcome="failed", cause="no_pull_request")
+                        await run.finish(
+                            outcome="failed", cause="no_pull_request", detail=None
+                        )
                     except WorkItemConflict as exc:
                         if exc.code != "publication_pending":
                             raise
                 elif outcome == "escalated":
-                    await run.finish(outcome="failed", cause="runner_escalated")
+                    await run.finish(
+                        outcome="failed",
+                        cause=_escalation_cause(failure),
+                        detail=failure.error_message if failure is not None else None,
+                    )
                 else:
-                    await run.finish(outcome="failed", cause="runner_failed")
+                    await run.finish(outcome="failed", cause="runner_failed", detail=None)
             except WorkItemConflict as exc:
                 logger.warning(
                     "work-item finish refused for %s: %s; writing no marker",

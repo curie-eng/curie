@@ -814,6 +814,7 @@ async def finish(
     runtime_epoch: int,
     outcome: Literal["completed", "failed"],
     cause: str,
+    detail: str | None,
 ) -> WorkItemOutcome | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -847,6 +848,7 @@ async def finish(
         expected_request_version=request.version,
         status=outcome,
         cause=cause,
+        detail=detail,
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
     )
     if isinstance(result, WorkItemConflict):

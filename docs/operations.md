@@ -881,11 +881,17 @@ dead-letter graveyard.
 
 A labelled factory run posts exactly one final comment on the originating
 issue. When publication succeeds, that comment names the exact pull request
-URL. When the run cannot complete, the comment contains `Could not complete:`
-followed by the platform cause
+URL. When the run cannot complete, the comment starts with `Could not complete:`
+and a plain sentence for the cause. When the model provider refused the run,
+a `Provider message:` line follows with the provider's own error text, redacted
+of keys and tokens. A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
-`publication_denied`, `publication_expired`, or `publication_failed`). The
+`publication_denied`, `publication_expired`, `publication_failed`, or a
+classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
+`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`, or
+`workspace_error`). A model provider that answers HTTP 402 or reports exhausted
+credits ends the run as `model_credit_exhausted` without retrying. The
 work item reconciler posts the comment after the terminal row and any
 publication lineage commit. A refused post is recorded on the notice and does
 not change the execution row. Waiting for approval is not an ending: the
