@@ -331,6 +331,17 @@ class BootEnv(_AciModel):
     state_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_STATE_TOKEN", "worker")
     )
+    # The live factory status card's report_progress port (#3077): the
+    # request-bound URL and scoped token the runner uses to POST phase reports.
+    # A kernel-authored knob like the approval markers above -- the worker's
+    # resume overlay mints it per-request, never the binding -- not part of the
+    # frozen ACI SessionConfig.
+    progress_url: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_PROGRESS_URL", "kernel")
+    )
+    progress_token: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_PROGRESS_TOKEN", "kernel")
+    )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
@@ -641,6 +652,10 @@ class BootEnv(_AciModel):
             env[self.env_key("state_url")] = self.state_url
         if self.state_token is not None:
             env[self.env_key("state_token")] = self.state_token
+        if self.progress_url is not None:
+            env[self.env_key("progress_url")] = self.progress_url
+        if self.progress_token is not None:
+            env[self.env_key("progress_token")] = self.progress_token
         if self.approval_required_tools:
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
@@ -696,6 +711,8 @@ class BootEnv(_AciModel):
             memory_token=_str_or_none(env.get("CURIE_MEMORY_TOKEN")),
             state_url=_str_or_none(env.get("CURIE_STATE_URL")),
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
+            progress_url=_str_or_none(env.get("CURIE_PROGRESS_URL")),
+            progress_token=_str_or_none(env.get("CURIE_PROGRESS_TOKEN")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
             approval_resumed_kind=_stripped_or_none(env.get("CURIE_APPROVAL_RESUMED_KIND")),

@@ -26,10 +26,11 @@ from .models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
     ExecutionRequest,
-    FactoryTerminalNotice,
+    FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
+    new_card_token,
 )
 
 RequestStatus = Literal[
@@ -201,18 +202,20 @@ async def _database_now(session: AsyncSession) -> datetime:
     return cast(datetime, value)
 
 
-def _queue_notice(
+async def _queue_notice(
     session: AsyncSession,
     work_item: WorkItem,
     request: ExecutionRequest,
     *,
     detail: str | None,
 ) -> None:
-    """Stage the owed comment in the terminal transaction. The caller commits.
+    """Stage the terminal result on the request's status comment row (#3077).
 
-    Reply routing is resolved when the durable notice is delivered. ``detail``
-    is the provider's own failure message (#3073); it is redacted before it is
-    stored, then clipped, so no key or token reaches the row or the comment.
+    The caller commits. The row normally exists from admission; a request
+    admitted before it did gets one here. Reply routing is resolved when the
+    comment is delivered. ``detail`` is the provider's own failure message
+    (#3073); it is redacted before it is stored, then clipped, so no key or
+    token reaches the row or the comment.
     """
 
     if request.terminal_at is None:
@@ -220,15 +223,19 @@ def _queue_notice(
     cause = request.terminal_cause
     if cause is None or not cause.strip():
         return
-    if cause.strip() == "issue_cancelled" and work_item.readmit_request_id is not None:
-        # A relabel superseded this run. The new run speaks for the issue.
-        return
-    session.add(
-        FactoryTerminalNotice(
+    stored = _notice_detail(detail)
+    await session.execute(
+        insert(FactoryStatusComment)
+        .values(
             execution_request_id=request.id,
             work_item_id=work_item.id,
+            card_token=new_card_token(),
             terminal_cause=cause.strip(),
-            detail=_notice_detail(detail),
+            detail=stored,
+        )
+        .on_conflict_do_update(
+            index_elements=["execution_request_id"],
+            set_={"terminal_cause": cause.strip(), "detail": stored},
         )
     )
 
@@ -256,35 +263,8 @@ async def _settle_terminal(
 
     if request.terminal_at is None:
         return
-    _queue_notice(session, work_item, request, detail=detail)
+    await _queue_notice(session, work_item, request, detail=detail)
     await transcripts.expire_for_work_item(session, work_item)
-
-
-async def _queue_suppressed_cancel_notice(
-    session: AsyncSession, work_item: WorkItem
-) -> None:
-    """Owe the stop notice a pending relabel suppressed, once the relabel is dropped."""
-
-    latest: ExecutionRequest | None = await session.scalar(
-        select(ExecutionRequest)
-        .where(
-            ExecutionRequest.work_item_id == work_item.id,
-            ExecutionRequest.terminal_at.is_not(None),
-        )
-        .order_by(ExecutionRequest.sequence.desc())
-        .limit(1)
-    )
-    if latest is None or (latest.terminal_cause or "").strip() != "issue_cancelled":
-        return
-    await session.execute(
-        insert(FactoryTerminalNotice)
-        .values(
-            execution_request_id=latest.id,
-            work_item_id=work_item.id,
-            terminal_cause="issue_cancelled",
-        )
-        .on_conflict_do_nothing(index_elements=["execution_request_id"])
-    )
 
 
 async def _opened_pull_request(
@@ -511,6 +491,14 @@ async def create_execution_request(
                     version=1,
                 )
                 session.add(request)
+                # The live status comment's row exists from admission (#3077).
+                session.add(
+                    FactoryStatusComment(
+                        execution_request_id=request_id,
+                        work_item_id=work_item_id,
+                        applied_label=None,
+                    )
+                )
                 await session.flush()
     except IntegrityError:
         work_item = await _reload_work_item(session, work_item_id)
@@ -1198,11 +1186,8 @@ async def request_cancellation(
             )
         )
         work_item = await _reload_work_item(session, work_item_id)
-        if active is None:
-            await _queue_suppressed_cancel_notice(session, work_item)
         return await _outcome(session, work_item, active)
 
-    dropped_readmit = work_item.readmit_request_id is not None
     now = await _database_now(session)
     changed_id: uuid.UUID | None = await session.scalar(
         update(WorkItem)
@@ -1281,8 +1266,6 @@ async def request_cancellation(
             )
         )
         active = await _reload_request(session, active.id)
-    elif active is None and dropped_readmit:
-        await _queue_suppressed_cancel_notice(session, work_item)
     work_item = await _reload_work_item(session, work_item_id)
     if active is None:
         # Nothing is left to run, so the cancelled WorkItem is terminal now. A
@@ -1358,7 +1341,10 @@ async def readmit(
         active = await _reload_request(session, active.id)
         return await _outcome(session, work_item, active)
     if active is not None:
-        # Superseded, not stopped: the new request speaks for the issue.
+        # Superseded, not stopped: the new request speaks for the issue. The
+        # old run's status comment is still finalized, with the superseded
+        # text. Not _settle_terminal: the WorkItem continues, so its
+        # transcript must survive.
         await session.execute(
             update(ExecutionRequest)
             .where(
@@ -1374,6 +1360,8 @@ async def readmit(
                 updated_at=func.clock_timestamp(),
             )
         )
+        superseded = await _reload_request(session, active.id)
+        await _queue_notice(session, work_item, superseded, detail=None)
     version: int | None = await session.scalar(
         update(WorkItem)
         .where(WorkItem.id == work_item_id)

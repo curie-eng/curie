@@ -518,6 +518,63 @@
         "title": "ActionUndoOut",
         "type": "object"
       },
+      "Activity": {
+        "additionalProperties": false,
+        "properties": {
+          "last_tool": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Tool"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "tool_calls": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Calls"
+          },
+          "turns": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turns"
+          }
+        },
+        "title": "Activity",
+        "type": "object"
+      },
       "AdapterPrincipalMint": {
         "description": "Administrative request to issue one channel adapter credential (ADR-0154).",
         "properties": {
@@ -2838,6 +2895,33 @@
         "title": "CostReport",
         "type": "object"
       },
+      "Declaration": {
+        "additionalProperties": false,
+        "properties": {
+          "loops": {
+            "items": {
+              "$ref": "#/components/schemas/LoopDeclaration"
+            },
+            "maxItems": 4,
+            "title": "Loops",
+            "type": "array"
+          },
+          "phases": {
+            "items": {
+              "$ref": "#/components/schemas/PhaseDeclaration"
+            },
+            "maxItems": 12,
+            "minItems": 1,
+            "title": "Phases",
+            "type": "array"
+          }
+        },
+        "required": [
+          "phases"
+        ],
+        "title": "Declaration",
+        "type": "object"
+      },
       "DeferBody": {
         "properties": {
           "capacity": {
@@ -3760,6 +3844,34 @@
         "title": "LoadPackConfig",
         "type": "object"
       },
+      "LoopDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "cap": {
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Cap",
+            "type": "integer"
+          },
+          "review": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Review",
+            "type": "string"
+          },
+          "start": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "review",
+          "cap"
+        ],
+        "title": "LoopDeclaration",
+        "type": "object"
+      },
       "MemoryEntryCreate": {
         "description": "Append one operator-authored memory record (#1904).\n\nProvenance is stamped by the server. Extra body fields, including a\ncaller-supplied provenance object, are ignored rather than trusted.",
         "properties": {
@@ -4174,6 +4286,28 @@
         "title": "OwnerLostBody",
         "type": "object"
       },
+      "PhaseDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "PhaseDeclaration",
+        "type": "object"
+      },
       "PodLogs": {
         "description": "Runner-pod logs for the per-run runner-logs affordance.",
         "properties": {
@@ -4208,6 +4342,57 @@
           "logs"
         ],
         "title": "PodLogs",
+        "type": "object"
+      },
+      "ProgressReport": {
+        "additionalProperties": false,
+        "properties": {
+          "activity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Activity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "declaration": {
+            "$ref": "#/components/schemas/Declaration"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "phase": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Phase",
+            "type": "string"
+          },
+          "round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round"
+          }
+        },
+        "required": [
+          "phase",
+          "declaration"
+        ],
+        "title": "ProgressReport",
         "type": "object"
       },
       "PublicationCreate": {
@@ -12893,6 +13078,44 @@
         ]
       }
     },
+    "/v1/factory/cards/{token}.svg": {
+      "get": {
+        "operationId": "factory_status_card_v1_factory_cards__token__svg_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "title": "Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/svg+xml": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Factory Status Card",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
     "/v1/internal/cluster-message-replies/{reply_ref}": {
       "post": {
         "operationId": "append_cluster_message_reply_v1_internal_cluster_message_replies__reply_ref__post",
@@ -14587,6 +14810,75 @@
         "summary": "Select Workspace Repository",
         "tags": [
           "internal-workspaces"
+        ]
+      }
+    },
+    "/v1/work-item-progress/{request_id}": {
+      "post": {
+        "operationId": "report_work_item_progress_v1_work_item_progress__request_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProgressReport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Report Work Item Progress V1 Work Item Progress  Request Id  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Work Item Progress",
+        "tags": [
+          "factory-status"
         ]
       }
     },

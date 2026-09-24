@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
-from curie_api.factory_notices import marker_for
+from curie_api.factory_notices import FINAL_MARKER, marker_for
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from sqlalchemy import text
@@ -73,6 +73,19 @@ _PRS = iter(range(701, 799))
 
 
 # --- helpers -------------------------------------------------------------------
+
+
+def _assert_no_final_result(sink: Any) -> None:
+    """Only the live status comment exists while CI runs; nothing is final (#3077)."""
+
+    assert sink.posts <= 1
+    assert not any(FINAL_MARKER in comment["body"] for comment in sink.comments)
+
+
+def _terminal_notices(request_id: Any) -> list[dict[str, Any]]:
+    """The status row exists from admission (#3077); a result is a terminal cause."""
+
+    return [row for row in _notices(request_id) if row["terminal_cause"] is not None]
 
 
 def _all(number: int) -> list[dict[str, Any]]:
@@ -336,8 +349,8 @@ def test_pending_ci_keeps_the_request_running_until_green_completes_it(
     _reconcile()
 
     assert _terminal(number) == ("running", None)
-    assert _notices(published["id"]) == []
-    assert sink.posts == 0
+    assert _terminal_notices(published["id"]) == []
+    _assert_no_final_result(sink)
     assert sink.ci_observations == [HEAD_A]
 
     _reconcile()
@@ -396,7 +409,7 @@ def test_no_checks_within_the_grace_period_completes_with_a_note(admitted: Any) 
     _reconcile()
 
     assert _terminal(number) == ("running", None)
-    assert sink.posts == 0
+    _assert_no_final_result(sink)
 
     _reconcile_later(130)
 
@@ -437,8 +450,8 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
 
     row = _all(number)[0]
     assert (row["status"], row["terminal_cause"]) == ("running", None)
-    assert _notices(request_id) == []
-    assert sink.posts == 0
+    assert _terminal_notices(request_id) == []
+    _assert_no_final_result(sink)
     turns = _ci_turns(request_id)
     assert [t["event_id"] for t in turns] == [f"work-item-{request_id}-ci-2"]
     lines = turns[0]["text"].split("\n")
@@ -721,8 +734,8 @@ def test_a_stale_green_after_a_new_push_leaves_the_request_running(
 
     assert pushed == [HEAD_B]
     assert _terminal(number) == ("running", None)
-    assert _notices(published["id"]) == []
-    assert sink.posts == 0
+    assert _terminal_notices(published["id"]) == []
+    _assert_no_final_result(sink)
 
     _reconcile()
 
@@ -750,7 +763,7 @@ def test_a_stale_failure_after_a_new_push_publishes_no_fix_turn(
 
     assert _ci_turns(published["id"]) == []
     assert _terminal(number) == ("running", None)
-    assert _notices(published["id"]) == []
+    assert _terminal_notices(published["id"]) == []
 
     _reconcile()
 
@@ -958,7 +971,7 @@ def test_a_lapsed_heartbeat_does_not_lose_a_request_waiting_on_ci(admitted: Any)
     _reconcile()
 
     assert _terminal(number) == ("running", None)
-    assert _notices(published["id"]) == []
+    assert _terminal_notices(published["id"]) == []
 
 
 # --- Fairness ----------------------------------------------------------------------------------
@@ -974,7 +987,7 @@ def test_a_pending_request_does_not_starve_a_green_one(admitted: Any) -> None:
 
     assert _terminal(9724) == ("running", None)
     assert _terminal(9725) == ("completed", "completed")
-    assert _notices(pending["id"]) == []
+    assert _terminal_notices(pending["id"]) == []
     assert len(_notices(green["id"])) == 1
 
 

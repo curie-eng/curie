@@ -11,6 +11,7 @@ production deployments.
 """
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
@@ -156,6 +157,10 @@ class Settings(BaseSettings):
     github_factory_ingress_enabled: bool = False
     github_factory_label: str = ""
     github_factory_mention: str = ""
+    # Public origin GitHub's image proxy fetches the live status card from
+    # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
+    # status comment still carries the checklist and the result.
+    github_factory_card_base_url: str = ""
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -609,6 +614,34 @@ class Settings(BaseSettings):
                 "complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_factory_card_base_url(self) -> "Settings":
+        """Empty, or an https origin (http localhost only in dev), no query or fragment."""
+        value = self.github_factory_card_base_url.strip()
+        if value.endswith("/"):
+            value = value[:-1]
+        if value:
+            parts = urlsplit(value)
+            local_dev = (
+                self.environment.strip().lower() == "dev"
+                and parts.scheme == "http"
+                and parts.hostname in ("localhost", "127.0.0.1")
+            )
+            if (
+                not (parts.scheme == "https" or local_dev)
+                or not parts.netloc
+                or parts.query
+                or parts.fragment
+                or "?" in value
+                or "#" in value
+            ):
+                raise ValueError(
+                    "GITHUB_FACTORY_CARD_BASE_URL must be empty or an https:// URL "
+                    "with no query or fragment"
+                )
+        self.github_factory_card_base_url = value
         return self
 
     @model_validator(mode="after")

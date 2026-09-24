@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
-from claude_agent_sdk import HookMatcher, create_sdk_mcp_server, tool
+from claude_agent_sdk import HookMatcher, SdkMcpTool, create_sdk_mcp_server, tool
 from claude_agent_sdk.types import (
     CanUseTool,
     McpSdkServerConfig,
@@ -223,6 +223,9 @@ APPROVAL_SERVER_NAME = "curie"
 _TOOL_NAME = "request_approval"
 # The fully qualified tool identifier as it appears on ToolUseBlock.name.
 APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
+# The live-status-card progress tool (#3077), mounted on the same server only
+# when the worker injected a progress URL and token.
+PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
 
 # Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
 # (#2286). The runner mounts both itself and a bundle cannot declare either:
@@ -251,9 +254,11 @@ APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 # Both are always exempt even though ``request_approval`` is omitted when a
 # permission gate already pages (#2657): an omitted tool is not callable, so
 # exempting its name costs nothing, and making the exemption depend on the
-# pager decision would add a second way for the two to disagree.
+# pager decision would add a second way for the two to disagree. The same
+# reasoning covers ``report_progress`` (#3077), mounted only for a factory
+# execution: it reports a phase and never acts, so it is never gated.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
-    {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME}
+    {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME, PROGRESS_TOOL_NAME}
 )
 
 # Platform-owned remote-development publication gate.  This is deliberately
@@ -403,6 +408,7 @@ def build_approval_server(
     *,
     managed_workspace: bool = False,
     include_request_approval: bool = True,
+    progress_tool: SdkMcpTool[Any] | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -423,13 +429,16 @@ def build_approval_server(
     ``include_request_approval=False`` omits only the generic policy gate. A
     managed workspace still carries ``publish_changes``, whose separate
     permission gate corresponds to an action the platform can actually perform.
+
+    ``progress_tool`` (#3077) is the ``report_progress`` tool, appended when the
+    runner resolved a progress URL, token and phase declaration.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
 
-    tools = [request_approval] if include_request_approval else []
+    tools: list[SdkMcpTool[Any]] = [request_approval] if include_request_approval else []
 
     @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
     async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
@@ -451,6 +460,8 @@ def build_approval_server(
         )
 
     tools.append(publish_changes)
+    if progress_tool is not None:
+        tools.append(progress_tool)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,

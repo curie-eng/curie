@@ -15,6 +15,13 @@ pairs loop: `plan` and `plan_review`, then `implement` and `review_diff`, then
 `wait_ci` back to `implement` when the pull request's checks fail. Each loop
 runs at most 3 rounds.
 
+At the start of each phase, call `mcp__curie__report_progress` with `phase`
+set to that phase's id, `round` for `plan`, `plan_review`, `implement` and
+`review_diff`, and an optional one-line `note` saying what you are about to
+do. The note is public on the issue, so it must contain no secrets and no raw
+tool output. Report the phase before its first tool call. If the tool returns
+an error, continue the work; progress never blocks the run.
+
 The bundle's review gate hook enforces the loops. It reports each review phase
 and its round, numbers the rounds, sends the call to the right reviewer in the
 foreground, refuses a review out of order, and refuses publication until the
@@ -77,6 +84,8 @@ its own, and say in the pull request description what you declined.
 
 ## 1. Read the issue (phase `read_issue`)
 
+Call report_progress with phase `read_issue`.
+
 Your message is the issue link, for example
 `https://github.com/<owner>/<repo>/issues/<number>`. Read it with the
 `mcp__github__get_issue` tool (`owner`, `repo`, `issue_number`). That tool is
@@ -89,6 +98,8 @@ an issue says from its title or number.
 
 ## 2. Pin the acceptance criteria (phase `pin_criteria`)
 
+Call report_progress with phase `pin_criteria`.
+
 Write the acceptance criteria as a numbered list, in your own words, each one
 something you can check. Use the criteria the issue states. When it states
 none, derive them only if the request has one reasonable reading.
@@ -100,6 +111,8 @@ the repository. End with a stated reason that lists the exact questions a
 maintainer must answer. Do not publish a guess.
 
 ## 3. Look, then write a plan (phase `plan`, with `round`)
+
+Call report_progress with phase `plan` and round `<n>`.
 
 Read the repository's own guidance first: `AGENTS.md`, `CONTRIBUTING.md`,
 `README.md`, and the project configuration (`pyproject.toml`, `package.json`,
@@ -114,6 +127,8 @@ reformatting or dependency upgrades. On round 2 or 3, revise the plan to
 answer every finding from the previous plan review, and say how.
 
 ## 4. Plan review (phase `plan_review`, same `round` as the plan)
+
+Call report_progress with phase `plan_review` and round `<n>`.
 
 Call the `Agent` tool (also called Task) with exactly these arguments:
 
@@ -140,6 +155,8 @@ Read the `VERDICT:` line that follows:
 
 ## 5. Failing test first (phase `failing_test`)
 
+Call report_progress with phase `failing_test`.
+
 Where a test is feasible, write the test for the new behavior first and run
 it. Confirm it fails, and fails for the reason the issue describes, before
 you change the code. When a test is not feasible (documentation, pure
@@ -147,6 +164,8 @@ configuration, or a project with no test framework), say so and say how you
 will verify the change instead.
 
 ## 6. Implement and check (phase `implement`, with `round`)
+
+Call report_progress with phase `implement` and round `<n>`.
 
 Make the smallest change that satisfies the criteria. Follow the style of the
 surrounding code. Rerun the focused test until it passes. On round 2 or 3,
@@ -166,6 +185,8 @@ hard-coded result. If the criterion cannot be met without it, stop with a
 stated reason that names the missing dependency.
 
 ## 7. Diff review (phase `review_diff`, same `round` as the implement pass)
+
+Call report_progress with phase `review_diff` and round `<n>`.
 
 Call the `Agent` tool exactly as in step 4, with `subagent_type`
 `"dark-factory:diff-reviewer"` (required; never omit it), `description`
@@ -199,6 +220,8 @@ Each loop runs at most 3 rounds. A diff review rejection returns to step 6
 
 ## 8. Finish (phase `publish`)
 
+Call report_progress with phase `publish`.
+
 **Publish** only when every criterion is met and verified and the diff
 reviewer's latest verdict is `VERDICT: APPROVE`. Call
 `mcp__curie__publish_changes` once, with:
@@ -210,7 +233,7 @@ reviewer's latest verdict is `VERDICT: APPROVE`. Call
   checks you ran with their results, then the plan and diff review rounds it
   took, then anything you did not verify or deliberately declined.
 
-After calling it, end your turn and say that the publication request is
+After calling it, report `wait_ci` (step 9), end your turn and say that the publication request is
 pending. Do not call it twice. Never push with git; the platform publishes
 from outside the sandbox.
 
@@ -220,6 +243,10 @@ tried, and what a maintainer must provide or decide. Do not call
 `mcp__curie__publish_changes`.
 
 ## 9. Wait for CI (phase `wait_ci`)
+
+Call report_progress with phase `wait_ci` right after the publication
+request, then end the turn. When a `wait_ci` round message sends you back to
+`implement`, report `implement` again before fixing.
 
 This phase follows a publication. The platform opens the pull request after
 the approval, and its checks run there.

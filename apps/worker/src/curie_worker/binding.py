@@ -135,6 +135,10 @@ GRANT_TOOL_ENV = BootEnv.env_key("approval_grant_tool")
 # confers nothing -- the runner reads it only to decide whether to emit an
 # observe-only warning when the approved business action never ran.
 RESUMED_KIND_ENV = BootEnv.env_key("approval_resumed_kind")
+# #3077 live factory status card: the request-bound report_progress URL and
+# scoped token, minted by the kernel's resume overlay per work-item execution.
+PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
+PROGRESS_TOKEN_ENV = BootEnv.env_key("progress_token")
 # ADR-0076 Stone 3 (#889, epic #512): the resolved terminal decision
 # ('approved'/'rejected'/'expired') of the approval this resume boot is
 # resuming from, so the runner can stamp it on the turn's OTel span and close

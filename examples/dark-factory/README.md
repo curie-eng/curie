@@ -124,6 +124,14 @@ run ends as one pull request or one comment on the issue that names the cause.
 `curie dev factory-e2e` deploys this bundle by default when it drives the
 factory against a disposable install.
 
+## Live status
+
+`progress/phases.json` declares the nine phases and the two review loops. At
+the start of each phase the skill calls `mcp__curie__report_progress`, and the
+platform edits one status comment on the issue with a live card showing the
+current phase, the loop rounds and the run's activity. A failed report never
+stops the run.
+
 ## Evals
 
 `evals/cases.json` checks the parts of the workflow a single turn can show: the

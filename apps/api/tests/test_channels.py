@@ -1269,7 +1269,9 @@ def _other_routes() -> list[tuple[str, str]]:
     HMAC signature, and `POST /console/session` authenticates on the login code
     in its body (ADR-0083), never on a header credential. Excluded rather than
     asserted, because each would answer for a reason that has nothing to do with
-    this token. `POST /console/login-codes` is NOT excluded: it does carry the
+    this token. `GET /v1/factory/cards/{token}.svg` is public by design: GitHub's
+    image proxy fetches it without credentials and the unguessable path token is
+    its only key (#3077). `POST /console/login-codes` is NOT excluded: it does carry the
     platform-key dependency, so the sweep still asserts it refuses a `chn`
     token.
     """
@@ -1280,6 +1282,7 @@ def _other_routes() -> list[tuple[str, str]]:
         "/config",
         "/github/webhook",
         "/console/session",
+        "/v1/factory/cards/{token}.svg",
     }
     routes: list[tuple[str, str]] = []
     for route in _walk(create_app().routes):

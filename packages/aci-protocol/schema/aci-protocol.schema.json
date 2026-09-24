@@ -562,6 +562,38 @@
           ],
           "title": "Port"
         },
+        "progress_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_PROGRESS_TOKEN",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Progress Token"
+        },
+        "progress_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_PROGRESS_URL",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Progress Url"
+        },
         "runner_token": {
           "anyOf": [
             {
@@ -1501,6 +1533,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.0",
-  "title": "ACI Protocol v0.5.0"
+  "protocolVersion": "0.5.1",
+  "title": "ACI Protocol v0.5.1"
 }
