@@ -55,20 +55,22 @@ Every space an agent works in is one of two kinds:
 - **Public:** open to everyone in the organization, and to no one outside it.
   An ordinary Slack channel.
 - **Private:** anything narrower or wider than that. A direct message, a
-  private channel, a private email thread, and any space that includes people
-  outside the organization. A space whose kind is unknown is treated as
-  private.
+  private channel, or a private email thread, which are narrower. A space that
+  includes people outside the organization, which is wider. A space whose kind
+  is unknown is treated as private.
+
+A space with outsiders is private in both directions. Nothing it learns flows
+out, like any private space, and agent memory doesn't flow in either, because
+agent memory holds what the organization knows and outsiders aren't its
+audience.
 
 **Private spaces keep their own memory, sealed.** A private space can have its
 own facts, so the agent doesn't have to re-read the whole history of a direct
 message or private channel to find one small fact. But those facts live apart
 from everything else. They are used only in that space. They never enter agent
 memory, never appear in another space, and cannot be read by an operator. Facts
-flow into a private space from agent memory; nothing flows out.
-
-One exception to "flows in": a space that includes people outside the
-organization does not receive agent memory, because agent memory holds what
-the organization knows and outsiders are not its audience.
+flow into a private space from agent memory, except into a space with
+outsiders; nothing flows out.
 
 **Agent memory learns only from public spaces.** A fact reaches agent memory
 only if it was stated somewhere the whole organization could see it. That rule
