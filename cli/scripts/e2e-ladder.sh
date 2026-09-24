@@ -915,7 +915,9 @@ cluster_external_ingress_seed() {
         echo "cluster product evidence blocked: the external Slack phase did not provide CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT" >&2
         return 1
     }
-    [[ "$(stat -c '%a' "$receipt")" == "600" ]] || {
+    # GNU `stat -c` and BSD `stat -f` share no flag for this. lstat reads the
+    # path itself, as stat does without -L, so a symlink is refused too.
+    [[ "$(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.lstat(sys.argv[1]).st_mode), "o"))' "$receipt")" == "600" ]] || {
         echo "cluster product evidence blocked: the external Slack ingress receipt must be mode 0600" >&2
         return 1
     }
