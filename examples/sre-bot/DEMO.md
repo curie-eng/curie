@@ -135,6 +135,8 @@ kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
 kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   patch deployments -n sre-demo
 kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+  patch pods -n sre-demo
+kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   patch deployments --namespace=curie
 kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   get secrets --all-namespaces
@@ -142,7 +144,8 @@ kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
   create rolebindings -n sre-demo
 ```
 
-Expect yes, yes, no, no, no. A yes on platform-namespace patch or Secret read
+Expect yes, yes, yes, no, no, no. Pod patch is what server-side apply needs
+for an approved `resources_create_or_update` of a Pod. A yes on platform-namespace patch or Secret read
 means the identity is too wide; stop and fix RBAC before scenario 2.
 
 ## How to read each scenario
