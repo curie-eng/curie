@@ -604,6 +604,45 @@ def install_values(
     return values
 
 
+def helm_upgrade_command(
+    *,
+    context: str,
+    release: str,
+    chart: str,
+    namespace: str,
+    values_file: str,
+) -> list[str]:
+    """Upgrade without dropping values this command does not set.
+
+    A plain upgrade resets to the chart plus this file. That removes
+    ``agentSandbox.connectorSecrets`` and the per-agent SandboxWarmPool the
+    bundle deploy added, and the next claim fails WarmPoolNotFound.
+    ``--reuse-values`` keeps that pool and merges the new file over it.
+    """
+
+    return [
+        "helm",
+        "--kube-context",
+        context,
+        "upgrade",
+        release,
+        chart,
+        "-n",
+        namespace,
+        "--reuse-values",
+        "-f",
+        values_file,
+        "--timeout",
+        "20m",
+    ]
+
+
+def agent_warm_pool_name(release: str, agent: str) -> str:
+    """The per-agent pool name the chart and the worker both derive."""
+
+    return f"{release}-agent-{agent}-runner-pool"
+
+
 def quota_hard_pods(listing: Mapping[str, Any]) -> str | None:
     """The pods hard limit from a `kubectl get resourcequota -o json` body."""
 
@@ -2034,20 +2073,13 @@ class Preflight:
             f"(model {config.model if config.model_api_key else 'fake'}, quota {quota})"
         )
         run(
-            [
-                "helm",
-                "--kube-context",
-                self.config.kube_context,
-                "upgrade",
-                RELEASE,
-                str(self.chart_dir),
-                "-n",
-                self.namespace,
-                "-f",
-                str(values_file),
-                "--timeout",
-                "20m",
-            ]
+            helm_upgrade_command(
+                context=self.config.kube_context,
+                release=RELEASE,
+                chart=str(self.chart_dir),
+                namespace=self.namespace,
+                values_file=str(values_file),
+            )
         )
         for kind in ("deployment", "statefulset"):
             for workload in self.kubectl("-n", self.namespace, "get", kind, "-o", "name").split():
@@ -2060,11 +2092,36 @@ class Preflight:
             observed = self.sandbox_pods_hard()
             if observed != str(quota):
                 raise PreflightFailed(f"sandbox pod quota is {observed}, not {quota}")
-        # A worker that lived through quota 0 keeps its consumer. Restart it
-        # after the quota change so the next execute wake is not delivered to
-        # a consumer that has already exited.
-        self.restart_worker()
+        self.ensure_agent_pool()
         self.step("helm upgraded", model=config.model, sandbox_pod_quota=quota)
+
+    def ensure_agent_pool(self) -> None:
+        """The per-agent warm pool must exist before the next claim.
+
+        Connector-backed claims reference it by name. If the upgrade removed
+        it, deploy the bundle again; that is what creates the pool.
+        """
+
+        name = agent_warm_pool_name(RELEASE, FACTORY_AGENT)
+        if self._pool_exists(name):
+            return
+        log(f"sandbox warm pool {name} is missing; deploying the bundle again")
+        self.deploy_bundle()
+        if not self._pool_exists(name):
+            raise PreflightFailed(f"sandbox warm pool {name} is still missing after deploy")
+
+    def _pool_exists(self, name: str) -> bool:
+        found = self.kubectl(
+            "-n",
+            self.namespace,
+            "get",
+            "sandboxwarmpool",
+            name,
+            "--ignore-not-found",
+            "-o",
+            "name",
+        )
+        return bool(found.strip())
 
     def ensure_api(self) -> None:
         """Reopen the API port-forward when the current one is not healthy."""

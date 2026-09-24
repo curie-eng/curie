@@ -1276,6 +1276,21 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
     )
 
 
+def test_helm_upgrade_reuses_values_so_the_agent_pool_survives() -> None:
+    argv = fe.helm_upgrade_command(
+        context="k8",
+        release="curie",
+        chart="/chart",
+        namespace="ns",
+        values_file="/values.json",
+    )
+    assert "--reuse-values" in argv
+    assert "--reset-values" not in argv
+    assert fe.agent_warm_pool_name("curie", "factory-e2e") == (
+        "curie-agent-factory-e2e-runner-pool"
+    )
+
+
 def test_evaluation_coding_quota_matches_the_chart_default() -> None:
     values = Path(__file__).resolve().parents[3] / "charts" / "curie" / "values.yaml"
     assert f'sandboxPodCount: "{fe.CODING_SANDBOX_POD_QUOTA}"' in values.read_text()
