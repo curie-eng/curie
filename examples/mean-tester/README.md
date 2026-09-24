@@ -47,6 +47,10 @@ MEAN_TESTER_CHANNELS: "C0…,C0…"        # channels this tester may probe
 MEAN_TESTER_REPOS: "owner/repo@main"   # repositories it reads target bundles from
 ```
 
+The agent is not told which channel a request came from. With one listed
+channel it tests there without being told; with several, each request must
+name its channel as `#channel`, or the tools refuse and list the choices.
+
 A round is at most `MEAN_TESTER_MAX_PROBES` probes (default and ceiling 4) per
 target, counted over `MEAN_TESTER_REPLY_TIMEOUT_S` (default 240 seconds), and
 at most `MEAN_TESTER_MAX_CONCURRENT_ROUNDS` targets (default 2, ceiling 4) are

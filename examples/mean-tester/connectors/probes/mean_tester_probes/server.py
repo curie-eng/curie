@@ -56,11 +56,19 @@ def build(config: Config, slack, sources, issues=None, now=time.monotonic) -> MC
         with posted_lock:
             return [ts for ts in probe_ts if (channel, ts) not in posted]
 
-    def listed_channel(channel: str) -> None:
+    def listed_channel(channel: str) -> str:
+        """The channel a tool works in. The runner gives the agent no Slack
+        channel id, so an omitted one means the only operator-listed channel."""
+        if not channel:
+            if len(config.channels) != 1:
+                listed = ", ".join(sorted(config.channels))
+                raise ToolError(f"several channels are listed ({listed}); pass channel")
+            (channel,) = config.channels
         try:
             refuse_unlisted(config, channel)
         except GuardRefusal as exc:
             raise ToolError(str(exc)) from exc
+        return channel
 
     def issue_repo(repository: str) -> RepoRef:
         if repository not in read_repos:
@@ -76,9 +84,9 @@ def build(config: Config, slack, sources, issues=None, now=time.monotonic) -> MC
         return listed
 
     @mcp.tool(annotations=READ)
-    def read_target(channel: str, target_user: str, bundle_name: str = "") -> dict:
+    def read_target(target_user: str, channel: str = "", bundle_name: str = "") -> dict:
         """Find the target's bundle in the listed repositories and read it."""
-        listed_channel(channel)
+        channel = listed_channel(channel)
         found = sources.find(channel, bundle_name or None)
         if not found:
             raise ToolError(
@@ -119,9 +127,9 @@ def build(config: Config, slack, sources, issues=None, now=time.monotonic) -> MC
         return {"url": issues.create(repo, title, body)}
 
     @mcp.tool(annotations=POST)
-    def send_probes(channel: str, target_user: str, probes: list[str]) -> dict:
+    def send_probes(target_user: str, probes: list[str], channel: str = "") -> dict:
         """Post each probe as a new root message mentioning the target."""
-        listed_channel(channel)  # before Slack is asked anything about it
+        channel = listed_channel(channel)  # before Slack is asked anything about it
         try:
             texts = guard.check(channel, slack.channel_info(channel), probes, target_user)
             if target_user not in slack.members(channel):
@@ -144,9 +152,9 @@ def build(config: Config, slack, sources, issues=None, now=time.monotonic) -> MC
         return {"probes": sent}
 
     @mcp.tool(annotations=READ)
-    def collect_replies(channel: str, target_user: str, probe_ts: list[str]) -> dict:
+    def collect_replies(target_user: str, probe_ts: list[str], channel: str = "") -> dict:
         """Wait for each probe's final reply and report what a person would see."""
-        listed_channel(channel)
+        channel = listed_channel(channel)
         foreign = foreign_probes(channel, probe_ts)
         if foreign:
             raise ToolError(
