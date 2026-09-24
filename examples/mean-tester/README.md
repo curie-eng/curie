@@ -30,8 +30,13 @@ two off-the-shelf stdio MCP servers that the runner image preinstalls:
 ## Configure
 
 Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKILL.md):
-the channel ids it may probe in, and the `owner/repo@branch` repositories it
-reads target bundles from.
+- the channel ids it may probe in;
+- the `owner/repo@branch` repositories it reads target bundles from;
+- the test installations, if any.
+
+Every target not listed as a test installation is production. Against
+production, the tester only reads and asks. It never asks for an action, even
+an approval-gated one, and never attaches a file (ADR 0172 decision 5).
 
 The sandbox needs egress to Slack's API and GitHub's API. Add one
 `agentSandbox.connectorEgress.<agent>` entry per CIDR, for TCP 443:
