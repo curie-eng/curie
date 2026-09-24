@@ -4584,7 +4584,12 @@ rung_local() {
         # that same daemon, where `default` is its own builder. On Linux the
         # endpoint is the default socket, so nothing changes there.
         local daemon_endpoint
-        daemon_endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+        daemon_endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')" || daemon_endpoint=""
+        if [[ -z "$daemon_endpoint" ]]; then
+            echo "local: could not read the current Docker context's daemon endpoint, so the source build cannot be pinned to that daemon's own builder." >&2
+            echo "fix: make \`docker context inspect\` succeed for the current context, then re-run." >&2
+            return 1
+        fi
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
