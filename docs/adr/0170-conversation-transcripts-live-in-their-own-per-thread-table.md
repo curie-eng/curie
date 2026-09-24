@@ -77,14 +77,15 @@ thread, and expire when their thread ends.**
    turns already behaves.
 5. **Upgrade.** One Alembic revision, classed `expand`, creates the table and
    copies every `transcript` namespace row from `workflow_state_entries` into
-   it. It leaves the legacy rows in place, so an older API instance still
-   serving during a rolling upgrade keeps its history. The first time the new
-   API touches a thread, it adopts that thread's legacy row: a legacy row newer
-   than the copy replaces it, and the legacy row is then deleted. A WorkItem's
-   terminal transition deletes its legacy row too. A later `contract` revision
-   (#3088) removes the legacy rows nobody touched. A row over the per-thread cap
-   is copied as-is. Its next append is refused and the runner compacts it, as it
-   does with an oversized value today. Existing installs need no operator step.
+   it, with the default idle expiry. It leaves the legacy rows in place, so an
+   older API instance still serving during a rolling upgrade keeps its history.
+   When the new API reads or writes a thread, a legacy row newer than its copy
+   replaces the copy. The legacy row itself is left alone until that thread's
+   history ends (a terminal WorkItem, a delete, or idle expiry), so it is never
+   adopted back. A later `contract` revision (#3088) removes the rest. A row
+   over the per-thread cap is copied as-is. Its next append is refused and the
+   runner compacts it, as it does with an oversized value today. Existing
+   installs need no operator step.
 
 ## Consequences
 
@@ -98,8 +99,9 @@ thread, and expire when their thread ends.**
   an empty history.
 - A second table now holds conversation data. Questions about keeping or
   exporting transcripts now concern one table, not a generic namespace.
-- Until #3088 lands, untouched legacy rows keep using space in the state store.
-  They no longer grow, because the new API never writes there.
+- Until #3088 lands, legacy rows keep using space in the state store, and each
+  transcript access reads one extra row. They no longer grow, because the new
+  API never writes there.
 - A downgrade writes each thread's newer copy back to the state store, and the
   old caps apply to it again. An N-1 API serving the new schema during a rollback
   sees the legacy rows the new API has not adopted yet.

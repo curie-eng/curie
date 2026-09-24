@@ -85,6 +85,12 @@ def test_0052_moves_transcripts_and_downgrade_moves_them_back(
             "WHERE agent_id = :a",
             {"a": agent_id},
         )
+        expiry = _sql(
+            "SELECT expires_at > now() + interval '29 days' AS idle_window "
+            "FROM curie.thread_transcripts WHERE agent_id = :a",
+            {"a": agent_id},
+        )
+        assert expiry == [{"idle_window": True}]
         assert moved == [
             {"thread_key": THREAD, "value": transcript, "version": 3, "binding_scope": None}
         ]
