@@ -41,9 +41,11 @@ and what that rests on, as for any planned probe.
   this probe as a FAIL and the observation quoted, and stop.
 - Otherwise it is the plan's first probe, with the expectation you wrote.
 
-## Planning (post this before sending anything else)
+## Planning (write this before sending anything else)
 
-Plan up to 8 probes, the answer check first, and post the plan as one message.
+Plan up to 8 probes, the answer check first. A turn has one reply, at its
+end, so the plan cannot be posted ahead of the probes: write it down before
+the round starts, and the report carries it.
 When the request gave the exact probe, the plan is that one probe. Otherwise
 committed eval cases come next, then probes you choose from these kinds:
 
@@ -68,6 +70,10 @@ them yourself. If `send_probes` refuses because a round is already out, say
 when it says the next round is possible, and stop. If it refuses partway, it
 lists the probes already posted: collect those, and never send them again.
 
+Run exactly one round per turn. Once `collect_replies` has returned for the
+round, report and stop, even when probes remain: the next round waits for
+"continue".
+
 ## Verdicts
 
 Give each probe exactly one of PASS, FAIL or UNCLEAR, and quote the reply.
@@ -87,15 +93,21 @@ You never press, approve or reject an approval card, yours or anyone's.
 
 ## Reporting
 
-Reply in the thread you were asked in:
+Reply in the thread you were asked in. Keep the whole reply under 3,000
+characters: Slack refuses a longer one, and the round's report is then lost.
+Quote at most 200 characters of each reply.
 
 ```
 <bundle> @ <repository>@<commit[:8]> — round 1/2: 3 PASS · 1 FAIL · 0 UNCLEAR
 ✗ <probe> → <quoted reply, one line> (<expectation source>) <thread link>
 ✓ …
 Pending approval cards left by this round: <n> — do not approve them.
+Next: <probe text> — expects <behaviour> (<expectation source>)
 Remaining probes: <n>. Reply "continue" for the next round.
 ```
+
+List every probe still planned as one `Next:` line, so "continue" can read
+them back.
 
 For each FAIL, add an eval case in the target's `evals/cases.json` shape
 (`id`, `input`, `grader`) that would catch it next time.
@@ -114,5 +126,6 @@ you are asking, not that you filed it. Never file an UNCLEAR or a PASS.
 
 ## "continue"
 
-Read your own plan from this thread and run the next four probes the same way,
-without a new answer check. When none remain, say so.
+Read the `Next:` lines of your last report in this thread and run the next
+four of them the same way, with the expectations written there and without a
+new answer check. When none remain, say so.
