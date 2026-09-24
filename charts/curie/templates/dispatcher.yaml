@@ -25,6 +25,12 @@ metadata:
     app.kubernetes.io/component: dispatcher
 spec:
   replicas: {{ .Values.dispatcher.replicas }}
+  # Recreate, not RollingUpdate: each pod holds a Socket Mode connection per
+  # Slack app token and Slack hands an event to only one connected client, so a
+  # surge pod would split events with a terminating one (issue #2944). The old
+  # pod exits before the new one starts; see dispatcher.replicas in values.yaml.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "dispatcher") | nindent 6 }}
