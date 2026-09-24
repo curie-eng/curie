@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
+from curie_telemetry.redact import redact_text
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
@@ -55,6 +56,8 @@ ConflictCode = Literal[
 ]
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
+# Longest provider message a factory notice keeps (#3073).
+_NOTICE_DETAIL_MAX = 600
 
 
 @dataclass(frozen=True)
@@ -180,11 +183,17 @@ async def _database_now(session: AsyncSession) -> datetime:
 
 
 def _queue_notice(
-    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    detail: str | None,
 ) -> None:
     """Stage the owed comment in the terminal transaction. The caller commits.
 
-    Reply routing is resolved when the durable notice is delivered.
+    Reply routing is resolved when the durable notice is delivered. ``detail``
+    is the provider's own failure message (#3073); it is redacted before it is
+    stored, then clipped, so no key or token reaches the row or the comment.
     """
 
     if request.terminal_at is None:
@@ -197,8 +206,17 @@ def _queue_notice(
             execution_request_id=request.id,
             work_item_id=work_item.id,
             terminal_cause=cause.strip(),
+            detail=_notice_detail(detail),
         )
     )
+
+
+def _notice_detail(detail: str | None) -> str | None:
+    # Redact before clip so a truncated key still matches the redactor.
+    text = redact_text((detail or "").strip())
+    if len(text) > _NOTICE_DETAIL_MAX:
+        text = text[: _NOTICE_DETAIL_MAX - 3].rstrip() + "..."
+    return text or None
 
 
 async def _opened_pull_request(
@@ -607,7 +625,7 @@ async def expire_waiting(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request)
+    _queue_notice(session, work_item, request, detail=None)
     return await _outcome(session, work_item, request)
 
 
@@ -768,6 +786,7 @@ async def _terminalize_execution(
     expected_request_version: int,
     status: Literal["completed", "failed"],
     cause: str,
+    detail: str | None,
     extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
     work_item = await _lock_work_item(session, work_item_id)
@@ -859,7 +878,7 @@ async def _terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request)
+    _queue_notice(session, work_item, request, detail=detail)
     return await _outcome(session, work_item, request)
 
 
@@ -879,6 +898,7 @@ async def complete_execution(
         expected_request_version=expected_request_version,
         status="completed",
         cause="completed",
+        detail=None,
         extra_where=(),
     )
 
@@ -900,6 +920,7 @@ async def fail_execution(
         expected_request_version=expected_request_version,
         status="failed",
         cause=cause,
+        detail=None,
         extra_where=(),
     )
 
@@ -957,7 +978,7 @@ async def request_cancellation(
             )
         )
         active = await _reload_request(session, active.id)
-        _queue_notice(session, work_item, active)
+        _queue_notice(session, work_item, active, detail=None)
     elif active is not None and active.status == "running":
         await session.execute(
             update(ExecutionRequest)
@@ -1242,7 +1263,7 @@ async def _record_runtime_termination(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request)
+    _queue_notice(session, work_item, request, detail=None)
     return await _outcome(session, work_item, request)
 
 

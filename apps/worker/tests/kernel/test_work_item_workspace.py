@@ -15,7 +15,15 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta, TurnSource
+from aci_protocol import (
+    ErrorEvent,
+    Final,
+    QueuedTurn,
+    ReplyHandle,
+    SessionStatus,
+    TextDelta,
+    TurnSource,
+)
 from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.behaviorpacks import BehaviorPacks
@@ -85,6 +93,7 @@ class _WorkItems:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.after_finish: Callable[[], Awaitable[None]] | None = None
+        self.finishes: list[dict[str, object]] = []
 
     async def acquire(
         self, request_id: uuid.UUID, *, owner: str, generation: int
@@ -107,8 +116,9 @@ class _WorkItems:
             heartbeat_interval_s=60.0,
         )
 
-    async def finish(self, _request_id: uuid.UUID, **_: object) -> None:
+    async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
         self.calls.append("finish")
+        self.finishes.append(kwargs)
         if self.after_finish is not None:
             await self.after_finish()
 
@@ -347,5 +357,34 @@ def test_concurrent_work_items_each_start_their_own_request(make_harness) -> Non
             assert work_items.calls.count("acquire") == len(request_ids)
             assert sorted(work_items.started) == sorted(request_ids)
             assert work_items.calls.count("finish") == len(request_ids)
+
+    asyncio.run(exercise())
+
+
+def test_credit_exhausted_escalation_finishes_with_its_cause_and_message(
+    make_harness,
+) -> None:
+    """#3073: the issue names the real cause, not ``runner_escalated``."""
+
+    async def exercise() -> None:
+        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            message = "model error: unknown: API Error: 402 This request requires more credits"
+            h.runner.default_script = [
+                ErrorEvent(message=message, classification="model-credit-exhausted"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert work_items.calls.count("finish") == 1
+            finish = work_items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "model_credit_exhausted"
+            assert finish["detail"] == message
 
     asyncio.run(exercise())

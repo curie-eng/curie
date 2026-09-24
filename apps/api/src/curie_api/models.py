@@ -888,6 +888,8 @@ class FactoryTerminalNotice(Base):
         ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
     )
     terminal_cause: Mapped[str] = mapped_column(Text)
+    # The provider's own failure message, redacted before it is stored (#3073).
+    detail: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
     posted_at: Mapped[datetime | None] = mapped_column(

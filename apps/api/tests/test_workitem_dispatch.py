@@ -464,6 +464,7 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
             runtime_epoch=2,
             outcome="completed",
             cause="completed",
+            detail=None,
         )
         assert _code(stale_finish) == "stale_owner"
         after = await _request_row(session, facts.request_id)

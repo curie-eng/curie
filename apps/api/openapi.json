@@ -3455,6 +3455,18 @@
             "title": "Cause",
             "type": "string"
           },
+          "detail": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
           "outcome": {
             "enum": [
               "completed",
