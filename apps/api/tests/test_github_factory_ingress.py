@@ -600,7 +600,7 @@ def test_pull_request_comment_stays_on_the_review_arm(
     assert _requests(number) == []
 
 
-def test_concurrent_label_deliveries_create_one_execution(
+def test_concurrent_label_deliveries_leave_one_active_execution(
     factory_app: tuple[TestClient, GitHubAPI],
 ) -> None:
     client, api = factory_app
@@ -624,10 +624,11 @@ def test_concurrent_label_deliveries_create_one_execution(
 
     assert errors == []
     assert [response.status_code for response in responses] == [200, 200]
-    statuses = sorted(response.json()["status"] for response in responses)
-    assert statuses[0] in {"factory_admitted", "factory_duplicate"}
-    assert statuses[1] in {"factory_admitted", "factory_duplicate"}
-    assert len(_requests(number)) == 1
+    statuses = [response.json()["status"] for response in responses]
+    assert statuses == ["factory_admitted", "factory_admitted"]
+    rows = _requests(number)
+    assert len({row["work_item_id"] for row in rows}) == 1
+    assert [row["status"] for row in rows].count("waiting") == 1
 
 
 def _mark_running(request_id: uuid.UUID) -> None:

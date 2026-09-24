@@ -114,6 +114,13 @@ def comment_body(
             text = f"Completed: {pr_url.strip()}\n"
         else:
             raise ValueError("a completed issue notice requires its pull request URL")
+    elif cause == "issue_cancelled":
+        text = (
+            "Stopped: this run was cancelled because the factory label was removed "
+            "or the issue was closed. Add the label again to start a new run.\n"
+            # tools/factory-e2e reads the cause from this line.
+            f"Cause: {cause}\n"
+        )
     else:
         text = f"Could not complete: {cause_text(cause)}\n"
         if detail is not None and detail.strip():

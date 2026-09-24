@@ -8,8 +8,10 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
 from channel_protocol import scoped_conversation_id
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
 
 from . import workitems
 from .config import get_settings
@@ -222,9 +224,9 @@ async def _replay_existing(
     return await _outcome(session, work_item, locked, replayed=True)
 
 
-async def admit(
+async def _admission_refusal(
     session: AsyncSession, facts: Any
-) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+) -> DispatchConflict | None:
     agent = await session.get(Agent, facts.agent_id)
     if agent is None:
         return await _refuse(session, "not_found")
@@ -251,13 +253,77 @@ async def admit(
         or not requester.strip()
     ):
         return await _refuse(session, "identity_mismatch")
+    return None
 
+
+async def admit(
+    session: AsyncSession, facts: Any
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    refused = await _admission_refusal(session, facts)
+    if refused is not None:
+        return refused
     existing = await session.scalar(
         select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
     )
     if existing is not None:
         return await _replay_existing(session, existing, facts)
+    return await _admit_new(session, facts)
 
+
+async def readmit(
+    session: AsyncSession, facts: Any
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    """Admit a label addition. On an existing WorkItem it starts a new run.
+
+    When the WorkItem still has a running request, the outcome carries that
+    request, not ``facts.request_id``: the new run starts once it has stopped.
+    """
+
+    refused = await _admission_refusal(session, facts)
+    if refused is not None:
+        return refused
+    existing = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
+    )
+    if existing is not None:
+        return await _replay_existing(session, existing, facts)
+    work_item = await session.scalar(
+        select(WorkItem).where(
+            WorkItem.github_repository_id == facts.github_repository_id,
+            WorkItem.github_issue_number == facts.github_issue_number,
+        )
+    )
+    if work_item is None:
+        return await _admit_new(session, facts)
+    if not _work_item_matches(work_item, facts):
+        return await _refuse(
+            session, "identity_mismatch", work_item_id=work_item.id
+        )
+    now = await _database_now(session)
+    readmitted = await workitems.readmit(
+        session,
+        work_item_id=work_item.id,
+        request_id=facts.request_id,
+        wait_deadline=now
+        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        objective=facts.objective,
+        requester=facts.requester,
+    )
+    if isinstance(readmitted, WorkItemConflict):
+        return readmitted
+    assert readmitted.request is not None
+    if readmitted.request.id != facts.request_id:
+        return readmitted
+    written = await _write_snapshot(session, facts.request_id, facts)
+    if isinstance(written, DispatchConflict):
+        return written
+    reloaded = await _reload_work_item(session, work_item.id)
+    return await _outcome(session, reloaded, written)
+
+
+async def _admit_new(
+    session: AsyncSession, facts: Any
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
     created = await workitems.create_or_get_work_item(
         session,
         github_repository_id=facts.github_repository_id,
@@ -863,13 +929,42 @@ async def finish(
     return result
 
 
+_ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
+
+
+def _unconfirmed_settle_teardown() -> ColumnElement[bool]:
+    """A force-settled cancellation whose sandbox teardown is still owed.
+
+    Teardown is thread-scoped, so a newer relabeled request on the same work
+    item owns the sandbox while it is active. Such a row is left flagged, not
+    cleared: once the sibling reaches a terminus the wake resumes and tears
+    down whatever the old claim left behind.
+    """
+
+    sibling = aliased(ExecutionRequest)
+    return and_(
+        ExecutionRequest.status == "cancelled",
+        ExecutionRequest.teardown_unconfirmed_at.is_not(None),
+        ~exists().where(
+            sibling.work_item_id == ExecutionRequest.work_item_id,
+            sibling.id != ExecutionRequest.id,
+            sibling.status.in_(_ACTIVE_STATUSES),
+        ),
+    )
+
+
 async def claim_termination(
     session: AsyncSession, request_id: uuid.UUID, *, owner: str
 ) -> TerminationClaim | DispatchConflict:
     request = await _lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    if request.status != "cancellation_requested":
+    settled_teardown = (
+        request.status == "cancelled" and request.teardown_unconfirmed_at is not None
+    )
+    # A settled teardown is re-checked against active siblings in the
+    # guarded update below.
+    if not settled_teardown and request.status != "cancellation_requested":
         return await _refuse(
             session,
             "not_running",
@@ -893,7 +988,9 @@ async def claim_termination(
         update(ExecutionRequest)
         .where(
             ExecutionRequest.id == request.id,
-            ExecutionRequest.status == "cancellation_requested",
+            _unconfirmed_settle_teardown()
+            if settled_teardown
+            else ExecutionRequest.status == "cancellation_requested",
         )
         .values(
             runtime_owner=owner,
@@ -905,6 +1002,14 @@ async def claim_termination(
         .returning(ExecutionRequest.id)
     )
     if changed_id is None:
+        if settled_teardown:
+            # A newer request on the thread owns the sandbox lifecycle.
+            return await _refuse(
+                session,
+                "not_running",
+                request_id=request.id,
+                status=request.status,
+            )
         return await _refuse(session, "duplicate", request_id=request.id)
     request = await _reload_request(session, request.id)
     claimed = TerminationClaim(runtime_epoch=request.runtime_epoch)
@@ -1043,13 +1148,21 @@ async def claim_terminate_publishes(
     due = (
         select(ExecutionRequest.id)
         .where(
-            ExecutionRequest.status == "cancellation_requested",
             ExecutionRequest.reply_kind.is_not(None),
             or_(
-                ExecutionRequest.runtime_owner.is_(None),
-                ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
-                ExecutionRequest.runtime_heartbeat_expires_at
-                <= func.clock_timestamp(),
+                and_(
+                    ExecutionRequest.status == "cancellation_requested",
+                    or_(
+                        # An issue cancellation stops a live runtime too.
+                        ExecutionRequest.terminal_cause == "issue_cancelled",
+                        ExecutionRequest.runtime_owner.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at
+                        <= func.clock_timestamp(),
+                    ),
+                ),
+                # A forced settle still owes the sandbox a teardown.
+                _unconfirmed_settle_teardown(),
             ),
             or_(
                 ExecutionRequest.terminate_published_at.is_(None),

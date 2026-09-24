@@ -375,6 +375,14 @@ class Settings(BaseSettings):
             "WORK_ITEM_RUNTIME_TTL_SECONDS",
         ),
     )
+    work_item_cancel_settle_seconds: int = Field(
+        default=120,
+        ge=1,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS",
+            "WORK_ITEM_CANCEL_SETTLE_SECONDS",
+        ),
+    )
     work_item_backoff_base_seconds: int = Field(
         default=10,
         gt=0,

@@ -422,7 +422,7 @@ def test_label_removal_posts_one_comment(admitted: Any) -> None:
     assert _notices(row["id"])[0]["posted_at"] is None
     _reconcile()
     assert sink.posts == 1
-    assert "issue_cancelled" in sink.comments[0]["body"]
+    assert "Stopped:" in sink.comments[0]["body"]
     assert marker_for(row["id"]) in sink.comments[0]["body"]
 
 
@@ -567,7 +567,7 @@ def test_a_running_cancellation_comments_only_after_the_runtime_is_observed(
     assert (terminal["status"], terminal["terminal_cause"]) == ("cancelled", "issue_cancelled")
     _reconcile()
     assert sink.posts == 1
-    assert "issue_cancelled" in sink.comments[0]["body"]
+    assert "Stopped:" in sink.comments[0]["body"]
     assert marker_for(row["id"]) in sink.comments[0]["body"]
 
 
