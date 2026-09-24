@@ -976,8 +976,11 @@ credential), then one authorized same-PR revision and label removal of one
 waiting request and one running request. After the waiting cancellation it
 raises the sandbox pod quota to the chart default with `helm upgrade
 --reuse-values`, so the per-agent sandbox warm pool survives. A request that
-has not started is cancelled and opened again, and that case is given up
-well before the hour-long never-started cap. Hidden checks run
+has not started, a delivery the tunnel rejected, or a run that escalates in
+the first few seconds is cancelled and opened again. A refusal still has to
+end as `no_pull_request`, and the budget case still has to end as
+`execution_deadline`. The case is given up well before the hour-long
+never-started cap. Hidden checks run
 against each resulting pull request and are not part of the ticket. The JSON evidence
 includes the candidate commit, each verdict, configured and observed model,
 usage or an explicit unverified record, and elapsed time. The command exits

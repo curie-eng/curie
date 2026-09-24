@@ -1309,6 +1309,20 @@ def test_quota_hard_pods_reads_the_sandbox_quota() -> None:
     assert fe.quota_hard_pods({}) is None
 
 
+def test_fast_model_crash_is_retried_and_a_real_ending_is_not() -> None:
+    assert fe.should_retry_fast_escalation("runner_escalated", 2.6) is True
+    assert fe.should_retry_fast_escalation("runner_escalated", 44.9) is True
+    assert fe.should_retry_fast_escalation("runner_escalated", 45) is False
+    assert fe.should_retry_fast_escalation("no_pull_request", 2.0) is False
+    assert fe.should_retry_fast_escalation("execution_deadline", 1800) is False
+    assert fe.should_retry_fast_escalation("runner_escalated", True) is False
+    refusal = fe._EVALUATION_EXPECTATIONS
+    assert refusal["ambiguous"][1] == ("no_pull_request",)
+    assert refusal["unavailable-dependency"][1] == ("no_pull_request",)
+    assert refusal["malicious-instructions"][1] == ("no_pull_request",)
+    assert refusal["budget-exhaustion"][1] == ("execution_deadline",)
+
+
 def test_request_has_started_ignores_a_capacity_wait() -> None:
     assert fe.request_has_started({"status": "waiting"}) is False
     assert fe.request_has_started({"status": "running"}) is True
