@@ -51,9 +51,18 @@ DEV_SCRIPTS = [
     REPO_ROOT / path
     for path in re.findall(r'dev_script\(\s*"([^"]+\.sh)"', CLI_MAIN_PATH.read_text())
 ]
+# `curie dev chart-check` runs this with the bash on PATH through
+# `run_chart_check_scripts` (cli/src/commands.rs), not `dev_script`, so the
+# dispatch above does not find it.
+WORKER_TTL_BOUNDS_PATH = (
+    REPO_ROOT / "charts" / "curie" / "ci" / "worker-ttl-bounds-assertions.sh"
+)
 # Scripts a contributor runs on their own host, whose bash may be 3.2: every
-# `curie dev` script, and the e2e scripts that are started by hand.
-HOST_SCRIPTS = sorted({*DEV_SCRIPTS, IDLE_ROUTE_PATH, MAIL_ADAPTER_PATH})
+# `curie dev` script, the chart assertion above, and the e2e scripts that are
+# started by hand.
+HOST_SCRIPTS = sorted(
+    {*DEV_SCRIPTS, WORKER_TTL_BOUNDS_PATH, IDLE_ROUTE_PATH, MAIL_ADAPTER_PATH}
+)
 
 
 def _bash3() -> str | None:
@@ -1382,3 +1391,42 @@ fi
         assert result.returncode == 0, result.stderr
         assert result.stdout == "lock taken\nlock still held\n", result.stderr
         assert result.stderr == ""
+
+
+# The programs worker-ttl-bounds hands to `python3 -c`, in assignment order.
+WORKER_TTL_BOUNDS_PROGRAMS = [
+    "WORKER_ENV_PY",
+    "WORKER_TERMINATION_GRACE_PY",
+    "WORKER_GRACE_COVERS_BUDGET_PY",
+]
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_worker_ttl_bounds_hands_python_each_program_whole(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """An empty program would pass every env assertion without checking one."""
+
+    block = _top_level_block(
+        WORKER_TTL_BOUNDS_PATH.read_text(),
+        "# Reads the worker Deployment's env list by NAME",
+        'TMP="$(mktemp -d)"',
+        WORKER_TTL_BOUNDS_PATH,
+    )
+    programs = re.findall(r"<<'PY'[^\n]*\n(.*?\n)PY\n", block, re.DOTALL)
+    assert len(programs) == len(WORKER_TTL_BOUNDS_PROGRAMS), block
+    dumps = "".join(
+        f'printf %s "${name}" > "$1/{name}"\n' for name in WORKER_TTL_BOUNDS_PROGRAMS
+    )
+    result = subprocess.run(
+        [interpreter, "-c", f"set -euo pipefail\n{block}{dumps}", "bash", str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    for name, program in zip(WORKER_TTL_BOUNDS_PROGRAMS, programs, strict=True):
+        received = (tmp_path / name).read_text()
+        # The two ways to assign a heredoc differ only in its trailing newline.
+        assert received.rstrip("\n") == program.rstrip("\n"), name
+        compile(received, name, "exec")
