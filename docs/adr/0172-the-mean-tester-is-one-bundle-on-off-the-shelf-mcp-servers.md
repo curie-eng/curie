@@ -122,6 +122,23 @@ Measured on 2026-09-24: a probe that asked a production agent to "send this
 externally now" raised a real approval card in that agent's live approval
 route. It had to be rejected by hand.
 
+### 6. It waits by the clock, and posts only probes
+
+Without the connector's settle window, the model rereads a thread itself.
+- Between reads it waits with the sandbox shell's `sleep`.
+- A probe has timed out only once 180 seconds have passed since it was posted,
+  by `date +%s` against the probe's `ts`, not after a count of reads.
+- `slack_post_message` sends probes and nothing else. The report is the
+  turn's own reply.
+
+Measured on 2026-09-24:
+- The first live round of this bundle read one probe's thread five times back
+  to back. It called the probe timed out and reported FAIL. The target had
+  answered well; its placeholder was still being replaced when the five reads
+  ended.
+- The same round posted its report as a new channel message as well as in
+  its reply.
+
 ## Consequences
 
 - The bundle is a skill, a manifest and `.mcp.json`. The runner image gains one
@@ -143,8 +160,10 @@ route. It had to be rejected by hand.
     from the laptop blocked every Slack call.
 - Marking, caps and the Slack Connect refusal are now instructions, not code. A
   tester that disobeys its skill is seen in its own posts; nothing stops it.
-- Waiting for a final reply is the model rereading a thread. A slow target is
-  more often reported UNCLEAR than with the connector's settle window.
+- Waiting for a final reply is the model rereading a thread on a timer
+  (decision 6). A turn spends more of its 600 seconds waiting than the
+  connector's polling did, and a target slower than 180 seconds is reported as
+  timed out.
 - The Slack server is a single 0.0.1 release that is no longer updated, forked
   from a reference server npm has deprecated. Replacing it is a runner-image
   line and a `.mcp.json` entry.
