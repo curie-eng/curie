@@ -3453,8 +3453,10 @@ case_connector_registry_missing_cluster() {
     cp "$lock" "$backup"
     # The IMAGE only, never the source_digest: moving the digest trips
     # `lock_preflight`'s staleness refusal first, and this case would then
-    # assert a green against the wrong refusal entirely.
-    sed -i "s|$good|$bad|" "$lock"
+    # assert a green against the wrong refusal entirely. Rewritten from the
+    # backup rather than with `sed -i`, which BSD sed reads differently, and
+    # in place, so the lock keeps its mode.
+    sed "s|$good|$bad|" "$backup" >"$lock"
     if ! grep -qF "$bad" "$lock"; then
         echo "cluster: connectors.lock.yaml still does not name '$bad' after the edit, so the deploy below would run against a perfectly good lock and prove nothing." >&2
         cp "$backup" "$lock"
