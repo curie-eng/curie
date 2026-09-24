@@ -218,9 +218,10 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
     """Every caller is a shell, so this is the status a shell reads.
 
     When the command dies of the TERM passed to it, GNU coreutils 9.1 and 9.7
-    in Debian images re-raise it (a returncode of -15), while the GNU timeout
-    on the ubuntu-24.04 Actions runner exits 143 without a warning (CI run
-    36041307028). A shell reads 143 from both.
+    in Debian images re-raise it (a returncode of -15). GNU timeout on a loaded
+    ubuntu-24.04 Actions runner once exited 143 instead, without a warning (CI
+    run 36041307028), for a reason not established: timeout.c is the same
+    there in 9.1 and 9.4. A shell reads 143 from both.
     """
 
     _require_a_group_of_its_own(implementation)
