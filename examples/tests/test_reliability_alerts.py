@@ -40,6 +40,7 @@ REQUIRED_ALERTS = {
     "CurieCoreWorkloadNotReady",
     "CurieStateStoreNotReady",
     "CuriePersistentVolumeSpaceLow",
+    "CurieKubeStateMetricsDown",
 }
 
 FORBIDDEN_IDENTITY = (
