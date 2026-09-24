@@ -240,6 +240,32 @@ sys.stdout.write(json.dumps(config))
 PY
 }
 
+build_denied_upgrade_kubeconfig() {
+  # The demo tests the Kubernetes connector, but the source bundle also declares
+  # self-upgrade. Give that unused connector a distinct identity with no role
+  # binding; never reuse the reader token or grant upgrade permissions here.
+  local identity="sre-demo-upgrade-denied" token
+  kubectl -n "$NAMESPACE" create serviceaccount "$identity" >/dev/null
+  local verb resource
+  for permission in 'create jobs' 'get secrets'; do
+    read -r verb resource <<< "$permission"
+    if [[ "$(kubectl auth can-i --as="system:serviceaccount:${NAMESPACE}:${identity}" "$verb" "$resource" -n "$NAMESPACE")" != "no" ]]; then
+      echo "unexpected upgrade grant for ${identity}: ${permission}" >&2
+      return 1
+    fi
+  done
+  token="$(kubectl -n "$NAMESPACE" create token "$identity" --duration=1h)"
+  SRE_DEMO_DENIED_TOKEN="$token" SRE_DEMO_DENIED_IDENTITY="$identity" python3 -c '
+import json, os, sys
+config = json.load(sys.stdin)
+identity = os.environ["SRE_DEMO_DENIED_IDENTITY"]
+config["users"] = [{"name": identity, "user": {"token": os.environ["SRE_DEMO_DENIED_TOKEN"]}}]
+config["contexts"] = [{"name": identity, "context": {"cluster": "in-cluster", "user": identity}}]
+config["current-context"] = identity
+json.dump(config, sys.stdout)
+'
+}
+
 ensure_demo_workload() {
   kubectl apply -f - <<EOF
 apiVersion: apps/v1
@@ -555,11 +581,13 @@ phase_run() {
   local bin
   bin="$(curie_bin)"
   kubectl apply -f "$ROOT/examples/sre-bot/manifests/kubernetes-access.yaml"
-  local kubeconfig
+  local kubeconfig upgrade_kubeconfig
   kubeconfig="$(build_kubeconfig)"
+  upgrade_kubeconfig="$(printf '%s' "$kubeconfig" | build_denied_upgrade_kubeconfig)"
   ensure_demo_workload
 
   export K8S_KUBECONFIG="$kubeconfig"
+  export SELF_UPGRADE_KUBECONFIG="$upgrade_kubeconfig"
 
   set +e
   "$bin" cluster deploy \
@@ -567,7 +595,8 @@ phase_run() {
     --chart "$ROOT/charts/curie" \
     --namespace "$NAMESPACE" \
     --release "$RELEASE" \
-    --secret K8S_KUBECONFIG
+    --secret K8S_KUBECONFIG \
+    --secret SELF_UPGRADE_KUBECONFIG
   local first_deploy=$?
   set -e
   if [[ "$first_deploy" != 0 && "$first_deploy" != 2 ]]; then
@@ -580,7 +609,8 @@ phase_run() {
     --chart "$ROOT/charts/curie" \
     --namespace "$NAMESPACE" \
     --release "$RELEASE" \
-    --secret K8S_KUBECONFIG
+    --secret K8S_KUBECONFIG \
+    --secret SELF_UPGRADE_KUBECONFIG
 
   local waited deployment
   waited=0
