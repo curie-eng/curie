@@ -16,7 +16,8 @@ The same scripts must run on the userland macOS ships, too: it has no GNU
 ``timeout`` and no ``setsid``, and its BSD ``sed`` reads the argument after a
 bare ``-i`` as a backup suffix. The executing tests for those sites put
 stand-ins on PATH that fail the way a stock Mac's tools do, so they fail on a
-Linux host as well.
+Linux host as well, and a second scan refuses the forms listed in ``GNU_ONLY``
+in any script listed in ``HOST_SCRIPTS``.
 """
 
 from __future__ import annotations
@@ -130,16 +131,50 @@ BASH4_ONLY = {
     _COMMAND + r"wait\s+-n\b": "wait -n (bash 4.3)",
 }
 
+# Any options a command takes before the one that matters.
+_OPTIONS = r"(\s+-[A-Za-z]+)*\s+"
 
-def _bash4_only_lines(source: str, name: str = "<source>") -> list[str]:
+# GNU userland a stock Mac lacks or reads differently, each measured on
+# 2026-09-24 on Darwin 25.6 with only /usr/bin:/bin:/usr/sbin:/sbin on PATH.
+# flock is absent there too, but four drill scripts still call it, so it joins
+# this table once they stop.
+GNU_ONLY = {
+    _COMMAND + r"timeout\s+[-$0-9\"']": 'timeout, absent: use "$GNU_PROCESS" timeout',
+    _COMMAND + r"setsid\s+[^\s=]": 'setsid, absent: use "$GNU_PROCESS" setsid',
+    r"\bsed" + _OPTIONS + r"-[A-Za-z]*i(\s|$)": "sed -i with no suffix, which BSD sed reads from the next argument",
+    r"\bsed" + _OPTIONS + r"-[A-Za-z]*z": "sed -z",
+    r"\bstat" + _OPTIONS + r"(-[A-Za-z]*c\b|--(format|printf)\b)": "stat -c, where BSD stat takes -f",
+    r"\bdate" + _OPTIONS + r"(-[A-Za-z]*d\b|--date\b)": "date -d",
+    r"\bhead" + _OPTIONS + r"-n\s*-[0-9]": "head -n -N",
+    _COMMAND + r"(tac|nproc|numfmt|shuf)\b": "tac, nproc, numfmt and shuf, absent",
+    r"\bxargs" + _OPTIONS + r"(-[A-Za-z]*d\b|--delimiter\b)": "xargs -d",
+    r"\bcp\b.*\s--parents\b": "cp --parents",
+    r"\bln" + _OPTIONS + r"-[A-Za-z]*r": "ln -r",
+    r"\bdu" + _OPTIONS + r"-[A-Za-z]*b": "du -b",
+    _COMMAND + r"install" + _OPTIONS + r"-[A-Za-z]*D": "install -D",
+    r"\bmktemp\b.*\s--(suffix|tmpdir)\b": "mktemp --suffix and --tmpdir",
+    r"\bps\b.*\s--no-headers?\b": "ps --no-headers",
+    r"\bcut\b.*\s--complement\b": "cut --complement",
+}
+
+
+def _refused_lines(table: dict[str, str], source: str, name: str) -> list[str]:
     hits = []
     for number, line in enumerate(source.splitlines(), start=1):
         if line.lstrip().startswith("#"):
             continue
-        for pattern, construct in BASH4_ONLY.items():
+        for pattern, construct in table.items():
             if re.search(pattern, line):
                 hits.append(f"{name}:{number}: {construct}: {line.strip()}")
     return hits
+
+
+def _bash4_only_lines(source: str, name: str = "<source>") -> list[str]:
+    return _refused_lines(BASH4_ONLY, source, name)
+
+
+def _gnu_only_lines(source: str, name: str = "<source>") -> list[str]:
+    return _refused_lines(GNU_ONLY, source, name)
 
 
 def _script_id(path: Path) -> str:
@@ -229,6 +264,74 @@ def test_the_source_scan_ignores_what_bash_3_2_accepts(line: str) -> None:
 
 def test_the_source_scan_ignores_a_comment_that_names_a_construct() -> None:
     assert not _bash4_only_lines("    # `${NAME+x}` rather than `[[ -v NAME ]]`\n")
+
+
+@pytest.mark.parametrize("script", HOST_SCRIPTS, ids=_script_id)
+def test_script_uses_no_gnu_only_userland(script: Path) -> None:
+    hits = _gnu_only_lines(script.read_text(), _script_id(script))
+    assert not hits, "a stock Mac lacks or misreads:\n" + "\n".join(hits)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The lines this scan was written against, before their fixes.
+        '        out="$(cd "$GATE_CASE_BUNDLE" && timeout 240 "$BIN" --json skill message \\',
+        '        timeout --foreground "$1s" "$2" --context "$3" -n "$4" get "$5" "$6" \\',
+        "    setsid bash -c '",
+        '    if ! timeout "$((MESSAGE_TIMEOUT_SECONDS + 30))" "$BIN" "${args[@]}" \\',
+        '    if ! timeout 90 "$BIN" --json cluster reset-thread "$AGENT" \\',
+        '    sed -i "s|$good|$bad|" "$lock"',
+        "    sed -Ei 's/a/b/' file",
+        "    sed -n -i 's/a/b/' file",
+        "    tr -d x < f | sed -z 's/a/b/'",
+        "    mode=\"$(stat -c '%a' \"$receipt\")\"",
+        '    stat --format=%a "$receipt"',
+        '    date -u -d "@$epoch" +%s',
+        '    date --date="1 hour ago"',
+        "    head -n -1 file",
+        "    tac file",
+        '    jobs="$(nproc)"',
+        "    numfmt --to=iec 1024",
+        "    shuf -n 1 file",
+        "    printf 'a\\n' | xargs -d '\\n' rm",
+        "    cp --parents a/b dest",
+        '    ln -sr "$target" "$link"',
+        "    du -sb dir",
+        "    install -Dm644 file dest/file",
+        "    mktemp --suffix=.json",
+        "    ps --no-headers -o pid",
+        "    cut --complement -c1 file",
+    ],
+)
+def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
+    assert _gnu_only_lines(line + "\n"), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '        out="$(cd "$GATE_CASE_BUNDLE" && "$GNU_PROCESS" timeout "$GATE_CASE_TURN_SECONDS" "$BIN" \\',
+        '        "$8" timeout --foreground "$1s" "$2" --context "$3" -n "$4" \\',
+        "    \"$GNU_PROCESS\" setsid bash -c '",
+        '    sed "s|$good|$bad|" "$backup" >"$lock"',
+        "    sed -i.bak 's/a/b/' file",
+        '    kubectl rollout status "deployment/$name" --timeout=180s >/dev/null',
+        "timeout = budget + 60",
+        '    banner "DIAGNOSTICS (timeout after ${timeout}s)"',
+        '  local ns="$1" name="$2" want="$3" timeout="${4:-180}"',
+        '    args+=(--timeout-secs "$MESSAGE_TIMEOUT_SECONDS")',
+        "require_command python3",
+        "    date -u +%Y-%m-%dT%H:%M:%S.%NZ",
+        '    touch -t 200001010000 "$lock"',
+        "    npm install -D acme-lint",
+        "    stat -f '%Lp' \"$receipt\"",
+        "    grep -c pattern file",
+        '    cp -a "$WORKDIR/bundle" "$GATE_CASE_BUNDLE"',
+    ],
+)
+def test_the_userland_scan_ignores_portable_forms(line: str) -> None:
+    assert not _gnu_only_lines(line + "\n"), line
 
 
 @needs_bash3
