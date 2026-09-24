@@ -1605,7 +1605,6 @@ def test_expired_text_names_the_configured_seconds(
     assert body["state"] == "expired"
     assert "90 s" in body["actionable_cause"], body["actionable_cause"]
     assert "1800" not in body["actionable_cause"], body["actionable_cause"]
-||||||| parent of 44f514a4 (Add failing tests for the factory CI wait and fix loop)
 
 
 # --- #3097: the CI gate's detail observer ---------------------------------------
