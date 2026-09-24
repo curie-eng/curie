@@ -1,37 +1,48 @@
-"""GNU ``timeout`` and util-linux ``setsid`` on a host that ships neither.
+"""GNU ``timeout`` and util-linux ``setsid`` and ``flock`` on a host that ships none.
 
-A stock Mac has no ``timeout`` and no ``setsid`` (measured 2026-09-24 on
-Darwin 25.6: ``timeout``, ``gtimeout`` and ``setsid`` are all absent from
-PATH), so the host scripts run both through ``cli/scripts/gnu-process.py``.
-Their callers test GNU's statuses: 124 once the bound fires, the command's own
-status otherwise, and a new session led by the ``$!`` the script recorded.
+A stock Mac has no ``timeout``, no ``setsid`` and no ``flock`` (measured
+2026-09-24 on Darwin 25.6: ``timeout``, ``gtimeout``, ``setsid`` and ``flock``
+are all absent from PATH), so the host scripts run them through
+``cli/scripts/gnu-process.py``. Their callers test GNU's statuses: 124 once the
+bound fires, the command's own status otherwise, a new session led by the
+``$!`` the script recorded, and a lock taken or refused on the descriptor the
+script opened.
 
 Every expectation here was measured against GNU coreutils 9.1 ``timeout`` and
-util-linux 2.38.1 ``setsid`` on Debian 12, in the ``curie-runner`` image. Each
-case also runs against GNU's own tool wherever it is on PATH, as on Linux CI,
-so a divergence from GNU fails there even though a Mac cannot see it.
+util-linux 2.38.1 ``setsid`` and ``flock`` on Debian 12, in the ``curie-runner``
+image. Each case also runs against GNU's own tool wherever it is on PATH, as on
+Linux CI, so a divergence from GNU fails there even though a Mac cannot see it.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER = REPO_ROOT / "cli" / "scripts" / "gnu-process.py"
-GNU_VERSION_MARKERS = {"timeout": "GNU coreutils", "setsid": "util-linux"}
+GNU_VERSION_MARKERS = {
+    "timeout": "GNU coreutils",
+    "setsid": "util-linux",
+    "flock": "util-linux",
+}
 # Exists and is not executable on both macOS and Linux.
 NOT_EXECUTABLE = "/etc/passwd"
 NOT_FOUND = "/nonexistent/acme-command"
 # 141 when SIGPIPE is at its default, 1 when an inherited SIG_IGN leaves `yes`
 # to fail on EPIPE instead. A pipeline under either tool must see the default.
 SIGPIPE_PROBE = ["bash", "-c", 'yes | head -n 1 >/dev/null; exit "${PIPESTATUS[0]}"']
+# The lock as the drill scripts take it, on a descriptor the shell opened.
+TAKE_THE_LOCK = 'exec 9>"$1"; shift; "$@" -n 9'
 
 
 def _is_gnu(tool: str) -> bool:
@@ -333,3 +344,109 @@ def test_setsid_forks_when_it_already_leads_a_group(
     pid, session = record.read_text().split()
     assert pid == session
     assert int(pid) != process.pid
+
+
+@contextlib.contextmanager
+def _held_elsewhere(lock: Path, operation: int | None) -> Iterator[None]:
+    """The lock, held on an open file description of the test's own."""
+
+    if operation is None:
+        yield
+        return
+    with lock.open("a") as handle:
+        fcntl.flock(handle, operation | fcntl.LOCK_NB)
+        yield
+
+
+def _free(lock: Path) -> bool:
+    with lock.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+    return True
+
+
+@pytest.mark.parametrize("implementation", _implementations("flock"))
+@pytest.mark.parametrize(
+    ("script", "held_elsewhere", "status", "stderr"),
+    [
+        pytest.param(TAKE_THE_LOCK, None, 0, "", id="takes-a-free-lock"),
+        pytest.param(
+            TAKE_THE_LOCK, fcntl.LOCK_EX, 1, "", id="refuses-a-lock-held-elsewhere"
+        ),
+        # Exclusive, so two drills can never both hold it.
+        pytest.param(
+            TAKE_THE_LOCK, fcntl.LOCK_SH, 1, "", id="refuses-a-lock-shared-elsewhere"
+        ),
+        pytest.param(
+            f'{TAKE_THE_LOCK} && "$@" -n 9', None, 0, "", id="retakes-its-own-lock"
+        ),
+        pytest.param(
+            'shift; "$@" -n 9',
+            None,
+            65,
+            "flock: 9: Bad file descriptor\n",
+            id="descriptor-not-open",
+        ),
+        pytest.param('shift; "$@" -n', None, 64, None, id="no-descriptor"),
+        pytest.param('shift; "$@" -n nine', None, 64, None, id="not-a-descriptor"),
+        pytest.param('shift; "$@"', None, 64, None, id="no-arguments"),
+    ],
+)
+def test_flock_exits_with_util_linuxs_status(
+    implementation: list[str],
+    script: str,
+    held_elsewhere: int | None,
+    status: int,
+    stderr: str | None,
+    tmp_path: Path,
+) -> None:
+    """The scripts test only `if ! flock -n 9`, and print their own refusal."""
+
+    lock = tmp_path / "lock"
+    with _held_elsewhere(lock, held_elsewhere):
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(lock), *implementation],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    assert result.returncode == status, result.stderr
+    if stderr is not None:
+        assert result.stderr == stderr
+
+
+@pytest.mark.parametrize("implementation", _implementations("flock"))
+def test_flock_leaves_the_lock_with_the_shell_until_it_closes_the_descriptor(
+    implementation: list[str], tmp_path: Path
+) -> None:
+    """A drill holds its lock for its whole run, long after the tool has exited."""
+
+    lock = tmp_path / "lock"
+    script = (
+        f"{TAKE_THE_LOCK} || exit; echo taken; read -r _; "
+        "exec 9>&-; echo closed; read -r _"
+    )
+    process = subprocess.Popen(
+        ["bash", "-c", script, "bash", str(lock), *implementation],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stdout.readline() == "taken\n"
+        assert not _free(lock), "the lock went with the tool"
+        process.stdin.write("\n")
+        process.stdin.flush()
+        assert process.stdout.readline() == "closed\n"
+        assert _free(lock), "closing the descriptor left the lock held"
+        process.stdin.write("\n")
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0
+    finally:
+        process.kill()
+        process.wait()
