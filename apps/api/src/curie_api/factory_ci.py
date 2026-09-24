@@ -363,6 +363,12 @@ return 0
 """
 
 
+def enqueue_marker(request_id: uuid.UUID, round_: int) -> str:
+    """The key set atomically with a round's continuation turn."""
+
+    return f"{ci_key(request_id, round_)}:enqueued"
+
+
 Dispatch = Callable[[ExecutionRequest, int, str], Awaitable[bool]]
 
 
@@ -376,7 +382,7 @@ async def gate(
     owner: str,
     next_poll: dict[uuid.UUID, datetime],
     dispatch: Dispatch,
-    may_observe: Callable[[], bool],
+    may_observe: Callable[[uuid.UUID], bool],
 ) -> GateResult:
     """Observe one published request's CI and act on the verdict.
 
@@ -403,7 +409,7 @@ async def gate(
     due = next_poll.get(request.id)
     if due is not None and now < due:
         return "waiting"
-    if not may_observe():
+    if not may_observe(request.id):
         return "waiting"
     latest = facts.publications[-1]
     observed_sha = lineage.head_sha
@@ -491,13 +497,12 @@ async def _continue(
     """Claim the round, hold the lease, publish the turn, then confirm the claim.
 
     The claim can expire during a slow hold or dispatch, so it alone cannot keep
-    a round to one turn. An enqueue marker, set NX just before the stream write,
-    is the idempotency key: a reconciler that finds it set never enqueues the
+    a round to one turn. An enqueue marker, set NX atomically with the stream
+    write by ``dispatch``, is the idempotency key: a reconciler that finds it set never enqueues the
     round again, and one whose claim was lost does not report the continuation.
     """
 
     key = ci_key(request.id, round_)
-    marker = f"{key}:enqueued"
     token = f"claimed:{owner}"
     assert request.execution_deadline is not None
     ttl = max(int((request.execution_deadline - now).total_seconds()) + 60, CI_CLAIM_SECONDS)
@@ -516,20 +521,16 @@ async def _continue(
         if not held:
             await valkey.eval(_RELEASE_CLAIM, 1, key, token)
             return "waiting"
-        if not await valkey.set(marker, owner, nx=True, ex=ttl):
+        if await valkey.exists(enqueue_marker(request.id, round_)):
             # Another reconciler already enqueued this round.
             await valkey.set(key, "published", ex=ttl)
             return "fixing"
-        try:
-            published = await dispatch(request, round_, text)
-        except Exception:
-            await valkey.delete(marker)
-            raise
+        # ``dispatch`` sets the marker and appends the turn atomically.
+        published = await dispatch(request, round_, text)
     except Exception:
         await valkey.eval(_RELEASE_CLAIM, 1, key, token)
         raise
     if not published:
-        await valkey.delete(marker)
         await valkey.eval(_RELEASE_CLAIM, 1, key, token)
         return "waiting"
     confirmed = await valkey.eval(_CONFIRM_CLAIM, 1, key, token, "published", ttl)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -34,6 +35,22 @@ from .workitem_dispatch import (
 logger = logging.getLogger(__name__)
 
 
+# The enqueue marker (key, TTL) that ``_xadd`` sets atomically with the turn.
+_ENQUEUE_MARKER: contextvars.ContextVar[tuple[str, int] | None] = contextvars.ContextVar(
+    "_ENQUEUE_MARKER", default=None
+)
+
+# Set the round's enqueue marker NX and append the turn atomically, so no crash
+# can leave a marker without its turn.
+_MARK_AND_XADD = """
+if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
+  redis.call('XADD', KEYS[2], '*', ARGV[2], ARGV[3])
+  return 1
+end
+return 0
+"""
+
+
 class WorkItemReconciler:
     def __init__(
         self,
@@ -47,6 +64,10 @@ class WorkItemReconciler:
         self._owner = f"work-item-reconciler:{uuid.uuid4()}"
         # Next CI observation per request waiting on CI (#3097), in database time.
         self._ci_next_poll: dict[uuid.UUID, datetime] = {}
+        # Pass number of each request's last CI observation, so the per-pass
+        # budget goes to the least recently observed due requests first.
+        self._ci_observed: dict[uuid.UUID, int] = {}
+        self._ci_pass = 0
 
     def _stream(self) -> str:
         return self._settings.runs_stream
@@ -64,6 +85,22 @@ class WorkItemReconciler:
                 raise
 
     async def _xadd(self, turn: QueuedTurn) -> None:
+        marked = _ENQUEUE_MARKER.get()
+        if marked is not None:
+            # Set the round's marker NX and append atomically; a marker that is
+            # already set means the turn is already on the stream.
+            marker, ttl = marked
+            await self._ensure_group()
+            await self._valkey.eval(
+                _MARK_AND_XADD,
+                2,
+                marker,
+                self._stream(),
+                ttl,
+                STREAM_PAYLOAD_FIELD,
+                turn.model_dump_json(),
+            )
+            return
         try:
             await self._ensure_group()
             await self._valkey.xadd(
@@ -292,15 +329,18 @@ class WorkItemReconciler:
 
         skip: set[uuid.UUID] = set()
         observations = 0
+        self._ci_pass += 1
 
-        def may_observe() -> bool:
+        def may_observe(request_id: uuid.UUID) -> bool:
             nonlocal observations
             if observations >= factory_ci.CI_OBSERVATIONS_PER_PASS:
                 return False
             observations += 1
+            self._ci_observed[request_id] = self._ci_pass
             return True
 
         client: httpx.AsyncClient | None = None
+        gated: list[workitems.PublicationSettlement] = []
         try:
             for _ in range(self._settings.work_item_batch_limit):
                 async with self._sessionmaker() as session:
@@ -309,7 +349,7 @@ class WorkItemReconciler:
                     )
                     if settlement is None:
                         await session.rollback()
-                        return
+                        break
                     skip.add(settlement.request_id)
                     if settlement.cause != "completed":
                         await workitems.fail_execution(
@@ -323,11 +363,16 @@ class WorkItemReconciler:
                         continue
                     # No network call under the claim's row lock.
                     await session.rollback()
+                gated.append(settlement)
+            # Least recently observed first, so slow observations of older
+            # requests cannot keep a later one out of the budget (#3097).
+            gated.sort(key=lambda item: self._ci_observed.get(item.request_id, 0))
+            for settlement in gated:
                 if client is None:
                     client = httpx.AsyncClient(
                         timeout=self._settings.github_app_timeout_seconds
                     )
-                await factory_ci.gate(
+                result = await factory_ci.gate(
                     self._sessionmaker,
                     self._valkey,
                     self._settings,
@@ -338,6 +383,8 @@ class WorkItemReconciler:
                     dispatch=self._dispatch_ci_turn,
                     may_observe=may_observe,
                 )
+                if result != "waiting":
+                    self._ci_observed.pop(settlement.request_id, None)
         finally:
             if client is not None:
                 await client.aclose()
@@ -364,23 +411,33 @@ class WorkItemReconciler:
                 request.id,
             )
             return False
-        await self._xadd(
-            QueuedTurn(
-                event_id=factory_ci.continuation_event_id(request.id, round_),
-                conversation_id=current.reply_conversation_id,
-                author=current.requester,
-                text=text,
-                source=TurnSource.WEBHOOK,
-                reply_handle=ReplyHandle(
-                    kind=current.reply_kind,
-                    channel=current.reply_address,
-                    placeholder=None,
-                    endpoint=binding.endpoint,
-                    adapter=binding.adapter,
-                ),
-                received_at=datetime.now(UTC).isoformat(),
-            )
+        assert request.execution_deadline is not None
+        ttl = max(
+            int((request.execution_deadline - datetime.now(UTC)).total_seconds()) + 60,
+            factory_ci.CI_CLAIM_SECONDS,
         )
+        token = _ENQUEUE_MARKER.set((factory_ci.enqueue_marker(request.id, round_), ttl))
+        try:
+            await self._xadd(
+                QueuedTurn(
+                    event_id=factory_ci.continuation_event_id(request.id, round_),
+                    conversation_id=current.reply_conversation_id,
+                    author=current.requester,
+                    text=text,
+                    source=TurnSource.WEBHOOK,
+                    reply_handle=ReplyHandle(
+                        kind=current.reply_kind,
+                        channel=current.reply_address,
+                        placeholder=None,
+                        endpoint=binding.endpoint,
+                        adapter=binding.adapter,
+                    ),
+                    received_at=datetime.now(UTC).isoformat(),
+                ),
+            )
+        finally:
+            _ENQUEUE_MARKER.reset(token)
+        # Already-enqueued counts as published: the round has its turn.
         return True
 
     async def _post_terminal_notices(self) -> None:
