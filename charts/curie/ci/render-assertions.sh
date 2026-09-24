@@ -1582,7 +1582,7 @@ if failures:
 print(f"  ok: DATATIER_TARGETS includes {expected!r} and excludes {forbidden!r}")
 PYEOF
 
-echo "=== Assertion 14: API schema-wait init waits quietly for Postgres then the upgrade phase (#2300) ==="
+echo "=== Assertion 14: API schema-wait init waits for Postgres, naming the probe error class, then the upgrade phase (#2300, #2865) ==="
 API_MIGRATE_OUT="$TMP/api_migrate"
 helm template curie "$CHART" --output-dir "$API_MIGRATE_OUT" >/dev/null
 API_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/api.yaml"
@@ -1843,7 +1843,7 @@ print(
 PYEOF
 
 python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
-  || fail "API migrate init command does not implement the bounded quiet readiness contract."
+  || fail "API migrate init command does not implement the bounded readiness diagnostics contract."
 
 SCHEMA_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/schema-migrate.yaml"
 [[ -f "$SCHEMA_MIGRATE_RENDER" ]] || fail "schema-migrate.yaml did not render"
@@ -2104,4 +2104,4 @@ fi
 echo "  ok: a NOTES image interpolated from empty image.tag is rejected (the assert can fail)"
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init command waits quietly with bounded retries before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control)."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control)."
