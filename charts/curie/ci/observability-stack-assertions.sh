@@ -1296,11 +1296,23 @@ echo "PASS: reliability alerts render, check, fire, and recover under promtool"
 for asset in alertmanager-webhook.yaml alertmanager-heartbeat.yaml; do
   [[ -f "$ASSETS/$asset" ]] || fail "missing alert path overlay $ASSETS/$asset"
 done
+# An operator's own overlay sits between the two, carrying the alert-signer token
+# mount that curie-sre's credentials_file reads. It lives in extraSecretMounts,
+# a list the heartbeat overlay must not set, or one of the two mounts is lost.
+cat >"$TMP/operator-alertmanager.yaml" <<'YAML'
+alertmanager:
+  extraSecretMounts:
+    - name: alert-signer-token
+      mountPath: /etc/alert-signer
+      secretName: alertmanager-signer-token
+      readOnly: true
+YAML
 helm template prometheus prometheus-community/prometheus \
   --version "$PROMETHEUS_CHART_VERSION" \
   --namespace observability \
   -f "$ASSETS/prometheus-values.yaml" \
   -f "$ASSETS/alertmanager-webhook.yaml" \
+  -f "$TMP/operator-alertmanager.yaml" \
   -f "$ASSETS/alertmanager-heartbeat.yaml" >"$TMP/prometheus-heartbeat.yaml"
 # The same install without the heartbeat overlay, so the rule_files it must keep
 # are the chart's own rendered defaults, not a list copied into this script.
@@ -1343,16 +1355,37 @@ rules_text = rendered(heartbeat_render, "heartbeat_rules.yml")
 
 # The image the chart's Alertmanager runs, so the amtool pin below cannot drift
 # from it when PROMETHEUS_CHART_VERSION moves.
-alertmanager_images = [
-    container["image"]
+alertmanager_pods = [
+    (doc["spec"]["template"]["spec"], container)
     for doc in yaml.safe_load_all(heartbeat_render.read_text())
     if doc and doc.get("kind") == "StatefulSet"
     for container in doc["spec"]["template"]["spec"].get("containers") or []
     if container.get("name") == "alertmanager"
 ]
-if len(alertmanager_images) != 1:
-    sys.exit(f"FAIL: expected one rendered alertmanager container, got {alertmanager_images}")
-(out / "heartbeat-alertmanager-image.txt").write_text(alertmanager_images[0])
+if len(alertmanager_pods) != 1:
+    sys.exit(f"FAIL: expected one rendered alertmanager container, got {len(alertmanager_pods)}")
+pod, alertmanager = alertmanager_pods[0]
+(out / "heartbeat-alertmanager-image.txt").write_text(alertmanager["image"])
+
+# Both the operator's token and the heartbeat URL reach the container, and the
+# heartbeat Secret is optional, so a missing one fails only the heartbeat posts.
+volumes = {volume["name"]: volume for volume in pod.get("volumes") or []}
+mounted = {
+    mount["mountPath"]: volumes.get(mount["name"])
+    for mount in alertmanager.get("volumeMounts") or []
+}
+for path, secret_name in (
+    ("/etc/alert-signer", "alertmanager-signer-token"),
+    ("/etc/alertmanager-heartbeat", "alertmanager-heartbeat"),
+):
+    volume = mounted.get(path)
+    if not volume or (volume.get("secret") or {}).get("secretName") != secret_name:
+        sys.exit(
+            f"FAIL: the rendered Alertmanager does not mount Secret {secret_name} at "
+            f"{path}; its mounts are {sorted(mounted)}"
+        )
+if mounted["/etc/alertmanager-heartbeat"]["secret"].get("optional") is not True:
+    sys.exit("FAIL: the rendered heartbeat Secret volume is not optional")
 
 # The routes test below sends the alert exactly as the rendered rule labels it,
 # so a renamed rule or a label the route cannot see fails here, not in cluster.

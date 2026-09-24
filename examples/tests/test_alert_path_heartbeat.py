@@ -76,6 +76,18 @@ def _rules(rule_file: dict) -> list[dict]:
     return rules
 
 
+def _heartbeat_volume(overlay: dict) -> dict:
+    volumes = [
+        volume
+        for volume in overlay["alertmanager"].get("extraVolumes") or []
+        if (volume.get("secret") or {}).get("secretName") == HEARTBEAT_SECRET
+    ]
+    assert len(volumes) == 1, (
+        f"expected one extraVolumes entry for Secret {HEARTBEAT_SECRET}, got {volumes}"
+    )
+    return volumes[0]
+
+
 def _normalized_matchers(route: dict) -> list[str]:
     return ["".join(matcher.split()) for matcher in route.get("matchers") or []]
 
@@ -126,26 +138,36 @@ def test_heartbeat_receiver_reads_its_url_from_the_mounted_secret() -> None:
     assert "url" not in webhook, "the heartbeat URL must come from the Secret"
     assert webhook["send_resolved"] is False
 
-    mounts = [
-        mount
-        for mount in overlay["alertmanager"].get("extraSecretMounts") or []
-        if mount.get("secretName") == HEARTBEAT_SECRET
-    ]
-    assert len(mounts) == 1, (
-        f"expected one extraSecretMounts entry for Secret {HEARTBEAT_SECRET}"
-    )
-    mount = mounts[0]
-    assert mount.get("readOnly") is True
-    assert mount.get("optional") is True, (
+    volume = _heartbeat_volume(overlay)
+    assert volume["secret"].get("optional") is True, (
         "a missing heartbeat Secret must fail only the heartbeat posts; a "
         "required one keeps Alertmanager from starting and takes the bot's "
         "alerts down with it"
     )
+    mounts = [
+        mount
+        for mount in overlay["alertmanager"].get("extraVolumeMounts") or []
+        if mount.get("name") == volume["name"]
+    ]
+    assert len(mounts) == 1, (
+        f"expected one extraVolumeMounts entry for volume {volume['name']}"
+    )
+    mount = mounts[0]
+    assert mount.get("readOnly") is True
     url_file = PurePosixPath(webhook["url_file"])
     mount_path = PurePosixPath(mount["mountPath"])
     assert url_file.is_absolute()
     assert url_file != mount_path and url_file.is_relative_to(mount_path), (
         f"url_file {url_file} is not a file under the Secret mount {mount_path}"
+    )
+
+
+def test_heartbeat_overlay_leaves_extra_secret_mounts_to_the_operator() -> None:
+    alertmanager = _load(HEARTBEAT_OVERLAY)["alertmanager"]
+    assert "extraSecretMounts" not in alertmanager, (
+        "the operator's alert-signer token mount lives in extraSecretMounts, "
+        "and Helm replaces the list, so setting it here drops that mount or "
+        "loses the heartbeat's, whichever overlay is applied last"
     )
 
 
