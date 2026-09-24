@@ -46,6 +46,14 @@
 # resolve `repo:` to `:latest`, which is a different image from the
 # appVersion tag the pods run.
 #
+# Issue #2944 (dispatcher rollout overlap), Assertion 16. The dispatcher holds
+# one Socket Mode connection per Slack app token, and Slack hands each event to
+# exactly one connected client. A RollingUpdate starts the replacement pod while
+# the old one is still connected, so events are split between them and the ones
+# handed to the terminating pod are lost. The dispatcher must render
+# `strategy: Recreate` with no rollingUpdate block, and every other workload must
+# keep the strategy it rendered before the fix.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -2103,5 +2111,50 @@ if [[ "$notes_image_negative_output" != *"ends in a bare colon"* ]]; then
 fi
 echo "  ok: a NOTES image interpolated from empty image.tag is rejected (the assert can fail)"
 
+echo "=== Assertion 16: the dispatcher rolls out with Recreate (issue #2944) ==="
+STRATEGY_RENDER="$TMP/strategy.yaml"
+helm template curie "$CHART" \
+  --set dispatcher.slack.appToken=xapp-render-assert \
+  --set dispatcher.slack.botToken=xoxb-render-assert \
+  >"$STRATEGY_RENDER"
+python3 - "$STRATEGY_RENDER" <<'PYEOF' || fail "dispatcher must render strategy Recreate and every other workload must keep its strategy (issue #2944)."
+import sys
+
+import yaml
+
+# Workload -> the strategy it renders. None means the Kubernetes default
+# (RollingUpdate for a Deployment, the controller default for the others).
+EXPECTED = {
+    ("Deployment", "curie-dispatcher"): ("strategy", {"type": "Recreate"}),
+    ("Deployment", "agent-sandbox-controller"): ("strategy", None),
+    ("Deployment", "curie-api"): ("strategy", None),
+    ("Deployment", "curie-ui"): ("strategy", None),
+    ("Deployment", "curie-worker"): ("strategy", None),
+    ("Deployment", "curie-langfuse-web"): ("strategy", {"type": "Recreate"}),
+    ("Deployment", "curie-langfuse-worker"): ("strategy", {"type": "Recreate"}),
+    ("Deployment", "curie-otel-collector"): ("strategy", {"type": "Recreate"}),
+    ("DaemonSet", "curie-runner-prewarm"): ("updateStrategy", None),
+    ("StatefulSet", "curie-clickhouse"): ("updateStrategy", None),
+    ("StatefulSet", "curie-postgres"): ("updateStrategy", None),
+    ("StatefulSet", "curie-rustfs"): ("updateStrategy", None),
+    ("StatefulSet", "curie-valkey"): ("updateStrategy", None),
+}
+seen = {}
+with open(sys.argv[1]) as fh:
+    for doc in yaml.safe_load_all(fh):
+        if isinstance(doc, dict) and doc.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
+            seen[(doc["kind"], doc["metadata"]["name"])] = doc["spec"]
+errors = []
+if set(seen) != set(EXPECTED):
+    errors.append("rendered workloads %s differ from expected %s" % (sorted(seen), sorted(EXPECTED)))
+for key, (field, want) in EXPECTED.items():
+    if key in seen and seen[key].get(field) != want:
+        errors.append("%s %s: %s is %r, expected %r" % (key[0], key[1], field, seen[key].get(field), want))
+for err in errors:
+    sys.stderr.write(err + "\n")
+sys.exit(1 if errors else 0)
+PYEOF
+echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
+
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control)."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); and the dispatcher rolls out with Recreate while every other workload keeps its strategy."
