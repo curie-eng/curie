@@ -397,6 +397,44 @@ def test_agent_skills_gate_names_a_listed_skill_that_is_gone(
 
 
 @pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_agent_skills_gate_matches_whole_entries_only(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """A path that shares a prefix with a listed skill is not that skill."""
+
+    root, valid, invalid = _agent_skills_tree(tmp_path)
+    shorter, longer = valid[0][:-1], valid[0] + "-extra"
+    (root / valid[0] / "SKILL.md").unlink()
+    for unlisted in (shorter, longer):
+        (root / unlisted).mkdir(parents=True)
+        (root / unlisted / "SKILL.md").write_text("---\nname: acme\n---\n")
+    result = _run_agent_skills(interpreter, root, invalid, tmp_path)
+    assert result.returncode == 1, result.stderr
+    assert (
+        f"2 skill(s) escaped the gate: {' '.join(sorted([shorter, longer]))}"
+        in result.stderr
+    ), result.stderr
+    assert f"1 listed skill(s) no longer exist: {valid[0]}" in result.stderr, (
+        result.stderr
+    )
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_agent_skills_gate_matches_a_glob_character_literally(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """A skill directory named like a pattern must not match what it globs."""
+
+    root, valid, invalid = _agent_skills_tree(tmp_path)
+    globbed = valid[0][:-1] + "?"
+    (root / globbed).mkdir(parents=True)
+    (root / globbed / "SKILL.md").write_text("---\nname: acme\n---\n")
+    result = _run_agent_skills(interpreter, root, invalid, tmp_path)
+    assert result.returncode == 1, result.stderr
+    assert f"1 skill(s) escaped the gate: {globbed}" in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
 def test_agent_skills_gate_names_every_listed_skill_when_none_is_found(
     interpreter: str, tmp_path: Path
 ) -> None:
