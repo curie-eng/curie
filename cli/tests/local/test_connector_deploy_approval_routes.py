@@ -10,6 +10,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -176,7 +177,19 @@ class LocalCase:
     env: dict[str, str]
 
 
-def _write_override(path: pathlib.Path, api_image: str) -> None:
+def _kernel_picked_ports(count: int) -> list[int]:
+    # Every probe stays bound until all are picked, so the ports are distinct.
+    probes = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
+    try:
+        for probe in probes:
+            probe.bind(("127.0.0.1", 0))
+        return [probe.getsockname()[1] for probe in probes]
+    finally:
+        for probe in probes:
+            probe.close()
+
+
+def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, int]) -> None:
     worker_database = (
         "postgresql+asyncpg://postgres:postgres@127.0.0.1:"
         "${CURIE_LOCAL_POSTGRES_PORT}/postgres"
@@ -184,11 +197,11 @@ def _write_override(path: pathlib.Path, api_image: str) -> None:
     path.write_text(
         f"""services:
   postgres:
-    ports: !override [\"127.0.0.1::5432\"]
+    ports: !override [\"127.0.0.1:{host_ports['postgres']}:5432\"]
   valkey:
-    ports: !override [\"127.0.0.1::6379\"]
+    ports: !override [\"127.0.0.1:{host_ports['valkey']}:6379\"]
   rustfs:
-    ports: !override [\"127.0.0.1::9000\", \"127.0.0.1::9001\"]
+    ports: !override [\"127.0.0.1:{host_ports['rustfs']}:9000\", \"127.0.0.1::9001\"]
   curie-migrate:
     image: {api_image}
     pull_policy: never
@@ -204,7 +217,7 @@ def _write_override(path: pathlib.Path, api_image: str) -> None:
       SLACK_BOT_TOKEN: \"\"
       OTEL_EXPORTER_OTLP_ENDPOINT: \"\"
       OTEL_EXPORTER_OTLP_PROTOCOL: \"\"
-    ports: !override [\"127.0.0.1::8000\"]
+    ports: !override [\"127.0.0.1:{host_ports['curie-api']}:8000\"]
   curie-worker:
     environment:
       DATABASE_URL: {worker_database}
@@ -283,7 +296,16 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
     bundle = root / ("bundle-release" if tier == "local-release" else "bundle")
     override = root / "compose.override.yaml"
     release = root / "compose.release.yaml"
-    _write_override(override, api_image)
+    # Named rather than Docker-allocated so the host-network worker can dial
+    # them on Docker Desktop too; the render check below says why.
+    host_ports = dict(
+        zip(
+            ("postgres", "valkey", "rustfs", "curie-api"),
+            _kernel_picked_ports(4),
+            strict=True,
+        )
+    )
+    _write_override(override, api_image, host_ports)
     if tier == "local-release":
         generated = _run(["python3", "compose/generate_release_compose.py"])
         release.write_text(_require(generated, "generating release Compose"))
@@ -299,16 +321,16 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             "COMPOSE_FILE": f"{base}:{override}",
             "COMPOSE_PROJECT_NAME": project,
             "CURIE_API_KEY": API_KEY,
-            "CURIE_API_URL": "http://127.0.0.1:1",
+            "CURIE_API_URL": f"http://127.0.0.1:{host_ports['curie-api']}",
             "CURIE_DOCKER_NETWORK": f"{project}_runner",
             "CURIE_LOCAL_IMAGE_TAG": f"test-{suffix}",
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
-            "CURIE_LOCAL_POSTGRES_PORT": "1",
+            "CURIE_LOCAL_POSTGRES_PORT": str(host_ports["postgres"]),
             "CURIE_LOCAL_STAGING_DIR": str(staging),
             "CURIE_LOCAL_STUB_PORT": "9",
-            "S3_ENDPOINT_URL": "http://127.0.0.1:1",
+            "S3_ENDPOINT_URL": f"http://127.0.0.1:{host_ports['rustfs']}",
             "VALKEY_HOST": "127.0.0.1",
-            "VALKEY_PORT": "1",
+            "VALKEY_PORT": str(host_ports["valkey"]),
         }
     )
     env.update(_provision_connector_credentials(source, root, env))
@@ -332,19 +354,33 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
     try:
         rendered_result = _run(compose + ["config", "--format", "json"], env=env)
         rendered = json.loads(_require(rendered_result, "rendering private Compose"))
-        for service in ("postgres", "valkey", "rustfs", "curie-api"):
+        # The host-network worker dials each of these at 127.0.0.1:<host port>.
+        # From inside Docker Desktop's VM a Docker-allocated host port refuses
+        # that connection while a host port the caller names answers, so each
+        # dialed port must be published at exactly the port the worker is given.
+        # Any other port stays Docker-allocated, and every port is loopback only.
+        dialed = {
+            "postgres": (5432, env["CURIE_LOCAL_POSTGRES_PORT"]),
+            "valkey": (6379, env["VALKEY_PORT"]),
+            "rustfs": (9000, str(urllib.parse.urlsplit(env["S3_ENDPOINT_URL"]).port)),
+            "curie-api": (8000, str(urllib.parse.urlsplit(env["CURIE_API_URL"]).port)),
+        }
+        for service, (target, host_port) in dialed.items():
             ports = rendered["services"][service].get("ports", [])
-            fixed = [
-                port
-                for port in ports
-                if port.get("published") not in {None, "", 0, "0"}
-            ]
+            published = {port["target"]: port.get("published") for port in ports}
             if (
-                not ports
-                or fixed
+                str(published.get(target)) != host_port
+                or any(
+                    value not in {None, "", 0, "0"}
+                    for key, value in published.items()
+                    if key != target
+                )
                 or any(port.get("host_ip") != "127.0.0.1" for port in ports)
             ):
-                raise RuntimeError(f"{service} does not bind only random loopback ports: {ports}")
+                raise RuntimeError(
+                    f"{service} does not publish {target} at the worker's host port "
+                    f"{host_port} with every other port Docker-allocated on loopback: {ports}"
+                )
         if rendered["networks"]["curie_runner"]["name"] != f"{project}_runner":
             raise RuntimeError("private runner network name was not applied")
         for tag in tags:
@@ -374,25 +410,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             ),
             "starting the private API stack",
         )
-        port_specs = {
-            "CURIE_API_URL": ("curie-api", "8000"),
-            "CURIE_LOCAL_POSTGRES_PORT": ("postgres", "5432"),
-            "VALKEY_PORT": ("valkey", "6379"),
-            "S3_ENDPOINT_URL": ("rustfs", "9000"),
-        }
-        discovered: dict[str, str] = {}
-        for name, (service, container_port) in port_specs.items():
-            port_result = _run(compose + ["port", service, container_port], env=env)
-            discovered[name] = (
-                _require(port_result, f"finding the private {service} port")
-                .strip()
-                .rsplit(":", 1)[1]
-            )
-        port = discovered["CURIE_API_URL"]
-        api_url = f"http://127.0.0.1:{port}"
-        env.update(discovered)
-        env["CURIE_API_URL"] = api_url
-        env["S3_ENDPOINT_URL"] = f"http://127.0.0.1:{discovered['S3_ENDPOINT_URL']}"
+        api_url = env["CURIE_API_URL"]
         build = _run(
             [str(binary), "--json", "build", "--plugin-dir", str(bundle)],
             env=env,
@@ -570,7 +588,24 @@ def _start_isolated_approval_seed_worker(case: LocalCase) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         case.env["CURIE_LOCAL_STUB_PORT"] = str(probe.getsockname()[1])
+    # `local up --build` builds twice, `docker build` for the source images and
+    # then compose for the worker overlay, and both must use the daemon's own
+    # builder rather than an ambient one. In Docker Desktop's `desktop-linux`
+    # context the first refuses the `default` builder and the second refuses
+    # `desktop-linux`. Naming the current context's daemon in DOCKER_HOST puts
+    # both in the `default` context on that daemon, where `default` is its own
+    # builder. On Linux the endpoint is the default socket, so nothing changes.
+    endpoint = _require(
+        _run(
+            ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+            env=case.env,
+        ),
+        "reading the current Docker context's daemon endpoint",
+    ).strip()
+    if not endpoint:
+        raise RuntimeError("the current Docker context names no daemon endpoint")
     env = dict(case.env)
+    env["DOCKER_HOST"] = endpoint
     env["BUILDX_BUILDER"] = "default"
     env["CURIE_FAKE_MODEL"] = "1"
     result = _run(
