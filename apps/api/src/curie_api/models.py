@@ -1725,6 +1725,8 @@ class ProviderInstallation(Base):
             "external_account_id",
             name="provider_installations_tenant_provider_external_key",
         ),
+        # Target of identity_links' tenant-scoped foreign key (#2910).
+        UniqueConstraint("tenant_id", "id", name="provider_installations_tenant_id_id_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1748,4 +1750,75 @@ class ProviderInstallation(Base):
     )
     disconnected_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
+    )
+
+
+class IdentityLink(Base):
+    """One provider-native id linked to one subject (#2910, ADR 0155 step 5).
+
+    A Slack user id on one installation, linked to exactly one of a principal
+    or a bot (an Agent). Only principal links are unique per (installation,
+    native id): today's static Slack app is one bot user fronting every bound
+    Agent. The tenant-carrying foreign keys keep the principal, the creator
+    and the installation in the link's tenant; ``agents`` has no tenant yet
+    (#2911), so ``bot_id`` is a plain key.
+    """
+
+    __tablename__ = "identity_links"
+    __table_args__ = (
+        CheckConstraint(
+            "(principal_id IS NULL) <> (bot_id IS NULL)",
+            name="identity_links_subject_xor_ck",
+        ),
+        CheckConstraint(
+            "verification_source IN ('provider_event_verified', 'admin_mapped')",
+            name="identity_links_verification_source_ck",
+        ),
+        CheckConstraint(
+            "length(provider_native_id) > 0",
+            name="identity_links_provider_native_id_ck",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_links_principal_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "created_by_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_links_created_by_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "provider_installation_id"],
+            [
+                f"{SCHEMA}.provider_installations.tenant_id",
+                f"{SCHEMA}.provider_installations.id",
+            ],
+            name="identity_links_installation_fkey",
+        ),
+        Index(
+            "identity_links_principal_native_key",
+            "provider_installation_id",
+            "provider_native_id",
+            unique=True,
+            postgresql_where=text("principal_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="identity_links_tenant_id_fkey")
+    )
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    bot_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", name="identity_links_bot_id_fkey"), default=None
+    )
+    provider_installation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    provider_native_id: Mapped[str] = mapped_column(String)
+    verification_source: Mapped[str] = mapped_column(String)
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
     )

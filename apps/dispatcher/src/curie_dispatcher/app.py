@@ -70,6 +70,7 @@ def build_app(
     authorize: Callable[..., Any] | None = None,
     logger: logging.Logger | None = None,
     resolver: Any | None = None,
+    identity_client: Any | None = None,
 ) -> App:
     """Build a Bolt App with the dispatcher's handlers registered."""
     signing = config.slack_signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
@@ -99,6 +100,9 @@ def build_app(
         # The approvals API client (#246), injectable so tests keep the
         # click-to-resolve path offline.
         register_kwargs["resolver"] = resolver
+    if identity_client is not None:
+        # The principal lookup client (#2910); None builds it from config.
+        register_kwargs["identity_client"] = identity_client
     register_handlers(app, **register_kwargs)
     return app
 

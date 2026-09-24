@@ -4154,6 +4154,135 @@
         "title": "PodLogs",
         "type": "object"
       },
+      "PrincipalResolutionOut": {
+        "description": "The answer; ``unresolved`` is still a 200, with the reason why.",
+        "properties": {
+          "principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Principal Id"
+          },
+          "provider_installation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Installation Id"
+          },
+          "reason": {
+            "enum": [
+              "linked",
+              "no_link",
+              "linked_to_bot",
+              "principal_inactive",
+              "installation_not_found",
+              "installation_disconnected"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "resolved",
+              "unresolved"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "principal_id",
+          "reason",
+          "provider_installation_id"
+        ],
+        "title": "PrincipalResolutionOut",
+        "type": "object"
+      },
+      "PrincipalResolveIn": {
+        "description": "Which principal is ``provider_subject`` on one installation?\n\nThe installation is named by exactly one locator: its id, or the\n``(provider, external_account_id)`` pair (a Slack team id), which is how\nthe dispatcher knows it.",
+        "properties": {
+          "external_account_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Account Id"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "enum": [
+                  "slack",
+                  "m365",
+                  "github",
+                  "jira",
+                  "linear",
+                  "confluence",
+                  "quickbooks",
+                  "other"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "provider_installation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Installation Id"
+          },
+          "provider_subject": {
+            "minLength": 1,
+            "title": "Provider Subject",
+            "type": "string"
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id"
+          }
+        },
+        "required": [
+          "provider_subject"
+        ],
+        "title": "PrincipalResolveIn",
+        "type": "object"
+      },
       "ProviderInstallationCreate": {
         "description": "A connected external account, created by an administrator.\n\n``credential_ref`` and ``webhook_verification_ref`` are plain strings\nhere, with no Field constraints, on purpose: FastAPI's 422 echoes the\nrejected input, and a value pasted where a reference belongs is exactly\nthe credential that must not come back. The router checks both against\nthe reference grammar and answers with a message that omits the value.",
         "properties": {
@@ -12359,6 +12488,65 @@
         "summary": "Ingest Hook",
         "tags": [
           "hooks"
+        ]
+      }
+    },
+    "/identity/resolve": {
+      "post": {
+        "operationId": "resolve_identity_identity_resolve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrincipalResolveIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrincipalResolutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Identity",
+        "tags": [
+          "identity"
         ]
       }
     },
