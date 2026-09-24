@@ -193,6 +193,30 @@ def test_sdk_abort_result_is_error_then_classified_final(
     assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
 
 
+def test_sdk_max_turns_result_is_classified_max_turns() -> None:
+    """#3071: the SDK's error_max_turns subtype is a known, named failure (the
+    turn budget ran out), not an unclassified one."""
+    state = TurnState()
+    msg = ResultMessage(
+        subtype="error_max_turns",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=5,
+        session_id="s",
+        result=None,
+    )
+
+    events = _translate(msg, state)
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "max-turns"
+    assert state.error_classification == "max-turns"
+    assert isinstance(events[1], Final)
+    assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
 def test_assistant_error_field_emits_error_event() -> None:
     msg = AssistantMessage(content=[], model="m", error="rate_limit")
     events = _translate(msg)

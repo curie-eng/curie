@@ -872,22 +872,27 @@ def test_runner_total_timeout_accepts_short_programmatic_values_and_maximum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The chart and Python config accept positive timeout values, including
-    sub-minute values; only positivity and the 1800s ceiling apply here."""
+    sub-minute values; only positivity and the 10800s ceiling (#3071) apply."""
     _clear_all_config_env(monkeypatch)
 
     short = _lease_config(runner_total_timeout_s=0.5)
     maximum = _lease_config(
-        delivery_budget_s=1800.0,
-        runner_total_timeout_s=1800.0,
+        delivery_budget_s=10800.0,
+        runner_total_timeout_s=10800.0,
     )
 
     assert short.runner_total_timeout_s == 0.5
-    assert maximum.runner_total_timeout_s == 1800.0
+    assert maximum.runner_total_timeout_s == 10800.0
 
 
 @pytest.mark.parametrize(
     ("value", "error_type"),
-    [(0.0, "greater_than"), (-0.1, "greater_than"), (1800.1, "less_than_equal")],
+    [
+        (0.0, "greater_than"),
+        (-0.1, "greater_than"),
+        (10800.1, "less_than_equal"),
+        (10801.0, "less_than_equal"),
+    ],
 )
 def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
     monkeypatch: pytest.MonkeyPatch,
@@ -897,7 +902,7 @@ def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
     _clear_all_config_env(monkeypatch)
 
     with pytest.raises(ValidationError) as exc_info:
-        _lease_config(delivery_budget_s=1800.0, runner_total_timeout_s=value)
+        _lease_config(delivery_budget_s=10800.0, runner_total_timeout_s=value)
 
     assert any(
         error["loc"] == ("runner_total_timeout_s",)
@@ -946,15 +951,89 @@ def test_delivery_knobs_ignore_bare_field_name_env(
 def test_delivery_budget_accepts_the_adr_maximum_and_rejects_above_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """1800s is the ADR's stated maximum ("Operators may configure 1,800
-    seconds"). A higher value would silently require a termination grace the
-    chart schema will not accept, so it is refused here instead."""
+    """#3071 raised the maximum to 10800s (three hours) so a long factory run
+    fits one delivery. Anything above it is refused at boot."""
     _clear_all_config_env(monkeypatch)
 
-    assert _lease_config(delivery_budget_s=1800.0).delivery_budget_s == 1800.0
+    assert _lease_config(delivery_budget_s=10800.0).delivery_budget_s == 10800.0
 
     with pytest.raises(ValueError):
-        _lease_config(delivery_budget_s=1800.5)
+        _lease_config(delivery_budget_s=10801.0)
+
+
+def test_delivery_budget_maximum_is_read_from_the_canonical_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10800")
+    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "10800")
+
+    config = WorkerConfig()
+
+    assert config.delivery_budget_s == 10800.0
+    assert config.runner_total_timeout_s == 10800.0
+
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10801")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert any(
+        error["loc"] == ("CURIE_DELIVERY_BUDGET_S",)
+        and error["type"] == "less_than_equal"
+        for error in exc_info.value.errors()
+    )
+
+
+def test_runner_ceiling_still_bounded_by_budget_at_the_raised_maximum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raising both maxima must not loosen the runner <= budget relationship."""
+    _clear_all_config_env(monkeypatch)
+
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=10800.0)
+
+    assert "CURIE_RUNNER_TOTAL_TIMEOUT_S" in str(exc_info.value)
+    assert "CURIE_DELIVERY_BUDGET_S" in str(exc_info.value)
+
+
+def test_termination_grace_must_cover_the_raised_maximum_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared grace still has to cover budget + reserve at 10800s."""
+    _clear_all_config_env(monkeypatch)
+
+    ok = _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10860.0)
+    assert ok.termination_grace_period_s == 10860.0
+
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10859.0)
+    assert "CURIE_TERMINATION_GRACE_PERIOD_S" in str(exc_info.value)
+
+
+def test_work_item_max_turns_defaults_to_1000(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+
+    assert WorkerConfig().work_item_max_turns == 1000
+
+
+def test_work_item_max_turns_reads_its_env_and_refuses_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORK_ITEM_MAX_TURNS", "5")
+
+    assert WorkerConfig().work_item_max_turns == 5
+
+    monkeypatch.setenv("CURIE_WORK_ITEM_MAX_TURNS", "0")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert any(
+        error["loc"] == ("CURIE_WORK_ITEM_MAX_TURNS",)
+        and error["type"] == "greater_than"
+        for error in exc_info.value.errors()
+    )
 
 
 def test_delivery_budget_accepts_its_floor_and_rejects_below_it(

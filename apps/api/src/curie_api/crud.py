@@ -464,6 +464,15 @@ async def update_agent_thinking(session: AsyncSession, agent: Agent, thinking: s
     return agent
 
 
+async def update_agent_execution_deadline(
+    session: AsyncSession, agent: Agent, seconds: int | None
+) -> Agent:
+    agent.execution_deadline_seconds = seconds
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_publication_policy(
     session: AsyncSession,
     agent: Agent,

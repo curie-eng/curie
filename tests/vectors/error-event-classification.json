@@ -14,7 +14,8 @@
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
-    "history-persistence-error"
+    "history-persistence-error",
+    "max-turns"
   ],
   "vectors": [
     {
@@ -111,6 +112,16 @@
       "name": "platform_history_persistence_error",
       "input": "history-persistence-error",
       "expected": "history-persistence-error"
+    },
+    {
+      "name": "platform_max_turns",
+      "input": "max-turns",
+      "expected": "max-turns"
+    },
+    {
+      "name": "sdk_error_max_turns_subtype_is_not_vocabulary",
+      "input": "error_max_turns",
+      "expected": "unclassified"
     }
   ]
 }

@@ -1527,3 +1527,81 @@ def test_ci_mint_exception_releases_its_permit(monkeypatch: pytest.MonkeyPatch) 
 
     healthy = _observe_once(monkeypatch, _FakeCreds())
     assert healthy.state == "passing"
+
+
+# --- per-agent execution deadline in outcome text (#3071) --------------------
+
+
+def _deadline_90_then_elapse(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    agent = _agent(stack, auth_headers)
+    patched = stack.patch(
+        f"/agents/{agent['agent_id']}",
+        json={"execution_deadline_seconds": 90},
+        headers=auth_headers,
+    )
+    assert patched.status_code == 200, patched.text
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+    _start(facts.request_id)
+
+    async def elapse_deadline() -> None:
+        # Keep the configured 90 s span but move it into the past, triggers
+        # bypassed for this row only; no real time passes.
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET "
+                        "started_at = now() - interval '150 seconds', "
+                        "execution_deadline = now() - interval '60 seconds' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": facts.request_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(elapse_deadline())
+    work_item_version, request_version = _versions(facts.request_id)
+
+    async def expire(session: AsyncSession) -> None:
+        result = await workitems.request_execution_deadline_cancellation(
+            session,
+            work_item_id=seeded.work_item_id,
+            request_id=facts.request_id,
+            expected_work_item_version=work_item_version,
+            expected_request_version=request_version,
+        )
+        assert isinstance(result, workitems.WorkItemOutcome), result
+
+    with_session(expire)
+    return facts, seeded
+
+
+def test_deadline_cancellation_text_names_the_configured_seconds(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _, seeded = _deadline_90_then_elapse(stack, auth_headers)
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+
+    assert body["state"] == "cancellation_requested"
+    assert "90 s" in body["actionable_cause"], body["actionable_cause"]
+    assert "1800" not in body["actionable_cause"], body["actionable_cause"]
+
+
+def test_expired_text_names_the_configured_seconds(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    facts, seeded = _deadline_90_then_elapse(stack, auth_headers)
+    _terminate(facts.request_id)
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+
+    assert body["state"] == "expired"
+    assert "90 s" in body["actionable_cause"], body["actionable_cause"]
+    assert "1800" not in body["actionable_cause"], body["actionable_cause"]

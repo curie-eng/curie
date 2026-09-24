@@ -541,6 +541,7 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
         opts(&server.base_url, "deal-desk", false),
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -583,6 +584,7 @@ async fn overrides_set_patches_only_the_field_named() {
         opts(&server.base_url, "deal-desk", false),
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Set("enabled:2000".to_string()),
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -631,6 +633,7 @@ async fn overrides_clear_sends_explicit_null_not_an_empty_string() {
         opts(&server.base_url, "deal-desk", false),
         commands::OverrideChange::Clear,
         commands::OverrideChange::Clear,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -679,10 +682,101 @@ async fn overrides_dry_run_makes_no_request_on_either_path() {
             commands::OverrideChange::Set("adaptive".to_string()),
         ),
     ] {
-        let out = commands::overrides(opts(&server.base_url, "deal-desk", true), model, thinking)
-            .await
-            .unwrap();
+        let out = commands::overrides(
+            opts(&server.base_url, "deal-desk", true),
+            model,
+            thinking,
+            commands::OverrideChange::Unchanged,
+        )
+        .await
+        .unwrap();
         assert!(matches!(out, commands::OverridesOutput::DryRun(_)));
     }
     assert!(server.recorded().is_empty());
+}
+
+// --- `<tier> overrides`: execution deadline (issue #3071) -------------------
+//
+// Same three-way contract as model/thinking, plus the one thing those two
+// don't have: the PATCH body carries `execution_deadline_seconds` as a JSON
+// NUMBER, so a body assertion here has to check for an unquoted int, not a
+// string, or it would pass even if the CLI sent `"120"`.
+
+#[tokio::test]
+async fn overrides_set_execution_deadline_patches_only_that_field() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":120,"memory":false}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Set("120".to_string()),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        out,
+        commands::OverridesOutput::Done { changed: true, .. }
+    ));
+
+    let rec = server.recorded();
+    let patch = rec.iter().find(|r| r.method == "PATCH").expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains(r#""execution_deadline_seconds":120"#),
+        "execution_deadline_seconds must be an unquoted JSON number: {body}"
+    );
+    assert!(
+        !body.contains("model") && !body.contains("thinking"),
+        "an unmentioned override must be omitted, not nulled: {body}"
+    );
+}
+
+#[tokio::test]
+async fn overrides_clear_execution_deadline_sends_explicit_null_not_an_empty_string() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list_with_overrides(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"memory":false}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Clear,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        out,
+        commands::OverridesOutput::Done { changed: true, .. }
+    ));
+
+    let patch = server
+        .recorded()
+        .into_iter()
+        .find(|r| r.method == "PATCH")
+        .expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains(r#""execution_deadline_seconds":null"#),
+        "body: {body}"
+    );
 }

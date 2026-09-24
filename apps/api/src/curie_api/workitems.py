@@ -23,6 +23,8 @@ from sqlalchemy.sql.elements import ColumnElement
 from . import transcripts
 from .config import get_settings
 from .models import (
+    DEFAULT_EXECUTION_DEADLINE_SECONDS,
+    Agent,
     ExecutionRequest,
     FactoryTerminalNotice,
     Publication,
@@ -576,10 +578,18 @@ async def _start_execution(
         return await _conflict(
             session, "waiting_deadline_elapsed", work_item=work_item, request=request
         )
+    # Same transaction as the transition: the owning agent's operator override,
+    # else the platform default (#3071).
+    agent_deadline = await session.scalar(
+        select(Agent.execution_deadline_seconds).where(Agent.id == work_item.agent_id)
+    )
+    deadline_seconds = (
+        agent_deadline if agent_deadline is not None else DEFAULT_EXECUTION_DEADLINE_SECONDS
+    )
     values: dict[str, Any] = {
         "status": "running",
         "started_at": now,
-        "execution_deadline": now + timedelta(seconds=1800),
+        "execution_deadline": now + timedelta(seconds=deadline_seconds),
         "version": ExecutionRequest.version + 1,
         "updated_at": func.clock_timestamp(),
         **extra_values,

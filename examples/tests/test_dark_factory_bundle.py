@@ -153,7 +153,7 @@ DISCIPLINE = {
         r"|reason.{0,80}instead of (a "
         r"|opening a )?pull request"
     ),
-    "time-budget-1800": r"1800",
+    "time-budget-10800": r"10800",
     "untrusted-input": r"untrusted",
     "stop-on-ambiguity": (
         r"ambigu\w*.{0,160}(stop"

@@ -72,8 +72,15 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "false-completion",
     "publication-unrecorded",
     "history-persistence-error",
+    # #3071: the turn budget ran out (SDK result subtype ``error_max_turns``).
+    "max-turns",
 })
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
+
+# SDK ResultMessage subtypes that name a known platform failure (#3071). Only
+# this explicit table maps an SDK token onto platform vocabulary; everything
+# else still goes through the allowlist unchanged.
+_RESULT_SUBTYPE_CLASSIFICATIONS = {"error_max_turns": "max-turns"}
 
 
 def map_error_classification(raw: str | None) -> str:
@@ -423,10 +430,13 @@ def _translate_result(
         events: list[OutboundEvent] = []
         if state.error_classification is None:
             raw = subtype or "server-error"
-            mapped = map_error_classification(raw)
+            known = _RESULT_SUBTYPE_CLASSIFICATIONS.get(raw)
+            mapped = known or map_error_classification(raw)
+            if known is not None:
+                state.error_classification = known
             events.append(
                 ErrorEvent(
-                    message=text if mapped == raw else f"{text}: {raw}",
+                    message=text if mapped == raw or known else f"{text}: {raw}",
                     classification=mapped,
                 )
             )

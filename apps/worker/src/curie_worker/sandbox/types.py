@@ -138,6 +138,10 @@ class SandboxHandle:
     # when a denied/failed revision leaves the git head unchanged.
     publication_visible_outcome_revision: int = 0
     generation: int = 0
+    # CURIE_MAX_TURNS this runner booted with (#3071), None when absent. The
+    # runner reads it once at boot, so a delivery wanting a different budget
+    # must not adopt this route.
+    max_turns: str | None = None
 
     @property
     def sandbox_id(self) -> str:

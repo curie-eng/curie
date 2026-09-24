@@ -104,7 +104,13 @@ from .behaviorpacks import (
     sample_load,
     sample_tip,
 )
-from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingResolver
+from .binding import (
+    DECISION_ENV,
+    GRANT_TOOL_ENV,
+    MAX_TURNS_ENV,
+    RESUMED_KIND_ENV,
+    BindingResolver,
+)
 from .config import WorkerConfig
 from .delivery_lease import DeliveryLease, LeaseLostError
 from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError
@@ -457,6 +463,9 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "false-completion",
     "publication-unrecorded",
     "history-persistence-error",
+    # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
+    # a retry would spend the same budget and stop at the same place.
+    "max-turns",
 })
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset({"runner-timeout-unconfirmed"})
@@ -532,6 +541,21 @@ def _join_reply_blocks(*parts: str | None) -> str:
     """
 
     return "\n\n".join(part for part in parts if part)
+
+
+# Operator guidance appended to an escalation lead for classifications whose
+# fix is a known knob (#3071). Keyed by the displayed classification token.
+_CLASSIFICATION_GUIDANCE = {
+    "max-turns": (
+        "The run used its whole turn budget; raise worker.workItemMaxTurns "
+        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns."
+    ),
+}
+
+
+def _with_guidance(lead: str, token: str) -> str:
+    guidance = _CLASSIFICATION_GUIDANCE.get(token)
+    return f"{lead} {guidance}" if guidance else lead
 
 
 def _escalation_text(
@@ -2186,6 +2210,15 @@ class Kernel:
                 if self._config.shimmer:
                     await self._set_shimmer(qevent, route, packs)
 
+            # Work-item turn budget (#3071). A factory execution runs far more
+            # tool turns than a chat reply, so ONLY a work-item delivery raises
+            # the runner's turn cap; every other delivery carries no
+            # CURIE_MAX_TURNS and keeps the runner default. Placed after every
+            # boot-env build site so both the targetless and the bound paths
+            # carry it.
+            if owned_work_item_id is not None and boot_env is not None:
+                boot_env[MAX_TURNS_ENV] = str(self._config.work_item_max_turns)
+
             # ADR-0131 reclaim preflight. A delivery that has CHANGED HANDS --
             # generation > 1, a distributed-state fact and never a sniff of the
             # message text, so kernel rule 3 stands -- may not simply route: the
@@ -2347,9 +2380,10 @@ class Kernel:
                         route,
                         _escalation_text(
                             qevent,
-                            lead=(
+                            lead=_with_guidance(
                                 f"The run hit an error ({token}) after starting an action; "
-                                "not retrying automatically."
+                                "not retrying automatically.",
+                                token,
                             ),
                             detail=outcome.error_message,
                         ),
@@ -2396,8 +2430,9 @@ class Kernel:
                         route,
                         _escalation_text(
                             qevent,
-                            lead=(
-                                f"The run failed ({token}) after {attempt} attempt(s)."
+                            lead=_with_guidance(
+                                f"The run failed ({token}) after {attempt} attempt(s).",
+                                token,
                             ),
                             detail=outcome.error_message,
                         ),
@@ -4635,6 +4670,34 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable workspace handoff boundary"
             )
+        # Turn budget fence (#3071). CURIE_MAX_TURNS binds only at boot, so a
+        # live route booted with a different budget is replaced (not adopted)
+        # once it reaches the same durable handoff boundary a late workspace
+        # acquisition waits for. A steerable message arriving while a turn is
+        # live keeps the one-live-session rule instead: it adopts and steers,
+        # and the budget applies from the next new turn.
+        turn_budget_replacement = (
+            existing_handle is not None
+            and existing_handle.max_turns != (boot_env or {}).get(MAX_TURNS_ENV)
+        )
+        if (
+            turn_budget_replacement
+            and existing_handle is not None
+            and not source.is_job
+            and verified_review is None
+            and await self._turn_active(existing_handle, remaining_s=remaining_s)
+        ):
+            turn_budget_replacement = False
+        if (
+            turn_budget_replacement
+            and existing_handle is not None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            raise ThreadBusyError(
+                f"thread {thread_key} has not reached a durable turn budget handoff boundary"
+            )
         if packs is not None and verified_review is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
@@ -4663,8 +4726,16 @@ class Kernel:
             workspace_repo=workspace_repo,
             replace_handle=(
                 existing_handle
-                if workspace_repo is not None and existing_handle is not None and (
-                    force_lineage_replacement or existing_handle.workspace_repo is None
+                if existing_handle is not None
+                and (
+                    turn_budget_replacement
+                    or (
+                        workspace_repo is not None
+                        and (
+                            force_lineage_replacement
+                            or existing_handle.workspace_repo is None
+                        )
+                    )
                 )
                 else None
             ),
@@ -4768,6 +4839,16 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
+            # Turn budget fence (#3071), finish-race side. The route was kept
+            # only to steer a live turn; that turn ended (or its liveness was
+            # unreadable), and CURIE_MAX_TURNS binds at boot, so a new turn must
+            # not open on this runner. Retry: the redelivery finds the turn
+            # idle and takes the replacement path above.
+            if handle.max_turns != (boot_env or {}).get(MAX_TURNS_ENV):
+                raise ThreadBusyError(
+                    f"thread {thread_key} turn ended before its steer; "
+                    "retrying to replace the runner's turn budget"
+                )
         if verified_review is not None:
             reserver = getattr(
                 self._publication_creator, "reserve_review_feedback", None
@@ -5268,7 +5349,13 @@ class Kernel:
                 # A runner appeared after the attachment lookup; it never saw
                 # the staged files, so refuse rather than adopt it (#2739).
                 raise RouteChangedError(thread_key)
-            if existing is not None and existing.workspace_repo == workspace_repo:
+            if (
+                existing is not None
+                and existing.workspace_repo == workspace_repo
+                # A route the caller fenced for replacement (#3071 turn
+                # budget) is never adopted.
+                and existing != replace_handle
+            ):
                 await asyncio.to_thread(
                     self._workspace.touch,
                     thread_key,
@@ -5384,6 +5471,18 @@ class Kernel:
                     "claim", "workspace substrate returned an invalid sandbox handle"
                 )
             return workspace_claim.handle
+        if replace_handle is not None:
+            # Turn budget fence (#3071): the caller proved the old runner idle
+            # with durable history; hand the route to a runner booted with this
+            # delivery's env, keeping the session and history identity.
+            return await asyncio.to_thread(
+                self._substrate.handoff,
+                thread_key,
+                expected=replace_handle,
+                env=boot_env or {},
+                workspace_repo=None,
+                agent_name=agent_name,
+            )
         try:
             return await asyncio.to_thread(
                 self._substrate.claim,

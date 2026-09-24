@@ -843,8 +843,11 @@ and `github/add_issue_comment`, and the bundle's review gate hook allows that
 comment only once, to post unresolved findings after a failed or capped review,
 so the runner denies every other GitHub write tool. Open runner egress to the GitHub API
 CIDRs (`agentSandbox.connectorEgress.<agent>`), and raise
-`worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` to 1800
-so the execution deadline, not the 600 s default, bounds a run. Whether a run
+`worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` to at
+least the agent's execution deadline so the deadline, not the 600 s default,
+bounds a run. For a run of up to three hours, set the agent's deadline with
+`curie cluster overrides <agent> --execution-deadline 10800` and both worker
+values to 10800; the chart raises the worker termination grace to match. Whether a run
 executes the repository's tests is the bundle's instruction. The platform does
 not check it.
 
@@ -873,11 +876,17 @@ until chart-owned values land):
 | `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
 | `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
 
-There are two time bounds after start: the ExecutionRequest deadline (1800 s)
-and the worker delivery budget (`worker.deliveryBudgetSeconds`, default 600).
+There are two time bounds after start: the ExecutionRequest deadline (the
+agent's `execution_deadline_seconds`, 60 to 10800, default 1800) and the worker
+delivery budget (`worker.deliveryBudgetSeconds`, default 600, maximum 10800).
 The runner request is bounded by the smaller of the two remaining times. A
 default install therefore fails a work item at 600 s (`deadline_halted`) unless
 operators raise the delivery budget for factory agents.
+
+A work item run boots its runner with a turn budget of `worker.workItemMaxTurns`
+(default 1000), so the deadline rather than the runner's default of 20 turns
+bounds it. A run that still exhausts its turns fails as `runner_escalated` with
+the classification `max-turns`.
 
 Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
@@ -899,7 +908,7 @@ credits ends the run as `model_credit_exhausted` without retrying. The
 work item reconciler posts the comment after the terminal row and any
 publication lineage commit. A refused post is recorded on the notice and does
 not change the execution row. Waiting for approval is not an ending: the
-execution deadline stays 1800 seconds from start and covers that wait.
+execution deadline stays fixed from start and covers that wait.
 
 Review feedback on a factory pull request asks for one more revision of that
 pull request. When a work item owns the PR, an `issue_comment`,
@@ -971,7 +980,7 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
 | `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
-| `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to 1800 s; unset, the model is fake |
+| `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
 | `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
 
 A missing input is refused, with every missing name listed, before the cluster
@@ -1087,7 +1096,7 @@ request, a `state` and an `actionable_cause`. The states:
 - `waiting`: admitted and waiting for sandbox capacity. The cause names
   capacity deferrals and says when the waiting deadline has elapsed but the
   reconciler has not yet expired the request.
-- `running`: started, bounded by the 1800 s execution deadline.
+- `running`: started, bounded by the agent's execution deadline (default 1800 s).
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
 - `cancelled`: the issue label was removed or the issue was closed. A pull

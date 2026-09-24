@@ -2068,3 +2068,116 @@ def test_cancelling_a_work_item_with_no_active_request_expires_its_transcript(
         assert await _transcript_threads(session, agent_id) == set()
 
     with_session(body)
+
+
+# --- per-agent execution deadline (#3071) -----------------------------------
+
+
+async def _set_agent_deadline(
+    session: AsyncSession, agent_id: uuid.UUID, seconds: int | None
+) -> None:
+    await session.execute(
+        text("UPDATE curie.agents SET execution_deadline_seconds = :s WHERE id = :id"),
+        {"s": seconds, "id": agent_id},
+    )
+    await session.commit()
+
+
+async def _stored_deadline_span(session: AsyncSession, request_id: uuid.UUID) -> timedelta:
+    row = (
+        await session.execute(
+            text(
+                "SELECT execution_deadline - started_at AS span "
+                "FROM curie.execution_requests WHERE id = :id"
+            ),
+            {"id": request_id},
+        )
+    ).one()
+    assert isinstance(row.span, timedelta)
+    return row.span
+
+
+def test_start_uses_the_owning_agents_execution_deadline(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        await _set_agent_deadline(session, agent_id, 90)
+        item = await _item(session, agent_id)
+        running = await _start(session, await _request(session, item.work_item))
+        assert running.request is not None
+        assert await _stored_deadline_span(session, running.request.id) == timedelta(seconds=90)
+
+    with_session(body)
+
+
+def test_start_uses_1800_when_the_agent_deadline_is_null(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        # Another agent's override must not leak into this one's start.
+        await _set_agent_deadline(session, await _agent(session, "other-bot"), 90)
+        await _set_agent_deadline(session, agent_id, None)
+        item = await _item(session, agent_id)
+        running = await _start(session, await _request(session, item.work_item))
+        assert running.request is not None
+        assert await _stored_deadline_span(session, running.request.id) == timedelta(seconds=1800)
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("seconds", [59, 10801])
+def test_agent_execution_deadline_column_check_refuses_out_of_range(
+    clean_db: None, seconds: int
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        with pytest.raises(IntegrityError):
+            await _set_agent_deadline(session, agent_id, seconds)
+
+    with_session(body)
+
+
+async def _insert_running_with_span(session: AsyncSession, seconds: int) -> None:
+    agent_id = await _agent(session)
+    item_id = uuid.uuid4()
+    started_at = await _now(session)
+    await session.execute(
+        text(
+            "INSERT INTO curie.work_items "
+            "(id, github_repository_id, github_issue_number, "
+            "github_installation_id, agent_id, repo_full_name, conversation_id, "
+            "version, next_sequence) VALUES "
+            "(:id, 101, 2573, 202, :agent, :repo, :conversation, 2, 2)"
+        ),
+        {"id": item_id, "agent": agent_id, "repo": REPO, "conversation": CONVERSATION},
+    )
+    await session.execute(
+        text(
+            "INSERT INTO curie.execution_requests "
+            "(id, work_item_id, sequence, status, wait_deadline, started_at, "
+            "execution_deadline, version, execution_attempts) VALUES "
+            "(:id, :item, 1, 'running', :wait, :started, :deadline, 2, 1)"
+        ),
+        {
+            "id": uuid.uuid4(),
+            "item": item_id,
+            "wait": started_at - timedelta(seconds=1),
+            "started": started_at,
+            "deadline": started_at + timedelta(seconds=seconds),
+        },
+    )
+    await session.commit()
+
+
+@pytest.mark.parametrize("seconds", [90, 10800])
+def test_execution_request_check_accepts_deadlines_up_to_10800(
+    clean_db: None, seconds: int
+) -> None:
+    with_session(lambda session: _insert_running_with_span(session, seconds))
+
+
+def test_execution_request_check_refuses_a_deadline_past_10800(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        with pytest.raises(IntegrityError) as excinfo:
+            await _insert_running_with_span(session, 10801)
+        assert "execution_requests_deadline_ck" in str(excinfo.value)
+
+    with_session(body)
