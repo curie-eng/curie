@@ -41,6 +41,57 @@ class DriverOutcomes(unittest.TestCase):
             payload,
         )
 
+    def test_demo_upgrade_credential_has_separate_denied_identity(self):
+        reader = {
+            "apiVersion": "v1",
+            "kind": "Config",
+            "clusters": [{"name": "in-cluster", "cluster": {"server": "https://kubernetes.default.svc"}}],
+            "users": [{"name": "reader", "user": {"token": "reader-token"}}],
+            "contexts": [
+                {"name": "reader", "context": {"cluster": "in-cluster", "user": "reader"}}
+            ],
+            "current-context": "reader",
+        }
+        result = self.run_function(
+            '''
+NAMESPACE=curie
+kubectl() {
+  printf '%s\\n' "$*" >> "$HOME/kubectl-calls"
+  case "$*" in
+    *'auth can-i'*) echo no ;;
+    *'create token'*) echo denied-token ;;
+  esac
+}
+build_denied_upgrade_kubeconfig < "$FIXTURE"
+''',
+            reader,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(result.stdout)
+        self.assertEqual(
+            config["users"],
+            [{"name": "sre-demo-upgrade-denied", "user": {"token": "denied-token"}}],
+        )
+        self.assertEqual(config["current-context"], "sre-demo-upgrade-denied")
+        self.assertNotIn("reader-token", result.stdout)
+
+    def test_demo_upgrade_credential_refuses_an_upgrade_grant(self):
+        result = self.run_function(
+            '''
+NAMESPACE=curie
+kubectl() {
+  case "$*" in
+    *'auth can-i'*) echo yes ;;
+    *'create token'*) echo denied-token ;;
+  esac
+}
+build_denied_upgrade_kubeconfig < "$FIXTURE"
+''',
+            {"users": [{"name": "reader", "user": {"token": "reader-token"}}]},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected upgrade grant", result.stderr)
+
     def test_timeout_json_is_not_a_reply(self):
         result = self.parse_turn({"reply": None, "finalized": False, "timed_out": True})
         self.assertNotEqual(result.returncode, 0, result.stdout)
