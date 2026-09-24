@@ -374,12 +374,16 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
 class BindingResolver:
     """Resolves a channel address to its active agent deployment (read-only).
 
-    Scoped to one tenant (ADR 0155 step 6). Every read matches only rows whose
-    ``tenant_id`` is the resolver's, and a binding row out of step with its
-    agent's tenant matches neither, so it fails closed. Another tenant's agent
-    answers exactly as an unknown one does. The tenant is the default one until
-    the queued turn carries its own (#2914); it is deliberately not an
-    operator setting, since a mistyped tenant would drop every event.
+    Scoped to one tenant (ADR 0155 step 6). Every read matches only agents
+    whose ``tenant_id`` is the resolver's, and resolution also requires the
+    binding row to carry it, so a binding out of step with its agent fails
+    closed. Another tenant's agent answers exactly as an unknown one does.
+    ``deployments`` and ``agent_versions`` are row scoped by the column only and
+    follow their agent (``v.agent_id = a.id``); predicates on them would have to
+    land in ``connector_loop._TARGETS_SQL`` too, or the two rankings diverge.
+    The tenant is the default one until the queued turn carries its own
+    (#2914); it is deliberately not an operator setting, since a mistyped
+    tenant would drop every event.
     """
 
     def __init__(
