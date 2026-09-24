@@ -50,9 +50,9 @@ thread, and expire when their thread ends.**
 1. **Storage.** A new Postgres table holds one row per thread, keyed by
    `(agent_id, binding_scope, thread_key)`. Each row has the ordered record
    array, a version for compare-and-set, and `created_at`, `updated_at` and
-   `expires_at`. There is no new datastore. No transcript row stays in
-   `workflow_state_entries`, and the state store's byte caps no longer apply to
-   transcripts.
+   `expires_at`. There is no new datastore. The new API never writes a
+   transcript to `workflow_state_entries`, and the state store's byte caps no
+   longer apply to transcripts.
 2. **Wire.** The runner keeps its `TranscriptStore` port and its
    `CURIE_HISTORY_REF` URL. The API serves the existing
    `/agents/<id>/state/transcript/...` routes (get, put, append, delete and
@@ -75,12 +75,16 @@ thread, and expire when their thread ends.**
    reads as absent, and the agent's next transcript write deletes it. A deleted
    transcript resumes as an empty history, which is how a thread with no prior
    turns already behaves.
-5. **Upgrade.** One Alembic revision creates the table, copies every
-   `transcript` namespace row from `workflow_state_entries` into it, and deletes
-   the copied rows. A row over the per-thread cap is copied as-is. Its next
-   append is refused and the runner compacts it, as it does with an oversized
-   value today. The revision is classed `expand`, so existing installs need no
-   operator step.
+5. **Upgrade.** One Alembic revision, classed `expand`, creates the table and
+   copies every `transcript` namespace row from `workflow_state_entries` into
+   it. It leaves the legacy rows in place, so an older API instance still
+   serving during a rolling upgrade keeps its history. The first time the new
+   API touches a thread, it adopts that thread's legacy row: a legacy row newer
+   than the copy replaces it, and the legacy row is then deleted. A WorkItem's
+   terminal transition deletes its legacy row too. A later `contract` revision
+   (#3088) removes the legacy rows nobody touched. A row over the per-thread cap
+   is copied as-is. Its next append is refused and the runner compacts it, as it
+   does with an oversized value today. Existing installs need no operator step.
 
 ## Consequences
 
@@ -94,9 +98,11 @@ thread, and expire when their thread ends.**
   an empty history.
 - A second table now holds conversation data. Questions about keeping or
   exporting transcripts now concern one table, not a generic namespace.
-- The migration is a data move. A downgrade copies every row back, and the old
-  caps apply to them again. An N-1 API serving the new schema during a rollback
-  sees no transcript history.
+- Until #3088 lands, untouched legacy rows keep using space in the state store.
+  They no longer grow, because the new API never writes there.
+- A downgrade writes each thread's newer copy back to the state store, and the
+  old caps apply to it again. An N-1 API serving the new schema during a rollback
+  sees the legacy rows the new API has not adopted yet.
 
 ## Alternatives considered
 

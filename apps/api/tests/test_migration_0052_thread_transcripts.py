@@ -1,4 +1,4 @@
-"""Migration 0052 moves transcripts out of the capped state store (ADR-0170)."""
+"""Migration 0052 copies transcripts out of the capped state store (ADR-0170)."""
 
 from __future__ import annotations
 
@@ -88,7 +88,19 @@ def test_0052_moves_transcripts_and_downgrade_moves_them_back(
         assert moved == [
             {"thread_key": THREAD, "value": transcript, "version": 3, "binding_scope": None}
         ]
-        assert _state_rows(agent_id) == [("memory", "facts"), ("workflow", "step")]
+        # Expand: the legacy row stays for an older API instance mid-rollout.
+        assert _state_rows(agent_id) == [
+            ("memory", "facts"),
+            ("transcript", THREAD),
+            ("workflow", "step"),
+        ]
+        # The new API then adopts the thread and deletes the legacy row; a
+        # downgrade writes the adopted transcript back.
+        _sql(
+            "DELETE FROM curie.workflow_state_entries WHERE agent_id = :a "
+            "AND namespace = 'transcript'",
+            {"a": agent_id},
+        )
 
         command.downgrade(config, "0051")
         assert _sql("SELECT to_regclass('curie.thread_transcripts') AS name")[0]["name"] is None
