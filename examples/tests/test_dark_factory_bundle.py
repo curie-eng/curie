@@ -277,3 +277,38 @@ def test_example_deploys_as_dark_factory_on_the_default_model() -> None:
     assert "agentSandbox.runner.model=z-ai/glm-5.3-flash" in readme
     assert "agent `dark-factory`" in operations
     assert "`z-ai/glm-5.3-flash`" in operations
+
+
+# --- #3097: wait_ci loops back to implement -----------------------------------------
+
+
+def _section(body: str, number: int) -> str:
+    match = re.search(rf"^## {number}\. .*?(?=^## \d+\. |\Z)", body, re.MULTILINE | re.DOTALL)
+    assert match, f"section {number} is missing"
+    return match.group(0)
+
+
+def test_wait_ci_section_loops_a_failed_check_back_to_implement() -> None:
+    _, body = _skill_parts()
+    section = _section(body, 9)
+    assert "(phase `wait_ci`)" in section.splitlines()[0]
+    assert "Curie wait_ci round" in section
+    assert "implement" in section
+    assert "untrusted" in section.lower()
+    assert ".github/" in section
+    assert "Could not complete:" in section
+    assert "1800" in section
+    assert "does not act on them yet" not in section
+
+
+def test_skill_names_three_review_loops_including_wait_ci() -> None:
+    _, body = _skill_parts()
+    assert "Two\npairs loop" not in body
+    assert re.search(r"`wait_ci`.{0,80}`implement`", body, re.DOTALL)
+
+
+def test_readme_describes_the_ci_wait_and_fix_loop() -> None:
+    readme = (BUNDLE / "README.md").read_text()
+    assert "does not act on the checks yet" not in readme
+    assert re.search(r"`wait_ci`.{0,80}`implement`", readme, re.DOTALL)
+    assert "unverified" in readme.lower()

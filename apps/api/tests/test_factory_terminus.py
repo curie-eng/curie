@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import threading
 import uuid
@@ -94,6 +95,10 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "publication_denied",
         "publication_expired",
         "publication_failed",
+        "ci_failed",
+        "ci_timeout",
+        "ci_unverified",
+        "ci_fix_unpublished",
     ],
 )
 def test_every_terminus_cause_has_its_own_plain_sentence(cause: str) -> None:
@@ -110,11 +115,136 @@ def test_unknown_cause_still_gets_a_sentence_and_its_code() -> None:
     assert "Cause: something_new" in body
 
 
+def test_ci_failed_notice_labels_its_details_not_a_provider_message() -> None:
+    detail = (
+        "Rounds: 3\nTried: round 2: \"Fix the test\" (1 files: src/app.py)\n"
+        "Failing checks: unit-tests (failure)"
+    )
+    body = comment_body(uuid.uuid4(), "ci_failed", pr_url=None, detail=detail)
+    assert body.startswith("Could not complete:")
+    assert "3 rounds" in body.splitlines()[0]
+    assert "Provider message:" not in body
+    assert "Details: Rounds: 3" in body
+    assert "Failing checks: unit-tests (failure)" in body
+    assert "Cause: ci_failed" in body
+
+
+def test_ci_unverified_notice_says_it_is_not_a_success() -> None:
+    body = comment_body(
+        uuid.uuid4(), "ci_unverified", pr_url=None, detail="Reason: github_forbidden"
+    )
+    assert body.startswith("Could not complete:")
+    assert "unverified" in body.splitlines()[0]
+    assert "Reason: github_forbidden" in body
+    assert "Completed:" not in body
+
+
+def test_completed_notice_carries_the_no_ci_note() -> None:
+    url = f"https://github.com/{REPO}/pull/77"
+    body = comment_body(
+        uuid.uuid4(), "completed", pr_url=url, detail="No CI checks appeared within 120 s."
+    )
+    assert body.startswith(f"Completed: {url}")
+    assert "Note: No CI checks appeared within 120 s." in body
+
+
+# --- #3097: a scripted fake of the GitHub Checks and Statuses APIs.
+#
+# https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+# https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
+# https://docs.github.com/en/rest/checks/runs#list-check-run-annotations
+#
+# Each observation (one check-runs read) pops the next script entry for the
+# head SHA it names; the last entry repeats. The combined-status read answers
+# from the entry the latest check-runs read popped.
+
+HEAD_A = "a1" * 20
+HEAD_B = "b2" * 20
+HEAD_C = "c3" * 20
+_CHECK_IDS = iter(range(9001, 99999))
+
+CiEntry = tuple[int, Any, int, Any]
+
+
+def check_run(
+    name: str,
+    *,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    title: str | None = None,
+    summary: str | None = None,
+    run_id: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": run_id if run_id is not None else next(_CHECK_IDS),
+        "name": name,
+        "status": status,
+        "conclusion": conclusion if status == "completed" else None,
+        "output": {"title": title, "summary": summary},
+    }
+
+
+def commit_status(context: str, state: str, description: str = "") -> dict[str, Any]:
+    return {"context": context, "state": state, "description": description}
+
+
+def ci_entry(
+    *runs: dict[str, Any],
+    statuses: tuple[dict[str, Any], ...] = (),
+    total: int | None = None,
+    check_status: int = 200,
+    status_status: int = 200,
+) -> CiEntry:
+    # The combined state reads "pending" when no status exists; only the
+    # statuses list is meaningful (the trap the gate must not fall into).
+    combined = "pending" if not statuses else statuses[0]["state"]
+    return (
+        check_status,
+        {"total_count": len(runs) if total is None else total, "check_runs": list(runs)},
+        status_status,
+        {"state": combined, "statuses": list(statuses), "total_count": len(statuses)},
+    )
+
+
+def ci_green() -> CiEntry:
+    return ci_entry(check_run("build"))
+
+
+def ci_pending() -> CiEntry:
+    return ci_entry(check_run("build", status="in_progress"))
+
+
+def ci_failing(name: str = "unit-tests", *, run_id: int | None = None) -> CiEntry:
+    return ci_entry(
+        check_run(
+            name,
+            conclusion="failure",
+            title="1 test failed",
+            summary="test_widget_parses_input failed: expected 2, got 1",
+            run_id=run_id,
+        ),
+        check_run("lint"),
+    )
+
+
+def ci_empty() -> CiEntry:
+    return ci_entry()
+
+
 class _Credentials:
+    app_configured = True
+
     def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
         if repo != REPO or installation_id != INSTALLATION_ID:
             raise RuntimeError("unexpected installation")
         return "ghs_factory_terminus_fixture"
+
+    def fresh_installation_token(
+        self, repo: str, installation_id: int | None = None
+    ) -> tuple[int, str]:
+        if repo != REPO:
+            raise RuntimeError("unexpected repository")
+        return 0, "fixture"
 
 
 class _GitHubComments(BaseHTTPRequestHandler):
@@ -124,7 +254,7 @@ class _GitHubComments(BaseHTTPRequestHandler):
         return
 
     def _send(self, status: int, payload: object) -> None:
-        body = json.dumps(payload).encode()
+        body = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -136,6 +266,8 @@ class _GitHubComments(BaseHTTPRequestHandler):
         assert isinstance(server, _CommentServer)
         parsed = urlsplit(self.path)
         path = parsed.path
+        if self._ci_get(server, path):
+            return
         server.requests.append(("GET", path, None))
         if server.by_path:
             items = list(server.lists.get(path, []))
@@ -148,6 +280,27 @@ class _GitHubComments(BaseHTTPRequestHandler):
             self._send(200, items[start : start + per_page])
             return
         self._send(200, list(server.comments))
+
+    def _ci_get(self, server: _CommentServer, path: str) -> bool:
+        repo = re.escape(REPO)
+        commit = re.fullmatch(rf"/repos/{repo}/commits/([0-9a-f]{{40}})/(check-runs|status)", path)
+        if commit is not None:
+            sha, kind = commit.group(1), commit.group(2)
+            script = server.ci_scripts.get(sha) or server.ci_script
+            if kind == "check-runs":
+                index = min(server.ci_cursor.get(sha, -1) + 1, len(script) - 1)
+                server.ci_cursor[sha] = index
+                server.ci_observations.append(sha)
+                self._send(script[index][0], script[index][1])
+            else:
+                index = max(server.ci_cursor.get(sha, 0), 0)
+                self._send(script[index][2], script[index][3])
+            return True
+        annotations = re.fullmatch(rf"/repos/{repo}/check-runs/([0-9]+)/annotations", path)
+        if annotations is not None:
+            self._send(200, server.annotations.get(int(annotations.group(1)), []))
+            return True
+        return False
 
     def do_POST(self) -> None:  # noqa: N802
         server = self.server
@@ -198,6 +351,13 @@ class _CommentServer(ThreadingHTTPServer):
         # Paths whose next POST response is dropped after the comment is
         # recorded, simulating a lost response to a successful post.
         self.lost_response_paths: set[str] = set()
+        # #3097 CI fake. The default is one green check run, so every suite that
+        # opens a pull request stays on the success path.
+        self.ci_script: list[CiEntry] = [ci_green()]
+        self.ci_scripts: dict[str, list[CiEntry]] = {}
+        self.ci_cursor: dict[str, int] = {}
+        self.ci_observations: list[str] = []
+        self.annotations: dict[int, list[dict[str, Any]]] = {}
 
 
 @pytest.fixture
@@ -230,6 +390,10 @@ def comments(monkeypatch: pytest.MonkeyPatch) -> Any:
     )
     monkeypatch.setattr(
         "curie_api.github_factory.credentials_for",
+        lambda _settings: _Credentials(),
+    )
+    monkeypatch.setattr(
+        "curie_api.workitem_outcomes.credentials_for",
         lambda _settings: _Credentials(),
     )
     yield server
@@ -708,7 +872,9 @@ def test_failure_and_opened_pull_request_each_post_one_final_comment(
     assert len(_notices(denied_row["id"])) == 1
 
 
-def _attach_publication(work_item_id: uuid.UUID, *, status: str, pr: int | None) -> None:
+def _attach_publication(
+    work_item_id: uuid.UUID, *, status: str, pr: int | None, head_sha: str = HEAD_A
+) -> None:
     async def go() -> None:
         engine = create_async_engine(get_settings().database_url)
         try:
@@ -767,10 +933,10 @@ def _attach_publication(work_item_id: uuid.UUID, *, status: str, pr: int | None)
                     text(
                         "INSERT INTO curie.thread_publication_lineages "
                         "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
-                        "base_sha, branch, pr_number, pr_url, status, version, "
+                        "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
                         "latest_revision) VALUES "
                         "(:id, :agent, :deployment, :conversation, :repo, :base, "
-                        ":branch, :pr, :url, 'open', 1, 1)"
+                        ":branch, :pr, :url, :head, 'open', 1, 1)"
                     ),
                     {
                         "id": lineage_id,
@@ -782,6 +948,7 @@ def _attach_publication(work_item_id: uuid.UUID, *, status: str, pr: int | None)
                         "branch": f"curie/publication-{lineage_id.hex}",
                         "pr": pr,
                         "url": pr_url,
+                        "head": head_sha if pr is not None else None,
                     },
                 )
                 await conn.execute(
@@ -807,12 +974,12 @@ def _attach_publication(work_item_id: uuid.UUID, *, status: str, pr: int | None)
                         "(id, approval_id, deployment_id, workspace_conversation_id, "
                         "lineage_id, execution_request_id, revision_number, repo_full_name, "
                         "status, base_sha, changed_paths, title, body, reply_kind, "
-                        "reply_channel, result_url) "
+                        "reply_channel, result_url, terminal_at) "
                         "VALUES (:id, :approval, :deployment, :conversation, :lineage, "
                         ":request_id, 1, :repo, :status, :base, "
                         "CAST('[\"README.md\"]' AS jsonb), "
                         "'Update README', 'Approved platform publication.', 'github', "
-                        ":channel, :result)"
+                        ":channel, :result, clock_timestamp())"
                     ),
                     {
                         "id": publication_id,
@@ -949,7 +1116,9 @@ def _insert_revision(work_item_id: uuid.UUID, number: int, objective: str) -> uu
     return request_id
 
 
-def _attach_revision_publication(work_item_id: uuid.UUID, request_id: uuid.UUID) -> None:
+def _attach_revision_publication(
+    work_item_id: uuid.UUID, request_id: uuid.UUID, *, head_sha: str = HEAD_B
+) -> None:
     item = _work_item_row(work_item_id)
     approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
     pr_url = f"https://github.com/{REPO}/pull/{item['pr_number']}"
@@ -981,12 +1150,12 @@ def _attach_revision_publication(work_item_id: uuid.UUID, request_id: uuid.UUID)
                         "(id, approval_id, deployment_id, workspace_conversation_id, "
                         "lineage_id, execution_request_id, revision_number, repo_full_name, "
                         "status, base_sha, changed_paths, title, body, reply_kind, "
-                        "reply_channel, result_url) "
+                        "reply_channel, result_url, terminal_at) "
                         "VALUES (:id, :approval, :deployment, :conversation, :lineage, "
                         ":request_id, 2, :repo, 'succeeded', :base, "
                         "CAST('[\"README.md\"]' AS jsonb), "
                         "'Rename the helper', 'Approved platform publication.', 'github', "
-                        ":channel, :result)"
+                        ":channel, :result, clock_timestamp())"
                     ),
                     {
                         "id": publication_id,
@@ -1003,10 +1172,10 @@ def _attach_revision_publication(work_item_id: uuid.UUID, request_id: uuid.UUID)
                 )
                 await conn.execute(
                     text(
-                        "UPDATE curie.thread_publication_lineages SET latest_revision = 2 "
-                        "WHERE id = :id"
+                        "UPDATE curie.thread_publication_lineages SET latest_revision = 2, "
+                        "head_sha = :head WHERE id = :id"
                     ),
-                    {"id": item["publication_lineage_id"]},
+                    {"id": item["publication_lineage_id"], "head": head_sha},
                 )
         finally:
             await engine.dispose()

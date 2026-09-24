@@ -1605,3 +1605,203 @@ def test_expired_text_names_the_configured_seconds(
     assert body["state"] == "expired"
     assert "90 s" in body["actionable_cause"], body["actionable_cause"]
     assert "1800" not in body["actionable_cause"], body["actionable_cause"]
+||||||| parent of 44f514a4 (Add failing tests for the factory CI wait and fix loop)
+
+
+# --- #3097: the CI gate's detail observer ---------------------------------------
+#
+# https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+# https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
+# https://docs.github.com/en/rest/checks/runs#list-check-run-annotations
+
+FAILING_RUN_ID = 4101
+
+
+def _detail_handler(
+    *,
+    runs: list[dict[str, Any]] | None = None,
+    statuses: list[dict[str, Any]] | None = None,
+    combined: str = "pending",
+) -> Callable[[httpx.Request], httpx.Response]:
+    check_runs = runs if runs is not None else [
+        {
+            "id": FAILING_RUN_ID,
+            "name": "unit-tests",
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {"title": "1 failed", "summary": "expected 2, got 1"},
+        },
+        {
+            "id": FAILING_RUN_ID + 1,
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "output": {"title": None, "summary": None},
+        },
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith(f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs"):
+            return httpx.Response(
+                200, json={"total_count": len(check_runs), "check_runs": check_runs}
+            )
+        if path.endswith(f"/repos/{REPO}/commits/{HEAD_SHA}/status"):
+            listed = statuses if statuses is not None else []
+            return httpx.Response(
+                200,
+                json={"state": combined, "statuses": listed, "total_count": len(listed)},
+            )
+        if path.endswith(f"/repos/{REPO}/check-runs/{FAILING_RUN_ID}/annotations"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "path": "src/widget.py",
+                        "start_line": 12,
+                        "end_line": 12,
+                        "annotation_level": "failure",
+                        "message": "AssertionError: expected 2, got 1",
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "missing fixture"})
+
+    return handle
+
+
+def _observe_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    creds: Any = None,
+) -> tuple[Any, list[httpx.Request]]:
+    from curie_api import workitem_outcomes
+
+    fake = creds or _FakeCreds()
+    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: fake)
+    seen: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    lineage, work_item = _ci_inputs()
+
+    async def run() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
+            return await workitem_outcomes.observe_ci_detail(
+                lineage, work_item, get_settings(), client
+            )
+
+    return asyncio.run(run()), seen
+
+
+def _annotation_messages(annotations: Any) -> list[str]:
+    groups = annotations.values() if isinstance(annotations, Mapping) else [annotations]
+    return [
+        str(item.get("message"))
+        for group in groups
+        for item in (group or [])
+        if isinstance(item, Mapping)
+    ]
+
+
+def test_ci_detail_reads_check_runs_statuses_and_failing_annotations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail, seen = _observe_detail(
+        monkeypatch,
+        _detail_handler(
+            statuses=[{"context": "ci/jenkins", "state": "error", "description": "boom"}]
+        ),
+    )
+
+    assert detail.reason is None
+    assert detail.head_sha == HEAD_SHA
+    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
+    assert [s["context"] for s in detail.statuses] == ["ci/jenkins"]
+    assert _annotation_messages(detail.annotations) == ["AssertionError: expected 2, got 1"]
+    paths = [request.url.path for request in seen]
+    # Annotations are read only for the failing run, never the passing one.
+    assert not any(p.endswith(f"/check-runs/{FAILING_RUN_ID + 1}/annotations") for p in paths)
+    for request in seen:
+        assert request.method == "GET"
+        assert request.headers["authorization"].lower() == f"bearer {SECRET_SENTINEL}".lower()
+
+
+def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail, _ = _observe_detail(
+        monkeypatch,
+        _detail_handler(
+            runs=[
+                {
+                    "id": 1,
+                    "name": "build",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "output": {},
+                }
+            ],
+            statuses=[],
+            combined="pending",
+        ),
+    )
+    assert detail.reason is None
+    assert list(detail.statuses) == []
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(401, "github_unauthorized"), (403, "github_forbidden"), (404, "github_not_found")],
+)
+def test_ci_detail_refusals_map_to_fixed_reasons(
+    monkeypatch: pytest.MonkeyPatch, status: int, reason: str
+) -> None:
+    detail, _ = _observe_detail(
+        monkeypatch, lambda r: httpx.Response(status, text=f"BODYTEXT {SECRET_SENTINEL}")
+    )
+    assert (detail.state, detail.reason) == ("unavailable", reason)
+    _reason_is_clean(detail)
+
+
+def test_ci_detail_stalled_mint_releases_the_caller_with_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A credential mint that never finishes does not hold the reconciler."""
+
+    import anyio
+    import anyio.to_thread
+    from curie_api import workitem_outcomes
+
+    monkeypatch.setattr(workitem_outcomes, "CI_DETAIL_DEADLINE_SECONDS", 0.05)
+
+    async def never_returns(func: Any, *args: Any, **kwargs: Any) -> Any:
+        await anyio.Event().wait()
+        raise AssertionError("the mint must never finish in this test")
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", never_returns)
+    detail, seen = _observe_detail(monkeypatch, _detail_handler())
+
+    assert (detail.state, detail.reason) == ("unavailable", "timeout")
+    assert seen == []
+
+
+def test_ci_detail_shares_the_bounded_credential_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detail observer mints through the same guard as observe_ci."""
+
+    from curie_api import workitem_outcomes
+
+    assert workitem_outcomes._mint_ci_token is not None
+    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
+        failed, _ = _observe_detail(
+            monkeypatch, _detail_handler(), creds=_FakeCreds(error=GitHubAppError("boom"))
+        )
+        assert failed.state == "unavailable"
+        assert failed.reason != "observation_busy"
+    healthy, _ = _observe_detail(monkeypatch, _detail_handler())
+    assert healthy.reason is None
