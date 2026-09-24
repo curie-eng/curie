@@ -370,10 +370,12 @@ serverFiles:
             # Two terms. The kubelet term reads this Prometheus's own scrape
             # of each node (`up` on that job, whose instance is the node
             # name), so it still fires when kube-state-metrics ran on the
-            # failed node and went down with it. Both aggregate to `node`
-            # alone, so a node failing both raises one alert, and a
-            # kube-state-metrics restart, which changes `instance`, keeps the
-            # `for` clock. status="true" == 0 also catches Unknown.
+            # failed node and went down with it. Both aggregate to `node`, so
+            # a node failing both raises one alert and a kube-state-metrics
+            # reschedule keeps one label set. For the Ready term the `for`
+            # clock survives that only when the old and new pods overlap; a
+            # restart that misses a scrape still restarts it.
+            # status="true" == 0 also catches Unknown.
             expr: |
               max by (node) (
                 kube_node_status_condition{
@@ -395,10 +397,11 @@ serverFiles:
             annotations:
               summary: A node is not Ready or its kubelet is unreachable
               description: >-
-                A node has not reported Ready, or its kubelet has not answered
-                a scrape, for 5 minutes. New pods are not scheduled onto it,
-                pods already on it are evicted after five minutes, and a
-                sandbox placed there cannot start.
+                A node has not reported Ready, or this Prometheus has not
+                reached its kubelet, for 5 minutes. A node that is not Ready
+                takes no new pods, evicts the ones it has after five minutes,
+                and cannot start a sandbox. If every node fires at once,
+                suspect this Prometheus's own network rather than the nodes.
           - alert: CuriePodCrashLooping
             # Covers every namespace, not only Curie's. max_over_time because
             # the waiting series exists only while the container waits, so
@@ -406,8 +409,10 @@ serverFiles:
             # `for` clock. The init term is its own metric: while an init
             # container crashes, the app container only waits as
             # PodInitializing, so the first term alone never fires.
-            # Aggregated to namespace, pod and container so a
-            # kube-state-metrics restart keeps the clock.
+            # Aggregated to namespace, pod and container, so a
+            # kube-state-metrics reschedule keeps one label set, and the 5m
+            # window bridges a restart's missed scrapes, so the clock survives
+            # a gap shorter than that.
             expr: |
               max by (namespace, pod, container) (
                 max_over_time(
@@ -439,10 +444,12 @@ serverFiles:
             # allowlist above exports, not by name: a component of api,
             # worker or dispatcher, and a helm.sh/chart of curie-*, which the
             # chart sets from its own name and so holds under nameOverride.
-            # Two terms as in the mail adapter rule, because unavailable is
-            # spec minus available and reads 0 at zero replicas. Aggregated
-            # to namespace and deployment, so a move from unavailable to
-            # scaled to zero keeps one label set and keeps firing.
+            # A vendored copy of the chart renamed away from `curie` selects
+            # nothing. Two terms as in the mail adapter rule, because
+            # unavailable is spec minus available and reads 0 at zero
+            # replicas. Aggregated to namespace and deployment, so a move
+            # from unavailable to scaled to zero keeps one label set and
+            # keeps firing.
             expr: |
               max by (namespace, deployment) (
                 (
@@ -473,7 +480,8 @@ serverFiles:
             # Valkey and Postgres carry no component label, so the name
             # suffix picks the store, and a helm.sh/chart of curie-*,
             # exported by the allowlist above, keeps a same-named
-            # StatefulSet from another chart out. Two terms, because
+            # StatefulSet from another chart out. A vendored copy of the chart
+            # renamed away from `curie` selects nothing. Two terms, because
             # ready < replicas reads 0 < 0 at zero replicas. Aggregated to
             # namespace and statefulset, so a move from not ready to scaled
             # to zero keeps one label set and keeps firing.
