@@ -3098,6 +3098,46 @@ def test_budget_exceeded_escalates_without_retry(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_max_turns_classification_is_platform_vocabulary_and_not_retryable() -> None:
+    """#3071: an exhausted turn budget is a named platform failure, and retrying
+    it would only burn the same budget again."""
+    from curie_worker.kernel import (
+        PLATFORM_ERROR_CLASSIFICATIONS,
+        RETRYABLE_CLASSIFICATIONS,
+        map_error_classification,
+    )
+
+    assert "max-turns" in PLATFORM_ERROR_CLASSIFICATIONS
+    assert "max-turns" not in RETRYABLE_CLASSIFICATIONS
+    assert map_error_classification("max-turns") == "max-turns"
+
+
+def test_max_turns_escalates_once_naming_the_turn_budget_knob(make_harness) -> None:
+    """#3071: the operator reading the escalation must learn that the turn
+    budget ran out and which knob raises it."""
+
+    async def go() -> None:
+        async with make_harness(max_attempts=3) as h:
+            h.runner.default_script = [
+                ErrorEvent(message="reached max turns", classification="max-turns"),
+                Final(text="f", status=FAIL),
+            ]
+            await h.kernel.process_event(_qevent("go"))
+
+            assert h.runner.opened == ["go"]  # max-turns is not retryable
+            text = h.sink.last_text
+            assert text is not None
+            assert "human" in text.lower()
+            assert "(unclassified)" not in text
+            assert "max-turns" in text
+            assert "turn budget" in text.lower()
+            assert (
+                "CURIE_WORK_ITEM_MAX_TURNS" in text or "worker.workItemMaxTurns" in text
+            ), text
+
+    asyncio.run(go())
+
+
 def test_connector_capability_failed_done_posts_diagnosis_not_escalate(
     make_harness,
 ) -> None:

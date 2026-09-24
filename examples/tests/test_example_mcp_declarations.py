@@ -58,9 +58,7 @@ def test_no_example_manifest_uses_string_pointer_mcpservers() -> None:
                 f"{type(value).__name__} {value!r} (string-pointer form silently "
                 f"disables MCP loading)"
             )
-    assert not violations, "String-pointer mcpServers declarations found:\n" + "\n".join(
-        violations
-    )
+    assert not violations, "String-pointer mcpServers declarations found:\n" + "\n".join(violations)
 
 
 def test_example_mcp_server_script_args_are_cwd_independent() -> None:
@@ -82,9 +80,7 @@ def test_example_mcp_server_script_args_are_cwd_independent() -> None:
                     f"relative path; use a ${{CLAUDE_PLUGIN_ROOT}}-qualified or "
                     f"absolute path so the server spawns regardless of cwd"
                 )
-    assert not violations, "cwd-dependent MCP server script args found:\n" + "\n".join(
-        violations
-    )
+    assert not violations, "cwd-dependent MCP server script args found:\n" + "\n".join(violations)
 
 
 def test_sre_bot_observability_connectors_ship_self_configured() -> None:
@@ -103,13 +99,11 @@ def test_sre_bot_observability_connectors_ship_self_configured() -> None:
     }
 
     assert (
-        kubernetes["image"]
-        == "ghcr.io/containers/kubernetes-mcp-server@sha256:"
+        kubernetes["image"] == "ghcr.io/containers/kubernetes-mcp-server@sha256:"
         "6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423"
     )
     assert (
-        grafana["image"]
-        == "docker.io/grafana/mcp-grafana@sha256:"
+        grafana["image"] == "docker.io/grafana/mcp-grafana@sha256:"
         "5efeafd01cd7e1aea9c4b0f03305951f2944db8f43e5ae290cce9578c977f241"
     )
     assert tempo["build"] == {
@@ -152,6 +146,5 @@ def test_sre_bot_python_connectors_pin_the_mcp_2_runtime_their_servers_import() 
     for connector in connectors:
         requirements = (connector / "requirements.txt").read_text().splitlines()
         assert "mcp==2.1.1" in requirements, (
-            f"{connector.name} imports mcp.server.mcpserver but its image "
-            "does not pin MCP 2.1.1"
+            f"{connector.name} imports mcp.server.mcpserver but its image does not pin MCP 2.1.1"
         )

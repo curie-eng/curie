@@ -32,6 +32,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
 
+# Work-item execution deadline bounds (#3071). An agent's
+# `execution_deadline_seconds` NULL means the default; a set value is bounded
+# by the minimum and maximum, and the ExecutionRequest CHECK caps every row at
+# the maximum.
+DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
+MIN_EXECUTION_DEADLINE_SECONDS = 60
+MAX_EXECUTION_DEADLINE_SECONDS = 10800
+
 GIT_FLOW_CREATED_BY = "git-flow"
 
 
@@ -85,6 +93,11 @@ class Agent(Base):
             "AND publication_branch_prefix NOT LIKE '%./')",
             name="agents_publication_branch_prefix_ck",
         ),
+        CheckConstraint(
+            "execution_deadline_seconds IS NULL OR execution_deadline_seconds "
+            f"BETWEEN {MIN_EXECUTION_DEADLINE_SECONDS} AND {MAX_EXECUTION_DEADLINE_SECONDS}",
+            name="agents_execution_deadline_seconds_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -126,6 +139,9 @@ class Agent(Base):
     # (`curie_runner.thinking`), not this column's -- stored as a plain string so
     # the persistence layer does not have to track the harness.
     thinking: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent work-item execution deadline in seconds (#3071). Operator-owned
+    # like `model`/`thinking`; NULL means DEFAULT_EXECUTION_DEADLINE_SECONDS.
+    execution_deadline_seconds: Mapped[int | None] = mapped_column(default=None)
     # Per-agent behavior packs: declarative, opt-in UX touches the worker applies
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;
@@ -680,7 +696,9 @@ class ExecutionRequest(Base):
         CheckConstraint(
             "(started_at IS NULL AND execution_deadline IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL AND "
-            "execution_deadline = started_at + interval '1800 seconds')",
+            "execution_deadline > started_at AND "
+            "execution_deadline <= started_at + "
+            f"interval '{MAX_EXECUTION_DEADLINE_SECONDS} seconds')",
             name="execution_requests_deadline_ck",
         ),
         CheckConstraint(

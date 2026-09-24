@@ -167,18 +167,18 @@ pub fn check_outcome(report: &CheckReport) -> std::result::Result<(), crate::exi
             "read the printed reason(s): fix the server's command/args, forward its credential with curie skill up --secret <NAME>, or raise --timeout if MCP init ran long",
         )),
         "invalid_bundle" => {
-            // An invalid bundle is a deterministic input error (exit 2, Usage),
-            // matching the runner's own `check.py` exit-2 for this verdict: the
-            // bundle dir exists but fails structural validation, so retrying the
-            // same argv fails identically. Surface the structural `reasons` so
-            // the user sees WHY the bundle is invalid.
-            let mut message = String::from("MCP load check reported an invalid bundle");
-            if !report.reasons.is_empty() {
-                message.push_str(": ");
-                message.push_str(&report.reasons.join("; "));
-            }
+            // Bundle validation, not an MCP load failure. A reason that already
+            // starts with the bundle headline is kept as the message.
+            let joined = report.reasons.join("; ");
+            let message = if report.reasons.is_empty() {
+                "invalid plugin bundle".to_string()
+            } else if joined.starts_with("invalid plugin bundle") {
+                joined
+            } else {
+                format!("invalid plugin bundle: {joined}")
+            };
             Err(crate::exit::CliError::usage(message).with_fix(
-                "fix the reported bundle-structure errors (.claude-plugin/plugin.json and skills/) and run curie skill check again",
+                "correct the invalid bundle declaration named in the error and run curie skill check again",
             ))
         }
         verdict => Err(crate::exit::CliError {
@@ -11717,6 +11717,66 @@ impl OverrideChange {
             OverrideChange::Set(v) => Some(serde_json::Value::String(v.clone())),
         }
     }
+
+    /// Same as [`patch_value`](Self::patch_value), but for `Set` the stored
+    /// string is parsed and emitted as a JSON NUMBER rather than a string.
+    ///
+    /// `execution_deadline_seconds` is an int on the wire, unlike `model`/
+    /// `thinking`, which are always strings. The value has already been range
+    /// checked by [`resolve_execution_deadline`](Self::resolve_execution_deadline),
+    /// so the parse here cannot fail for a `Set` this function is meant to see.
+    fn patch_value_as_number(&self) -> Option<serde_json::Value> {
+        match self {
+            OverrideChange::Unchanged => None,
+            OverrideChange::Clear => Some(serde_json::Value::Null),
+            OverrideChange::Set(v) => Some(serde_json::Value::Number(
+                v.parse::<i64>()
+                    .expect("execution deadline Set must already be a validated integer")
+                    .into(),
+            )),
+        }
+    }
+
+    /// Resolve the `--execution-deadline`/`--clear-execution-deadline` pair
+    /// into one intent, with the same three-way semantics as
+    /// [`resolve`](Self::resolve) plus client-side range validation.
+    ///
+    /// Args:
+    ///   value: the `--execution-deadline` value, if the operator passed one.
+    ///   clear: whether `--clear-execution-deadline` was passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error when both were passed, the value is not
+    ///   an integer, or it falls outside 60..=10800 seconds.
+    pub fn resolve_execution_deadline(value: Option<String>, clear: bool) -> Result<Self> {
+        const MIN_SECONDS: i64 = 60;
+        const MAX_SECONDS: i64 = 10800;
+        match (value, clear) {
+            (Some(_), true) => Err(crate::exit::usage(
+                "--execution-deadline and --clear-execution-deadline contradict each other; \
+                 pass one. --clear-execution-deadline restores the platform default"
+                    .to_string(),
+            )),
+            (Some(v), false) => {
+                let trimmed = v.trim();
+                let seconds: i64 = trimmed.parse().map_err(|_| {
+                    crate::exit::usage(format!(
+                        "--execution-deadline must be a whole number of seconds \
+                         between {MIN_SECONDS} and {MAX_SECONDS}, got {v:?}"
+                    ))
+                })?;
+                if !(MIN_SECONDS..=MAX_SECONDS).contains(&seconds) {
+                    return Err(crate::exit::usage(format!(
+                        "--execution-deadline must be between {MIN_SECONDS} and \
+                         {MAX_SECONDS} seconds, got {seconds}"
+                    )));
+                }
+                Ok(OverrideChange::Set(seconds.to_string()))
+            }
+            (None, true) => Ok(OverrideChange::Clear),
+            (None, false) => Ok(OverrideChange::Unchanged),
+        }
+    }
 }
 
 /// The `PATCH /agents/{id}` body for a `<tier> overrides` write, or `None` when
@@ -11736,6 +11796,7 @@ impl OverrideChange {
 pub fn overrides_patch_body(
     model: &OverrideChange,
     thinking: &OverrideChange,
+    execution_deadline: &OverrideChange,
 ) -> Option<serde_json::Value> {
     let mut body = serde_json::Map::new();
     if let Some(v) = model.patch_value() {
@@ -11743,6 +11804,9 @@ pub fn overrides_patch_body(
     }
     if let Some(v) = thinking.patch_value() {
         body.insert("thinking".to_string(), v);
+    }
+    if let Some(v) = execution_deadline.patch_value_as_number() {
+        body.insert("execution_deadline_seconds".to_string(), v);
     }
     if body.is_empty() {
         return None;
@@ -11774,14 +11838,18 @@ pub fn overrides_summary(
     agent: &str,
     model: &Option<String>,
     thinking: &Option<String>,
+    execution_deadline_seconds: &Option<u32>,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
+    let deadline = execution_deadline_seconds
+        .map(|s| format!("{s} s"))
+        .unwrap_or_else(|| "platform default".to_string());
     // The verb carries its own leading space, so an inspect closes straight
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}",
+        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}",
         show(model),
         show(thinking)
     )
@@ -11802,6 +11870,7 @@ pub enum OverridesOutput {
         agent: String,
         model: Option<String>,
         thinking: Option<String>,
+        execution_deadline_seconds: Option<u32>,
         changed: bool,
     },
 }
@@ -11814,11 +11883,13 @@ impl crate::ui::CliOutput for OverridesOutput {
                 agent,
                 model,
                 thinking,
+                execution_deadline_seconds,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
                 "model": model,
                 "thinking": thinking,
+                "execution_deadline_seconds": execution_deadline_seconds,
                 "changed": changed,
             }),
         }
@@ -11831,9 +11902,16 @@ impl crate::ui::CliOutput for OverridesOutput {
                 agent,
                 model,
                 thinking,
+                execution_deadline_seconds,
                 changed,
             } => {
-                ui.payload(&overrides_summary(agent, model, thinking, *changed));
+                ui.payload(&overrides_summary(
+                    agent,
+                    model,
+                    thinking,
+                    execution_deadline_seconds,
+                    *changed,
+                ));
             }
         }
     }
@@ -11864,9 +11942,10 @@ pub async fn overrides(
     opts: AgentActionOpts,
     model: OverrideChange,
     thinking: OverrideChange,
+    execution_deadline: OverrideChange,
 ) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let body = overrides_patch_body(&model, &thinking);
+    let body = overrides_patch_body(&model, &thinking, &execution_deadline);
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(
@@ -11891,6 +11970,7 @@ pub async fn overrides(
             agent: agent.name,
             model: agent.model,
             thinking: agent.thinking,
+            execution_deadline_seconds: agent.execution_deadline_seconds,
             changed: false,
         });
     };
@@ -11910,6 +11990,7 @@ pub async fn overrides(
         agent: saved.name,
         model: saved.model,
         thinking: saved.thinking,
+        execution_deadline_seconds: saved.execution_deadline_seconds,
         changed: true,
     })
 }
@@ -12110,8 +12191,12 @@ mod overrides_tests {
     // alone" silently becomes "reset this to the platform default".
     #[test]
     fn an_unchanged_field_is_absent_and_a_cleared_field_is_present_and_null() {
-        let body = overrides_patch_body(&OverrideChange::Unchanged, &OverrideChange::Clear)
-            .expect("a clear is a write");
+        let body = overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Clear,
+            &OverrideChange::Unchanged,
+        )
+        .expect("a clear is a write");
         let obj = body.as_object().expect("an object");
         assert!(
             !obj.contains_key("model"),
@@ -12122,9 +12207,12 @@ mod overrides_tests {
 
     #[test]
     fn both_unchanged_is_no_body_at_all_which_is_the_inspect_path() {
-        assert!(
-            overrides_patch_body(&OverrideChange::Unchanged, &OverrideChange::Unchanged).is_none()
-        );
+        assert!(overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged
+        )
+        .is_none());
     }
 
     #[test]
@@ -12132,6 +12220,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
         assert_eq!(body["model"], "kimi-k2");
@@ -12168,10 +12257,10 @@ mod overrides_tests {
     // verb was interpolated as an empty string before the colon.
     #[test]
     fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
-        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, false);
+        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, false);
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default"
+            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -12179,8 +12268,8 @@ mod overrides_tests {
     #[test]
     fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
         assert_eq!(
-            super::overrides_summary("a", &None, &Some("adaptive".into()), true),
-            "overrides for a now: model platform default, thinking adaptive"
+            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), true),
+            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s"
         );
     }
 
@@ -12207,6 +12296,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
         assert_eq!(body["model"], "kimi-k2");
@@ -12226,6 +12316,100 @@ mod overrides_tests {
             OverrideChange::resolve("model", Some("m".into()), false).unwrap(),
             OverrideChange::Set("m".into())
         );
+    }
+
+    // --- `--execution-deadline`/`--clear-execution-deadline` (issue #3071) --
+    //
+    // Same three-way PATCH semantics as `model`/`thinking`, plus one thing
+    // neither of those has: the wire field, `execution_deadline_seconds`, is a
+    // JSON NUMBER, not a string, so a `Set` value has to be parsed and range
+    // checked (60..10800) client-side rather than forwarded as typed text.
+
+    #[test]
+    fn a_set_execution_deadline_carries_a_json_number_not_a_string() {
+        let body = overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::resolve_execution_deadline(Some("120".into()), false).unwrap(),
+        )
+        .expect("a set is a write");
+        assert_eq!(body["execution_deadline_seconds"], 120);
+        assert!(body.get("model").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn a_cleared_execution_deadline_is_present_and_null() {
+        let body = overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::Clear,
+        )
+        .expect("a clear is a write");
+        assert!(body["execution_deadline_seconds"].is_null());
+    }
+
+    #[test]
+    fn an_unchanged_execution_deadline_is_absent_when_model_and_thinking_are_set() {
+        let body = overrides_patch_body(
+            &OverrideChange::Set("kimi-k2".into()),
+            &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
+        )
+        .expect("a set is a write");
+        assert!(
+            !body
+                .as_object()
+                .unwrap()
+                .contains_key("execution_deadline_seconds"),
+            "unchanged must be absent: {body}"
+        );
+    }
+
+    #[test]
+    fn an_execution_deadline_below_the_minimum_is_refused_client_side() {
+        let err = OverrideChange::resolve_execution_deadline(Some("59".into()), false)
+            .expect_err("below the 60s floor must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("60"), "{msg}");
+        assert!(msg.contains("10800"), "{msg}");
+    }
+
+    #[test]
+    fn an_execution_deadline_above_the_maximum_is_refused_client_side() {
+        let err = OverrideChange::resolve_execution_deadline(Some("10801".into()), false)
+            .expect_err("above the 10800s ceiling must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("60"), "{msg}");
+        assert!(msg.contains("10800"), "{msg}");
+    }
+
+    #[test]
+    fn execution_deadline_boundaries_are_accepted() {
+        assert_eq!(
+            OverrideChange::resolve_execution_deadline(Some("60".into()), false).unwrap(),
+            OverrideChange::Set("60".into())
+        );
+        assert_eq!(
+            OverrideChange::resolve_execution_deadline(Some("10800".into()), false).unwrap(),
+            OverrideChange::Set("10800".into())
+        );
+    }
+
+    #[test]
+    fn a_non_integer_execution_deadline_is_refused_client_side() {
+        let err = OverrideChange::resolve_execution_deadline(Some("soon".into()), false)
+            .expect_err("a non-integer value must be refused");
+        assert!(err.to_string().contains("--execution-deadline"), "{err}");
+    }
+
+    #[test]
+    fn setting_and_clearing_execution_deadline_together_is_a_usage_error() {
+        let err = OverrideChange::resolve_execution_deadline(Some("120".into()), true)
+            .expect_err("contradictory flags must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("--execution-deadline"), "{msg}");
+        assert!(msg.contains("--clear-execution-deadline"), "{msg}");
     }
 }
 

@@ -209,6 +209,10 @@ async def update_agent(
         agent = await crud.update_agent_model(session, agent, data.model)
     if "thinking" in sent:
         agent = await crud.update_agent_thinking(session, agent, data.thinking)
+    if "execution_deadline_seconds" in sent:
+        agent = await crud.update_agent_execution_deadline(
+            session, agent, data.execution_deadline_seconds
+        )
     if data.memory is not None:
         # Omitted leaves it unchanged; unlike `model`/`thinking` there is no
         # separate "platform default" a null would clear back to, so this

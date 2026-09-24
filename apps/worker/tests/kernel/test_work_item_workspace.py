@@ -28,6 +28,7 @@ from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.config import WorkerConfig
+from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
@@ -76,6 +77,15 @@ class _Workspace:
 
     def claim_or_resume_with_handle(self, **kwargs: object) -> object:
         self.claimed.append(kwargs.get("repo_full_name"))
+        if kwargs.get("replace_handle") is not None:
+            handoff = self.substrate.handoff(  # type: ignore[attr-defined]
+                str(kwargs["thread_key"]),
+                expected=kwargs["replace_handle"],
+                env=dict(kwargs.get("env") or {}),
+                workspace_repo=kwargs.get("repo_full_name"),
+                agent_name=kwargs.get("agent_name"),
+            )
+            return SimpleNamespace(handle=handoff, prepared=None)
         handle = self.substrate.claim(  # type: ignore[attr-defined]
             str(kwargs["thread_key"]),
             env=kwargs.get("env"),
@@ -502,5 +512,211 @@ def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(
             assert "record_termination" in work_items.calls
             assert h.fake_k8s.claims == {}
             assert h.substrate._affinity.get(thread_key) is None
+
+    asyncio.run(exercise())
+
+
+def test_work_item_boot_env_carries_the_configured_turn_budget(make_harness) -> None:
+    """#3071: a factory execution runs with the worker's work-item turn budget,
+    not the runner's short chat default."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 1 and envs[0] is not None
+            assert envs[0].get("CURIE_MAX_TURNS") == "5"
+
+    asyncio.run(exercise())
+
+
+def test_ordinary_chat_boot_env_carries_no_turn_budget(make_harness) -> None:
+    """#3071: only a work-item delivery raises the turn budget; chat keeps the
+    runner default by carrying no CURIE_MAX_TURNS at all."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        ) as h:
+            h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(
+                _turn(f"slack-{uuid.uuid4()}", f"Please look at {ISSUE_URL}")
+            )
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 1 and envs[0] is not None
+            assert "CURIE_MAX_TURNS" not in envs[0]
+
+    asyncio.run(exercise())
+
+
+def test_work_item_replaces_a_chat_sandbox_booted_without_its_turn_budget(
+    make_harness,
+) -> None:
+    """#3071: CURIE_MAX_TURNS binds at boot, so a work item on a thread whose
+    live sandbox was claimed by chat gets a fresh runner carrying its budget."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 2
+            assert "CURIE_MAX_TURNS" not in (envs[0] or {})
+            assert (envs[1] or {}).get("CURIE_MAX_TURNS") == "5"
+
+    asyncio.run(exercise())
+
+
+def test_chat_replaces_a_work_item_sandbox_booted_with_the_factory_budget(
+    make_harness,
+) -> None:
+    """#3071: an ordinary turn after a work item on the same thread must not
+    inherit the factory turn budget from the reused sandbox."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 2
+            assert (envs[0] or {}).get("CURIE_MAX_TURNS") == "5"
+            assert "CURIE_MAX_TURNS" not in (envs[1] or {})
+
+    asyncio.run(exercise())
+
+
+def _fail_settled_release(h: object) -> None:
+    """Make the settled work item's best-effort sandbox release fail (#3075).
+
+    A settled work item normally deletes its claim, so the only way its live,
+    factory-budget sandbox survives to meet the next delivery on the thread is
+    a failed release, which the kernel logs and tolerates. That surviving
+    route is exactly what the #3071 turn budget fence guards.
+    """
+
+    def release(_thread_key: str) -> bool:
+        raise RuntimeError("control plane unavailable")
+
+    h.substrate.release = release  # type: ignore[attr-defined]
+
+
+def test_consecutive_work_items_with_the_same_budget_adopt_the_sandbox(
+    make_harness,
+) -> None:
+    """#3071: a matching turn budget is no reason to replace a live runner.
+    The first work item's release fails, so its live sandbox survives, and the
+    next work item with the same budget adopts it instead of claiming again."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+            _fail_settled_release(h)
+
+            for _ in range(2):
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 1
+            assert (envs[0] or {}).get("CURIE_MAX_TURNS") == "5"
+            assert len(h.runner.opened) == 2
+
+    asyncio.run(exercise())
+
+
+def test_chat_steers_a_live_work_item_turn_instead_of_replacing_it(make_harness) -> None:
+    """#3071: the turn budget fence applies only to a new turn. A message that
+    arrives while the work item turn is live steers it (one live session)."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+            _fail_settled_release(h)
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+            assert len(h.fake_k8s.claims) == 1
+            h.runner.turn_active = True
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+
+            assert h.runner.steers == ["hello there"]
+            assert len(h.fake_k8s.claim_envs) == 1
+
+    asyncio.run(exercise())
+
+
+def test_chat_never_opens_a_turn_on_a_runner_with_the_factory_budget(
+    make_harness,
+) -> None:
+    """#3071 finish race: liveness said busy, but the work item turn ended
+    before the steer (409). The chat turn must not open on the old runner with
+    the factory budget; it is retried and the retry replaces the runner."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+            _fail_settled_release(h)
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+            assert len(h.fake_k8s.claims) == 1
+            opened_before = list(h.runner.opened)
+
+            async def active_then_finished(*_args: object, **_kwargs: object) -> bool:
+                h.runner.turn_active = False  # the turn ends before the steer lands
+                return True
+
+            h.kernel._turn_active = active_then_finished  # type: ignore[method-assign]
+            chat = _turn(f"slack-{uuid.uuid4()}", "hello there")
+            with pytest.raises(ThreadBusyError):
+                await h.kernel.process_event(chat)
+
+            assert h.runner.opened == opened_before
+            assert len(h.fake_k8s.claim_envs) == 1
+
+            del h.kernel._turn_active
+            await h.kernel.process_event(chat)
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 2
+            assert "CURIE_MAX_TURNS" not in (envs[1] or {})
 
     asyncio.run(exercise())

@@ -54,8 +54,7 @@ def _cel(policy: dict) -> str:
 def test_draft_adr_0141_names_the_attack_the_control_and_the_exclusions() -> None:
     text = ADR.read_text(encoding="utf-8")
     assert "\nStatus: Draft\n" in text, (
-        "ADR-0141 must stay Draft; acceptance is what would authorize applying "
-        "the sketch"
+        "ADR-0141 must stay Draft; acceptance is what would authorize applying the sketch"
     )
     assert "does not authorize implementation" in text
     for required in (
@@ -82,9 +81,7 @@ def test_admission_sketch_pins_live_cronjob_params_not_an_sa_allowlist() -> None
         "curie-upgrade-job-label-required",
     }
     pin = next(
-        doc
-        for doc in policies
-        if doc["metadata"]["name"] == "curie-upgrade-job-template-pin"
+        doc for doc in policies if doc["metadata"]["name"] == "curie-upgrade-job-template-pin"
     )
     param = (pin.get("spec") or {}).get("paramKind") or {}
     assert param.get("kind") == "CronJob", (
@@ -168,10 +165,7 @@ def test_installer_does_not_apply_the_draft_admission_sketch() -> None:
         "wiring the sketch into cli/src/examples.rs would apply a Draft "
         "control the next time someone runs --platform-upgrade"
     )
-    include = (
-        'include_bytes!("../../examples/sre-bot/manifests/'
-        'upgrade-job-admission.yaml")'
-    )
+    include = 'include_bytes!("../../examples/sre-bot/manifests/upgrade-job-admission.yaml")'
     assert include not in source
 
 

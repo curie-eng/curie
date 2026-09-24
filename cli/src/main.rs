@@ -76,7 +76,7 @@ struct AgentTarget<T: TierDefaults> {
     agent: String,
     #[arg(long, default_value = T::API_URL, env = "CURIE_API_URL")]
     api_url: String,
-    #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+    #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
     api_key: String,
     #[arg(long)]
     dry_run: bool,
@@ -703,7 +703,7 @@ enum Command {
         )]
         api_url: String,
         /// Platform API key.
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
         /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
@@ -943,7 +943,7 @@ enum Command {
         api_url: Option<String>,
         /// API key for `--api-url`. Optional: discovered from the release Secret
         /// when omitted.
-        #[arg(long, env = "CURIE_API_KEY")]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
     },
 
@@ -1809,7 +1809,7 @@ enum LocalAction {
         #[arg(long)]
         api_url: Option<String>,
         /// Platform API key for the default-channel lookup.
-        #[arg(long, env = "CURIE_API_KEY", default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Synthetic Slack user id for the enqueued event.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -1857,7 +1857,7 @@ enum LocalAction {
         #[arg(long)]
         api_url: Option<String>,
         /// Platform API key for the default-channel lookup.
-        #[arg(long, env = "CURIE_API_KEY", default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, default_value = message::DEFAULT_API_KEY, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Synthetic Slack user id for the enqueued events.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -1913,7 +1913,7 @@ enum LocalAction {
         )]
         api_url: String,
         /// Platform API key.
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
         /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
@@ -2069,9 +2069,16 @@ enum LocalAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2100,7 +2107,7 @@ enum LocalAction {
         clear_branch_prefix: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2138,7 +2145,7 @@ enum LocalAction {
         limit: f64,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2149,7 +2156,7 @@ enum LocalAction {
         agent: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Confirm the action.
         #[arg(long)]
@@ -2163,7 +2170,7 @@ enum LocalAction {
         agent: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
@@ -2183,7 +2190,7 @@ enum LocalAction {
         thread_key: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Confirm the action; it interrupts any live turn on the thread.
         #[arg(long)]
@@ -2222,7 +2229,7 @@ enum LocalAction {
             env = "CURIE_API_URL"
         )]
         api_url: String,
-        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         /// Confirm this destructive action.
         #[arg(long)]
@@ -2659,7 +2666,7 @@ enum ClusterAction {
         api_local_port: u16,
         /// Platform API key for the default-channel lookup. Omit to read the
         /// release's own key from its chart Secret.
-        #[arg(long, env = "CURIE_API_KEY", value_parser = message::cluster_api_key)]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::cluster_api_key)]
         api_key: Option<String>,
         /// Synthetic Slack user id for the enqueued event.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -2733,7 +2740,7 @@ enum ClusterAction {
         api_local_port: u16,
         /// Platform API key for the default-channel lookup. Omit to read the
         /// release's own key from its chart Secret.
-        #[arg(long, env = "CURIE_API_KEY", value_parser = message::cluster_api_key)]
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::cluster_api_key)]
         api_key: Option<String>,
         /// Synthetic Slack user id for the enqueued events.
         #[arg(long, default_value = message::DEFAULT_USER)]
@@ -2907,6 +2914,13 @@ enum ClusterAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -4476,6 +4490,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
                 api_url,
                 api_key,
                 dry_run,
@@ -4489,6 +4505,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
+                    commands::OverrideChange::resolve_execution_deadline(
+                        execution_deadline,
+                        clear_execution_deadline,
+                    )?,
                 )
                 .await?,
             ),
@@ -4621,8 +4641,8 @@ async fn run(command: Option<Command>) -> Result<()> {
             ),
         },
         Some(Command::Cluster { action, context }) => {
-            if let Some(target) = curie::kube_context::pin_for_cluster_command(context.as_deref())?
-            {
+            let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
+            if let Some(target) = &target {
                 ui::ui().note(&format!(
                     "Kubernetes context: {} (cluster {})",
                     target.context, target.cluster
@@ -4784,11 +4804,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 release,
                 dry_run,
             } => emit(
-                ops::status(CommonOpts {
-                    namespace,
-                    release,
-                    dry_run,
-                })
+                ops::status(
+                    CommonOpts {
+                        namespace,
+                        release,
+                        dry_run,
+                    },
+                    target.is_some(),
+                )
                 .await?,
             ),
             ClusterAction::Observability {
@@ -5571,6 +5594,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
                 conn,
                 dry_run,
             } => {
@@ -5581,6 +5606,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
+                let execution_deadline = commands::OverrideChange::resolve_execution_deadline(
+                    execution_deadline,
+                    clear_execution_deadline,
+                )?;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
@@ -5593,6 +5622,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         model,
                         thinking,
+                        execution_deadline,
                     )
                     .await?,
                 )

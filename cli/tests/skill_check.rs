@@ -215,6 +215,44 @@ fn check_run_args_carry_the_specced_timeout() {
     assert!(joined.contains("ghcr.io/example/curie-runner:1.2.3"));
 }
 
+const INVALID_BUNDLE_FIX: &str =
+    "correct the invalid bundle declaration named in the error and run curie skill check again";
+
+/// One runner `PluginBundleError` line. It already starts with the bundle headline.
+const RUNNER_SHAPED_BUNDLE_REASON: &str = "invalid plugin bundle at /plugin: [mcp.declared_pointer] plugin.json: manifest mcpServers is the path '.mcp.json', a form the loader ignores";
+
+/// Bare validator lines. The bracketed codes are opaque and must pass through.
+const BARE_POINTER_REASON: &str =
+    "[mcp.declared_pointer] plugin.json: manifest mcpServers is a path the loader ignores";
+const BARE_CRON_REASON: &str =
+    "[triggers.cron_invalid_schedule] triggers/nightly.md: schedule is not accepted";
+
+fn invalid_bundle_with_reasons(reasons: &[&str]) -> curie::commands::CheckReport {
+    let mut report =
+        parse_check_report(INVALID_BUNDLE_JSON).expect("invalid_bundle seam JSON parses");
+    report.reasons = reasons.iter().map(|reason| reason.to_string()).collect();
+    report
+}
+
+fn assert_invalid_bundle_failure(err: &curie::exit::CliError) {
+    assert_eq!(
+        err.class,
+        ExitClass::Usage,
+        "invalid_bundle is a Usage error (exit 2), matching the runner's exit 2"
+    );
+    assert_eq!(err.class.code(), 2, "Usage exits 2");
+    assert!(
+        !err.message.contains("MCP"),
+        "a bundle validation failure must not mention MCP, got: {}",
+        err.message
+    );
+    assert_eq!(
+        err.fix.as_deref(),
+        Some(INVALID_BUNDLE_FIX),
+        "fix must name the invalid bundle declaration, not only plugin.json and skills/"
+    );
+}
+
 // --- Test 7: verdict-JSON -> outcome mapping -------------------------------
 
 #[test]
@@ -257,10 +295,24 @@ fn red_report_maps_to_failure_with_a_fix_hint() {
         ExitClass::Failure,
         "red is a plain Failure (exit 1)"
     );
+    assert_eq!(err.class.code(), 1, "Failure exits 1");
+    assert_eq!(err.message, "MCP load check reported red");
+    assert!(
+        !err.message.contains("invalid plugin bundle"),
+        "a red MCP load failure must not be reported as an invalid plugin bundle, got: {}",
+        err.message
+    );
     let fix = err
         .fix
         .expect("red outcome must carry an actionable fix hint");
-    assert!(!fix.trim().is_empty(), "the fix hint must be non-empty");
+    assert!(
+        fix.contains("raise --timeout"),
+        "the red fix must still point at raising --timeout, got: {fix}"
+    );
+    assert_eq!(
+        fix,
+        "read the printed reason(s): fix the server's command/args, forward its credential with curie skill up --secret <NAME>, or raise --timeout if MCP init ran long"
+    );
 }
 
 #[test]
@@ -273,23 +325,81 @@ fn invalid_bundle_report_maps_to_usage_exit_2_with_reasons() {
     );
 
     let err = check_outcome(&report).expect_err("an invalid_bundle verdict maps to Err");
-    assert_eq!(
-        err.class,
-        ExitClass::Usage,
-        "invalid_bundle is a Usage error (exit 2), matching the runner's exit 2"
-    );
+    assert_invalid_bundle_failure(&err);
     // The structural validation errors must surface in the message so the user
-    // sees WHY the bundle is invalid.
+    // sees WHY the bundle is invalid. Both fixture reasons stay intact.
     assert!(
         err.message
-            .contains("no SKILL.md found for declared skill 'text-stats'"),
+            .contains("skills/: no SKILL.md found for declared skill 'text-stats'"),
         "the message must carry the structural reasons, got: {}",
         err.message
     );
-    let fix = err
-        .fix
-        .expect("invalid_bundle outcome must carry an actionable fix hint");
-    assert!(!fix.trim().is_empty(), "the fix hint must be non-empty");
+    assert!(
+        err.message
+            .contains(".claude-plugin/plugin.json: 'name' is required"),
+        "the message must carry the structural reasons, got: {}",
+        err.message
+    );
+    assert_eq!(
+        err.message,
+        "invalid plugin bundle: skills/: no SKILL.md found for declared skill 'text-stats'; .claude-plugin/plugin.json: 'name' is required"
+    );
+}
+
+#[test]
+fn invalid_bundle_with_empty_reasons_is_exactly_invalid_plugin_bundle() {
+    let report = invalid_bundle_with_reasons(&[]);
+    assert!(report.reasons.is_empty(), "this case carries no reasons");
+
+    let err = check_outcome(&report).expect_err("an invalid_bundle verdict maps to Err");
+    assert_invalid_bundle_failure(&err);
+    assert_eq!(err.message, "invalid plugin bundle");
+}
+
+#[test]
+fn invalid_bundle_runner_shaped_reason_is_unchanged_without_a_doubled_headline() {
+    // The runner already emits one reason that starts with "invalid plugin bundle".
+    // That string is the whole message; prefixing it doubles the headline.
+    let err = check_outcome(&invalid_bundle_with_reasons(&[RUNNER_SHAPED_BUNDLE_REASON]))
+        .expect_err("an invalid_bundle verdict maps to Err");
+    assert_invalid_bundle_failure(&err);
+    assert_eq!(err.message, RUNNER_SHAPED_BUNDLE_REASON);
+    assert!(
+        err.message.contains("[mcp.declared_pointer]"),
+        "the bracketed code must survive verbatim, got: {}",
+        err.message
+    );
+    assert!(
+        !err.message
+            .contains("invalid plugin bundle: invalid plugin bundle"),
+        "the headline must not be doubled, got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn invalid_bundle_bare_reasons_preserve_opaque_validation_codes() {
+    // Codes are opaque text. This does not define cron scheduling.
+    let err = check_outcome(&invalid_bundle_with_reasons(&[
+        BARE_POINTER_REASON,
+        BARE_CRON_REASON,
+    ]))
+    .expect_err("an invalid_bundle verdict maps to Err");
+    assert_invalid_bundle_failure(&err);
+    assert_eq!(
+        err.message,
+        format!("invalid plugin bundle: {BARE_POINTER_REASON}; {BARE_CRON_REASON}")
+    );
+    assert!(
+        err.message.contains("[mcp.declared_pointer]"),
+        "the pointer code must survive verbatim, got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("[triggers.cron_invalid_schedule]"),
+        "the cron code must survive verbatim, got: {}",
+        err.message
+    );
 }
 
 #[test]

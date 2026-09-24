@@ -1,7 +1,7 @@
 {
   "name": "dark-factory",
   "version": "0.1.0",
-  "description": "Curie's default dark factory agent: one labelled GitHub issue in, one reviewed pull request or one stated reason out. A single agent reads the issue through a read-only GitHub MCP server, pins acceptance criteria, plans, writes a failing test where feasible, implements, runs the repository's own checks, reviews its diff against every criterion, and publishes through Curie's built-in approval-gated publication tool within the 1800 second execution bound.",
+  "description": "Curie's default dark factory agent: one labelled GitHub issue in, one reviewed pull request or one stated reason out. One agent reads the issue through the GitHub MCP server, pins acceptance criteria, plans, gets the plan reviewed by an Opus plan-reviewer subagent, writes a failing test where feasible, implements and runs the repository's own checks, gets the diff reviewed by an Opus diff-reviewer subagent (each loop capped at 3 rounds, enforced by a hook), and publishes through Curie's built-in approval-gated publication tool within the 10800 second (3 hour) execution bound.",
   "author": { "name": "CurieTech" },
   "license": "Apache-2.0",
   "keywords": ["factory", "coding", "github", "issues", "pull-request"],
@@ -11,7 +11,7 @@
   ],
   "toolPolicy": {
     "enforcement": "curie/mcp-tool-policy@1",
-    "allow": ["github/get_issue"],
+    "allow": ["github/get_issue", "github/add_issue_comment"],
     "approvalRequired": [],
     "deny": []
   }

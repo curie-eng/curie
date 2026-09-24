@@ -33,7 +33,12 @@ from pydantic import (
 from . import adapter_principal
 from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
-from .models import GIT_FLOW_CREATED_BY, Environment
+from .models import (
+    GIT_FLOW_CREATED_BY,
+    MAX_EXECUTION_DEADLINE_SECONDS,
+    MIN_EXECUTION_DEADLINE_SECONDS,
+    Environment,
+)
 from .publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from .repo_full_name import RepoFullName
 from .source_binding import (
@@ -1164,6 +1169,16 @@ class AgentUpdate(BaseModel):
     # `model` above: omitted is unchanged, explicit null clears to the platform
     # default.
     thinking: str | None = None
+    # New per-agent work-item execution deadline in seconds (#3071). Same
+    # three-way semantics as `model`: omitted is unchanged, explicit null clears
+    # to the platform default of 1800 s.
+    execution_deadline_seconds: (
+        Annotated[
+            int,
+            Field(ge=MIN_EXECUTION_DEADLINE_SECONDS, le=MAX_EXECUTION_DEADLINE_SECONDS),
+        ]
+        | None
+    ) = None
     # New permission gates (#245). Omitted (None) leaves the current gates
     # unchanged; an explicit empty list clears them.
     approval_required_tools: list[str] | None = None
@@ -1233,6 +1248,8 @@ class AgentOut(BaseModel):
     behavior_packs: dict[str, Any] | None
     model: str | None
     thinking: str | None
+    # Null means the platform default execution deadline (1800 s) (#3071).
+    execution_deadline_seconds: int | None = None
     approval_required_tools: list[str] | None
     approval_routes: dict[str, ApprovalRouteBindingOut] | None
     # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned

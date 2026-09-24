@@ -15,7 +15,7 @@
       "input": "How many seconds does the platform allow one factory run before it stops the run? Reply with the number only.",
       "grader": {
         "kind": "contains",
-        "expected": "1800",
+        "expected": "10800",
         "case_sensitive": false
       }
     },

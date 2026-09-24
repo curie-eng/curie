@@ -1342,6 +1342,14 @@ api:
 
 dispatcher:
   deploy: true
+  # The dispatcher is not a rolling workload. It deploys with strategy Recreate
+  # so a rollout never runs two Socket Mode clients on one app token: Slack
+  # delivers each event to only one connected client, and an event handed to a
+  # pod that is terminating is lost (issue #2944). The cost is a brief gap on
+  # every rollout, from the old pod exiting until the new pod reconnects, in
+  # which Slack retries events it could not deliver instead of splitting them.
+  # For the same reason keep replicas at 1: each extra replica is another
+  # client on the same tokens.
   replicas: 1
   # Platform API the dispatcher resolves Slack approval clicks against. Empty
   # (the default) derives the in-chart API Service,
@@ -1648,15 +1656,16 @@ mailAdapter:
 worker:
   deploy: true
   replicas: 1
-  # Must be >= deliveryBudgetSeconds + deliveryShutdownReserveSeconds
-  # (ADR-0131): 1800 + 60 = 1860 covers the ADR's maximum configurable budget.
-  # The prior 1800 (#1570, "Give worker turns time to drain") was sized
-  # against max_attempts * runner_total_timeout_s with zero headroom for
-  # settlement -- a worker draining a maximum-budget turn was SIGKILLed at
-  # exactly the moment it would have settled. Voluntary termination may now
-  # take up to the configured budget plus reserve, so a rollout can take up
-  # to ~31 minutes per pod at the maximum budget; operators choose that cost
-  # when they choose a long execution budget.
+  # Floor for the worker's voluntary termination grace. The chart renders the
+  # effective grace as max(this, deliveryBudgetSeconds +
+  # deliveryShutdownReserveSeconds) (ADR-0131, #3071), so a raised budget
+  # raises the grace with it and the render never fails on this pair. 1860
+  # covers the default-era 1800 s budget plus the 60 s reserve. The prior 1800
+  # (#1570) left zero headroom for settlement -- a worker draining a
+  # maximum-budget turn was SIGKILLed at exactly the moment it would have
+  # settled. Voluntary termination may take up to the budget plus reserve, so
+  # at the 10800 s maximum a rollout can take about three hours per pod;
+  # operators choose that cost when they choose a long execution budget.
   terminationGracePeriodSeconds: 1860
   image:
     repository: ghcr.io/curie-eng/curie-worker
@@ -1876,13 +1885,12 @@ worker:
   # scientific notation for larger values, which the worker then cannot parse.
   #
   # The OVERALL deadline for one delivery: claim, every runner request, every
-  # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 1800
-  # (the ADR's stated maximum); values.schema.json enforces this at
-  # install/template time and the worker's own validator enforces it again at
-  # boot.
+  # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 10800
+  # (three hours, #3071); values.schema.json enforces this at install/template
+  # time and the worker's own validator enforces it again at boot.
   deliveryBudgetSeconds: 600
   # Positive per-request ceiling for runner work within the overall delivery
-  # budget. Must be at most 1800 seconds and no greater than
+  # budget. Must be at most 10800 seconds and no greater than
   # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
   # enforces the scalar bounds and the worker template enforces the relationship
   # at render time.
@@ -1897,9 +1905,14 @@ worker:
   # count.
   deliveryLeaseHeartbeatSeconds: 10
   # Budget reserved for terminal settlement (fenced ACK/dead-letter/outbox
-  # clear) after the runner work is done. `terminationGracePeriodSeconds`
-  # above must be at least deliveryBudgetSeconds + this value.
+  # clear) after the runner work is done. The rendered termination grace is
+  # at least deliveryBudgetSeconds + this value.
   deliveryShutdownReserveSeconds: 60
+  # Turn budget for a work-item (factory) delivery (#3071), rendered as
+  # CURIE_WORK_ITEM_MAX_TURNS. The worker writes it into that delivery's
+  # sandbox as CURIE_MAX_TURNS; chat and other deliveries keep the runner's
+  # short default. A run that exhausts it fails as `max-turns`.
+  workItemMaxTurns: 1000
   # Pre-upgrade drain gate (issue #2010). ADR-0131 made one worker's own
   # shutdown safe; it says nothing about the roll happening around it. A
   # `helm upgrade` applies the worker AND its backing services in one pass, so

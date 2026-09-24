@@ -457,8 +457,8 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
     }
     assert not {"fakeModel", "model", "credentials"} & set(values["agentSandbox"])
     worker = values["worker"]
-    assert worker["deliveryBudgetSeconds"] >= 1800
-    assert worker["runnerTotalTimeoutSeconds"] >= 1800
+    assert worker["deliveryBudgetSeconds"] == 10800
+    assert worker["runnerTotalTimeoutSeconds"] == 10800
     assert worker["runnerTotalTimeoutSeconds"] <= worker["deliveryBudgetSeconds"]
     assert {"cidr": "1.2.3.4/32", "ports": [{"protocol": "TCP", "port": 443}]} in values[
         "security"
@@ -587,8 +587,9 @@ def test_moved_default_branch_fails() -> None:
 
 
 def test_overrunning_the_bound_fails() -> None:
-    assert fe.judge_outcome(_outcome(elapsed_seconds=2100.5), "pr")
-    assert fe.judge_outcome(_outcome(elapsed_seconds=2100.0), "pr") == []
+    assert fe.ELAPSED_LIMIT_SECONDS == 11100
+    assert fe.judge_outcome(_outcome(elapsed_seconds=11100.5), "pr")
+    assert fe.judge_outcome(_outcome(elapsed_seconds=11100.0), "pr") == []
 
 
 def test_expect_pr_requires_a_pr() -> None:
@@ -772,11 +773,11 @@ def test_terminus_matcher_requires_app_author_and_marker() -> None:
 def test_elapsed_runs_to_the_observed_ending_not_terminal_at() -> None:
     request = {
         "started_at": "2026-01-01T00:00:00Z",
-        "terminal_at": "2026-01-01T00:30:00Z",
+        "terminal_at": "2026-01-01T03:00:00Z",
     }
-    elapsed, execution = fe.ending_times(request, labelled_at=0.0, ended_at="2026-01-01T00:38:20Z")
-    assert elapsed == 2300.0
-    assert execution == 1800.0
+    elapsed, execution = fe.ending_times(request, labelled_at=0.0, ended_at="2026-01-01T03:08:20Z")
+    assert elapsed == 11300.0
+    assert execution == 10800.0
     assert fe.judge_outcome(_outcome(elapsed_seconds=elapsed), "pr")
 
 

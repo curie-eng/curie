@@ -541,9 +541,7 @@ class RuntimeStack:
         invalid: bool = False,
     ) -> dict[str, Any]:
         container = (
-            self.invalid_candidate_runner_container
-            if invalid
-            else self.candidate_runner_container
+            self.invalid_candidate_runner_container if invalid else self.candidate_runner_container
         )
         result = _docker(
             "exec",
@@ -976,10 +974,7 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
             invalid_last_error = json.dumps(capability, sort_keys=True)
         time.sleep(1)
     else:
-        raise AssertionError(
-            "invalid MCP connectors never became ready: "
-            f"{invalid_last_error}"
-        )
+        raise AssertionError(f"invalid MCP connectors never became ready: {invalid_last_error}")
 
 
 def _stop_runtime_stack(stack: RuntimeStack) -> None:
@@ -1031,9 +1026,7 @@ def _response_text(response: dict[str, Any]) -> str:
 
 def _candidate_response_text(response: dict[str, Any]) -> str:
     return "\n".join(
-        item["text"]
-        for item in response.get("content", [])
-        if item.get("type") == "text"
+        item["text"] for item in response.get("content", []) if item.get("type") == "text"
     )
 
 
@@ -1043,9 +1036,7 @@ def _candidate_environment_contains_a_token_value(
     invalid: bool = False,
 ) -> bool:
     container = (
-        stack.invalid_candidate_runner_container
-        if invalid
-        else stack.candidate_runner_container
+        stack.invalid_candidate_runner_container if invalid else stack.candidate_runner_container
     )
     environment = _inspect(container)["Config"].get("Env") or []
     serialized = json.dumps(environment)
@@ -1064,8 +1055,7 @@ def _trace_query_for_session(session_id: str) -> str:
     # TraceQL requires quotes around dotted custom attribute names.
     # https://grafana.com/docs/tempo/latest/traceql/construct-traceql-queries/
     return (
-        '{ resource.service.name = "curie-runner" '
-        f'&& span."curie.session_id" = "{session_id}" }}'
+        f'{{ resource.service.name = "curie-runner" && span."curie.session_id" = "{session_id}" }}'
     )
 
 
@@ -1078,9 +1068,7 @@ def test_candidate_runner_derives_and_probes_both_pod_credential_connectors(
     environment_contains_token = _candidate_environment_contains_a_token_value(
         observability_runtime
     )
-    evidence_contains_token = _evidence_contains_a_token_value(
-        observability_runtime, evidence
-    )
+    evidence_contains_token = _evidence_contains_a_token_value(observability_runtime, evidence)
 
     assert environment_contains_token is False
     assert evidence_contains_token is False
@@ -1308,9 +1296,7 @@ def test_invalid_connector_token_fails_a_real_read_after_successful_tool_discove
     environment_contains_token = _candidate_environment_contains_a_token_value(
         observability_runtime, invalid=True
     )
-    evidence_contains_token = _evidence_contains_a_token_value(
-        observability_runtime, evidence
-    )
+    evidence_contains_token = _evidence_contains_a_token_value(observability_runtime, evidence)
     assert environment_contains_token is False
     assert evidence_contains_token is False
     assert "GRAFANA_SERVICE_ACCOUNT_TOKEN" not in evidence["environment_names"]
@@ -1324,10 +1310,7 @@ def test_invalid_connector_token_fails_a_real_read_after_successful_tool_discove
     response = responses[0]
     assert response.get("isError") is True, response
     text = _candidate_response_text(response).lower()
-    assert any(
-        marker in text
-        for marker in ("401", "403", "unauthorized")
-    ), response
+    assert any(marker in text for marker in ("401", "403", "unauthorized")), response
 
 
 # #2059: the shipped Tempo ran every memory knob at Tempo's DISTRIBUTED

@@ -799,7 +799,7 @@ async def heartbeat(
 async def hold_for_approval(
     session: AsyncSession, request_id: uuid.UUID, *, runtime_epoch: int
 ) -> HeartbeatResult | DispatchConflict:
-    """Keep a suspended approval inside the 1800s execution bound.
+    """Keep a suspended approval inside the request's execution deadline.
 
     The worker stops refreshing the short runtime lease when the turn suspends.
     This sets that lease to the execution deadline. It does not finish the request.

@@ -67,9 +67,7 @@ def test_demo_fresh_install_prepares_the_example_before_cluster_up() -> None:
     text = (BUNDLE / "DEMO.md").read_text(encoding="utf-8")
     fresh_install = _markdown_section(text, "## Fresh install")
 
-    installer = _live_command_index(
-        fresh_install, "curie example sre-bot install"
-    )
+    installer = _live_command_index(fresh_install, "curie example sre-bot install")
     cluster_up = _live_command_index(fresh_install, "curie cluster up")
 
     assert installer < cluster_up, (
@@ -84,13 +82,10 @@ def test_readme_first_install_block_names_the_safe_fresh_install_sequence() -> N
     first_block = _first_bash_block(install)
 
     if "curie cluster up" in first_block:
-        installer = _live_command_index(
-            first_block, "curie example sre-bot install"
-        )
+        installer = _live_command_index(first_block, "curie example sre-bot install")
         cluster_up = _live_command_index(first_block, "curie cluster up")
         assert installer < cluster_up, (
-            "the first README install block must prepare the example before "
-            "credentialed cluster up"
+            "the first README install block must prepare the example before credentialed cluster up"
         )
     else:
         assert "(DEMO.md#fresh-install)" in install, (
