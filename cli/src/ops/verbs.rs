@@ -776,7 +776,35 @@ pub(crate) fn mail_probe_is_gated_off(computed: Option<&serde_json::Value>) -> b
     })
 }
 
-pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
+/// The error for a status run that resolved no Kubernetes context and could reach
+/// neither Helm nor the pod list (#2864). Without a context the failure says nothing
+/// about the release, so it names the missing context and suggests `--context`,
+/// never a mutating `cluster up`.
+fn unresolved_context_error(
+    context_resolved: bool,
+    helm_ok: bool,
+    pods_listed: bool,
+    available: &[String],
+) -> Option<crate::exit::CliError> {
+    if context_resolved || helm_ok || pods_listed {
+        return None;
+    }
+    let names = if available.is_empty() {
+        "(none)".to_string()
+    } else {
+        available.join(", ")
+    };
+    Some(
+        crate::exit::CliError::failure(
+            "no Kubernetes context resolved (the kubeconfig has no current-context) and the cluster could not be reached",
+        )
+        .with_fix(format!(
+            "rerun with an explicit context: `curie cluster --context <name> status`; available contexts: {names}"
+        )),
+    )
+}
+
+pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterStatusOutput> {
     if opts.dry_run {
         // A dry run makes no cluster call, so the release's fullname cannot be
         // discovered and the chart's no-override rule is the honest best guess.
@@ -937,6 +965,12 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
             Some(field("CHART:", "")).filter(|version| !version.trim().is_empty());
     }
 
+    let context_error = unresolved_context_error(
+        context_resolved,
+        helm_ok,
+        ok,
+        &crate::kube_context::available_contexts(),
+    );
     let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
@@ -954,6 +988,9 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         upgrade,
     }));
     let json = crate::ui::CliOutput::to_json(&output);
+    if let Some(error) = context_error {
+        return Err(crate::ui::ui().failed_report(&output, error.into()));
+    }
     if json["healthy"] != true {
         return Err(crate::ui::ui().failed_report(
             &output,
