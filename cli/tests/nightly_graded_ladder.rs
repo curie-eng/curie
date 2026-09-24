@@ -1519,12 +1519,17 @@ fn local_source_build_uses_the_daemon_backed_builder() {
 
 #[test]
 fn local_source_build_uses_the_current_contexts_daemon_builder() {
-    // Docker Desktop's context is `desktop-linux`, and buildx refuses the
-    // `default` builder from any context but `default`.
+    // Docker Desktop's context is `desktop-linux`. There `docker build`
+    // refuses the `default` builder and `docker compose build` refuses
+    // `desktop-linux`, and `local up --build` runs both. Addressing the
+    // context's daemon through DOCKER_HOST makes `default` its builder for both.
     let (output, _, _, _) = run_local_observability_control(&[
         ("BUILDX_BUILDER", "curie-e2e-builder"),
         ("STUB_REQUIRE_DEFAULT_BUILDER", "1"),
-        ("STUB_DOCKER_CONTEXT", "desktop-linux"),
+        (
+            "STUB_DOCKER_ENDPOINT",
+            "unix:///Users/acme/.docker/run/docker.sock",
+        ),
     ]);
     let transcript = transcript(&output);
     assert!(
@@ -2414,7 +2419,8 @@ print(json.dumps({
         ;;
     "local up --project "*|"local up -f "*/compose.dev.yaml" --build")
         if [ "${STUB_REQUIRE_DEFAULT_BUILDER:-0}" = "1" ] \
-            && [ "${BUILDX_BUILDER:-}" != "${STUB_DOCKER_CONTEXT:-default}" ]; then
+            && { [ "${BUILDX_BUILDER:-}" != "default" ] \
+                || [ "${DOCKER_HOST:-}" != "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}" ]; }; then
             echo "local source build did not select the Docker daemon builder" >&2
             exit 97
         fi
@@ -2576,9 +2582,9 @@ if [ -n "${STUB_DOCKER_INVOCATION_LOG:-}" ]; then
     printf '%s\n' "$*" >> "$STUB_DOCKER_INVOCATION_LOG"
 fi
 case "$*" in
-    "context show")
-        # buildx names each context's daemon builder after the context.
-        printf '%s\n' "${STUB_DOCKER_CONTEXT:-default}"
+    "context inspect --format {{.Endpoints.docker.Host}}")
+        # The daemon the current context names.
+        printf '%s\n' "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
         ;;
     "inspect curie-runner-local")
         # e2e.sh's ownership precondition: the standard interactive runner is
