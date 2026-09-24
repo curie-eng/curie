@@ -4,7 +4,7 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "next",
-    "commit": "2b8f35d261794bc7e058fcc9c73d86d75a9700dc",
+    "commit": "fed6cc092ec37d0ce4c6c28706ed38d180c375c8",
     "shortCommit": "2b8f35d2",
     "release": "v0.10.0-rc.2"
   },
