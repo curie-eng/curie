@@ -838,6 +838,97 @@ fn seed_env_if_missing(root: &Path) -> Result<EnvSeed> {
     Ok(EnvSeed::Created)
 }
 
+/// Install the primary checkout's tracked Git hooks for every linked worktree.
+pub fn dev_hooks_install() -> Result<()> {
+    let root = find_repo_root().ok_or_else(|| {
+        crate::exit::usage("Run `curie dev hooks install` from a Curie source checkout.")
+    })?;
+    let git_root = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&root)
+        .output()
+        .context("Git is required to install hooks")?;
+    if !git_root.status.success() {
+        bail!("This Curie source directory is not a Git checkout.");
+    }
+    let git_root_path =
+        String::from_utf8(git_root.stdout).context("Git returned an invalid path")?;
+    if Path::new(git_root_path.trim()).canonicalize()? != root.canonicalize()? {
+        bail!("Run `curie dev hooks install` from the root Git checkout.");
+    }
+
+    let worktrees = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&root)
+        .output()
+        .context("Could not find the primary Git checkout")?;
+    if !worktrees.status.success() {
+        bail!("Could not find the primary Git checkout.");
+    }
+    let listing = String::from_utf8(worktrees.stdout).context("Git returned an invalid path")?;
+    let primary = listing
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("Could not find the primary Git checkout."))?;
+    let hooks_dir = primary.join("hooks").canonicalize().map_err(|_| {
+        anyhow::anyhow!(
+            "The primary checkout has no tracked hooks directory. Update it to a revision containing hooks/pre-push, then retry."
+        )
+    })?;
+    let hook = hooks_dir.join("pre-push");
+    if !hook.is_file() {
+        bail!(
+            "The tracked hook is missing from the primary checkout: {}",
+            hook.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if hook.metadata()?.permissions().mode() & 0o111 == 0 {
+            bail!(
+                "The primary checkout hook is not executable: {}",
+                hook.display()
+            );
+        }
+    }
+
+    let current = std::process::Command::new("git")
+        .args(["config", "--get", "core.hooksPath"])
+        .current_dir(&root)
+        .output()
+        .context("Could not read the local Git hook configuration")?;
+    match current.status.code() {
+        Some(0) => {
+            let value = String::from_utf8(current.stdout)
+                .context("The local Git hook path is not valid UTF8")?;
+            if value.trim() != hooks_dir.to_string_lossy() {
+                bail!(
+                    "core.hooksPath is already set to `{}`. Keep that hook directory or clear the setting before installing Curie hooks.",
+                    value.trim()
+                );
+            }
+        }
+        Some(1) if current.stdout.is_empty() => {}
+        _ => bail!("Could not read the Git hook configuration."),
+    }
+
+    let status = std::process::Command::new("git")
+        .args(["config", "--local", "core.hooksPath"])
+        .arg(&hooks_dir)
+        .current_dir(&root)
+        .status()
+        .context("Could not set the repository Git hook path")?;
+    if !status.success() {
+        bail!("Could not set the repository Git hook path.");
+    }
+
+    crate::ui::ui().success("Git hooks installed for this checkout and its linked worktrees.");
+    Ok(())
+}
+
 /// `curie dev <script>`: run a repo dev script by relative path. Thin wrapper
 /// -- finds the repo root, confirms the script exists, shells `bash <script> [args]`
 /// from the root, streams its output, and propagates its exit code. A release

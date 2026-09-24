@@ -5608,6 +5608,18 @@ export const commandManifest = {
       "name": "dev",
       "subcommands": [
         {
+          "about": "Manage hooks for this source checkout",
+          "hidden": false,
+          "name": "hooks",
+          "subcommands": [
+            {
+              "about": "Install the tracked Git hooks in this checkout",
+              "hidden": false,
+              "name": "install"
+            }
+          ]
+        },
+        {
           "about": "Check the frozen contracts (`bash scripts/check-contracts.sh`)",
           "hidden": false,
           "name": "contracts"
