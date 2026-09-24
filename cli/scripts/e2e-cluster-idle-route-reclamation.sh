@@ -1271,7 +1271,9 @@ cleanup() {
     fi
     restore_runner_ingress || cleanup_failed=1
     delete_unrelated_valkey_keys || cleanup_failed=1
-    for pod in "${FILLER_PODS[@]}"; do
+    # Empty when a run fails before the fillers exist, which bash 3.2 refuses
+    # to expand under `set -u` without the `+` guard.
+    for pod in ${FILLER_PODS[@]+"${FILLER_PODS[@]}"}; do
         kube -n "$NAMESPACE" label pod "$pod" "$FILLER_LABEL_NAME-" \
             --overwrite >/dev/null 2>&1 || true
     done
@@ -1479,7 +1481,11 @@ if value.get("deployment",{}).get("status") != "active":
 PY
 
 echo "=== release routes left by the required cluster ladder ==="
-mapfile -t preexisting_routes < <(route_keys)
+# A read loop, not mapfile: bash 3.2, which macOS ships, has no mapfile.
+preexisting_routes=()
+while IFS= read -r route_key; do
+    preexisting_routes+=("$route_key")
+done < <(route_keys)
 for index in "${!preexisting_routes[@]}"; do
     reset_thread "${preexisting_routes[$index]}" "$WORKDIR/reset-preexisting-$index.json"
     wait_route_gone "${preexisting_routes[$index]}"

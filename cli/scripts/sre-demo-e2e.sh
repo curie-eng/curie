@@ -634,7 +634,7 @@ run_assertion() {
   set -e
   case "$result" in
     0) status=PASS; write_summary "- $row: PASS (only the named assertion)." ;;
-    3) status=BLOCKED; write_summary "- $row: BLOCKED. ${BLOCK_REASONS[$row]}"
+    3) status=BLOCKED; write_summary "- $row: BLOCKED. $(block_reason "$row")"
        OBSERVATION_FAILURES=$((OBSERVATION_FAILURES + 1)) ;;
     *) status=FAILED; write_summary "- $row: FAILED. Raw diagnostics were kept private during execution."
        OBSERVATION_FAILURES=$((OBSERVATION_FAILURES + 1)) ;;
@@ -652,13 +652,16 @@ PYOUTCOME
   fi
 }
 
-declare -A BLOCK_REASONS=(
-  [read]="cluster message did not return a finalized reply that named every observed namespace."
-  [scale]="Pending tool, held replicas, operator-principal resolve, and post-approve replica change are required."
-  [rearm]="Requires a completed operator grant followed by a new request whose pending row is distinct; the preceding grant path is blocked."
-  [configuration-denial]="The real connector MCP endpoint could not be reached."
-  [rbac-ceiling]="Requires operator-principal approval and an explicit forbidden tool result, with the platform deployment unchanged."
-)
+# A case, not an associative array: bash 3.2, which macOS ships, has none.
+block_reason() {
+  case "$1" in
+    read) echo "cluster message did not return a finalized reply that named every observed namespace." ;;
+    scale) echo "Pending tool, held replicas, operator-principal resolve, and post-approve replica change are required." ;;
+    rearm) echo "Requires a completed operator grant followed by a new request whose pending row is distinct; the preceding grant path is blocked." ;;
+    configuration-denial) echo "The real connector MCP endpoint could not be reached." ;;
+    rbac-ceiling) echo "Requires operator-principal approval and an explicit forbidden tool result, with the platform deployment unchanged." ;;
+  esac
+}
 
 workload_specs() {
   kubectl get deploy,statefulset,daemonset -A -o json | python3 -c '
