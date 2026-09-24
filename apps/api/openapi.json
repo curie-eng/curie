@@ -4395,6 +4395,303 @@
         "title": "ProgressReport",
         "type": "object"
       },
+      "ProviderInstallationCreate": {
+        "description": "A connected external account, created by an administrator.\n\n``credential_ref`` and ``webhook_verification_ref`` are plain strings\nhere, with no Field constraints, on purpose: FastAPI's 422 echoes the\nrejected input, and a value pasted where a reference belongs is exactly\nthe credential that must not come back. The router checks both against\nthe reference grammar and answers with a message that omits the value.",
+        "properties": {
+          "credential_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ref"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "external_account_id": {
+            "minLength": 1,
+            "title": "External Account Id",
+            "type": "string"
+          },
+          "installed_by_principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed By Principal Id"
+          },
+          "provider": {
+            "enum": [
+              "slack",
+              "m365",
+              "github",
+              "jira",
+              "linear",
+              "confluence",
+              "quickbooks",
+              "other"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "status": {
+            "default": "connected",
+            "enum": [
+              "connected",
+              "disconnected",
+              "degraded"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id"
+          },
+          "webhook_verification_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Verification Ref"
+          }
+        },
+        "required": [
+          "provider",
+          "external_account_id"
+        ],
+        "title": "ProviderInstallationCreate",
+        "type": "object"
+      },
+      "ProviderInstallationOut": {
+        "properties": {
+          "credential_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ref"
+          },
+          "disconnected_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disconnected At"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "external_account_id": {
+            "title": "External Account Id",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "installed_at": {
+            "format": "date-time",
+            "title": "Installed At",
+            "type": "string"
+          },
+          "installed_by_principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed By Principal Id"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "webhook_verification_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Verification Ref"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "provider",
+          "external_account_id",
+          "display_name",
+          "credential_ref",
+          "scopes",
+          "webhook_verification_ref",
+          "status",
+          "installed_by_principal_id",
+          "installed_at",
+          "disconnected_at"
+        ],
+        "title": "ProviderInstallationOut",
+        "type": "object"
+      },
+      "ProviderInstallationUpdate": {
+        "description": "Partial update: an omitted field is unchanged, and null clears a nullable one.\n\nThe reference fields follow ``ProviderInstallationCreate``'s rule.",
+        "properties": {
+          "credential_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ref"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "external_account_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Account Id"
+          },
+          "scopes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scopes"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "connected",
+                  "disconnected",
+                  "degraded"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "webhook_verification_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Verification Ref"
+          }
+        },
+        "title": "ProviderInstallationUpdate",
+        "type": "object"
+      },
       "PublicationCreate": {
         "description": "Trusted snapshot facts used to atomically create approval + publication.",
         "properties": {

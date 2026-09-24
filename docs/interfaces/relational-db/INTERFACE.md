@@ -67,10 +67,11 @@ is a judgement call, not something derivable from the tree.
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **twenty** columns:
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **21** columns:
    `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
    `hook_partitions`, `source_bindings`, `changed_paths`, `evidence`, `arguments`,
-   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, `declaration`, `activity`, and `value`. The last one is
+   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, `declaration`, `activity`,
+   `scopes`, and `value`. The last one is
    declared twice, on `apps/api/src/curie_api/models.py::WorkflowStateEntry.value` and on
    `ThreadTranscript.value`, which holds one thread's transcript (ADR-0170); `evidence` is used
    by both approval and action audit rows. Three of them are
@@ -83,7 +84,8 @@ is a judgement call, not something derivable from the tree.
    per hook (ADR-0134, Draft). `source_bindings` holds the operator-controlled
    workload-to-allowlisted-repository map for inbound hooks (#2572). The review-feedback
    outbox likewise stores a normalized `feedback` object and credential-free serialized
-   `turn` as JSONB.
+   `turn` as JSONB. `scopes` is `apps/api/src/curie_api/models.py::ProviderInstallation.scopes`,
+   the list of provider scopes granted to a connected external account (#2909).
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)

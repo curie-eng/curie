@@ -1926,9 +1926,7 @@ class ProviderInstallation(Base):
     external_account_id: Mapped[str] = mapped_column(String)
     display_name: Mapped[str | None] = mapped_column(default=None)
     credential_ref: Mapped[str | None] = mapped_column(default=None)
-    scopes: Mapped[list[str]] = mapped_column(
-        JSONB, default=list, server_default=text("'[]'::jsonb")
-    )
+    scopes: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
     webhook_verification_ref: Mapped[str | None] = mapped_column(default=None)
     status: Mapped[str] = mapped_column(String, default="connected", server_default="connected")
     installed_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
