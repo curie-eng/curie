@@ -1665,7 +1665,7 @@ class Kernel:
 
         parsed = parse_work_item_event_id(event_id)
         if parsed is not None:
-            return parsed.kind in {"execute"}
+            return parsed.kind in {"execute", "ci"}
         return (
             event_id in self._factory_work_item_events
             or self._run_for_event(event_id) is not None
@@ -1899,6 +1899,28 @@ class Kernel:
                     on_stale=self._abandon_stale_work_item,
                 )
                 owned_work_item_id = parsed_work_item.request_id
+            elif parsed_work_item is not None and parsed_work_item.is_ci_fix:
+                # A CI fix round continues the SAME running request (#3097): adopt
+                # it by conversation the way an approval continuation does, and
+                # refuse the turn when the running request is not the one the
+                # event names (a relabel replaced it) or the execution ended.
+                try:
+                    adopted = await self._adopt_resumed_work_item(event_id, thread_key)
+                except _FactoryExecutionEnded:
+                    self._factory_work_item_events.add(event_id)
+                    await self._markers.mark_done(event_id)
+                    return
+                if adopted != parsed_work_item.request_id:
+                    if adopted is not None:
+                        self._work_item_runs.pop(adopted, None)
+                    logger.info(
+                        "work-item CI continuation %s is stale: running request is %s",
+                        event_id,
+                        adopted,
+                    )
+                    await self._markers.mark_done(event_id)
+                    return
+                owned_work_item_id = adopted
             elif self._is_approval_resume(event_id):
                 try:
                     owned_work_item_id = await self._adopt_resumed_work_item(
@@ -3163,7 +3185,10 @@ class Kernel:
         )
         if run is not None and run.event_id != qevent.event_id:
             run = None
-        if run is None and self._is_approval_resume(qevent.event_id):
+        if run is None and (
+            (parsed is not None and parsed.is_ci_fix)
+            or self._is_approval_resume(qevent.event_id)
+        ):
             run = self._run_for_event(qevent.event_id)
         if run is not None and run.started and not run.finished:
             try:
@@ -3185,7 +3210,13 @@ class Kernel:
                 elif outcome == "delivered":
                     try:
                         await run.finish(
-                            outcome="failed", cause="no_pull_request", detail=None
+                            outcome="failed",
+                            cause=(
+                                "ci_fix_unpublished"
+                                if parsed is not None and parsed.is_ci_fix
+                                else "no_pull_request"
+                            ),
+                            detail=None,
                         )
                     except WorkItemConflict as exc:
                         if exc.code != "publication_pending":
@@ -5800,7 +5831,8 @@ class Kernel:
         parsed_publication = parse_work_item_event_id(qevent.event_id)
         publication_run = (
             self._work_item_runs.get(parsed_publication.request_id)
-            if parsed_publication is not None and parsed_publication.kind in {"execute"}
+            if parsed_publication is not None
+            and parsed_publication.kind in {"execute", "ci"}
             else None
         )
         try:
@@ -5844,7 +5876,7 @@ class Kernel:
                         work_item_request_id=(
                             parsed_publication.request_id
                             if parsed_publication is not None
-                            and parsed_publication.kind in {"execute"}
+                            and parsed_publication.kind in {"execute", "ci"}
                             and publication_run is not None
                             and publication_run.started
                             else None

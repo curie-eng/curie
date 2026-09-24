@@ -7,6 +7,7 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import redis.asyncio as redis
 from aci_protocol import (
     STREAM_PAYLOAD_FIELD,
@@ -16,12 +17,12 @@ from aci_protocol import (
     TurnSource,
 )
 from redis.exceptions import ResponseError
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_notices, workitems
+from . import factory_ci, factory_notices, workitems
 from .config import Settings
-from .models import ExecutionRequest, WorkItem
+from .models import ExecutionRequest, Publication, WorkItem
 from .workitem_dispatch import (
     claim_due,
     claim_terminate_publishes,
@@ -44,6 +45,8 @@ class WorkItemReconciler:
         self._valkey = valkey
         self._settings = settings
         self._owner = f"work-item-reconciler:{uuid.uuid4()}"
+        # Next CI observation per request waiting on CI (#3097), in database time.
+        self._ci_next_poll: dict[uuid.UUID, datetime] = {}
 
     def _stream(self) -> str:
         return self._settings.runs_stream
@@ -181,6 +184,11 @@ class WorkItemReconciler:
                     .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
                     .where(
                         ExecutionRequest.status == "running",
+                        # A published request waits on CI; the CI gate owns it.
+                        ~exists().where(
+                            Publication.execution_request_id == ExecutionRequest.id,
+                            Publication.status == "succeeded",
+                        ),
                         (
                             (
                                 ExecutionRequest.runtime_heartbeat_expires_at.is_not(
@@ -276,29 +284,98 @@ class WorkItemReconciler:
                 )
 
     async def _settle_publications(self) -> None:
-        for _ in range(self._settings.work_item_batch_limit):
-            async with self._sessionmaker() as session:
-                settlement = await workitems.claim_publication_settlement(session)
-                if settlement is None:
+        """Settle linked publications; a succeeded one goes through the CI gate.
+
+        ``skip`` holds every request handled this pass, so one request waiting
+        on CI cannot starve the others (#3097).
+        """
+
+        skip: set[uuid.UUID] = set()
+        observations = 0
+        client: httpx.AsyncClient | None = None
+        try:
+            for _ in range(self._settings.work_item_batch_limit):
+                async with self._sessionmaker() as session:
+                    settlement = await workitems.claim_publication_settlement(
+                        session, exclude=frozenset(skip)
+                    )
+                    if settlement is None:
+                        await session.rollback()
+                        return
+                    skip.add(settlement.request_id)
+                    if settlement.cause != "completed":
+                        await workitems.fail_execution(
+                            session,
+                            work_item_id=settlement.work_item_id,
+                            request_id=settlement.request_id,
+                            cause=settlement.cause,
+                            expected_work_item_version=settlement.work_item_version,
+                            expected_request_version=settlement.request_version,
+                        )
+                        continue
+                    # No network call under the claim's row lock.
                     await session.rollback()
-                    return
-                if settlement.cause == "completed":
-                    await workitems.complete_execution(
-                        session,
-                        work_item_id=settlement.work_item_id,
-                        request_id=settlement.request_id,
-                        expected_work_item_version=settlement.work_item_version,
-                        expected_request_version=settlement.request_version,
+                if observations >= factory_ci.CI_OBSERVATIONS_PER_PASS:
+                    continue
+                observations += 1
+                if client is None:
+                    client = httpx.AsyncClient(
+                        timeout=self._settings.github_app_timeout_seconds
                     )
-                else:
-                    await workitems.fail_execution(
-                        session,
-                        work_item_id=settlement.work_item_id,
-                        request_id=settlement.request_id,
-                        cause=settlement.cause,
-                        expected_work_item_version=settlement.work_item_version,
-                        expected_request_version=settlement.request_version,
-                    )
+                await factory_ci.gate(
+                    self._sessionmaker,
+                    self._valkey,
+                    self._settings,
+                    client,
+                    settlement,
+                    owner=self._owner,
+                    next_poll=self._ci_next_poll,
+                    dispatch=self._dispatch_ci_turn,
+                )
+        finally:
+            if client is not None:
+                await client.aclose()
+
+    async def _dispatch_ci_turn(
+        self, request: ExecutionRequest, round_: int, text: str
+    ) -> bool:
+        """Enqueue a CI fix turn for the same request, like its execute wake."""
+
+        async with self._sessionmaker() as session:
+            loaded = await load_execute_wake(session, request.id)
+        if loaded is None:
+            return False
+        current, _work_item, binding = loaded
+        if (
+            current.requester is None
+            or current.reply_kind is None
+            or current.reply_address is None
+            or current.reply_conversation_id is None
+            or binding is None
+        ):
+            logger.warning(
+                "work item request %s cannot route its CI fix turn; leaving it waiting",
+                request.id,
+            )
+            return False
+        await self._xadd(
+            QueuedTurn(
+                event_id=factory_ci.continuation_event_id(request.id, round_),
+                conversation_id=current.reply_conversation_id,
+                author=current.requester,
+                text=text,
+                source=TurnSource.WEBHOOK,
+                reply_handle=ReplyHandle(
+                    kind=current.reply_kind,
+                    channel=current.reply_address,
+                    placeholder=None,
+                    endpoint=binding.endpoint,
+                    adapter=binding.adapter,
+                ),
+                received_at=datetime.now(UTC).isoformat(),
+            )
+        )
+        return True
 
     async def _post_terminal_notices(self) -> None:
         async with self._sessionmaker() as session:

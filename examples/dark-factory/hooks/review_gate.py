@@ -60,12 +60,25 @@ AGENT_TOOLS = {"Agent", "Task"}
 
 _ISSUE_LINK = re.compile(r"github\.com/([\w.-]+)/([\w.-]+)/(?:issues|pull)/(\d+)")
 _VERDICT = re.compile(r"^\s*VERDICT:\s*(APPROVE|CHANGES)\b", re.MULTILINE)
+_CI_ROUND = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
 
 
 def _fresh(prompt: str = "") -> dict[str, Any]:
+    """Fresh state for a new run, or for a CI fix round.
+
+    A CI fix round is detected from the prompt's second line only (the
+    hook's own marker, written by the platform); a match anywhere else,
+    including inside the untrusted CI JSON that follows, has no effect. A CI
+    fix round starts with the plan already approved (plan review already
+    happened) and the diff loop at round 0.
+    """
     link = _ISSUE_LINK.search(prompt)
+    lines = prompt.split("\n")
+    ci_match = _CI_ROUND.match(lines[1]) if len(lines) > 1 else None
+    ci_round = int(ci_match.group(1)) if ci_match else None
+    plan = {"round": 0, "verdict": "APPROVE"} if ci_round else {"round": 0, "verdict": None}
     return {
-        "plan": {"round": 0, "verdict": None},
+        "plan": plan,
         "diff": {"round": 0, "verdict": None},
         "stopped": None,
         "issue": [link.group(1).lower(), link.group(2).lower(), int(link.group(3))]
@@ -73,6 +86,7 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
         else None,
         "comment_attempts": 0,
         "commented": False,
+        "ci_round": ci_round,
     }
 
 
@@ -305,7 +319,18 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
     event = data.get("hook_event_name", "")
     path = state_path(str(data.get("session_id") or ""))
     if event == "UserPromptSubmit":
-        save(path, _fresh(str(data.get("prompt") or "")))
+        state = _fresh(str(data.get("prompt") or ""))
+        save(path, state)
+        ci_round = state.get("ci_round")
+        if ci_round:
+            emit_phase(
+                "wait_ci", ci_round, f"checks failed; fix round {ci_round} of {MAX_ROUNDS}"
+            )
+            return _context(
+                "UserPromptSubmit",
+                "CI fix round: go to phase implement, fix what the failing checks show, "
+                "call the diff reviewer, then publish to the same pull request.",
+            )
         return None
     tool = str(data.get("tool_name") or "")
     tool_input = dict(data.get("tool_input") or {})
