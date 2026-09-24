@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from . import transcripts
 from .config import get_settings
 from .models import (
     ExecutionRequest,
@@ -217,6 +218,25 @@ def _notice_detail(detail: str | None) -> str | None:
     if len(text) > _NOTICE_DETAIL_MAX:
         text = text[: _NOTICE_DETAIL_MAX - 3].rstrip() + "..."
     return text or None
+
+
+async def _settle_terminal(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    detail: str | None,
+) -> None:
+    """Stage everything a terminal request owes in its own transaction.
+
+    That is the factory comment and, per ADR-0170, deleting the thread's
+    transcript: a terminal WorkItem's history is not resumed again.
+    """
+
+    if request.terminal_at is None:
+        return
+    _queue_notice(session, work_item, request, detail=detail)
+    await transcripts.expire_for_work_item(session, work_item)
 
 
 async def _opened_pull_request(
@@ -625,7 +645,7 @@ async def expire_waiting(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request, detail=None)
+    await _settle_terminal(session, work_item, request, detail=None)
     return await _outcome(session, work_item, request)
 
 
@@ -878,7 +898,7 @@ async def _terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request, detail=detail)
+    await _settle_terminal(session, work_item, request, detail=detail)
     return await _outcome(session, work_item, request)
 
 
@@ -978,7 +998,7 @@ async def request_cancellation(
             )
         )
         active = await _reload_request(session, active.id)
-        _queue_notice(session, work_item, active, detail=None)
+        await _settle_terminal(session, work_item, active, detail=None)
     elif active is not None and active.status == "running":
         await session.execute(
             update(ExecutionRequest)
@@ -1017,6 +1037,10 @@ async def request_cancellation(
         )
         active = await _reload_request(session, active.id)
     work_item = await _reload_work_item(session, work_item_id)
+    if active is None:
+        # Nothing is left to run, so the cancelled WorkItem is terminal now. A
+        # waiting or running request expires the transcript when it settles.
+        await transcripts.expire_for_work_item(session, work_item)
     return await _outcome(session, work_item, active)
 
 
@@ -1263,7 +1287,7 @@ async def _record_runtime_termination(
         request = await _reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await _reload_request(session, request_id)
-    _queue_notice(session, work_item, request, detail=None)
+    await _settle_terminal(session, work_item, request, detail=None)
     return await _outcome(session, work_item, request)
 
 

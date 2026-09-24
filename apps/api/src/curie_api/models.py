@@ -1452,6 +1452,49 @@ class WorkflowStateEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+
+class ThreadTranscript(Base):
+    """One thread's conversation transcript (ADR-0170, #3070).
+
+    Moved out of ``workflow_state_entries``: that store caps a whole (agent,
+    namespace), so every thread an agent ever ran shared one transcript budget
+    and a busy factory agent stopped for good once it filled. A transcript is
+    capped per thread here (``transcript_max_thread_bytes``) with no agent-wide
+    cap, and it is deleted when its WorkItem reaches a terminal state or, for a
+    thread with no WorkItem, once ``expires_at`` passes. The state API keeps
+    serving it under ``/state/transcript/<thread_key>``.
+    """
+
+    __tablename__ = "thread_transcripts"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            name="uq_thread_transcripts_agent_scope_thread",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_thread_transcripts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    # Same partition key as ``WorkflowStateEntry.binding_scope``; NULL is the
+    # agent-wide identity every runner transcript uses today.
+    binding_scope: Mapped[str | None] = mapped_column(default=None)
+    # The worker's scoped thread key, which is also ``WorkItem.conversation_id``.
+    thread_key: Mapped[str]
+    value: Mapped[Any] = mapped_column(JSONB)
+    version: Mapped[int] = mapped_column(default=1)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
 class ConsoleSession(Base):
     """One console login: the code that establishes it and the session it becomes.
 
