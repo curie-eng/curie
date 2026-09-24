@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -34,11 +33,6 @@ from .workitem_dispatch import (
 
 logger = logging.getLogger(__name__)
 
-
-# The enqueue marker (key, TTL) that ``_xadd`` sets atomically with the turn.
-_ENQUEUE_MARKER: contextvars.ContextVar[tuple[str, int] | None] = contextvars.ContextVar(
-    "_ENQUEUE_MARKER", default=None
-)
 
 # Set the round's enqueue marker NX and append the turn atomically, so no crash
 # can leave a marker without its turn.
@@ -84,17 +78,16 @@ class WorkItemReconciler:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-    async def _xadd(self, turn: QueuedTurn) -> None:
-        marked = _ENQUEUE_MARKER.get()
-        if marked is not None:
+    async def _xadd(self, turn: QueuedTurn, *, marker: tuple[str, int] | None = None) -> None:
+        if marker is not None:
             # Set the round's marker NX and append atomically; a marker that is
             # already set means the turn is already on the stream.
-            marker, ttl = marked
+            key, ttl = marker
             await self._ensure_group()
             await self._valkey.eval(
                 _MARK_AND_XADD,
                 2,
-                marker,
+                key,
                 self._stream(),
                 ttl,
                 STREAM_PAYLOAD_FIELD,
@@ -411,32 +404,27 @@ class WorkItemReconciler:
                 request.id,
             )
             return False
-        assert request.execution_deadline is not None
-        ttl = max(
-            int((request.execution_deadline - datetime.now(UTC)).total_seconds()) + 60,
-            factory_ci.CI_CLAIM_SECONDS,
-        )
-        token = _ENQUEUE_MARKER.set((factory_ci.enqueue_marker(request.id, round_), ttl))
-        try:
-            await self._xadd(
-                QueuedTurn(
-                    event_id=factory_ci.continuation_event_id(request.id, round_),
-                    conversation_id=current.reply_conversation_id,
-                    author=current.requester,
-                    text=text,
-                    source=TurnSource.WEBHOOK,
-                    reply_handle=ReplyHandle(
-                        kind=current.reply_kind,
-                        channel=current.reply_address,
-                        placeholder=None,
-                        endpoint=binding.endpoint,
-                        adapter=binding.adapter,
-                    ),
-                    received_at=datetime.now(UTC).isoformat(),
+        await self._xadd(
+            QueuedTurn(
+                event_id=factory_ci.continuation_event_id(request.id, round_),
+                conversation_id=current.reply_conversation_id,
+                author=current.requester,
+                text=text,
+                source=TurnSource.WEBHOOK,
+                reply_handle=ReplyHandle(
+                    kind=current.reply_kind,
+                    channel=current.reply_address,
+                    placeholder=None,
+                    endpoint=binding.endpoint,
+                    adapter=binding.adapter,
                 ),
-            )
-        finally:
-            _ENQUEUE_MARKER.reset(token)
+                received_at=datetime.now(UTC).isoformat(),
+            ),
+            marker=(
+                factory_ci.enqueue_marker(request.id, round_),
+                factory_ci.round_ttl(request, datetime.now(UTC)),
+            ),
+        )
         # Already-enqueued counts as published: the round has its turn.
         return True
 

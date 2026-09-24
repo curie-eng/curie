@@ -651,11 +651,13 @@ def test_a_failed_xadd_clears_the_claim_so_the_next_pass_retries(
     original = WorkItemReconciler._xadd
     failures: list[str] = []
 
-    async def flaky(self: WorkItemReconciler, turn: Any) -> None:
+    async def flaky(
+        self: WorkItemReconciler, turn: Any, *, marker: tuple[str, int] | None = None
+    ) -> None:
         if "-ci-" in turn.event_id and not failures:
             failures.append(turn.event_id)
             raise redis.exceptions.ConnectionError("valkey went away")
-        await original(self, turn)
+        await original(self, turn, marker=marker)
 
     monkeypatch.setattr(WorkItemReconciler, "_xadd", flaky)
 
@@ -1077,9 +1079,7 @@ def test_a_claim_lost_during_a_slow_dispatch_enqueues_the_round_once(
         if not stalled:
             stalled.append(True)
             # The claim's TTL runs out while this dispatch is still in flight.
-            other = aioredis.Redis(
-                host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None
-            )
+            other = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
             engine = create_async_engine(get_settings().database_url)
             try:
                 await other.delete(key)

@@ -363,6 +363,12 @@ return 0
 """
 
 
+def round_ttl(request: ExecutionRequest, now: datetime) -> int:
+    """Seconds a round's claim and marker outlive the request's execution deadline."""
+    assert request.execution_deadline is not None
+    return max(int((request.execution_deadline - now).total_seconds()) + 60, CI_CLAIM_SECONDS)
+
+
 def enqueue_marker(request_id: uuid.UUID, round_: int) -> str:
     """The key set atomically with a round's continuation turn."""
 
@@ -504,8 +510,7 @@ async def _continue(
 
     key = ci_key(request.id, round_)
     token = f"claimed:{owner}"
-    assert request.execution_deadline is not None
-    ttl = max(int((request.execution_deadline - now).total_seconds()) + 60, CI_CLAIM_SECONDS)
+    ttl = round_ttl(request, now)
     if not await valkey.set(key, token, nx=True, ex=CI_CLAIM_SECONDS):
         return "fixing"
     try:
