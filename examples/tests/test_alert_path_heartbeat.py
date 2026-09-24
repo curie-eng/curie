@@ -136,6 +136,11 @@ def test_heartbeat_receiver_reads_its_url_from_the_mounted_secret() -> None:
     )
     mount = mounts[0]
     assert mount.get("readOnly") is True
+    assert mount.get("optional") is True, (
+        "a missing heartbeat Secret must fail only the heartbeat posts; a "
+        "required one keeps Alertmanager from starting and takes the bot's "
+        "alerts down with it"
+    )
     url_file = PurePosixPath(webhook["url_file"])
     mount_path = PurePosixPath(mount["mountPath"])
     assert url_file.is_absolute()
