@@ -1072,3 +1072,82 @@ def test_idle_route_preflight_accepts_a_host_without_gnu_userland(
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "preflight passed\n"
+
+
+REGISTRY_GOOD_IMAGE = "ghcr.io/acme/tempo@sha256:" + "a" * 64
+REGISTRY_LOCK = (
+    "connectors:\n"
+    "  tempo:\n"
+    f"    image: {REGISTRY_GOOD_IMAGE}\n"
+    f"    source_digest: sha256:{'b' * 64}\n"
+)
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_registry_missing_case_corrupts_and_restores_the_lock_on_a_stock_mac(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """The deploy sees the unresolvable image, and the bundle gets its lock back.
+
+    The restored lock must be the same bytes, mode and fixed mtime, with no
+    backup file left beside it, because the packed bundle is what
+    assert_bundle_identity compares across rungs.
+    """
+
+    case = _shell_function(
+        LADDER_PATH.read_text(), "case_connector_registry_missing_cluster"
+    )
+    bundle = tmp_path / "work" / "bundle"
+    bundle.mkdir(parents=True)
+    lock = bundle / "connectors.lock.yaml"
+    lock.write_text(REGISTRY_LOCK)
+    lock.chmod(0o644)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    _write_executable(
+        bin_dir / "kubectl", f"#!/bin/sh\necho {shlex.quote(REGISTRY_GOOD_IMAGE)}\n"
+    )
+    curie = tmp_path / "curie"
+    _write_executable(
+        curie,
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '    "--json cluster deploy --namespace acme-ns --release acme --plugin-dir "*)\n'
+        '        cp "$9/connectors.lock.yaml" "$STUB_STATE/deployed.lock.yaml"\n'
+        '        echo "error: the registry could not resolve the locked image"\n'
+        "        exit 2 ;;\n"
+        "esac\n"
+        'echo "unexpected curie invocation: $*" >&2\n'
+        "exit 97\n",
+    )
+    script = f"""set -euo pipefail
+WORKDIR="$1"
+BIN="$2"
+ns_rel=(--namespace acme-ns --release acme)
+connector_object_name() {{ echo "$1-$2-$3"; }}
+connector_image() {{ echo {shlex.quote(REGISTRY_GOOD_IMAGE)}; }}
+{case}
+case_connector_registry_missing_cluster acme acme-bot acme-ns
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path / "work"), str(curie)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_STATE": str(tmp_path),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    deployed = tmp_path / "deployed.lock.yaml"
+    assert deployed.read_text() == REGISTRY_LOCK.replace(
+        REGISTRY_GOOD_IMAGE, "ghcr.io/acme/tempo@sha256:" + "f" * 64
+    )
+    assert lock.read_text() == REGISTRY_LOCK
+    assert lock.stat().st_mode & 0o777 == 0o644
+    assert time.localtime(lock.stat().st_mtime)[:6] == (2000, 1, 1, 0, 0, 0)
+    assert sorted(path.name for path in bundle.iterdir()) == [lock.name]
