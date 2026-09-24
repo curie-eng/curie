@@ -585,6 +585,7 @@ def _start_isolated_approval_seed_worker(case: LocalCase) -> None:
     # compose's own default applies: it must be the dispatcher `local up
     # --build` just built, not whatever `curie-dispatcher:latest` is local.
     candidate = f"ghcr.io/curie-eng/curie-dispatcher:{case.env['CURIE_LOCAL_IMAGE_TAG']}"
+    case.env["CURIE_DISPATCHER_IMAGE"] = candidate
     rendered = json.loads(
         _require(
             _run(
