@@ -380,7 +380,7 @@ def _cleanup() -> None:
     _sql(
         "DO $$ BEGIN "
         "IF to_regclass('curie.provider_installations') IS NOT NULL THEN "
-        "TRUNCATE curie.provider_installations; END IF; END $$"
+        "TRUNCATE curie.provider_installations CASCADE; END IF; END $$"
     )
     _sql("DELETE FROM curie.principals WHERE idp_subject LIKE :mark", {"mark": f"{MARK}%"})
     _sql("DELETE FROM curie.tenants WHERE deployment_id LIKE :mark", {"mark": f"{MARK}%"})

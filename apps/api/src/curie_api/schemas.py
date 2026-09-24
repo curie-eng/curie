@@ -33,6 +33,7 @@ from pydantic import (
 from . import adapter_principal
 from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
+from .identity.service import ResolutionReason, ResolutionStatus
 from .models import GIT_FLOW_CREATED_BY, Environment
 from .publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from .repo_full_name import RepoFullName
@@ -2712,3 +2713,44 @@ class ProviderInstallationOut(BaseModel):
     installed_by_principal_id: uuid.UUID | None
     installed_at: datetime
     disconnected_at: datetime | None
+
+
+# --- identity resolution (#2910, ADR 0155 step 5) --------------------------
+
+
+class PrincipalResolveIn(BaseModel):
+    """Which principal is ``provider_subject`` on one installation?
+
+    The installation is named by exactly one locator: its id, or the
+    ``(provider, external_account_id)`` pair (a Slack team id), which is how
+    the dispatcher knows it.
+    """
+
+    # Omitted means the default tenant; nothing branches on how many exist.
+    tenant_id: uuid.UUID | None = None
+    provider_subject: str = Field(min_length=1)
+    provider_installation_id: uuid.UUID | None = None
+    provider: ProviderName | None = None
+    external_account_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _exactly_one_locator(self) -> "PrincipalResolveIn":
+        by_id = self.provider_installation_id is not None
+        by_account = self.provider is not None or self.external_account_id is not None
+        if by_id == by_account:
+            raise ValueError(
+                "name the installation by provider_installation_id or by "
+                "provider and external_account_id, not both or neither"
+            )
+        if by_account and (self.provider is None or self.external_account_id is None):
+            raise ValueError("provider and external_account_id are given together")
+        return self
+
+
+class PrincipalResolutionOut(BaseModel):
+    """The answer; ``unresolved`` is still a 200, with the reason why."""
+
+    status: ResolutionStatus
+    principal_id: uuid.UUID | None
+    reason: ResolutionReason
+    provider_installation_id: uuid.UUID | None

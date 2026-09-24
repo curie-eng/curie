@@ -246,6 +246,8 @@ _HTTP_OPERATIONS = [
     "/health",
     "/ready",
     "/hooks/{agent_id}/{hook}",
+    # Principal resolution for the dispatcher (#2910).
+    "/identity/resolve",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",
