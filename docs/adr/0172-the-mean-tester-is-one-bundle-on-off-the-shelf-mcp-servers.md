@@ -2,7 +2,13 @@
 
 Date: 2026-09-24
 
-Status: Draft
+Status: Accepted
+
+Accepted alongside implementation under the coordinated exception in
+[ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md):
+the maintainer approved it in the review of #3055 on 2026-09-24. It is
+realized by `examples/mean-tester` and the Slack server line in
+`runner/Dockerfile`.
 
 This ADR amends [ADR-0169](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md):
 decisions 6, 7 and 8, how decision 2 reads Git, and which probes decision 4's
