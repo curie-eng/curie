@@ -601,6 +601,13 @@ class WorkItem(Base):
             "publication_lineage_id",
             name="work_items_publication_lineage_key",
         ),
+        CheckConstraint(
+            "(readmit_request_id IS NULL AND readmit_requester IS NULL "
+            "AND readmit_objective IS NULL) OR "
+            "(readmit_request_id IS NOT NULL AND readmit_requester IS NOT NULL "
+            "AND readmit_objective IS NOT NULL)",
+            name="work_items_readmit_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -624,6 +631,13 @@ class WorkItem(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # A relabel that arrived while a request was still running. The
+    # reconciler admits it once that request reaches a terminus.
+    readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
@@ -707,6 +721,10 @@ class ExecutionRequest(Base):
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
             "AND termination_observation IS NOT NULL)))) IS TRUE",
             name="execution_requests_state_shape_ck",
+        ),
+        CheckConstraint(
+            "teardown_unconfirmed_at IS NULL OR status = 'cancelled'",
+            name="execution_requests_teardown_unconfirmed_ck",
         ),
         CheckConstraint(
             "dispatch_generation >= 1",
@@ -832,6 +850,15 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     terminate_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Settle anchor: updated_at moves on heartbeats and terminate publishes.
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # A forced settle with no worker teardown receipt. Terminate wakes keep
+    # going out until a worker records the teardown and clears this.
+    teardown_unconfirmed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     runtime_claim_name: Mapped[str | None] = mapped_column(Text, default=None)

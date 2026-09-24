@@ -38,12 +38,12 @@ from .models import Agent, AgentChannel, WorkItem
 from .repo_full_name import repo_url_path
 from .schemas import WebhookResult
 from .workitem_dispatch import DispatchConflict
-from .workitems import WorkItemConflict, WorkItemOutcome
+from .workitems import GITHUB_CHANNEL_KIND, WorkItemConflict, WorkItemOutcome, github_reply_route
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
-_CHANNEL_KIND = "github"
+_CHANNEL_KIND = GITHUB_CHANNEL_KIND
 _IGNORED = {
     "unsupported_action",
     "unsupported_event",
@@ -251,11 +251,14 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> 
     objective = f"{base}/{notice.repo_full_name}/issues/{notice.issue_number}"
     if notice.disposition == "mention":
         objective = f"{objective}#issuecomment-{notice.comment_id}"
+    kind, address, reply_conversation_id = github_reply_route(
+        notice.repo_full_name, notice.issue_number
+    )
     return _Facts(
         agent_id=binding.agent_id,
-        kind=_CHANNEL_KIND,
-        address=notice.repo_full_name,
-        reply_conversation_id=f"issue-{notice.issue_number}",
+        kind=kind,
+        address=address,
+        reply_conversation_id=reply_conversation_id,
         repo_full_name=notice.repo_full_name,
         github_repository_id=notice.repository_id,
         github_issue_number=notice.issue_number,
@@ -278,10 +281,13 @@ async def _work_item(session: AsyncSession, notice: FactoryNotice) -> WorkItem |
 
 def _admission_result(
     result: WorkItemOutcome | WorkItemConflict | DispatchConflict,
+    request_id: uuid.UUID,
 ) -> WebhookResult:
     if isinstance(result, WorkItemOutcome):
         if result.replayed:
             return WebhookResult(status="factory_duplicate")
+        if result.request is not None and result.request.id != request_id:
+            return WebhookResult(status="factory_readmit_pending")
         return WebhookResult(status="factory_admitted")
     code = result.code
     if code in _IGNORED:
@@ -299,8 +305,12 @@ async def _admit(
         existing = await _work_item(session, notice)
         if existing is None:
             raise FactoryRefused("not_admitted")
-    result = await workitem_dispatch.admit(session, _facts(notice, binding, settings))
-    return _admission_result(result)
+    facts = _facts(notice, binding, settings)
+    if notice.disposition == "mention":
+        result = await workitem_dispatch.admit(session, facts)
+    else:
+        result = await workitem_dispatch.readmit(session, facts)
+    return _admission_result(result, facts.request_id)
 
 
 async def _cancel(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:

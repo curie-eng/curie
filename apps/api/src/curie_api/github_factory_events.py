@@ -47,7 +47,12 @@ class FactoryNotice:
         if self.disposition == "mention":
             identity = f"https://github.com/factory/mention/{self.repository_id}/{self.comment_id}"
         else:
-            identity = f"https://github.com/factory/label/{self.repository_id}/{self.issue_number}"
+            # Each labeled delivery is its own request, so a relabel starts a
+            # new run. Redelivery of the same delivery is deduped upstream.
+            identity = (
+                f"https://github.com/factory/label/{self.repository_id}/"
+                f"{self.issue_number}/{self.delivery_id}"
+            )
         return uuid.uuid5(uuid.NAMESPACE_URL, identity)
 
 

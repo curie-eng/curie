@@ -82,11 +82,15 @@ class WorkItemReconciler:
         await self._expire_waiting()
         await self._request_deadline_cancellations()
         await self._request_owner_lost_cancellations()
+        # Terminate wakes go out before the settle pass: a forced settle
+        # requires a published wake, so the worker was told to tear down.
+        await self._publish_terminate_wakes()
+        await self._settle_overdue_cancellations()
+        await self._readmit_pending()
         await self._post_terminal_notices()
         async with self._sessionmaker() as session:
             await redispatch_lapsed_acquisitions(session)
         await self._publish_execute_wakes()
-        await self._publish_terminate_wakes()
 
     async def run_forever(self) -> None:
         while True:
@@ -204,6 +208,71 @@ class WorkItemReconciler:
                     request_id=row.id,
                     expected_work_item_version=row.work_item_version,
                     expected_request_version=row.version,
+                )
+
+    async def _settle_overdue_cancellations(self) -> None:
+        settle_seconds = self._settings.work_item_cancel_settle_seconds
+        async with self._sessionmaker() as session:
+            now = await workitems._database_now(session)
+            rows = (
+                await session.execute(
+                    select(
+                        ExecutionRequest.id,
+                        ExecutionRequest.work_item_id,
+                        ExecutionRequest.version,
+                    )
+                    .where(
+                        ExecutionRequest.status == "cancellation_requested",
+                        ExecutionRequest.terminal_cause == "issue_cancelled",
+                        ExecutionRequest.cancellation_requested_at.is_not(None),
+                        ExecutionRequest.cancellation_requested_at
+                        <= now - timedelta(seconds=settle_seconds),
+                        ExecutionRequest.terminate_published_at.is_not(None),
+                        ExecutionRequest.runtime_owner.is_(None)
+                        | (
+                            ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)
+                            & (ExecutionRequest.runtime_heartbeat_expires_at <= now)
+                        ),
+                    )
+                    .limit(self._settings.work_item_batch_limit)
+                )
+            ).all()
+        for row in rows:
+            async with self._sessionmaker() as session:
+                result = await workitems.settle_overdue_cancellation(
+                    session,
+                    work_item_id=row.work_item_id,
+                    request_id=row.id,
+                    expected_request_version=row.version,
+                    settle_seconds=settle_seconds,
+                )
+            if isinstance(result, workitems.WorkItemOutcome):
+                logger.warning(
+                    "work item request %s cancellation settled after %ds "
+                    "without a worker teardown receipt",
+                    row.id,
+                    settle_seconds,
+                )
+
+    async def _readmit_pending(self) -> None:
+        async with self._sessionmaker() as session:
+            ids = (
+                await session.scalars(
+                    select(WorkItem.id)
+                    .where(WorkItem.readmit_request_id.is_not(None))
+                    .limit(self._settings.work_item_batch_limit)
+                )
+            ).all()
+        for work_item_id in ids:
+            async with self._sessionmaker() as session:
+                now = await workitems._database_now(session)
+                await workitems.admit_pending_readmit(
+                    session,
+                    work_item_id=work_item_id,
+                    wait_deadline=now
+                    + timedelta(
+                        seconds=self._settings.work_item_wait_budget_seconds
+                    ),
                 )
 
     async def _settle_publications(self) -> None:
