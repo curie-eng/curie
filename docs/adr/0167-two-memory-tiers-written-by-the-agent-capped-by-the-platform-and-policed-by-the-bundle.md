@@ -58,7 +58,8 @@ short of an operator deleting it, and no way to scope memory to a channel.
 What we add or change. The design follows how Claude Code keeps memory: a
 short index that is always loaded, detail that is read only when needed, a
 size check on every write, and no compaction or version history. When memory
-grows, information moves into detail; it is not compressed or dropped.
+grows, information moves into detail or into an archive; it is not compressed.
+The only fact ever dropped is an incorrect one, replaced by its correction.
 
 It differs from Claude Code where a Curie agent's situation differs. A Claude
 Code session is usually one task, and the code it produces is the durable
@@ -127,17 +128,24 @@ Each fact is its own row, so a busy topic never outgrows one stored value.
 This is Claude Code's index and topic files, arranged for a memory that grows
 faster.
 
+Memory has three levels, from most to least accessible. Current facts are in
+the index. Their detail, and current facts past the index cap (M), are read on
+demand. Archived facts (N) are kept but left out of the index entirely; each
+topic's index line says how many it holds, and they are read only when asked
+for.
+
 A fact is one statement by one person. When someone adds to a fact another
 person stated (an exception, a condition, a reason), that addition is saved
 as a new fact in the same topic with its own author, and the original fact is
 left as it was. Detail holds only what the fact's own author said.
 
-**E. The agent gets a `remember` / `read` / `forget` tool, bound to the
-current channel.**
-`remember` adds a fact to a declared topic, or updates one by id; the
+**E. The agent gets a `remember` / `read` / `archive` / `restore` tool,
+bound to the current channel.**
+`remember` adds a fact to a declared topic, or corrects one by id; the
 platform refuses any undeclared topic. `read` returns one fact with its
-detail, or a whole topic, newest first and paged when long. `forget` removes
-one fact by id. There is no search. The declared kinds and their descriptions
+detail, or a whole topic, newest first and paged when long; archived facts are
+returned only when asked for. `archive` moves a fact out of the index into the
+archive, and `restore` moves it back. There is no delete, and no search. The declared kinds and their descriptions
 are the tool's instructions, so the model sees exactly what it may save. The
 tool writes only to the channel the message came from; if the model passes a
 channel name, it is ignored. The tool is mounted only when an operator has
@@ -145,8 +153,9 @@ turned memory on for the agent. Upgrading does not turn it on.
 
 **F. Saves are silent unless the person asked.**
 When someone explicitly says "remember this" or "forget that," the reply
-confirms it. Otherwise the agent does not announce saves. Never an approval
-card.
+confirms it. "Forget that" archives the fact, and the reply says it was moved
+out of active memory rather than claiming it is gone. Otherwise the agent does
+not announce saves. Never an approval card.
 
 **G. Every fact records who stated it and when. The platform fills this in.**
 The author is part of the fact's provenance, beside the session id, trace ids
@@ -172,7 +181,10 @@ security boundary. Approvals and policy gates stay the enforcement layer.
 correct any fact in it.**
 A correction says a fact is wrong and replaces it: the new statement
 overwrites the fact under the same id, and its author becomes the person who
-corrected it, because the statement is now theirs. Adding to a fact is not a
+corrected it, because the statement is now theirs. This is the only way the
+agent drops information, because only an incorrect statement is worth
+losing. A fact that was true but no longer applies is not a correction: it is
+archived (N). Adding to a fact is not a
 correction; it is a new fact (D). When the agent moves detail out of a
 statement to shorten the index (M), the author does not change, because no
 person said anything new. Saving the exact same text again is refused.
@@ -205,34 +217,46 @@ fact was saved.
 **M. The index is capped, and measured on every save.**
 The cap is Claude Code's: 200 lines or 25 KB, whichever comes first. The API
 measures the index after every save. Near the cap, the save succeeds and the
-tool's reply tells the agent to move detail out of statements and into
-detail, keeping each statement to one short line. That is the only change the
-agent makes to shorten memory: it does not merge or drop facts on its own.
+tool's reply tells the agent to shorten the index in two ways: move detail
+out of statements, keeping each to one short line, and archive facts that are
+no longer current. Those are the only changes the agent makes to shorten
+memory: it does not merge or drop facts.
 Over the cap, the save still succeeds, and the oldest facts in each topic are
 left out of the index at the next boot, replaced by a line saying how many
 older facts the topic holds and that `read` shows them. Nothing is deleted.
 The operator is told, and the boot log records it (P). If a tier reaches the
-state store's per-namespace limit, saves are refused and a person decides what
-to remove.
+state store's per-namespace limit, saves are refused and an operator decides
+what to delete.
 
-**N. No compaction.**
+**N. Only incorrect facts are dropped. Outdated facts are archived. No
+compaction.**
 Compaction lets a model decide which facts to keep and which to drop. The
 model is capable but not perfect, so some of what it drops will be correct,
-and dropping it is needless: a fact that does not fit in the index can stay
-stored and be read when needed (M). So nothing compresses or rewrites memory.
-A fact changes only when the agent saves, corrects or forgets it, when the
-agent moves its detail out of the statement (M), or when an operator or
-person edits it. Facts are removed only by a correction, a `forget`, or a
-person. Compaction is for a session's own context, not for memory.
+and dropping it is needless: a fact that no longer belongs in the index can be
+kept further away and read when needed. So nothing compresses or rewrites
+memory, and a fact leaves memory only in two ways:
 
-**O. Deleted facts stay deleted.**
+- It is incorrect, and a correction replaces it (I).
+- An operator deletes it from the console, for a removal request such as a
+  person asking for their name to be taken out. The agent cannot delete.
+
+Everything else that is no longer current goes to the archive: a fact that was
+true but no longer applies ("Sam approved contracts until September"), and a
+fact a person asked the agent to forget. When the agent cannot tell whether a
+fact is wrong or only outdated, it archives it, because archiving can be
+undone. Archived facts keep their author and date and can be restored.
+
+**O. Replaced, deleted and archived facts do not come back on their own.**
 Otherwise the agent re-saves the fact on the next turn, because the message
-that produced it is still in the conversation. The store has to remember what
-a person or operator removed; the agent has no way to know.
+that produced it is still in the conversation. The store remembers what was
+replaced or deleted, and refuses a save that would bring it back. A save that
+matches an archived fact is refused with a pointer to it; the agent restores
+it if it is current again. The agent has no other way to know.
 
 **P. Boots log what they loaded.**
 "Found agent tier," "found channel tier," or "found nothing," distinguishably,
-plus how many facts were left out of the index for being past the cap.
+plus how many facts were left out of the index for being past the cap, and
+how many are archived.
 Without this, a tier that was never written and a tier the runner cannot read
 look the same.
 
@@ -264,6 +288,14 @@ look the same.
   is already in the session; only detail and older facts need reading.
 - **Refuse saves over the cap.** No. The fact being saved right now would be
   lost. Older facts are left out of the index instead, and stay readable.
+- **Drop facts that are outdated, or that a person asked to forget.** No, see
+  N. They were correct, and keeping them costs nothing while they stay out of
+  the index.
+- **Leave outdated facts in the index.** No. They would take space from
+  current facts and mislead a model that has no reason to doubt them.
+- **Let the agent delete.** No. Every drop the agent could make on its own
+  judgment is a chance to lose something correct. Only a correction or an
+  operator removes a fact.
 - **Compaction, on a schedule or when a tier fills**
   ([ADR-0111](0111-the-default-memory-compaction-algorithm.md)). No, see N.
   It drops correct facts that could have been kept and simply not loaded.
@@ -304,8 +336,9 @@ look the same.
   rather than guessed.
 - Turning memory on for an agent now means it saves by default. Operators
   should know that before they turn it on, and the console says so.
-- "Who owns what" stores people's names as role facts. That is personal data;
-  `forget` and deletion (O) are how a person has it removed.
+- "Who owns what" stores people's names as role facts. That is personal data.
+  Asking the agent to forget only archives it; a person who wants it removed
+  asks an operator, who deletes it from the console (N).
 - "How to work here" lets any channel member give the agent standing
   instructions. H marks them, but an agent whose side effects are not behind
   approvals is exposed to a harmful one.
@@ -336,11 +369,15 @@ look the same.
    author; the next boot shows only the corrected text. An addition by a
    different person becomes a new fact in the same topic, and the original
    fact and its author are unchanged.
-8. A forgotten or deleted fact stays gone on the next turn, even though the
-   message that produced it is still in the conversation.
-9. "How to work here" facts are injected under the channel-members header,
+8. A replaced or operator-deleted fact stays gone on the next turn, even
+   though the message that produced it is still in the conversation; a save
+   matching an archived fact is refused with a pointer to it.
+9. "Forget that" archives the fact, the reply says it was moved out of active
+   memory, the index shows the topic's archived count, and `restore` brings
+   it back. The agent has no way to delete.
+10. "How to work here" facts are injected under the channel-members header,
    with author and date, below the bundle's prompt.
-10. A planted instruction disguised as memory is saved as a fact, shows its
+11. A planted instruction disguised as memory is saved as a fact, shows its
     author in the console, and does not affect any approval.
 
 ## Related ADRs
