@@ -975,7 +975,8 @@ malicious instruction) on the configured model and again on
 credential), then one authorized same-PR revision and label removal of one
 waiting request and one running request. After the waiting cancellation it
 raises the sandbox pod quota to the chart default with `helm upgrade
---reuse-values`, so the per-agent sandbox warm pool survives. A request that
+--reuse-values`, so the per-agent sandbox warm pool survives. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` so the model session
+does not die while titling itself. A request that
 has not started, a delivery the tunnel rejected, or a run that escalates in
 the first few seconds is cancelled and opened again. A refusal still has to
 end as `no_pull_request`, and the budget case still has to end as

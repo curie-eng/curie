@@ -592,6 +592,12 @@ def install_values(
         values["agentSandbox"]["runner"].update(
             {"fakeModel": False, "model": config.model, "credentials": config.model_api_key}
         )
+        # Claude Code's session-title request does not recognize a gateway model
+        # id. That side request fails the turn as "model error: unknown".
+        # CLAUDE_CODE_DISABLE_TERMINAL_TITLE skips it for Agent SDK sessions.
+        values["agentSandbox"]["runner"]["extraEnv"] = [
+            {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"},
+        ]
         # The chart maximum, so the 1800 s ExecutionRequest deadline and not
         # the default 600 s worker budget bounds the run. The runner ceiling
         # must not exceed the delivery budget.

@@ -453,6 +453,7 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
         "fakeModel": False,
         "model": config.model,
         "credentials": "model-key-value",
+        "extraEnv": [{"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"}],
     }
     assert not {"fakeModel", "model", "credentials"} & set(values["agentSandbox"])
     worker = values["worker"]
@@ -1307,6 +1308,32 @@ def test_quota_hard_pods_reads_the_sandbox_quota() -> None:
     assert fe.quota_hard_pods(listing) == "50"
     assert fe.quota_hard_pods({"items": []}) is None
     assert fe.quota_hard_pods({}) is None
+
+
+def test_real_model_install_skips_session_title_generation(tmp_path: Path) -> None:
+    config = fe.FactoryConfig(
+        kube_context="k8",
+        app_id="1",
+        installation_id=1,
+        private_key_file=tmp_path / "app.pem",
+        repo="acme/fixture",
+        label="curie-factory",
+        mention="acme-bot",
+        cloudflared="cloudflared",
+        priority_classes=None,
+        restore_webhook_url=None,
+        webhook_secret="secret",
+        actor_token="token",
+        model_api_key="test-key",
+    )
+    values = fe.install_values(
+        config,
+        candidate="a" * 40,
+        app_key_secret="ref",
+        consumer_controller=False,
+    )
+    env = values["agentSandbox"]["runner"]["extraEnv"]
+    assert {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"} in env
 
 
 def test_fast_model_crash_is_retried_and_a_real_ending_is_not() -> None:
