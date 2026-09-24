@@ -79,9 +79,9 @@ address, treated as an opaque string (#1459, following
 [ADR-0096](0096-port-adapters-are-deployed-services.md)'s channel-neutral
 port). A Slack channel, a mailbox, and a direct message are all channels. Two
 agents in the same channel do not share memory: each has its own channel tier
-there. No key, API or runner code names a specific surface. A direct message
-is a channel whose address is the person, so private chats get their own
-memory with no extra mechanism. Each tier holds an operator's document (K)
+there. No key, API or runner code names a specific surface. Direct messages
+are the exception to memory altogether: nothing is saved from them (Q). Each
+tier holds an operator's document (K)
 and the agent's own memory (D). A bundle that needs another tier can declare
 one; this needs to be possible, not visible.
 
@@ -149,7 +149,8 @@ archive, and `restore` moves it back. There is no delete, and no search. The dec
 are the tool's instructions, so the model sees exactly what it may save. The
 tool writes only to the channel the message came from; if the model passes a
 channel name, it is ignored. The tool is mounted only when an operator has
-turned memory on for the agent. Upgrading does not turn it on.
+turned memory on for the agent, and never in a direct message (Q). Upgrading
+does not turn it on.
 
 **F. Saves are silent unless the person asked.**
 When someone explicitly says "remember this" or "forget that," the reply
@@ -160,7 +161,8 @@ not announce saves. Never an approval card.
 **G. Every fact records who stated it and when. The platform fills this in.**
 The author is part of the fact's provenance, beside the session id, trace ids
 and timestamp [ADR-0025](0025-memory-port-and-first-loader.md) already
-stores. The existing provenance cannot answer "who said this" on its own: it
+stores. Provenance also records the channel the fact came from and that
+channel's audience (R). The existing provenance cannot answer "who said this" on its own: it
 names no person, and the traces it points to live in the observability store,
 which is optional and does not keep data as long as memory does. The platform
 sets the author from whoever sent the message. The tool has no author
@@ -194,8 +196,10 @@ retained. Accountability for open correction comes from provenance, not from
 permissions.
 
 **J. What may be saved is the bundle's decision, not the runner's.**
-The runner has no content rules of its own. What it enforces is the bundle's
-list of kinds (B), or the defaults (C), plus any exclusion the bundle adds.
+The runner has one content rule of its own, which is a security rule rather
+than a preference: it refuses to save secrets (S). Otherwise what it enforces
+is the bundle's list of kinds (B), or the defaults (C), plus any exclusion the
+bundle adds.
 The platform can check mechanically that a save names a declared kind. It
 cannot check that the text really is that kind of fact; that stays a model
 judgment, backed by provenance and open correction.
@@ -260,11 +264,70 @@ how many are archived.
 Without this, a tier that was never written and a tier the runner cannot read
 look the same.
 
+**Q. Nothing is saved from direct messages.**
+A direct message with the agent is private to the person in it, and memory
+would keep what they said where others could reach it: an operator reading
+the store, or the agent tier carrying it to other channels. So the save tool
+is not mounted in a direct message, and the platform refuses any memory write
+whose turn came from one. If someone in a DM asks the agent to remember
+something, it says it does not keep memory from direct messages. The agent
+tier and the operator's documents are still read in a DM. Slack does not
+remove this need: how long it keeps direct messages, bots' included, is each
+workspace's retention setting.
+
+**R. Every fact carries its source audience, and memory never reaches a wider
+one.**
+The adapter reports each channel's audience, and provenance records it with
+the fact:
+
+| Where the fact came from | Audience |
+|---|---|
+| A private channel, or a private email thread | private: only the people in it |
+| A channel open to the whole organization | internal |
+| A channel or email thread that includes people outside the organization | external |
+
+A channel whose audience is unknown is treated as private. The audience is
+enforced in three places, all deterministic:
+
+1. **On write.** A fact from a private or external channel cannot be written
+   to the agent tier, because the agent tier reaches every channel. It can
+   still be saved in its own channel's tier.
+2. **On boot and `read`.** A session is given only the facts whose audience
+   covers where its reply is going. A private or external fact is available
+   only in its own channel; an internal fact is available in any internal
+   channel. A reply to an email thread that includes an outside address sees
+   only facts from that thread. A fact the agent never sees cannot leak.
+3. **On the way out.** Before a reply is posted or sent, it is checked for the
+   exact statement of any fact whose audience does not cover the destination.
+   A match stops the send and is flagged to the operator. This catches a fact
+   that reached the session some other way, such as being quoted in the
+   conversation.
+
+The console shows every agent-tier fact with its source channel and audience,
+and flags any that came from a private or external one.
+
+**S. Secrets are never saved.**
+Every write is checked against secret patterns (API keys, tokens, private
+keys, passwords in connection strings), the same kind of check the repository
+runs on commits. A match is refused and reported as refused, whatever the
+declared kind. This is the one content check the runner owns, because a
+leaked credential is a security failure, not a matter of what a bundle wants
+to remember.
+
 ## Alternatives considered
 
 - **A per-person tier.** No. It splits facts a channel should share, and
   facts keyed to a person tend to be facts about that person, which then
-  follow them around. DMs already get their own memory via the channel tier.
+  follow them around.
+- **Memory in direct messages.** No, see Q. The convenience is real, but a DM
+  is the one place a person reasonably expects nothing to be kept.
+- **Require operator approval for agent-tier writes.** No. Writes will be
+  common, approval would make the agent tier impractical, and it would put a
+  third party in front of facts people did not address to them. The audience
+  rule (R) keeps private facts out of the agent tier without it.
+- **Rely on the model to keep private facts out of the agent tier.** No. It is
+  the case where a misjudgement reaches the most people, so the check is
+  mechanical (R).
 - **Save nothing unless the bundle declares kinds.** No. The out-of-the-box
   agent would forget every instruction, decision and owner it is told about,
   which is most of what a channel agent needs to keep.
@@ -278,7 +341,8 @@ look the same.
 - **A platform-wide content rule** ("never store comments about people").
   No. The code can't judge whether a sentence is about a person, and a rule
   enforced only by a prompt isn't enforced. The defaults (C) leave personal
-  descriptions out by not declaring a kind for them.
+  descriptions out by not declaring a kind for them. Secrets are different:
+  they can be matched mechanically, so they are refused (S).
 - **One index line per fact, with no topics.** No. A channel agent's memory
   grows faster than a Claude Code session's, and every fact would cost an
   index line.
@@ -346,6 +410,21 @@ look the same.
   [ADR-0111](0111-the-default-memory-compaction-algorithm.md) are marked as
   folded into this one. The acceptance PR sets them to
   `Superseded by ADR-0167`.
+- Each adapter must report a channel's audience. Slack can tell a direct
+  message, a private channel, a public channel and a channel shared with
+  another organization apart. Email derives it from the thread's recipients.
+  Until an adapter reports audience, its channels are treated as private.
+- Traces still record every turn, direct messages included, in full. Keeping
+  direct messages out of memory does not keep them out of the trace store,
+  which anyone with trace access can read. Keeping them private end to end
+  needs trace redaction, which is its own decision.
+- Whether an operator can read a private channel's memory is not decided
+  here. The proposed default is that they cannot. It belongs with the trace
+  redaction decision, since an operator with trace access could read the
+  channel anyway.
+- The outbound check (R) catches the exact statement of a fact, not a
+  paraphrase. Keeping restricted facts out of the session is the main guard;
+  the check is the backstop.
 - Known gaps: no time-based expiry, so stale facts stay until corrected,
   though their dates are visible; the channel tier assumes one agent per
   channel until multi-channel lands.
@@ -379,6 +458,18 @@ look the same.
    with author and date, below the bundle's prompt.
 11. A planted instruction disguised as memory is saved as a fact, shows its
     author in the console, and does not affect any approval.
+12. In a direct message, no save tool is mounted and a direct write is
+    refused; the agent tier is still read.
+13. A fact from a private channel is refused in the agent tier and saved in
+    its own channel's tier; a channel with unknown audience is treated as
+    private.
+14. A session replying to an internal channel does not see another channel's
+    private facts; a reply to an email thread with an outside address sees
+    only that thread's facts.
+15. A reply containing the exact statement of a restricted fact is stopped
+    before sending and flagged.
+16. A save containing an API key or token is refused and reported as refused,
+    whatever its kind.
 
 ## Related ADRs
 
