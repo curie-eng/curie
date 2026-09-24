@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from .. import workitem_dispatch
 from ..auth import require_internal_worker_token
+from ..config import get_settings
 from ..deps import SessionDep
 from ..workitem_dispatch import DispatchConflict
 from ..workitems import WorkItemConflict, WorkItemOutcome
@@ -59,6 +60,11 @@ class StartBody(BaseModel):
 
 
 class HeartbeatBody(BaseModel):
+    runtime_epoch: int = Field(ge=1)
+
+
+class OwnerLostBody(BaseModel):
+    owner: str = Field(min_length=1)
     runtime_epoch: int = Field(ge=1)
 
 
@@ -125,6 +131,25 @@ async def running_work_item_request(
         "runtime_epoch": row.runtime_epoch,
         "execution_deadline": row.execution_deadline.isoformat(),
         "status": row.status,
+    }
+
+
+@router.get("/runtime-owners")
+async def list_work_item_runtime_owners(
+    session: SessionDep, after: uuid.UUID | None = None
+) -> dict[str, Any]:
+    rows = await workitem_dispatch.list_runtime_owners(
+        session, limit=get_settings().work_item_batch_limit, after=after
+    )
+    return {
+        "requests": [
+            {
+                "request_id": str(row.request_id),
+                "runtime_owner": row.runtime_owner,
+                "runtime_epoch": row.runtime_epoch,
+            }
+            for row in rows
+        ]
     }
 
 
@@ -253,6 +278,19 @@ async def hold_work_item_for_approval(
         "terminal_cause": result.terminal_cause,
         "work_item_cancelled": result.work_item_cancelled,
     }
+
+
+@router.post("/requests/{request_id}/owner-lost")
+async def declare_work_item_owner_lost(
+    request_id: uuid.UUID, body: OwnerLostBody, session: SessionDep
+) -> dict[str, Any]:
+    result = await workitem_dispatch.declare_owner_lost(
+        session, request_id, owner=body.owner, runtime_epoch=body.runtime_epoch
+    )
+    if isinstance(result, DispatchConflict):
+        _raise_conflict(result)
+    assert not isinstance(result, DispatchConflict)
+    return {"status": result.status, "terminal_cause": result.terminal_cause}
 
 
 @router.post("/requests/{request_id}/finish")

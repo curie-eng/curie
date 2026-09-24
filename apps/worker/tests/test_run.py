@@ -1041,6 +1041,7 @@ class _FakeRuntime:
         self.pressure_async_redis = _FakeTransport()
         self.eval_redis = _FakeTransport()
         self.engine = _FakeTransport()
+        self.orphan_sweeper = None
 
 
 def _boot(

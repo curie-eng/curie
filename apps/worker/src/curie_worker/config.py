@@ -1112,6 +1112,10 @@ class WorkerConfig(BaseSettings):
     cron_tick_interval_s: float = Field(
         default=30.0, gt=0, validation_alias="CURIE_CRON_TICK_INTERVAL_S"
     )
+    # How often the worker looks for WorkItem runs whose owner died (#3076).
+    work_item_orphan_sweep_interval_s: float = Field(
+        default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
+    )
     # The reconciler reuses `connector_release` / `connector_namespace` above --
     # deliberately the same two values the runner's connector scope is built
     # from. They must agree: the runner dials a Service by the name those

@@ -4154,6 +4154,26 @@
         "title": "ObservationNode",
         "type": "object"
       },
+      "OwnerLostBody": {
+        "properties": {
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "owner",
+          "runtime_epoch"
+        ],
+        "title": "OwnerLostBody",
+        "type": "object"
+      },
       "PodLogs": {
         "description": "Runner-pod logs for the per-run runner-logs affordance.",
         "properties": {
@@ -13948,6 +13968,77 @@
         ]
       }
     },
+    "/v1/internal/work-items/requests/{request_id}/owner-lost": {
+      "post": {
+        "operationId": "declare_work_item_owner_lost_v1_internal_work_items_requests__request_id__owner_lost_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnerLostBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Declare Work Item Owner Lost V1 Internal Work Items Requests  Request Id  Owner Lost Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Declare Work Item Owner Lost",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
     "/v1/internal/work-items/requests/{request_id}/start": {
       "post": {
         "operationId": "start_work_item_request_v1_internal_work_items_requests__request_id__start_post",
@@ -14216,6 +14307,74 @@
           }
         },
         "summary": "Running Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/runtime-owners": {
+      "get": {
+        "operationId": "list_work_item_runtime_owners_v1_internal_work_items_runtime_owners_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Work Item Runtime Owners V1 Internal Work Items Runtime Owners Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Work Item Runtime Owners",
         "tags": [
           "internal-work-items"
         ]

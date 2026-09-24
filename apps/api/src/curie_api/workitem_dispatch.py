@@ -104,6 +104,19 @@ class ClaimedDispatch:
 
 
 @dataclass(frozen=True)
+class RuntimeOwnerRow:
+    request_id: uuid.UUID
+    runtime_owner: str
+    runtime_epoch: int
+
+
+@dataclass(frozen=True)
+class OwnerLostResult:
+    status: str
+    terminal_cause: str | None
+
+
+@dataclass(frozen=True)
 class TerminatePublish:
     request_id: uuid.UUID
     reply_kind: str
@@ -851,6 +864,124 @@ async def hold_for_approval(
         terminal_cause=request.terminal_cause,
         work_item_cancelled=work_item is not None and work_item.cancelled_at is not None,
     )
+    await session.commit()
+    return result
+
+
+def _not_approval_hold() -> ColumnElement[bool]:
+    # hold_for_approval parks the lease at exactly the execution deadline.
+    return ExecutionRequest.runtime_heartbeat_expires_at.is_distinct_from(
+        ExecutionRequest.execution_deadline
+    )
+
+
+async def list_runtime_owners(
+    session: AsyncSession, *, limit: int, after: uuid.UUID | None = None
+) -> list[RuntimeOwnerRow]:
+    """Running requests with a live runtime owner, approval holds excluded.
+
+    Ordered by id so a caller pages with `after` set to the last id it saw.
+    """
+
+    rows = (
+        await session.execute(
+            select(
+                ExecutionRequest.id,
+                ExecutionRequest.runtime_owner,
+                ExecutionRequest.runtime_epoch,
+            )
+            .where(
+                ExecutionRequest.status == "running",
+                ExecutionRequest.runtime_owner.is_not(None),
+                _not_approval_hold(),
+                *(() if after is None else (ExecutionRequest.id > after,)),
+            )
+            .order_by(ExecutionRequest.id)
+            .limit(limit)
+        )
+    ).all()
+    await session.commit()
+    return [
+        RuntimeOwnerRow(
+            request_id=row.id,
+            runtime_owner=row.runtime_owner,
+            runtime_epoch=row.runtime_epoch,
+        )
+        for row in rows
+        if row.runtime_owner is not None
+    ]
+
+
+async def declare_owner_lost(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    owner: str,
+    runtime_epoch: int,
+) -> OwnerLostResult | DispatchConflict:
+    """A worker proved ``owner`` dead; hand the run to the terminate chain.
+
+    The runtime lease expires now so any worker can claim the termination.
+    """
+
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
+    if work_item.cancelled_at is not None:
+        return await _refuse(
+            session,
+            "work_item_cancelled",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
+    held = (
+        request.runtime_heartbeat_expires_at is not None
+        and request.runtime_heartbeat_expires_at == request.execution_deadline
+    )
+    if (
+        request.status != "running"
+        or request.runtime_owner != owner
+        or request.runtime_epoch != runtime_epoch
+        or held
+    ):
+        return await _refuse(
+            session,
+            "stale_owner",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
+    changed_id = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.status == "running",
+            ExecutionRequest.runtime_owner == owner,
+            ExecutionRequest.runtime_epoch == runtime_epoch,
+            _not_approval_hold(),
+        )
+        .values(
+            status="cancellation_requested",
+            terminal_cause="owner_lost",
+            cancellation_requested_at=func.clock_timestamp(),
+            runtime_heartbeat_expires_at=func.clock_timestamp(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _refuse(
+            session,
+            "stale_owner",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
+    request = await _reload_request(session, request.id)
+    result = OwnerLostResult(status=request.status, terminal_cause=request.terminal_cause)
     await session.commit()
     return result
 

@@ -251,6 +251,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
         # Cron scheduler tick (#268), read by the worker process only.
         "CURIE_CRON_TICK_INTERVAL_S",
+        # WorkItem orphan sweep cadence (#3076), read by the worker process only.
+        "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
