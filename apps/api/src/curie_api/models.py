@@ -37,6 +37,22 @@ from .repo_full_name import normalize_repo_full_name
 GIT_FLOW_CREATED_BY = "git-flow"
 
 
+# The tenant self-host auto-provisions (migration 0051), at a fixed id so later
+# migrations and server defaults can name it without a lookup.
+DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+class AgentStatus(enum.StrEnum):
+    """Lifecycle of a bot (ADR 0155 section 3). A plain string column checked by
+    ``agents_status_ck``. Nothing routes on it yet: which states still answer a
+    channel event is decided where inbound events are authorized (#2914)."""
+
+    active = "active"
+    paused = "paused"
+    draining = "draining"
+    retired = "retired"
+
+
 class Environment(enum.StrEnum):
     prod = "prod"
     dev = "dev"
@@ -87,9 +103,38 @@ class Agent(Base):
             "AND publication_branch_prefix NOT LIKE '%./')",
             name="agents_publication_branch_prefix_ck",
         ),
+        CheckConstraint(
+            "status IN ('active', 'paused', 'draining', 'retired')",
+            name="agents_status_ck",
+        ),
+        # Carries tenant_id, so the owning team must be a team of the same tenant.
+        ForeignKeyConstraint(
+            ["tenant_id", "owning_team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            name="agents_owning_team_fkey",
+        ),
+        Index("ix_agents_owning_team_id", "owning_team_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # The bot's tenant (ADR 0155 step 6, migration 0054). The server default is
+    # the default tenant so an N-1 writer inside the schema window, which names
+    # no tenant, still lands its row somewhere valid. The worker's binding
+    # resolver matches only its own tenant's agents.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="agents_tenant_id_fkey"),
+        default=DEFAULT_TENANT_ID,
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
+    )
+    status: Mapped[str] = mapped_column(
+        default=AgentStatus.active.value, server_default=AgentStatus.active.value
+    )
+    owning_team_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    # Opaque references into policy stores that do not exist yet. Nothing
+    # dereferences them in this release.
+    topic_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    data_classification_ref: Mapped[str | None] = mapped_column(default=None)
+    retention_policy_ref: Mapped[str | None] = mapped_column(default=None)
     name: Mapped[str] = mapped_column(unique=True)
     # The GitHub repo (owner/name) whose pushes deploy this agent (J1).
     #
@@ -290,6 +335,16 @@ class AgentChannel(Base):
         # `FOR UPDATE` on every add, move and delete; unindexed, each of those
         # scans the whole table while holding locks.
         Index("ix_agent_channels_agent_id", "agent_id"),
+        # Carries tenant_id, so the installation must belong to the binding's tenant.
+        ForeignKeyConstraint(
+            ["tenant_id", "provider_installation_id"],
+            [
+                f"{SCHEMA}.provider_installations.tenant_id",
+                f"{SCHEMA}.provider_installations.id",
+            ],
+            name="agent_channels_provider_installation_fkey",
+        ),
+        Index("ix_agent_channels_provider_installation_id", "provider_installation_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -298,6 +353,20 @@ class AgentChannel(Base):
     )
     kind: Mapped[str]
     address: Mapped[str]
+    # The agent's tenant, copied onto the row by every write path. The resolver
+    # requires both to match, so a row out of step with its agent fails closed.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="agent_channels_tenant_id_fkey"),
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
+    )
+    # The connected account this binding arrives through (ADR 0155). NULL is
+    # today's statically configured single Slack app, unchanged.
+    provider_installation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    # The work-item topic this binding serves; its foreign key arrives with the
+    # work-item subsystem.
+    topic_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     # The server-controlled reply route (migration 0024). Both NULL for `slack`,
     # whose route is the worker's configured Slack origin; both set together for
     # any other kind -- `agent_channels_route_pair_ck` states that invariant at
@@ -320,6 +389,11 @@ class AgentVersion(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
     )
+    # Row scoping only: the agent's tenant, copied by the write path.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="agent_versions_tenant_id_fkey"),
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
+    )
     version_label: Mapped[str]
     bundle_ref: Mapped[str | None] = mapped_column(default=None)
     bundle_sha256: Mapped[str | None] = mapped_column(default=None)
@@ -341,6 +415,11 @@ class Deployment(Base):
     )
     version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE"), index=True
+    )
+    # Row scoping only: the agent's tenant, copied by the write path.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="deployments_tenant_id_fkey"),
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
     )
     environment: Mapped[Environment] = mapped_column(
         Enum(Environment, name="environment", schema=SCHEMA)
@@ -1725,6 +1804,8 @@ class ProviderInstallation(Base):
             "external_account_id",
             name="provider_installations_tenant_provider_external_key",
         ),
+        # Target of agent_channels' tenant-scoped foreign key.
+        UniqueConstraint("tenant_id", "id", name="provider_installations_tenant_id_id_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

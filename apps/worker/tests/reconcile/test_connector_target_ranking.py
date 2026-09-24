@@ -183,9 +183,7 @@ def test_the_prod_winner_is_reported_even_when_it_has_no_bundle() -> None:
         engine = await _engine_or_skip()
         try:
             token = uuid.uuid4().hex[:8]
-            agent_id = await _seed_agent(
-                engine, name=f"rank-{token}", address=f"C-rank-{token}"
-            )
+            agent_id = await _seed_agent(engine, name=f"rank-{token}", address=f"C-rank-{token}")
             prod_version = await _seed_deployment(
                 engine,
                 agent_id=agent_id,
@@ -239,9 +237,7 @@ def test_a_pass_prunes_rather_than_reconciling_a_lower_precedence_version() -> N
         try:
             token = uuid.uuid4().hex[:8]
             agent_name = f"prune-{token}"
-            agent_id = await _seed_agent(
-                engine, name=agent_name, address=f"C-prune-{token}"
-            )
+            agent_id = await _seed_agent(engine, name=agent_name, address=f"C-prune-{token}")
             prod_version = await _seed_deployment(
                 engine,
                 agent_id=agent_id,
@@ -260,9 +256,7 @@ def test_a_pass_prunes_rather_than_reconciling_a_lower_precedence_version() -> N
                 client = FakeClient(
                     [
                         live_copy(manifest("Service", f"svc-{token}"), agent=agent_name),
-                        live_copy(
-                            manifest("Deployment", f"dep-{token}"), agent=agent_name
-                        ),
+                        live_copy(manifest("Deployment", f"dep-{token}"), agent=agent_name),
                     ]
                 )
                 source = RefusesForAgent(agent_id)
@@ -281,9 +275,7 @@ def test_a_pass_prunes_rather_than_reconciling_a_lower_precedence_version() -> N
                     "the runner-up was rendered: the pass is reconciling a "
                     "version this agent's sandbox does not boot"
                 )
-                assert client.applied == [], (
-                    "objects were applied from a version no sandbox boots"
-                )
+                assert client.applied == [], "objects were applied from a version no sandbox boots"
                 assert sorted(client.deleted) == [
                     ("Deployment", f"dep-{token}"),
                     ("Service", f"svc-{token}"),
@@ -344,7 +336,12 @@ def test_the_two_queries_agree_on_the_winner() -> None:
                     bound: Any = (
                         (
                             await conn.execute(
-                                resolve_sql, {"kind": "slack", "address": address}
+                                resolve_sql,
+                                {
+                                    "kind": "slack",
+                                    "address": address,
+                                    "tenant_id": binding.DEFAULT_TENANT_ID,
+                                },
                             )
                         )
                         .mappings()
@@ -391,9 +388,7 @@ def test_the_two_queries_agree_on_the_more_recent_of_two_prod_deployments() -> N
         try:
             token = uuid.uuid4().hex[:8]
             address = f"C-recency-{token}"
-            agent_id = await _seed_agent(
-                engine, name=f"recency-{token}", address=address
-            )
+            agent_id = await _seed_agent(engine, name=f"recency-{token}", address=address)
             older_version = await _seed_deployment(
                 engine,
                 agent_id=agent_id,
@@ -415,7 +410,12 @@ def test_the_two_queries_agree_on_the_more_recent_of_two_prod_deployments() -> N
                     bound: Any = (
                         (
                             await conn.execute(
-                                resolve_sql, {"kind": "slack", "address": address}
+                                resolve_sql,
+                                {
+                                    "kind": "slack",
+                                    "address": address,
+                                    "tenant_id": binding.DEFAULT_TENANT_ID,
+                                },
                             )
                         )
                         .mappings()

@@ -23,7 +23,7 @@ from curie_api.config import get_settings
 from curie_api.deps import get_session
 from curie_api.main import create_app
 from curie_api.models import WorkflowStateEntry
-from curie_worker.binding import BindingResolver
+from curie_worker.binding import BindingResolver, ResolvedDeployment
 from curie_worker.config import WorkerConfig
 from fastapi.testclient import TestClient
 from sqlalchemy import UniqueConstraint
@@ -197,8 +197,38 @@ def _runner_state_url(*, kind: str, address: str) -> str:
         )
         try:
             resolver = BindingResolver(engine, config)
-            resolved = await resolver.resolve(kind, address)
-            assert resolved is not None
+            # Not `resolver.resolve()`: that is HEAD worker SQL, which reads
+            # columns later revisions add (tenant_id, 0054), and head worker code
+            # is not required to run below head. This test is at 0036/0037, so
+            # the binding is read with SQL valid at that revision and the real
+            # `boot_env` still derives the state URL from agent id + memory.
+            async with engine.connect() as conn:
+                row = (
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT a.id AS agent_id, a.name AS agent_name, "
+                                "a.memory AS memory, d.id AS deployment_id, "
+                                "v.id AS version_id, v.version_label AS version_label, "
+                                "v.bundle_ref AS bundle_ref, "
+                                "a.max_usd_per_day AS max_usd_per_day, "
+                                "a.max_output_tokens_per_run AS max_output_tokens_per_run "
+                                f"FROM {SCHEMA}.agents a "
+                                f"JOIN {SCHEMA}.agent_channels c ON c.agent_id = a.id "
+                                f"JOIN {SCHEMA}.deployments d "
+                                "ON d.agent_id = a.id AND d.status = 'active' "
+                                f"JOIN {SCHEMA}.agent_versions v "
+                                "ON v.id = d.version_id AND v.agent_id = a.id "
+                                "WHERE c.kind = :kind AND c.address = :address"
+                            ),
+                            {"kind": kind, "address": address},
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+            assert len(row) == 1, row
+            resolved = ResolvedDeployment.model_validate(dict(row[0]))
             env = resolver.boot_env(
                 resolved,
                 "migration-thread",
@@ -251,9 +281,7 @@ def test_legacy_state_runner_url_and_value_survive_upgrade(
     }
 
     isolated_url = _runner_state_url(kind=KIND, address=ADDRESS)
-    assert isolated_url.endswith(
-        f"/agents/{legacy_id}/state/bindings/{KIND}/{ADDRESS}"
-    )
+    assert isolated_url.endswith(f"/agents/{legacy_id}/state/bindings/{KIND}/{ADDRESS}")
     hidden = _api_get(f"{isolated_url}/workflow/legacy-key")
     assert hidden.status_code == 404
     assert hidden.json() == {"detail": "state entry not found"}
@@ -298,9 +326,7 @@ def test_legacy_unscoped_general_state_deliberately_flips_when_provenance_is_amb
 
     assert _memory_by_name() == {"ambiguous-provenance-owner": True}
     assert _state_rows(agent_id) == before
-    visible = _api_get(
-        f"http://migration-api.test/agents/{agent_id}/state/workflow/ambiguous-key"
-    )
+    visible = _api_get(f"http://migration-api.test/agents/{agent_id}/state/workflow/ambiguous-key")
     assert visible.status_code == 200, visible.text
     assert visible.json()["value"] == original_value
 

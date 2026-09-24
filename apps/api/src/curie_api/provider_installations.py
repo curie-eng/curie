@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .config import Settings
 from .models import (
+    DEFAULT_TENANT_ID,
     PROVIDER_REFERENCE_DENY_PATTERN,
     PROVIDER_REFERENCE_MAX_LENGTH,
     PROVIDER_REFERENCE_PATTERN,
@@ -41,8 +42,6 @@ from .schemas import ProviderInstallationCreate, ProviderInstallationUpdate
 
 _LOG = logging.getLogger("curie_api.provider_installations")
 
-# Migration 0051's auto-provisioned tenant.
-DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 # Fixed, like the default tenant, so replicas booting together collide on the
 # primary key rather than each inserting a row, and so the row keeps its
 # identity after an administrator renames ``external_account_id``.
@@ -97,6 +96,11 @@ _CONSTRAINT_ERRORS: dict[str, tuple[type[Exception], str]] = {
     "provider_installations_installer_fkey": (
         InstallationInvalid,
         "installed_by_principal_id is not a principal of this tenant",
+    ),
+    # A binding arriving through this installation keeps it: unbind first.
+    "agent_channels_provider_installation_fkey": (
+        InstallationConflict,
+        "a channel binding still arrives through this provider installation",
     ),
 }
 
@@ -195,7 +199,7 @@ async def update_installation(
 
 async def delete_installation(session: AsyncSession, installation: ProviderInstallation) -> None:
     await session.delete(installation)
-    await session.commit()
+    await _commit(session)
 
 
 # --- the static Slack app --------------------------------------------------
