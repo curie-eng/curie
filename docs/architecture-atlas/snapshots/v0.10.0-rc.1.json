@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "next",
-    "commit": "7917c6d826df2ffac63373b796b62ac138133507",
-    "shortCommit": "7917c6d8",
+    "commit": "d02f64e26047c1531163bb7167e7e47fb380135c",
+    "shortCommit": "d02f64e2",
     "release": "v0.10.0-rc.1"
   },
   "title": "Curie architecture atlas",
@@ -1044,84 +1044,84 @@
       "type": "code",
       "title": "Factory Bundle Code",
       "path": "examples/dark-factory/skills/implement-issue/SKILL.md",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/examples/dark-factory/skills/implement-issue/SKILL.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/examples/dark-factory/skills/implement-issue/SKILL.md"
     },
     {
       "id": "factory-ingress-code",
       "type": "code",
       "title": "Factory Ingress Code",
       "path": "apps/api/src/curie_api/github_factory.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/src/curie_api/github_factory.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/src/curie_api/github_factory.py"
     },
     {
       "id": "workitem-code",
       "type": "code",
       "title": "Workitem Code",
       "path": "apps/api/src/curie_api/workitems.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/src/curie_api/workitems.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/src/curie_api/workitems.py"
     },
     {
       "id": "factory-status-code",
       "type": "code",
       "title": "Factory Status Code",
       "path": "apps/api/src/curie_api/factory_card.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/src/curie_api/factory_card.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/src/curie_api/factory_card.py"
     },
     {
       "id": "factory-worker-code",
       "type": "code",
       "title": "Factory Worker Code",
       "path": "apps/worker/src/curie_worker/workitem_dispatch.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/worker/src/curie_worker/workitem_dispatch.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/worker/src/curie_worker/workitem_dispatch.py"
     },
     {
       "id": "cron-worker-code",
       "type": "code",
       "title": "Cron Worker Code",
       "path": "apps/worker/src/curie_worker/cron_loop.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/worker/src/curie_worker/cron_loop.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/worker/src/curie_worker/cron_loop.py"
     },
     {
       "id": "transcripts-code",
       "type": "code",
       "title": "Transcripts Code",
       "path": "apps/api/src/curie_api/transcripts.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/src/curie_api/transcripts.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/src/curie_api/transcripts.py"
     },
     {
       "id": "migration-0046-code",
       "type": "code",
       "title": "Migration 0046 Code",
       "path": "apps/api/alembic/versions/0046_work_items.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/alembic/versions/0046_work_items.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/alembic/versions/0046_work_items.py"
     },
     {
       "id": "migration-0048-code",
       "type": "code",
       "title": "Migration 0048 Code",
       "path": "apps/api/alembic/versions/0048_hook_runs.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/alembic/versions/0048_hook_runs.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/alembic/versions/0048_hook_runs.py"
     },
     {
       "id": "migration-0053-code",
       "type": "code",
       "title": "Migration 0053 Code",
       "path": "apps/api/alembic/versions/0053_thread_transcripts.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/alembic/versions/0053_thread_transcripts.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/alembic/versions/0053_thread_transcripts.py"
     },
     {
       "id": "migration-0056-code",
       "type": "code",
       "title": "Migration 0056 Code",
       "path": "apps/api/alembic/versions/0056_factory_status_comments.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/apps/api/alembic/versions/0056_factory_status_comments.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/apps/api/alembic/versions/0056_factory_status_comments.py"
     },
     {
       "id": "factory-driver-code",
       "type": "code",
       "title": "Factory Driver Code",
       "path": "tools/factory-e2e/factory_e2e.py",
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/tools/factory-e2e/factory_e2e.py"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/tools/factory-e2e/factory_e2e.py"
     }
   ],
   "documentationDrift": [
@@ -5324,7 +5324,7 @@
       "seamIds": [
         "triggers"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0160-a-long-scheduled-sweep-stays-on-one-sandbox.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0160-a-long-scheduled-sweep-stays-on-one-sandbox.md"
     },
     {
       "id": "ADR-0161",
@@ -5341,7 +5341,7 @@
       "seamIds": [
         "triggers"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0161-signed-github-issue-events-admit-one-work-item.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0161-signed-github-issue-events-admit-one-work-item.md"
     },
     {
       "id": "ADR-0162",
@@ -5360,7 +5360,7 @@
         "triggers",
         "relational-db"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0162-work-items-own-durable-execution-identity.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0162-work-items-own-durable-execution-identity.md"
     },
     {
       "id": "ADR-0165",
@@ -5377,7 +5377,7 @@
       "seamIds": [
         "triggers"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md"
     },
     {
       "id": "ADR-0166",
@@ -5394,7 +5394,7 @@
       "seamIds": [
         "relational-db"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0166-tenant-boundary-and-principal-identity-land-together.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0166-tenant-boundary-and-principal-identity-land-together.md"
     },
     {
       "id": "ADR-0168",
@@ -5410,7 +5410,7 @@
       "seamIds": [
         "channel-ingress"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0168-one-installation-hosts-several-bot-identities.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0168-one-installation-hosts-several-bot-identities.md"
     },
     {
       "id": "ADR-0169",
@@ -5426,7 +5426,7 @@
       "seamIds": [
         "mcp-service-auth"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md"
     },
     {
       "id": "ADR-0170",
@@ -5443,7 +5443,7 @@
       "seamIds": [
         "workflow-state"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0170-conversation-transcripts-live-in-their-own-per-thread-table.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0170-conversation-transcripts-live-in-their-own-per-thread-table.md"
     },
     {
       "id": "ADR-0171",
@@ -5459,7 +5459,7 @@
       "seamIds": [
         "queue-stream"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md"
     },
     {
       "id": "ADR-0172",
@@ -5475,7 +5475,7 @@
       "seamIds": [
         "mcp-service-auth"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md"
     },
     {
       "id": "ADR-0173",
@@ -5491,7 +5491,7 @@
       "seamIds": [
         "substrate"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/7917c6d826df2ffac63373b796b62ac138133507/docs/adr/0173-a-bundle-may-layer-its-own-runner-image.md"
+      "href": "https://github.com/curie-eng/curie/blob/d02f64e26047c1531163bb7167e7e47fb380135c/docs/adr/0173-a-bundle-may-layer-its-own-runner-image.md"
     }
   ],
   "investments": [
