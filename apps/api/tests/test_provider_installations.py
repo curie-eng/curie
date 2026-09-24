@@ -377,10 +377,19 @@ def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str,
 def _cleanup() -> None:
     # Tolerates the table being absent so a missing migration fails the test
     # body with a clear error rather than erroring every fixture.
+    # Test-seeded agents go first: since 0054 their bindings may reference an
+    # installation. DELETE, not TRUNCATE: agent_channels now holds an FK to
+    # provider_installations, and TRUNCATE refuses a referenced table outright.
+    _sql(
+        "DELETE FROM curie.agent_channels WHERE agent_id IN "
+        "(SELECT id FROM curie.agents WHERE name LIKE :mark)",
+        {"mark": f"{MARK}%"},
+    )
+    _sql("DELETE FROM curie.agents WHERE name LIKE :mark", {"mark": f"{MARK}%"})
     _sql(
         "DO $$ BEGIN "
         "IF to_regclass('curie.provider_installations') IS NOT NULL THEN "
-        "TRUNCATE curie.provider_installations; END IF; END $$"
+        "DELETE FROM curie.provider_installations; END IF; END $$"
     )
     _sql("DELETE FROM curie.principals WHERE idp_subject LIKE :mark", {"mark": f"{MARK}%"})
     _sql("DELETE FROM curie.tenants WHERE deployment_id LIKE :mark", {"mark": f"{MARK}%"})
@@ -524,6 +533,37 @@ def test_create_list_get_patch_delete(api: TestClient, auth_headers: dict[str, s
 
     assert api.delete(f"{BASE}/{installation_id}", headers=auth_headers).status_code == 204
     assert api.get(f"{BASE}/{installation_id}", headers=auth_headers).status_code == 404
+
+
+def test_delete_installation_referenced_by_a_binding_returns_409(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    referenced = _create(api, auth_headers)
+    unreferenced = _create(api, auth_headers)
+    agent_id = uuid.uuid4()
+    _sql(
+        "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
+        {"id": agent_id, "name": f"{MARK}{agent_id}"},
+    )
+    _sql(
+        "INSERT INTO curie.agent_channels "
+        "(id, agent_id, tenant_id, kind, address, provider_installation_id) "
+        "VALUES (:id, :agent_id, :tenant_id, 'slack', :address, :installation_id)",
+        {
+            "id": uuid.uuid4(),
+            "agent_id": agent_id,
+            "tenant_id": DEFAULT_TENANT_UUID,
+            "address": f"C{uuid.uuid4().hex[:12].upper()}",
+            "installation_id": uuid.UUID(referenced["id"]),
+        },
+    )
+
+    response = api.delete(f"{BASE}/{referenced['id']}", headers=auth_headers)
+    assert response.status_code == 409, response.text
+    assert "channel binding" in response.text.lower()
+    assert api.get(f"{BASE}/{referenced['id']}", headers=auth_headers).status_code == 200
+
+    assert api.delete(f"{BASE}/{unreferenced['id']}", headers=auth_headers).status_code == 204
 
 
 def test_create_with_same_tenant_installer(api: TestClient, auth_headers: dict[str, str]) -> None:

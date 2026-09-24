@@ -9,7 +9,9 @@ agent_versions.
 
 Resolution rule: an agent holds one or more rows in ``agent_channels``
 (ADR-0096, #1459; ADR-0118). Resolution is from the ``(kind, address)`` pair to
-the agent, so the count of bindings per agent never affects the predicate. The
+the agent, so the count of bindings per agent never affects the predicate, and
+only within the resolver's tenant: the agent and the binding row must both carry
+it (ADR 0155 step 6). The
 run uses that agent's active
 deployment (deployments.status = 'active'); when both a prod and a dev
 deployment are active, prod wins, then the most recent. An address with no
@@ -199,6 +201,10 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
     except ValueError:
         return None
 
+# Migration 0051's auto-provisioned tenant, the one every row belongs to until
+# a second tenant exists. A frozen copy: this package does not import the API's.
+DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
 # The trailing `d.id DESC` carries no meaning of its own -- id order is not a
 # precedence rule and nothing may start reading one into it. It exists only to
 # make the order TOTAL: two active deployments in the same environment with an
@@ -232,6 +238,7 @@ JOIN {schema}.agent_channels c ON c.agent_id = a.id
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
@@ -247,6 +254,7 @@ SELECT a.id AS agent_id,
 FROM {schema}.agents a
 JOIN {schema}.agent_channels c ON c.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 """
 
 
@@ -364,11 +372,26 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
 
 
 class BindingResolver:
-    """Resolves a channel address to its active agent deployment (read-only)."""
+    """Resolves a channel address to its active agent deployment (read-only).
 
-    def __init__(self, engine: AsyncEngine, config: WorkerConfig) -> None:
+    Scoped to one tenant (ADR 0155 step 6). Every read matches only rows whose
+    ``tenant_id`` is the resolver's, and a binding row out of step with its
+    agent's tenant matches neither, so it fails closed. Another tenant's agent
+    answers exactly as an unknown one does. The tenant is the default one until
+    the queued turn carries its own (#2914); it is deliberately not an
+    operator setting, since a mistyped tenant would drop every event.
+    """
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        config: WorkerConfig,
+        *,
+        tenant_id: uuid.UUID = DEFAULT_TENANT_ID,
+    ) -> None:
         self._engine = engine
         self._config = config
+        self._tenant_id = tenant_id
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
         self._undeployed_binding_sql = text(
@@ -383,7 +406,9 @@ class BindingResolver:
         agent, which is #38's misroute wearing the neutral-binding hat.
         """
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._sql, {"kind": kind, "address": address})
+            result = await conn.execute(
+                self._sql, {"kind": kind, "address": address, "tenant_id": self._tenant_id}
+            )
             rows = result.mappings().all()
         if not rows:
             return None
@@ -415,16 +440,20 @@ class BindingResolver:
         """
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                self._undeployed_binding_sql, {"kind": kind, "address": address}
+                self._undeployed_binding_sql,
+                {"kind": kind, "address": address, "tenant_id": self._tenant_id},
             )
             row = result.mappings().first()
         return None if row is None else BoundAgent.model_validate(dict(row))
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""
-        sql = text(f"SELECT repo_full_name FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT repo_full_name FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -596,9 +625,12 @@ class BindingResolver:
         """The agent's connector secrets (#429), for lanes that boot by agent_id
         rather than by channel (the eval consumer). Decodes the JSONB the same
         way ``resolve`` does; None when the agent is unknown or has no secrets."""
-        sql = text(f"SELECT secrets FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT secrets FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None or row[0] is None:
             return None
@@ -609,9 +641,12 @@ class BindingResolver:
 
     async def name_for(self, agent_id: uuid.UUID) -> str | None:
         """The agent's NAME for eval pool routing (#1488). None if unknown."""
-        sql = text(f"SELECT name FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT name FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -623,10 +658,11 @@ class BindingResolver:
     ) -> tuple[str | None, str | None]:
         """The agent's model and thinking settings for eval sandbox boots."""
         sql = text(
-            f"SELECT model, thinking FROM {self._config.db_schema}.agents WHERE id = :id"
+            f"SELECT model, thinking FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
         )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None, None

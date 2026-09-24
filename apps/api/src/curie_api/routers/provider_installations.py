@@ -117,4 +117,7 @@ async def delete_provider_installation(installation_id: uuid.UUID, session: Sess
     installation = await installations.get_installation(session, installation_id)
     if installation is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "provider installation not found")
-    await installations.delete_installation(session, installation)
+    try:
+        await installations.delete_installation(session, installation)
+    except installations.InstallationConflict as exc:
+        raise _http_error(exc) from None
