@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -141,6 +142,9 @@ BASH4_ONLY = {
     r"%\([^)]*\)T": "printf %(...)T (bash 4.2)",
     r"\{0[0-9]+\.\.[0-9]+\}": "zero-padded brace range (bash 4.0)",
     _COMMAND + r"wait\s+-n\b": "wait -n (bash 4.3)",
+    # 3.2 accepts this, but reads only what the pipe holds when it looks, which
+    # for a fresh process substitution is usually nothing.
+    _COMMAND + r"(source|\.)\s+<\(": "source <(...), read short or empty by 3.2",
 }
 
 # Any options a command takes before the one that matters.
@@ -254,6 +258,11 @@ def test_script_uses_no_construct_bash_3_2_rejects(script: Path) -> None:
         "    read -t 0.5 line",
         "    printf '%(%s)T' -1",
         "    for n in {01..10}; do",
+        '      source <(sed -n "/^f()/,/^g()/p" "$1")',
+        '    . <(printf "%s\\n" "f() { :; }")',
+        "    if source <(render); then",
+        "    elif source <(render); then",
+        "    command . <(render)",
     ],
 )
 def test_the_source_scan_refuses_each_construct(line: str) -> None:
@@ -271,6 +280,8 @@ def test_the_source_scan_refuses_each_construct(line: str) -> None:
         '    printf %s "${OUT}">"$file"',
         '    assert el, f"<{t}> is missing"',
         "    for n in {1..10}; do",
+        "    done < <(route_keys)",
+        "    diff <(a) <(b)",
     ],
 )
 def test_the_source_scan_ignores_what_bash_3_2_accepts(line: str) -> None:
@@ -1430,3 +1441,52 @@ def test_worker_ttl_bounds_hands_python_each_program_whole(
         # The two ways to assign a heredoc differ only in its trailing newline.
         assert received.rstrip("\n") == program.rstrip("\n"), name
         compile(received, name, "exec")
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_worker_ttl_bounds_reads_the_reply_timeout_through_the_ladder_helper(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """Assertion (l) lifts the helper out of e2e-ladder.sh into a child bash."""
+
+    source = WORKER_TTL_BOUNDS_PATH.read_text()
+    fail = _top_level_block(source, "fail() {", "render() {", WORKER_TTL_BOUNDS_PATH)
+    stub = _top_level_block(
+        source,
+        'LADDER_STUB_DIR="$TMP/ladder-kubectl"',
+        "render_worker_deployment_json() {",
+        WORKER_TTL_BOUNDS_PATH,
+    )
+    helpers = "".join(
+        _shell_function(source, name, WORKER_TTL_BOUNDS_PATH)
+        for name in (
+            "run_ladder_reply_timeout",
+            "assert_ladder_helper_present",
+            "assert_ladder_reply_timeout",
+        )
+    )
+    worker = {"name": "worker", "env": [{"name": "CURIE_DELIVERY_BUDGET_S", "value": "900"}]}
+    deployment = tmp_path / "worker.json"
+    deployment.write_text(
+        json.dumps({"spec": {"template": {"spec": {"containers": [worker]}}}})
+    )
+    # The child bash and the kubectl stub's `#!/usr/bin/env bash` both take
+    # bash from PATH, so PATH names the interpreter under test as well.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "bash").symlink_to(os.path.abspath(shutil.which(interpreter) or interpreter))
+    script = f"""set -euo pipefail
+TMP="$1"
+LADDER="$2"
+{fail}{stub}{helpers}
+assert_ladder_helper_present
+assert_ladder_reply_timeout "$3" 960
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path), str(LADDER_PATH), str(deployment)],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
