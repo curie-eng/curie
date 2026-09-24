@@ -973,8 +973,11 @@ request, an unavailable dependency, an execution-deadline budget, and a
 malicious instruction) on the configured model and again on
 `CURIE_FACTORY_REFERENCE_MODEL` (default `anthropic/claude-sonnet-4.5`, same
 credential), then one authorized same-PR revision and label removal of one
-waiting request and one running request. Hidden checks run against each
-resulting pull request and are not part of the ticket. The JSON evidence
+waiting request and one running request. After the waiting cancellation it
+raises the sandbox pod quota to the chart default and restarts the worker.
+A request that has not started is cancelled and opened again, and that case
+is given up well before the hour-long never-started cap. Hidden checks run
+against each resulting pull request and are not part of the ticket. The JSON evidence
 includes the candidate commit, each verdict, configured and observed model,
 usage or an explicit unverified record, and elapsed time. The command exits
 non-zero when any of those fields is missing or any verdict is not passed.

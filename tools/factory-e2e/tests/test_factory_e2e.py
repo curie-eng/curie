@@ -1276,6 +1276,24 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
     )
 
 
+def test_evaluation_coding_quota_matches_the_chart_default() -> None:
+    values = Path(__file__).resolve().parents[3] / "charts" / "curie" / "values.yaml"
+    assert f'sandboxPodCount: "{fe.CODING_SANDBOX_POD_QUOTA}"' in values.read_text()
+    assert fe.CODING_SANDBOX_POD_QUOTA > 0
+
+
+def test_unstarted_attempts_stop_before_the_hour_cap() -> None:
+    assert fe.START_ATTEMPTS >= 2
+    assert fe.START_ATTEMPTS * fe.START_WAIT_SECONDS < fe.NEVER_STARTED_CAP_SECONDS
+
+
+def test_quota_hard_pods_reads_the_sandbox_quota() -> None:
+    listing = {"items": [{"spec": {"hard": {"pods": "50", "limits.cpu": "8"}}}]}
+    assert fe.quota_hard_pods(listing) == "50"
+    assert fe.quota_hard_pods({"items": []}) is None
+    assert fe.quota_hard_pods({}) is None
+
+
 def test_request_has_started_ignores_a_capacity_wait() -> None:
     assert fe.request_has_started({"status": "waiting"}) is False
     assert fe.request_has_started({"status": "running"}) is True

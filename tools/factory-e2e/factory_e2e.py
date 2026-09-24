@@ -133,6 +133,13 @@ EXECUTION_BOUND_SECONDS = 1800
 PUBLICATION_ALLOWANCE_SECONDS = 600
 # A run that never starts is still given up on after this long from labelling.
 NEVER_STARTED_CAP_SECONDS = 3600
+# Chart default (charts/curie/values.yaml resourceQuota.hard.sandboxPodCount).
+# Evaluation installs at 0 for the waiting cancellation, then sets this.
+CODING_SANDBOX_POD_QUOTA = 50
+# An unstarted request is cancelled and opened again. The product can drop the
+# first wake after a rollout; waiting out NEVER_STARTED_CAP only burns the tunnel.
+START_ATTEMPTS = 3
+START_WAIT_SECONDS = 150
 # The judged bound: the execution deadline plus terminal settlement slack.
 ELAPSED_LIMIT_SECONDS = EXECUTION_BOUND_SECONDS + 300
 POLL_SECONDS = 15
@@ -595,6 +602,23 @@ def install_values(
             "sandbox": {"create": False, "name": sandbox},
         }
     return values
+
+
+def quota_hard_pods(listing: Mapping[str, Any]) -> str | None:
+    """The pods hard limit from a `kubectl get resourcequota -o json` body."""
+
+    items = listing.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+        hard = spec.get("hard") if isinstance(spec.get("hard"), dict) else {}
+        pods = hard.get("pods")
+        if isinstance(pods, str) and pods.strip():
+            return pods.strip()
+    return None
 
 
 def judge_outcome(
@@ -1184,6 +1208,8 @@ class Preflight:
         self._consumer_controller = False
         self._egress_cidrs: list[str] = []
         self._sandbox_quota: int | None = None
+        self._api_forward: subprocess.Popen[Any] | None = None
+        self._tunnel_proc: subprocess.Popen[Any] | None = None
         self._fixture_base_sha = ""
         self._issue_token_minted = 0.0
         self._fixture_restore_pushed = False
@@ -1246,7 +1272,12 @@ class Preflight:
     def api(
         self, method: str, path: str, *, headers: Mapping[str, str], body: Any = None
     ) -> tuple[int, Any]:
-        return http_json(method, self.api_url + path, headers=headers, body=body)
+        url = self.api_url + path
+        try:
+            return http_json(method, url, headers=headers, body=body)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            self.ensure_api()
+            return http_json(method, self.api_url + path, headers=headers, body=body)
 
     # --- steps ---------------------------------------------------------
 
@@ -1535,6 +1566,9 @@ class Preflight:
         return cidrs
 
     def port_forward(self) -> None:
+        if self._api_forward is not None:
+            _stop(self._api_forward)
+            self._api_forward = None
         port = _free_port()
         process = subprocess.Popen(
             [
@@ -1552,6 +1586,7 @@ class Preflight:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        self._api_forward = process
         self.teardown.push("stop api port-forward", lambda: {"stopped": _stop(process)})
         self.api_url = f"http://127.0.0.1:{port}"
 
@@ -1724,6 +1759,9 @@ class Preflight:
         )
 
     def tunnel(self) -> None:
+        if self._tunnel_proc is not None:
+            _stop(self._tunnel_proc)
+            self._tunnel_proc = None
         process = subprocess.Popen(
             [
                 self.config.cloudflared,
@@ -1740,6 +1778,7 @@ class Preflight:
         def stop() -> dict[str, Any]:
             return {"stopped": _stop(process), "exit_code": process.returncode}
 
+        self._tunnel_proc = process
         self.teardown.push("stop tunnel", stop)
         found: list[str] = []
 
@@ -1812,7 +1851,10 @@ class Preflight:
             return {"restored": True, "verified": True}
 
         self.teardown.push("restore App webhook", restore_webhook)
-        target = self.tunnel_url + "/github/webhook"
+        self._patch_webhook(self.tunnel_url + "/github/webhook")
+        self.step("App webhook repointed at the tunnel")
+
+    def _patch_webhook(self, target: str) -> None:
         status, _ = self.as_app(
             "PATCH", "/app/hook/config", {"url": target, "content_type": "json"}
         )
@@ -1821,7 +1863,6 @@ class Preflight:
         status, now = self.as_app("GET", "/app/hook/config")
         if status != 200 or not isinstance(now, dict) or now.get("url") != target:
             raise PreflightFailed("the App webhook URL did not read back as the tunnel")
-        self.step("App webhook repointed at the tunnel")
 
     def _paged(self, path: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -2013,10 +2054,81 @@ class Preflight:
                 self.kubectl("-n", self.namespace, "rollout", "status", workload, "--timeout=15m")
         self.config = config
         self._sandbox_quota = quota
-        # The new worker accepts a label immediately, but the first claim after
-        # the rollout can stay unstarted. Give the consumer a moment to attach.
-        time.sleep(20)
+        # The API pod roll drops the port-forward. Reconnect before any read.
+        self.ensure_api()
+        if quota is not None:
+            observed = self.sandbox_pods_hard()
+            if observed != str(quota):
+                raise PreflightFailed(f"sandbox pod quota is {observed}, not {quota}")
+        # A worker that lived through quota 0 keeps its consumer. Restart it
+        # after the quota change so the next execute wake is not delivered to
+        # a consumer that has already exited.
+        self.restart_worker()
         self.step("helm upgraded", model=config.model, sandbox_pod_quota=quota)
+
+    def ensure_api(self) -> None:
+        """Reopen the API port-forward when the current one is not healthy."""
+
+        if self.api_url:
+            try:
+                status, _ = http_json("GET", self.api_url + "/health", timeout=5)
+            except (urllib.error.URLError, TimeoutError, OSError):
+                status = 0
+            if status == 200:
+                return
+            log("api port-forward is down; opening it again")
+        self.port_forward()
+
+    def restart_worker(self) -> None:
+        """Roll the worker deployment and wait until the new pod is ready."""
+
+        log("restarting the worker")
+        self.kubectl(
+            "-n",
+            self.namespace,
+            "rollout",
+            "restart",
+            "deployment",
+            "-l",
+            "app.kubernetes.io/component=worker",
+        )
+        names = self.kubectl(
+            "-n",
+            self.namespace,
+            "get",
+            "deployment",
+            "-l",
+            "app.kubernetes.io/component=worker",
+            "-o",
+            "name",
+        ).split()
+        if not names:
+            raise PreflightFailed("no worker deployment to restart")
+        for name in names:
+            self.kubectl("-n", self.namespace, "rollout", "status", name, "--timeout=15m")
+        self.ensure_api()
+        time.sleep(15)
+
+    def sandbox_pods_hard(self) -> str | None:
+        raw = self.kubectl("-n", self.namespace, "get", "resourcequota", "-o", "json")
+        try:
+            return quota_hard_pods(json.loads(raw))
+        except json.JSONDecodeError as exc:
+            raise PreflightFailed("resource quota list was not JSON") from exc
+
+    def ensure_tunnel(self) -> None:
+        """Replace the quick tunnel when GitHub can no longer reach the API."""
+
+        if self.tunnel_url:
+            try:
+                healthy = public_get_status(self.tunnel_url + "/health") == 200
+            except (urllib.error.URLError, TimeoutError, OSError):
+                healthy = False
+            if healthy:
+                return
+            log("webhook tunnel is down; opening another")
+        self.tunnel()
+        self._patch_webhook(self.tunnel_url + "/github/webhook")
 
     def read_observed_model(self, since: float | None = None) -> str | dict[str, str]:
         """CURIE_MODEL from sandbox pods started after ``since``.
@@ -2120,6 +2232,7 @@ class Preflight:
         if time.time() - self._issue_token_minted < 15 * 60:
             return
         log("refreshing the issue read token before it expires")
+        self.ensure_api()
         self.deploy_bundle()
 
     def pin_fixture_base(self) -> None:
@@ -3392,31 +3505,39 @@ def _run_issue_case(p: Preflight, case_id: str) -> tuple[dict[str, Any], dict[st
     result: dict[str, Any] = {}
     hidden: dict[str, Any] = {"status": "failed", "failures": ["the case did not run"]}
     try:
-        p.ensure_issue_token()
-        p.scenario_started = dt.datetime.now(dt.UTC).replace(microsecond=0)
-        if case_id == "failing-test":
-            p.seed_failing_test_commit()
-        p.head_before = p.default_branch_head()
         p.expect = expect
         p.expect_causes = frozenset(causes)
         p.expect_reasons = ()
         title, body = evaluation_issue(case_id)
-        _open_case(p, title, body)
-        if not _wait_for_start(p, 180):
-            log("the request did not start; closing it and retrying once")
-            p.reset_fixture()
-            if case_id == "failing-test":
-                p.restore_fixture_base()
+        started_ok = False
+        for attempt in range(START_ATTEMPTS):
+            p.ensure_api()
+            p.ensure_tunnel()
+            p.ensure_issue_token()
             p.scenario_started = dt.datetime.now(dt.UTC).replace(microsecond=0)
             if case_id == "failing-test":
+                p.restore_fixture_base()
                 p.seed_failing_test_commit()
             p.head_before = p.default_branch_head()
             _open_case(p, title, body)
-        result, failures = _capture(p, lambda: issue_to_pr(p))
-        problems.extend(failures)
-        hidden = _hidden_for_case(p, case_id, result)
-        if hidden["status"] == "failed":
-            problems.extend(str(item) for item in hidden["failures"])
+            if _wait_for_start(p, START_WAIT_SECONDS):
+                started_ok = True
+                break
+            log(
+                "the request did not start "
+                f"(attempt {attempt + 1} of {START_ATTEMPTS}); closing it"
+            )
+            p.reset_fixture()
+            if attempt + 1 < START_ATTEMPTS:
+                p.restart_worker()
+        if not started_ok:
+            problems.append("the execution request did not start")
+        else:
+            result, failures = _capture(p, lambda: issue_to_pr(p))
+            problems.extend(failures)
+            hidden = _hidden_for_case(p, case_id, result)
+            if hidden["status"] == "failed":
+                problems.extend(str(item) for item in hidden["failures"])
     except PreflightFailed as exc:
         problems.append(str(exc))
     finally:
@@ -3569,7 +3690,7 @@ def evaluation(p: Preflight) -> dict[str, Any]:
     waiting = _run_cancellation(p, "waiting")
     quota_error = ""
     try:
-        p.helm_upgrade(quota=None)
+        p.helm_upgrade(quota=CODING_SANDBOX_POD_QUOTA)
     except PreflightFailed as exc:
         quota_error = str(exc)
     if quota_error:
@@ -3589,7 +3710,7 @@ def evaluation(p: Preflight) -> dict[str, Any]:
         running = _run_cancellation(p, "running")
     model_error = ""
     try:
-        p.helm_upgrade(quota=None, model=reference_model)
+        p.helm_upgrade(quota=CODING_SANDBOX_POD_QUOTA, model=reference_model)
     except PreflightFailed as exc:
         model_error = str(exc)
     if model_error:
