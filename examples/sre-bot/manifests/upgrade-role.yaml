@@ -8,7 +8,8 @@
 # next to the platform's own Secrets.
 #
 # ---------------------------------------------------------------------------
-# Read this grant honestly: it is the widest one in the bundle
+# Read this grant honestly: it is the widest one in the default bundle
+# (kubernetes-operator-access.yaml, where an operator applies it, is wider)
 # ---------------------------------------------------------------------------
 #
 # `create` on `jobs` cannot be narrowed with `resourceNames`. Kubernetes matches

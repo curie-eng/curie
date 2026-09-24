@@ -162,11 +162,15 @@ The most complete example in this repo is a production triage bot:
 Kubernetes MCP connector. Thirteen exact core read tools run immediately, six
 exact mutation tools require approval, and unmatched tools deny.
 
-Kubernetes RBAC is the capability boundary. The connector can read enumerated
-non-secret operational resources cluster-wide and can mutate workload APIs only
-inside the disposable `sre-demo` namespace. It cannot read Secrets or mutate
-identity, RBAC, namespaces, nodes, admission configuration, CRDs, or any
-cluster-scoped resource.
+Kubernetes RBAC is the capability boundary. With the default grant, the
+connector can read enumerated non-secret operational resources cluster-wide and
+can mutate workload APIs only inside the disposable `sre-demo` namespace. It
+cannot read Secrets or mutate identity, RBAC, namespaces, nodes, admission
+configuration, CRDs, or any cluster-scoped resource. An operator can instead
+apply the opt-in operator grant, which widens reads and writes to every
+built-in kind except Secrets and ServiceAccount tokens; reads stay ungated,
+every write still needs approval, and the example's README lists what then
+sits behind that approval.
 
 The supported installer applies that identity, constructs its file-mounted
 kubeconfig in memory, installs the observability stack, and deploys the bundle:

@@ -54,18 +54,17 @@ The live names are `mcp__kubernetes__pods_delete`,
 These six entries are exact, not a wildcard. Each approval is one-shot and
 tool-name-scoped. Rejection leaves the call upstream of the MCP server.
 
-The single `sre-bot-kubernetes` credential has cluster read access only for
-non-secret operational resources and an additive Role only in `sre-demo`. It
-may create, update, patch, scale, or delete workload resources there. It cannot
-reach Secrets, ServiceAccounts, RBAC, CRDs, admission webhooks, namespace or
-node mutation, another namespace, or cluster-scoped mutation.
+Under the default grant, `manifests/kubernetes-access.yaml`, the single
+`sre-bot-kubernetes` credential has cluster read access only for non-secret
+operational resources and an additive Role only in `sre-demo`. It may create,
+update, patch, scale, or delete workload resources there. It cannot reach
+Secrets, ServiceAccounts, RBAC, CRDs, admission webhooks, namespace or node
+mutation, another namespace, or cluster-scoped mutation. The operator grant
+below lifts most of that.
 
 Raw manifest updates can change images, commands, and environment inside that
 ceiling. Kubernetes RBAC cannot restrict a patch to a friendly field, and there
-is no generic rollback for those changes. Approval controls the agent, not the
-credential: if the credential leaks, only RBAC remains.
-
-### Operator grant (opt-in)
+is no generic rollback for tho### Operator grant (opt-in)
 
 An operator who wants approved writes to reach workloads outside `sre-demo`
 applies `manifests/kubernetes-operator-access.yaml` after the default file. It
@@ -76,16 +75,37 @@ and at cluster scope, plus Curie's sandbox groups and the add-on groups the
 default reads. The six mutations above still require approval; RBAC is still
 the ceiling, now a much higher one.
 
-It withholds reading or writing Secrets, `serviceaccounts/token`, and the
-`escalate`, `bind`, `impersonate`, `approve` and `sign` verbs, so the credential
-cannot bind itself to `cluster-admin` or grant more than it holds. Several paths
-to Secret contents stay open behind approval: `pods/exec` and the kubelet's
-`nodes/proxy`, which can exec into any container; a pod that mounts a Secret or
-runs as any ServiceAccount and so acts with its grant; admission webhooks, which
-see the objects they match; and APIServices, which can redirect an API group.
+Reads widen as well, and reads run without approval: the read tools reach every
+non-Secret resource in every namespace, Curie's own objects and RBAC included,
+and the kubelet through `nodes/proxy`, which `nodes_log` and
+`nodes_stats_summary` use to read node logs and stats. The credential is not
+limited to that: any access to `nodes/proxy`, `get` included, reaches the
+kubelet's exec and run endpoints, so it is exec into any container on the node.
+
+It withholds Secrets, `serviceaccounts/token`, `pods/proxy` and
+`services/proxy` (no tool here uses them, and they would tunnel ungated reads
+into any in-cluster endpoint), and the `escalate`, `bind`, `impersonate`,
+`approve` and `sign` verbs, so the credential cannot bind itself to
+`cluster-admin`, grant more than it holds, or approve a certificate.
+
+Each of these stays one approved call away:
+
+- exec, through `pods/exec`;
+- a pod that mounts a Secret, runs as any ServiceAccount, or mounts a hostPath,
+  whose output the ungated `pods_log` then reads, so the approval of a pod
+  create is the one checkpoint in front of every Secret;
+- admission webhooks and CEL admission policies, which see or change the
+  objects they match;
+- APIServices, which can redirect a whole API group;
+- a binding that hands this role to another subject, which outlives the
+  approval;
+- changes to Curie itself (its Deployments and SandboxTemplates), including how
+  approvals are enforced, after which later writes may not reach an approval;
+- Argo CD objects, which deploy with Argo CD's own identity.
+
 Under this grant approval is the real protection for Secret contents, and a
 leaked connector credential carries the whole grant with no approval in front
-of it. The file's header lists each path and the `kubectl auth can-i` checks.
+of it, exec into any container on any node through `nodes/proxy` included. The file's header lists each path and the checks to run after applying.
 
 ## Platform publication
 
@@ -115,8 +135,9 @@ Tool: `mcp__self-upgrade__upgrade_platform()` with zero arguments.
 
 This is a second explicit gate and a separate Job-trigger path. The Job's
 short-lived projected `curie-platform-upgrader` identity can rewrite the
-platform release objects. The general Kubernetes connector never receives that
-identity or Role. A Helm rollback does not undo database migrations, so recovery
+platform release objects. Under the default grant the general Kubernetes
+connector never receives that identity or Role; under the operator grant it can
+run a pod as `curie-platform-upgrader`, one approved call away. A Helm rollback does not undo database migrations, so recovery
 may require restoring a backup rather than another tool call.
 
 ### Service-account escalation disclosure
