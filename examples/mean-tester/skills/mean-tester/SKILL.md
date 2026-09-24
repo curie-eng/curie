@@ -130,9 +130,10 @@ A round is at most four probes, the answer check included.
 - A probe has timed out only once 180 seconds have passed since it was posted.
   Compare `date +%s` with the probe's `ts`; never count reads instead.
 
-Use `mcp__plugin_mean-tester_slack__slack_post_message` only to send probes.
-Your report is your reply in the thread you were asked in: never post it, or
-anything else, yourself.
+Use `mcp__plugin_mean-tester_slack__slack_post_message` only to send probes:
+exactly once per probe, and never for anything else. The platform posts your
+final answer for you, in the thread you were asked in. So the report is your
+final answer, and you never post it, or a summary of it, yourself.
 
 Run exactly one round per turn. Once every probe in the round has a final
 reply or has timed out, report and stop, even when probes remain: the next
