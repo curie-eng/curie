@@ -1,4 +1,4 @@
-# 174. A test installation may let a mean tester resolve its approvals over Slack
+# 174. A test installation may let a listed bot resolve approvals over Slack
 
 Date: 2026-09-24
 
@@ -6,8 +6,10 @@ Status: Draft
 
 This ADR builds on [ADR-0169](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md)
 and on the approval authorizer ([ADR-0034](0034-approval-authorizers-resolve-membership-in-the-api.md)).
-It supersedes nothing. It changes ADR-0169's decision 5, "The tester never
-resolves an approval", for test installations only.
+It supersedes nothing. This is a platform capability: a second way to resolve
+an approval, in the dispatcher and the API. The mean tester is its first
+consumer. For that consumer it changes ADR-0169's decision 5, "The tester never
+resolves an approval", on test installations only.
 
 ## Context
 
@@ -43,10 +45,11 @@ never reach production: ADR-0172's decision 5, accepted in #3055.
 
 ## Decision
 
-**An installation that declares itself a test installation may list a mean
-tester's Slack bot user as an approver on chosen routes. That bot then resolves
-a card by replying in the card's thread, and the reply takes the same authorized
-path a click takes. Every other installation refuses it.**
+**An installation that declares itself a test installation may list a bot's
+Slack user as an approver on chosen routes. That bot then resolves a card by
+replying in the card's thread, and the reply takes the same authorized path a
+click takes. Every other installation refuses it. A mean tester is the first
+such bot.**
 
 1. **Off unless the installation says it is a test installation.**
    - A chart value, `approvals.botApprovers.enabled`, defaults to `false`.

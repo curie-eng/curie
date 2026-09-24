@@ -196,5 +196,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0170 | [Conversation transcripts live in their own per-thread table](0170-conversation-transcripts-live-in-their-own-per-thread-table.md) | Accepted |
 | 0171 | [A factory run may take three hours and is bounded by time, not turns](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md) | Accepted |
 | 0172 | [The mean tester is one bundle on off-the-shelf MCP servers, and it only reports](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md) | Accepted |
-| 0174 | [A test installation may let a mean tester resolve its approvals over Slack](0174-a-test-installation-may-let-a-mean-tester-resolve-its-approvals.md) | Draft |
+| 0174 | [A test installation may let a listed bot resolve approvals over Slack](0174-a-test-installation-may-let-a-listed-bot-resolve-approvals-over-slack.md) | Draft |
 <!-- END GENERATED: adr-index -->
