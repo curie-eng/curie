@@ -87,6 +87,8 @@ def build(config: Config, slack, sources, issues=None, now=time.monotonic) -> MC
     def read_target(target_user: str, channel: str = "", bundle_name: str = "") -> dict:
         """Find the target's bundle in the listed repositories and read it."""
         channel = listed_channel(channel)
+        log.info("read_target channel=%s target_user=%r bundle_name=%r",
+                 channel, target_user, bundle_name)
         found = sources.find(channel, bundle_name or None)
         if not found:
             raise ToolError(
@@ -130,6 +132,8 @@ def build(config: Config, slack, sources, issues=None, now=time.monotonic) -> MC
     def send_probes(target_user: str, probes: list[str], channel: str = "") -> dict:
         """Post each probe as a new root message mentioning the target."""
         channel = listed_channel(channel)  # before Slack is asked anything about it
+        log.info("send_probes channel=%s target_user=%r probes=%d",
+                 channel, target_user, len(probes))
         try:
             texts = guard.check(channel, slack.channel_info(channel), probes, target_user)
             if target_user not in slack.members(channel):
@@ -155,6 +159,8 @@ def build(config: Config, slack, sources, issues=None, now=time.monotonic) -> MC
     def collect_replies(target_user: str, probe_ts: list[str], channel: str = "") -> dict:
         """Wait for each probe's final reply and report what a person would see."""
         channel = listed_channel(channel)
+        log.info("collect_replies channel=%s target_user=%r probe_ts=%s",
+                 channel, target_user, probe_ts)
         foreign = foreign_probes(channel, probe_ts)
         if foreign:
             raise ToolError(
