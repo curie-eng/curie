@@ -23,9 +23,11 @@ two off-the-shelf stdio MCP servers that the runner image preinstalls:
   The invitation list is the allowlist: the bot can post anywhere it is invited.
   Never invite it to an externally shared channel. Nothing else stops it
   probing there.
-- **A GitHub token**, fine-grained and limited to the repositories it reads,
-  with **Contents: Read** and nothing else. The token sits in the sandbox's
-  environment, so its scope is the real bound.
+- **A GitHub token for the tester itself**, never a person's. Use either a
+  fine-grained token on a machine account, or a GitHub App installation
+  token. Limit it to the repositories the tester reads, with **Contents:
+  Read** and nothing else. The token sits in the sandbox's environment, so its
+  scope is the real bound.
 
 ## Configure
 
@@ -57,6 +59,19 @@ curie cluster deploy --plugin-dir examples/mean-tester --target dev \
   --secret MEAN_TESTER_SLACK_BOT_TOKEN --secret MEAN_TESTER_SLACK_TEAM_ID \
   --secret GITHUB_PERSONAL_ACCESS_TOKEN
 ```
+
+### Where the secrets are stored
+
+1. `curie cluster deploy --secret NAME` records each value under
+   `agentSandbox.connectorSecrets.<agent>` in the release.
+2. The chart renders them as one Kubernetes Secret for this agent alone:
+   `<release>-agent-<agent>-connector-secrets`.
+3. Only this agent's SandboxTemplate reads its keys, into the runner's
+   environment through `secretKeyRef`.
+4. `.mcp.json` expands `${NAME}` from that environment when it starts each
+   server.
+
+No other agent's sandbox receives them.
 
 ## Use it
 
