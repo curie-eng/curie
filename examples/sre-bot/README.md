@@ -167,15 +167,15 @@ A broken alert path looks exactly like a quiet cluster: every rule goes quiet
 and nothing says so. Healthy means the heartbeat keeps arriving outside the
 cluster and no alert is firing; either one alone proves nothing.
 
-`CurieKubeStateMetricsDown` pages when this stack has had no successful
-kube-state-metrics scrape for 5 minutes. Most workload rules read
-kube-state-metrics, and without it they stay quiet whatever the cluster does.
+`CurieKubeStateMetricsDown` pages when a kube-state-metrics target of this stack
+has failed its scrape, or none has been scraped, for 5 minutes. Most workload
+rules read kube-state-metrics, and without it they stay quiet whatever the
+cluster does.
 
 The heartbeat is opt-in. Set up a check in an external dead man's switch that
 alarms when posts stop, with a period of at least 5 minutes (posts arrive about
-every two minutes). Store its URL in a Secret, then apply
-`observability/alertmanager-heartbeat.yaml` after
-`observability/alertmanager-webhook.yaml`:
+every two minutes). Store its URL in a Secret in Alertmanager's namespace
+(`observability` unless `--observability-namespace` named another):
 
 ```bash
 read -rsp 'Heartbeat URL: ' HEARTBEAT_URL   # e.g. https://heartbeat.example.com/ping/EXAMPLE
@@ -184,9 +184,36 @@ kubectl -n observability create secret generic alertmanager-heartbeat \
   --from-literal=url="$HEARTBEAT_URL"
 ```
 
+Then upgrade the Prometheus release with the overlays in this order, the
+heartbeat overlay last. `my-alertmanager.yaml` stands for your own overlay, if
+you have one:
+
+```bash
+helm upgrade prometheus prometheus-community/prometheus --version 29.27.0 \
+  -n observability \
+  -f examples/sre-bot/observability/prometheus-values.yaml \
+  -f examples/sre-bot/observability/alertmanager-webhook.yaml \
+  -f my-alertmanager.yaml \
+  -f examples/sre-bot/observability/alertmanager-heartbeat.yaml
+```
+
+The heartbeat overlay goes after the webhook overlay: the other way round the
+config is invalid (`undefined receiver "heartbeat"`). Helm replaces lists, so
+the heartbeat overlay's `extraSecretMounts` replaces yours. Add each mount you
+already have, such as the alert-signer token the `curie-sre` receiver's
+`credentials_file` reads, to that list in `alertmanager-heartbeat.yaml`, or the
+bot's receiver loses it while the heartbeat keeps arriving. Re-running
+`curie example sre-bot install --observability` upgrades the release with
+`prometheus-values.yaml` alone, which removes the overlays and turns
+Alertmanager off; run the command above again after it.
+
 The overlay adds `CurieAlertPathHeartbeat`, which always fires, and routes it
 only to that URL; it never reaches the bot. Without it, nothing watches the
-alert path.
+alert path. Posts stop within about a minute and a half of Prometheus stopping,
+so a service with a five-minute period alarms about six to seven minutes after
+the stop, plus its grace. The Secret mount is optional: without the Secret or
+its `url` key Alertmanager still runs and every alert still reaches the bot;
+only the heartbeat posts fail, so the external service alarms.
 
 The heartbeat cannot see the last leg, from Alertmanager to the bot. Check that
 with one synthetic alert posted to Alertmanager's API:
@@ -198,9 +225,10 @@ kubectl -n observability exec prometheus-alertmanager-0 -- \
   --alertmanager.url=http://localhost:9093
 ```
 
-Then wait for the bot's reply in the bound channel (`C0EXAMPLE1` above). A
-missing reply means the path is broken somewhere between Alertmanager and the
-bot.
+Then wait for the bot's reply in the bound channel (`C0EXAMPLE1` above). The
+reply says coding is stopped, because the alert names no workload, and a
+second, resolved delivery follows about five minutes later. A missing reply
+means the path is broken somewhere between Alertmanager and the bot.
 
 ## Verification
 

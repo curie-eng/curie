@@ -545,13 +545,17 @@ serverFiles:
                 percent free for 15 minutes. A full volume stops the workload
                 that writes to it.
           - alert: CurieKubeStateMetricsDown
-            # `== 1` inside absent(), so one term covers both failures: a
-            # scrape that fails reads up 0 and is filtered out, and a target
-            # that vanished has no up series at all. The job matcher keeps it
-            # to this stack's own kubernetes-service-endpoints scrape, so a
-            # kube-state-metrics scraped by another job cannot hold it quiet.
-            # `up` carries no curie_source stamp (see the header), so it is
-            # qualified by job instead.
+            # Two terms. `== 1` inside absent() covers both ways no target
+            # answers: a scrape that fails reads up 0 and is filtered out, and
+            # a target that vanished has no up series at all. The count term
+            # pages on any target at 0, so a second one answering (its
+            # self-monitoring port, another replica or shard) cannot hold the
+            # page quiet. Both yield the empty label set, so they raise one
+            # alert. The job matcher keeps it to this stack's own
+            # kubernetes-service-endpoints scrape, so a kube-state-metrics
+            # scraped by another job cannot hold it quiet either. `up` carries
+            # no curie_source stamp (see the header), so it is qualified by
+            # job instead.
             expr: |
               absent(
                 up{
@@ -559,18 +563,25 @@ serverFiles:
                   app_kubernetes_io_name="kube-state-metrics"
                 } == 1
               )
+              or
+              count(
+                up{
+                  job="kubernetes-service-endpoints",
+                  app_kubernetes_io_name="kube-state-metrics"
+                } == 0
+              )
             for: 5m
             labels:
               severity: page
               component: curie-kube-state-metrics
             annotations:
-              summary: kube-state-metrics is not being scraped
+              summary: A kube-state-metrics scrape is failing
               description: >-
-                No kube-state-metrics scrape has succeeded for 5 minutes.
-                Every rule that reads it now reads nothing and stays quiet
-                whatever the cluster does: the mail adapter, connector,
-                dispatcher, core workload, state store and crash loop rules,
-                and the node rule's Ready term.
+                A kube-state-metrics target has failed its scrape, or none has
+                been scraped, for 5 minutes. The rules that read it then read
+                nothing and stay quiet whatever the cluster does: the mail
+                adapter, connector, dispatcher, core workload, state store and
+                crash loop rules, and the node rule's Ready term.
           - alert: CurieNodeMemoryHeadroomLow
             expr: |
               100 * (
