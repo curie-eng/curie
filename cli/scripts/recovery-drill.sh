@@ -19,6 +19,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# util-linux flock, with its exit statuses, on hosts that ship none (a stock Mac).
+GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 SURFACE="local"
 SCENARIO="all"
 BOUND_SECONDS=120
@@ -644,7 +646,7 @@ main() {
     fi
 
     exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
+    if ! "$GNU_PROCESS" flock -n 9; then
         die "another recovery-drill holds $LOCK_FILE"
     fi
     bring_up_local
