@@ -939,6 +939,12 @@ _HOOK_RUN_CARRY: ContextVar[_HookRunCarry | None] = ContextVar(
     "curie_worker_hook_run_carry", default=None
 )
 
+# The WorkItem request this delivery acquired or adopted. Per delivery, never
+# kernel-global: concurrent executions each start their own request (#3069).
+_OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
+    "curie_worker_owned_work_item", default=None
+)
+
 
 def _hook_success_outcome() -> HookRunOutcome | None:
     carry = _HOOK_RUN_CARRY.get()
@@ -1227,7 +1233,6 @@ class Kernel:
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
         self._held_work_items: dict[str, WorkItemRun] = {}
-        self._active_work_item_request_id: uuid.UUID | None = None
         # Approval resume ids that were mapped to a factory execution.
         # The live run can be removed before a later delivery failure reaches
         # ``notify_turn_not_started``, so the exact event identity survives to
@@ -1664,7 +1669,6 @@ class Kernel:
         held.finished = False
         held.event_id = event_id
         self._work_item_runs[held.request_id] = held
-        self._active_work_item_request_id = held.request_id
         self._factory_work_item_events.add(event_id)
         return held.request_id
 
@@ -1712,6 +1716,7 @@ class Kernel:
                 self._release_order_entry(thread_key, entry)
 
         owned_work_item_id: uuid.UUID | None = None
+        owned_token = _OWNED_WORK_ITEM.set(None)
         try:
             if await self._markers.is_terminal(event_id):
                 # ``is_terminal``, not ``is_done``: a DONE outbox record proves
@@ -1825,7 +1830,6 @@ class Kernel:
                         exc.code,
                     )
                     return
-                self._active_work_item_request_id = parsed_work_item.request_id
                 self._work_item_runs[parsed_work_item.request_id] = WorkItemRun(
                     client=self._work_items,
                     request_id=parsed_work_item.request_id,
@@ -1846,6 +1850,7 @@ class Kernel:
                     self._factory_work_item_events.add(event_id)
                     await self._markers.mark_done(event_id)
                     return
+            _OWNED_WORK_ITEM.set(owned_work_item_id)
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
@@ -2414,8 +2419,7 @@ class Kernel:
                     owned_run = self._work_item_runs.pop(owned_work_item_id, None)
                     if owned_run is not None:
                         await owned_run.close()
-                if getattr(self, "_active_work_item_request_id", None) == owned_work_item_id:
-                    self._active_work_item_request_id = None
+            _OWNED_WORK_ITEM.reset(owned_token)
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
             # path (success, escalate, drop, or error). Best-effort and
@@ -4727,19 +4731,18 @@ class Kernel:
         # Register before start_turn so a kill during the POST can find this
         # thread. Canned and steered returns above never register. A failed
         # start unregisters so a turn that never opened cannot leak an entry.
-        run = None
-        for candidate in getattr(self, "_work_item_runs", {}).values():
-            if (
-                candidate.thread_key == thread_key
-                and candidate.started
-                and not candidate.finished
-            ):
-                run = candidate
-                break
+        runs = getattr(self, "_work_item_runs", {})
+        owned_id = _OWNED_WORK_ITEM.get()
+        run = runs.get(owned_id) if owned_id is not None else None
         if run is None:
-            active_id = getattr(self, "_active_work_item_request_id", None)
-            runs = getattr(self, "_work_item_runs", {})
-            run = runs.get(active_id) if active_id is not None else None
+            for candidate in runs.values():
+                if (
+                    candidate.thread_key == thread_key
+                    and candidate.started
+                    and not candidate.finished
+                ):
+                    run = candidate
+                    break
         if run is not None and run.finished:
             raise WorkItemStartRefused("work item authority is finished")
         if run is not None and not run.started:
