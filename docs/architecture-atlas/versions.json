@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "product-altitude",
+  "defaultVersion": "v0.10.0-rc.1",
   "versions": [
     {
       "id": "v0.7.1",
@@ -145,6 +145,14 @@
       "date": "2026-09-24",
       "branch": "main",
       "commit": "d72611c7292e414ebd31d1450d317149de343abc"
+    },
+    {
+      "id": "v0.10.0-rc.1",
+      "label": "v0.10.0-rc.1",
+      "file": "snapshots/v0.10.0-rc.1.json",
+      "date": "2026-09-24",
+      "branch": "next",
+      "commit": "bd776667616375e7d6dbcf64bfaddee582be99d1"
     }
   ]
 }
