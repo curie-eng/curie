@@ -3,6 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -142,6 +143,94 @@ def test_older_chart_version_uses_newest_numeric_catalog_window(tmp_path: Path) 
     assert "chart appVersion 0.9.0" in result.stdout
     assert "catalog appVersion 0.9.10" in result.stdout
     assert "schema_head 0002" in result.stdout
+
+
+def test_release_candidate_chart_requires_its_exact_catalog_window(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.10.0-rc.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.0": "0002"},
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "no window for appVersion 0.10.0-rc.1" in result.stderr
+
+
+def test_release_candidate_precedes_stable_in_catalog_order(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.10.0-rc.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={
+            "0.10.0": "0002",
+            "0.10.0-rc.1": "0001",
+        },
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "chart appVersion 0.10.0-rc.1" in result.stdout
+    assert "catalog appVersion 0.10.0 schema_head 0002" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["0.10.0-rc", "0.10.0-rc.x", "0.10.0-rc.01", "0.10.0-rc.1.extra"],
+)
+def test_malformed_release_candidate_catalog_key_fails(
+    tmp_path: Path, version: str
+) -> None:
+    _write_chart(tmp_path, app_version="0.9.9")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.9.9": "0002", version: "0002"},
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert version in result.stderr
+
+
+def test_release_candidate_chart_window_matches_alembic_head(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.10.0-rc.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.9.9": "0001", "0.10.0-rc.1": "0002"},
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "chart appVersion 0.10.0-rc.1" in result.stdout
+    assert "catalog appVersion 0.10.0-rc.1 schema_head 0002" in result.stdout
+
+
+def test_release_candidate_window_must_match_alembic_head(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.10.0-rc.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.9.9": "0001", "0.10.0-rc.1": "0001"},
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "0.10.0-rc.1" in result.stderr
+    assert "schema_head" in result.stderr
+    assert "0002" in result.stderr
 
 
 def test_migration_with_matching_window_passes(tmp_path: Path) -> None:
