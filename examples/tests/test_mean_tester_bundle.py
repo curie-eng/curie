@@ -151,3 +151,25 @@ def test_every_fail_case_also_demands_zero_passes():
         expected = case["grader"]["expected"]
         if "FAIL" in expected and not expected.endswith("0 FAIL"):
             assert expected.startswith("0 PASS"), case["id"]
+
+
+def _platform_texts() -> list[str]:
+    section = re.search(r"^## Platform texts\n(.*?)(?=^## |\Z)", _skill(), re.M | re.S)
+    assert section, "SKILL.md must keep a '## Platform texts' section"
+    return re.findall(r"^- `([^`]+)`", section.group(1), re.M)
+
+
+def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
+    sources = "\n".join(
+        (REPO / path).read_text()
+        for path in (
+            "apps/dispatcher/src/curie_dispatcher/config.py",
+            "apps/worker/src/curie_worker/config.py",
+            "apps/worker/src/curie_worker/kernel.py",
+        )
+    )
+    joined = re.sub(r'"\s*\n\s*"', "", sources)  # join implicitly concatenated literals
+    texts = _platform_texts()
+    assert len(texts) >= 6
+    for text in texts:
+        assert text in joined, f"{text!r} no longer appears in the platform; update SKILL.md"
