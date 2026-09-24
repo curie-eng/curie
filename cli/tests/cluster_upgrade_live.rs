@@ -870,7 +870,7 @@ fn release_channel_dry_run_plans_target_cache_and_url_without_fetching() {
         .unwrap_or_else(|| panic!("cold dry-run has no Helm plan line: {plan:?}"));
     assert_eq!(
         helm_line,
-        format!("helm upgrade rel {target} -n ns --wait --timeout 15m"),
+        format!("helm upgrade rel {target} -n ns --wait --timeout 15m -f <retained-values>"),
         "the downloaded archive is a local chart at Apply, so the cold plan must omit --version"
     );
     assert!(
@@ -969,8 +969,9 @@ fn release_channel_cached_dry_run_checks_target_without_version_flag() {
     );
     assert!(
         plan.iter().filter_map(Value::as_str).any(|line| {
-            line == format!("helm upgrade rel {target} -n ns --wait --timeout 15m")
-                && !line.contains("--version")
+            line == format!(
+                "helm upgrade rel {target} -n ns --wait --timeout 15m -f <retained-values>"
+            ) && !line.contains("--version")
         }),
         "cached plan must use the exact local-archive command head: {plan:?}"
     );
@@ -995,8 +996,8 @@ fn release_channel_cold_dry_run_still_reports_config_conflict() {
         &["--dry-run"],
     );
     assert!(
-        output.status.success(),
-        "dry-run reports refusals in its plan: {} / {}",
+        !output.status.success(),
+        "a refusing dry-run reports the refusal in its plan and fails (#2862): {} / {}",
         stdout(&output),
         stderr(&output)
     );
@@ -1037,8 +1038,8 @@ fn explicit_missing_chart_refuses_without_becoming_pending_release_download() {
     let missing = missing.to_string_lossy().into_owned();
     let output = fixture.run_with("schema-compatible", "0.9.0", &missing, &["--dry-run"]);
     assert!(
-        output.status.success(),
-        "dry-run refusal belongs in the plan"
+        !output.status.success(),
+        "dry-run refusal belongs in the plan and fails the dry run (#2862)"
     );
     let plan = json(&output)["plan"].to_string();
     assert!(
@@ -2802,16 +2803,15 @@ fn dry_run_helm_line_matches_the_recorded_upgrade_argv() {
             mutator.argv(),
             stderr(&output)
         );
-        // `--install`/`-f` are runtime-state tails; the planned line is the
-        // fixed head, and it must match that head exactly.
-        let head: Vec<String> = upgrades[0]
-            .iter()
-            .take(line.split(' ').count())
-            .cloned()
-            .collect();
+        // #2863: the planned line is the whole command. Only the `-f`
+        // tempfile path differs, and the plan names it by placeholder.
+        let mut executed = upgrades[0].clone();
+        if let Some(at) = executed.iter().position(|arg| arg == "-f") {
+            executed[at + 1] = "<retained-values>".into();
+        }
         assert_eq!(
             line,
-            head.join(" "),
+            executed.join(" "),
             "planned line must be the executed command: {:?}",
             upgrades[0]
         );
@@ -3418,4 +3418,129 @@ fn retained_dotted_maps_and_scalars_stay_exact_in_forward_only_upgrade_json() {
         Some(&Value::Bool(true)),
         "forward only control must stay a boolean: {values}"
     );
+}
+
+/// Every call that writes: Helm apply or rollback, and any kubectl create,
+/// patch, apply, replace or delete.
+fn mutating_calls(fixture: &Fixture) -> Vec<Vec<String>> {
+    fixture
+        .argv()
+        .into_iter()
+        .filter(|call| {
+            match (
+                call.first().map(String::as_str),
+                call.get(1).map(String::as_str),
+            ) {
+                (Some("helm"), Some(verb)) => {
+                    matches!(verb, "upgrade" | "install" | "rollback" | "uninstall")
+                }
+                (Some("kubectl"), Some(verb)) => {
+                    matches!(verb, "create" | "patch" | "apply" | "replace" | "delete")
+                }
+                _ => false,
+            }
+        })
+        .collect()
+}
+
+/// #2862: a dry run that ends in a Validate refusal exits with the same
+/// nonzero class as the identical real run, and issues no mutating call.
+/// Covers the chart identity refusal and the schema graph refusal.
+#[test]
+fn dry_run_refusal_exits_like_the_real_run_without_mutating() {
+    for (scenario, needle) in [
+        ("local-chart-mismatch", "declares version"),
+        ("schema-incompatible", "refusal at validate"),
+    ] {
+        let dry = Fixture::new(None);
+        let output = dry.run_with(scenario, "0.9.0", "charts/curie", &["--dry-run"]);
+        assert!(
+            !output.status.success(),
+            "{scenario}: a refusing dry run must exit nonzero: {}",
+            visible(&output)
+        );
+        assert!(
+            visible(&output).contains(needle),
+            "{scenario}: the refusal must stay visible: {}",
+            visible(&output)
+        );
+        assert!(
+            mutating_calls(&dry).is_empty(),
+            "{scenario}: a dry run must not mutate: {:?}",
+            dry.argv()
+        );
+
+        let real = Fixture::new(None);
+        let real_output = real.run(scenario, "0.9.0", "charts/curie");
+        assert!(
+            !real_output.status.success(),
+            "{scenario}: real run refuses"
+        );
+        assert_eq!(
+            output.status.code(),
+            real_output.status.code(),
+            "{scenario}: dry run and real run must share an exit class"
+        );
+        assert!(real.helm_upgrades().is_empty(), "{scenario}");
+    }
+}
+
+/// #2862 negative control: a plan with no refusal still succeeds and still
+/// mutates nothing.
+#[test]
+fn valid_dry_run_succeeds_without_mutating() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with("schema-compatible", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert!(!visible(&output).contains("refusal at validate"));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+}
+
+/// #2863: the apply line a dry run prints is the argv the real run executes,
+/// with only the retained values tempfile path replaced by a placeholder. The
+/// overlay's contents never reach the plan.
+#[test]
+fn printed_apply_line_matches_executed_helm_argv() {
+    let overlay = r#"{"worker":{"replicas":2},"marker":"overlay-value-must-not-print"}"#;
+    for (scenario, install) in [("schema-compatible", false), ("fresh-install", true)] {
+        let dry = Fixture::new(Some(overlay));
+        let output = dry.run_with(scenario, "0.9.0", "charts/curie", &["--dry-run"]);
+        assert!(output.status.success(), "{scenario}: {}", visible(&output));
+        assert!(
+            !visible(&output).contains("overlay-value-must-not-print"),
+            "{scenario}: values contents must not be printed: {}",
+            visible(&output)
+        );
+        let printed: Vec<String> = json(&output)["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|line| line.starts_with("helm upgrade "))
+            .unwrap_or_else(|| panic!("{scenario}: no apply line: {}", visible(&output)))
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+
+        let real = Fixture::new(Some(overlay));
+        let real_output = real.run(scenario, "0.9.0", "charts/curie");
+        let upgrades = real.helm_upgrades();
+        assert_eq!(upgrades.len(), 1, "{scenario}: {}", visible(&real_output));
+        let mut executed = upgrades[0].clone();
+        let values_at = executed
+            .iter()
+            .position(|arg| arg == "-f")
+            .unwrap_or_else(|| panic!("{scenario}: apply passed no values: {executed:?}"));
+        executed[values_at + 1] = "<retained-values>".into();
+
+        assert_eq!(
+            printed, executed,
+            "{scenario}: printed plan drifted from apply"
+        );
+        assert_eq!(
+            printed.iter().any(|arg| arg == "--install"),
+            install,
+            "{scenario}: --install only for a first install: {printed:?}"
+        );
+    }
 }

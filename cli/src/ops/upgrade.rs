@@ -395,6 +395,7 @@ pub struct FakeUpgradeHost {
     converge_exact: bool,
     manifest_matches: bool,
     in_flight: Vec<String>,
+    retained_values: bool,
     applied: bool,
     pub drain_calls: u32,
     pub mutate_calls: u32,
@@ -416,6 +417,7 @@ impl FakeUpgradeHost {
             converge_exact: true,
             manifest_matches: true,
             in_flight: Vec::new(),
+            retained_values: false,
             applied: false,
             drain_calls: 0,
             mutate_calls: 0,
@@ -484,6 +486,11 @@ impl FakeUpgradeHost {
         self
     }
 
+    pub fn with_retained_values(mut self) -> Self {
+        self.retained_values = true;
+        self
+    }
+
     pub fn clear_interrupt(&mut self) {
         self.interrupt_after = None;
         self.fail_at = None;
@@ -517,6 +524,9 @@ impl UpgradeDriver for FakeUpgradeHost {
     }
     fn set_known_good(&mut self, version: Option<String>) {
         self.known_good = version;
+    }
+    fn retained_values(&self) -> bool {
+        self.retained_values
     }
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
@@ -606,7 +616,14 @@ fn plan_lines(
     from: Option<&str>,
     secret: Option<&str>,
     schema_plan: Option<&str>,
+    retained_values: bool,
 ) -> Vec<String> {
+    let apply = helm_upgrade_argv(
+        opts,
+        &opts.to,
+        from.is_none(),
+        retained_values.then_some(RETAINED_VALUES_PLACEHOLDER),
+    );
     let from = from.unwrap_or("none");
     let mut lines = vec![
         format!("phase plan: {from} -> {}", opts.to),
@@ -619,7 +636,7 @@ fn plan_lines(
         "phase migrate: checkpoint boundary only; the chart's pre-upgrade hook Job \
          performs schema migration during apply"
             .into(),
-        helm_upgrade_argv(opts, &opts.to).join(" "),
+        apply.join(" "),
         "phase converge: exact images, generations, replicas, unavailable=0, hooks, queues, manifest"
             .into(),
         "phase canary: target-version smoke".into(),
@@ -726,6 +743,10 @@ trait UpgradeDriver {
     fn schema_plan(&self) -> Option<String> {
         None
     }
+    /// Whether Apply hands Helm a retained values overlay via `-f` (#2863).
+    fn retained_values(&self) -> bool {
+        false
+    }
     fn redact(&self, text: &str) -> String {
         match self.secret() {
             Some(secret) => text.replace(secret, &mask_secret(secret)),
@@ -789,19 +810,33 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         from.as_deref(),
         host.secret(),
         host.schema_plan().as_deref(),
+        host.retained_values(),
     );
     let mut plan: Vec<String> = plan.into_iter().map(|l| host.redact(&l)).collect();
 
     if opts.common.dry_run {
         // The plan is what the command WILL do, so a dry run that computed the
         // read-only pre-mutation checks must show the refusal the real run
-        // would hit at Validate instead of printing a clean nine-phase plan.
-        if let Some(detail) = host.validate_refusal() {
-            plan.push(host.redact(&format!("refusal at validate: {detail}")));
+        // would hit at Validate instead of printing a clean nine-phase plan,
+        // and must fail like that real run does (#2862).
+        let refusal = host.validate_refusal().or_else(|| {
+            if host.refuse_config() {
+                Some("configuration compatibility check refused the overlay before mutation".into())
+            } else if host.refuse_schema() {
+                Some("database/application compatibility check refused the target schema before mutation".into())
+            } else {
+                None
+            }
+        });
+        let refusal = refusal.map(|detail| host.redact(&detail));
+        if let Some(detail) = &refusal {
+            plan.push(format!("refusal at validate: {detail}"));
         }
-        return Ok(ClusterUpgradeOutput::DryRun(crate::ui::DryRunPlan {
-            lines: plan,
-        }));
+        let output = ClusterUpgradeOutput::DryRun(crate::ui::DryRunPlan { lines: plan });
+        return match refusal {
+            Some(detail) => Err(crate::ui::ui().failed_report(&output, anyhow::anyhow!(detail))),
+            None => Ok(output),
+        };
     }
 
     let mut record = match host.load_record() {
@@ -1183,7 +1218,15 @@ fn chart_ref(opts: &UpgradeOpts) -> &str {
 /// mutating call so the printed plan cannot drift from the executed command.
 /// A ref Helm resolves IS pinned by `--version`; a local path is pinned by
 /// `chart_pin_refusal` before Apply ever runs, so it deliberately carries none.
-fn helm_upgrade_argv(opts: &UpgradeOpts, to: &str) -> Vec<String> {
+/// `install` adds `--install` for a release that does not exist yet, and
+/// `values` is the retained overlay's `-f` operand: the real tempfile path for
+/// Apply, [`RETAINED_VALUES_PLACEHOLDER`] for the plan (#2863).
+fn helm_upgrade_argv(
+    opts: &UpgradeOpts,
+    to: &str,
+    install: bool,
+    values: Option<&str>,
+) -> Vec<String> {
     let chart = chart_ref(opts);
     let mut argv = vec![
         "helm".to_string(),
@@ -1203,8 +1246,19 @@ fn helm_upgrade_argv(opts: &UpgradeOpts, to: &str) -> Vec<String> {
         argv.push("--version".into());
         argv.push(to.to_string());
     }
+    if install {
+        argv.push("--install".into());
+    }
+    if let Some(values) = values {
+        argv.push("-f".into());
+        argv.push(values.to_string());
+    }
     argv
 }
+
+/// Stands in for the retained values tempfile in the printed plan, which never
+/// carries the path or the overlay contents.
+const RETAINED_VALUES_PLACEHOLDER: &str = "<retained-values>";
 
 fn api_workload_missing(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
@@ -1996,20 +2050,20 @@ impl LiveHost {
     }
 
     fn helm_upgrade(&self, to: &str) -> Result<()> {
-        let mut args: Vec<_> = helm_upgrade_argv(&self.opts, to)
-            .into_iter()
-            .skip(1)
-            .map(plain)
-            .collect();
-        if self.current.is_none() {
-            args.push(plain("--install"));
-        }
         let tmp = tempfile::NamedTempFile::new().context("upgrade values tempfile")?;
-        if let Some(overlay) = &self.overlay {
-            std::fs::write(tmp.path(), overlay)?;
-            args.push(plain("-f"));
-            args.push(plain(tmp.path().to_string_lossy().into_owned()));
-        }
+        let values = match &self.overlay {
+            Some(overlay) => {
+                std::fs::write(tmp.path(), overlay)?;
+                Some(tmp.path().to_string_lossy().into_owned())
+            }
+            None => None,
+        };
+        let args: Vec<_> =
+            helm_upgrade_argv(&self.opts, to, self.current.is_none(), values.as_deref())
+                .into_iter()
+                .skip(1)
+                .map(plain)
+                .collect();
         let cmd = OpsCommand::new("helm", args);
         let (ok, _, err) = self.run(&cmd)?;
         if !ok {
@@ -2133,6 +2187,9 @@ impl UpgradeDriver for LiveHost {
     fn schema_plan(&self) -> Option<String> {
         self.schema_plan.clone()
     }
+    fn retained_values(&self) -> bool {
+        self.overlay.is_some()
+    }
     fn validate_refusal(&self) -> Option<String> {
         self.chart_refusal
             .clone()
@@ -2208,8 +2265,8 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         // run when the selected local chart or Helm reference is available;
         // a cold release asset records those checks as pending instead (#2301).
         live.compute_pre_mutation();
-        let result = run_lifecycle_inner(opts, &mut live).await;
-        return wrap_schema_refusal(&live, result);
+        // A refusing dry run already failed with its plan as the report.
+        return run_lifecycle_inner(opts, &mut live).await;
     }
 
     require_on_path("helm")?;
