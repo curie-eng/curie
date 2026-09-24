@@ -1954,3 +1954,80 @@ def test_an_opened_pull_request_completes_after_the_execution_deadline(
         )
 
     with_session(body)
+
+
+async def _seed_transcript(session: AsyncSession, agent_id: uuid.UUID, thread: str) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO curie.thread_transcripts (id, agent_id, thread_key, value) "
+            "VALUES (:id, :agent, :thread, CAST('[{\"role\": \"user\"}]' AS jsonb))"
+        ),
+        {"id": uuid.uuid4(), "agent": agent_id, "thread": thread},
+    )
+    await session.commit()
+
+
+async def _transcript_threads(session: AsyncSession, agent_id: uuid.UUID) -> set[str]:
+    rows = await session.scalars(
+        text("SELECT thread_key FROM curie.thread_transcripts WHERE agent_id = :agent"),
+        {"agent": agent_id},
+    )
+    return set(rows)
+
+
+def test_a_terminal_work_item_expires_only_its_own_transcript(clean_db: None) -> None:
+    """ADR-0170 (#3070): the terminal transition deletes the thread's history."""
+
+    other_thread = "slack:C0EXAMPLE1:1700000000.000200"
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item = (await _item(session, agent_id)).work_item
+        running = await _start(session, await _request(session, item))
+        await _seed_transcript(session, agent_id, CONVERSATION)
+        await _seed_transcript(session, agent_id, other_thread)
+        request = running.request
+        assert request is not None
+
+        stale = await workitems.fail_execution(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=request.id,
+            cause="runner_escalated",
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=request.version + 1,
+        )
+        _conflict(stale, "stale_version")
+        assert await _transcript_threads(session, agent_id) == {CONVERSATION, other_thread}
+
+        failed = await workitems.fail_execution(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=request.id,
+            cause="runner_escalated",
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=request.version,
+        )
+        assert isinstance(failed, workitems.WorkItemOutcome), failed
+        assert failed.request is not None and failed.request.status == "failed"
+        assert await _transcript_threads(session, agent_id) == {other_thread}
+
+    with_session(body)
+
+
+def test_cancelling_a_waiting_work_item_expires_its_transcript(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        waiting = await _request(session, (await _item(session, agent_id)).work_item)
+        await _seed_transcript(session, agent_id, CONVERSATION)
+
+        cancelled = await workitems.request_cancellation(
+            session,
+            work_item_id=waiting.work_item.id,
+            expected_work_item_version=waiting.work_item.version,
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        assert cancelled.request is not None and cancelled.request.status == "cancelled"
+        assert await _transcript_threads(session, agent_id) == set()
+
+    with_session(body)

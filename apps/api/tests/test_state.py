@@ -475,7 +475,7 @@ def test_transcript_value_cap_records_once_without_mutating_the_log(
     url = f"/agents/{aid}/state/transcript/thread-value/append"
     seed = {"kind": "message", "text": "seed"}
     settings = get_settings()
-    settings.state_max_value_bytes = _json_size([seed])
+    settings.transcript_max_thread_bytes = _json_size([seed])
     try:
         initial = client.post(url, json={"item": seed}, headers=auth_headers)
         assert initial.status_code == 200, initial.text
@@ -506,57 +506,87 @@ def test_transcript_value_cap_records_once_without_mutating_the_log(
         get_settings.cache_clear()
 
 
-def test_transcript_namespace_cap_records_once_and_preserves_every_key(
+def test_many_threads_for_one_agent_all_persist_and_resume_past_the_old_namespace_cap(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """ADR-0170 (#3070): transcripts are capped per thread, never per agent.
+
+    Before the move every thread shared the agent's 1 MiB transcript namespace,
+    so a factory agent failed every new run once about 30 issues filled it. Here
+    one agent writes threads whose total is well past that old cap, each close to
+    its own per-thread cap, and every thread still appends and reads back.
+    """
+    aid = _agent(client, auth_headers)
+    settings = get_settings()
+    thread_cap = settings.transcript_max_thread_bytes
+    old_namespace_cap = settings.state_max_namespace_bytes
+    turn = {"role": "assistant", "content": "x" * (thread_cap // 4)}
+    threads = [f"issue-{n}" for n in range(24)]
+
+    written: dict[str, Any] = {}
+    for thread in threads:
+        url = f"/agents/{aid}/state/transcript/{thread}"
+        for _ in range(3):
+            appended = client.post(f"{url}/append", json={"item": turn}, headers=auth_headers)
+            assert appended.status_code == 200, appended.text
+        written[thread] = appended.json()["value"]
+
+    total = sum(_json_size(value) for value in written.values())
+    assert total > old_namespace_cap, (total, old_namespace_cap)
+    for thread, value in written.items():
+        url = f"/agents/{aid}/state/transcript/{thread}"
+        resumed = client.get(url, headers=auth_headers)
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["value"] == value
+        assert resumed.json()["version"] == 3
+    # No thread lives in the capped state store any more.
+    listed = client.get(f"/agents/{aid}/state/transcript", headers=auth_headers).json()
+    assert {row["key"] for row in listed} == set(threads)
+    assert _history_failure_points(history_failure_metrics) == []
+
+
+def test_one_thread_over_its_cap_is_refused_without_touching_its_siblings(
     client: Any,
     auth_headers: dict[str, str],
     clean_db: None,
     history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
     aid = _agent(client, auth_headers)
-    target_item = {"kind": "message", "text": "target"}
-    sibling_item = {"kind": "message", "text": "sibling"}
-    target = f"/agents/{aid}/state/transcript/thread-target"
-    sibling = f"/agents/{aid}/state/transcript/thread-sibling"
     settings = get_settings()
-    settings.state_max_value_bytes = 10_000
-    settings.state_max_namespace_bytes = _json_size([target_item]) + _json_size(
-        [sibling_item]
-    )
+    settings.transcript_max_thread_bytes = 200
+    base = f"/agents/{aid}/state/transcript"
     try:
-        target_seed = client.post(
-            f"{target}/append", json={"item": target_item}, headers=auth_headers
+        sibling = client.post(
+            f"{base}/thread-sibling/append",
+            json={"item": {"text": "s" * 100}},
+            headers=auth_headers,
         )
-        sibling_seed = client.post(
-            f"{sibling}/append", json={"item": sibling_item}, headers=auth_headers
+        assert sibling.status_code == 200, sibling.text
+        runaway = client.post(
+            f"{base}/thread-runaway/append",
+            json={"item": {"text": "r" * 100}},
+            headers=auth_headers,
         )
-        assert target_seed.status_code == 200, target_seed.text
-        assert sibling_seed.status_code == 200, sibling_seed.text
-
+        assert runaway.status_code == 200, runaway.text
         refused = client.post(
-            f"{target}/append",
-            json={"item": {"kind": "message", "text": "next"}},
+            f"{base}/thread-runaway/append",
+            json={"item": {"text": "r" * 100}},
             headers=auth_headers,
         )
         assert refused.status_code == 413, refused.text
-
-        for url, seeded in ((target, target_seed), (sibling, sibling_seed)):
-            stored = client.get(url, headers=auth_headers)
-            assert stored.status_code == 200, stored.text
-            assert stored.json()["value"] == seeded.json()["value"]
-            assert stored.json()["version"] == seeded.json()["version"]
-
-        other = _agent(
-            client,
-            auth_headers,
-            address="C000000S02",
-            name="state-agent-other",
-        )
-        healthy = client.post(
-            f"/agents/{other}/state/transcript/thread-other/append",
-            json={"item": {"kind": "message", "text": "healthy"}},
+        assert "per-thread" in refused.json()["detail"]
+        grown = client.post(
+            f"{base}/thread-new/append",
+            json={"item": {"text": "n" * 100}},
             headers=auth_headers,
         )
-        assert healthy.status_code == 200, healthy.text
+        assert grown.status_code == 200, grown.text
+        assert client.get(f"{base}/thread-sibling", headers=auth_headers).json()[
+            "value"
+        ] == sibling.json()["value"]
         assert _history_failure_points(history_failure_metrics) == [
             (
                 1,
@@ -564,12 +594,42 @@ def test_transcript_namespace_cap_records_once_and_preserves_every_key(
                     "service.name": "curie-api",
                     "source": "state-api",
                     "outcome": "capacity",
-                    "limit": "namespace",
+                    "limit": "value",
                 },
             )
         ]
     finally:
         get_settings.cache_clear()
+
+
+def test_expired_idle_transcript_reads_as_absent_and_is_swept(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """ADR-0170: a thread with no WorkItem expires after its idle window."""
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/transcript"
+    settings = get_settings()
+    settings.transcript_idle_ttl_seconds = 0
+    try:
+        stale = client.post(
+            f"{base}/thread-idle/append", json={"item": {"text": "old"}}, headers=auth_headers
+        )
+        assert stale.status_code == 200, stale.text
+    finally:
+        get_settings.cache_clear()
+    assert client.get(f"{base}/thread-idle", headers=auth_headers).status_code == 404
+    assert client.get(base, headers=auth_headers).json() == []
+
+    fresh = client.post(
+        f"{base}/thread-live/append", json={"item": {"text": "new"}}, headers=auth_headers
+    )
+    assert fresh.status_code == 200, fresh.text
+    restarted = client.post(
+        f"{base}/thread-idle/append", json={"item": {"text": "again"}}, headers=auth_headers
+    )
+    assert restarted.status_code == 200, restarted.text
+    assert restarted.json()["value"] == [{"text": "again"}]
+    assert restarted.json()["version"] == 1
 
 
 def test_non_transcript_capacity_refusal_records_no_history_failure(
@@ -1408,7 +1468,7 @@ def test_value_cap_refusal_names_the_key_over_the_limit(
     # thread an operator must recover.
     aid = _agent(client, auth_headers)
     settings = get_settings()
-    settings.state_max_value_bytes = 50
+    settings.transcript_max_thread_bytes = 50
     try:
         refused = client.post(
             f"/agents/{aid}/state/transcript/thread-runaway/append",
@@ -1424,11 +1484,12 @@ def test_value_cap_refusal_names_the_key_over_the_limit(
 def test_namespace_cap_refusal_names_the_largest_thread_not_the_caller(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # #2820: one runaway thread fills the per-agent transcript namespace and
-    # a small sibling's append is refused. The refusal must name the runaway
-    # thread, which is the one to export and delete, not only the caller.
+    # #2820: one runaway key fills a namespace and a small sibling's append is
+    # refused. The refusal must name the runaway key, which is the one to export
+    # and delete, not only the caller. Transcripts no longer share a namespace
+    # (ADR-0170), so this now guards general state.
     aid = _agent(client, auth_headers)
-    base = f"/agents/{aid}/state/transcript"
+    base = f"/agents/{aid}/state/audit"
     settings = get_settings()
     settings.state_max_value_bytes = 10_000
     settings.state_max_namespace_bytes = 400
@@ -1539,7 +1600,6 @@ def test_binding_scoped_delete_honors_expected_version(
 
 def _hold_row_lock_then_append(
     aid: str,
-    namespace: str,
     key: str,
     item: Any,
     locked: threading.Event,
@@ -1548,7 +1608,7 @@ def _hold_row_lock_then_append(
 ) -> None:
     """A concurrent append from an outside session (#2927).
 
-    Takes the row lock exactly as `_append_state` does (SELECT ... FOR UPDATE),
+    Takes the transcript row lock exactly as an append does (SELECT ... FOR UPDATE),
     signals, waits for the test's go-ahead, then appends `item` and bumps the
     version before committing.
     """
@@ -1560,13 +1620,12 @@ def _hold_row_lock_then_append(
                 row = await connection.fetchrow(
                     """
                     SELECT id, value
-                    FROM curie.workflow_state_entries
+                    FROM curie.thread_transcripts
                     WHERE agent_id = $1 AND binding_scope IS NULL
-                      AND namespace = $2 AND key = $3
+                      AND thread_key = $2
                     FOR UPDATE
                     """,
                     uuid.UUID(aid),
-                    namespace,
                     key,
                 )
                 assert row is not None
@@ -1574,7 +1633,7 @@ def _hold_row_lock_then_append(
                 await asyncio.to_thread(release.wait, 10)
                 await connection.execute(
                     """
-                    UPDATE curie.workflow_state_entries
+                    UPDATE curie.thread_transcripts
                     SET value = $2::jsonb, version = version + 1
                     WHERE id = $1
                     """,
@@ -1615,7 +1674,7 @@ def test_cas_put_behind_a_locked_concurrent_append_is_409_and_keeps_the_append(
     errors: list[Exception] = []
     holder = threading.Thread(
         target=_hold_row_lock_then_append,
-        args=(aid, "transcript", key, {"text": "two"}, locked, release, errors),
+        args=(aid, key, {"text": "two"}, locked, release, errors),
         daemon=True,
     )
     holder.start()
@@ -1669,7 +1728,7 @@ def test_append_reserve_refusal_is_413_unchanged_and_not_a_persistence_failure(
     item = {"kind": "message", "text": "x" * 100}
     settings = get_settings()
     # After appending `item` exactly 50 bytes remain free under the cap.
-    settings.state_max_value_bytes = _json_size([seed, item]) + 50
+    settings.transcript_max_thread_bytes = _json_size([seed, item]) + 50
     try:
         initial = client.post(url, json={"item": seed}, headers=auth_headers)
         assert initial.status_code == 200, initial.text
