@@ -2953,7 +2953,7 @@ OIDC_LOGIN_ATTEMPT_LOCK = (2908, 0)
 class OidcLoginAttemptsExhausted(Exception):
     """Raised instead of creating an attempt when :data:`OIDC_LOGIN_ATTEMPT_CAP` is reached."""
 
-#: The single-tenant appliance's tenant, provisioned by migration 0050 at this
+#: The single-tenant appliance's tenant, provisioned by migration 0051 at this
 #: fixed id. Every OIDC principal lands here until issuer-to-tenant mapping
 #: exists.
 DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")

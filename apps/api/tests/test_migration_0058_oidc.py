@@ -1,9 +1,9 @@
-"""Migration 0052: OIDC login schema (#2908).
+"""Migration 0058: OIDC login schema (#2908).
 
 Upgrade adds ``curie.oidc_login_attempts``, ``console_sessions.principal_id``
 and ``principals.idp_issuer``, and replaces the principals unique key
 ``(tenant_id, idp_subject)`` with ``principals_tenant_issuer_subject_key`` on
-``(tenant_id, idp_issuer, idp_subject)``. Downgrade to 0051 reverses every piece
+``(tenant_id, idp_issuer, idp_subject)``. Downgrade to 0057 reverses every piece
 and restores the old key. Runs on a private database (``isolated_migration_db``).
 """
 
@@ -117,7 +117,7 @@ def _state_hash_unique() -> bool:
     )
 
 
-def _assert_at_0052() -> None:
+def _assert_at_0058() -> None:
     assert _regclass("oidc_login_attempts") is not None
     attempts = _columns("oidc_login_attempts")
     assert set(attempts) == ATTEMPT_COLUMNS
@@ -142,54 +142,54 @@ def _assert_at_0052() -> None:
     assert OLD_KEY not in uniques
 
 
-def _assert_at_0051() -> None:
+def _assert_at_0057() -> None:
     assert _regclass("oidc_login_attempts") is None
     assert "principal_id" not in _columns("console_sessions")
     assert "idp_issuer" not in _columns("principals")
     uniques = _unique_constraints("principals")
     assert uniques.get(OLD_KEY) == ["tenant_id", "idp_subject"]
     assert NEW_KEY not in uniques
-    # The tables 0051 and earlier own survive.
+    # The tables 0057 and earlier own survive.
     assert _regclass("principals") is not None
     assert _regclass("console_sessions") is not None
 
 
-def test_0052_revision_follows_0051() -> None:
+def test_0058_revision_follows_0057() -> None:
     script = ScriptDirectory.from_config(_config())
-    revision = script.get_revision("0052")
+    revision = script.get_revision("0058")
     assert revision is not None
-    assert revision.down_revision == "0051"
+    assert revision.down_revision == "0057"
 
 
-def test_0052_round_trip(isolated_migration_db: None) -> None:
+def test_0058_round_trip(isolated_migration_db: None) -> None:
     config = _config()
     command.upgrade(config, "head")
-    _assert_at_0052()
+    _assert_at_0058()
     try:
-        command.downgrade(config, "0051")
-        _assert_at_0051()
+        command.downgrade(config, "0057")
+        _assert_at_0057()
     finally:
         # A failed assertion must not leave this private database below head.
         command.upgrade(config, "head")
-    _assert_at_0052()
+    _assert_at_0058()
 
 
-def test_0052_backfills_existing_principals_with_blank_issuer(
+def test_0058_backfills_existing_principals_with_blank_issuer(
     isolated_migration_db: None,
 ) -> None:
-    """A principal row that predates 0052 survives the upgrade with idp_issuer ''."""
+    """A principal row that predates 0058 survives the upgrade with idp_issuer ''."""
 
     config = _config()
-    command.upgrade(config, "0051")
+    command.upgrade(config, "0057")
     try:
         _sql(
             "INSERT INTO curie.principals (id, tenant_id, idp_subject, type) VALUES "
             "(gen_random_uuid(), '00000000-0000-0000-0000-000000000001', "
-            "'pre-0052-sub', 'human')"
+            "'pre-0058-sub', 'human')"
         )
         command.upgrade(config, "head")
         rows = _sql(
-            "SELECT idp_issuer FROM curie.principals WHERE idp_subject = 'pre-0052-sub'"
+            "SELECT idp_issuer FROM curie.principals WHERE idp_subject = 'pre-0058-sub'"
         )
         assert rows == [{"idp_issuer": ""}]
     finally:

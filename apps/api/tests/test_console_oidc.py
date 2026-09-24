@@ -214,7 +214,7 @@ def _booted_app(
     """Boot the app under ``env`` on a clean principal / login-attempt table."""
 
     # clean_db truncates console_sessions; principals are ours to reset. CASCADE
-    # reaches principal_teams and (post-0052) console_sessions.principal_id.
+    # reaches principal_teams and (post-0058) console_sessions.principal_id.
     _sql("TRUNCATE curie.principals CASCADE")
     _sql("TRUNCATE curie.oidc_login_attempts")
     with oidc_env(env):

@@ -5,7 +5,7 @@
 - ``principals.idp_issuer`` joins the identity key. An OIDC ``sub`` is unique
   only per issuer, so ``(tenant_id, idp_subject)`` would let a replacement IdP
   that reuses a subject string inherit an old principal. The unique key becomes
-  ``(tenant_id, idp_issuer, idp_subject)``. 0051's tables have no callers, so no
+  ``(tenant_id, idp_issuer, idp_subject)``. 0057's tables have no callers, so no
   row can collide; any pre-existing row gets ``''``, which no login matches.
 - ``console_sessions.principal_id`` binds an OIDC session to its principal.
   Nullable, and ``subject`` is left alone: login-code sessions keep working
@@ -17,8 +17,8 @@
 
 Expand: the release before this one never reads any of it.
 
-Revision ID: 0052
-Revises: 0051
+Revision ID: 0058
+Revises: 0057
 Create Date: 2026-09-22
 """
 
@@ -28,8 +28,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0052"
-down_revision: str | None = "0051"
+revision: str = "0058"
+down_revision: str | None = "0057"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

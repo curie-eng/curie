@@ -1778,7 +1778,7 @@ class Principal(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
     # The OIDC `iss` that vouched for `idp_subject`. '' for rows that predate
-    # 0052, which no login can match because every login carries its issuer.
+    # 0058, which no login can match because every login carries its issuer.
     idp_issuer: Mapped[str] = mapped_column(String, default="", server_default="")
     idp_subject: Mapped[str] = mapped_column(String)
     type: Mapped[str] = mapped_column(String)

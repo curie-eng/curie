@@ -98,8 +98,8 @@ fn v092_accepts_0045_and_refuses_outside_its_single_revision_window() {
 }
 
 /// Released 0.9.1 reports catalog head 0044. This tree's packaged chart keeps
-/// the 0045 floor and continues through feature train head 0057, so the
-/// pending live migrations are 0045 through 0057 and the upgrade applies.
+/// the 0045 floor and continues through feature train head 0058, so the
+/// pending live migrations are 0045 through 0058 and the upgrade applies.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -109,7 +109,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0045");
-    assert_eq!(target.schema_head, "0057");
+    assert_eq!(target.schema_head, "0058");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -118,7 +118,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         revisions,
         [
             "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
-            "0056", "0057"
+            "0056", "0057", "0058"
         ]
     );
     assert!(pending.iter().all(|step| step.kind == "expand"));

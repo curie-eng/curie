@@ -2,7 +2,7 @@
 
 Migration 0057 adds ``principals``, ``teams`` and ``principal_teams`` with no
 callers yet. A principal is keyed by ``(tenant_id, idp_issuer, idp_subject)``
-(0053, #2908: an OIDC ``sub`` is only unique per issuer); email and display name
+(0058, #2908: an OIDC ``sub`` is only unique per issuer); email and display name
 are attributes, never the identity. Teams are either mirrored IdP
 groups (which must carry the IdP's ``external_id``) or Curie-managed. A
 membership row is a composite-keyed link that cascades away with either side.
@@ -66,7 +66,7 @@ def test_principal_model_shape() -> None:
     assert idp_subject_col.type.python_type is str
     assert idp_subject_col.nullable is False
 
-    # 0052 (#2908): the issuer is part of the identity key.
+    # 0058 (#2908): the issuer is part of the identity key.
     idp_issuer_col = columns["idp_issuer"]
     assert idp_issuer_col.type.python_type is str
     assert idp_issuer_col.nullable is False
@@ -424,7 +424,7 @@ def test_unique_constraint_is_named(migrated: None) -> None:
         )
 
     names = {row["conname"] for row in _rolled_back(body)}
-    # 0052 (#2908) replaced the (tenant_id, idp_subject) key with one that
+    # 0058 (#2908) replaced the (tenant_id, idp_subject) key with one that
     # includes the issuer; the old name must be gone, not kept alongside.
     assert names == {
         "principals_tenant_issuer_subject_key",
