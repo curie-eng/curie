@@ -7,6 +7,13 @@ configmapReload:
     enabled: false
 kube-state-metrics:
   enabled: true
+  # CurieCoreWorkloadNotReady and CurieStateStoreNotReady select on these
+  # labels through kube_deployment_labels and kube_statefulset_labels.
+  # kube-state-metrics exports no object labels by default, so without this
+  # both rules select nothing and stay silent.
+  metricLabelsAllowlist:
+    - deployments=[app.kubernetes.io/component,helm.sh/chart]
+    - statefulsets=[helm.sh/chart]
   resources:
     requests:
       cpu: 10m
@@ -360,31 +367,62 @@ serverFiles:
                 minutes. While it is down no Slack message reaches any agent,
                 and every other pod still looks healthy.
           - alert: CurieNodeNotReady
-            # Testing the status="true" series for 0 catches Unknown as well
-            # as False. A node that stops reporting goes Unknown, which a
-            # status="false" rule would miss.
+            # Two terms. The kubelet term reads this Prometheus's own scrape
+            # of each node (`up` on that job, whose instance is the node
+            # name), so it still fires when kube-state-metrics ran on the
+            # failed node and went down with it. Both aggregate to `node`
+            # alone, so a node failing both raises one alert, and a
+            # kube-state-metrics restart, which changes `instance`, keeps the
+            # `for` clock. status="true" == 0 also catches Unknown.
             expr: |
-              kube_node_status_condition{condition="Ready",status="true"} == 0
+              max by (node) (
+                kube_node_status_condition{
+                  condition="Ready",
+                  status="true"
+                } == 0
+              )
+              or
+              max by (node) (
+                label_replace(
+                  up{job="kubernetes-nodes"} == 0,
+                  "node", "$1", "instance", "(.+)"
+                )
+              )
             for: 5m
             labels:
               severity: page
               component: curie-node
             annotations:
-              summary: A node is not Ready
+              summary: A node is not Ready or its kubelet is unreachable
               description: >-
-                A node has not reported Ready for 5 minutes. Pods on it stop
-                being scheduled, and a sandbox placed there cannot start.
+                A node has not reported Ready, or its kubelet has not answered
+                a scrape, for 5 minutes. New pods are not scheduled onto it,
+                pods already on it are evicted after five minutes, and a
+                sandbox placed there cannot start.
           - alert: CuriePodCrashLooping
-            # max_over_time, not the raw series: the waiting series exists
-            # only while the container waits, so each brief run between
-            # back-offs would drop it and restart the `for` clock. Held over
-            # 5m, a container that flaps between waiting and running stays
-            # firing.
+            # Covers every namespace, not only Curie's. max_over_time because
+            # the waiting series exists only while the container waits, so
+            # each brief run between back-offs would drop it and restart the
+            # `for` clock. The init term is its own metric: while an init
+            # container crashes, the app container only waits as
+            # PodInitializing, so the first term alone never fires.
+            # Aggregated to namespace, pod and container so a
+            # kube-state-metrics restart keeps the clock.
             expr: |
-              max_over_time(
-                kube_pod_container_status_waiting_reason{
-                  reason="CrashLoopBackOff"
-                }[5m]
+              max by (namespace, pod, container) (
+                max_over_time(
+                  kube_pod_container_status_waiting_reason{
+                    reason="CrashLoopBackOff"
+                  }[5m]
+                )
+              ) >= 1
+              or
+              max by (namespace, pod, container) (
+                max_over_time(
+                  kube_pod_init_container_status_waiting_reason{
+                    reason="CrashLoopBackOff"
+                  }[5m]
+                )
               ) >= 1
             for: 10m
             labels:
@@ -393,79 +431,90 @@ serverFiles:
             annotations:
               summary: A container is crash-looping
               description: >-
-                A container has been in CrashLoopBackOff for 10 minutes. It
-                keeps failing on start and waits longer before each retry.
+                A container or init container in any namespace has been in
+                CrashLoopBackOff for 10 minutes. It keeps failing on start and
+                waits longer before each retry.
           - alert: CurieCoreWorkloadNotReady
-            # Same two terms as the mail adapter, for the same reason. The
-            # role regex also matches `<release>-langfuse-worker`, which is
-            # Langfuse's worker and not Curie's, and a connector whose name
-            # ends in a role, which CurieConnectorNotReady already owns. The
-            # second matcher drops both.
+            # Selects Curie chart objects by the labels the kube-state-metrics
+            # allowlist above exports, not by name: a component of api,
+            # worker or dispatcher, and a helm.sh/chart of curie-*, which the
+            # chart sets from its own name and so holds under nameOverride.
+            # Two terms as in the mail adapter rule, because unavailable is
+            # spec minus available and reads 0 at zero replicas. Aggregated
+            # to namespace and deployment, so a move from unavailable to
+            # scaled to zero keeps one label set and keeps firing.
             expr: |
-              (
-                kube_deployment_status_replicas_unavailable{
-                  deployment=~".+-(api|worker|dispatcher)",
-                  deployment!~".*-(mcp|langfuse)-.*"
-                } > 0
-              )
-              or
-              (
-                kube_deployment_spec_replicas{
-                  deployment=~".+-(api|worker|dispatcher)",
-                  deployment!~".*-(mcp|langfuse)-.*"
-                } == 0
+              max by (namespace, deployment) (
+                (
+                  kube_deployment_status_replicas_unavailable > 0
+                  or
+                  kube_deployment_spec_replicas == 0
+                )
+                and on (namespace, deployment)
+                kube_deployment_labels{
+                  label_app_kubernetes_io_component=~"api|worker|dispatcher",
+                  label_helm_sh_chart=~"curie-.+"
+                }
               )
             for: 5m
             labels:
               severity: page
               component: curie-core
             annotations:
-              summary: A core Curie Deployment is not serving
+              summary: A core Curie Deployment has an unavailable replica or is scaled to zero
               description: >-
-                The api, worker or dispatcher has no available replica, or has
-                been scaled to zero. The api readiness probe queries the
-                database, so a database outage, including one outside the
-                cluster, surfaces here as an unavailable api.
+                The api, worker or dispatcher of a Curie release has a replica
+                that is not available, such as a crashed pod or a rollout
+                whose new pod never became ready, or has been scaled to zero.
+                The api readiness probe queries the database, so a database
+                outage, including one outside the cluster, surfaces here as an
+                unavailable api.
           - alert: CurieStateStoreNotReady
-            # Two terms, because ready < replicas is 0 < 0 at zero replicas.
-            # No `on (...)`: both series share every label but __name__, so
-            # both terms yield the same label set, and a store going from not
-            # ready to scaled to zero keeps firing instead of restarting the
-            # 5m wait under new labels.
+            # Valkey and Postgres carry no component label, so the name
+            # suffix picks the store, and a helm.sh/chart of curie-*,
+            # exported by the allowlist above, keeps a same-named
+            # StatefulSet from another chart out. Two terms, because
+            # ready < replicas reads 0 < 0 at zero replicas. Aggregated to
+            # namespace and statefulset, so a move from not ready to scaled
+            # to zero keeps one label set and keeps firing.
             expr: |
-              (
-                kube_statefulset_status_replicas_ready{
-                  statefulset=~".+-(valkey|postgres)"
+              max by (namespace, statefulset) (
+                (
+                  (
+                    kube_statefulset_status_replicas_ready
+                    <
+                    kube_statefulset_replicas
+                  )
+                  or
+                  kube_statefulset_replicas == 0
+                )
+                and on (namespace, statefulset)
+                kube_statefulset_labels{
+                  statefulset=~".+-(valkey|postgres)",
+                  label_helm_sh_chart=~"curie-.+"
                 }
-                <
-                kube_statefulset_replicas{
-                  statefulset=~".+-(valkey|postgres)"
-                }
-              )
-              or
-              (
-                kube_statefulset_replicas{
-                  statefulset=~".+-(valkey|postgres)"
-                } == 0
               )
             for: 5m
             labels:
               severity: page
               component: curie-state
             annotations:
-              summary: Valkey or Postgres is not ready
+              summary: Valkey or Postgres of a Curie release is not ready
               description: >-
-                A Valkey or Postgres StatefulSet has fewer ready replicas than
-                it asks for, or has been scaled to zero. Every agent depends
-                on both: Valkey carries the run queue and Postgres the agents
-                and their state.
+                A Valkey or Postgres StatefulSet of a Curie release has fewer
+                ready replicas than it asks for, or has been scaled to zero.
+                Every agent depends on both: Valkey carries the run queue and
+                Postgres the agents and their state.
           - alert: CuriePersistentVolumeSpaceLow
-            # Filtered on the curie_source stamp like the node rules below:
-            # these come from the kubelet via the node-role scrape, which is
-            # not namespace bounded, so the stamp is what marks a series as
-            # this stack's own. An unstamped series belongs to another source.
+            # Covers every volume mounted on any node, in any namespace: each
+            # kubelet reports its own through the kubernetes-nodes scrape.
+            # The curie_source stamp is not a Curie or namespace filter; it
+            # only excludes series that did not come from this Prometheus's
+            # own scrape, such as ones remote-written into it. Aggregated to
+            # the claim, so a claim mounted on more than one node raises one
+            # alert.
             expr: |
-              (
+              min by (namespace, persistentvolumeclaim) (
                 kubelet_volume_stats_available_bytes{
                   curie_source="curie-sre-bot"
                 }
@@ -481,7 +530,7 @@ serverFiles:
             annotations:
               summary: A persistent volume has less than 10 percent free
               description: >-
-                A curie_source=curie-sre-bot volume series has stayed below 10
+                A persistent volume mounted on any node has stayed below 10
                 percent free for 15 minutes. A full volume stops the workload
                 that writes to it.
           - alert: CurieNodeMemoryHeadroomLow
