@@ -192,7 +192,7 @@ def test_a_round_waits_by_the_clock_and_posts_only_probes():
     # reply a timeout, and the report was also posted as a channel message.
     rnd = re.search(r"^## Running a round\n(.*?)(?=^## )", _skill(), re.M | re.S)
     assert rnd, "SKILL.md must keep a '## Running a round' section"
-    text = rnd.group(1)
+    text = " ".join(rnd.group(1).split())  # prose wraps anywhere; compare words
     assert "sleep" in text and "180 seconds" in text and "date +%s" in text
     assert "five times" not in text
     assert "only to send probes" in text
