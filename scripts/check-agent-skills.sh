@@ -130,7 +130,9 @@ echo "found ${#discovered[@]} skill(s)"
 
 listed=()
 listed+=("${VALID_SKILLS[@]}")
-listed+=("${INVALID_SKILLS[@]}")
+# INVALID_SKILLS may be emptied, which bash 3.2 refuses to expand under
+# `set -u` without the `+` guard.
+listed+=(${INVALID_SKILLS[@]+"${INVALID_SKILLS[@]}"})
 
 echo "== checking the allowlist covers exactly the discovered skills =="
 # bash 3.2, which macOS ships, has no associative arrays. Each set is instead one
@@ -203,7 +205,7 @@ fi
 echo "== asserting the deliberately malformed fixture(s) are still rejected =="
 passed=()
 unverdicted=()
-for skill in "${INVALID_SKILLS[@]}"; do
+for skill in ${INVALID_SKILLS[@]+"${INVALID_SKILLS[@]}"}; do
   echo "-- $skill (must be rejected) --"
   # "Nonzero" is not evidence of a rejection: a missing path exits 2 and a uvx
   # resolution failure exits 1, the same as a real rejection. Only status 1
