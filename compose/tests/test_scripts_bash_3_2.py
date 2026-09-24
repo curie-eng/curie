@@ -30,14 +30,16 @@ IDLE_ROUTE_PATH = (
     REPO_ROOT / "cli" / "scripts" / "e2e-cluster-idle-route-reclamation.sh"
 )
 MAIL_ADAPTER_PATH = REPO_ROOT / "scripts" / "e2e-mail-adapter.sh"
-# Scripts a contributor runs on their own host, whose bash may be 3.2.
-HOST_SCRIPTS = [
-    LADDER_PATH,
-    AGENT_SKILLS_PATH,
-    SRE_DEMO_PATH,
-    IDLE_ROUTE_PATH,
-    MAIL_ADAPTER_PATH,
+CLI_MAIN_PATH = REPO_ROOT / "cli" / "src" / "main.rs"
+# Every script a `curie dev` verb runs, read from the verbs' dispatch.
+DEV_SCRIPT_CALLS = CLI_MAIN_PATH.read_text().count("dev_script(")
+DEV_SCRIPTS = [
+    REPO_ROOT / path
+    for path in re.findall(r'dev_script\(\s*"([^"]+\.sh)"', CLI_MAIN_PATH.read_text())
 ]
+# Scripts a contributor runs on their own host, whose bash may be 3.2: every
+# `curie dev` script, and the e2e scripts that are started by hand.
+HOST_SCRIPTS = sorted({*DEV_SCRIPTS, IDLE_ROUTE_PATH, MAIL_ADAPTER_PATH})
 
 
 def _bash3() -> str | None:
@@ -132,6 +134,18 @@ def _bash4_only_lines(source: str, name: str = "<source>") -> list[str]:
 
 def _script_id(path: Path) -> str:
     return str(path.relative_to(REPO_ROOT))
+
+
+def test_every_curie_dev_script_is_a_host_script() -> None:
+    """A dispatch the pattern cannot read would drop its script silently."""
+
+    assert len(DEV_SCRIPTS) == DEV_SCRIPT_CALLS, (
+        f"{CLI_MAIN_PATH} calls dev_script {DEV_SCRIPT_CALLS} times, but only "
+        f"{len(DEV_SCRIPTS)} name a script literally"
+    )
+    assert {LADDER_PATH, AGENT_SKILLS_PATH, SRE_DEMO_PATH} <= set(DEV_SCRIPTS)
+    missing = [_script_id(path) for path in HOST_SCRIPTS if not path.is_file()]
+    assert not missing, missing
 
 
 @pytest.mark.parametrize("script", HOST_SCRIPTS, ids=_script_id)
