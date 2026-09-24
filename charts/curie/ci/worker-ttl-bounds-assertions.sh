@@ -131,8 +131,13 @@ render() { helm template curie "$CHART" "$@" 2>&1; }
 # Reads the worker Deployment's env list by NAME out of a render, rather than
 # grepping: a value moving between containers, or a second container growing a
 # same-named var, is invisible to a grep and caught here.
-WORKER_ENV_PY="$(
-  cat <<'PY'
+#
+# Each program is read from a bare heredoc rather than captured with
+# `"$(cat ...)"`: bash 3.2, macOS's /bin/bash, scans a heredoc inside a command
+# substitution for quotes, so the apostrophe in a Python comment opened one that
+# never closed and the whole script failed to parse. `read -d ''` returns 1 at
+# end of input, hence `|| true`.
+IFS= read -r -d '' WORKER_ENV_PY <<'PY' || true
 import sys, yaml
 want = sys.argv[2:]
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
@@ -172,10 +177,8 @@ for pair in want:
     elif got != expected:
         raise SystemExit(f"{name} rendered {got!r}, expected {expected!r}")
 PY
-)"
 
-WORKER_TERMINATION_GRACE_PY="$(
-  cat <<'PY'
+IFS= read -r -d '' WORKER_TERMINATION_GRACE_PY <<'PY' || true
 import sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 deploys = [
@@ -192,15 +195,13 @@ if type(got) is not int or got != 1860:
         f"{got!r}, expected integer 1860"
     )
 PY
-)"
 
 # ADR-0131 relationship: rendered grace must be >= rendered delivery budget +
 # rendered shutdown reserve. The fixed-value check above catches a values-file
 # drift; THIS catches an operator who raises the budget (or leaves an old grace
 # override in place) without raising the grace to match -- the actual
 # ADR-0131 misconfiguration, and the one the fixed check cannot see.
-WORKER_GRACE_COVERS_BUDGET_PY="$(
-  cat <<'PY'
+IFS= read -r -d '' WORKER_GRACE_COVERS_BUDGET_PY <<'PY' || true
 import sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 deploys = [
@@ -224,7 +225,6 @@ if type(grace) is not int or grace < required:
         "SIGKILLed before it could settle"
     )
 PY
-)"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -360,6 +360,9 @@ PY
   fi
 }
 
+# The next two helpers lift the ladder functions with `eval "$(sed ...)"`, not
+# `source <(...)`, which bash 3.2 reads short or empty; and the sed range ends
+# `!p;}`, because macOS's sed refuses a `}` straight after a command.
 run_ladder_reply_timeout() {
   local deployment_json="$1" stdout="$2" stderr="$3"
   PATH="$LADDER_STUB_DIR:$PATH" \
@@ -370,7 +373,7 @@ run_ladder_reply_timeout() {
     CURIE_RELEASE="curie" \
     bash -c '
       set -euo pipefail
-      source <(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p}" "$1")
+      eval "$(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p;}" "$1")"
       if ! declare -F cluster_reply_timeout_seconds >/dev/null; then
         echo "cluster: required cluster_reply_timeout_seconds helper is absent from the ladder source" >&2
         exit 1
@@ -383,7 +386,7 @@ assert_ladder_helper_present() {
   local stderr="$TMP/l-helper-presence.err"
   if ! bash -c '
     set -euo pipefail
-    source <(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p}" "$1")
+    eval "$(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p;}" "$1")"
     if ! declare -F cluster_reply_timeout_seconds >/dev/null; then
       echo "cluster: required cluster_reply_timeout_seconds helper is absent from the ladder source" >&2
       exit 1

@@ -13,21 +13,25 @@ in ``BASH4_ONLY`` in any script listed in ``HOST_SCRIPTS``. It cannot see an
 empty array expanded under ``set -u``; only the executing tests catch that.
 
 The same scripts must run on the userland macOS ships, too: it has no GNU
-``timeout`` and no ``setsid``, and its BSD ``sed`` reads the argument after a
-bare ``-i`` as a backup suffix. The executing tests for those sites put
-stand-ins on PATH that fail the way a stock Mac's tools do, so they fail on a
-Linux host as well, and a second scan refuses the forms listed in ``GNU_ONLY``
-in any script listed in ``HOST_SCRIPTS``.
+``timeout``, no ``setsid`` and no ``flock``, and its BSD ``sed`` reads the
+argument after a bare ``-i`` as a backup suffix. The executing tests for those
+sites put stand-ins on PATH that fail the way a stock Mac's tools do, so they
+fail on a Linux host as well, and a second scan refuses the forms listed in
+``GNU_ONLY`` in any script listed in ``HOST_SCRIPTS``.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import json
 import os
 import re
 import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -48,9 +52,18 @@ DEV_SCRIPTS = [
     REPO_ROOT / path
     for path in re.findall(r'dev_script\(\s*"([^"]+\.sh)"', CLI_MAIN_PATH.read_text())
 ]
+# `curie dev chart-check` runs this with the bash on PATH through
+# `run_chart_check_scripts` (cli/src/commands.rs), not `dev_script`, so the
+# dispatch above does not find it.
+WORKER_TTL_BOUNDS_PATH = (
+    REPO_ROOT / "charts" / "curie" / "ci" / "worker-ttl-bounds-assertions.sh"
+)
 # Scripts a contributor runs on their own host, whose bash may be 3.2: every
-# `curie dev` script, and the e2e scripts that are started by hand.
-HOST_SCRIPTS = sorted({*DEV_SCRIPTS, IDLE_ROUTE_PATH, MAIL_ADAPTER_PATH})
+# `curie dev` script, the chart assertion above, and the e2e scripts that are
+# started by hand.
+HOST_SCRIPTS = sorted(
+    {*DEV_SCRIPTS, WORKER_TTL_BOUNDS_PATH, IDLE_ROUTE_PATH, MAIL_ADAPTER_PATH}
+)
 
 
 def _bash3() -> str | None:
@@ -129,6 +142,9 @@ BASH4_ONLY = {
     r"%\([^)]*\)T": "printf %(...)T (bash 4.2)",
     r"\{0[0-9]+\.\.[0-9]+\}": "zero-padded brace range (bash 4.0)",
     _COMMAND + r"wait\s+-n\b": "wait -n (bash 4.3)",
+    # 3.2 accepts this, but reads only what the pipe holds when it looks, which
+    # for a fresh process substitution is usually nothing.
+    _COMMAND + r"(source|\.)\s+<\(": "source <(...), read short or empty by 3.2",
 }
 
 # Any options a command takes before the one that matters.
@@ -136,11 +152,10 @@ _OPTIONS = r"(\s+-[A-Za-z]+)*\s+"
 
 # GNU userland a stock Mac lacks or reads differently, each measured on
 # 2026-09-24 on Darwin 25.6 with only /usr/bin:/bin:/usr/sbin:/sbin on PATH.
-# flock is absent there too, but four drill scripts still call it, so it joins
-# this table once they stop.
 GNU_ONLY = {
     _COMMAND + r"timeout\s+[-$0-9\"']": 'timeout, absent: use "$GNU_PROCESS" timeout',
     _COMMAND + r"setsid\s+[^\s=]": 'setsid, absent: use "$GNU_PROCESS" setsid',
+    _COMMAND + r"flock\s+[-$0-9\"']": 'flock, absent: use "$GNU_PROCESS" flock',
     r"\bsed" + _OPTIONS + r"-[A-Za-z]*i(\s|$)": (
         "sed -i with no suffix, which BSD sed reads from the next argument"
     ),
@@ -243,6 +258,11 @@ def test_script_uses_no_construct_bash_3_2_rejects(script: Path) -> None:
         "    read -t 0.5 line",
         "    printf '%(%s)T' -1",
         "    for n in {01..10}; do",
+        '      source <(sed -n "/^f()/,/^g()/p" "$1")',
+        '    . <(printf "%s\\n" "f() { :; }")',
+        "    if source <(render); then",
+        "    elif source <(render); then",
+        "    command . <(render)",
     ],
 )
 def test_the_source_scan_refuses_each_construct(line: str) -> None:
@@ -260,6 +280,8 @@ def test_the_source_scan_refuses_each_construct(line: str) -> None:
         '    printf %s "${OUT}">"$file"',
         '    assert el, f"<{t}> is missing"',
         "    for n in {1..10}; do",
+        "    done < <(route_keys)",
+        "    diff <(a) <(b)",
     ],
 )
 def test_the_source_scan_ignores_what_bash_3_2_accepts(line: str) -> None:
@@ -306,6 +328,10 @@ def test_script_uses_no_gnu_only_userland(script: Path) -> None:
         "    mktemp --suffix=.json",
         "    ps --no-headers -o pid",
         "    cut --complement -c1 file",
+        "if ! flock -n 9; then",
+        "    if ! flock -n 9; then",
+        '    flock -w 30 "$LOCK_FILE" make',
+        'exec 9>"$lock" && flock 9',
     ],
 )
 def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
@@ -333,6 +359,8 @@ def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
         "    stat -f '%Lp' \"$receipt\"",
         "    grep -c pattern file",
         '    cp -a "$WORKDIR/bundle" "$GATE_CASE_BUNDLE"',
+        'if ! "$GNU_PROCESS" flock -n 9; then',
+        "    fcntl.flock(log, fcntl.LOCK_EX)",
     ],
 )
 def test_the_userland_scan_ignores_portable_forms(line: str) -> None:
@@ -817,7 +845,7 @@ def _stock_mac_userland(bin_dir: Path) -> None:
 
     real_sed = shutil.which("sed")
     assert real_sed, "no sed on PATH"
-    for tool in ("timeout", "setsid"):
+    for tool in ("timeout", "setsid", "flock"):
         _write_executable(
             bin_dir / tool,
             f'#!/bin/sh\necho "bash: {tool}: command not found" >&2\nexit 127\n',
@@ -1260,3 +1288,205 @@ case_connector_registry_missing_cluster acme acme-bot acme-ns
     assert lock.stat().st_mode & 0o777 == 0o644
     assert time.localtime(lock.stat().st_mtime)[:6] == (2000, 1, 1, 0, 0, 0)
     assert sorted(path.name for path in bundle.iterdir()) == [lock.name]
+
+
+# Each drill that takes an exclusive lock before it starts, with the refusal it
+# prints when another run holds that lock.
+DRILL_LOCK_REFUSALS = {
+    REPO_ROOT / "cli" / "scripts" / "cluster-upgrade-matrix.sh": (
+        "error: another cluster-upgrade-matrix holds"
+    ),
+    REPO_ROOT / "cli" / "scripts" / "recovery-drill.sh": (
+        "error: another recovery-drill holds"
+    ),
+    REPO_ROOT / "cli" / "scripts" / "restore-drill.sh": (
+        "error: another restore drill is already running"
+    ),
+    REPO_ROOT / "cli" / "scripts" / "upgrade-drill.sh": (
+        "error: another upgrade-drill holds"
+    ),
+}
+# Exits 0 only when an open file description of its own can take the lock.
+LOCK_PROBE = (
+    "import fcntl, sys; "
+    "fcntl.flock(open(sys.argv[1], 'a'), fcntl.LOCK_EX | fcntl.LOCK_NB)"
+)
+
+
+def _drill_lock(source: str, path: Path) -> str:
+    """The drill's own lock, from its ``exec 9>`` through its ``fi``.
+
+    Its target becomes ``$LOCK_FILE``, so the test never takes the lock a real
+    drill on this host would take.
+    """
+
+    lines = source.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.lstrip().startswith("exec 9>")]
+    assert len(starts) == 1, f"{path}: expected one exec 9>"
+    end = next(i for i in range(starts[0], len(lines)) if lines[i].strip() == "fi")
+    block, retargeted = re.subn(
+        r'^(\s*)exec 9>"[^"]*"$',
+        r'\1exec 9>"$LOCK_FILE"',
+        "".join(lines[starts[0] : end + 1]),
+        count=1,
+        flags=re.MULTILINE,
+    )
+    assert retargeted == 1, f"{path}: the lock is not opened on one quoted path"
+    return block
+
+
+def _one_line_functions(source: str, names: list[str]) -> str:
+    """The script's own definitions of ``names``, one line or several."""
+
+    definitions = []
+    for name in names:
+        single = re.search(rf"^{name}\(\) \{{.*\}}$", source, re.MULTILINE)
+        if single:
+            definitions.append(single.group(0) + "\n")
+        elif f"\n{name}() {{\n" in source:
+            definitions.append(_shell_function(source, name))
+    return "".join(definitions)
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize("drill", sorted(DRILL_LOCK_REFUSALS), ids=_script_id)
+@pytest.mark.parametrize("held_elsewhere", [False, True], ids=["free", "held"])
+def test_drill_takes_its_lock_on_a_stock_mac(
+    interpreter: str, drill: Path, held_elsewhere: bool, tmp_path: Path
+) -> None:
+    """The lock is all that keeps a second drill from running beside the first.
+
+    A free lock is taken and stays held for the rest of the run, and a held one
+    is refused with the drill's own message. A stock Mac has no flock, and a
+    missing tool must not read as another run.
+    """
+
+    source = drill.read_text()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    lock = tmp_path / "drill.lock"
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{_top_level_assignments(source, ["GNU_PROCESS"])}
+LOCK_FILE="$1"
+{_one_line_functions(source, ["log", "die"])}
+{_drill_lock(source, drill)}
+echo "lock taken"
+if {shlex.quote(sys.executable)} -c {shlex.quote(LOCK_PROBE)} "$LOCK_FILE" 2>/dev/null; then
+    echo "lock free again"
+else
+    echo "lock still held"
+fi
+"""
+    with contextlib.ExitStack() as stack:
+        if held_elsewhere:
+            holder = stack.enter_context(lock.open("a"))
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            [interpreter, "-c", script, "bash", str(lock)],
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    if held_elsewhere:
+        assert result.returncode == 1, result.stderr
+        assert result.stdout == ""
+        # util-linux flock refuses silently, so the drill's line is the only one.
+        refusal = result.stderr.splitlines()
+        assert len(refusal) == 1, result.stderr
+        assert refusal[0].startswith(DRILL_LOCK_REFUSALS[drill]), result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "lock taken\nlock still held\n", result.stderr
+        assert result.stderr == ""
+
+
+# The programs worker-ttl-bounds hands to `python3 -c`, in assignment order.
+WORKER_TTL_BOUNDS_PROGRAMS = [
+    "WORKER_ENV_PY",
+    "WORKER_TERMINATION_GRACE_PY",
+    "WORKER_GRACE_COVERS_BUDGET_PY",
+]
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_worker_ttl_bounds_hands_python_each_program_whole(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """An empty program would pass every env assertion without checking one."""
+
+    block = _top_level_block(
+        WORKER_TTL_BOUNDS_PATH.read_text(),
+        "# Reads the worker Deployment's env list by NAME",
+        'TMP="$(mktemp -d)"',
+        WORKER_TTL_BOUNDS_PATH,
+    )
+    programs = re.findall(r"<<'PY'[^\n]*\n(.*?\n)PY\n", block, re.DOTALL)
+    assert len(programs) == len(WORKER_TTL_BOUNDS_PROGRAMS), block
+    dumps = "".join(
+        f'printf %s "${name}" > "$1/{name}"\n' for name in WORKER_TTL_BOUNDS_PROGRAMS
+    )
+    result = subprocess.run(
+        [interpreter, "-c", f"set -euo pipefail\n{block}{dumps}", "bash", str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    for name, program in zip(WORKER_TTL_BOUNDS_PROGRAMS, programs, strict=True):
+        received = (tmp_path / name).read_text()
+        # The two ways to assign a heredoc differ only in its trailing newline.
+        assert received.rstrip("\n") == program.rstrip("\n"), name
+        compile(received, name, "exec")
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+def test_worker_ttl_bounds_reads_the_reply_timeout_through_the_ladder_helper(
+    interpreter: str, tmp_path: Path
+) -> None:
+    """Assertion (l) lifts the helper out of e2e-ladder.sh into a child bash."""
+
+    source = WORKER_TTL_BOUNDS_PATH.read_text()
+    fail = _top_level_block(source, "fail() {", "render() {", WORKER_TTL_BOUNDS_PATH)
+    stub = _top_level_block(
+        source,
+        'LADDER_STUB_DIR="$TMP/ladder-kubectl"',
+        "render_worker_deployment_json() {",
+        WORKER_TTL_BOUNDS_PATH,
+    )
+    helpers = "".join(
+        _shell_function(source, name, WORKER_TTL_BOUNDS_PATH)
+        for name in (
+            "run_ladder_reply_timeout",
+            "assert_ladder_helper_present",
+            "assert_ladder_reply_timeout",
+        )
+    )
+    worker = {"name": "worker", "env": [{"name": "CURIE_DELIVERY_BUDGET_S", "value": "900"}]}
+    deployment = tmp_path / "worker.json"
+    deployment.write_text(
+        json.dumps({"spec": {"template": {"spec": {"containers": [worker]}}}})
+    )
+    # The child bash and the kubectl stub's `#!/usr/bin/env bash` both take
+    # bash from PATH, so PATH names the interpreter under test as well.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "bash").symlink_to(os.path.abspath(shutil.which(interpreter) or interpreter))
+    script = f"""set -euo pipefail
+TMP="$1"
+LADDER="$2"
+{fail}{stub}{helpers}
+assert_ladder_helper_present
+assert_ladder_reply_timeout "$3" 960
+"""
+    result = subprocess.run(
+        [interpreter, "-c", script, "bash", str(tmp_path), str(LADDER_PATH), str(deployment)],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

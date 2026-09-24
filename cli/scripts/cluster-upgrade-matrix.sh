@@ -13,6 +13,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# util-linux flock, with its exit statuses, on hosts that ship none (a stock Mac).
+GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 SELF_TEST=0
 FORCE=0
 KEEP=0
@@ -1860,7 +1862,7 @@ fi
 # unit test (or a second invocation) cannot be blocked by a live matrix run.
 refuse_soak "$NAMESPACE" "$RELEASE"
 exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+if ! "$GNU_PROCESS" flock -n 9; then
     die "another cluster-upgrade-matrix holds $LOCK_FILE"
 fi
 run_matrix
