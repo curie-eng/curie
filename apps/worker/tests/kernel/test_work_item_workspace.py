@@ -145,11 +145,16 @@ class _RecordingSink:
 
 
 def _turn(
-    event_id: str, text: str, *, kind: str = "slack", placeholder: str | None = None
+    event_id: str,
+    text: str,
+    *,
+    kind: str = "slack",
+    placeholder: str | None = None,
+    conversation_id: str = "1700000000.000001",
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id=event_id,
-        conversation_id="1700000000.000001",
+        conversation_id=conversation_id,
         author="U0EXAMPLE1",
         text=text,
         reply_handle=ReplyHandle(
@@ -290,5 +295,57 @@ def test_issue_url_in_ordinary_chat_selects_no_repository(make_harness) -> None:
             )
 
             assert h.kernel._workspace.selections == [None]
+
+    asyncio.run(exercise())
+
+
+class _BarrierWorkItems(_WorkItems):
+    """Holds every acquire until all concurrent executions have acquired."""
+
+    def __init__(self, parties: int) -> None:
+        super().__init__()
+        self.barrier = asyncio.Barrier(parties)
+        self.started: list[uuid.UUID] = []
+
+    async def acquire(
+        self, request_id: uuid.UUID, *, owner: str, generation: int
+    ) -> WorkItemAcquireGrant:
+        grant = await super().acquire(request_id, owner=owner, generation=generation)
+        await self.barrier.wait()
+        return grant
+
+    async def start(self, request_id: uuid.UUID, **kwargs: object) -> WorkItemStartGrant:
+        self.started.append(request_id)
+        return await super().start(request_id, **kwargs)
+
+
+def test_concurrent_work_items_each_start_their_own_request(make_harness) -> None:
+    """#3069: a turn never starts under another execution's request."""
+
+    async def exercise() -> None:
+        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+            request_ids = [uuid.uuid4() for _ in range(3)]
+            work_items = _BarrierWorkItems(len(request_ids))
+            h.kernel._work_items = work_items
+            h.runner.default_script = [
+                Final(text="Working. Done.", status=SessionStatus.DONE),
+            ]
+
+            await asyncio.gather(
+                *(
+                    h.kernel.process_event(
+                        _turn(
+                            f"work-item-{request_id}-execute-1",
+                            f"Resolve {ISSUE_URL}",
+                            conversation_id=f"1700000000.00000{index}",
+                        )
+                    )
+                    for index, request_id in enumerate(request_ids, start=2)
+                )
+            )
+
+            assert work_items.calls.count("acquire") == len(request_ids)
+            assert sorted(work_items.started) == sorted(request_ids)
+            assert work_items.calls.count("finish") == len(request_ids)
 
     asyncio.run(exercise())
