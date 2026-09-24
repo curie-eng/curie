@@ -119,7 +119,7 @@
     },
     "0.10.0-rc.1": {
       "schema_min": "0045",
-      "schema_head": "0056"
+      "schema_head": "0057"
     },
     "0.10.0": {
       "schema_min": "0045",

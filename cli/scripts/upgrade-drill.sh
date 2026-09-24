@@ -182,7 +182,7 @@ release_identities_match() {
     [[ -f "$chart" && -f "$cargo" ]] || return 1
     chart_identity="$(chart_version "$chart")"
     cli_identity="$(cli_version "$cargo")"
-    [[ "$chart_identity" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$chart_identity" == "$cli_identity" ]]
+    [[ "$chart_identity" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ && "$chart_identity" == "$cli_identity" ]]
 }
 
 parse_args() {

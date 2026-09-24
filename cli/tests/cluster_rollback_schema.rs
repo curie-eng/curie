@@ -106,9 +106,10 @@ fn v0100_release_candidate_has_an_exact_catalog_window() {
 
     let window = window_for("0.10.0-rc.1").expect("release candidate is catalogued");
     assert_eq!(window.schema_min, "0045");
-    assert_eq!(window.schema_head, "0056");
+    assert_eq!(window.schema_head, "0057");
     assert!(live_in_window("0045", &window));
     assert!(live_in_window("0056", &window));
+    assert!(live_in_window("0057", &window));
     assert!(!live_in_window("0044", &window));
     assert_eq!(
         window_for("v0.10.0-rc.1")
@@ -121,11 +122,11 @@ fn v0100_release_candidate_has_an_exact_catalog_window() {
 #[test]
 fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
     assert_eq!(
-        newest_fail_forward(["0.10.0-rc.1"], "0056").as_deref(),
+        newest_fail_forward(["0.10.0-rc.1"], "0057").as_deref(),
         Some("0.10.0-rc.1")
     );
     assert_eq!(
-        newest_fail_forward(["0.10.0-rc.1", "0.10.0"], "0056").as_deref(),
+        newest_fail_forward(["0.10.0-rc.1", "0.10.0"], "0057").as_deref(),
         Some("0.10.0")
     );
 }
