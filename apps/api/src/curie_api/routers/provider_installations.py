@@ -1,8 +1,8 @@
 """Admin CRUD for provider installations (#2909, ADR 0155 step 4).
 
 Platform key only, like every other administrative router. The table holds
-references rather than credentials, and no error body echoes a submitted
-value, so a token pasted where a reference belongs is refused, not returned.
+references rather than credentials, a value in a well-known credential shape
+is refused, and no error body echoes a submitted value.
 """
 
 import uuid
