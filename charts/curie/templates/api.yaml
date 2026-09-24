@@ -120,8 +120,13 @@ spec:
                   # Do not run Alembic here: that is the rollback defect.
                   exit 0
                 fi
+                # Name the probe's error class while waiting, not only at exit:
+                # a restarted container's logs are gone, and "too many clients"
+                # must read differently from "store is down" (#2865).
                 if [ "$attempt" -eq 1 ]; then
-                  echo "Waiting for Postgres readiness"
+                  echo "Waiting for Postgres readiness; probe error class: $probe_error_class"
+                elif [ $((attempt % 10)) -eq 0 ] && [ "$attempt" -lt "$max_attempts" ]; then
+                  echo "Still waiting for Postgres readiness after $attempt of $max_attempts attempts; probe error class: $probe_error_class"
                 fi
                 if [ "$attempt" -lt "$max_attempts" ]; then
                   sleep 2
