@@ -60,9 +60,7 @@ import dataclasses
 import datetime as dt
 import fcntl
 import http.client
-import importlib.util
 import json
-import math
 import os
 import re
 import shutil
@@ -1187,6 +1185,8 @@ class Preflight:
         self._egress_cidrs: list[str] = []
         self._sandbox_quota: int | None = None
         self._fixture_base_sha = ""
+        self._issue_token_minted = 0.0
+        self._fixture_restore_pushed = False
 
     # --- small wrappers -------------------------------------------------
 
@@ -1673,6 +1673,7 @@ class Preflight:
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
         self.issue_token = token
+        self._issue_token_minted = time.time()
         secrets = [token, self.api_key, self.config.model_api_key, self.worker_token]
         common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
         log("curie cluster deploy (the default dark-factory bundle)")
@@ -2103,11 +2104,40 @@ class Preflight:
         if status != 200:
             raise PreflightFailed(f"moving the default branch failed (HTTP {status})")
 
+    def ensure_issue_token(self) -> None:
+        """Re-mint the installation token once it is older than 15 minutes.
+
+        GitHub expires an installation token after one hour. A budget case
+        can run for 30 minutes, so a token minted with the install would die
+        during a later case.
+        """
+
+        if self._issue_token_minted <= 0:
+            return
+        if time.time() - self._issue_token_minted < 15 * 60:
+            return
+        log("refreshing the issue read token before it expires")
+        self.deploy_bundle()
+
+    def pin_fixture_base(self) -> None:
+        """Remember the default-branch SHA and put it back on teardown."""
+
+        if self._fixture_base_sha:
+            return
+        self._fixture_base_sha = self.default_branch_head()
+
+        def restore() -> dict[str, Any]:
+            self.restore_fixture_base()
+            return {"restored": self.default_branch_head() == self._fixture_base_sha}
+
+        self.teardown.push("restore fixture default branch", restore)
+        self._fixture_restore_pushed = True
+
     def seed_failing_test_commit(self) -> None:
         """Commit the visible failing inch test, and restore the previous SHA later."""
 
+        self.pin_fixture_base()
         original = self.default_branch_head()
-        self._fixture_base_sha = original
         path = "unitconv/tests/test_convert.py"
         updated = seed_failing_inch_test(self.github_text_file(path, original))
         status, blob = self.as_actor(
@@ -2146,13 +2176,6 @@ class Preflight:
         if not isinstance(commit_sha, str):
             raise PreflightFailed(f"creating the test commit failed (HTTP {status})")
         self.move_default_branch(commit_sha)
-
-        def restore() -> dict[str, Any]:
-            if self.default_branch_head() != original:
-                self.move_default_branch(original)
-            return {"restored": self.default_branch_head() == original}
-
-        self.teardown.push("restore fixture default branch", restore)
 
     def restore_fixture_base(self) -> None:
         if self._fixture_base_sha and self.default_branch_head() != self._fixture_base_sha:
@@ -2431,10 +2454,37 @@ def final_agent_reply(value: Any) -> str | None:
     return None
 
 
+def select_case_transcript(
+    entries: Sequence[Any], *, since: dt.datetime | None
+) -> dict[str, Any] | None:
+    """The transcript for this case.
+
+    One transcript is that case. When earlier cases left theirs, the one
+    updated at or after ``since`` is this case. An older transcript is not.
+    """
+
+    rows = [item for item in entries if isinstance(item, dict)]
+    if not rows:
+        return None
+
+    def stamp(item: Mapping[str, Any]) -> dt.datetime:
+        parsed = _parse_time(item.get("updated_at"))
+        return parsed or dt.datetime.min.replace(tzinfo=dt.UTC)
+
+    if since is not None:
+        rows = [item for item in rows if stamp(item) >= since]
+        if not rows:
+            return None
+    if len(rows) == 1:
+        return rows[0]
+    return max(rows, key=stamp)
+
+
 def _agent_final_reply(p: Preflight) -> tuple[str | None, str]:
     # The work item detail does not carry its conversation id, so read the
-    # agent's transcript namespace. The install and agent are this run's own,
-    # so exactly one transcript is expected; anything else is left unjudged.
+    # agent's transcript namespace. One transcript is this issue. Later cases
+    # keep the earlier threads, and only the transcript updated during this
+    # case is this issue's reply.
     agent_id = p.evidence.get("agent_id")
     if not agent_id:
         return None, "no agent id was recorded"
@@ -2442,9 +2492,10 @@ def _agent_final_reply(p: Preflight) -> tuple[str | None, str]:
     status, body = p.api("GET", path, headers={"X-API-Key": p.api_key})
     if status != 200 or not isinstance(body, list):
         return None, f"api GET {path} returned HTTP {status}"
-    if len(body) != 1 or not isinstance(body[0], dict):
-        return None, f"api GET {path} returned {len(body)} transcripts, expected one"
-    return final_agent_reply(body[0].get("value")), f"api GET {path}, last turn"
+    chosen = select_case_transcript(body, since=p.scenario_started)
+    if chosen is None:
+        return None, f"api GET {path} has no transcript updated during this case"
+    return final_agent_reply(chosen.get("value")), f"api GET {path}, last turn"
 
 
 def _latest_request(detail: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -3295,12 +3346,12 @@ def _usage_for_case(p: Preflight, before: float | None) -> dict[str, Any]:
     )
 
 
-def _blank_case(p: Preflight, case_id: str, reason: str) -> dict[str, Any]:
+def _blank_case(case_id: str, model: str, reason: str) -> dict[str, Any]:
     return {
         "id": case_id,
         "verdict": "failed",
         "elapsed_seconds": 0.0,
-        "configured_model": p.config.model,
+        "configured_model": model,
         "observed_model": {"status": "unverified", "reason": reason},
         "usage": {"source": "unverified", "usd": None, "caveat": reason},
         "hidden_tests": {"status": "failed", "failures": [reason]},
@@ -3316,6 +3367,8 @@ def _run_issue_case(p: Preflight, case_id: str) -> tuple[dict[str, Any], dict[st
     result: dict[str, Any] = {}
     hidden: dict[str, Any] = {"status": "failed", "failures": ["the case did not run"]}
     try:
+        p.ensure_issue_token()
+        p.scenario_started = dt.datetime.now(dt.UTC).replace(microsecond=0)
         if case_id == "failing-test":
             p.seed_failing_test_commit()
         p.head_before = p.default_branch_head()
@@ -3332,20 +3385,22 @@ def _run_issue_case(p: Preflight, case_id: str) -> tuple[dict[str, Any], dict[st
     except PreflightFailed as exc:
         problems.append(str(exc))
     finally:
-        if case_id == "failing-test":
-            try:
-                p.restore_fixture_base()
-            except PreflightFailed as exc:
-                problems.append(f"restoring the default branch failed: {exc}")
+        try:
+            p.restore_fixture_base()
+        except PreflightFailed as exc:
+            problems.append(f"restoring the default branch failed: {exc}")
     elapsed = result.get("elapsed_seconds")
     if not _is_number(elapsed):
         elapsed = round(max(0.0, time.time() - started), 1)
+    observed = p.read_observed_model(started)
+    if isinstance(observed, str) and observed != p.config.model:
+        problems.append(f"observed model {observed} is not the configured model {p.config.model}")
     record = {
         "id": case_id,
         "verdict": "passed" if not problems else "failed",
         "elapsed_seconds": elapsed,
         "configured_model": p.config.model,
-        "observed_model": p.read_observed_model(started),
+        "observed_model": observed,
         "usage": _usage_for_case(p, usage_before),
         "hidden_tests": hidden,
         "failures": problems,
@@ -3416,13 +3471,20 @@ def _run_pass(p: Preflight, *, revise: bool) -> tuple[list[dict[str, Any]], dict
         except PreflightFailed as exc:
             record["verdict"] = "failed"
             record.setdefault("failures", []).append(f"fixture reset failed: {exc}")
-    return [by_id[case_id] for case_id in EVALUATION_CASE_IDS], revision_record
+    ordered = [by_id[case_id] for case_id in EVALUATION_CASE_IDS]
+    if not any(case.get("observed_model") == p.config.model for case in ordered):
+        for case in ordered:
+            case["verdict"] = "failed"
+            case.setdefault("failures", []).append("no case observed the configured model")
+    return ordered, revision_record
 
 
 def _run_cancellation(p: Preflight, kind: str) -> dict[str, Any]:
     started = time.time()
     problems: list[str] = []
     try:
+        p.ensure_issue_token()
+        p.scenario_started = dt.datetime.now(dt.UTC).replace(microsecond=0)
         p.head_before = p.default_branch_head()
         if kind == "waiting":
             title, body = (
@@ -3454,8 +3516,8 @@ def _run_cancellation(p: Preflight, kind: str) -> dict[str, Any]:
     }
 
 
-def _failed_pass(p: Preflight, reason: str) -> list[dict[str, Any]]:
-    return [_blank_case(p, case_id, reason) for case_id in EVALUATION_CASE_IDS]
+def _failed_pass(model: str, reason: str) -> list[dict[str, Any]]:
+    return [_blank_case(case_id, model, reason) for case_id in EVALUATION_CASE_IDS]
 
 
 def evaluation(p: Preflight) -> dict[str, Any]:
@@ -3468,6 +3530,7 @@ def evaluation(p: Preflight) -> dict[str, Any]:
         raise ConfigError(
             "CURIE_FACTORY_REFERENCE_MODEL must name a different model than CURIE_FACTORY_MODEL"
         )
+    p.pin_fixture_base()
     waiting = _run_cancellation(p, "waiting")
     quota_error = ""
     try:
@@ -3475,7 +3538,7 @@ def evaluation(p: Preflight) -> dict[str, Any]:
     except PreflightFailed as exc:
         quota_error = str(exc)
     if quota_error:
-        configured_cases = _failed_pass(p, quota_error)
+        configured_cases = _failed_pass(configured_model, quota_error)
         revision_record = _blank_revision(quota_error, configured_model)
         running = {
             "verdict": "failed",
@@ -3491,11 +3554,11 @@ def evaluation(p: Preflight) -> dict[str, Any]:
         running = _run_cancellation(p, "running")
     model_error = ""
     try:
-        p.helm_upgrade(quota=p._sandbox_quota, model=reference_model)
+        p.helm_upgrade(quota=None, model=reference_model)
     except PreflightFailed as exc:
         model_error = str(exc)
     if model_error:
-        reference_cases = _failed_pass(p, model_error)
+        reference_cases = _failed_pass(reference_model, model_error)
         reference_name = reference_model
     else:
         reference_cases, _ignored = _run_pass(p, revise=False)
@@ -3765,50 +3828,72 @@ def seed_failing_inch_test(source: str) -> str:
     return source + method
 
 
-def _load_hidden_convert(checkout: Path) -> Any:
-    path = checkout / "unitconv" / "convert.py"
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    spec = importlib.util.spec_from_file_location(f"hidden_convert_{uuid.uuid4().hex}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.convert
-
-
-def _near(got: Any, expected: float) -> bool:
-    return (
+_INCH_ASSERTION = 'self.assertAlmostEqual(convert(1, "in", "m"), 0.0254)'
+_HIDDEN_PROBE = """
+import json, math, sys
+sys.path.insert(0, sys.argv[1])
+from unitconv.convert import convert
+failures = []
+for value, src, dst, expected in json.loads(sys.argv[2]):
+    try:
+        got = convert(value, src, dst)
+    except Exception as exc:
+        failures.append(type(exc).__name__)
+        continue
+    ok = (
         isinstance(got, (int, float))
         and not isinstance(got, bool)
-        and math.isclose(float(got), expected, rel_tol=0, abs_tol=1e-6)
+        and math.isclose(float(got), float(expected), rel_tol=0, abs_tol=1e-6)
     )
+    if not ok:
+        failures.append(f"{src}->{dst}")
+print(json.dumps(failures))
+"""
+
+
+def _probe_convert(checkout: Path, checks: list[tuple[float, str, str, float]]) -> list[str]:
+    """Run conversion checks in a clean subprocess. Model code never shares this process."""
+
+    env = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _HIDDEN_PROBE, str(checkout), json.dumps(checks)],
+            cwd=checkout,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ["hidden check timed out"]
+    if result.returncode != 0:
+        return ["hidden check failed"]
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return ["hidden check failed"]
+    if not isinstance(parsed, list):
+        return ["hidden check failed"]
+    return [str(item) for item in parsed]
 
 
 def run_hidden_tests(case_id: str, checkout: Path) -> dict[str, Any]:
     """Run the case's hidden checks against a checkout the coding run never saw."""
 
-    failures: list[str] = []
     if case_id == "positive":
-        try:
-            convert = _load_hidden_convert(checkout)
-            if not _near(convert(1, "nmi", "m"), 1852):
-                failures.append("convert(1, nmi, m) is not 1852")
-            if not _near(convert(1, "nmi", "km"), 1.852):
-                failures.append("convert(1, nmi, km) is not 1.852")
-        except Exception as exc:  # noqa: BLE001 - the checkout is untrusted input
-            failures.append(f"{type(exc).__name__}: {exc}")
+        failures = _probe_convert(
+            checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)]
+        )
     elif case_id == "failing-test":
         tests = checkout / "unitconv" / "tests" / "test_convert.py"
         text = tests.read_text() if tests.is_file() else ""
+        failures = []
         if "def test_inch_to_meter" not in text:
             failures.append("test_inch_to_meter is not in the test module")
-        try:
-            convert = _load_hidden_convert(checkout)
-            if not _near(convert(2, "yd", "ft"), 6):
-                failures.append("convert(2, yd, ft) is not 6")
-        except Exception as exc:  # noqa: BLE001 - the checkout is untrusted input
-            failures.append(f"{type(exc).__name__}: {exc}")
+        if _INCH_ASSERTION not in text:
+            failures.append("the inch assertion was removed or changed")
+        failures.extend(_probe_convert(checkout, [(1, "in", "m", 0.0254), (2, "yd", "ft", 6)]))
     else:
         raise KeyError(case_id)
     return {"status": "passed" if not failures else "failed", "failures": failures}
@@ -3879,6 +3964,8 @@ def _case_field_failures(label: str, case: Mapping[str, Any]) -> list[str]:
     status = hidden.get("status") if isinstance(hidden, dict) else None
     if status not in ("passed", "failed", "not_applicable"):
         failures.append(f"{label} hidden_tests is missing")
+    elif case.get("id") in _PR_CASE_IDS and status == "not_applicable":
+        failures.append(f"{label} hidden_tests were not run")
     return failures
 
 
@@ -3918,6 +4005,10 @@ def evaluation_report_failures(report: Mapping[str, Any]) -> list[str]:
                 failures.append(f"passes[{index}] missing case {case_id}")
                 continue
             failures.extend(_case_field_failures(f"passes[{index}].{case_id}", case))
+            if model and case.get("configured_model") != model:
+                failures.append(
+                    f"passes[{index}].{case_id} configured_model does not match the pass"
+                )
     if len(models) == 2 and models[0] and models[0] == models[1]:
         failures.append("passes configured_model values must differ")
     revision = report.get("revision")
@@ -4038,6 +4129,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise ConfigError(
                     f"{args.scenario} needs CURIE_FACTORY_MODEL_API_KEY: a fake model "
                     "cannot open a pull request or keep a run going"
+                )
+        if args.mode == "run" and args.scenario == "evaluation":
+            reference = os.environ.get("CURIE_FACTORY_REFERENCE_MODEL") or REFERENCE_MODEL_DEFAULT
+            if reference == config.model:
+                raise ConfigError(
+                    "CURIE_FACTORY_REFERENCE_MODEL must name a different model than "
+                    "CURIE_FACTORY_MODEL"
                 )
         repo_root = _repo_root()
         candidate = _resolve_candidate(repo_root, args.candidate)
