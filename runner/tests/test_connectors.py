@@ -781,9 +781,13 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     # `_boot_env` sets CURIE_STATE_URL, so this boot mounts both platform
     # servers and the exemption set for it is the state-mounted one.
     assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+    # report_progress mounts only when the worker injected the progress env
+    # (#3077); its name is exempt regardless, like an omitted request_approval.
+    from curie_runner.approval import PROGRESS_TOOL_NAME
+
     assert _published_live_tool_names(mounted) == platform_tool_names(
         state_server_mounted=True
-    )
+    ) - {PROGRESS_TOOL_NAME}
 
 
 def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
@@ -809,7 +813,9 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
 
     assert set(mounted) == {APPROVAL_SERVER_NAME}
     published = _published_live_tool_names(mounted)
-    assert published == platform_tool_names(state_server_mounted=False)
+    from curie_runner.approval import PROGRESS_TOOL_NAME
+
+    assert published == platform_tool_names(state_server_mounted=False) - {PROGRESS_TOOL_NAME}
     assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
 
 

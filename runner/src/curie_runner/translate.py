@@ -45,6 +45,7 @@ from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .history import ConversationMessage
 from .otel import _GenerationSpan
+from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
 
 # Longest raw tool reply this will parse into a recordable ``result``. The reply
@@ -215,11 +216,17 @@ def translate_message(
     state: TurnState,
     classifier: SideEffectClassifier,
     gen: _GenerationSpan | None,
+    *,
+    activity: ProgressActivity | None = None,
 ) -> list[OutboundEvent]:
-    """Map one SDK message to the ACI outbound events it produces."""
+    """Map one SDK message to the ACI outbound events it produces.
+
+    ``activity`` (#3077) receives the turn and tool-call counters the
+    ``report_progress`` tool carries; None when no progress tool is mounted.
+    """
 
     if isinstance(message, AssistantMessage):
-        return _translate_assistant(message, state, classifier, gen)
+        return _translate_assistant(message, state, classifier, gen, activity)
     if isinstance(message, ResultMessage):
         return _translate_result(message, state)
     if isinstance(message, UserMessage):
@@ -243,6 +250,7 @@ def _translate_assistant(
     state: TurnState,
     classifier: SideEffectClassifier,
     gen: _GenerationSpan | None,
+    activity: ProgressActivity | None = None,
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
 
@@ -268,6 +276,8 @@ def _translate_assistant(
             detail = f"{detail}: {provider_text}"
         events.append(ErrorEvent(message=detail, classification=mapped))
 
+    if activity is not None:
+        activity.observe_assistant_message()
     for block in message.content:
         if isinstance(block, TextBlock):
             if block.text:
@@ -275,6 +285,8 @@ def _translate_assistant(
                 events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
             events.append(ToolNote(text=f"running tool {block.name}", tool=block.name))
+            if activity is not None:
+                activity.observe_tool(block.name)
             # Every tool call is evidence for the false-completion check (#517),
             # including the approval-request tool below and read-only tools.
             state.tool_call_count += 1

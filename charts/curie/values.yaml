@@ -1126,6 +1126,9 @@ api:
   githubFactoryIngressEnabled: false
   githubFactoryLabel: ""
   githubFactoryMention: ""
+  # Public https origin GitHub's image proxy fetches the live factory status card
+  # from (#3077). Empty omits the card image; the comment keeps its checklist.
+  githubFactoryCardBaseUrl: ""
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed

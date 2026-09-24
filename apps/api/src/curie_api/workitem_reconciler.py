@@ -120,7 +120,7 @@ class WorkItemReconciler:
         await self._publish_terminate_wakes()
         await self._settle_overdue_cancellations()
         await self._readmit_pending()
-        await self._post_terminal_notices()
+        await self._sync_status_comments()
         async with self._sessionmaker() as session:
             await redispatch_lapsed_acquisitions(session)
         await self._publish_execute_wakes()
@@ -428,9 +428,9 @@ class WorkItemReconciler:
         # Already-enqueued counts as published: the round has its turn.
         return True
 
-    async def _post_terminal_notices(self) -> None:
+    async def _sync_status_comments(self) -> None:
         async with self._sessionmaker() as session:
-            await factory_notices.post_due_notices(session, self._settings)
+            await factory_notices.sync_status_comments(session, self._settings)
 
     async def _publish_execute_wakes(self) -> None:
         async with self._sessionmaker() as session:

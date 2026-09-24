@@ -42,6 +42,10 @@
           "type": "string",
           "description": "Issue label that requests initial factory admission. Empty while intake is off."
         },
+        "githubFactoryCardBaseUrl": {
+          "type": "string",
+          "description": "Public https origin GitHub's image proxy fetches the live factory status card from. Empty omits the card image."
+        },
         "githubFactoryMention": {
           "type": "string",
           "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."

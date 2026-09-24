@@ -284,6 +284,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/finish",
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
+    "/v1/work-item-progress/{request_id}",
+    "/v1/factory/cards/{token}.svg",
     "/work-items",
     "/work-items/{work_item_id}",
     "unmatched",

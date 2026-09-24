@@ -72,6 +72,7 @@ from .memory import (
     utcnow_iso,
 )
 from .otel import RunTracer, _GenerationSpan
+from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
 from .translate import TurnState, translate_message
 
@@ -253,8 +254,12 @@ class SessionRunner:
         connector_reprobe: ConnectorReprobe | None = None,
         connector_availability: ConnectorAvailability | None = None,
         history_capacity_exceeded: bool = False,
+        progress_activity: ProgressActivity | None = None,
     ) -> None:
         self._factory = session_factory
+        # Session-wide activity counters for report_progress (#3077); None when
+        # no progress tool is mounted.
+        self._progress_activity = progress_activity
         self._ceiling = ceiling
         self._tracer = tracer
         self._classifier = classifier
@@ -1077,7 +1082,9 @@ class SessionRunner:
             else:
                 tracker.add_increment(usage)
             budget_hit = tracker.exceeded
-            events = translate_message(message, state, self._classifier, gen)
+            events = translate_message(
+                message, state, self._classifier, gen, activity=self._progress_activity
+            )
             # Synchronous, on the very iteration that delivered the block and
             # strictly before any ResultMessage iteration classifies the turn
             # (#2294). Never a task, and nothing is awaited between observing a
