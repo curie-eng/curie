@@ -48,8 +48,8 @@ CORE_RESOURCES = (
 )
 
 # Core subresources as kube-apiserver serves them (the APIResourceList in
-# kubernetes/kubernetes api/discovery/api__v1.json), minus
-# `serviceaccounts/token`. `kubectl api-resources` lists no subresources.
+# kubernetes/kubernetes api/discovery/api__v1.json), minus the withheld ones in
+# FORBIDDEN_RESOURCES. `kubectl api-resources` lists no subresources.
 CORE_SUBRESOURCES = (
     "namespaces/finalize",
     "namespaces/status",
@@ -64,13 +64,11 @@ CORE_SUBRESOURCES = (
     "pods/exec",
     "pods/log",
     "pods/portforward",
-    "pods/proxy",
     "pods/resize",
     "pods/status",
     "replicationcontrollers/scale",
     "replicationcontrollers/status",
     "resourcequotas/status",
-    "services/proxy",
     "services/status",
 )
 
@@ -102,8 +100,17 @@ CURIE_AND_READER_GROUPS = ("agents.x-k8s.io", "extensions.agents.x-k8s.io", "arg
 INSTALLATION_GROUPS = ("crd.k8s.amazonaws.com", "networking.k8s.aws", "vpcresources.k8s.aws")
 
 FORBIDDEN_RESOURCES = frozenset(
-    {"secrets", "secrets/*", "serviceaccounts/*", "serviceaccounts/token"}
+    {
+        "secrets",
+        "secrets/*",
+        "serviceaccounts/*",
+        "serviceaccounts/token",
+        "pods/proxy",
+        "services/proxy",
+    }
 )
+# Core resources no entry may reach, however it is spelled (`*`, `*/token`).
+WITHHELD_CORE = ("secrets", "serviceaccounts/token", "pods/proxy", "services/proxy")
 RULE_KEYS = frozenset({"apiGroups", "resources", "verbs"})
 
 
@@ -179,12 +186,16 @@ def _violations(rules: list[dict]) -> list[str]:
             found.append(f"{where}: every core resource")
         if FORBIDDEN_RESOURCES & set(resources):
             found.append(f"{where}: names {sorted(FORBIDDEN_RESOURCES & set(resources))}")
-        if "" in groups and any(
-            _resource_matches(entry, withheld)
-            for entry in resources
-            for withheld in ("secrets", "serviceaccounts/token")
-        ):
-            found.append(f"{where}: reaches secrets or serviceaccounts/token")
+        reached = sorted(
+            {
+                withheld
+                for entry in resources
+                for withheld in WITHHELD_CORE
+                if _resource_matches(entry, withheld)
+            }
+        )
+        if "" in groups and reached:
+            found.append(f"{where}: reaches {reached}")
         if set(verbs) - VERBS:
             found.append(f"{where}: verbs {sorted(set(verbs) - VERBS)}")
     return found
@@ -223,7 +234,11 @@ def test_one_binding_ties_the_operator_role_to_the_bot_identity_only() -> None:
     bindings = _of_kind(_documents(), "ClusterRoleBinding")
     assert len(bindings) == 1, f"expected one ClusterRoleBinding, found {len(bindings)}"
     (binding,) = bindings
-    assert binding["roleRef"] == {"apiGroup": RBAC_API, "kind": "ClusterRole", "name": OPERATOR_ROLE}
+    assert binding["roleRef"] == {
+        "apiGroup": RBAC_API,
+        "kind": "ClusterRole",
+        "name": OPERATOR_ROLE,
+    }
     assert binding["subjects"] == [SUBJECT]
 
 
@@ -293,7 +308,11 @@ def test_rbac_matching_has_no_per_resource_subresource_wildcard() -> None:
 
 
 INTENDED_SHAPE = [
-    {"apiGroups": [""], "resources": ["serviceaccounts", "pods/exec", "*/scale"], "verbs": sorted(VERBS)},
+    {
+        "apiGroups": [""],
+        "resources": ["serviceaccounts", "pods/exec", "nodes/proxy", "*/scale"],
+        "verbs": sorted(VERBS),
+    },
     {"apiGroups": ["apps", RBAC_API], "resources": ["*"], "verbs": sorted(VERBS)},
 ]
 
@@ -311,7 +330,8 @@ def test_the_guard_accepts_the_intended_shape() -> None:
             id="secrets-named-in-another-group",
         ),
         pytest.param(
-            {"apiGroups": [""], "resources": ["secrets/*"], "verbs": ["get"]}, id="secrets-slash-star"
+            {"apiGroups": [""], "resources": ["secrets/*"], "verbs": ["get"]},
+            id="secrets-slash-star",
         ),
         pytest.param(
             {"apiGroups": [""], "resources": ["serviceaccounts/*"], "verbs": ["create"]},
@@ -323,6 +343,16 @@ def test_the_guard_accepts_the_intended_shape() -> None:
         ),
         pytest.param(
             {"apiGroups": [""], "resources": ["*/token"], "verbs": ["create"]}, id="any-token"
+        ),
+        pytest.param(
+            {"apiGroups": [""], "resources": ["pods/proxy"], "verbs": ["get"]}, id="pods-proxy"
+        ),
+        pytest.param(
+            {"apiGroups": [""], "resources": ["services/proxy"], "verbs": ["get"]},
+            id="services-proxy",
+        ),
+        pytest.param(
+            {"apiGroups": [""], "resources": ["*/proxy"], "verbs": ["get"]}, id="any-proxy"
         ),
         pytest.param(
             {"apiGroups": ["*"], "resources": ["deployments"], "verbs": ["get"]}, id="every-group"
@@ -351,7 +381,10 @@ def test_the_guard_accepts_the_intended_shape() -> None:
             {"apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "verbs": ["sign"]},
             id="sign",
         ),
-        pytest.param({"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["*"]}, id="all-verbs"),
+        pytest.param(
+            {"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["*"]},
+            id="all-verbs",
+        ),
         pytest.param(
             {
                 "apiGroups": ["apps"],
@@ -363,7 +396,8 @@ def test_the_guard_accepts_the_intended_shape() -> None:
         ),
         pytest.param({"nonResourceURLs": ["*"], "verbs": ["get"]}, id="non-resource-urls"),
         pytest.param(
-            {"apiGroups": [""], "resources": "secrets", "verbs": ["get"]}, id="resources-as-a-string"
+            {"apiGroups": [""], "resources": "secrets", "verbs": ["get"]},
+            id="resources-as-a-string",
         ),
     ],
 )
@@ -442,6 +476,73 @@ def test_skill_no_longer_states_sre_demo_as_a_fixed_ceiling(phrase: str) -> None
     assert phrase not in _flat(_skill_prose())
 
 
-def test_skill_still_reports_a_403_as_the_ceiling() -> None:
-    paragraphs = [_flat(part) for part in re.split(r"\n\s*\n", _skill_prose())]
-    assert [part for part in paragraphs if "403" in part and "ceiling" in part]
+def _paragraphs() -> list[str]:
+    return [_flat(part) for part in re.split(r"\n\s*\n", _skill_prose())]
+
+
+def test_skill_still_reports_a_403_as_the_ceiling_never_an_approval_problem() -> None:
+    assert [
+        part
+        for part in _paragraphs()
+        if "403" in part
+        and "ceiling" in part
+        and re.search(r"\bnever retr", part, re.IGNORECASE)
+        and "approval problem" in part
+    ]
+
+
+def test_skill_tells_the_ceiling_by_the_operator_binding() -> None:
+    assert [
+        part
+        for part in _paragraphs()
+        if "ClusterRoleBinding" in part and OPERATOR_ROLE in part
+    ]
+
+
+# A sentence that puts the write ceiling at sre-demo must say when that holds.
+FIXED_CEILING = re.compile(
+    r"only (?:in|inside|within|to) `sre-demo`"
+    r"|`sre-demo` only"
+    r"|(?:outside|inside|within|limited to|confined to|restricted to) `sre-demo`"
+    r"|operations in `sre-demo`"
+)
+CONDITION = re.compile(r"\b(?:default|unless|absent|if|operator grant)\b", re.IGNORECASE)
+
+
+def _unconditional_ceilings(prose: str) -> list[str]:
+    return [
+        sentence
+        for sentence in re.split(r"(?<=[.!?])\s+", _flat(prose))
+        if FIXED_CEILING.search(sentence) and not CONDITION.search(sentence)
+    ]
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Kubernetes RBAC still limits the approved call to workload operations in `sre-demo`.",
+        "The API server still refuses writes outside `sre-demo`, Secrets, and RBAC.",
+        "Raw manifest updates can replace images inside `sre-demo`; show the effect.",
+        "Writes succeed only in `sre-demo`.",
+        "You can change workloads in `sre-demo` only.",
+    ],
+)
+def test_the_fixed_ceiling_check_flags_an_unconditional_sentence(sentence: str) -> None:
+    assert _unconditional_ceilings(sentence) == [sentence]
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "RBAC is the ceiling: by default it refuses writes outside `sre-demo`.",
+        "Present means the operator grant applies, absent means writes succeed only in "
+        "`sre-demo`.",
+        "Workload operations in `sre-demo` by default, wider where it was applied.",
+    ],
+)
+def test_the_fixed_ceiling_check_passes_a_conditional_sentence(sentence: str) -> None:
+    assert _unconditional_ceilings(sentence) == []
+
+
+def test_skill_states_no_unconditional_sre_demo_ceiling() -> None:
+    assert _unconditional_ceilings(_skill_prose()) == []
