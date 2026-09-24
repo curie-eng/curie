@@ -1605,9 +1605,26 @@ def fail(message):
     raise SystemExit(message)
 
 
+# The API schema-wait init and the schema-migrate Job share one Postgres
+# readiness loop; both run through this checker (#2865).
+MODE = sys.argv[2] if len(sys.argv) > 2 else "api"
+if MODE not in {"api", "migrate"}:
+    fail(f"unknown readiness checker mode {MODE!r}")
+EXEC_VERB = "wait" if MODE == "api" else "upgrade"
+WAIT_LINE = "Waiting for Postgres readiness"
+STILL_LINE = "Still waiting for Postgres readiness"
+
+
 def migrate_container(manifest):
     matches = []
     for doc in yaml.safe_load_all(pathlib.Path(manifest).read_text()):
+        if MODE == "migrate":
+            if isinstance(doc, dict) and doc.get("kind") == "Job":
+                containers = doc["spec"]["template"]["spec"].get("containers", [])
+                matches.extend(
+                    item for item in containers if item.get("name") == "schema-migrate"
+                )
+            continue
         if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
             continue
         containers = (
@@ -1621,7 +1638,7 @@ def migrate_container(manifest):
         if alembic:
             fail("API init must not run a migrate container; Alembic belongs on the upgrade Job")
     if len(matches) != 1:
-        fail(f"expected exactly one schema-wait init container, found {len(matches)}")
+        fail(f"expected exactly one {MODE} readiness container, found {len(matches)}")
     return matches[0]
 
 
@@ -1635,6 +1652,8 @@ def shell_process(container):
     if process[1] != "-c":
         fail("schema-wait init container shell command must use -c")
     script = process[2]
+    if MODE == "migrate":
+        return process
     if "alembic" in script:
         fail("schema-wait init must not invoke Alembic; migrations belong on the upgrade Job")
     wait = "exec python -m curie_api.schema_compat wait"
@@ -1653,7 +1672,7 @@ def write_program(path, text):
     path.chmod(0o755)
 
 
-def run_case(process, readiness_failures):
+def run_case(process, readiness_failures, error_class="InvalidPasswordError"):
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp)
         fake_bin = root / "bin"
@@ -1682,6 +1701,10 @@ class InvalidPasswordError(Exception):
     pass
 
 
+class TooManyConnectionsError(Exception):
+    pass
+
+
 class Connection:
     async def close(self):
         pass
@@ -1694,7 +1717,11 @@ async def connect(database_url, timeout):
     with attempts.open("a") as stream:
         stream.write(f"{count}\\n")
     if count <= int(os.environ["READINESS_FAILURES"]):
-        raise InvalidPasswordError("asyncpg-password-sentinel-must-not-leak")
+        if os.environ["READINESS_ERROR"] == "ConnectionRefusedError":
+            raise ConnectionRefusedError("asyncpg-password-sentinel-must-not-leak")
+        raise globals()[os.environ["READINESS_ERROR"]](
+            "asyncpg-password-sentinel-must-not-leak"
+        )
     return Connection()
 """
         )
@@ -1714,6 +1741,7 @@ async def connect(database_url, timeout):
                 ),
                 "READINESS_ATTEMPTS": str(attempts),
                 "READINESS_FAILURES": str(readiness_failures),
+                "READINESS_ERROR": error_class,
             }
         )
         try:
@@ -1741,7 +1769,7 @@ if ready.returncode != 0:
     fail(f"immediate readiness exited {ready.returncode}: {ready.stdout}{ready.stderr}")
 if len(ready_attempts) != 1:
     fail(f"immediate readiness ran the probe {len(ready_attempts)} times, expected once")
-if ready_calls != ["wait"]:
+if ready_calls != [EXEC_VERB]:
     fail(f"immediate readiness did not invoke schema_compat wait: {ready_calls!r}")
 
 delayed, delayed_attempts, delayed_calls = run_case(process, 2)
@@ -1749,62 +1777,78 @@ if delayed.returncode != 0:
     fail(f"delayed readiness exited {delayed.returncode}: {delayed.stdout}{delayed.stderr}")
 if len(delayed_attempts) != 3:
     fail(f"delayed readiness ran the probe {len(delayed_attempts)} times, expected three")
-if delayed_calls != ["wait"]:
+if delayed_calls != [EXEC_VERB]:
     fail(f"delayed readiness did not invoke schema_compat wait: {delayed_calls!r}")
 delayed_output = [
     line.strip()
     for line in (delayed.stdout + delayed.stderr).splitlines()
     if line.strip()
 ]
-if delayed_output != ["Waiting for Postgres readiness"]:
-    fail(f"delayed readiness must log one concise wait line: {delayed_output!r}")
+if delayed_output != [f"{WAIT_LINE}; probe error class: InvalidPasswordError"]:
+    fail(f"delayed readiness must log one concise wait line naming the error: {delayed_output!r}")
 
-exhausted, exhausted_attempts, exhausted_calls = run_case(process, 60)
-if exhausted.returncode == 0:
-    fail("readiness exhaustion must exit nonzero so the init container can restart")
-if len(exhausted_attempts) != 60:
-    fail(f"readiness exhaustion must make exactly 60 attempts; observed {len(exhausted_attempts)}")
-if exhausted_calls:
-    fail(f"readiness exhaustion must not invoke schema wait; got {exhausted_calls!r}")
+def exhausted_output(error_class):
+    exhausted, attempts, calls = run_case(process, 60, error_class)
+    if exhausted.returncode == 0:
+        fail("readiness exhaustion must exit nonzero so the container can restart")
+    if len(attempts) != 60:
+        fail(f"readiness exhaustion must make exactly 60 attempts; observed {len(attempts)}")
+    if calls:
+        fail(f"readiness exhaustion must not invoke schema_compat; got {calls!r}")
+    return [
+        line.strip()
+        for line in (exhausted.stdout + exhausted.stderr).splitlines()
+        if line.strip()
+    ]
 
-output_lines = [
-    line.strip()
-    for line in (exhausted.stdout + exhausted.stderr).splitlines()
-    if line.strip()
-]
-if not output_lines:
-    fail("readiness exhaustion must emit one concise terminal message")
-if len(output_lines) > 2:
-    fail(f"readiness exhaustion emitted {len(output_lines)} lines, expected at most 2")
-if output_lines[0] != "Waiting for Postgres readiness":
-    fail(f"first readiness failure must emit one concise wait message: {output_lines!r}")
-lower_output = " ".join(output_lines).lower()
-if "postgres" not in lower_output or not any(
-    word in lower_output for word in ("ready", "wait", "timeout", "unavailable")
-):
-    fail(f"readiness exhaustion message must explain the Postgres wait: {output_lines!r}")
-if "InvalidPasswordError" not in " ".join(output_lines):
-    fail(f"readiness exhaustion must retain the final probe error class: {output_lines!r}")
-if "traceback" in lower_output or "sqlalchemy.exc" in lower_output:
-    fail(f"readiness exhaustion emitted a traceback: {output_lines!r}")
-if any(
-    secret in lower_output
-    for secret in (
-        "example_not_a_secret",
-        "postgresql+asyncpg://",
-        "asyncpg-password-sentinel-must-not-leak",
-    )
-):
-    fail(f"readiness exhaustion exposed database credentials: {output_lines!r}")
+
+# Saturation and an unreachable store must be told apart WHILE waiting, not
+# only in the exit line a restarted container loses (#2865). One line on
+# attempt 1, one every tenth attempt, one at exit: bounded at 7 for 60.
+for error_class in ("TooManyConnectionsError", "ConnectionRefusedError", "InvalidPasswordError"):
+    output_lines = exhausted_output(error_class)
+    waiting = output_lines[:-1]
+    expected_waiting = [f"{WAIT_LINE}; probe error class: {error_class}"] + [
+        f"{STILL_LINE} after {n} of 60 attempts; probe error class: {error_class}"
+        for n in (10, 20, 30, 40, 50)
+    ]
+    if waiting != expected_waiting:
+        fail(
+            "readiness wait must name the probe error class on attempt 1 and every "
+            f"tenth attempt: {output_lines!r}"
+        )
+    final = output_lines[-1].lower()
+    if "postgres" not in final or "unavailable" not in final:
+        fail(f"readiness exhaustion message must explain the Postgres wait: {output_lines!r}")
+    if error_class not in output_lines[-1]:
+        fail(f"readiness exhaustion must retain the final probe error class: {output_lines!r}")
+    lower_output = " ".join(output_lines).lower()
+    if "traceback" in lower_output or "sqlalchemy.exc" in lower_output:
+        fail(f"readiness exhaustion emitted a traceback: {output_lines!r}")
+    if any(
+        secret in lower_output
+        for secret in (
+            "example_not_a_secret",
+            "postgresql+asyncpg://",
+            "asyncpg-password-sentinel-must-not-leak",
+        )
+    ):
+        fail(f"readiness exhaustion exposed database credentials: {output_lines!r}")
 
 print(
-    "  ok: immediate and delayed readiness run schema_compat wait; bounded "
-    "exhaustion stays concise, exits nonzero, and never invokes the wait"
+    f"  ok ({MODE}): immediate and delayed readiness run schema_compat {EXEC_VERB}; "
+    "the wait names the probe error class periodically, stays bounded, exits "
+    "nonzero, and never leaks credentials"
 )
 PYEOF
 
 python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
   || fail "API migrate init command does not implement the bounded quiet readiness contract."
+
+SCHEMA_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/schema-migrate.yaml"
+[[ -f "$SCHEMA_MIGRATE_RENDER" ]] || fail "schema-migrate.yaml did not render"
+python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" migrate \
+  || fail "schema-migrate Job does not implement the same readiness diagnostics contract."
 
 echo "=== Assertion 14 negative control: changed readiness bound FAILS ==="
 API_MIGRATE_BOUND_MUTANT="$TMP/mutant-api-migrate-bound"
