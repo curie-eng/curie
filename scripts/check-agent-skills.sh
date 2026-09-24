@@ -65,6 +65,7 @@ VALID_SKILLS=(
   ".claude/skills/update-architecture-atlas"
   "examples/dark-factory/skills/implement-issue"
   "examples/github-issues/skills/github-issues"
+  "examples/mean-tester/skills/mean-tester"
   "examples/sre-bot/skills/sre-bot"
   "examples/text-stats-engine/skills/text-stats"
   "examples/weather/skills/weather"

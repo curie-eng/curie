@@ -1,0 +1,8 @@
+# Where this repository sends the mean tester (ADR-0089). The tester must run
+# behind its OWN Slack app, never the app of an agent it tests: a bot's own
+# posts never reach its own dispatcher (relevance.py IgnoringSelfEvents).
+targets:
+  dev:
+    agent: mean-tester-dev
+    env: dev
+    # slack_channel: C0EXAMPLE1
