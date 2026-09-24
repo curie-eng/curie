@@ -1,4 +1,4 @@
-"""Migration 0054 allows per-agent execution deadlines up to 10800 s (#3071)."""
+"""Migration 0055 allows per-agent execution deadlines up to 10800 s (#3071)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
-BELOW = "0053"
+BELOW = "0054"
 STARTED = datetime(2026, 9, 24, 12, tzinfo=UTC)
 
 
@@ -53,7 +53,7 @@ def _insert_running(deadline_seconds: int) -> None:
     agent_id, item_id = uuid.uuid4(), uuid.uuid4()
     _sql(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
-        {"id": agent_id, "name": f"m0054-{agent_id.hex[:8]}"},
+        {"id": agent_id, "name": f"m0055-{agent_id.hex[:8]}"},
     )
     _sql(
         "INSERT INTO curie.work_items (id, github_repository_id, github_issue_number, "
@@ -82,7 +82,7 @@ def _rejected(deadline_seconds: int) -> None:
     assert getattr(excinfo.value.orig, "sqlstate", None) == "23514"
 
 
-def test_0054_relaxes_the_deadline_check_and_downgrade_restores_it(
+def test_0055_relaxes_the_deadline_check_and_downgrade_restores_it(
     isolated_migration_db: None,
 ) -> None:
     config = _config()

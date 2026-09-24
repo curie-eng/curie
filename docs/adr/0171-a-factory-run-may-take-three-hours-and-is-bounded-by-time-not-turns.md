@@ -13,7 +13,7 @@ Accepted alongside implementation under the coordinated exception in
 The recorded maintainer approval is issue #3071, filed by the maintainer, which
 directs this change and asks for supersession through the ADR procedure. The
 realizing code path is `workitems.py` (`_start_execution`), migration
-`0054_execution_deadline_seconds`, the worker `delivery_budget_s`,
+`0055_execution_deadline_seconds`, the worker `delivery_budget_s`,
 `runner_total_timeout_s` and `work_item_max_turns` settings, and the chart's
 effective termination grace helper.
 

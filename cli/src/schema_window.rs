@@ -381,13 +381,13 @@ mod tests {
         let n = window_for("0.10.0").expect("0.10.0 is catalogued for the next train matrix");
         let n1 = window_for("0.10.1").expect("0.10.1 is catalogued for the next train matrix");
         assert_eq!(n.schema_min, "0045");
-        assert_eq!(n.schema_head, "0054");
+        assert_eq!(n.schema_head, "0055");
         assert_eq!(n.schema_min, n1.schema_min);
         assert_eq!(n.schema_head, n1.schema_head);
         check_target_schema(
             "0.10.0",
             &n,
-            "0054",
+            "0055",
             &["0.10.0".to_string(), "0.10.1".to_string()],
         )
         .expect("N+1 to N is the same schema window");
