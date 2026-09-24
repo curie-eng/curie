@@ -161,7 +161,7 @@ def test_release_candidate_chart_requires_its_exact_catalog_window(tmp_path: Pat
 
 
 def test_release_candidate_precedes_stable_in_catalog_order(tmp_path: Path) -> None:
-    _write_chart(tmp_path, app_version="0.10.0-rc.1")
+    _write_chart(tmp_path, app_version="0.10.0")
     _write_catalog(
         tmp_path,
         revisions=["0001", "0002"],
@@ -175,7 +175,7 @@ def test_release_candidate_precedes_stable_in_catalog_order(tmp_path: Path) -> N
     result = _run_gate(tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert "chart appVersion 0.10.0-rc.1" in result.stdout
+    assert "chart appVersion 0.10.0" in result.stdout
     assert "catalog appVersion 0.10.0 schema_head 0002" in result.stdout
 
 

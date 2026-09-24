@@ -1,6 +1,7 @@
 import argparse
 import ast
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -87,22 +88,18 @@ def _load_catalog(path: Path) -> tuple[object, str | None]:
     return payload, None
 
 
-def _semantic_version_key(version: str) -> tuple[int, int, int] | None:
+def _semantic_version_key(version: str) -> tuple[int, int, int, int, int] | None:
     normalized = version.strip()
     if normalized[:1] in {"v", "V"}:
         normalized = normalized[1:]
-    parts = normalized.split(".")
-    if len(parts) != 3:
+    match = re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.(0|[1-9][0-9]*))?",
+        normalized,
+    )
+    if match is None:
         return None
-    for part in parts:
-        if (
-            not part
-            or not part.isascii()
-            or not part.isdigit()
-            or (len(part) > 1 and part.startswith("0"))
-        ):
-            return None
-    return int(parts[0]), int(parts[1]), int(parts[2])
+    major, minor, patch, rc = match.groups()
+    return int(major), int(minor), int(patch), int(rc is None), int(rc or 0)
 
 
 def main() -> int:
@@ -181,13 +178,16 @@ def main() -> int:
         return _fail(f"catalog has no window for appVersion {app_version}")
 
     newest_app_version: str | None = None
-    newest_version_key: tuple[int, int, int] | None = None
+    newest_version_key: tuple[int, int, int, int, int] | None = None
+    chart_is_release_candidate = False
     for version in windows:
         version_key = _semantic_version_key(version)
         if version_key is None:
             return _fail(
-                f"catalog window key is not a numeric semantic version: {version!r}"
+                f"catalog window key is not a supported semantic version: {version!r}"
             )
+        if version == app_version:
+            chart_is_release_candidate = version_key[3] == 0
         if newest_version_key is None or version_key > newest_version_key:
             newest_app_version = version
             newest_version_key = version_key
@@ -204,6 +204,11 @@ def main() -> int:
         return _fail(
             f"windows[{newest_app_version!r}].schema_head is {schema_head!r} "
             f"but alembic head is {head}"
+        )
+    if chart_is_release_candidate and chart_window.get("schema_head") != head:
+        return _fail(
+            f"windows[{app_version!r}].schema_head is "
+            f"{chart_window.get('schema_head')!r} but alembic head is {head}"
         )
 
     print(

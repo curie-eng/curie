@@ -110,7 +110,9 @@ fn v0100_release_candidate_has_an_exact_catalog_window() {
     assert!(live_in_window("0056", &window));
     assert!(!live_in_window("0044", &window));
     assert_eq!(
-        window_for("v0.10.0-rc.1").expect("prefixed release candidate is catalogued").schema_head,
+        window_for("v0.10.0-rc.1")
+            .expect("prefixed release candidate is catalogued")
+            .schema_head,
         window.schema_head
     );
 }

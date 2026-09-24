@@ -104,17 +104,35 @@ pub fn live_in_window(live: &str, window: &Window) -> bool {
     live_idx >= min_idx && live_idx <= head_idx
 }
 
-fn version_key(version: &str) -> Vec<u32> {
-    normalize_app_version(version)
-        .split('.')
-        .map(|part| {
-            part.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .parse()
-                .unwrap_or(0)
-        })
-        .collect()
+type VersionKey = (u64, u64, u64, u8, u64);
+
+fn version_key(version: &str) -> Option<VersionKey> {
+    let normalized = normalize_app_version(version);
+    let (core, release_candidate) = match normalized.split_once("-rc.") {
+        Some((core, rc)) => (core, Some(rc)),
+        None => (normalized.as_str(), None),
+    };
+    let parse_number = |part: &str| {
+        if part.is_empty()
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
+        part.parse::<u64>().ok()
+    };
+    let mut parts = core.split('.');
+    let major = parse_number(parts.next()?)?;
+    let minor = parse_number(parts.next()?)?;
+    let patch = parse_number(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (stable, rc) = match release_candidate {
+        Some(value) => (0, parse_number(value)?),
+        None => (1, 0),
+    };
+    Some((major, minor, patch, stable, rc))
 }
 
 /// Newest catalogued application version in `candidates` whose window contains
@@ -129,6 +147,9 @@ pub fn newest_fail_forward<'a>(
         if version.is_empty() {
             continue;
         }
+        let Some(key) = version_key(&version) else {
+            continue;
+        };
         let Some(window) = window_for(&version) else {
             continue;
         };
@@ -137,7 +158,7 @@ pub fn newest_fail_forward<'a>(
         }
         match &best {
             None => best = Some(version),
-            Some(current) if version_key(&version) > version_key(current) => {
+            Some(current) if Some(key) > version_key(current) => {
                 best = Some(version);
             }
             Some(_) => {}
