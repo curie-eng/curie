@@ -2100,7 +2100,7 @@ enum LocalAction {
         clear_branch_prefix: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
-        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
         api_key: String,
         #[arg(long)]
         dry_run: bool,
