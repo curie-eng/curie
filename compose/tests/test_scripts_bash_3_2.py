@@ -139,11 +139,10 @@ _OPTIONS = r"(\s+-[A-Za-z]+)*\s+"
 
 # GNU userland a stock Mac lacks or reads differently, each measured on
 # 2026-09-24 on Darwin 25.6 with only /usr/bin:/bin:/usr/sbin:/sbin on PATH.
-# flock is absent there too, but four drill scripts still call it, so it joins
-# this table once they stop.
 GNU_ONLY = {
     _COMMAND + r"timeout\s+[-$0-9\"']": 'timeout, absent: use "$GNU_PROCESS" timeout',
     _COMMAND + r"setsid\s+[^\s=]": 'setsid, absent: use "$GNU_PROCESS" setsid',
+    _COMMAND + r"flock\s+[-$0-9\"']": 'flock, absent: use "$GNU_PROCESS" flock',
     r"\bsed" + _OPTIONS + r"-[A-Za-z]*i(\s|$)": (
         "sed -i with no suffix, which BSD sed reads from the next argument"
     ),
