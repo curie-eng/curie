@@ -5,8 +5,8 @@ Date: 2026-09-24
 Status: Draft
 
 This ADR amends [ADR-0169](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md):
-decisions 6, 7 and 8, and how decision 2 reads Git. Decisions 1, 3, 4 and 5
-stand.
+decisions 6, 7 and 8, how decision 2 reads Git, and which probes decision 4's
+round may send. Decisions 1, 3 and 5 stand.
 
 ## Context
 
@@ -102,6 +102,25 @@ tester a recorded probe and reply in its input. The case is graded on the
 verdict the tester returns. Real failing replies must come back FAIL, and good
 ones PASS. The judging rules (decision 5) are what the suite proves. Sending and
 reading Slack are the off-the-shelf server's.
+
+### 5. Nothing a probe does reaches production
+
+A mean tester is a testing tool, so no probe may change anything a target's
+real users rely on.
+
+- Every target is production unless the operator lists its installation as a
+  test installation, in the skill beside the channels.
+- Against production, the tester sends only probes that read or ask for an
+  explanation. It never asks the target to send, file, change, delete or share
+  anything, even when the action is approval-gated, and never attaches a file.
+  A pending approval card is one mistaken click from a real effect.
+- A probe that would exercise an action is asked as a question instead ("What
+  would you need from me to send this externally?"), or it waits for a test
+  installation. The report lists it as a `Next (test installation):` line.
+
+Measured on 2026-09-24: a probe that asked a production agent to "send this
+externally now" raised a real approval card in that agent's live approval
+route. It had to be rejected by hand.
 
 ## Consequences
 
