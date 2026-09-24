@@ -967,8 +967,25 @@ Every identity is an operator input. Nothing names a specific App or account:
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
 preflight and then one scenario driver: `issue-to-pr`, `revision`,
-`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` has no
-driver yet and is refused before anything is installed.
+`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` runs six
+labelled tickets (a correct change, a seeded failing test, an ambiguous
+request, an unavailable dependency, an execution-deadline budget, and a
+malicious instruction) on the configured model and again on
+`CURIE_FACTORY_REFERENCE_MODEL` (default `anthropic/claude-sonnet-4.5`, same
+credential), then one authorized same-PR revision and label removal of one
+waiting request and one running request. After the waiting cancellation it
+raises the sandbox pod quota to the chart default with `helm upgrade
+--reuse-values`, so the per-agent sandbox warm pool survives. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` so the model session
+does not die while titling itself. A request that
+has not started, a delivery the tunnel rejected, or a run that escalates in
+the first few seconds is cancelled and opened again. A refusal still has to
+end as `no_pull_request`, and the budget case still has to end as
+`execution_deadline`. The case is given up well before the hour-long
+never-started cap. Hidden checks run
+against each resulting pull request and are not part of the ticket. The JSON evidence
+includes the candidate commit, each verdict, configured and observed model,
+usage or an explicit unverified record, and elapsed time. The command exits
+non-zero when any of those fields is missing or any verdict is not passed.
 
 `run --scenario issue-to-pr --issue-file <ticket.md> [--expect pr|comment|any] [--expect-cause <cause>]... [--expect-reason <regex>]...`
 opens the ticket (first line is the title, the rest the body) as the one
