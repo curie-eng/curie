@@ -13,21 +13,24 @@ in ``BASH4_ONLY`` in any script listed in ``HOST_SCRIPTS``. It cannot see an
 empty array expanded under ``set -u``; only the executing tests catch that.
 
 The same scripts must run on the userland macOS ships, too: it has no GNU
-``timeout`` and no ``setsid``, and its BSD ``sed`` reads the argument after a
-bare ``-i`` as a backup suffix. The executing tests for those sites put
-stand-ins on PATH that fail the way a stock Mac's tools do, so they fail on a
-Linux host as well, and a second scan refuses the forms listed in ``GNU_ONLY``
-in any script listed in ``HOST_SCRIPTS``.
+``timeout``, no ``setsid`` and no ``flock``, and its BSD ``sed`` reads the
+argument after a bare ``-i`` as a backup suffix. The executing tests for those
+sites put stand-ins on PATH that fail the way a stock Mac's tools do, so they
+fail on a Linux host as well, and a second scan refuses the forms listed in
+``GNU_ONLY`` in any script listed in ``HOST_SCRIPTS``.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
 import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -136,11 +139,10 @@ _OPTIONS = r"(\s+-[A-Za-z]+)*\s+"
 
 # GNU userland a stock Mac lacks or reads differently, each measured on
 # 2026-09-24 on Darwin 25.6 with only /usr/bin:/bin:/usr/sbin:/sbin on PATH.
-# flock is absent there too, but four drill scripts still call it, so it joins
-# this table once they stop.
 GNU_ONLY = {
     _COMMAND + r"timeout\s+[-$0-9\"']": 'timeout, absent: use "$GNU_PROCESS" timeout',
     _COMMAND + r"setsid\s+[^\s=]": 'setsid, absent: use "$GNU_PROCESS" setsid',
+    _COMMAND + r"flock\s+[-$0-9\"']": 'flock, absent: use "$GNU_PROCESS" flock',
     r"\bsed" + _OPTIONS + r"-[A-Za-z]*i(\s|$)": (
         "sed -i with no suffix, which BSD sed reads from the next argument"
     ),
@@ -306,6 +308,10 @@ def test_script_uses_no_gnu_only_userland(script: Path) -> None:
         "    mktemp --suffix=.json",
         "    ps --no-headers -o pid",
         "    cut --complement -c1 file",
+        "if ! flock -n 9; then",
+        "    if ! flock -n 9; then",
+        '    flock -w 30 "$LOCK_FILE" make',
+        'exec 9>"$lock" && flock 9',
     ],
 )
 def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
@@ -333,6 +339,8 @@ def test_the_userland_scan_refuses_each_gnu_only_form(line: str) -> None:
         "    stat -f '%Lp' \"$receipt\"",
         "    grep -c pattern file",
         '    cp -a "$WORKDIR/bundle" "$GATE_CASE_BUNDLE"',
+        'if ! "$GNU_PROCESS" flock -n 9; then',
+        "    fcntl.flock(log, fcntl.LOCK_EX)",
     ],
 )
 def test_the_userland_scan_ignores_portable_forms(line: str) -> None:
@@ -817,7 +825,7 @@ def _stock_mac_userland(bin_dir: Path) -> None:
 
     real_sed = shutil.which("sed")
     assert real_sed, "no sed on PATH"
-    for tool in ("timeout", "setsid"):
+    for tool in ("timeout", "setsid", "flock"):
         _write_executable(
             bin_dir / tool,
             f'#!/bin/sh\necho "bash: {tool}: command not found" >&2\nexit 127\n',
@@ -1260,3 +1268,117 @@ case_connector_registry_missing_cluster acme acme-bot acme-ns
     assert lock.stat().st_mode & 0o777 == 0o644
     assert time.localtime(lock.stat().st_mtime)[:6] == (2000, 1, 1, 0, 0, 0)
     assert sorted(path.name for path in bundle.iterdir()) == [lock.name]
+
+
+# Each drill that takes an exclusive lock before it starts, with the refusal it
+# prints when another run holds that lock.
+DRILL_LOCK_REFUSALS = {
+    REPO_ROOT / "cli" / "scripts" / "cluster-upgrade-matrix.sh": (
+        "error: another cluster-upgrade-matrix holds"
+    ),
+    REPO_ROOT / "cli" / "scripts" / "recovery-drill.sh": (
+        "error: another recovery-drill holds"
+    ),
+    REPO_ROOT / "cli" / "scripts" / "restore-drill.sh": (
+        "error: another restore drill is already running"
+    ),
+    REPO_ROOT / "cli" / "scripts" / "upgrade-drill.sh": (
+        "error: another upgrade-drill holds"
+    ),
+}
+# Exits 0 only when an open file description of its own can take the lock.
+LOCK_PROBE = (
+    "import fcntl, sys; "
+    "fcntl.flock(open(sys.argv[1], 'a'), fcntl.LOCK_EX | fcntl.LOCK_NB)"
+)
+
+
+def _drill_lock(source: str, path: Path) -> str:
+    """The drill's own lock, from its ``exec 9>`` through its ``fi``.
+
+    Its target becomes ``$LOCK_FILE``, so the test never takes the lock a real
+    drill on this host would take.
+    """
+
+    lines = source.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.lstrip().startswith("exec 9>")]
+    assert len(starts) == 1, f"{path}: expected one exec 9>"
+    end = next(i for i in range(starts[0], len(lines)) if lines[i].strip() == "fi")
+    block, retargeted = re.subn(
+        r'^(\s*)exec 9>"[^"]*"$',
+        r'\1exec 9>"$LOCK_FILE"',
+        "".join(lines[starts[0] : end + 1]),
+        count=1,
+        flags=re.MULTILINE,
+    )
+    assert retargeted == 1, f"{path}: the lock is not opened on one quoted path"
+    return block
+
+
+def _one_line_functions(source: str, names: list[str]) -> str:
+    """The script's own definitions of ``names``, one line or several."""
+
+    definitions = []
+    for name in names:
+        single = re.search(rf"^{name}\(\) \{{.*\}}$", source, re.MULTILINE)
+        if single:
+            definitions.append(single.group(0) + "\n")
+        elif f"\n{name}() {{\n" in source:
+            definitions.append(_shell_function(source, name))
+    return "".join(definitions)
+
+
+@pytest.mark.parametrize("interpreter", EVERY_BASH)
+@pytest.mark.parametrize("drill", sorted(DRILL_LOCK_REFUSALS), ids=_script_id)
+@pytest.mark.parametrize("held_elsewhere", [False, True], ids=["free", "held"])
+def test_drill_takes_its_lock_on_a_stock_mac(
+    interpreter: str, drill: Path, held_elsewhere: bool, tmp_path: Path
+) -> None:
+    """The lock is all that keeps a second drill from running beside the first.
+
+    A free lock is taken and stays held for the rest of the run, and a held one
+    is refused with the drill's own message. A stock Mac has no flock, and a
+    missing tool must not read as another run.
+    """
+
+    source = drill.read_text()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stock_mac_userland(bin_dir)
+    lock = tmp_path / "drill.lock"
+    script = f"""set -euo pipefail
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+{_top_level_assignments(source, ["GNU_PROCESS"])}
+LOCK_FILE="$1"
+{_one_line_functions(source, ["log", "die"])}
+{_drill_lock(source, drill)}
+echo "lock taken"
+if {shlex.quote(sys.executable)} -c {shlex.quote(LOCK_PROBE)} "$LOCK_FILE" 2>/dev/null; then
+    echo "lock free again"
+else
+    echo "lock still held"
+fi
+"""
+    with contextlib.ExitStack() as stack:
+        if held_elsewhere:
+            holder = stack.enter_context(lock.open("a"))
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            [interpreter, "-c", script, "bash", str(lock)],
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    if held_elsewhere:
+        assert result.returncode == 1, result.stderr
+        assert result.stdout == ""
+        # util-linux flock refuses silently, so the drill's line is the only one.
+        refusal = result.stderr.splitlines()
+        assert len(refusal) == 1, result.stderr
+        assert refusal[0].startswith(DRILL_LOCK_REFUSALS[drill]), result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "lock taken\nlock still held\n", result.stderr
+        assert result.stderr == ""
