@@ -152,15 +152,24 @@ serverFiles:
         # Each process exports under its own `instance`, so a restarted
         # process's counters are new series too.
         # `X unless last_over_time(X[1h] offset O)` is a series with no sample
-        # in the hour ending O ago; O is the rule's window plus its `for`, so a
-        # new series that reaches the threshold within the window stays new
-        # for a whole `for`. The cost: a series with no sample for over an
-        # hour looks new when samples resume, so a counter already at its
-        # threshold fires once. CurieApplicationMetricsAbsent pages long
-        # before a gap that long.
+        # in the hour ending O ago. O is the rule's window, so a new series'
+        # value counts as its increase over the same window increase() uses.
+        # The costs: a Prometheus with no history of a running process, such
+        # as a fresh install or a lost volume, treats every counter as new,
+        # and each one already at its threshold pages once, for about its
+        # window. A series with no sample for longer than the 1h lookback
+        # plus the rule's `for` refires once when samples resume;
+        # CurieApplicationMetricsAbsent pages long before a gap that long.
+        #
+        # An install that sets api.approvalSweepIntervalSeconds to 0 records
+        # no curie_approval_pending and should drop that term from
+        # CurieApplicationMetricsAbsent.
         rules:
           - alert: CurieApplicationMetricsAbsent
-            expr: absent(curie_queue_depth) or absent(curie_approval_pending)
+            expr: |
+              absent(curie_queue_depth{service_name="curie-worker"})
+              or
+              absent(curie_approval_pending{service_name="curie-api"})
             for: 10m
             labels:
               severity: page
@@ -169,10 +178,11 @@ serverFiles:
               summary: Curie application metrics are absent from Prometheus
               description: >-
                 curie_queue_depth or curie_approval_pending has had no sample
-                for 10 minutes. The worker records curie_queue_depth on every
-                poll and the api records curie_approval_pending on every
-                sweep, so their absence is a broken metrics pipeline or a dead
-                process, never a quiet system.
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
           - alert: CurieTurnAcceptedStale
             expr: |
               (
@@ -202,7 +212,7 @@ serverFiles:
                 unless
                 last_over_time(
                   curie_turn_completed_total{outcome="classified_failure"}[1h]
-                  offset 20m
+                  offset 15m
                 )
               ) > 0
             for: 5m
@@ -263,7 +273,7 @@ serverFiles:
                 unless
                 last_over_time(
                   curie_worker_supervised_restart_total{outcome="restart"}[1h]
-                  offset 35m
+                  offset 30m
                 )
               ) >= 3
             for: 5m
@@ -303,7 +313,7 @@ serverFiles:
                 curie_reply_delivery_total{outcome="failure"}
                 unless
                 last_over_time(
-                  curie_reply_delivery_total{outcome="failure"}[1h] offset 25m
+                  curie_reply_delivery_total{outcome="failure"}[1h] offset 15m
                 )
               ) >= 3
             for: 10m
@@ -336,7 +346,7 @@ serverFiles:
                     operation="/channels/token",
                     outcome="5xx"
                   }[1h]
-                  offset 65m
+                  offset 1h
                 )
               ) > 0
             for: 5m

@@ -1202,6 +1202,9 @@ api:
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
+  # Each sweep also records curie_approval_pending, so 0 stops that gauge too;
+  # the SRE bot example's CurieApplicationMetricsAbsent reads it, and an install
+  # that disables the sweeper drops that term.
   approvalSweepIntervalSeconds: 30
   # Break-glass approval recovery (#2753). OFF by default. Turn it on only for
   # the duration of a recovery, then turn it off again.
