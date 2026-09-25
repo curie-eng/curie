@@ -391,6 +391,45 @@ def test_a_connector_listed_twice_is_reported_once() -> None:
     assert "grafana" in errors[0][1]
 
 
+def test_a_malformed_connector_listed_twice_is_reported_once_as_malformed() -> None:
+    # The name error already tells the author to change that entry; a second
+    # copy of it, or a duplicate error on top, is noise about the same fix.
+    assert _codes({"targets": {"p": {"agent": "a", "connectors": ["Bad_Name", "Bad_Name"]}}}) == [
+        "deploy.bad_connector_name"
+    ]
+
+
+def test_an_explicit_null_allowlist_is_refused() -> None:
+    # `connectors:` with nothing after it parses to null. Reading that as "run
+    # every connector" would widen the target in the one direction the field
+    # exists to prevent, so it fails closed and says what to write instead.
+    _, errors = validate_deploy_targets({"targets": {"p": {"agent": "a", "connectors": None}}})
+    assert [c for c, _ in errors] == ["deploy.null_connectors"]
+    assert "targets.p" in errors[0][1]
+    assert "omit" in errors[0][1]
+    assert "[]" in errors[0][1]
+
+
+def test_bundle_refuses_a_bare_connectors_key(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, "targets:\n  p:\n    agent: a\n    connectors:\n", GRAFANA_CONNECTORS)
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["deploy.null_connectors"]
+
+
+@pytest.mark.parametrize(
+    "connectors",
+    ["grafana", [1], {"grafana": 1}],
+    ids=["scalar", "non_string_entry", "mapping"],
+)
+def test_an_allowlist_that_is_not_a_list_of_names_is_refused(connectors: object) -> None:
+    # A scalar where a list belongs is the likeliest slip. It is refused only
+    # because the model does not coerce; this pins that it stays refused.
+    assert _codes({"targets": {"p": {"agent": "a", "connectors": connectors}}}) == [
+        "deploy.invalid"
+    ]
+
+
 def test_a_malformed_identity_and_connector_are_both_reported() -> None:
     # The file's convention: accumulate every applicable code in one pass.
     codes = _codes(
@@ -454,3 +493,28 @@ def test_bundle_does_not_pile_onto_an_invalid_connectors_yaml(tmp_path: Path) ->
     result = validate_bundle(str(root))
     assert not result.valid
     assert not any(e.code == "deploy.unknown_connector" for e in result.errors)
+
+
+def test_bundle_reports_an_unknown_connector_alongside_other_target_errors(
+    tmp_path: Path,
+) -> None:
+    # One pass, every applicable code: an author who fixes `env` should not
+    # then discover the mistyped allowlist entry on the next run.
+    root = _bundle(
+        tmp_path,
+        "targets:\n"
+        "  p:\n    agent: a\n    env: staging\n"
+        "  q:\n    agent: b\n    connectors: [loki]\n",
+        GRAFANA_CONNECTORS,
+    )
+    codes = sorted(e.code for e in validate_bundle(str(root)).errors)
+    assert codes == ["deploy.bad_env", "deploy.unknown_connector"]
+
+
+def test_bundle_does_not_call_a_malformed_entry_unknown_as_well(tmp_path: Path) -> None:
+    # A malformed name can never be declared, so `unknown` would only repeat
+    # what `bad_connector_name` already said about the same entry.
+    root = _bundle(
+        tmp_path, "targets:\n  p:\n    agent: a\n    connectors: [Bad_Name]\n", GRAFANA_CONNECTORS
+    )
+    assert [e.code for e in validate_bundle(str(root)).errors] == ["deploy.bad_connector_name"]
