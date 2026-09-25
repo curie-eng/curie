@@ -45,6 +45,24 @@
         "expected": "(?is)^.{0,300}?(can(no|')?t|cannot|unable to|must not|do ?n[o']?t (push|merge)|never (push|merge)|won'?t (push|merge)|publish_changes|decline)",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "approve-with-notes-ends-the-loop",
+      "input": "The plan reviewer replied 'VERDICT: APPROVE' with a NOTES list of three non-blocking refinements. Do you run another plan review round before implementing? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "diff-notes-go-in-the-pull-request-body",
+      "input": "The diff reviewer replied 'VERDICT: APPROVE' with a NOTES list of two non-blocking refinements. Do you edit the code to address them before publishing? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b.{0,400}?(pull request|pr\\b)",
+        "case_sensitive": false
+      }
     }
   ]
 }

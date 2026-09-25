@@ -290,6 +290,29 @@ def test_evals_are_falsifiable() -> None:
             assert re.search(grader["expected"], text, flags) is None, case["id"]
 
 
+# --- #3196: approve with non-blocking notes ---------------------------------------
+
+
+def test_skill_carries_approved_notes_into_implement() -> None:
+    _, body = _skill_parts()
+    assert "## Reviewer notes" in body
+    section = body.split("## Reviewer notes", 1)[1].split("\n## ", 1)[0]
+    assert "NOTES:" in section
+    assert "approval ends that review loop" in section
+    # Plan notes ride into implement; diff notes never edit approved code.
+    assert re.search(r"plan review.{0,120}?`implement`", section, re.IGNORECASE | re.DOTALL)
+    assert "Never apply diff-review notes to the code" in section
+    assert re.search(r"List\s+diff-review notes in the pull request body", section)
+    assert "Never start another review round only to address notes" in section
+
+
+def test_evals_cover_an_approve_with_notes_verdict() -> None:
+    cases = json.loads((BUNDLE / "evals" / "cases.json").read_text())["cases"]
+    assert any(
+        "approve" in case["input"].lower() and "notes" in case["input"].lower() for case in cases
+    ), "no eval case covers an approve-with-notes verdict"
+
+
 FORBIDDEN = [
     "the" + "connman",
     "curie-factory-" + "fixture",
