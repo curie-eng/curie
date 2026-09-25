@@ -2,11 +2,15 @@
 
 Date: 2026-09-24
 
-Status: Draft
+Status: Accepted
+
+Accepted with explicit maintainer approval from Brian Conn in the review of
+[#3148](https://github.com/curie-eng/curie/pull/3148), the pull request that
+published this status, before implementation.
 
 Today anyone who can reach a bot, in a Slack channel, a direct message or its
-email inbox, can use it. A personal assistant bot holds one person's mail,
-calendar and chat access, so it must answer only that person. This ADR gives
+email inbox, can use it. Some bots hold credentials or data that only certain
+people should reach, so they must answer only those people. This ADR gives
 each place a bot listens an optional list of who may talk to it, checked once,
 before anything happens, and everyone else gets nothing back. No list means
 today's behavior, each channel still proves who the sender is (email still
@@ -39,7 +43,7 @@ exempts them from the loop guard and never refuses a person, and the mail
 adapter's deploy-time sender list covers every inbox it serves and takes a
 redeploy to change.
 
-A personal assistant must refuse everyone else on every binding before a turn
+A bot with a list must refuse everyone else on every binding before a turn
 starts. Inside the turn is too late, since the turn reads the credentials, and
 the model is not a security boundary. Today it is safe only where nobody else
 can reach it.
@@ -144,8 +148,8 @@ fixed by editing the list.
 
 ## Consequences
 
-- A personal assistant can sit in shared channels and own an inbox, and everyone
-  else is refused before a sandbox is claimed.
+- Any bot can sit in shared channels and own an inbox, and everyone not on its
+  list is refused before a sandbox is claimed.
 - While the API is down, first contact on an uncached Slack route is refused,
   even with no list. That is the cost of failing closed.
 - Another bot in the same install (ADR-0168 decision 6) is refused unless
@@ -203,5 +207,5 @@ person does.
    (`packages/aci-protocol`).
 4. **Let the dispatcher read the binding table.** Deferred to #2914, which gives
    the dispatcher the database access it has never had.
-5. **Wait for #2914.** Rejected. It needs #2910, #2911 and #2913, and a personal
-   assistant cannot be deployed safely until then.
+5. **Wait for #2914.** Rejected. It needs #2910, #2911 and #2913, and a bot that
+   must answer only certain people cannot be deployed safely until then.
