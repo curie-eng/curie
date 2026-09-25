@@ -127,6 +127,9 @@ def test_the_chart_rendering_parses_as_rendered(monkeypatch: pytest.MonkeyPatch)
         ([SECOND], "declares no 'default' identity"),
         ([DEFAULT, SECOND, SECOND], "repeats identity names \\['second'\\]"),
         ([DEFAULT, {**SECOND, "name": "Second"}], "should match pattern"),
+        # A binding's `adapter` refuses a doubled hyphen, so a declared name
+        # carrying one could never be bound.
+        ([DEFAULT, {**SECOND, "name": "sales--eu"}], "should match pattern"),
         ([DEFAULT, {**SECOND, "name": "a" * 41}], "at most 40 characters"),
         ([DEFAULT, {**SECOND, "note": "x"}], "Extra inputs are not permitted"),
         (

@@ -148,8 +148,16 @@ def slack(**fields):
     return {"dispatcher": {"slack": fields}}
 
 
+# `default` by reference: once the list is non-empty, a plain block token fails the render.
+BLOCK_REFS = {
+    "appTokenExistingSecret": "slack-main",
+    "botTokenExistingSecret": "slack-main",
+    "signingSecretExistingSecret": "slack-main",
+}
+
+
 def with_block(*identities, **extra):
-    return slack(appToken="xapp-example", botToken="xoxb-example", identities=list(identities), **extra)
+    return slack(**BLOCK_REFS, identities=list(identities), **extra)
 
 
 SECOND = {
@@ -171,6 +179,12 @@ LEGACY_DISPATCHER = [
     entry("SLACK_SIGNING_SECRET", SECRET, "slackSigningSecret"),
 ]
 LEGACY_BOT = [entry("SLACK_BOT_TOKEN", SECRET, "slackBotToken")]
+BLOCK_DISPATCHER = [
+    entry("SLACK_APP_TOKEN", "slack-main", "slackAppToken"),
+    entry("SLACK_BOT_TOKEN", "slack-main", "slackBotToken"),
+    entry("SLACK_SIGNING_SECRET", "slack-main", "slackSigningSecret"),
+]
+BLOCK_BOT = [entry("SLACK_BOT_TOKEN", "slack-main", "slackBotToken")]
 LEGACY_NAMES = ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET")
 
 # --- S1: a stock install with no Slack at all -------------------------------
@@ -216,10 +230,13 @@ for label, identities in (("S4 empty", []), ("S4 null", None)):
     _, output = render({"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": identities}}})
     same_objects(label, plain, output)
 _, plain_upgrade = render(PLAIN, "--is-upgrade")
-_, empty_upgrade = render(with_block(), "--is-upgrade")
+_, empty_upgrade = render(
+    {"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": []}}}, "--is-upgrade"
+)
 same_objects("S4 upgrade", plain_upgrade, empty_upgrade)
 
 # --- T1: the block plus two listed identities -------------------------------
+_, block_only = render(slack(**BLOCK_REFS))
 _, two = render(with_block(SECOND, THIRD))
 two_env = workloads(two)
 expected_declaration = [
@@ -243,13 +260,13 @@ indexed_bot = [
     entry("CURIE_SLACK_BOT_TOKEN__1", "slack-third", "bot"),
 ]
 assert two_env["dispatcher"] is not None, "T1: the dispatcher must render"
-assert named(two_env["dispatcher"], *LEGACY_NAMES) == LEGACY_DISPATCHER, "T1: default moved"
+assert named(two_env["dispatcher"], *LEGACY_NAMES) == BLOCK_DISPATCHER, "T1: default moved"
 assert [e for e in two_env["dispatcher"] if e["name"].startswith(INDEXED)] == indexed_dispatcher, (
     f"T1: dispatcher indexed env: {[e for e in two_env['dispatcher'] if e['name'].startswith(INDEXED)]!r}"
 )
 declarations = {}
 for workload in ("worker", "api"):
-    assert named(two_env[workload], *LEGACY_NAMES) == LEGACY_BOT, f"T1: {workload} default moved"
+    assert named(two_env[workload], *LEGACY_NAMES) == BLOCK_BOT, f"T1: {workload} default moved"
     rendered = [e for e in two_env[workload] if e["name"].startswith(INDEXED)]
     assert rendered == indexed_bot, f"T1: {workload} must get bot tokens only; got {rendered!r}"
 for workload, entries in two_env.items():
@@ -265,7 +282,7 @@ for entries in two_env.values():
             assert e["valueFrom"]["secretKeyRef"]["name"] != SECRET, f"T1: {e!r} reads the chart Secret"
 same_objects(
     "T1 everything else",
-    plain,
+    block_only,
     two,
     ignore={("Deployment", "acme-curie-dispatcher"), ("Deployment", "acme-curie-worker"),
             ("Deployment", "acme-curie-api")},
@@ -346,7 +363,8 @@ refuse("N9 plain token value", with_block({**SECOND, "botToken": "xoxb-example"}
 refuse("N10 unknown key", with_block({**SECOND, "note": "x"}), f"{W0} has unknown key \"note\"")
 refuse("N11 default twice", with_block({**listed_default}), f"{W0} names the identity \"default\"")
 refuse("N12 no default", slack(identities=[SECOND]), "declares no identity named \"default\"")
-refuse("N13 half-configured block", slack(appToken="xapp-example", identities=[SECOND]),
+refuse("N13 half-configured block",
+       slack(appTokenExistingSecret="slack-main", identities=[SECOND]),
        "dispatcher.slack is half-configured")
 refuse("N14 a map, not a list", slack(appToken="xapp-example", botToken="xoxb-example",
                                       identities={"second": SECOND}),
@@ -368,6 +386,20 @@ refuse("N21 an empty map, not a list", slack(appToken="xapp-example", botToken="
        "dispatcher.slack.identities must be a list")
 refuse("N22 the reserved delivery selector", with_block({**SECOND, "name": "curie-cluster-message"}),
        f"{W0}.name", "curie-cluster-message", "reserved")
+# A binding's `adapter` refuses a doubled hyphen, so no binding could name this identity.
+refuse("N23 doubled hyphen", with_block({**SECOND, "name": "sales--eu"}), f"{W0}.name",
+       "must match")
+render(with_block({**SECOND, "name": "sales-eu"}))  # N23 control: one hyphen renders
+# Once the list is non-empty, `default`'s secrets arrive by reference too.
+for token in ("appToken", "botToken", "signingSecret"):
+    block = {**BLOCK_REFS, token: "plain-example"}
+    del block[f"{token}ExistingSecret"]
+    refuse(f"N24 plain dispatcher.slack.{token} beside a list", slack(**block, identities=[SECOND]),
+           f"dispatcher.slack.{token} is a plain secret value", "dispatcher.slack.identities",
+           "#1759", f"dispatcher.slack.{token}ExistingSecret")
+refuse("N25 plain block tokens beside a list, on upgrade too",
+       slack(appToken="xapp-example", botToken="xoxb-example", identities=[SECOND]),
+       "dispatcher.slack.appToken is a plain secret value", args=("--is-upgrade",))
 
 # --- X: extraEnv cannot shadow a name this chart owns -----------------------
 def with_extra_env(values, workload, name):
@@ -436,8 +468,15 @@ os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"] = "example-attester-secret"
 from curie_api.config import Settings
 from curie_dispatcher.config import DispatcherConfig
 from curie_worker.config import WorkerConfig
+from aci_protocol.slack_identities import IDENTITY_NAME_PATTERN
 from curie_worker.sandbox.types import filter_agent_child_env
 from pydantic import ValidationError
+
+# One name rule: the chart's refusal must be the parser's pattern, character for character.
+template = open("charts/curie/templates/_slack-identities.tpl").read()
+assert f'regexMatch "{IDENTITY_NAME_PATTERN}"' in template, (
+    f"the chart's identity name rule is not the parser's {IDENTITY_NAME_PATTERN!r}"
+)
 
 
 def parse_everywhere(label, declaration, want):
