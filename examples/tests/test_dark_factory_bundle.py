@@ -260,6 +260,35 @@ def test_phases_section_names_the_platform_progress_tool() -> None:
     assert re.search(r"never blocks|continue the work", phases, re.IGNORECASE)
 
 
+# --- #3195: report each phase once; never end a message without a tool call ---------
+
+
+def _phases_section() -> str:
+    """The `## Phases` section, whitespace-normalized so line wrapping cannot
+    break a sentence-level assertion (#3195)."""
+    _, body = _skill_parts()
+    return re.sub(r"\s+", " ", body.split("## Phases", 1)[1].split("\n## ", 1)[0])
+
+
+def test_phases_section_reports_each_phase_once_on_entry() -> None:
+    """One report_progress per phase entry, not one per turn while working (#3195)."""
+    assert re.search(
+        r"report_progress`? once when you enter a phase, not while you work in it",
+        _phases_section(),
+    )
+
+
+def test_phases_section_bars_a_message_without_a_tool_call() -> None:
+    """A message without a tool call ends the run; only the stop may be all text (#3195)."""
+    assert re.search(
+        r"Every message you send must include a tool call"
+        r".{0,220}publish_changes"
+        r".{0,220}Could not complete:"
+        r".{0,220}A message without a tool call ends the run",
+        _phases_section(),
+    )
+
+
 def test_untrusted_covers_issue_and_repository_and_instructions() -> None:
     _, body = _skill_parts()
     text = body.lower()

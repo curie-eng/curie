@@ -15,13 +15,24 @@ pairs loop: `plan` and `plan_review`, then `implement` and `review_diff`, then
 `wait_ci` back to `implement` when the pull request's checks fail. Each loop
 runs at most 3 rounds.
 
-At the start of each phase except `wait_ci`, which the platform reports, call
-`mcp__curie__report_progress` with `phase`
-set to that phase's id, `round` for `plan`, `plan_review`, `implement` and
+Call `mcp__curie__report_progress` once when you enter a phase, not while you
+work in it: report before the phase's first tool call, and do not report the
+same phase again while you stay in it. Every phase except `wait_ci`, which
+the platform reports, gets one report per entry — a new round of a loop, or
+the return from `wait_ci` to `implement`, is a new entry. Pass `phase` set to
+that phase's id, `round` for `plan`, `plan_review`, `implement` and
 `review_diff`, and an optional one-line `note` saying what you are about to
 do. The note is public on the issue, so it must contain no secrets and no raw
-tool output. Report the phase before its first tool call. If the tool returns
-an error, continue the work; progress never blocks the run.
+tool output. If the tool returns an error, continue the work; progress never
+blocks the run.
+
+Every message you send must include a tool call until you have called
+`mcp__curie__publish_changes` or are stopping with `Could not complete:`. A
+message without a tool call ends the run — an all-text reply such as "Now
+I'll revise the plan" stops the loop mid-phase, publishing nothing and
+stating no reason. Say what you are doing in a message that also makes the
+next tool call. Your only text-only endings are that `Could not complete:`
+stop and the publication-pending note after `publish_changes`.
 
 The bundle's review gate hook enforces the loops. It reports each review phase
 and its round, numbers the rounds, sends the call to the right reviewer in the
