@@ -3,19 +3,36 @@
 import uuid
 from urllib.parse import quote
 
+#: The identity whose thread key carries no identity segment: the one Slack app
+#: every route had before ADR-0168. A copy of ``aci_protocol.turn.DEFAULT_IDENTITY``,
+#: because this package does not depend on that one; ``test_identity`` pins them.
+DEFAULT_IDENTITY = "default"
 
-def scoped_conversation_id(kind: str, address: str, conversation_id: str) -> str:
+
+def scoped_conversation_id(
+    kind: str,
+    address: str,
+    conversation_id: str,
+    *,
+    identity: str | None = None,
+) -> str:
     """Return the collision-free internal identity for a routed conversation.
 
     Channel-native conversation ids are opaque and unique only within their
     adapter address. Encoding every component before joining keeps component
     boundaries unambiguous without imposing parsing rules on adapters.
+
+    ``identity`` is the route's resolved identity (``route_identity``), a
+    segment after ``kind`` unless it is None or ``DEFAULT_IDENTITY``
+    (ADR-0168 decision 4).
     """
 
-    return ":".join(
-        quote(component, safe="")
-        for component in (kind, address, conversation_id)
+    components = (
+        (kind, address, conversation_id)
+        if identity is None or identity == DEFAULT_IDENTITY
+        else (kind, identity, address, conversation_id)
     )
+    return ":".join(quote(component, safe="") for component in components)
 
 
 def hook_conversation_id(
