@@ -1369,3 +1369,213 @@ async fn routing_check_swallows_a_body_it_cannot_decode() {
         .unwrap()
         .is_none());
 }
+
+// --------------------------------------------------------------------------- //
+// A deploy's binding carries the target's identity (ADR-0168 decision 8)
+// --------------------------------------------------------------------------- //
+const IDENTITY: &str = "ops-bot";
+
+/// An agent whose Slack bindings each carry an identity, as the API reads them
+/// back: a default binding reads `"default"`, never an absent key.
+fn agent_json_routes(id: &str, name: &str, routes: &[(&str, &str)]) -> String {
+    let bindings = routes
+        .iter()
+        .map(|(address, identity)| {
+            format!(r#"{{"kind":"slack","address":"{address}","adapter":"{identity}"}}"#)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"id":"{id}","name":"{name}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+    )
+}
+
+fn create_body(server: &MockServer) -> serde_json::Value {
+    server
+        .recorded()
+        .into_iter()
+        .find(|r| r.method == "POST" && r.path == "/agents")
+        .map(|r| serde_json::from_slice(&r.body).expect("create body is JSON"))
+        .expect("one POST /agents")
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_new_agent_is_created_on_the_named_identity() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(
+            201,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, IDENTITY)]),
+        ),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap();
+    assert_eq!(
+        create_body(&server)["channel"],
+        serde_json::json!({"kind": "slack", "address": BOUND, "adapter": IDENTITY})
+    );
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn the_default_identity_is_written_exactly_as_before() {
+    for identity in [None, Some("default")] {
+        let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/agents") => Response::json(200, "[]"),
+            ("POST", "/agents") => {
+                Response::json(201, &agent_json(AGENT_ID, AGENT_NAME, BOUND, None))
+            }
+            (m, p) => panic!("unexpected request: {m} {p}"),
+        });
+        let client = ApiClient::new(&server.base_url, "k").unwrap();
+        client
+            .resolve_agent_as(AGENT_NAME, Some(BOUND), None, identity)
+            .await
+            .unwrap();
+        assert_eq!(
+            create_body(&server)["channel"],
+            serde_json::json!({"kind": "slack", "address": BOUND}),
+            "{identity:?} must send no adapter"
+        );
+    }
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_default_binding_on_the_channel_does_not_hold_a_named_identity() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, "default")],
+        )),
+        ("POST", p) if *p == channels_path() => Response::json(
+            201,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, "default"), (BOUND, IDENTITY)]),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap();
+    assert_eq!(
+        channel_post_bodies(&server),
+        vec![serde_json::json!({"kind": "slack", "address": BOUND, "adapter": IDENTITY})]
+    );
+    assert_no_patch(&server);
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_binding_already_on_the_named_identity_writes_nothing() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, IDENTITY)],
+        )),
+        // Answered, never panicked, so a needless write is RECORDED.
+        ("POST", p) if *p == channels_path() => Response::json(
+            201,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, IDENTITY)]),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap();
+    assert_no_binding_write(&server);
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_conflict_is_success_only_when_this_agent_holds_the_same_identity() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, "default")],
+        )),
+        ("POST", p) if *p == channels_path() => Response::json(
+            409,
+            r#"{"detail":"another agent is already bound to that channel kind and address"}"#,
+        ),
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, "default")]),
+        ),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let err = client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .expect_err("holding the default route is not holding the named one");
+    assert!(format!("{err:#}").contains("409"), "{err:#}");
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_named_identity_the_database_cannot_store_is_a_usage_error_naming_it() {
+    const REFUSAL: &str = "a Slack binding naming an identity other than 'default' cannot be \
+        stored until the database admits it (https://github.com/curie-eng/curie/issues/3146). \
+        The identity is declared; bind the channel under 'default' instead";
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, "default")],
+        )),
+        ("POST", p) if *p == channels_path() => {
+            Response::json(422, &serde_json::json!({ "detail": REFUSAL }).to_string())
+        }
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let err = client
+        .resolve_agent_as(AGENT_NAME, Some(OTHER), None, Some(IDENTITY))
+        .await
+        .unwrap_err();
+    let (class, fix) = curie::exit::classify(&err);
+    assert_eq!(class.code(), 2, "a usage error, not a generic failure");
+    let message = err.to_string();
+    assert!(message.contains(IDENTITY), "{message}");
+    assert!(message.contains(REFUSAL), "the platform's own reason, verbatim: {message}");
+    assert!(!message.contains("failed with 422"), "{message}");
+    assert!(fix.expect("a fix").contains("--identity"));
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn an_undeclared_identity_is_a_usage_error_carrying_the_platform_reason() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(
+            422,
+            r#"{"detail":[{"type":"value_error","loc":["body","channel"],"msg":"Value error, slack identity 'ops-bot' is not declared by this installation, which declares 'default'.","input":{}}]}"#,
+        ),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let err = client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2);
+    assert!(
+        err.to_string()
+            .contains("is not declared by this installation, which declares 'default'"),
+        "{err}"
+    );
+}
