@@ -189,8 +189,8 @@ def test_app_jwt_is_rs256_and_verifies(tmp_path: Path) -> None:
 
 
 def test_request_id_matches_api_derivation() -> None:
-    expected = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/factory/label/123/9")
-    assert fe.request_id_for(123, 9) == expected
+    expected = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/factory/label/123/9/d-1")
+    assert fe.request_id_for(123, 9, "d-1") == expected
 
 
 def _delivery(guid: str, number: int, repo: str, *, action: str = "labeled") -> dict[str, Any]:
@@ -1008,7 +1008,7 @@ def test_revision_request_id_matches_the_api_derivation() -> None:
     inner = uuid.uuid5(uuid.NAMESPACE_URL, f"{rid}:issue_comment:{cid}")
     expected = uuid.uuid5(uuid.NAMESPACE_URL, f"github-feedback-{inner}")
     assert fe.revision_request_id(rid, cid) == expected
-    assert fe.revision_request_id(rid, cid) != fe.request_id_for(rid, 9)
+    assert fe.revision_request_id(rid, cid) != fe.request_id_for(rid, 9, "d-1")
 
 
 def test_match_delivery_action_kwarg_picks_unlabeled_and_ignores_labeled() -> None:

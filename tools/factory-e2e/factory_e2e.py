@@ -650,10 +650,13 @@ def app_jwt(app_id: str, key_file: Path, *, now: int | None = None) -> str:
     return f"{header}.{payload}.{_b64url(signed.stdout)}"
 
 
-def request_id_for(repository_id: int, issue_number: int) -> uuid.UUID:
-    """The execution request id the api derives for a label admission."""
+def request_id_for(repository_id: int, issue_number: int, delivery_id: str) -> uuid.UUID:
+    """The execution request id the api derives for a label admission.
 
-    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}"
+    Each labeled delivery is its own request, so the delivery id is part of it.
+    """
+
+    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{delivery_id}"
     return uuid.uuid5(uuid.NAMESPACE_URL, identity)
 
 
@@ -2343,7 +2346,7 @@ class Preflight:
                 f"{delivery.get('status_code')}, api status {api_status!r}"
             )
         self.step("delivery accepted", delivery_id=delivery.get("guid"))
-        request_id = request_id_for(self.repository_id, issue_number)
+        request_id = request_id_for(self.repository_id, issue_number, str(delivery.get("guid")))
         status, body = self.api(
             "GET",
             f"/v1/internal/work-items/requests/{request_id}",
