@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from plugin_format import validate_bundle
 from plugin_format.connectors import validate_connectors
 from plugin_format.deploy_targets import validate_deploy_targets
@@ -518,3 +519,136 @@ def test_bundle_does_not_call_a_malformed_entry_unknown_as_well(tmp_path: Path) 
         tmp_path, "targets:\n  p:\n    agent: a\n    connectors: [Bad_Name]\n", GRAFANA_CONNECTORS
     )
     assert [e.code for e in validate_bundle(str(root)).errors] == ["deploy.bad_connector_name"]
+
+
+# --------------------------------------------------------------------------- #
+# Which connectors an agent runs (ADR-0168 decision 8)
+# --------------------------------------------------------------------------- #
+from plugin_format.connectors import ConnectorsFile  # noqa: E402
+from plugin_format.deploy_targets import (  # noqa: E402
+    DeployTargetsFile,
+    connectors_for_agent,
+    restrict_connectors,
+)
+
+_TWO_CONNECTORS = (
+    "connectors:\n"
+    "  grafana:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    secrets: [GRAFANA_TOKEN]\n"
+    "  loki:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    secrets: [LOKI_TOKEN]\n"
+)
+
+
+def _targets(data: dict) -> DeployTargetsFile:
+    return DeployTargetsFile.model_validate({"targets": data})
+
+
+# @spec ADR-0168 d8
+@pytest.mark.parametrize(
+    ("targets", "agent", "expected"),
+    [
+        (None, "acme-bot", None),
+        ({"dev": {"agent": "acme-dev", "connectors": []}}, "acme-bot", None),
+        ({"prod": {"agent": "acme-bot", "env": "prod"}}, "acme-bot", None),
+        (
+            {"prod": {"agent": "acme-bot", "env": "prod", "connectors": ["grafana"]}},
+            "acme-bot",
+            frozenset({"grafana"}),
+        ),
+        ({"prod": {"agent": "acme-bot", "env": "prod", "connectors": []}}, "acme-bot", frozenset()),
+        (
+            {
+                "dev": {"agent": "acme-dev", "connectors": ["grafana"]},
+                "prod": {"agent": "acme-bot", "env": "prod", "connectors": ["loki"]},
+            },
+            "acme-bot",
+            frozenset({"loki"}),
+        ),
+    ],
+    ids=[
+        "no_deploy_yaml",
+        "no_target_names_the_agent",
+        "absent_key_runs_all",
+        "listed",
+        "empty_runs_none",
+        "two_agents_from_one_artifact",
+    ],
+)
+def test_connectors_for_agent(targets: dict | None, agent: str, expected: object) -> None:
+    parsed = None if targets is None else _targets(targets)
+    assert connectors_for_agent(parsed, agent) == expected
+
+
+# @spec ADR-0168 d8
+def test_restrict_connectors_keeps_only_the_allowlist() -> None:
+    declared, errors = validate_connectors(yaml.safe_load(_TWO_CONNECTORS))
+    assert errors == [] and declared is not None
+    assert sorted(restrict_connectors(declared, frozenset({"grafana"})).connectors) == ["grafana"]
+    assert restrict_connectors(declared, frozenset()).connectors == {}
+    assert restrict_connectors(declared, None) is declared
+
+
+# @spec ADR-0168 d8
+def test_restrict_connectors_never_mutates_the_declaration() -> None:
+    declared, _ = validate_connectors(yaml.safe_load(_TWO_CONNECTORS))
+    assert isinstance(declared, ConnectorsFile)
+    restrict_connectors(declared, frozenset())
+    assert sorted(declared.connectors) == ["grafana", "loki"]
+
+
+# @spec ADR-0168 d8
+def test_two_targets_binding_one_agent_must_agree_on_connectors() -> None:
+    codes = _codes(
+        {
+            "targets": {
+                "dev": {"agent": "acme-bot", "connectors": ["grafana"]},
+                "prod": {"agent": "acme-bot", "env": "prod", "connectors": ["loki"]},
+            }
+        }
+    )
+    assert codes == ["deploy.conflicting_connectors"]
+
+
+# @spec ADR-0168 d8
+def test_an_absent_list_and_a_list_disagree_for_one_agent() -> None:
+    codes = _codes(
+        {
+            "targets": {
+                "dev": {"agent": "acme-bot"},
+                "prod": {"agent": "acme-bot", "env": "prod", "connectors": []},
+            }
+        }
+    )
+    assert codes == ["deploy.conflicting_connectors"]
+
+
+# @spec ADR-0168 d8
+def test_two_targets_binding_one_agent_may_list_the_same_set_in_any_order() -> None:
+    parsed, errors = validate_deploy_targets(
+        {
+            "targets": {
+                "dev": {"agent": "acme-bot", "connectors": ["grafana", "loki"]},
+                "prod": {"agent": "acme-bot", "env": "prod", "connectors": ["loki", "grafana"]},
+            }
+        }
+    )
+    assert errors == []
+    assert connectors_for_agent(parsed, "acme-bot") == frozenset({"grafana", "loki"})
+
+
+# @spec ADR-0168 d8
+def test_the_conflict_error_names_both_targets_and_the_agent() -> None:
+    _, errors = validate_deploy_targets(
+        {
+            "targets": {
+                "dev": {"agent": "acme-bot", "connectors": ["grafana"]},
+                "prod": {"agent": "acme-bot", "env": "prod", "connectors": ["loki"]},
+            }
+        }
+    )
+    (message,) = [m for c, m in errors if c == "deploy.conflicting_connectors"]
+    assert "targets.dev" in message and "targets.prod" in message
+    assert "acme-bot" in message
