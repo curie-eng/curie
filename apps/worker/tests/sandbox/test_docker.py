@@ -165,6 +165,36 @@ def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential(
     assert "CURIE_SEALING_PRIVATE_KEY" not in child_env_names
 
 
+def test_create_claim_excludes_every_slack_identity_token_from_child_env() -> None:
+    """ADR-0168 decisions 1 and 5: each declared Slack identity's tokens reach
+    the worker as indexed `CURIE_SLACK_*__<n>` variables. The filter drops them
+    by prefix, at any index, and a connector marker cannot readmit one. The
+    non-secret declaration itself carries no token and may pass."""
+
+    tokens = {
+        "CURIE_SLACK_BOT_TOKEN__0": "placeholder",
+        "CURIE_SLACK_BOT_TOKEN__12": "placeholder",
+        "CURIE_SLACK_APP_TOKEN__0": "placeholder",
+        "CURIE_SLACK_SIGNING_SECRET__0": "placeholder",
+    }
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-slack-identities",
+        pool="pool",
+        env={
+            **tokens,
+            "CURIE_SLACK_IDENTITIES": "[]",
+            "CURIE_CONNECTOR_SECRET_KEYS": "CURIE_SLACK_BOT_TOKEN__0",
+        },
+    )
+
+    child_env_names = {
+        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
+    }
+    assert tokens.keys().isdisjoint(child_env_names)
+    assert "CURIE_SLACK_IDENTITIES" in child_env_names
+
+
 def test_create_claim_fetches_and_unwraps_bundle() -> None:
     store = _FakeBundleStore(_plugin_tar_gz(wrapper="deal-desk"))
     client = _RecordingDocker(image="curie-runner", bundle_store=store)
