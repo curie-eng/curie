@@ -260,6 +260,40 @@ def test_resolves_channel_to_active_deployment_and_builds_env() -> None:
     asyncio.run(go())
 
 
+def test_a_cluster_message_relay_turn_resolves_the_channels_default_binding() -> None:
+    """`curie cluster message` queues a Slack turn whose handle carries the
+    worker's built-in reply adapter; the binding `curie cluster deploy` wrote
+    for that channel stores no adapter. The relay still resolves to it."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"agent-{token}", max_usd=None, max_tokens=None
+            )
+            await _seed_deployment(
+                engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
+            )
+
+            resolved = await _resolver(engine).resolve("slack", "curie-cluster-message", channel)
+            assert resolved is not None
+            assert resolved.agent_id == agent_id
+
+            await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
 def test_resolves_a_non_slack_binding_on_the_kind_address_pair() -> None:
     """T-A4, kind-independence half / AC4. Rewritten from PR 1's
     `test_resolves_a_non_slack_binding_on_address_alone`, which asserted the

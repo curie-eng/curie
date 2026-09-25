@@ -634,6 +634,37 @@ def test_a_slack_turn_with_no_adapter_falls_back_to_the_custom_transport_row() -
     assert matching_routes([custom_transport], "slack", "C0EXAMPLE1", None) == [custom_transport]
 
 
+# `curie cluster message` relays a turn with the worker's built-in reply
+# adapter. That adapter picks where the reply is delivered, not which binding
+# answers: the turn is still the channel's own Slack turn.
+_CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+
+
+def test_the_cluster_message_relay_adapter_is_not_an_identity() -> None:
+    assert route_identity(SLACK_KIND, _CLUSTER_MESSAGE_ADAPTER) == DEFAULT_IDENTITY
+
+
+def test_a_cluster_message_relay_turn_matches_the_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    named_row = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+
+    assert matching_routes(
+        [default_row, named_row], "slack", "C0EXAMPLE1", _CLUSTER_MESSAGE_ADAPTER
+    ) == [default_row]
+
+
+def test_a_cluster_message_relay_turn_falls_back_to_the_custom_transport_row() -> None:
+    # Before the route triple a relay turn resolved on (kind, address) alone,
+    # so it reached this row the same as a turn with no adapter does.
+    custom_transport = _Row(
+        kind="slack", address="C0EXAMPLE1", adapter="proof-offline", endpoint="http://127.0.0.1:1"
+    )
+
+    assert matching_routes(
+        [custom_transport], "slack", "C0EXAMPLE1", _CLUSTER_MESSAGE_ADAPTER
+    ) == [custom_transport]
+
+
 def test_the_custom_transport_fallback_does_not_fire_with_a_given_adapter() -> None:
     # The fallback is reserved for an OMITTED adapter (the old callers of a
     # custom-transport row never send one). A turn that names an adapter and
