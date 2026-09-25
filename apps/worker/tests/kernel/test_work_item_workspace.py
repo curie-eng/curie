@@ -16,8 +16,10 @@ from types import SimpleNamespace
 
 import pytest
 from aci_protocol import (
+    Event,
     ErrorEvent,
     Final,
+    PublicationContext,
     QueuedTurn,
     ReplyHandle,
     SessionStatus,
@@ -26,6 +28,7 @@ from aci_protocol import (
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
+from curie_worker.approvals import PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel import ThreadBusyError
@@ -212,6 +215,84 @@ def test_work_item_execution_checks_out_the_work_item_repository(make_harness) -
             assert h.kernel._workspace.selections == [WORK_ITEM_REPO]
             assert h.kernel._workspace.claimed == [WORK_ITEM_REPO]
             assert h.sink.updates == []
+
+    asyncio.run(exercise())
+
+
+def test_existing_pr_factory_turn_receives_trusted_publication_context(make_harness) -> None:
+    async def exercise() -> None:
+        request_id = uuid.uuid4()
+        expected = PublicationContext(
+            agent_id=AGENT_ID,
+            deployment_id=DEPLOYMENT_ID,
+            work_item_id=request_id,
+            execution_request_id=request_id,
+            runtime_epoch=1,
+            conversation_id=f"work-item-{request_id}",
+            lineage_id=uuid.uuid4(),
+            lineage_version=2,
+            expected_head="a" * 40,
+            queued_event_id=f"work-item-{request_id}-execute-1",
+            precheck_url="https://api.example.com/publications/precheck",
+            capability="ppc.example.signature",
+            observed_title="Existing pull request",
+            observed_body_sha256="b" * 64,
+            observed_at=datetime.now(UTC),
+        )
+
+        class PublicationApi:
+            def __init__(self) -> None:
+                self.mint_calls: list[dict[str, object]] = []
+
+            async def get_publication_lineage(self, *_args: object) -> PublicationLineage:
+                return PublicationLineage(
+                    id=expected.lineage_id,
+                    deployment_id=DEPLOYMENT_ID,
+                    conversation_id=expected.conversation_id,
+                    repo_full_name=WORK_ITEM_REPO,
+                    base_sha="c" * 40,
+                    branch="curie/thread-example",
+                    pr_number=7,
+                    pr_url=f"https://github.com/{WORK_ITEM_REPO}/pull/7",
+                    head_sha=expected.expected_head,
+                    state="open",
+                    version=2,
+                    latest_revision=1,
+                    has_pending_revision=False,
+                    has_pending_outcome=False,
+                    visible_outcome_revision=1,
+                )
+
+            async def get_publication_precheck_context(
+                self, **kwargs: object
+            ) -> PublicationContext:
+                self.mint_calls.append(kwargs)
+                return expected
+
+        publication_api = PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publication_api,
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+            captured: list[Event] = []
+            start_turn = h.kernel._runner.start_turn
+
+            async def capture_turn(base_url: str, event: Event, *args: object, **kwargs: object):
+                captured.append(event)
+                return await start_turn(base_url, event, *args, **kwargs)
+
+            h.kernel._runner.start_turn = capture_turn  # type: ignore[method-assign]
+            await h.kernel.process_event(
+                _turn(expected.queued_event_id, f"Resolve {ISSUE_URL}")
+            )
+
+            assert publication_api.mint_calls
+            assert len(captured) == 1
+            assert captured[0].publication_context == expected
+            assert expected.capability not in captured[0].text
 
     asyncio.run(exercise())
 
