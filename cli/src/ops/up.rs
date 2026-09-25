@@ -5290,6 +5290,62 @@ mod tests {
         );
     }
 
+    /// `up` hands a recorded `dispatcher.slack.identities` list straight back
+    /// (`plain_up_re_supplies_recorded_slack_identities_without_reuse_values`),
+    /// so `diff` must not announce a reset for any of its leaves. An identity's
+    /// name is configuration an operator reads to confirm which bots survive;
+    /// its Secret references stay masked exactly as their names already say.
+    #[test]
+    fn slack_identities_are_preserved_and_their_names_never_masked() {
+        for key in [
+            "dispatcher.slack.identities",
+            "dispatcher.slack.identities[0].name",
+            "dispatcher.slack.identities[1].name",
+            "dispatcher.slack.identities[0].appTokenExistingSecret",
+            "dispatcher.slack.identities[0].botTokenExistingSecretKey",
+            "dispatcher.slack.identities[1].signingSecretExistingSecret",
+        ] {
+            assert!(
+                is_preserved_by_up(key),
+                "diff must not report a reset for {key}, which up re-supplies"
+            );
+        }
+        for key in [
+            "dispatcher.slack.identities[0].name",
+            "dispatcher.slack.identities[1].name",
+        ] {
+            assert!(
+                !is_secret_value_key(key),
+                "{key} is an identity name, not a credential"
+            );
+            let expression = format!("{key}=second");
+            assert_eq!(
+                mask_helm_set_expression(&expression),
+                expression,
+                "the plan must show {key} as written"
+            );
+        }
+        for key in [
+            "dispatcher.slack.identities[0].appTokenExistingSecret",
+            "dispatcher.slack.identities[0].appTokenExistingSecretKey",
+            "dispatcher.slack.identities[0].botTokenExistingSecret",
+            "dispatcher.slack.identities[0].botTokenExistingSecretKey",
+            "dispatcher.slack.identities[0].signingSecretExistingSecret",
+            "dispatcher.slack.identities[0].signingSecretExistingSecretKey",
+        ] {
+            assert!(
+                is_secret_value_key(key),
+                "{key} must stay masked as it is today"
+            );
+            let expression = format!("{key}=slack-second");
+            assert_ne!(
+                mask_helm_set_expression(&expression),
+                expression,
+                "the plan must mask {key}"
+            );
+        }
+    }
+
     #[test]
     fn up_no_expose_drops_the_nodeport_sets() {
         let cmds = up_commands(&UpOpts {
