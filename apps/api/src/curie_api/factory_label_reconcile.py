@@ -207,13 +207,17 @@ async def _reconcile_repository(
     grace = timedelta(seconds=settings.github_factory_reconcile_grace_s)
     admitted = 0
     for number in missing:
-        events = await _get_all(
-            client,
-            api=api,
-            token=token,
-            path=f"{repo_path}/issues/{number}/events",
-            params={},
-        )
+        try:
+            events = await _get_all(
+                client,
+                api=api,
+                token=token,
+                path=f"{repo_path}/issues/{number}/events",
+                params={},
+            )
+        except _Unavailable:
+            # One unreadable issue must not hold up the rest of the repository.
+            continue
         event = _last_label_event(events, label)
         if event is None or type(event.get("id")) is not int:
             continue
