@@ -18,10 +18,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
 from curie_api import factory_ci, workitems
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
+from pydantic import ValidationError
 
 HEAD = "a1" * 20
 PR_URL = "https://github.com/acme-corp/acme-bot/pull/77"

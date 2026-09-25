@@ -46,6 +46,12 @@
           "type": "string",
           "description": "Public https origin GitHub's image proxy fetches the live factory status card from. Empty omits the card image."
         },
+        "githubFactoryCiWaitSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10800,
+          "description": "Seconds a published factory run waits on its pull request's CI, from the push. The execution deadline still caps it."
+        },
         "githubFactoryMention": {
           "type": "string",
           "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."

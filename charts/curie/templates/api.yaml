@@ -184,6 +184,8 @@ spec:
               value: {{ .Values.api.githubFactoryMention | quote }}
             - name: GITHUB_FACTORY_CARD_BASE_URL
               value: {{ .Values.api.githubFactoryCardBaseUrl | quote }}
+            - name: GITHUB_FACTORY_CI_WAIT_S
+              value: {{ .Values.api.githubFactoryCiWaitSeconds | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the

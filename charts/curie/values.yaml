@@ -1129,6 +1129,9 @@ api:
   # Public https origin GitHub's image proxy fetches the live factory status card
   # from (#3077). Empty omits the card image; the comment keeps its checklist.
   githubFactoryCardBaseUrl: ""
+  # Seconds a published factory run waits on its pull request's CI, from the
+  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
+  githubFactoryCiWaitSeconds: 1200
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed

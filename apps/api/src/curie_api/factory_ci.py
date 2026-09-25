@@ -38,7 +38,6 @@ from .models import ExecutionRequest, Publication, ThreadPublicationLineage, Wor
 from .workitem_outcomes import CiDetail
 
 CI_GRACE_SECONDS = 120
-CI_WAIT_SECONDS = 1200
 CI_POLL_SECONDS = 20
 CI_MAX_ROUNDS = 3
 CI_OBSERVATIONS_PER_PASS = 4
@@ -117,11 +116,12 @@ def decide(
     now: datetime,
     published_at: datetime,
     execution_deadline: datetime,
+    ci_wait_seconds: int,
     prior_round_had_checks: bool = False,
 ) -> Verdict:
     """The CI verdict for one observation. Pure: time is an argument."""
 
-    ci_deadline = min(published_at + timedelta(seconds=CI_WAIT_SECONDS), execution_deadline)
+    ci_deadline = min(published_at + timedelta(seconds=ci_wait_seconds), execution_deadline)
     expired = now >= ci_deadline
     if detail.state != "observed" or detail.reason is not None:
         reason = detail.reason or "github_error"
@@ -429,6 +429,7 @@ async def gate(
         now=now,
         published_at=facts.published_at,
         execution_deadline=request.execution_deadline,
+        ci_wait_seconds=settings.github_factory_ci_wait_s,
         prior_round_had_checks=round_ > 1,
     )
     if verdict.kind == "pending":

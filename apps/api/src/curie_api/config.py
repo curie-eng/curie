@@ -167,6 +167,15 @@ class Settings(BaseSettings):
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
     github_factory_card_base_url: str = ""
+    # How long a published factory run waits on its pull request's CI, from the
+    # push (#3162). The execution deadline still caps it; at most 10800 s, the
+    # longest execution deadline (ADR 0171).
+    github_factory_ci_wait_s: int = Field(
+        default=1200,
+        gt=0,
+        le=10800,
+        validation_alias="GITHUB_FACTORY_CI_WAIT_S",
+    )
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
