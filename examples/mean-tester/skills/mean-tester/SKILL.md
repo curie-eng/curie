@@ -212,12 +212,15 @@ report, with everything not sent as `Next:` lines.
   `ts` it returns: that is the thread.
 - Open at most New threads per 15 minutes in any 15 minutes, counted by
   `date +%s` against the `ts` of the threads you opened. When the next thread
-  would pass it, `sleep` until it would not. Do not end the turn to wait for
-  the thread rate: the budget is there to wait in. A shell command stops after
-  two minutes, so wait in `sleep 110` steps, and keep reading the open threads
-  between them. Run every wait as a plain shell command, never in the
-  background. Nothing will wake you: a background command's result never
-  reaches a turn that has ended, and ending the turn ends the campaign.
+  would pass it, wait until it would not. Do not end the turn to wait for the
+  thread rate: the budget is there to wait in. The shell refuses a long
+  standalone `sleep`, and a command stops after two minutes, so wait with a
+  loop that ends by the clock at most 100 seconds away, then read the open
+  threads and wait again:
+  `T=$(( $(date +%s) + 100 )); until [ $(date +%s) -ge $T ]; do sleep 5; done`.
+  Run every wait as a plain shell command, never in the background. Nothing
+  will wake you: a background command's result never reaches a turn that has
+  ended, and ending the turn ends the campaign.
 - Send a follow-up with
   `mcp__plugin_mean-tester_slack__slack_reply_to_thread` (`thread_ts` = the
   thread's `ts`), only in a thread your own probe opened, and only once the
