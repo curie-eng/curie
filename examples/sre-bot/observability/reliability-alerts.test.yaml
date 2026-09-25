@@ -1,7 +1,8 @@
 rule_files:
   - reliability-alerts.rules.yaml
 
-evaluation_interval: 5m
+# Production evaluates every 60s, and so does this file.
+evaluation_interval: 1m
 
 tests:
   - name: application metrics absent fires
@@ -13,19 +14,35 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-metrics
+              service_name: curie-api
               severity: page
             exp_annotations:
               summary: Curie application metrics are absent from Prometheus
               description: >-
                 curie_queue_depth or curie_approval_pending has had no sample
-                for 10 minutes. The worker records curie_queue_depth on every
-                poll and the api records curie_approval_pending on every
-                sweep, so their absence is a broken metrics pipeline or a dead
-                process, never a quiet system.
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
+          - exp_labels:
+              component: curie-metrics
+              service_name: curie-worker
+              severity: page
+            exp_annotations:
+              summary: Curie application metrics are absent from Prometheus
+              description: >-
+                curie_queue_depth or curie_approval_pending has had no sample
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
 
   # Both gauges are missing until 15m while turns are accepted throughout: an
-  # accepted-turn counter is not evidence the pipeline works. Firing at 10m;
-  # quiet at 15m, the first evaluation that finds both gauges again.
+  # accepted-turn counter is not evidence the pipeline works. Firing at 10m,
+  # one alert per missing gauge, each naming its service; quiet at 15m, the
+  # first evaluation that finds both gauges again.
   - name: application metrics recover when both gauges return
     interval: 1m
     input_series:
@@ -41,15 +58,30 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-metrics
+              service_name: curie-api
               severity: page
             exp_annotations:
               summary: Curie application metrics are absent from Prometheus
               description: >-
                 curie_queue_depth or curie_approval_pending has had no sample
-                for 10 minutes. The worker records curie_queue_depth on every
-                poll and the api records curie_approval_pending on every
-                sweep, so their absence is a broken metrics pipeline or a dead
-                process, never a quiet system.
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
+          - exp_labels:
+              component: curie-metrics
+              service_name: curie-worker
+              severity: page
+            exp_annotations:
+              summary: Curie application metrics are absent from Prometheus
+              description: >-
+                curie_queue_depth or curie_approval_pending has had no sample
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
       - eval_time: 15m
         alertname: CurieApplicationMetricsAbsent
         exp_alerts: []
@@ -632,10 +664,8 @@ tests:
   # is rescheduled, so each alert is expected with its identity labels only.
 
   # The pending checks (exp_alerts: [] one evaluation before `for` elapses)
-  # pin each `for` only to this file's 5m evaluation step, which the
-  # pre-existing cases share. Production evaluates every 60s, so a `for` a few
-  # minutes short of its value would still pass here. Pinning `for` to the
-  # minute needs a separate file with a 1m step.
+  # pin each `for` to the minute, since this file evaluates every 60s as
+  # production does.
 
   # CurieNodeNotReady has two terms. kube-state-metrics reports three Ready
   # series per node, one per status, and the rule reads status="true" for 0,
@@ -1590,23 +1620,21 @@ tests:
   # `_` until the first export, then the counter's value, never a leading 0.
   # Each process exports under its own `instance`, so a restarted worker's
   # counters are new series too. increase() cannot see a series' first
-  # sample, so each counter rule also reads a series that had no sample in
-  # the hour ending one offset ago.
+  # sample, so each counter rule also counts, from zero, a series that had no
+  # sample in the hour ending one window ago.
   #
-  # Timing. This file evaluates rules every 5m (evaluation_interval above),
-  # whatever a case's input interval, and an eval_time reads the evaluation
-  # at or before it, so every eval_time below is a multiple of 5m. The input
-  # interval is 1m so a first sample can sit a minute either side of an
-  # evaluation. `last_over_time(X[1h] offset O)` evaluated at t reads
-  # (t-O-1h, t-O], called the offset hour below. Promtool has no history
-  # before 0m: a series sampled from 0m is new there, and becomes old once
-  # its first sample falls inside the offset hour.
+  # Timing. Rules evaluate every 1m, as in production, and so do the inputs,
+  # so each eval_time is one evaluation. `last_over_time(X[1h] offset O)`
+  # evaluated at t reads (t-O-1h, t-O], called the offset hour below; O is
+  # the rule's window. An instant selector looks back 5m, left-open. Promtool
+  # has no history before 0m: a series sampled from 0m is new there, and
+  # becomes old once its first sample falls inside the offset hour.
 
-  # First export at 1m. Pending at 5m and firing at 10m on the new-series
-  # term alone, since a counter flat at 1 never increases. Still firing at
-  # 20m, where the offset hour ends at 0m and finds nothing: an offset of 19m
-  # or less reaches 1m there and goes quiet. Quiet at 25m, where the offset
-  # hour ends at 5m and finds the first samples.
+  # First export at 1m. Pending from 1m and firing at 6m on the new-series term
+  # alone, since a counter flat at 1 never increases. Still firing at 15m, where
+  # the offset hour ends at 0m and finds nothing: an offset of 14m or less
+  # reaches 1m there and goes quiet. Quiet at 16m, where the offset hour ends at
+  # 1m: an offset over 15m still fires there.
   - name: classified task failure fires on a new series' first sample
     interval: 1m
     input_series:
@@ -1616,7 +1644,7 @@ tests:
       - eval_time: 5m
         alertname: CurieTaskFailure
         exp_alerts: []
-      - eval_time: 10m
+      - eval_time: 6m
         alertname: CurieTaskFailure
         exp_alerts:
           - exp_labels:
@@ -1631,7 +1659,7 @@ tests:
                 curie_turn_completed_total with outcome classified_failure
                 increased in the last 15 minutes, counting a series' first
                 sample as an increase from zero.
-      - eval_time: 20m
+      - eval_time: 15m
         alertname: CurieTaskFailure
         exp_alerts:
           - exp_labels:
@@ -1646,22 +1674,22 @@ tests:
                 curie_turn_completed_total with outcome classified_failure
                 increased in the last 15 minutes, counting a series' first
                 sample as an increase from zero.
-      - eval_time: 25m
+      - eval_time: 16m
         alertname: CurieTaskFailure
         exp_alerts: []
 
-  # Sampled from 0m, so new until the offset hour reaches its first sample.
-  # At 20m the offset hour ends at 0m, and a counter flat at 1 has not
-  # increased: quiet. An offset over 20m still reads nothing at 20m and
-  # fires. 40m is
-  # the steady state: a series older than the offset that does not increase.
-  - name: a classified failure series flat at 1 stays quiet once older than the offset
+  # Sampled from 0m, so new until the offset hour reaches its first sample: it
+  # fires from 5m to 14m. At 15m the offset hour ends at 0m, and a counter flat
+  # at 1 has not increased: quiet. An offset over 15m still reads nothing at 15m
+  # and fires. 40m is the steady state: a series older than the window that does
+  # not increase.
+  - name: a classified failure series flat at 1 stays quiet once older than the window
     interval: 1m
     input_series:
       - series: 'curie_turn_completed_total{service_name="curie-worker",source="worker",outcome="classified_failure"}'
         values: '1x40'
     alert_rule_test:
-      - eval_time: 20m
+      - eval_time: 15m
         alertname: CurieTaskFailure
         exp_alerts: []
       - eval_time: 40m
@@ -1680,10 +1708,10 @@ tests:
         alertname: CurieTaskFailure
         exp_alerts: []
 
-  # Both terms hold from 5m to 20m. `or` matches on every label but the
-  # metric name, so they give one series and one alert; two series with one
-  # label set would fail the rule's evaluation. From 25m only the increase
-  # term holds, and the alert keeps its labels.
+  # Both terms hold from 2m to 15m. `or` matches on every label but the metric
+  # name, so they give one series and one alert; two series with one label set
+  # would fail the rule's evaluation. From 16m only the increase term holds, and
+  # the alert keeps its labels.
   - name: a new classified failure series that keeps failing fires once
     interval: 1m
     input_series:
@@ -1721,11 +1749,11 @@ tests:
                 increased in the last 15 minutes, counting a series' first
                 sample as an increase from zero.
 
-  # A worker restart. The old process's series, flat at 1 and old from 20m,
-  # has its last export at 40m; the new process's first failure is exported
-  # at 42m under its own instance. Quiet at 40m. Pending at 45m, when the
-  # old series has also left the 5m instant look-back. Firing at 50m with
-  # the new instance's labels only.
+  # A worker restart. The old process's series, flat at 1, has its last export
+  # at 40m; the new process's first failure is exported at 42m under its own
+  # instance, as a new series. Quiet at 40m. Pending from 42m and firing at 47m
+  # with the new instance's labels only. The old series is another label set and
+  # plays no part in the new one's term.
   - name: classified task failure fires on the first failure after a worker restart
     interval: 1m
     input_series:
@@ -1737,15 +1765,71 @@ tests:
       - eval_time: 40m
         alertname: CurieTaskFailure
         exp_alerts: []
-      - eval_time: 45m
+      - eval_time: 46m
         alertname: CurieTaskFailure
         exp_alerts: []
-      - eval_time: 50m
+      - eval_time: 47m
         alertname: CurieTaskFailure
         exp_alerts:
           - exp_labels:
               component: curie-task
+              outcome: classified_failure
+              service_name: curie-worker
+              severity: page
+              source: worker
               instance: curie-worker-b
+            exp_annotations:
+              summary: A Curie turn completed as classified_failure
+              description: >-
+                curie_turn_completed_total with outcome classified_failure
+                increased in the last 15 minutes, counting a series' first
+                sample as an increase from zero.
+
+  # One series, flat at 1, whose samples stop after 30m and resume at 51m, as
+  # after a 20-minute pipeline outage. Its offset hour always holds a sample from
+  # before the gap or after it, so it never looks new. 60m and 65m are where a
+  # plain `X offset 15m` would find the gap and fire.
+  - name: a classified failure series that resumes after a 20-minute gap stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_turn_completed_total{service_name="curie-worker",source="worker",outcome="classified_failure"}'
+        values: '1x30 _x20 1x40'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+
+  # The cost of the new-series term. A series at 1 whose samples stop after 30m
+  # and resume at 100m, 70 minutes later. The offset hour at t is
+  # (t-75m, t-15m]: it holds no sample once t-75m reaches 30m, at 105m, and holds
+  # the resumed samples once t-15m reaches 100m, at 115m. So the series looks new
+  # from 105m to 114m, ten evaluations: pending until 109m, firing from 110m to
+  # 114m, quiet from 115m. It fires once. A gap refires only when it exceeds the
+  # 1h lookback plus `for: 5m` by an evaluation, 66 minutes; a lookback of 59m
+  # or 61m moves the firing a minute and fails at 109m or 110m.
+  - name: a classified failure series that resumes after a 70-minute gap fires once
+    interval: 1m
+    input_series:
+      - series: 'curie_turn_completed_total{service_name="curie-worker",source="worker",outcome="classified_failure"}'
+        values: '1x30 _x69 1x40'
+    alert_rule_test:
+      - eval_time: 104m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+      - eval_time: 109m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+      - eval_time: 110m
+        alertname: CurieTaskFailure
+        exp_alerts:
+          - exp_labels:
+              component: curie-task
               outcome: classified_failure
               service_name: curie-worker
               severity: page
@@ -1756,31 +1840,53 @@ tests:
                 curie_turn_completed_total with outcome classified_failure
                 increased in the last 15 minutes, counting a series' first
                 sample as an increase from zero.
+      - eval_time: 114m
+        alertname: CurieTaskFailure
+        exp_alerts:
+          - exp_labels:
+              component: curie-task
+              outcome: classified_failure
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: A Curie turn completed as classified_failure
+              description: >-
+                curie_turn_completed_total with outcome classified_failure
+                increased in the last 15 minutes, counting a series' first
+                sample as an increase from zero.
+      - eval_time: 115m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+      - eval_time: 130m
+        alertname: CurieTaskFailure
+        exp_alerts: []
 
-  # One series, flat at 1 and old from 20m, whose samples stop after 30m and
-  # resume at 51m, as after a 20-minute pipeline outage. Its offset hour
-  # always holds a sample from before the gap or after it, so it never looks
-  # new. 60m and 70m are where a plain `X offset 20m` would find the gap and
-  # fire.
-  - name: a classified failure series that resumes after a 20-minute gap stays quiet
+  # Samples stop after 30m and resume at 89m, 59 minutes later. The offset hour
+  # would hold no sample from 105m, but it holds the resumed samples from 104m:
+  # the series never looks new.
+  - name: a classified failure series that resumes after a 59-minute gap stays quiet
     interval: 1m
     input_series:
       - series: 'curie_turn_completed_total{service_name="curie-worker",source="worker",outcome="classified_failure"}'
-        values: '1x30 _x20 1x40'
+        values: '1x30 _x58 1x40'
     alert_rule_test:
-      - eval_time: 60m
+      - eval_time: 95m
         alertname: CurieTaskFailure
         exp_alerts: []
-      - eval_time: 70m
+      - eval_time: 104m
         alertname: CurieTaskFailure
         exp_alerts: []
-      - eval_time: 90m
+      - eval_time: 110m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+      - eval_time: 120m
         alertname: CurieTaskFailure
         exp_alerts: []
 
-  # First export at 1m. Pending at 5m, firing at 10m. Still firing at 65m,
-  # where the offset hour ends at 0m: an offset of 64m or less reaches 1m
-  # there and goes quiet. Quiet at 70m, where the offset hour ends at 5m.
+  # First export at 1m. Pending from 1m, firing at 6m. Still firing at 60m, where
+  # the offset hour ends at 0m: an offset of 59m or less reaches 1m there and
+  # goes quiet. Quiet at 61m: an offset over 1h still fires there.
   - name: token rotation 5xx fires on a new series' first sample
     interval: 1m
     input_series:
@@ -1790,7 +1896,7 @@ tests:
       - eval_time: 5m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
-      - eval_time: 10m
+      - eval_time: 6m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts:
           - exp_labels:
@@ -1807,7 +1913,7 @@ tests:
                 curie_http_server_request_total for /channels/token with
                 outcome 5xx increased in the last hour, counting a series'
                 first sample as an increase from zero.
-      - eval_time: 65m
+      - eval_time: 60m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts:
           - exp_labels:
@@ -1824,20 +1930,20 @@ tests:
                 curie_http_server_request_total for /channels/token with
                 outcome 5xx increased in the last hour, counting a series'
                 first sample as an increase from zero.
-      - eval_time: 70m
+      - eval_time: 61m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
 
-  # Sampled from 0m. At 65m the offset hour ends at 0m, and a counter flat at
-  # 1 has not increased in the hour: quiet. An offset over 65m still reads
-  # nothing at 65m and fires. 90m is the steady state.
-  - name: a token rotation 5xx series flat at 1 stays quiet once older than the offset
+  # Sampled from 0m. At 60m the offset hour ends at 0m, and a counter flat at 1
+  # has not increased in the hour: quiet. An offset over 1h still reads nothing
+  # at 60m and fires. 90m is the steady state.
+  - name: a token rotation 5xx series flat at 1 stays quiet once older than the window
     interval: 1m
     input_series:
       - series: 'curie_http_server_request_total{service_name="curie-api",operation="/channels/token",role="server",source="POST",outcome="5xx"}'
         values: '1x90'
     alert_rule_test:
-      - eval_time: 65m
+      - eval_time: 60m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
       - eval_time: 90m
@@ -1854,8 +1960,8 @@ tests:
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
 
-  # Both terms hold from 5m to 60m and give one alert. From 70m only the
-  # increase term holds.
+  # Both terms hold from 2m to 60m and give one alert. From 61m only the increase
+  # term holds.
   - name: a new token rotation 5xx series that keeps failing fires once
     interval: 1m
     input_series:
@@ -1897,10 +2003,10 @@ tests:
                 outcome 5xx increased in the last hour, counting a series'
                 first sample as an increase from zero.
 
-  # An api restart. The old process's series, flat at 1 and old from 65m,
-  # has its last export at 80m; the new process's first 5xx is exported at
-  # 82m under its own instance. Quiet at 80m, pending at 85m, firing at 90m
-  # with the new instance's labels only.
+  # An api restart. The old process's series, flat at 1, has its last export at
+  # 80m; the new process's first 5xx is exported at 82m under its own instance.
+  # Quiet at 80m. Pending from 82m and firing at 87m with the new instance's
+  # labels only.
   - name: token rotation 5xx fires on the first 5xx after an api restart
     interval: 1m
     input_series:
@@ -1912,21 +2018,21 @@ tests:
       - eval_time: 80m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
-      - eval_time: 85m
+      - eval_time: 86m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
-      - eval_time: 90m
+      - eval_time: 87m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts:
           - exp_labels:
               component: curie-token
-              instance: curie-api-b
               operation: /channels/token
               outcome: 5xx
               role: server
               service_name: curie-api
               severity: page
               source: POST
+              instance: curie-api-b
             exp_annotations:
               summary: Channel-token HTTP rotation returned 5xx
               description: >-
@@ -1934,41 +2040,44 @@ tests:
                 outcome 5xx increased in the last hour, counting a series'
                 first sample as an increase from zero.
 
-  # Flat at 1 and old from 65m; samples stop after 79m and resume at 100m.
-  # 155m and 160m are where a plain `X offset 65m` would find the gap and
-  # fire; the offset hour always holds a sample.
+  # Flat at 1; samples stop after 79m and resume at 100m. 150m and 155m are where
+  # a plain `X offset 1h` would find the gap and fire; the offset hour always
+  # holds a sample.
   - name: a token rotation 5xx series that resumes after a 20-minute gap stays quiet
     interval: 1m
     input_series:
       - series: 'curie_http_server_request_total{service_name="curie-api",operation="/channels/token",role="server",source="POST",outcome="5xx"}'
         values: '1x79 _x20 1x60'
     alert_rule_test:
-      - eval_time: 155m
+      - eval_time: 150m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
-      - eval_time: 160m
+      - eval_time: 155m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
       - eval_time: 180m
         alertname: CurieChannelTokenRotationFailed
         exp_alerts: []
 
-  # First export at 6m, at 1; 2 from 13m; 3 from 20m, 14 minutes after the
-  # first sample. increase() sees at most two of the three failures, so only
-  # the new-series term reaches 3. Pending at 20m and 25m, firing at 30m,
-  # where the offset hour ends at 5m and finds nothing: an offset of 24m or
-  # less reaches 6m there and goes quiet. Quiet at 35m, where the offset hour
-  # holds the first samples.
-  - name: reply refusals fire when a new series reaches 3 within 15 minutes of its first sample
+  # Parity between an old and a new series. Worker a's series has stood at 5
+  # since 0m; worker b's first failure is exported at 40m. Each then has three
+  # failures, at 40m, 41m and 43m, a spread of 3 minutes. Both terms hold from
+  # 43m: a's increase() until 53m, and b's new-series term until 54m, when the
+  # offset hour reaches b's first sample. Both are pending at 52m and fire at
+  # 53m, one alert each; b's alone fires at 54m, and an offset under 15m ends it
+  # at 53m.
+  - name: reply refusals fire for an old and a new series with three failures in 3 minutes
     interval: 1m
     input_series:
-      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure"}'
-        values: '_x6 1x6 2x6 3x25'
+      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure",instance="curie-worker-a"}'
+        values: '5x39 6 7x1 8x40'
+      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure",instance="curie-worker-b"}'
+        values: '_x40 1 2x1 3x40'
     alert_rule_test:
-      - eval_time: 25m
+      - eval_time: 52m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
-      - eval_time: 30m
+      - eval_time: 53m
         alertname: CurieReplyDeliveryRefused
         exp_alerts:
           - exp_labels:
@@ -1978,19 +2087,67 @@ tests:
               role: client
               service_name: curie-worker
               severity: page
+              instance: curie-worker-a
             exp_annotations:
               summary: Repeated Curie reply delivery failures
               description: >-
                 curie_reply_delivery_total with outcome failure increased by
                 three or more in 15 minutes, counting a series' first sample
                 as an increase from zero.
-      - eval_time: 35m
+          - exp_labels:
+              component: curie-delivery
+              operation: post
+              outcome: failure
+              role: client
+              service_name: curie-worker
+              severity: page
+              instance: curie-worker-b
+            exp_annotations:
+              summary: Repeated Curie reply delivery failures
+              description: >-
+                curie_reply_delivery_total with outcome failure increased by
+                three or more in 15 minutes, counting a series' first sample
+                as an increase from zero.
+      - eval_time: 54m
+        alertname: CurieReplyDeliveryRefused
+        exp_alerts:
+          - exp_labels:
+              component: curie-delivery
+              operation: post
+              outcome: failure
+              role: client
+              service_name: curie-worker
+              severity: page
+              instance: curie-worker-b
+            exp_annotations:
+              summary: Repeated Curie reply delivery failures
+              description: >-
+                curie_reply_delivery_total with outcome failure increased by
+                three or more in 15 minutes, counting a series' first sample
+                as an increase from zero.
+
+  # The same two series with three failures at 40m, 42m and 45m, a spread of 5
+  # minutes. Both terms hold from 45m, a's until 53m and b's until 54m, short of
+  # `for: 10m`, so neither fires. An offset over 15m keeps b's term until 55m and
+  # fires it there.
+  - name: reply refusals stay quiet for an old and a new series with three failures in 5 minutes
+    interval: 1m
+    input_series:
+      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure",instance="curie-worker-a"}'
+        values: '5x39 6x1 7x2 8x40'
+      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure",instance="curie-worker-b"}'
+        values: '_x40 1x1 2x2 3x40'
+    alert_rule_test:
+      - eval_time: 54m
+        alertname: CurieReplyDeliveryRefused
+        exp_alerts: []
+      - eval_time: 55m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
 
-  # Two failures, the first sample at 1 and then 2: short of 3 on either
-  # term, and the new-series term compares the counter's value, not a count
-  # of samples.
+  # Two failures, the first sample at 1 and then 2: short of 3 on either term,
+  # and the new-series term compares the counter's value, not a count of
+  # samples.
   - name: a new reply failure series at 2 stays quiet
     interval: 1m
     input_series:
@@ -2004,48 +2161,27 @@ tests:
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
 
-  # First export at 4m; 3 from 20m, 16 minutes after the first sample, so
-  # the three failures do not fall within 15 minutes. The new-series term
-  # holds at 20m and 25m; at 30m the offset hour ends at 5m and holds the
-  # first sample, and it lapses 5 minutes short of `for: 10m`. increase()
-  # sees at most two failures. An offset of 27m or more still reads nothing
-  # at 30m and fires.
-  - name: a new reply failure series that reaches 3 more than 15 minutes after its first sample stays quiet
-    interval: 1m
-    input_series:
-      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure"}'
-        values: '_x4 1x7 2x7 3x30'
-    alert_rule_test:
-      - eval_time: 25m
-        alertname: CurieReplyDeliveryRefused
-        exp_alerts: []
-      - eval_time: 30m
-        alertname: CurieReplyDeliveryRefused
-        exp_alerts: []
-      - eval_time: 35m
-        alertname: CurieReplyDeliveryRefused
-        exp_alerts: []
-
-  # Sampled from 0m at 5, above the threshold. At 25m the offset hour ends at
-  # 0m and the counter has not increased: quiet. An offset over 25m still reads
-  # nothing at 25m and fires. 60m is the steady state.
-  - name: a reply failure series flat at 5 stays quiet once older than the offset
+  # Sampled from 0m at 5, above the threshold, so it fires from 10m to 14m. At
+  # 15m the offset hour ends at 0m and the counter has not increased: quiet. An
+  # offset over 15m still reads nothing at 15m and fires. 60m is the steady
+  # state.
+  - name: a reply failure series flat at 5 stays quiet once older than the window
     interval: 1m
     input_series:
       - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure"}'
         values: '5x60'
     alert_rule_test:
-      - eval_time: 25m
+      - eval_time: 15m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
       - eval_time: 60m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
 
-  # First export at 6m already at 3, then one more failure a minute. Both
-  # terms hold from 10m; pending at 15m and firing at 20m as one alert. At
-  # 35m the offset hour holds the first sample and only the increase term
-  # holds; the alert keeps its labels.
+  # First export at 6m already at 3, then one more failure a minute. The
+  # new-series term holds from 6m to 20m and the increase term from 9m; pending
+  # at 15m and firing from 16m as one alert. At 35m only the increase term
+  # holds, and the alert keeps its labels.
   - name: a new reply failure series that starts at 3 and keeps failing fires once
     interval: 1m
     input_series:
@@ -2055,7 +2191,7 @@ tests:
       - eval_time: 15m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
-      - eval_time: 20m
+      - eval_time: 16m
         alertname: CurieReplyDeliveryRefused
         exp_alerts:
           - exp_labels:
@@ -2090,31 +2226,31 @@ tests:
 
   # A worker restart. The old process's series, at 1, has its last export at
   # 40m; the new process's first failure is exported at 42m under its own
-  # instance, at 1, and reaches 3 at 50m. increase() sees at most two of the
-  # new series' failures. Pending at 50m and 55m, firing at 60m with the new
-  # instance's labels only.
+  # instance, and its third at 44m. increase() sees at most two of them. The
+  # new-series term holds from 44m to 56m: pending at 53m, firing at 54m with
+  # the new instance's labels only.
   - name: reply refusals fire on three failures after a worker restart
     interval: 1m
     input_series:
       - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure",instance="curie-worker-a"}'
         values: '1x40'
       - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure",instance="curie-worker-b"}'
-        values: '_x42 1x2 2x4 3x20'
+        values: '_x42 1 2 3x20'
     alert_rule_test:
-      - eval_time: 55m
+      - eval_time: 53m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
-      - eval_time: 60m
+      - eval_time: 54m
         alertname: CurieReplyDeliveryRefused
         exp_alerts:
           - exp_labels:
               component: curie-delivery
-              instance: curie-worker-b
               operation: post
               outcome: failure
               role: client
               service_name: curie-worker
               severity: page
+              instance: curie-worker-b
             exp_annotations:
               summary: Repeated Curie reply delivery failures
               description: >-
@@ -2122,37 +2258,41 @@ tests:
                 three or more in 15 minutes, counting a series' first sample
                 as an increase from zero.
 
-  # Flat at 5, at the threshold, so a series that looked new would fire;
-  # flat at 1 could not fire either way. Old from 25m; samples stop after 30m
-  # and resume at 51m. 70m and 75m are where a plain `X offset 25m` would
-  # find the gap and fire; the offset hour always holds a sample.
+  # Flat at 5, at the threshold, so a series that looked new would fire; flat at
+  # 1 could not fire either way. Samples stop after 30m and resume at 51m. 62m
+  # and 65m are where a plain `X offset 15m` would find the gap and fire; the
+  # offset hour always holds a sample.
   - name: a reply failure series that resumes after a 20-minute gap stays quiet
     interval: 1m
     input_series:
       - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure"}'
         values: '5x30 _x20 5x40'
     alert_rule_test:
-      - eval_time: 70m
+      - eval_time: 62m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
-      - eval_time: 75m
+      - eval_time: 65m
         alertname: CurieReplyDeliveryRefused
         exp_alerts: []
 
-  # First export at 6m, at 1; 2 from 20m; 3 from 35m, 29 minutes after the
-  # first sample. increase() sees at most two restarts. Pending at 35m,
-  # firing at 40m, where the offset hour ends at 5m and finds nothing: an
-  # offset of 34m or less reaches 6m there and goes quiet. Quiet at 45m.
-  - name: supervised restart loop fires when a new series reaches 3 within 30 minutes of its first sample
+  # Parity between an old and a new series. Worker a's series has stood at 5
+  # since 0m; worker b's first restart is exported at 40m. Each then has three
+  # restarts, at 40m, 51m and 63m, a spread of 23 minutes. Both terms hold from
+  # 63m: a's increase() until 68m, and b's new-series term until 69m. Both are
+  # pending at 67m and fire at 68m, one alert each; b's alone fires at 69m, and
+  # an offset under 30m ends it at 68m.
+  - name: supervised restart loop fires for an old and a new series with three restarts in 23 minutes
     interval: 1m
     input_series:
-      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart"}'
-        values: '_x6 1x13 2x14 3x30'
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart",instance="curie-worker-a"}'
+        values: '5x39 6x10 7x11 8x40'
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart",instance="curie-worker-b"}'
+        values: '_x40 1x10 2x11 3x40'
     alert_rule_test:
-      - eval_time: 35m
+      - eval_time: 67m
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
-      - eval_time: 40m
+      - eval_time: 68m
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts:
           - exp_labels:
@@ -2161,6 +2301,7 @@ tests:
               service_name: curie-worker
               operation: publications
               outcome: restart
+              instance: curie-worker-a
             exp_annotations:
               summary: A supervised worker task is crash-looping
               description: >-
@@ -2168,7 +2309,54 @@ tests:
                 increased by three or more in 30 minutes for one operation,
                 counting a series' first sample as an increase from zero. The
                 task is backing off and will be parked if it keeps crashing.
-      - eval_time: 45m
+          - exp_labels:
+              severity: page
+              component: curie-worker
+              service_name: curie-worker
+              operation: publications
+              outcome: restart
+              instance: curie-worker-b
+            exp_annotations:
+              summary: A supervised worker task is crash-looping
+              description: >-
+                curie_worker_supervised_restart_total with outcome restart
+                increased by three or more in 30 minutes for one operation,
+                counting a series' first sample as an increase from zero. The
+                task is backing off and will be parked if it keeps crashing.
+      - eval_time: 69m
+        alertname: CurieWorkerSupervisedRestartLoop
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-worker
+              service_name: curie-worker
+              operation: publications
+              outcome: restart
+              instance: curie-worker-b
+            exp_annotations:
+              summary: A supervised worker task is crash-looping
+              description: >-
+                curie_worker_supervised_restart_total with outcome restart
+                increased by three or more in 30 minutes for one operation,
+                counting a series' first sample as an increase from zero. The
+                task is backing off and will be parked if it keeps crashing.
+
+  # The same two series with three restarts at 40m, 52m and 65m, a spread of 25
+  # minutes. Both terms hold from 65m, a's until 68m and b's until 69m, short of
+  # `for: 5m`, so neither fires. An offset over 30m keeps b's term until 70m and
+  # fires it there.
+  - name: supervised restart loop stays quiet for an old and a new series with three restarts in 25 minutes
+    interval: 1m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart",instance="curie-worker-a"}'
+        values: '5x39 6x11 7x12 8x40'
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart",instance="curie-worker-b"}'
+        values: '_x40 1x11 2x12 3x40'
+    alert_rule_test:
+      - eval_time: 69m
+        alertname: CurieWorkerSupervisedRestartLoop
+        exp_alerts: []
+      - eval_time: 70m
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
 
@@ -2185,44 +2373,26 @@ tests:
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
 
-  # First export at 4m; 3 from 35m, 31 minutes after the first sample. The
-  # new-series term holds at 35m; at 40m the offset hour ends at 5m and
-  # holds the first sample, and it lapses before `for: 5m`. increase() sees
-  # at most two restarts. An offset of 37m or more still reads nothing at
-  # 40m and fires.
-  - name: a new supervised restart series that reaches 3 more than 30 minutes after its first sample stays quiet
-    interval: 1m
-    input_series:
-      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart"}'
-        values: '_x4 1x15 2x14 3x30'
-    alert_rule_test:
-      - eval_time: 35m
-        alertname: CurieWorkerSupervisedRestartLoop
-        exp_alerts: []
-      - eval_time: 40m
-        alertname: CurieWorkerSupervisedRestartLoop
-        exp_alerts: []
-
-  # Sampled from 0m at 5. At 35m the offset hour ends at 0m and the counter has
-  # not increased: quiet. An offset over 35m still reads nothing at 35m and
-  # fires. 80m is the steady state.
-  - name: a supervised restart series flat at 5 stays quiet once older than the offset
+  # Sampled from 0m at 5, so it fires from 5m to 29m. At 30m the offset hour ends
+  # at 0m and the counter has not increased: quiet. An offset over 30m still
+  # reads nothing at 30m and fires. 80m is the steady state.
+  - name: a supervised restart series flat at 5 stays quiet once older than the window
     interval: 1m
     input_series:
       - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="restart"}'
         values: '5x80'
     alert_rule_test:
-      - eval_time: 35m
+      - eval_time: 30m
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
       - eval_time: 80m
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
 
-  # Two operations, each first exported at 6m already at 3 and restarting
-  # once a minute. Both terms hold from 10m; firing at 15m with one alert
-  # per operation. At 45m the offset hour holds the first samples and only the
-  # increase term holds.
+  # Two operations, each first exported at 6m already at 3 and restarting once a
+  # minute. The new-series term holds from 6m to 35m and the increase term from
+  # 9m; pending at 10m and firing from 11m with one alert per operation. At 45m
+  # only the increase term holds.
   - name: new supervised restart series that start at 3 and keep restarting fire once per operation
     interval: 1m
     input_series:
@@ -2231,7 +2401,10 @@ tests:
       - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="restart"}'
         values: '_x6 3+1x40'
     alert_rule_test:
-      - eval_time: 15m
+      - eval_time: 10m
+        alertname: CurieWorkerSupervisedRestartLoop
+        exp_alerts: []
+      - eval_time: 11m
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts:
           - exp_labels:
@@ -2292,8 +2465,9 @@ tests:
 
   # A worker restart. The old process's series, at 1, has its last export at
   # 40m; the new process's first restart is exported at 42m under its own
-  # instance, at 1, and reaches 3 at 50m. increase() sees at most two.
-  # Pending at 50m, firing at 55m with the new instance's labels only.
+  # instance, and its third at 50m. increase() sees at most two. The new-series
+  # term holds from 50m to 71m: pending at 54m, firing at 55m with the new
+  # instance's labels only.
   - name: supervised restart loop fires on three restarts after a worker restart
     interval: 1m
     input_series:
@@ -2302,7 +2476,7 @@ tests:
       - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart",instance="curie-worker-b"}'
         values: '_x42 1x2 2x4 3x20'
     alert_rule_test:
-      - eval_time: 50m
+      - eval_time: 54m
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
       - eval_time: 55m
@@ -2311,10 +2485,10 @@ tests:
           - exp_labels:
               severity: page
               component: curie-worker
-              instance: curie-worker-b
               service_name: curie-worker
               operation: publications
               outcome: restart
+              instance: curie-worker-b
             exp_annotations:
               summary: A supervised worker task is crash-looping
               description: >-
@@ -2323,9 +2497,9 @@ tests:
                 counting a series' first sample as an increase from zero. The
                 task is backing off and will be parked if it keeps crashing.
 
-  # Flat at 5, at the threshold. Old from 35m; samples stop after 40m and
-  # resume at 61m. 85m and 90m are where a plain `X offset 35m` would find
-  # the gap and fire; the offset hour always holds a sample.
+  # Flat at 5, at the threshold. Samples stop after 40m and resume at 61m. 85m
+  # and 90m are where a plain `X offset 30m` would find the gap and fire; the
+  # offset hour always holds a sample.
   - name: a supervised restart series that resumes after a 20-minute gap stays quiet
     interval: 1m
     input_series:
@@ -2339,13 +2513,14 @@ tests:
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
 
-  # CurieApplicationMetricsAbsent reads the two gauges, which the worker and
-  # the api record on every queue poll and every approval sweep whether or
+  # CurieApplicationMetricsAbsent reads the two gauges, which the worker
+  # records on every maintenance tick and the api on every sweep whether or
   # not anything happens, so a quiet system still has both. A counter is no
-  # such evidence: it has no series until its first measurement.
+  # such evidence: it has no series until its first measurement. Each absent()
+  # names its service, so each missing gauge is its own alert.
 
-  # The worker has polled and the api has swept, and no turn has been
-  # accepted since they started, so no counter series exists at all.
+  # The worker has run its maintenance loop and the api has swept, and no turn
+  # has been accepted since they started, so no counter series exists at all.
   - name: both gauges present with no counter series stays quiet
     interval: 1m
     input_series:
@@ -2361,8 +2536,8 @@ tests:
         alertname: CurieApplicationMetricsAbsent
         exp_alerts: []
 
-  # Missing from 0m: pending at 5m, firing at 10m. Accepted turns do not
-  # hold it quiet.
+  # Missing from 0m: pending at 9m and firing at 10m, naming the worker.
+  # Accepted turns and the api's gauge do not hold it quiet.
   - name: a missing queue depth gauge fires while turns flow
     interval: 1m
     input_series:
@@ -2371,7 +2546,7 @@ tests:
       - series: 'curie_approval_pending{service_name="curie-api",operation="observe",outcome="pending"}'
         values: '0x30'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 9m
         alertname: CurieApplicationMetricsAbsent
         exp_alerts: []
       - eval_time: 10m
@@ -2379,15 +2554,17 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-metrics
+              service_name: curie-worker
               severity: page
             exp_annotations:
               summary: Curie application metrics are absent from Prometheus
               description: >-
                 curie_queue_depth or curie_approval_pending has had no sample
-                for 10 minutes. The worker records curie_queue_depth on every
-                poll and the api records curie_approval_pending on every
-                sweep, so their absence is a broken metrics pipeline or a dead
-                process, never a quiet system.
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
 
   - name: a missing approval pending gauge fires while turns flow
     interval: 1m
@@ -2397,7 +2574,7 @@ tests:
       - series: 'curie_queue_depth{service_name="curie-worker",source="worker",outcome="pending"}'
         values: '0x30'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 9m
         alertname: CurieApplicationMetricsAbsent
         exp_alerts: []
       - eval_time: 10m
@@ -2405,21 +2582,23 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-metrics
+              service_name: curie-api
               severity: page
             exp_annotations:
               summary: Curie application metrics are absent from Prometheus
               description: >-
                 curie_queue_depth or curie_approval_pending has had no sample
-                for 10 minutes. The worker records curie_queue_depth on every
-                poll and the api records curie_approval_pending on every
-                sweep, so their absence is a broken metrics pipeline or a dead
-                process, never a quiet system.
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
 
-  # The worker's last poll is at 10m, as when its process dies. With the 5m
-  # left-open lookback the gauge reads absent from 15m; pending at 20m and
-  # firing at 25m, 10 minutes later, while the api's gauge and accepted
-  # turns keep coming.
-  - name: a queue depth gauge that stops fires 10 minutes after it reads absent
+  # The worker's last maintenance tick is at 10m, as when its process dies. The
+  # 5m left-open look-back reads the gauge absent from 15m, so it is pending
+  # until 24m and fires at 25m, about 15 minutes after the last sample, while the
+  # api's gauge and accepted turns keep coming.
+  - name: a queue depth gauge that stops fires about 15 minutes after its last sample
     interval: 1m
     input_series:
       - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted"}'
@@ -2429,7 +2608,7 @@ tests:
       - series: 'curie_approval_pending{service_name="curie-api",operation="observe",outcome="pending"}'
         values: '0x40'
     alert_rule_test:
-      - eval_time: 20m
+      - eval_time: 24m
         alertname: CurieApplicationMetricsAbsent
         exp_alerts: []
       - eval_time: 25m
@@ -2437,12 +2616,14 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-metrics
+              service_name: curie-worker
               severity: page
             exp_annotations:
               summary: Curie application metrics are absent from Prometheus
               description: >-
                 curie_queue_depth or curie_approval_pending has had no sample
-                for 10 minutes. The worker records curie_queue_depth on every
-                poll and the api records curie_approval_pending on every
-                sweep, so their absence is a broken metrics pipeline or a dead
-                process, never a quiet system.
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.

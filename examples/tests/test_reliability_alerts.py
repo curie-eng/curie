@@ -22,6 +22,7 @@ ROLLOUT = REPO_ROOT / "examples" / "sre-bot" / "docs" / "METRICS-ROLLOUT.md"
 METRICS_CATALOG = (
     REPO_ROOT / "packages" / "telemetry" / "src" / "curie_telemetry" / "metrics.py"
 )
+RUNTIME_PROOF = REPO_ROOT / "charts" / "curie" / "ci" / "runtime" / "metrics-alerts-runtime.sh"
 
 REQUIRED_ALERTS = {
     "CurieTurnAcceptedStale",
@@ -104,7 +105,11 @@ FIRST_SAMPLE_RULES = {
     ),
 }
 
-APPLICATION_GAUGES = {"curie_queue_depth", "curie_approval_pending"}
+# Each gauge CurieApplicationMetricsAbsent reads, and the service that records it.
+APPLICATION_GAUGES = {
+    "curie_queue_depth": "curie-worker",
+    "curie_approval_pending": "curie-api",
+}
 
 _DURATION_UNITS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
@@ -310,21 +315,16 @@ def test_counter_rule_also_reads_a_series_first_sample(alert: str) -> None:
 
 
 @pytest.mark.parametrize("alert", sorted(FIRST_SAMPLE_RULES))
-def test_first_sample_offset_is_the_window_plus_for(alert: str) -> None:
-    # A new series that reaches the threshold anywhere in the window must
-    # still be new for a whole `for`, and no longer.
-    rule = _rule(alert)
+def test_first_sample_offset_is_the_window(alert: str) -> None:
+    # Then the new-series term counts, from zero, the span increase() counts
+    # for an old series, and `for` applies to both terms alike.
     terms = _first_sample_terms(alert)
     assert terms, (
         f"{alert} has no `X unless last_over_time(X[1h] offset O)` term to read an "
         "offset from"
     )
-    assert "for" in rule, f"{alert} has no for"
-    assert _seconds(terms["offset"]) == _seconds(terms["window"]) + _seconds(
-        rule["for"]
-    ), (
-        f"{alert}: offset {terms['offset']} must equal its window "
-        f"{terms['window']} plus its for {rule['for']}"
+    assert _seconds(terms["offset"]) == _seconds(terms["window"]), (
+        f"{alert}: offset {terms['offset']} must equal its window {terms['window']}"
     )
 
 
@@ -340,9 +340,11 @@ def test_first_sample_term_looks_back_an_hour(alert: str) -> None:
 
 
 def _catalog_kinds() -> dict[str, str]:
-    """Each catalog metric's Prometheus name and instrument kind.
+    """Each catalog metric's instrument kind, by name with dots as underscores.
 
-    Read through the parser, so a comment in the catalog cannot count.
+    A counter's name gains `_total`. No unit suffix is applied, so the name is
+    the one Prometheus stores only for a `{...}` unit, which it drops. Read
+    through the parser, so a comment in the catalog cannot count.
     """
     tree = ast.parse(METRICS_CATALOG.read_text())
     catalog = next(
@@ -367,23 +369,47 @@ def _catalog_kinds() -> dict[str, str]:
 
 def test_application_metrics_absent_reads_gauges_every_process_records() -> None:
     # A counter has no series until its first measurement, so its absence
-    # after a restart is a quiet system; a gauge recorded on every poll or
-    # sweep is absent only when the pipeline or the process is.
+    # after a restart is a quiet system; a gauge its service records on every
+    # tick or sweep is absent only when that service or the pipeline is. The
+    # service_name matcher names the missing service in the alert.
     rule = _rule("CurieApplicationMetricsAbsent")
     compact = _compact(rule["expr"])
     name = r"[a-zA-Z_:][a-zA-Z0-9_:]*"
-    assert re.fullmatch(rf"absent\({name}\)(?:orabsent\({name}\))*", compact), (
-        "CurieApplicationMetricsAbsent must be absent() of bare metrics joined by or, "
+    term = rf"absent\({name}(?:\{{[^}}]*\}})?\)"
+    assert re.fullmatch(rf"{term}(?:or{term})*", compact), (
+        "CurieApplicationMetricsAbsent must be absent() of metrics joined by or, "
         f"got {rule['expr']!r}"
     )
-    read = set(re.findall(rf"absent\(({name})\)", compact))
+    read = dict(re.findall(rf"absent\(({name})(?:\{{([^}}]*)\}})?\)", compact))
     kinds = _catalog_kinds()
     for metric in sorted(read):
         assert kinds.get(metric) == "gauge", (
             f"{metric} is {kinds.get(metric)!r} in the telemetry catalog, not a gauge"
         )
-    assert read == APPLICATION_GAUGES
+    assert read == {
+        metric: f'service_name="{service}"' for metric, service in APPLICATION_GAUGES.items()
+    }
     assert rule.get("for") == "10m"
+
+
+def test_runtime_proof_emits_and_waits_on_the_gauges_the_absent_rule_reads() -> None:
+    # The runtime proof breaks export to show absent-data detection, which it
+    # can show only for gauges it emits, under the names Prometheus stores.
+    script = "\n".join(
+        line
+        for line in RUNTIME_PROOF.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for metric, service in APPLICATION_GAUGES.items():
+        otel = re.escape(metric.replace("_", "."))
+        call = re.search(rf'gauge_metric\(\s*"{otel}"[^)]*\)', script)
+        assert call, f"the runtime proof does not emit {metric}"
+        assert re.search(rf'"service\.name":\s*"{re.escape(service)}"', call.group(0))
+        # A unit other than a {...} annotation adds a suffix to the stored name.
+        assert re.search(r'unit="\{[^"]*\}"', call.group(0)), call.group(0)
+        assert f'{metric}{{service_name="{service}"}}' in script, (
+            f"the runtime proof does not wait on {metric} from {service}"
+        )
 
 
 def test_duplicate_node_exporter_alert_counts_series_not_sum() -> None:
