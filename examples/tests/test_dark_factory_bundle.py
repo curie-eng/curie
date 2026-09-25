@@ -242,6 +242,11 @@ def test_every_step_reports_its_own_phase_through_report_progress() -> None:
     sections = _step_sections(body)
     assert list(sections) == PHASES
     for phase, text in sections.items():
+        if phase == "wait_ci":
+            # The agent's turn ends at publication; the platform reports it (#3179).
+            assert "report_progress" not in text
+            assert re.search(r"platform reports `wait_ci`", text)
+            continue
         assert "report_progress" in text, phase
         assert re.search(rf"report_progress[^\n]*\b{phase}\b", text), phase
         if phase in LOOPED_PHASES:

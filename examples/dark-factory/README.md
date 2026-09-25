@@ -21,7 +21,8 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    to `implement` (never to `plan`).
 8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
-9. `wait_ci`: the pull request's checks run and the platform waits on them.
+9. `wait_ci`: the pull request's checks run and the platform waits on them
+   and reports this phase.
    A failure sends a new message in the same run with the failing checks, and
    the run loops back to `implement` to fix them, then republishes to the
    same pull request. A green result, or no checks at all, ends the run

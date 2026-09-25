@@ -184,6 +184,42 @@ async def record_report(
     return RecordResult("recorded", active.id)
 
 
+WAIT_CI_PHASE = "wait_ci"
+
+
+async def record_wait_ci(session: AsyncSession, request_id: uuid.UUID) -> bool:
+    """Record ``wait_ci`` on a request the CI gate now owns (#3179).
+
+    The agent's turn ends when it requests publication, so it can never report
+    this phase itself. Writes only when the request's declaration names the
+    phase and the latest report is not already ``wait_ci``; a CI fix round's
+    ``implement`` report makes the next publication record it again.
+    """
+
+    row: FactoryStatusComment | None = await session.scalar(
+        select(FactoryStatusComment)
+        .where(FactoryStatusComment.execution_request_id == request_id)
+        .with_for_update()
+    )
+    declared = (
+        row is not None
+        and row.declaration is not None
+        and any(phase.get("id") == WAIT_CI_PHASE for phase in row.declaration.get("phases", []))
+    )
+    latest = await session.scalar(
+        select(ExecutionRequestPhaseReport.phase)
+        .where(ExecutionRequestPhaseReport.execution_request_id == request_id)
+        .order_by(ExecutionRequestPhaseReport.id.desc())
+        .limit(1)
+    )
+    if not declared or latest == WAIT_CI_PHASE:
+        await session.rollback()
+        return False
+    session.add(ExecutionRequestPhaseReport(execution_request_id=request_id, phase=WAIT_CI_PHASE))
+    await session.commit()
+    return True
+
+
 # --- the phase view (pure) ------------------------------------------------------
 
 PhaseState = Literal["done", "current", "redo", "pending"]
