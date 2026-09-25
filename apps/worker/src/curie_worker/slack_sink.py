@@ -139,9 +139,9 @@ def _thread_ts(conversation_id: str | None) -> str | None:
 class UntrustedSlackEndpointError(RuntimeError):
     """A turn named a Slack endpoint outside the configured Slack origin.
 
-    Refused loudly and BEFORE any request: the platform bot token authenticates
-    every Slack call, so honoring an arbitrary per-turn base URL hands that token
-    to whoever named it (D4.4, finding 8).
+    Refused loudly and BEFORE any request: the route's bot token (ADR-0168
+    decision 5) authenticates every Slack call, so honoring an arbitrary
+    per-turn base URL hands that token to whoever named it (D4.4, finding 8).
     """
 
 
@@ -281,8 +281,9 @@ class SlackReplyAdapter:
     the PATH within that origin (issue #19), so replies route back to the ingress
     that enqueued the turn instead of a single worker-global endpoint, but an
     endpoint at any other origin is refused (D4.4). One ``AsyncWebClient`` is
-    built and cached per distinct base URL, since the SDK binds the endpoint at
-    client construction.
+    built and cached per distinct ``(identity, base URL)`` pair (ADR-0168
+    decision 5), since the SDK binds both the token and the endpoint at client
+    construction.
     """
 
     def __init__(
@@ -293,7 +294,6 @@ class SlackReplyAdapter:
         base_url: str | None = None,
         trusted_origins: Sequence[str] = (),
     ) -> None:
-        self._token = token
         # The positional token is ``default``'s, so every existing caller keeps
         # its meaning; the map adds the named identities (``slack_tokens``).
         self._tokens: dict[str, str] = {**(identity_tokens or {}), DEFAULT_IDENTITY: token}
