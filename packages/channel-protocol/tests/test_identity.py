@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from inspect import Parameter, signature
+from pathlib import Path
 from typing import get_type_hints
 
 import pytest
@@ -252,3 +254,22 @@ def test_parse_inverts_the_builder_over_awkward_components() -> None:
                     assert parse_scoped_conversation_id(key) == ScopedConversation(
                         kind, identity, address, conversation_id
                     ), key
+
+
+_VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-reset-set.json"
+
+
+def test_parse_round_trips_every_frozen_vector_example() -> None:
+    """review-4-5 finding 5: the earlier parse tests only cover hand-written
+    keys and the ``_AWKWARD`` product, never the one corpus the API, the
+    worker, and the CLI all freeze together (``tests/vectors/thread-reset-set.json``).
+    A parser and a builder that agree on invented keys but disagree on the
+    shared vector would still pass every other test in this file."""
+    examples = json.loads(_VECTOR.read_text())["thread_key_examples"]
+    assert examples
+    for example in examples:
+        identity = aci_turn.route_identity(example["kind"], example.get("adapter"))
+        expected_identity = None if identity == DEFAULT_IDENTITY else identity
+        assert parse_scoped_conversation_id(example["thread_key"]) == ScopedConversation(
+            example["kind"], expected_identity, example["channel"], example["conversation_id"]
+        ), example
