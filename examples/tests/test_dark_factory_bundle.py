@@ -355,6 +355,30 @@ def test_wait_ci_section_loops_a_failed_check_back_to_implement() -> None:
     assert "does not act on them yet" not in section
 
 
+# --- #3194: publish reads the repository's PR conventions ---------------------------
+
+
+def test_publish_section_reads_repository_pr_conventions() -> None:
+    _, body = _skill_parts()
+    section = _section(body, 8)
+    assert "(phase `publish`)" in section.splitlines()[0]
+    # The conventions are read before the publication is requested.
+    assert section.index("AGENTS.md") < section.index("mcp__curie__publish_changes")
+    assert "CONTRIBUTING.md" in section
+    assert re.search(r"pull\s+request\s+template", section)
+    assert "CI job" in section
+    assert re.search(r"pull\s+request\s+bod", section)
+    # ...and followed, including required trailers and selectors.
+    assert re.search(
+        r"follow (them|those conventions).{0,80}(trailer|selector)",
+        section,
+        re.IGNORECASE | re.DOTALL,
+    )
+    # The skill stays repository-agnostic: it names where conventions live,
+    # never a specific repository's rules (#3194).
+    assert "Fix pin" not in body
+
+
 def test_skill_names_three_review_loops_including_wait_ci() -> None:
     _, body = _skill_parts()
     assert "Two\npairs loop" not in body

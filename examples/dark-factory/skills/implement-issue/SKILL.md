@@ -224,8 +224,12 @@ Each loop runs at most 3 rounds. A diff review rejection returns to step 6
 Call report_progress with phase `publish`.
 
 **Publish** only when every criterion is met and verified and the diff
-reviewer's latest verdict is `VERDICT: APPROVE`. Call
-`mcp__curie__publish_changes` once, with:
+reviewer's latest verdict is `VERDICT: APPROVE`. First read the repository's
+pull request conventions: `AGENTS.md` and `CONTRIBUTING.md`, the pull request
+template (often under `.github/`), and any CI job that checks pull request
+bodies. Follow them in the pull request's title and body, including required
+trailers and selectors; when they conflict with the outline below, the
+repository's conventions win. Call `mcp__curie__publish_changes` once, with:
 
 - `title`: a short summary that ends with the issue reference, for example
   `Add inch to centimeter conversion (#12)`.
