@@ -240,11 +240,6 @@ payload = {
                     "source": "worker",
                     "outcome": "success",
                 }),
-                gauge_metric("curie.queue.message.age", 12, {
-                    "service.name": "curie-worker",
-                    "source": "worker",
-                    "outcome": "pending",
-                }),
                 sum_metric("curie.runner.rpc.result", rpc, {
                     "service.name": "curie-worker",
                     "operation": "event",
@@ -260,6 +255,13 @@ payload = {
                 # CurieApplicationMetricsAbsent reads this gauge and the api's
                 # below, with the attributes and units the services record.
                 gauge_metric("curie.queue.depth", 0, {
+                    "service.name": "curie-worker",
+                    "source": "worker",
+                    "outcome": "pending",
+                }, unit="{message}"),
+                # CurieQueueMessageAgeHigh reads the lag gauge the worker
+                # records on the same tick.
+                gauge_metric("curie.queue.lag", 0, {
                     "service.name": "curie-worker",
                     "source": "worker",
                     "outcome": "pending",
@@ -322,6 +324,7 @@ for expr in \
   'curie_runner_rpc_result_total or curie_runner_rpc_result' \
   'curie_reply_delivery_total or curie_reply_delivery' \
   'curie_queue_depth{service_name="curie-worker"}' \
+  'curie_queue_lag{service_name="curie-worker"}' \
   'curie_approval_pending{service_name="curie-api"}'
 do
   wait_query "$expr" >/dev/null

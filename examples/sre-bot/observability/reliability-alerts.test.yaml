@@ -149,36 +149,165 @@ tests:
         alertname: CurieTaskFailure
         exp_alerts: []
 
-  - name: oldest queued age fires
-    interval: 5m
+  # curie_queue_lag is the worker's gauge of the whole run stream's lag, one
+  # series per worker process, recorded on every maintenance tick, about every
+  # 30s. The rule drops the instance and reads that lag at each minute of the
+  # last 15. Here lag is 0 until 10m and 3 from then on, so the 15 minutes
+  # 10m..24m first read no 0 at 24m and `for` has held for 5m at 29m.
+  - name: queue lag above zero for the window and for fires
+    interval: 30s
     input_series:
-      - series: 'curie_queue_message_age_seconds{service_name="curie-worker",source="worker",outcome="pending"}'
-        values: '1200+0x6'
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x19 3x60'
     alert_rule_test:
-      - eval_time: 20m
+      - eval_time: 28m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts: []
+      - eval_time: 29m
         alertname: CurieQueueMessageAgeHigh
         exp_alerts:
           - exp_labels:
               component: curie-queue
+              job: curie/curie-worker
               outcome: pending
               service_name: curie-worker
               severity: page
               source: worker
             exp_annotations:
-              summary: Oldest queued Curie message is older than 15 minutes
+              summary: Queued Curie messages have waited undelivered for 15 minutes
               description: >-
-                curie_queue_message_age_seconds has stayed above 900 for 10
-                minutes.
+                curie_queue_lag, the entries in the run stream not yet
+                delivered to the worker consumer group, has been above 0 at
+                every minute for 15 minutes, whichever worker recorded it. A
+                queue that is draining reads 0.
 
-  - name: fresh queue age stays quiet
-    interval: 5m
+  # The same series with one 0 at 21m, which the minute read sees: the 15
+  # minutes read no 0 again only from 36m, so at 40m, eleven minutes after the
+  # case above fires, `for` has not held.
+  - name: queue lag that drops to zero inside the window stays quiet
+    interval: 30s
     input_series:
-      - series: 'curie_queue_message_age_seconds{service_name="curie-worker",source="worker",outcome="pending"}'
-        values: '30+0x6'
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x19 3x21 0 3x38'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts: []
+
+  # One tick at 11m sees an entry not yet delivered; every other tick reads 0.
+  - name: a single queue lag sample above zero stays quiet
+    interval: 30s
+    input_series:
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x21 4 0x38'
     alert_rule_test:
       - eval_time: 20m
         alertname: CurieQueueMessageAgeHigh
         exp_alerts: []
+
+  - name: a healthy queue lag of zero stays quiet
+    interval: 30s
+    input_series:
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts: []
+
+  # A worker restarts into a backlog: worker-a's lag is 3 from 10m and its
+  # last sample is at 20m; worker-b, the new process, reads 3 from 21m. The
+  # lag with the instance dropped runs on unbroken from 10m, so it fires at
+  # 29m as the single series above does, not 5m after worker-b's first
+  # sample, and once.
+  - name: queue lag across a worker restart into a backlog fires once on the joined series
+    interval: 30s
+    input_series:
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x19 3x20'
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-b",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '_x42 3x40'
+    alert_rule_test:
+      - eval_time: 28m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts: []
+      - eval_time: 29m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts:
+          - exp_labels:
+              component: curie-queue
+              job: curie/curie-worker
+              outcome: pending
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: Queued Curie messages have waited undelivered for 15 minutes
+              description: >-
+                curie_queue_lag, the entries in the run stream not yet
+                delivered to the worker consumer group, has been above 0 at
+                every minute for 15 minutes, whichever worker recorded it. A
+                queue that is draining reads 0.
+
+  # Every worker process records the same stream's lag.
+  - name: queue lag from two worker replicas fires one alert
+    interval: 30s
+    input_series:
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x19 3x60'
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-b",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x19 3x60'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts:
+          - exp_labels:
+              component: curie-queue
+              job: curie/curie-worker
+              outcome: pending
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: Queued Curie messages have waited undelivered for 15 minutes
+              description: >-
+                curie_queue_lag, the entries in the run stream not yet
+                delivered to the worker consumer group, has been above 0 at
+                every minute for 15 minutes, whichever worker recorded it. A
+                queue that is draining reads 0.
+
+  # Prometheus first holds the series at 5m, already at 3. Under 15 minutes of
+  # minute reads it stays quiet, 13 minutes on as well; the 15 reads 5m..19m
+  # are first all there at 19m, and `for` has held for 5m at 24m.
+  - name: a queue lag series younger than 15 minutes stays quiet
+    interval: 30s
+    input_series:
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '_x10 3x60'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts: []
+      - eval_time: 23m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts:
+          - exp_labels:
+              component: curie-queue
+              job: curie/curie-worker
+              outcome: pending
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: Queued Curie messages have waited undelivered for 15 minutes
+              description: >-
+                curie_queue_lag, the entries in the run stream not yet
+                delivered to the worker consumer group, has been above 0 at
+                every minute for 15 minutes, whichever worker recorded it. A
+                queue that is draining reads 0.
 
   - name: owed completion age fires
     interval: 5m
