@@ -10,6 +10,8 @@ BaseSettings refactor.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from curie_dispatcher.config import DispatcherConfig
 from pydantic import ValidationError
@@ -369,3 +371,29 @@ def test_the_dispatcher_does_not_read_the_shimmer_flag(
     # future env plumbing can quietly reintroduce a second reader.
     assert "shimmer" not in type(config).model_fields
     assert "status_text" not in type(config).model_fields
+
+
+def test_a_malformed_slack_identity_declaration_refuses_dispatcher_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dispatcher parses `CURIE_SLACK_IDENTITIES` with the same shared
+    parser as the API and worker (ADR-0168 decision 1), so a declaration the
+    chart would never render must refuse boot here too, not only at the API."""
+
+    _set_valid_chat_attester_secret(monkeypatch)
+    monkeypatch.setenv(
+        "CURIE_SLACK_IDENTITIES",
+        json.dumps(
+            [
+                {
+                    "name": "second",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "PATH",
+                    "signing_secret_env": None,
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="CURIE_SLACK_IDENTITIES"):
+        DispatcherConfig()

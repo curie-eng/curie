@@ -65,6 +65,43 @@ def test_a_declaration_parses_in_order_and_names_every_identity(
 
     assert parsed == (SlackIdentity(**DEFAULT), SlackIdentity(**SECOND))
     assert declared_slack_identity_names(parsed) == frozenset({"default", "second"})
+    # Task 5's chart gate builds a set of parsed identities, so each one must
+    # be hashable; `model_config = ConfigDict(frozen=True, ...)` is what makes
+    # a pydantic model hashable, and this is the property that would break if
+    # that were ever dropped.
+    assert isinstance(hash(parsed), int)
+    assert len({parsed[0], parsed[1]}) == 2
+
+
+def test_a_listed_default_with_no_signing_secret_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 5's T2: a list-only install where `default` comes from a listed
+    entry with no signing ref renders `signing_secret_env: null`. `default`
+    still takes the legacy app and bot names."""
+
+    no_signing_default = {**DEFAULT, "signing_secret_env": None}
+
+    parsed = _parse(monkeypatch, [no_signing_default, SECOND])
+
+    assert parsed == (SlackIdentity(**no_signing_default), SlackIdentity(**SECOND))
+    assert parsed[0].signing_secret_env is None
+    assert parsed[0].app_token_env == "SLACK_APP_TOKEN"
+    assert parsed[0].bot_token_env == "SLACK_BOT_TOKEN"
+
+
+def test_a_default_declaration_may_omit_signing_secret_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chart omits the key entirely for this shape; the field default
+    (`None`) must parse the same as an explicit `null`."""
+
+    omitted = {key: value for key, value in DEFAULT.items() if key != "signing_secret_env"}
+
+    parsed = _parse(monkeypatch, [omitted])
+
+    assert parsed == (SlackIdentity(**{**DEFAULT, "signing_secret_env": None}),)
+    assert parsed[0].signing_secret_env is None
 
 
 def test_the_chart_rendering_parses_as_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,12 +122,19 @@ def test_the_chart_rendering_parses_as_rendered(monkeypatch: pytest.MonkeyPatch)
     [
         ("null", "must be a JSON list"),
         ("{}", "must be a JSON list"),
+        ("[", "Expecting value"),
+        ("hello", "Expecting value"),
         ([SECOND], "declares no 'default' identity"),
         ([DEFAULT, SECOND, SECOND], "repeats identity names \\['second'\\]"),
         ([DEFAULT, {**SECOND, "name": "Second"}], "should match pattern"),
         ([DEFAULT, {**SECOND, "name": "a" * 41}], "at most 40 characters"),
         ([DEFAULT, {**SECOND, "note": "x"}], "Extra inputs are not permitted"),
         ([{**DEFAULT, "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0"}], "'default' must read"),
+        ([{**DEFAULT, "app_token_env": "CURIE_SLACK_APP_TOKEN__0"}], "'default' must read"),
+        (
+            [{**DEFAULT, "signing_secret_env": "CURIE_SLACK_SIGNING_SECRET__0"}],
+            "'default' must read",
+        ),
         ([DEFAULT, {**SECOND, "bot_token_env": "PATH"}], "CURIE_SLACK_BOT_TOKEN__<index>"),
         ([DEFAULT, {**SECOND, "app_token_env": "CURIE_SLACK_APP_TOKEN__01"}], "<index>"),
         (
@@ -105,9 +149,23 @@ def test_the_chart_rendering_parses_as_rendered(monkeypatch: pytest.MonkeyPatch)
             ],
             "gives two identities the env names \\['CURIE_SLACK_BOT_TOKEN__0'\\]",
         ),
+        (
+            [
+                DEFAULT,
+                {**SECOND, "signing_secret_env": "CURIE_SLACK_SIGNING_SECRET__0"},
+                {
+                    **SECOND,
+                    "name": "third",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__1",
+                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__1",
+                    "signing_secret_env": "CURIE_SLACK_SIGNING_SECRET__0",
+                },
+            ],
+            "gives two identities the env names \\['CURIE_SLACK_SIGNING_SECRET__0'\\]",
+        ),
     ],
 )
-def test_a_declaration_the_chart_would_never_render_is_refused(
+def test_a_declaration_outside_the_pinned_env_name_shape_is_refused(
     monkeypatch: pytest.MonkeyPatch, value: object, message: str
 ) -> None:
     with pytest.raises(ValidationError, match=message):

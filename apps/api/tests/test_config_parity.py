@@ -164,3 +164,38 @@ def test_the_three_lanes_parse_one_slack_identity_declaration_alike(
 
     assert api == worker == dispatcher
     assert [identity.name for identity in api] == ["default", "second"]
+
+
+def test_a_bare_slack_identities_env_var_is_ignored_by_all_three_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only `CURIE_SLACK_IDENTITIES` is the chart's reserved name (ADR-0168
+    decision 1); a same-named `SLACK_IDENTITIES` elsewhere in the pod env (an
+    operator's `.env`, `api.extraEnv`, ...) must not be read by any of the
+    three, or the API could admit names the dispatcher and worker never see."""
+
+    monkeypatch.delenv("CURIE_SLACK_IDENTITIES", raising=False)
+    monkeypatch.setenv(
+        "SLACK_IDENTITIES",
+        json.dumps(
+            [
+                {
+                    "name": "default",
+                    "app_token_env": "SLACK_APP_TOKEN",
+                    "bot_token_env": "SLACK_BOT_TOKEN",
+                    "signing_secret_env": "SLACK_SIGNING_SECRET",
+                },
+                {
+                    "name": "second",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                    "signing_secret_env": None,
+                },
+            ]
+        ),
+    )
+    monkeypatch.setenv("CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "parity-attester-secret-2")
+
+    assert Settings().slack_identities == ()
+    assert WorkerConfig().slack_identities == ()
+    assert DispatcherConfig().slack_identities == ()
