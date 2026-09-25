@@ -739,6 +739,7 @@ class SessionRunner:
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
                 self._approval_gate.reset()
+                self._approval_gate.bind_publication_context(event.publication_context)
             tracker = BudgetTracker(ceiling=self._ceiling)
             metric_outcome = "interrupted"
             metric_attributes = {
@@ -970,6 +971,8 @@ class SessionRunner:
                                 self._turn_epoch = None
             finally:
                 self._active_state = None
+                if self._approval_gate is not None:
+                    self._approval_gate.clear_publication_context()
                 try:
                     emit_completed_metrics()
                 finally:
@@ -1093,7 +1096,7 @@ class SessionRunner:
             # strictly before any ResultMessage iteration classifies the turn
             # (#2294). Never a task, and nothing is awaited between observing a
             # publication call and classifying the turn that made it.
-            self._observe_publication_calls(state)
+            await self._observe_publication_calls(state)
             decided_result_final: Final | None = None
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
@@ -1250,7 +1253,7 @@ class SessionRunner:
         else:
             yield to_ndjson_line(self._with_connector_notice(final))
 
-    def _observe_publication_calls(self, state: TurnState) -> None:
+    async def _observe_publication_calls(self, state: TurnState) -> None:
         """Record every publication call the runner sees on the stream (#2294).
 
         The runner's own observer, alongside the PreToolUse hook (#1852) and
@@ -1286,7 +1289,7 @@ class SessionRunner:
 
         gate = self._approval_gate
         while state.publication_calls_observed < len(state.publication_calls):
-            payload = state.publication_calls[state.publication_calls_observed]
+            tool_use_id, payload = state.publication_calls[state.publication_calls_observed]
             state.publication_calls_observed += 1
             if gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
                 # The model named the publication tool where the platform has no
@@ -1298,11 +1301,13 @@ class SessionRunner:
                 )
                 continue
             try:
-                recorded = gate.observe_publication(payload)
+                recorded = await gate.observe_publication(tool_use_id, payload)
             except ValueError as exc:
                 # First reason wins for the message; the loop carries on so a
                 # corrected retry later in the same turn can still record.
                 state.publication_unrecorded = state.publication_unrecorded or str(exc)
+                continue
+            if recorded is None:
                 continue
             if recorded:
                 # Neutral wording, and NOT a warning: against the real SDK this
@@ -1326,6 +1331,13 @@ class SessionRunner:
                     "publication already recorded this turn session=%s",
                     self._session_id,
                 )
+
+    def _has_unhandled_publication(self, state: TurnState) -> bool:
+        gate = self._approval_gate
+        return any(
+            gate is None or not gate.publication_refused(tool_use_id)
+            for tool_use_id, _ in state.publication_calls
+        )
 
     def _log_publication_fallback_alone(self, state: TurnState) -> None:
         """Warn when the stream observer was the ONLY layer that decided (#2294).
@@ -1355,7 +1367,7 @@ class SessionRunner:
 
         gate = self._approval_gate
         if (
-            not state.publication_calls
+            not self._has_unhandled_publication(state)
             or gate is None
             or gate.pending_summary is None
             or gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
@@ -1390,7 +1402,7 @@ class SessionRunner:
         """
 
         if (
-            not state.publication_calls
+            not self._has_unhandled_publication(state)
             or final.status is not SessionStatus.AWAITING_APPROVAL
             or final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
         ):
@@ -1454,7 +1466,7 @@ class SessionRunner:
         """
 
         if (
-            not state.publication_calls
+            not self._has_unhandled_publication(state)
             or final.status is SessionStatus.AWAITING_APPROVAL
             or final.status is SessionStatus.CLASSIFIED_FAILURE
             or self._interrupt_requested

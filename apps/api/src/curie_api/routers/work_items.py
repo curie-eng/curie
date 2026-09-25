@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -85,6 +86,14 @@ class TerminationBody(BaseModel):
     observation: str = Field(min_length=1)
 
 
+class RunningWorkItemRequest(BaseModel):
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    runtime_epoch: int
+    execution_deadline: datetime
+    status: Literal["running"]
+
+
 def _raise_conflict(result: object) -> None:
     code = getattr(result, "code", None)
     if isinstance(code, str):
@@ -113,10 +122,10 @@ async def admit_work_item(
     raise HTTPException(status.HTTP_409_CONFLICT, {"code": "not_found"})
 
 
-@router.get("/running")
+@router.get("/running", response_model=RunningWorkItemRequest)
 async def running_work_item_request(
     conversation_id: str, session: SessionDep
-) -> dict[str, Any]:
+) -> RunningWorkItemRequest:
     state, row = await workitem_dispatch.running_for_conversation(
         session, conversation_id
     )
@@ -126,12 +135,13 @@ async def running_work_item_request(
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
     if row.execution_deadline is None:
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": "execution_ended"})
-    return {
-        "request_id": str(row.id),
-        "runtime_epoch": row.runtime_epoch,
-        "execution_deadline": row.execution_deadline.isoformat(),
-        "status": row.status,
-    }
+    return RunningWorkItemRequest(
+        work_item_id=row.work_item_id,
+        request_id=row.id,
+        runtime_epoch=row.runtime_epoch,
+        execution_deadline=row.execution_deadline,
+        status="running",
+    )
 
 
 @router.get("/runtime-owners")

@@ -46,6 +46,7 @@ from aci_protocol import (
     GateKind,
     HookRunRef,
     OutboundEvent,
+    PublicationContext,
     QueuedTurn,
     ReplyHandle,
     SessionStatus,
@@ -1798,7 +1799,7 @@ class Kernel:
                     owner=self._config.consumer_name,
                     grant=WorkItemAcquireGrant(
                         generation=0,
-                        work_item_id=found.request_id,
+                        work_item_id=found.work_item_id,
                         conversation_id=thread_key,
                         wait_deadline="",
                         repo_full_name=None,
@@ -3923,6 +3924,7 @@ class Kernel:
                             event,
                             claim_env,
                             packs,
+                            queued_event_id=qevent.event_id,
                             workspace_deployment_id=workspace_deployment_id,
                             agent_name=agent_name,
                             source=qevent.source,
@@ -4245,6 +4247,7 @@ class Kernel:
                     nav,
                     agent_id,
                     inferred,
+                    workspace_deployment_id=workspace_deployment_id,
                     remaining_s=(
                         None
                         if remaining_s is None
@@ -4521,6 +4524,14 @@ class Kernel:
                         if agent_id is not None:
                             self._register_run(agent_id, thread_key)
                         try:
+                            event, remaining_s = await self._bind_publication_context(
+                                event,
+                                queued_event_id=qevent.event_id,
+                                workspace_deployment_id=workspace_deployment_id,
+                                handle=handle,
+                                run=self._run_for_event(qevent.event_id),
+                                remaining_s=remaining_s,
+                            )
                             turn = await self._runner.start_turn(
                                 handle.base_url,
                                 event,
@@ -4544,6 +4555,7 @@ class Kernel:
                                 event,
                                 resolved_env,
                                 packs,
+                                queued_event_id=qevent.event_id,
                                 workspace_deployment_id=workspace_deployment_id,
                                 agent_name=agent_name,
                                 source=source,
@@ -4655,6 +4667,7 @@ class Kernel:
         boot_env: dict[str, str] | None,
         packs: BehaviorPacks | None = None,
         *,
+        queued_event_id: str,
         workspace_deployment_id: uuid.UUID | None = None,
         agent_name: str | None = None,
         source: TurnSource = TurnSource.SLACK,
@@ -4743,9 +4756,14 @@ class Kernel:
                     self._publication_creator, "get_publication_lineage", None
                 )
                 if reader is not None:
-                    lineage = await reader(
-                        workspace_deployment_id, thread_key, workspace_repo
-                    )
+                    try:
+                        lineage = await reader(
+                            workspace_deployment_id, thread_key, workspace_repo
+                        )
+                    except (ApprovalBackendError, WorkspaceSelectionRefused):
+                        if self._is_factory_work_item_turn(queued_event_id):
+                            raise RunnerError("publication lineage is unavailable") from None
+                        raise
                     if lineage is not None and lineage.state != "open":
                         raise WorkspaceSelectionRefused(
                             "This pull request is already terminal. Start a new thread."
@@ -5117,6 +5135,14 @@ class Kernel:
         if agent_id is not None:
             self._register_run(agent_id, thread_key)
         try:
+            event, remaining_s = await self._bind_publication_context(
+                event,
+                queued_event_id=queued_event_id,
+                workspace_deployment_id=workspace_deployment_id,
+                handle=handle,
+                run=run,
+                remaining_s=remaining_s,
+            )
             turn = await self._runner.start_turn(
                 handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
             )
@@ -5129,6 +5155,74 @@ class Kernel:
         return _RouteResult(
             steered=False, handle=handle, turn=turn, workspace_inferred_repo=inferred
         )
+
+    async def _bind_publication_context(
+        self,
+        event: Event,
+        *,
+        queued_event_id: str,
+        workspace_deployment_id: uuid.UUID | None,
+        handle: SandboxHandle,
+        run: WorkItemRun | None,
+        remaining_s: float | None,
+    ) -> tuple[Event, float | None]:
+        """Bind fresh API authority immediately before a covered factory turn."""
+
+        parsed = parse_work_item_event_id(queued_event_id)
+        factory_execute = parsed is not None and parsed.kind in {"execute", "ci"}
+        factory_resume = (
+            self._is_approval_resume(queued_event_id)
+            and run is not None
+            and run.event_id == queued_event_id
+        )
+        if handle.workspace_repo is None or not (factory_execute or factory_resume):
+            return event, remaining_s
+        if (
+            workspace_deployment_id is None
+            or run is None
+            or run.event_id != queued_event_id
+            or not run.started
+            or run.finished
+            or run.runtime_epoch is None
+            or self._publication_creator is None
+        ):
+            raise RunnerError("publication context requires current execution authority")
+        started = time.monotonic()
+        timeout_s = 10.0 if remaining_s is None else min(10.0, remaining_s)
+        try:
+            async with asyncio.timeout(timeout_s):
+                context = await self._publication_creator.get_publication_precheck_context(
+                    deployment_id=workspace_deployment_id,
+                    work_item_id=run.work_item_id,
+                    execution_request_id=run.request_id,
+                    runtime_epoch=run.runtime_epoch,
+                    queued_event_id=queued_event_id,
+                )
+        except (ApprovalBackendError, TimeoutError):
+            raise RunnerError("publication context is unavailable") from None
+        if run.finished:
+            raise RunnerError("publication execution authority ended before turn start")
+        if context is not None and (
+            not isinstance(context, PublicationContext)
+            or context.deployment_id != workspace_deployment_id
+            or context.work_item_id != run.work_item_id
+            or context.execution_request_id != run.request_id
+            or context.runtime_epoch != run.runtime_epoch
+            or context.queued_event_id != queued_event_id
+        ):
+            raise RunnerError("publication context identity was refused")
+        if context is not None:
+            # The worker may self-dial localhost while the sandbox reaches the
+            # API through its bridge network. The API signs the authority, not
+            # the transport URL; deliver the same route on the runner's base.
+            base = self._config.runner_facing_api_base_url.rstrip("/")
+            context = context.model_copy(
+                update={"precheck_url": f"{base}/publications/precheck"}
+            )
+        remaining_s = run.bound_remaining_s(
+            None if remaining_s is None else remaining_s - (time.monotonic() - started)
+        )
+        return event.model_copy(update={"publication_context": context}), remaining_s
 
     @staticmethod
     def _log_claim_latency(thread_key: str, claim_started: float) -> None:
@@ -6459,6 +6553,7 @@ class Kernel:
         agent_id: uuid.UUID | None,
         inferred: str | None,
         *,
+        workspace_deployment_id: uuid.UUID | None,
         remaining_s: float | None,
     ) -> TurnOutcome:
         """Re-prompt a factory execute turn that ended without publishing, ONCE.
@@ -6500,6 +6595,14 @@ class Kernel:
         )
         event = self._to_event(qevent).model_copy(update={"text": prompt})
         try:
+            event, left = await self._bind_publication_context(
+                event,
+                queued_event_id=qevent.event_id,
+                workspace_deployment_id=workspace_deployment_id,
+                handle=handle,
+                run=run,
+                remaining_s=left,
+            )
             turn = await self._runner.start_turn(
                 handle.base_url, event, token=handle.token or None, remaining_s=left
             )

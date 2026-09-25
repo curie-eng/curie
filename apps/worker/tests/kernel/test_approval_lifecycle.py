@@ -191,6 +191,8 @@ def test_completed_lineage_can_replace_an_idle_durable_awaiting_runner() -> None
         from curie_worker.kernel import Kernel
 
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._runner = _LineageFenceRunner(  # type: ignore[attr-defined]
             {
                 "status": SessionStatus.AWAITING_APPROVAL.value,
@@ -247,6 +249,8 @@ def test_lineage_handoff_keeps_busy_and_durability_fences(
         from curie_worker.kernel import Kernel
 
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._runner = _LineageFenceRunner(status)  # type: ignore[attr-defined]
 
         assert not await kernel._workspace_handoff_ready(
@@ -265,6 +269,8 @@ def test_non_lineage_handoff_still_refuses_awaiting_approval() -> None:
         from curie_worker.kernel import Kernel
 
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._runner = _LineageFenceRunner(  # type: ignore[attr-defined]
             {
                 "status": SessionStatus.AWAITING_APPROVAL.value,
@@ -300,6 +306,8 @@ def test_open_lineage_bypasses_same_repo_adoption_and_surfaces_route_cas_loss() 
                 raise RuntimeError("late workspace handoff lost its route fence")
 
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._substrate = Substrate()  # type: ignore[attr-defined]
         kernel._workspace = Workspace()  # type: ignore[attr-defined]
 
@@ -384,6 +392,8 @@ def test_route_cas_loss_never_steers_or_starts_the_old_lineage_runner() -> None:
         workspace = Workspace()
         runner = Runner()
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._substrate = substrate  # type: ignore[attr-defined]
         kernel._workspace = workspace  # type: ignore[attr-defined]
         kernel._runner = runner  # type: ignore[attr-defined]
@@ -396,6 +406,7 @@ def test_route_cas_loss_never_steers_or_starts_the_old_lineage_runner() -> None:
                     user="U0REQUEST1",
                 ),
                 {},
+                queued_event_id="test-event",
                 workspace_deployment_id=uuid.UUID(
                     "11111111-1111-4111-8111-111111111111"
                 ),
@@ -505,6 +516,8 @@ def test_verified_lineage_with_mismatched_route_state_cold_reconciles(
                 raise RuntimeError("captured cold lineage reconciliation")
 
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._substrate = Substrate()  # type: ignore[attr-defined]
         kernel._workspace = Workspace()  # type: ignore[attr-defined]
         kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
@@ -524,6 +537,7 @@ def test_verified_lineage_with_mismatched_route_state_cold_reconciles(
                     user="U0REQUEST1",
                 ),
                 {},
+                queued_event_id="test-event",
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
                 workspace_inference=_WorkspaceInferenceCarry(),
@@ -629,6 +643,8 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
         workspace = Workspace()
         runner = Runner()
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._substrate = substrate  # type: ignore[attr-defined]
         kernel._workspace = workspace  # type: ignore[attr-defined]
         kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
@@ -642,6 +658,7 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
                 user="U0REQUEST1",
             ),
             {},
+            queued_event_id="test-event",
             workspace_deployment_id=deployment_id,
             agent_name="acme-bot",
             workspace_inference=_WorkspaceInferenceCarry(),
@@ -774,6 +791,8 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
         workspace = Workspace()
         runner = Runner()
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._substrate = substrate  # type: ignore[attr-defined]
         kernel._workspace = workspace  # type: ignore[attr-defined]
         kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
@@ -788,6 +807,7 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
             thread_key,
             event,
             {},
+            queued_event_id="test-event",
             workspace_deployment_id=deployment_id,
             agent_name="acme-bot",
             workspace_inference=_WorkspaceInferenceCarry(),
@@ -797,6 +817,7 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
             thread_key,
             event,
             {},
+            queued_event_id="test-event",
             workspace_deployment_id=deployment_id,
             agent_name="acme-bot",
             workspace_inference=_WorkspaceInferenceCarry(),
@@ -894,6 +915,8 @@ def test_api_pending_publication_work_is_fenced_before_lineage_handoff_probe(
             }
         )
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._workspace = workspace  # type: ignore[attr-defined]
         kernel._substrate = Substrate()  # type: ignore[attr-defined]
         kernel._runner = runner  # type: ignore[attr-defined]
@@ -908,6 +931,7 @@ def test_api_pending_publication_work_is_fenced_before_lineage_handoff_probe(
                     ts="1700000000.000100",
                 ),
                 {"CURIE_RUNNER_TOKEN": "runner-token"},
+                queued_event_id="test-event",
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
                 workspace_inference=_WorkspaceInferenceCarry(),
@@ -1066,6 +1090,8 @@ def test_api_stale_head_conflict_stops_before_workspace_or_model_for_private_rep
                 raise AssertionError("stale API truth reached sandbox routing")
 
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._workspace = Workspace()  # type: ignore[attr-defined]
         kernel._substrate = Substrate()  # type: ignore[attr-defined]
         kernel._runner = _LineageFenceRunner({})  # type: ignore[attr-defined]
@@ -1080,6 +1106,7 @@ def test_api_stale_head_conflict_stops_before_workspace_or_model_for_private_rep
                     ts="1700000000.000100",
                 ),
                 {},
+                queued_event_id="test-event",
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
                 workspace_inference=_WorkspaceInferenceCarry(),
@@ -1639,6 +1666,8 @@ def test_private_lineage_head_reaches_handoff_without_a_publication_credential()
 
         workspace = Workspace()
         kernel = object.__new__(Kernel)
+        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+        kernel._work_item_runs = {}  # type: ignore[attr-defined]
         kernel._workspace = workspace  # type: ignore[attr-defined]
         kernel._substrate = Substrate()  # type: ignore[attr-defined]
         kernel._runner = _LineageFenceRunner(  # type: ignore[attr-defined]
@@ -1659,6 +1688,7 @@ def test_private_lineage_head_reaches_handoff_without_a_publication_credential()
                     ts="1700000000.000100",
                 ),
                 {"CURIE_RUNNER_TOKEN": "runner-token"},
+                queued_event_id="test-event",
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
                 workspace_inference=_WorkspaceInferenceCarry(),

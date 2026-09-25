@@ -86,6 +86,7 @@ class WorkItemStartGrant:
 @dataclass(frozen=True)
 class WorkItemRunning:
     request_id: uuid.UUID
+    work_item_id: uuid.UUID
     runtime_epoch: int
     execution_deadline: datetime
 
@@ -328,6 +329,7 @@ class WorkItemDispatchClient:
             body = response.json()
             return WorkItemRunning(
                 request_id=uuid.UUID(str(body["request_id"])),
+                work_item_id=uuid.UUID(str(body["work_item_id"])),
                 runtime_epoch=int(body["runtime_epoch"]),
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
             )
@@ -523,6 +525,7 @@ class WorkItemRun:
         on_stale: StopCallback,
     ) -> None:
         self.request_id = request_id
+        self.work_item_id = grant.work_item_id
         self.owner = owner
         self.generation = grant.generation
         self.repo_full_name = grant.repo_full_name

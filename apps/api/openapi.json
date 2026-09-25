@@ -4395,6 +4395,146 @@
         "title": "ProgressReport",
         "type": "object"
       },
+      "PublicationContext": {
+        "description": "API issued authority and observation for one execution's publication read.\n\nThe capability authorizes only the publication precheck endpoint. It must\nstay outside model text, transcripts, workspace files and logs. The queued\nevent identifier is a correlation value, not proof of an active turn.\nObservation metadata records the API read at dispatch; consumers must make\na fresh comparison before handling an empty publication proposal.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "capability": {
+            "minLength": 1,
+            "title": "Capability",
+            "type": "string"
+          },
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "execution_request_id": {
+            "format": "uuid",
+            "title": "Execution Request Id",
+            "type": "string"
+          },
+          "expected_head": {
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Expected Head",
+            "type": "string"
+          },
+          "lineage_id": {
+            "format": "uuid",
+            "title": "Lineage Id",
+            "type": "string"
+          },
+          "lineage_version": {
+            "exclusiveMinimum": 0.0,
+            "title": "Lineage Version",
+            "type": "integer"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "observed_body_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Observed Body Sha256",
+            "type": "string"
+          },
+          "observed_title": {
+            "title": "Observed Title",
+            "type": "string"
+          },
+          "precheck_url": {
+            "format": "uri",
+            "minLength": 1,
+            "title": "Precheck Url",
+            "type": "string"
+          },
+          "queued_event_id": {
+            "minLength": 1,
+            "title": "Queued Event Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "exclusiveMinimum": 0.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "deployment_id",
+          "work_item_id",
+          "execution_request_id",
+          "runtime_epoch",
+          "conversation_id",
+          "lineage_id",
+          "lineage_version",
+          "expected_head",
+          "queued_event_id",
+          "precheck_url",
+          "capability",
+          "observed_title",
+          "observed_body_sha256",
+          "observed_at"
+        ],
+        "title": "PublicationContext",
+        "type": "object"
+      },
+      "PublicationContextMint": {
+        "additionalProperties": false,
+        "description": "Trusted worker identity for a running factory execution.",
+        "properties": {
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "execution_request_id": {
+            "format": "uuid",
+            "title": "Execution Request Id",
+            "type": "string"
+          },
+          "queued_event_id": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Queued Event Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "exclusiveMinimum": 0.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deployment_id",
+          "work_item_id",
+          "execution_request_id",
+          "runtime_epoch",
+          "queued_event_id"
+        ],
+        "title": "PublicationContextMint",
+        "type": "object"
+      },
       "PublicationCreate": {
         "description": "Trusted snapshot facts used to atomically create approval + publication.",
         "properties": {
@@ -5085,6 +5225,65 @@
         "title": "PublicationOut",
         "type": "object"
       },
+      "PublicationPrecheck": {
+        "additionalProperties": false,
+        "description": "Observed metadata and a proposal, with no caller selected resource.",
+        "properties": {
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "observed_body_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Observed Body Sha256",
+            "type": "string"
+          },
+          "observed_title": {
+            "maxLength": 256,
+            "title": "Observed Title",
+            "type": "string"
+          },
+          "proposed_body": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "title": "Proposed Body",
+            "type": "string"
+          },
+          "proposed_title": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Proposed Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observed_title",
+          "observed_body_sha256",
+          "observed_at",
+          "proposed_title",
+          "proposed_body"
+        ],
+        "title": "PublicationPrecheck",
+        "type": "object"
+      },
+      "PublicationPrecheckResult": {
+        "properties": {
+          "result": {
+            "enum": [
+              "unchanged",
+              "metadata_changed"
+            ],
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "PublicationPrecheckResult",
+        "type": "object"
+      },
       "QueuedTurn": {
         "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.",
         "properties": {
@@ -5691,6 +5890,43 @@
           "pods"
         ],
         "title": "RunnerPods",
+        "type": "object"
+      },
+      "RunningWorkItemRequest": {
+        "properties": {
+          "execution_deadline": {
+            "format": "date-time",
+            "title": "Execution Deadline",
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "status": {
+            "const": "running",
+            "title": "Status",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "runtime_epoch",
+          "execution_deadline",
+          "status"
+        ],
+        "title": "RunningWorkItemRequest",
         "type": "object"
       },
       "SettingConfig": {
@@ -12991,6 +13227,65 @@
         ]
       }
     },
+    "/publications/precheck": {
+      "post": {
+        "operationId": "compare_publication_metadata_publications_precheck_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Publication-Precheck",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Publication-Precheck"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationPrecheck"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationPrecheckResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Compare Publication Metadata",
+        "tags": [
+          "publications"
+        ]
+      }
+    },
     "/publications/{publication_id}": {
       "get": {
         "operationId": "get_publication_publications__publication_id__get",
@@ -13453,6 +13748,68 @@
           }
         },
         "summary": "Get Publication Lineage",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/precheck/context": {
+      "post": {
+        "operationId": "mint_publication_context_v1_internal_publications_precheck_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationContextMint"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationContext"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "204": {
+            "description": "The running execution has no existing pull request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Publication Context",
         "tags": [
           "internal-publications"
         ]
@@ -14510,9 +14867,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Running Work Item Request V1 Internal Work Items Running Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/RunningWorkItemRequest"
                 }
               }
             },

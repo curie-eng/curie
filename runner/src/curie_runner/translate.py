@@ -192,7 +192,7 @@ class TurnState:
     # reported as errored *because we interrupted it*, instead of reporting a
     # failure with nothing to approve.
     approval_halt_requested: bool = False
-    # The raw ``ToolUseBlock.input`` of every publication call seen on the
+    # The exact tool ID and input of every publication call seen on the
     # stream this turn (#2294), in call order. Captured here, decided in
     # ``SessionRunner._observe_publication_calls``: this module stays pure and
     # never touches the ApprovalGate, so the same seam serves the live turn and
@@ -202,7 +202,7 @@ class TurnState:
     # standing. It is load-bearing for the case where neither SDK layer recorded
     # the call at all and the turn would otherwise finalize DONE with nothing to
     # approve.
-    publication_calls: list[dict[str, Any]] = field(default_factory=list)
+    publication_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     # How many of ``publication_calls`` the session has already acted on, so the
     # observation runs exactly once per call even though it is invoked on every
     # message of the turn.
@@ -311,7 +311,7 @@ def _translate_assistant(
                 # do with it; recording it here would put gate state in a
                 # deliberately pure module.
                 state.publication_calls.append(
-                    block.input if isinstance(block.input, dict) else {}
+                    (block.id, block.input if isinstance(block.input, dict) else {})
                 )
             if block.name == APPROVAL_TOOL_NAME:
                 # A policy gate fired (ADR-0010). Capture the summary (and the

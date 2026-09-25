@@ -221,6 +221,7 @@ async def _run_execute(
 ) -> tuple[list[str], _WorkItems, object]:
     """Drive one factory execute event; return the prompts, the double, the event."""
 
+    harness_kwargs.setdefault("publication_creator", _PublicationApi())
     async with make_harness(
         binding=_Binding(), workspace_factory=_Workspace, **harness_kwargs
     ) as h:
@@ -377,6 +378,9 @@ class _PublicationApi:
         self.creates: list[object] = []
 
     async def get_publication_lineage(self, *_args: object) -> None:
+        return None
+
+    async def get_publication_precheck_context(self, **_kwargs: object) -> None:
         return None
 
     async def create_publication(self, request: object) -> object:
@@ -571,7 +575,10 @@ def test_publication_pending_on_an_early_stop_finish_settles_the_event(
 def test_an_approval_resume_turn_is_not_continued(make_harness) -> None:
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_PublicationApi(),
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
@@ -632,7 +639,11 @@ def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness
     from curie_worker.runner_client import RunnerError
 
     async def exercise() -> None:
-        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
             h.runner.turn_scripts = [list(ZERO_WORK_TURN)]
