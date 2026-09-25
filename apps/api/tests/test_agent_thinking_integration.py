@@ -74,7 +74,7 @@ def test_patch_without_thinking_leaves_it_unchanged(
     assert resp.status_code == 200, resp.text
     assert resp.json()["thinking"] == "adaptive"
     assert resp.json()["channels"] == [
-            {"kind": "slack", "address": "CTHINK002", "adapter": "default"}
+            {"kind": "slack", "address": "CTHINK002", "adapter": "default", "allowed_callers": None}
         ]
 
 

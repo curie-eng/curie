@@ -71,6 +71,16 @@ generic endpoints as a plugin API:
   an authenticated request to a caller-selected endpoint. Raw broker produce
   access remains first-party only: it could mint a turn or forge its author
   without the ingress API's authentication and dedupe.
+- **A 403 from `POST /channels/turns` is final, for every adapter.** After the
+  token is verified and before anything is claimed or queued, the API runs the
+  binding's caller list (ADR 0175,
+  `apps/api/src/curie_api/admission.py::admit`) against the turn's `author`,
+  and answers 403 when the list does not admit it. The adapter settles that
+  delivery without a turn and never retries it, and it sends nothing back to
+  the sender, since a polite refusal tells a stranger the bot exists. 401, 429,
+  202 and 5xx stay retryable. An adapter that retries every error retries the
+  403 forever; `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.post_turn`
+  is the worked example of treating it as final.
 - **Binding and reply-route facts are server controlled.** A binding is the
   neutral `{kind, address}` pair (`ChannelBinding`) on `AgentChannel`; its write
   form also records the paired `endpoint` and `adapter` facts an operator sets at

@@ -89,7 +89,7 @@ def test_a_legacy_binding_serializes_instead_of_failing(
 
     assert response.status_code == 200, response.text
     assert response.json()["channels"] == [
-        {"kind": "slack", "address": LEGACY_ADDRESS, "adapter": "default"}
+        {"kind": "slack", "address": LEGACY_ADDRESS, "adapter": "default", "allowed_callers": None}
     ]
 
 

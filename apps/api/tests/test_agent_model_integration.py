@@ -72,7 +72,9 @@ def test_patch_without_model_leaves_it_unchanged(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["channels"] == [{"kind": "slack", "address": "CMOVED001", "adapter": "default"}]
+    assert body["channels"] == [
+        {"kind": "slack", "address": "CMOVED001", "adapter": "default", "allowed_callers": None}
+    ]
     assert body["model"] == "deepseek-v4"
 
 

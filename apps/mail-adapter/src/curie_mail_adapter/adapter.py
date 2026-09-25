@@ -14,7 +14,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from .agentmail import AgentMailClient, request
 from .config import MailAdapterConfig
@@ -39,6 +39,10 @@ BACKOFF_MAX_SECONDS = 60.0
 # semantics: it neither arms nor clears an already armed delay.
 CAUSE_MAX_CHARS = 120
 REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
+
+# What one channel port POST settled: admitted, refused for good by the
+# binding's caller list (403, ADR 0175), or left pending for another attempt.
+IngressOutcome = Literal["accepted", "refused", "retry"]
 
 
 def _poll_should_back_off(status: int) -> bool:
@@ -479,12 +483,22 @@ class MailAdapter:
         )
 
     def _deliver_turn(self, message_id: str, turn: dict[str, Any]) -> bool:
-        settled = self.post_turn(turn)
-        if settled:
+        outcome = self.post_turn(turn)
+        if outcome == "accepted":
             self.state.accept_ingress(message_id)
-        else:
-            self.state.defer_ingress(message_id, 0.0)
-        return settled
+            return True
+        if outcome == "refused":
+            # ADR 0175: the binding's caller list does not admit this sender.
+            # Final, like the adapter's own sender gate: the message is settled
+            # without a turn and never retried, and the reply slot store_turn
+            # opened is closed first, so a crash between the two steps leaves a
+            # delivery that is retried (and refused again) rather than a live
+            # reply slot for a turn that will never exist.
+            self.state.finish_reply(str(turn["conversation_id"]), str(turn["reply_ref"]))
+            self.state.settle_without_turn(message_id, "rejected")
+            return True
+        self.state.defer_ingress(message_id, 0.0)
+        return False
 
     def provider_authenticated(self, labels: Iterable[str]) -> bool:
         return not set(labels) & REJECTED_LABELS
@@ -500,8 +514,16 @@ class MailAdapter:
                 return True
         return False
 
-    def post_turn(self, turn: dict[str, Any]) -> bool:
-        """Return True only for the platform's terminal 200 admission."""
+    def post_turn(self, turn: dict[str, Any]) -> IngressOutcome:
+        """Post one turn to the channel port and classify the platform's answer.
+
+        Returns:
+            ``"accepted"`` only for the platform's terminal 200 admission;
+            ``"refused"`` for a 403, which the channel port answers when the
+            binding's caller list does not admit the sender (ADR 0175) and which
+            is final for every adapter; ``"retry"`` for everything else, which
+            leaves the delivery pending under the same stable id.
+        """
         url = f"{self.config.api_base_url.rstrip('/')}/channels/turns"
         headers = {"X-API-Key": self.config.channel_token}
         for attempt in range(1, self.config.ingress_attempts + 1):
@@ -539,17 +561,24 @@ class MailAdapter:
                 _correlation(str(turn["delivery_id"])),
             )
             if result.status == 200:
-                return True
+                return "accepted"
+            if result.status == 403:
+                logger.warning(
+                    "ingress refused correlation=%s: the binding's caller list does not "
+                    "admit this sender; settling the message without a turn",
+                    _correlation(str(turn["delivery_id"])),
+                )
+                return "refused"
             if result.status == 429:
                 retry_after = _retry_after_seconds(result.headers)
                 if retry_after > 0:
                     self.shutdown.wait(retry_after)
-            return False
+            return "retry"
         logger.warning(
             "ingress unreachable; correlation=%s remains pending",
             _correlation(str(turn["delivery_id"])),
         )
-        return False
+        return "retry"
 
     # -- egress -------------------------------------------------------------
 

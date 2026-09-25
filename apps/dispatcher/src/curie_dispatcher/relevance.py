@@ -64,6 +64,8 @@ class DropReason(StrEnum):
     NO_ACTION_IN_PAYLOAD = "no_action_in_payload"
     EMPTY_ACTION_COMMAND = "empty_action_command"
     UNADDRESSABLE_ACTION = "unaddressable_action"
+    CALLER_NOT_ALLOWED = "caller_not_allowed"
+    ADMISSION_UNAVAILABLE = "admission_unavailable"
 
 
 #: One documented sentence per reason. Asserted total in both directions -- a
@@ -114,6 +116,18 @@ DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
         DropReason.UNADDRESSABLE_ACTION: (
             "An App Home or modal click carries no channel and no message, so there "
             "is no thread in which a reply could be delivered."
+        ),
+        DropReason.CALLER_NOT_ALLOWED: (
+            "The binding this delivery arrived on carries a list of who may talk to "
+            "the bot, and the platform API said the caller is not on it (ADR 0175), "
+            "so no placeholder is posted and no turn is minted: a polite refusal "
+            "would tell a stranger the bot exists."
+        ),
+        DropReason.ADMISSION_UNAVAILABLE: (
+            "The platform API could not answer whether the caller may talk to the "
+            "bot and no usable answer was cached, so the delivery is refused rather "
+            "than admitted unchecked (ADR 0175 fails closed). This is an outage "
+            "signal, not a list typo: the route may carry no list at all."
         ),
     }
 )

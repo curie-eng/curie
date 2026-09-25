@@ -10,6 +10,7 @@ from typing import NoReturn
 
 from aci_protocol.turn import route_identity
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.exceptions import RequestValidationError
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -31,10 +32,12 @@ from ..schemas import (
     BundleFiles,
     ChannelBindingPatch,
     ChannelBindingWrite,
+    ChannelCallersWrite,
     ConnectorManifests,
     VersionCreate,
     VersionOut,
     enforce_behavior_packs_size,
+    validate_allowed_callers,
 )
 
 router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
@@ -627,6 +630,20 @@ async def move_agent_channel(
                 status.HTTP_409_CONFLICT,
                 f"generation mismatch: expected {expected_generation}, stored {binding.generation}",
             )
+        if binding.allowed_callers is not None and data.kind != binding.kind:
+            # ADR 0175: the list's entries were checked against THIS kind's id
+            # shape (a Slack user id is not an email address), so carrying it
+            # onto another kind would store ids the new kind can never match
+            # and silently lock everyone out. Refused rather than cleared, so
+            # dropping the protection is always a deliberate write.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{kind}:{address} carries a caller list checked for kind {kind!r}; "
+                "moving it to another kind would keep ids that kind cannot match. "
+                "Clear the list with PUT /agents/{agent_id}/channels/callers "
+                "(allowed_callers: null) first, then move the binding and set a "
+                "new list.",
+            )
         try:
             async with session.begin_nested():  # SAVEPOINT
                 await crud.update_channel_binding(session, binding, data)
@@ -635,6 +652,55 @@ async def move_agent_channel(
             # this one) already holds raises the identical violation and needs the
             # identical owner recheck, inside the same still-live transaction.
             await _raise_binding_conflict(exc, session, agent_id, data)
+        return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+
+
+@router.put("/{agent_id}/channels/callers", response_model=AgentOut)
+async def set_agent_channel_callers(
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    data: ChannelCallersWrite,
+    session: SessionDep,
+    adapter: str | None = None,
+) -> AgentOut:
+    """Set or clear who may talk to the bot through one binding (ADR 0175).
+
+    The route is selected exactly as the move and delete endpoints select it:
+    `(kind, address)` as query parameters plus the optional `adapter` identity
+    (ADR-0168 decision 3). `allowed_callers: null` clears the list so everyone
+    may talk to the bot again; a list replaces the stored one whole.
+
+    Its own endpoint, apart from `PATCH /agents/{agent_id}/channels`, because
+    that write bumps the binding's generation and so revokes the adapter's
+    token (#2379). Who may use a route is a separate question from the route
+    itself (decision 4), so this write leaves the generation alone and an
+    inbox keeps receiving mail while its list is edited.
+
+    The entries are checked against the SELECTED binding's kind, under the same
+    per-agent lock every binding write takes, so a concurrent move cannot
+    change the kind between the check and the store. A refused list is a 422
+    in FastAPI's own shape, like any other body error.
+    """
+
+    async with _deadlock_as_conflict():
+        agent = await _agent_or_404(session, agent_id)
+        bindings = await crud.lock_agent_bindings(session, agent_id)
+        binding = _binding_for(bindings, kind, address, adapter)
+        try:
+            stored = validate_allowed_callers(binding.kind, data.allowed_callers)
+        except ValueError as exc:
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("body", "allowed_callers"),
+                        "msg": f"Value error, {exc}",
+                        "input": None,
+                    }
+                ]
+            ) from exc
+        await crud.set_allowed_callers(session, binding, stored)
         return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
 
 

@@ -3391,6 +3391,248 @@ pub async fn channel_bindings(
     })
 }
 
+/// What one `curie <tier> callers <agent> --surface KIND=ADDRESS` invocation
+/// does to that surface's caller list (ADR 0175): show it, replace it, or clear
+/// it so everyone may talk to the bot again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallersChange {
+    /// No `--set` and no `--clear`: read the list and write nothing.
+    Show,
+    /// `--set`: replace the list with exactly these ids.
+    Set(Vec<String>),
+    /// `--clear`: remove the list, so everyone may talk to the bot.
+    Clear,
+}
+
+impl CallersChange {
+    /// Resolve `--set` / `--clear` into one intent, before any I/O.
+    ///
+    /// clap already refuses the two together (`conflicts_with`). This mirrors
+    /// only the API's kind-free rules (convention: validate at the API, mirror
+    /// in the CLI): an entry must be non-empty with no whitespace. The id shape
+    /// per kind (a Slack U/W/B id, one bare email address) stays the API's
+    /// call, because only the API knows the selected binding's kind for sure.
+    ///
+    /// Args:
+    ///   set: the `--set` ids, comma separated or repeated; empty when absent.
+    ///   clear: whether `--clear` was passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error naming the malformed entry.
+    pub fn resolve(set: Vec<String>, clear: bool) -> Result<Self> {
+        if clear {
+            return Ok(CallersChange::Clear);
+        }
+        if set.is_empty() {
+            return Ok(CallersChange::Show);
+        }
+        for id in &set {
+            if id.is_empty() || id.chars().any(char::is_whitespace) {
+                return Err(crate::exit::usage(format!(
+                    "--set takes exact caller ids, comma separated, with no spaces \
+                     (e.g. --set U0123ABCD,U0456EFGH or --set person@example.com); got {id:?}"
+                )));
+            }
+        }
+        Ok(CallersChange::Set(set))
+    }
+}
+
+/// Output of `<tier> callers <agent>`: the dry-run plan, or the surface as the
+/// API holds it after this invocation. `allowed_callers` is `None` when the
+/// surface carries no list (everyone may talk to the bot), which is emitted as
+/// JSON `null` rather than omitted, so a consumer never mistakes "open" for "not
+/// reported". `changed` distinguishes a show from a write.
+#[derive(Debug)]
+pub enum CallersOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        surface: crate::api::ChannelBinding,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for CallersOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            CallersOutput::DryRun(plan) => plan.to_json(),
+            CallersOutput::Done {
+                agent,
+                surface,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                "kind": surface.kind,
+                "address": surface.address,
+                "adapter": surface.adapter,
+                "allowed_callers": surface.allowed_callers,
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            CallersOutput::DryRun(plan) => plan.render(ui),
+            CallersOutput::Done {
+                agent,
+                surface,
+                changed,
+            } => {
+                let route = match channel_binding_named_identity(surface) {
+                    Some(identity) => format!("{}:{} ({identity})", surface.kind, surface.address),
+                    None => format!("{}:{}", surface.kind, surface.address),
+                };
+                let verb = if *changed { " now" } else { "" };
+                let who = match &surface.allowed_callers {
+                    None => "everyone (no caller list)".to_string(),
+                    Some(ids) => ids.join(", "),
+                };
+                ui.payload(&format!("callers for {agent} on {route}{verb}: {who}"));
+            }
+        }
+    }
+}
+
+/// The surface `(kind, address, adapter)` names among one agent's bindings.
+///
+/// Matched as the API's `_binding_for` matches: the pair always, and the
+/// identity only when `adapter` names one, compared on the identity the read
+/// side reports (a Slack binding with none reads back `default`).
+fn find_surface<'a>(
+    channels: &'a [crate::api::ChannelBinding],
+    kind: &str,
+    address: &str,
+    adapter: Option<&str>,
+) -> Option<&'a crate::api::ChannelBinding> {
+    channels.iter().find(|binding| {
+        binding.kind == kind
+            && binding.address == address
+            && adapter.is_none_or(|wanted| binding.adapter.as_deref() == Some(wanted))
+    })
+}
+
+/// `curie <tier> callers <agent> --surface KIND=ADDRESS [--set IDS | --clear]`.
+///
+/// With neither flag this SHOWS the surface's caller list, from the agent read
+/// alone. With `--set` it replaces the list, and with `--clear` it removes it,
+/// through `PUT /agents/{id}/channels/callers` (ADR 0175), and reports the
+/// surface as the API stored it. The write leaves the binding's generation
+/// alone, so an adapter's channel token keeps working.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   surface: the `--surface KIND=ADDRESS` value.
+///   adapter: `--adapter`, the identity that selects one of several routes on
+///     a pair (ADR-0168 decision 3); omitted selects as the API does.
+///   change: the intent already parsed from `--set` / `--clear`.
+///
+/// Returns:
+///   The surface and its caller list, or the dry-run plan.
+pub async fn channel_callers(
+    opts: AgentActionOpts,
+    surface: &str,
+    adapter: Option<String>,
+    change: CallersChange,
+) -> Result<CallersOutput> {
+    let (kind, address) = parse_channel_pair(surface)?;
+    if opts.dry_run {
+        let selector = match &adapter {
+            Some(adapter) => format!("kind={kind}&address={address}&adapter={adapter}"),
+            None => format!("kind={kind}&address={address}"),
+        };
+        let plan = match &change {
+            CallersChange::Show => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print the caller list \
+                 of {kind}:{address})",
+                opts.api_url, opts.agent
+            ),
+            CallersChange::Set(ids) => format!(
+                "PUT {}/agents/<id>/channels/callers?{selector}  {}  (would resolve agent {:?} first)",
+                opts.api_url,
+                serde_json::json!({ "allowed_callers": ids }),
+                opts.agent
+            ),
+            CallersChange::Clear => format!(
+                "PUT {}/agents/<id>/channels/callers?{selector}  {{\"allowed_callers\":null}}  \
+                 (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(CallersOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let not_bound = || {
+        crate::exit::CliError::usage(format!(
+            "agent {} has no {kind}:{address} surface{}",
+            agent.name,
+            adapter
+                .as_deref()
+                .map(|a| format!(" as {a:?}"))
+                .unwrap_or_default()
+        ))
+        .with_fix(format!(
+            "List the agent's surfaces with `curie <tier> surfaces {}` and pass one of them \
+             as --surface KIND=ADDRESS.",
+            agent.name
+        ))
+    };
+    let callers = match &change {
+        CallersChange::Show => {
+            let found = find_surface(&agent.channels, &kind, &address, adapter.as_deref())
+                .cloned()
+                .ok_or_else(not_bound)?;
+            return Ok(CallersOutput::Done {
+                agent: agent.name.clone(),
+                surface: found,
+                changed: false,
+            });
+        }
+        CallersChange::Set(ids) => Some(ids.as_slice()),
+        CallersChange::Clear => None,
+    };
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    let verb = if callers.is_some() {
+        "setting"
+    } else {
+        "clearing"
+    };
+    let step = cl.step(&format!(
+        "{verb} the caller list of {kind}:{address} on {}",
+        agent.name
+    ));
+    let saved = match client
+        .set_channel_callers(&agent.id, &kind, &address, adapter.as_deref(), callers)
+        .await
+    {
+        Ok(saved) => {
+            step.done(if callers.is_some() { "set" } else { "cleared" });
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    let stored = find_surface(&saved.channels, &kind, &address, adapter.as_deref())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the API accepted the caller list but its answer carries no {kind}:{address} surface"
+            )
+        })?;
+    Ok(CallersOutput::Done {
+        agent: saved.name,
+        surface: stored,
+        changed: true,
+    })
+}
+
 #[cfg(test)]
 mod channels_tests {
     use super::ChannelChange;

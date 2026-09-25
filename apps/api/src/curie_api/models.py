@@ -284,6 +284,11 @@ class AgentChannel(Base):
     PLACE, and `POST /channels/token` bumps it on every mint, so the row id is a
     stable identity and the generation is the only thing that makes a rebind or
     remint observable to a credential minted before it.
+
+    `allowed_callers` (ADR 0175, migration 0059) is who may start a turn through
+    this binding: NULL for everyone, else the exact caller ids `admission.admit`
+    matches. It is written only by its own endpoint, which leaves `generation`
+    alone, because who may use a route is a separate question from the route.
     """
 
     __tablename__ = "agent_channels"
@@ -326,11 +331,20 @@ class AgentChannel(Base):
     # the database so a half-configured route cannot be written out of band.
     endpoint: Mapped[str | None] = mapped_column(default=None)
     adapter: Mapped[str | None] = mapped_column(default=None)
-    # Rotation counter (ADR-0096 D5, #2379). Bumped on every binding write,
-    # including one that changes nothing, and on every `POST /channels/token`
-    # mint: re-asserting a binding or reminting its credential both invalidate
-    # outstanding tokens.
+    # Rotation counter (ADR-0096 D5, #2379). Bumped on every write to the ROUTE
+    # (a move or re-assert through `update_channel_binding`, including one that
+    # changes nothing) and on every `POST /channels/token` mint: re-asserting a
+    # binding or reminting its credential both invalidate outstanding tokens.
+    # Editing `allowed_callers` below does NOT bump it (ADR 0175 decision 4).
     generation: Mapped[int] = mapped_column(server_default="0", default=0)
+    # Who may start a turn through this binding (ADR 0175, migration 0059).
+    # NULL means everyone; a list is never empty (the API refuses it and
+    # `agent_channels_allowed_callers_ck` states it at the database).
+    # `none_as_null` is load-bearing: without it a Python None is stored as the
+    # JSON value `null`, which is not SQL NULL and fails that CHECK.
+    allowed_callers: Mapped[list[str] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="channels")
 

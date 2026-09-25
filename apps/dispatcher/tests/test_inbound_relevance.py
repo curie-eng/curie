@@ -41,6 +41,7 @@ from unittest.mock import MagicMock
 import pytest
 import redis
 from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_dispatcher.admission import build_admission
 from curie_dispatcher.app import build_app
 from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.handlers import process_action
@@ -52,7 +53,7 @@ from slack_sdk.errors import SlackApiError, SlackRequestError
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
-from .conftest import FakeSocketClient, _authorize
+from .conftest import FakeAdmissionApi, FakeSocketClient, _authorize
 from .test_dispatch import BOT_TS, _drain, _events_api_request
 
 # ---------------------------------------------------------------------------
@@ -437,6 +438,11 @@ class Row:
     text_contains: tuple[str, ...] = ()
     text_not_contains: tuple[str, ...] = ()
     dedupe_id: str | None = None
+    #: ADR 0175: a caller list on one route, as ``(address, caller ids)``, set
+    #: on the fake platform API before the delivery.
+    caller_list: tuple[str, tuple[str, ...]] | None = None
+    #: ADR 0175: the fake platform API answers every admission question 503.
+    api_down: bool = False
 
 
 MATRIX: tuple[Row, ...] = (
@@ -957,6 +963,36 @@ MATRIX: tuple[Row, ...] = (
         action_body=_anonymous_action_body(),
         dedupe_id="action--",
     ),
+    Row(
+        name="mention_from_a_caller_not_on_the_bindings_list",
+        expected=DropReason.CALLER_NOT_ALLOWED,
+        why=(
+            "ADR 0175: the binding for C123 carries a list of who may talk to the bot "
+            "and U123 is not on it, so the platform API answers refused. The refusal "
+            "happens BEFORE the dedupe claim, so a later delivery after the list "
+            "changes is judged afresh rather than refused as already seen."
+        ),
+        request=_events_api_request(
+            "env-unlisted", "Ev-unlisted", _mention(text="<@U0BOT> what is on my calendar")
+        ),
+        caller_list=("C123", ("U0EXAMPLE1",)),
+        dedupe_id="Ev-unlisted",
+    ),
+    Row(
+        name="mention_while_the_platform_api_cannot_answer",
+        expected=DropReason.ADMISSION_UNAVAILABLE,
+        why=(
+            "ADR 0175 fails closed: the platform API answers 503 and nothing is "
+            "cached for this route, so the caller is refused even though the route "
+            "carries no list. The distinct reason keeps an operator from hunting "
+            "for a list typo during an outage."
+        ),
+        request=_events_api_request(
+            "env-api-down", "Ev-api-down", _mention(text="<@U0BOT> hello")
+        ),
+        api_down=True,
+        dedupe_id="Ev-api-down",
+    ),
 )
 
 
@@ -967,7 +1003,10 @@ MATRIX: tuple[Row, ...] = (
 
 @pytest.mark.parametrize("row", MATRIX, ids=[row.name for row in MATRIX])
 def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
-    row: Row, redis_client: redis.Redis, config: DispatcherConfig
+    row: Row,
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
 ) -> None:
     """AC 3. Every row ends visibly: on the stream, or in the log naming a reason.
 
@@ -988,6 +1027,11 @@ def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
         assert primer.errors == [], f"the priming delivery for {row.name!r} itself failed"
         assert len(_stream_entries(redis_client, config)) == 1, "the prime must have enqueued"
 
+    if row.caller_list is not None:
+        address, callers = row.caller_list
+        admission_api.lists[(address, None)] = set(callers)
+    admission_api.down = row.api_down
+
     before = len(_stream_entries(redis_client, config))
     harness = _build_harness(config, redis_client)
 
@@ -1005,6 +1049,7 @@ def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
             redis_client=redis_client,
             config=config,
             slack_identity=DEFAULT_IDENTITY,
+            admission=build_admission(config),
             logger=harness.logger,
         )
         _drain(harness.app)

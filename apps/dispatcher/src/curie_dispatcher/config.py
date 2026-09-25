@@ -28,6 +28,8 @@ Env mapping:
     CURIE_API_KEY            -> api_key
     CURIE_APPROVAL_CHAT_ATTESTER_SECRET -> approval_chat_attester_secret
     CURIE_API_PREFLIGHT_TIMEOUT_SECONDS -> api_preflight_timeout_s
+    CURIE_ADMISSION_CACHE_TTL_SECONDS -> admission_cache_ttl_s
+    CURIE_ADMISSION_STALE_SECONDS     -> admission_stale_s
     CURIE_HEARTBEAT_FILE             -> heartbeat_file
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
 """
@@ -156,6 +158,25 @@ class DispatcherConfig(BaseSettings):
         validation_alias="CURIE_API_PREFLIGHT_TIMEOUT_SECONDS",
     )
 
+    # How long an admission answer from the platform API counts (ADR 0175
+    # decision 2), which is also how long a caller-list change takes to apply
+    # in Slack. The stale window is how long an EXPIRED answer still counts
+    # while the API cannot answer; past it, and with nothing cached, a caller
+    # is refused. Finite and positive for the same reason as the preflight
+    # deadline: `inf` would turn the fail-closed rule off without saying so.
+    admission_cache_ttl_s: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="CURIE_ADMISSION_CACHE_TTL_SECONDS",
+    )
+    admission_stale_s: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="CURIE_ADMISSION_STALE_SECONDS",
+    )
+
     placeholder_text: str = Field(
         default="On it. Working on your request.",
         validation_alias="CURIE_PLACEHOLDER_TEXT",
@@ -201,6 +222,18 @@ class DispatcherConfig(BaseSettings):
         # Decode here so JSON null is rejected instead of being discarded by
         # the settings env source and silently replaced by the empty default.
         return json.loads(value) if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _stale_window_covers_the_ttl(self) -> "DispatcherConfig":
+        """Refuse a stale window shorter than the TTL it extends."""
+
+        if self.admission_stale_s < self.admission_cache_ttl_s:
+            raise ValueError(
+                "CURIE_ADMISSION_STALE_SECONDS must be at least "
+                "CURIE_ADMISSION_CACHE_TTL_SECONDS: it is how long an expired "
+                "answer still counts while the API is down"
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_independent_chat_attester(self) -> "DispatcherConfig":

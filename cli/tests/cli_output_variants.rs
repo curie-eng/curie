@@ -40,9 +40,9 @@ use curie::api::{
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
-    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput, KillOutput,
+    MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
+    SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -337,6 +337,24 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "CallersOutput",
+        samples![
+            "DryRun" => CallersOutput::DryRun(plan()),
+            // A restricted surface; the open (null list) shape is pinned by
+            // cli/tests/callers_verb.rs against the same schema.
+            "Done" => CallersOutput::Done {
+                agent: "a".to_string(),
+                surface: ChannelBinding {
+                    kind: "slack".to_string(),
+                    address: "C0EXAMPLE1".to_string(),
+                    adapter: Some("default".to_string()),
+                    allowed_callers: Some(vec!["U0EXAMPLE1".to_string()]),
+                },
+                changed: true,
+            },
+        ],
+    );
+    m.insert(
         "ChannelsOutput",
         samples![
             "DryRun" => ChannelsOutput::DryRun(plan()),
@@ -350,6 +368,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         kind: "slack".to_string(),
                         address: "#legacy-alerts".to_string(),
                         adapter: None,
+                        allowed_callers: None,
                     },
                     // A named, non-default identity (ADR-0168 decision 3)
                     // alongside the default-identity row above, so the schema
@@ -358,6 +377,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         kind: "slack".to_string(),
                         address: "C0EXAMPLE1".to_string(),
                         adapter: Some("ops-secondary".to_string()),
+                        allowed_callers: None,
                     },
                 ],
                 changed: true,

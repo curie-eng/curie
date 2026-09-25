@@ -60,6 +60,23 @@
       },
       "cardinality_bound": 192
     },
+    "curie.turn.refused": {
+      "type": "counter",
+      "unit": "{turn}",
+      "description": "Callers refused before a turn by a binding's caller list.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher"
+        ],
+        "reason": [
+          "caller_not_allowed",
+          "admission_unavailable"
+        ]
+      },
+      "cardinality_bound": 4
+    },
     "curie.turn.duration": {
       "type": "histogram",
       "unit": "s",
@@ -1045,6 +1062,7 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
@@ -1073,6 +1091,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1157,7 +1176,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4000
+      "cardinality_bound": 4080
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1179,6 +1198,7 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
@@ -1207,6 +1227,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1291,7 +1312,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4000
+      "cardinality_bound": 4080
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1313,6 +1334,7 @@
           "/agents/{agent_id}/behavior-packs",
           "/agents/{agent_id}/budget",
           "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
@@ -1341,6 +1363,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
@@ -1418,7 +1441,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 800
+      "cardinality_bound": 816
     },
     "curie.background.loop": {
       "type": "counter",

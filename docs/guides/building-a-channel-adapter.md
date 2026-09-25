@@ -96,9 +96,11 @@ binding has no reply route yet, so a half-configured route is caught at bind
 time instead of mid-turn.
 
 The token claims the binding row's id plus the `generation` the mint stamps.
-Every mint bumps that generation, and every binding write bumps it too,
-including a re-assert of identical values, so a remint or a rebind kills every
-outstanding token for the pair. Plan for re-minting: treat a 401 from ingress
+Every mint bumps that generation, and every write to the binding's route (a move,
+or a re-assert of identical values) bumps it too, so a remint or a rebind kills
+every outstanding token for the pair. Editing the binding's caller list (ADR 0175)
+does not bump it, so an operator can add or remove a person without revoking your
+token. Plan for re-minting: treat a 401 from ingress
 as "ask the operator for a fresh token", not as a bug. The previous token is
 already dead; installing the new one is what restores enqueue.
 
@@ -152,6 +154,7 @@ Responses:
 | 200 `{event_id, stream_id, duplicate}` | Accepted. `duplicate: false` means this request enqueued it. |
 | 202 `{event_id, stream_id: null, duplicate: true}` | Another request holds the claim and has not enqueued yet. Come back. |
 | 401 | Missing, malformed, expired, or stale-generation credential. One detail string for all of them, deliberately. |
+| 403 | The binding's caller list (ADR 0175) does not admit the turn's `author`. Final: settle the delivery without a turn, never retry it, and send nothing back to the sender. |
 | 404 | No agent bound to that `(kind, address)`. |
 | 409 | The binding has no reply route configured. |
 | 413 | Body over 256 KiB. The bound is enforced before parsing or authenticating. |
@@ -163,6 +166,14 @@ Responses:
 `delivery_id`; 401 additionally needs an operator to re-mint the scoped token.
 Do not treat “a response arrived” as final: 202 explicitly says another claim is
 not yet enqueued, and dropping that response loses the upstream message.
+
+**403 is final, for every adapter.** The platform checked the binding's caller list
+after your token and before claiming anything, and the author is not on it. Settle
+the delivery the way you settle mail your own sender filter rejected, and do not
+answer the sender: a polite refusal tells a stranger the bot exists. An adapter that
+retries every error will retry this one forever. Run your own sender checks first,
+as the mail adapter does, and send the sender you authenticated as `author`; for
+email that is the bare address, lowercased.
 
 The remaining 4xx statuses are terminal for the current configuration, but they
 are not success: log the recovery instruction and retain enough durable evidence

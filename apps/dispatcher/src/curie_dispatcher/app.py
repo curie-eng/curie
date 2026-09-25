@@ -17,6 +17,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
 
+from .admission import AdmissionGate
 from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers
 from .identities import SlackIdentityCredentials, default_identity_credentials
@@ -78,12 +79,16 @@ def build_app(
     authorize: Callable[..., Any] | None = None,
     logger: logging.Logger | None = None,
     resolver: Any | None = None,
+    admission: AdmissionGate | None = None,
 ) -> App:
     """Build one identity's Bolt App with the dispatcher's handlers registered.
 
     ``identity`` is ``default`` when omitted, built from the ``SLACK_*``
     settings exactly as a stock install always built it. Its name is what every
     turn this app mints carries (ADR-0168 decision 2).
+
+    ``admission`` is the caller-list gate (ADR 0175). ``run`` passes one gate
+    shared by every identity; None builds one for this app from config.
     """
     credentials = identity if identity is not None else default_identity_credentials(config)
     signing = credentials.signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
@@ -114,6 +119,8 @@ def build_app(
         # The approvals API client (#246), injectable so tests keep the
         # click-to-resolve path offline.
         register_kwargs["resolver"] = resolver
+    if admission is not None:
+        register_kwargs["admission"] = admission
     register_handlers(app, **register_kwargs)
     return app
 

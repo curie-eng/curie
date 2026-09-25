@@ -34,6 +34,12 @@
       "version": "1.0"
     },
     {
+      "result": "CallersOutput",
+      "kind": "CliOutput",
+      "schema": "callers.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ChannelTokenOutput",
       "kind": "CliOutput",
       "schema": "channel-token.schema.json",

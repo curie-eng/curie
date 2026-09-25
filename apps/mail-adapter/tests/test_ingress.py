@@ -399,3 +399,58 @@ def test_rejected_mail_counts_against_the_seen_bound(
 
     assert len(adapter.seen) == 3
     assert ingress.attempts == 0
+
+
+def test_a_403_from_the_channel_port_is_final_and_settles_without_a_turn(
+    mail: MailState,
+    ingress: IngressState,
+    adapter: MailAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ADR 0175: the platform answers 403 when the binding's caller list does
+    not admit the sender. That is final for every adapter, so the delivery is
+    settled without a turn and never posted again, unlike the retryable 401,
+    429 and 5xx above. The adapter's own sender gate still ran first: the
+    sender here passed CURIE_MAIL_ALLOWED_SENDERS and was refused upstream."""
+
+    ingress.response = (403, {"detail": "this binding does not admit the turn's author"})
+    mail.add_inbound("msg-1", "thr-1", text="the numbers you asked for")
+
+    with caplog.at_level("WARNING", logger="curie_mail_adapter.adapter"):
+        adapter.poll_once()
+        adapter.poll_once()
+        adapter.poll_once()
+
+    # One attempt in total: not retried inside the POST loop (which would try
+    # CURIE_MAIL_INGRESS_ATTEMPTS times) and not retried by later passes.
+    assert ingress.attempts == 1
+    assert ingress.delivery_ids() == ["msg-1"]
+    assert adapter.state.delivery("msg-1") == {"state": "rejected", "turn": None}
+    assert adapter.state.pending() == []
+    # The reply slot the admitted turn opened is closed: no reply can be
+    # recorded against a turn that will never exist.
+    assert adapter.state.live_reply_refs("thr-1") == []
+    refusals = [r.getMessage() for r in caplog.records if "ingress refused" in r.getMessage()]
+    assert len(refusals) == 1
+    assert ALLOWED_SENDER not in refusals[0] and "msg-1" not in refusals[0]
+
+
+def test_a_403_after_a_retryable_answer_still_settles_the_same_delivery(
+    mail: MailState, ingress: IngressState, adapter: MailAdapter
+) -> None:
+    """A delivery left pending by a 5xx is refused on its retry; the retry path
+    settles it the same way the first attempt would have."""
+
+    ingress.responses = [
+        (500, {"detail": "retry"}, {}),
+        (403, {"detail": "this binding does not admit the turn's author"}, {}),
+    ]
+    mail.add_inbound("msg-1", "thr-1")
+
+    adapter.poll_once()
+    assert adapter.state.delivery("msg-1")["state"] == "ingress_pending"  # type: ignore[index]
+    adapter.poll_once()
+    adapter.poll_once()
+
+    assert ingress.delivery_ids() == ["msg-1", "msg-1"]
+    assert adapter.state.delivery("msg-1") == {"state": "rejected", "turn": None}
