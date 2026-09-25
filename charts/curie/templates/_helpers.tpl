@@ -1674,7 +1674,8 @@ key: {{ .defaultKey }}
 {{- define "curie.dispatcher.enabled" -}}
 {{- $appTokenSet := or .Values.dispatcher.slack.appToken .Values.dispatcher.slack.appTokenExistingSecret -}}
 {{- $botTokenSet := or .Values.dispatcher.slack.botToken .Values.dispatcher.slack.botTokenExistingSecret -}}
-{{- if and .Values.dispatcher.deploy $appTokenSet $botTokenSet -}}
+{{- $listed := .Values.dispatcher.slack.identities -}}
+{{- if and .Values.dispatcher.deploy (or (and $appTokenSet $botTokenSet) $listed) -}}
 true
 {{- end -}}
 {{- end -}}

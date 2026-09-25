@@ -290,12 +290,10 @@ spec:
               value: {{ index .Values.worker.publication.resources.requests "ephemeral-storage" | quote }}
             - name: CURIE_PUBLICATION_EPHEMERAL_LIMIT
               value: {{ index .Values.worker.publication.resources.limits "ephemeral-storage" | quote }}
-            # Same shared secret reference api.yaml and dispatcher.yaml resolve
-            # (issue #1759, curie.secretRef), so the three cannot drift apart.
-            - name: SLACK_BOT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.botTokenExistingSecret "existingSecretKey" .Values.dispatcher.slack.botTokenExistingSecretKey "defaultKey" "slackBotToken") | nindent 18 }}
+            # Every Slack identity's bot token, from the one helper api.yaml and
+            # dispatcher.yaml also render (curie.env.slack), so the three cannot
+            # drift apart.
+            {{- include "curie.env.slack" (dict "root" . "workload" "worker") | trim | nindent 12 }}
             # The sealing keys (ADR-0094). The connector reconciler runs here,
             # so this is the only workload that needs to DECRYPT a sealed
             # value; nothing else in the release gets them. Both are optional:
@@ -495,7 +493,7 @@ spec:
             - name: BUNDLE_BUCKET
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson)) | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.

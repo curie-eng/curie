@@ -1413,6 +1413,32 @@ dispatcher:
     signingSecret: ""
     signingSecretExistingSecret: ""
     signingSecretExistingSecretKey: slackSigningSecret
+    # More Slack identities (ADR-0168 decision 1). The block above is the
+    # identity named `default`; each entry here is one more Slack app, and a
+    # binding names it in `adapter`. Empty (the default) renders nothing new.
+    # Each secret arrives by existingSecret reference only (#1759): a plain
+    # appToken/botToken/signingSecret key in an entry fails the render.
+    #   identities:
+    #     - name: sales                     # [a-z0-9]([a-z0-9-]*[a-z0-9])?, at most 40
+    #       appTokenExistingSecret: slack-sales
+    #       appTokenExistingSecretKey: slackAppToken          # the default
+    #       botTokenExistingSecret: slack-sales
+    #       botTokenExistingSecretKey: slackBotToken          # the default
+    #       signingSecretExistingSecret: slack-sales          # optional
+    #       signingSecretExistingSecretKey: slackSigningSecret  # the default
+    # `default` is configured in exactly one place: the block above, or an
+    # entry named `default` with the block's token fields left empty. A list
+    # that ends up with no `default` fails the render, because a Slack route
+    # that names no identity means `default`. A list entry's tokens render as
+    # CURIE_SLACK_BOT_TOKEN__<n> (worker, API, dispatcher) and
+    # CURIE_SLACK_APP_TOKEN__<n> / CURIE_SLACK_SIGNING_SECRET__<n> (dispatcher),
+    # where <n> is the entry's position, and CURIE_SLACK_IDENTITIES tells all
+    # three which name reads which variable. A listed identity is declared to
+    # the API, which then accepts bindings naming it; the dispatcher still
+    # connects only `default` until each identity gets its own connection. A
+    # plain `curie cluster up` carries a recorded list forward with the
+    # release's other recorded values.
+    identities: []
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }

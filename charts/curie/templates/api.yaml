@@ -275,15 +275,12 @@ spec:
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
             # Slack bot token for the approval user-group authorizer (#420): the
             # API resolves usergroups.users.list itself rather than trusting a
-            # caller-asserted membership claim (ADR-0034). Same shared secret
-            # reference dispatcher.yaml and worker.yaml resolve (issue #1759,
-            # curie.secretRef), so the three cannot drift apart.
+            # caller-asserted membership claim (ADR-0034). Every Slack identity's
+            # bot token comes from the one helper dispatcher.yaml and worker.yaml
+            # also render (curie.env.slack), so the three cannot drift apart.
             # Rendered unconditionally; a declared approver group with no token
             # then fails closed at resolve time, which is the intended posture.
-            - name: SLACK_BOT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.botTokenExistingSecret "existingSecretKey" .Values.dispatcher.slack.botTokenExistingSecretKey "defaultKey" "slackBotToken") | nindent 18 }}
+            {{- include "curie.env.slack" (dict "root" . "workload" "api") | trim | nindent 12 }}
             # Expiry sweeper cadence (#412). Rendered unconditionally, not behind
             # an optional-value guard, because the disable value 0 is falsy in Go
             # templates and would be silently dropped, leaving the app default
@@ -299,7 +296,7 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson)) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000
