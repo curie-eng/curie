@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
 from channel_protocol import scoped_conversation_id
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -63,6 +64,23 @@ from .schemas import (
 from .workspace_policy import repository_is_allowed
 
 _WORKSPACE_UNSET = object()
+
+
+class AmbiguousRoute(RuntimeError):
+    """`binding_for_route` matched more than one row for one `(kind, adapter,
+    address)`.
+
+    Unreachable while migration 0023's `agent_channels_kind_address_key`
+    (UNIQUE kind, address) caps the pair at one row, so `matching_bindings`
+    can never hand this function more than one. Raised rather than returned as `None`
+    (which would read as "no binding", hiding the ambiguity) or resolved by
+    picking `matches[0]` (which would silently serve a different agent's
+    route than the caller asked for) -- the same failure mode
+    `routers/agents.py:_binding_for` raises a 409 on for the identical
+    question at the write path. A router that reaches this once the contract
+    migration for ADR-0168 decision 3 (#3100) widens that constraint to the
+    triple decides its own response; none has to catch it yet.
+    """
 
 
 class PublicationReplayConflict(RuntimeError):
@@ -323,7 +341,12 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
 
 
 async def lock_agent_bindings(session: AsyncSession, agent_id: uuid.UUID) -> list[AgentChannel]:
-    """`SELECT ... FOR UPDATE` the agent's WHOLE binding set, ordered as it reads.
+    """`SELECT ... FOR UPDATE` the agent's WHOLE binding set, in route order.
+
+    Ordered by the route `(kind, adapter, address)` (ADR-0168 decision 3), so
+    the lock order stays total if several identities ever share a pair.
+    `Agent.channels` reads `(kind, address)`; the two orders agree while
+    migration 0023's `agent_channels_kind_address_key` holds one row per pair.
 
     Every mutating binding handler opens with this, and then picks its target
     out of the returned list rather than issuing a second, unlocked query --
@@ -352,28 +375,140 @@ async def lock_agent_bindings(session: AsyncSession, agent_id: uuid.UUID) -> lis
     result = await session.scalars(
         select(AgentChannel)
         .where(AgentChannel.agent_id == agent_id)
-        .order_by(AgentChannel.kind, AgentChannel.address)
+        .order_by(AgentChannel.kind, AgentChannel.adapter, AgentChannel.address)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     return list(result)
 
 
-async def agent_id_for_pair(session: AsyncSession, kind: str, address: str) -> uuid.UUID | None:
-    """Which agent holds this `(kind, address)` pair, if any.
+async def agent_id_for_route(
+    session: AsyncSession, kind: str, adapter: str | None, address: str
+) -> uuid.UUID | None:
+    """Which agent holds this ROUTE -- `(kind, adapter, address)` -- if any.
 
-    Named rather than inlined at its one call site: it answers the question a
+    Named rather than inlined at its call sites: it answers the question a
     binding write's 409 has to answer accurately -- is the duplicate THIS
     agent's or another's -- and an inline `select` there reads as an incidental
-    query the next reader deletes.
+    query the next reader deletes. Replaces `agent_id_for_pair` (ADR-0168
+    decision 3): the pair alone no longer names the row uniquely once several
+    identities can share one `(kind, address)`.
+
+    Selects the rows on `(kind, address)` and narrows to `adapter`'s RESOLVED
+    identity in PYTHON, because a SQL predicate on the raw `adapter` column
+    would miss a legacy NULL -- `route_identity` is what turns that NULL into
+    'default' for Slack, and there is no portable SQL equivalent to call
+    without duplicating the identity rule in a second language. Migration
+    0023's `agent_channels_kind_address_key` (UNIQUE kind, address) holds the
+    candidate set to at most one row until the contract migration for
+    ADR-0168 decision 3 (#3100) widens it to the triple; the loop is for when
+    several identities can share a pair.
     """
 
-    owner: uuid.UUID | None = await session.scalar(
+    wanted = route_identity(kind, adapter)
+    result = await session.execute(
+        select(AgentChannel.agent_id, AgentChannel.adapter).where(
+            AgentChannel.kind == kind, AgentChannel.address == address
+        )
+    )
+    for owner_id, stored_adapter in result.all():
+        if route_identity(kind, stored_adapter) == wanted:
+            return owner_id
+    return None
+
+
+async def agent_id_for_channel_pair(
+    session: AsyncSession, kind: str, address: str
+) -> uuid.UUID | None:
+    """Which agent holds this PAIR, ignoring identity -- if any.
+
+    A deliberately narrower question than `agent_id_for_route`: the database
+    constraint is still `agent_channels_kind_address_key` (UNIQUE kind,
+    address; migration 0023, until the contract migration for ADR-0168
+    decision 3 (#3100) widens it to the triple), so this is the lookup that
+    answers what the constraint actually enforces. `agent_id_for_route` can
+    legitimately return `None` while this agent still holds the pair under a
+    DIFFERENT identity -- a custom-transport binding a bare identity-form
+    write collided with, for instance -- and `_raise_binding_conflict` falls
+    back to this lookup so that case still names the right agent instead of
+    reading as "another agent already bound". `add_agent_channel` asks it too,
+    to recognize a re-POST of a pair this agent already holds as idempotent.
+
+    Not the routing question: that is `agent_id_for_route`'s. This one exists
+    only because the pair constraint has not widened yet.
+    """
+
+    return await session.scalar(
         select(AgentChannel.agent_id).where(
             AgentChannel.kind == kind, AgentChannel.address == address
         )
     )
-    return owner
+
+
+def matching_bindings(
+    bindings: list[AgentChannel], kind: str, address: str, adapter: str | None
+) -> list[AgentChannel]:
+    """The rows in ``bindings`` that `(kind, address, adapter)` selects.
+
+    A thin, name-preserving wrapper over `aci_protocol.turn.matching_routes`
+    (ADR-0168 decision 3), the one matching rule shared by every reader that
+    has to answer "is this the same route" -- whether it already holds the
+    candidate rows (`routers/hooks.py`'s preloaded `agent.channels`,
+    `routers/agents.py`'s locked per-agent set) or fetches them fresh
+    (`binding_for_route`, below).
+    """
+
+    return matching_routes(bindings, kind, address, adapter)
+
+
+async def binding_for_route(
+    session: AsyncSession,
+    kind: str,
+    adapter: str | None,
+    address: str,
+    *,
+    for_update: bool = False,
+) -> AgentChannel | None:
+    """The single binding ROW `(kind, adapter, address)` names, or None.
+
+    The shared answer for every reader that needs the row itself rather than
+    only its owning agent id -- the read-path counterpart to
+    `agent_id_for_route`. Selects the PAIR in SQL
+    (`agent_channels_kind_address_key` still holds the pair to one row, so
+    at most one row can match) and narrows to `adapter`'s identity with
+    `matching_bindings`, so this function and every in-memory caller of that
+    function agree on what counts as the same route.
+
+    Raises `AmbiguousRoute` rather than returning `matches[0]` if
+    `matching_bindings` ever returns more than one row -- unreachable today
+    for the reason above, but once the contract migration for ADR-0168
+    decision 3 (#3100) widens the constraint to the triple this must fail
+    loud, not silently serve whichever row sorted first.
+
+    `for_update` takes the same row lock `lock_agent_bindings` and
+    `mint_channel_token` already take, with `populate_existing` for the same
+    reason: a caller already holding this row in its identity map (loaded
+    for an earlier check) must see the fresh, locked version rather than a
+    stale one from before a concurrent winner's commit.
+    """
+
+    stmt = select(AgentChannel).where(AgentChannel.kind == kind, AgentChannel.address == address)
+    if for_update:
+        # Locks every row on the PAIR, not only the one `adapter` will match
+        # -- harmless while the pair holds at most one row, but once the
+        # contract migration for ADR-0168 decision 3 (#3100) lets several
+        # identities share a pair the lock must narrow by adapter in SQL, or
+        # a mint for one identity needlessly blocks a concurrent mint for
+        # another on the same pair.
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    rows = list(await session.scalars(stmt))
+    matches = matching_bindings(rows, kind, address, adapter)
+    if len(matches) > 1:
+        raise AmbiguousRoute(
+            f"{len(matches)} rows match kind {kind!r}, adapter {adapter!r}, address "
+            f"{address!r}; pass a more specific adapter to name one"
+        )
+    return matches[0] if matches else None
 
 
 async def update_channel_binding(
@@ -408,9 +543,31 @@ async def update_channel_binding(
     # re-points the pair and leaves the old endpoint/adapter behind would send
     # the new route's replies to the previous adapter, authenticated as it. This
     # is also the cutover's step 10 -- bind first, move the route in later.
-    if "endpoint" in channel.model_fields_set:
+    endpoint_sent = "endpoint" in channel.model_fields_set
+    adapter_sent = "adapter" in channel.model_fields_set
+    if endpoint_sent:
         binding.endpoint = channel.endpoint
         binding.adapter = channel.adapter
+    elif channel.kind == SLACK_KIND and adapter_sent:
+        # ADR-0168 decision 3: a Slack PATCH may name a new
+        # identity ALONE, with no endpoint (`ChannelBindingPatch
+        # ._check_route_presence` already allows this shape -- Slack's
+        # implicit transport carries no endpoint). The
+        # `"endpoint" in model_fields_set` gate above predates the identity
+        # form and would otherwise silently drop the one field this branch's
+        # caller actually sent.
+        #
+        # `endpoint` is cleared too, not left as it was: naming an identity
+        # alone means moving TO the identity form (`ChannelBindingPatch`'s own
+        # docstring), and 0024's `agent_channels_route_pair_ck` CHECKs
+        # `(endpoint IS NULL) = (adapter IS NULL)` at the database -- writing
+        # `channel.adapter` (None, the stored form of the default identity)
+        # while a stale endpoint from a prior custom-transport row survives
+        # would violate it. A row that WAS on the custom-transport form
+        # therefore loses that transport on this move, which is the point:
+        # the caller asked to be addressed by identity, not by a lingering URL.
+        binding.adapter = channel.adapter
+        binding.endpoint = None
     binding.generation += 1
     await session.flush()
     return binding
@@ -1070,8 +1227,15 @@ async def create_publication(
             .execution_options(populate_existing=True)
         )
         if binding is not None and (
-            binding.endpoint != data.reply_endpoint or binding.adapter != data.reply_adapter
+            binding.endpoint != data.reply_endpoint
+            or route_identity(data.reply_kind, binding.adapter)
+            != route_identity(data.reply_kind, data.reply_adapter)
         ):
+            # Compared through `route_identity`, not the raw column (ADR-0168
+            # decision 3): a Slack binding is stored with `adapter=None` and a
+            # wire-side `reply_adapter='default'` names the SAME identity; a
+            # raw `!=` would see a mismatch and drop a lineage this
+            # publication should adopt.
             binding = None
         lineage_id = uuid.uuid4()
         lineage = ThreadPublicationLineage(
@@ -1169,7 +1333,13 @@ async def create_publication(
                 data.reply_kind != review_binding.kind
                 or data.reply_channel != review_binding.address
                 or data.reply_endpoint != review_binding.endpoint
-                or data.reply_adapter != review_binding.adapter
+                # Through `route_identity`, not the raw column (ADR-0168
+                # decision 3): a stored `adapter=None` Slack binding and a
+                # wire-side `reply_adapter='default'` name the same identity,
+                # so comparing the raw columns would refuse a review revision
+                # replaying the exact route its own reservation was raised on.
+                or route_identity(data.reply_kind, data.reply_adapter)
+                != route_identity(review_binding.kind, review_binding.adapter)
                 or (data.reply_conversation_id or data.conversation_id)
                 != lineage.reply_conversation_id
             ):
@@ -2109,6 +2279,12 @@ async def _adapter_served_targets(
     Read fresh on every call, like ``get_approval_route_binding``: a binding
     deleted or a route re-pointed after the credential was issued narrows what
     the adapter sees immediately.
+
+    Holds a binding row of ANY kind, Slack included: an adapter principal
+    (ADR-0154) is scoped to the binding ROW id its token claims, not to a
+    kind that can authenticate HTTP egress, so a principal may legitimately
+    serve a Slack binding (``test_adapter_principal.py``'s own default
+    fixture is one).
     """
 
     if not bindings:

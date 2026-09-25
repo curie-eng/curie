@@ -58,7 +58,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
-from .. import adapter_principal, channel_token
+from .. import adapter_principal, channel_token, crud
 from ..approval_auth import platform_key_or_adapter
 from ..auth import verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
@@ -122,6 +122,16 @@ class ChannelTokenRequest(ChannelBinding):
     # them. Minting itself is a rotation write: it bumps generation so a remint
     # revokes the token it replaces (#2379).
     ttl_s: int = Field(default=3600, gt=0, le=604800)
+
+    # The route's IDENTITY half (ADR-0168 decision 3), optional so every
+    # caller that predates it -- CLI, UI, the e2e proof -- keeps minting
+    # exactly as before: an omission resolves through `route_identity` to the
+    # default Slack identity, or the single row migration 0023's pair
+    # constraint lets a non-Slack pair hold. Not validated as a slug here the
+    # way `ChannelBindingWrite.adapter` is: this field NAMES a route to look
+    # up, it never gets written to one, so there is no config-map-key shape
+    # for a caller-supplied value to violate.
+    adapter: str | None = None
 
 
 class ChannelTokenOut(BaseModel):
@@ -190,30 +200,32 @@ def _parse_turn(raw: bytes) -> TurnIn:
 
 
 async def _resolve_binding(
-    session: Any, kind: str, address: str
+    session: Any, kind: str, adapter: str | None, address: str
 ) -> AgentChannel | None:
-    """The binding row for one `(kind, address)` pair, or None.
+    """The binding row for one `(kind, adapter, address)` route, or None.
 
     The PAIR, never the address alone: since migration 0023 one address can be
     bound under two kinds, and resolving on the address would let one kind's
-    adapter reach the other kind's agent.
+    adapter reach the other kind's agent. Delegates to `crud.binding_for_route`
+    (ADR-0168 decision 3), which narrows the pair's row to `adapter`'s
+    RESOLVED identity -- an omitted Slack adapter still means the default app,
+    exactly as before this router had an identity to resolve.
     """
 
-    row: AgentChannel | None = await session.scalar(
-        select(AgentChannel).where(
-            AgentChannel.kind == kind, AgentChannel.address == address
-        )
-    )
-    return row
+    return await crud.binding_for_route(session, kind, adapter, address)
 
 
 def _route_is_configured(row: AgentChannel) -> bool:
     """Whether this binding can actually deliver a reply.
 
-    `slack` needs no per-binding route (D4.4). Every other kind needs both
-    halves, and the DB CHECK guarantees they are both-or-neither, so testing one
-    of them would be enough -- both are tested because the guarantee is the
-    database's, not this function's.
+    `slack` needs no per-binding route (D4.4): the worker's configured Slack
+    origin is what actually delivers. A default-identity Slack row carries
+    NULL in both `endpoint` and `adapter`, not its identity, until the
+    contract migration for ADR-0168 decision 3 (#3100) flips the stored form,
+    so it is answered by kind and never reaches the test below. Every other
+    kind needs both halves, and the DB CHECK guarantees they are
+    both-or-neither, so testing one of them would be enough -- both are tested
+    because the guarantee is the database's, not this function's.
     """
 
     if row.kind == _IMPLICIT_ROUTE_KIND:
@@ -278,11 +290,11 @@ async def mint_channel_token(
         # never take `FOR UPDATE` on a row it does not serve, and unknown vs
         # unserved must read identically (same detail, same lack of a lock) so
         # an adapter cannot probe which pairs are bound outside its own set.
-        unlocked_row = await session.scalar(
-            select(AgentChannel).where(
-                AgentChannel.kind == data.kind, AgentChannel.address == data.address
-            )
-        )
+        # Selected by the TRIPLE (`data.adapter`, ADR-0168 decision 3), not
+        # only the pair: an omitted `data.adapter` still resolves to the
+        # default Slack identity through `route_identity`, so an unchanged
+        # caller keeps naming the same row it always did.
+        unlocked_row = await crud.binding_for_route(session, data.kind, data.adapter, data.address)
         if unlocked_row is None or unlocked_row.id not in adapter.bindings:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "adapter principal does not serve this binding"
@@ -293,11 +305,8 @@ async def mint_channel_token(
     # on two tokens, and neither rotation would revoke the other. `populate_existing`
     # is the same load-bearing choice as `crud.lock_agent_bindings`. Only reached
     # for a row the adapter (or the platform key) actually serves.
-    row: AgentChannel | None = await session.scalar(
-        select(AgentChannel)
-        .where(AgentChannel.kind == data.kind, AgentChannel.address == data.address)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    row = await crud.binding_for_route(
+        session, data.kind, data.adapter, data.address, for_update=True
     )
     if row is None:
         raise HTTPException(
@@ -475,7 +484,12 @@ async def ingest_turn(
     )
     body = _parse_turn(raw)
     claims = _verify_credential(x_api_key)
-    row = await _resolve_binding(session, body.kind, body.address)
+    # `TurnIn` deliberately does not model `adapter` (plan D4.1, `TurnIn`'s own
+    # docstring): the credential -- not the body -- names the binding, so an
+    # omitted adapter here is not "unspecified", it is every caller of this
+    # route, including one that predates ADR-0168 decision 3. `None` resolves
+    # to the default Slack identity or the pair's single non-Slack row.
+    row = await _resolve_binding(session, body.kind, None, body.address)
     _authorize(claims, row)
     if row is None:
         raise HTTPException(

@@ -157,6 +157,14 @@ def test_the_map_no_longer_carries_the_retired_one_binding_per_agent_entry() -> 
     dropped constraint's message -- but only because a pre-0018 database still
     HAS that constraint, and no database will ever carry `agent_channels_agent_id_key`
     while also serving a platform that offers the subresource.
+
+    ADR-0168 decision 3 (#3100) keeps the stored form until its contract
+    migration, so the constraint the database carries is STILL
+    `agent_channels_kind_address_key`. It fires on the PAIR whatever identity
+    the write names, so its message names the pair and no identity. That
+    migration adds the widened constraint's entry with the constraint itself;
+    a speculative entry for a constraint no database carries would read as a
+    protection that does not exist.
     """
 
     assert "agent_channels_agent_id_key" not in _UNIQUE_CONSTRAINT_MESSAGES, (
@@ -164,7 +172,17 @@ def test_the_map_no_longer_carries_the_retired_one_binding_per_agent_entry() -> 
         "(ADR-0118); its 409 message can never fire again and tells an operator "
         "the opposite of what the API now does"
     )
-    assert "agent_channels_kind_address_key" in _UNIQUE_CONSTRAINT_MESSAGES, (
+    message = _UNIQUE_CONSTRAINT_MESSAGES.get("agent_channels_kind_address_key")
+    assert message is not None, (
         "one agent per route (#38) is unchanged and is now the ONLY binding "
         "conflict; dropping its message turns that 409 into a bare fallback"
+    )
+    assert "channel kind and address" in message, message
+    assert "identity" not in message, (
+        "the pair constraint fires whatever the identity, so its message must "
+        "not claim the identity took part: " + message
+    )
+    assert "agent_channels_route_key" not in _UNIQUE_CONSTRAINT_MESSAGES, (
+        "no database carries a route-triple constraint until the contract "
+        "migration for ADR-0168 decision 3 (#3100) adds it"
     )

@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NoReturn
 
+from aci_protocol.turn import route_identity
 from fastapi import APIRouter, Depends, HTTPException, status
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
@@ -64,7 +65,10 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
     # (ADR-0096 phase 2). Without this the create succeeded and the second agent
     # was silently shadowed by the resolver at runtime. Stated without the word
     # "Slack" since ADR-0096: the invariant, and the shadowing it prevents,
-    # belong to every channel kind.
+    # belong to every channel kind. The constraint is on the PAIR and fires
+    # whatever identity the write names, so the message names the pair. The
+    # contract migration for ADR-0168 decision 3 (#3100) widens it to the
+    # `(kind, adapter, address)` route and adds that constraint's entry here.
     "agent_channels_kind_address_key": (
         "another agent is already bound to that channel kind and address; one "
         "agent per route (move or delete the other agent, or pick another "
@@ -311,40 +315,94 @@ async def _agent_or_404(session: AsyncSession, agent_id: uuid.UUID) -> Agent:
     return agent
 
 
-def _binding_for(bindings: list[AgentChannel], kind: str, address: str) -> AgentChannel:
-    """Pick the pair's row out of THIS agent's locked set, or 404.
+def _binding_for(
+    bindings: list[AgentChannel], kind: str, address: str, adapter: str | None
+) -> AgentChannel:
+    """Pick the route's row out of THIS agent's locked set, or 404 or 409.
+
+    The matching RULE lives in `crud.matching_bindings`, shared with every
+    other reader of a route including `add_agent_channel`'s idempotence check
+    below, so the two surfaces here agree on what counts as "the same
+    binding". Migration 0023's `agent_channels_kind_address_key` (UNIQUE
+    kind, address) holds one row per pair, so the 409 below (several
+    identities on one pair) cannot fire against real data until the contract
+    migration for ADR-0168 decision 3 (#3100) widens the constraint to the
+    triple and several identities can share one pair.
 
     Selecting from the locked list rather than issuing a second, unlocked query
     is what makes the lock load-bearing. It is also the authorization boundary:
-    a pair belonging to a DIFFERENT agent names no row here, so it reads as 404
-    rather than becoming a cross-agent write the caller sees a 200 for.
+    a route belonging to a DIFFERENT agent names no row here, so it reads as
+    404 rather than becoming a cross-agent write the caller sees a 200 for.
     """
 
-    for binding in bindings:
-        if binding.kind == kind and binding.address == address:
-            return binding
+    matches = crud.matching_bindings(bindings, kind, address, adapter)
+    if len(matches) > 1:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"several identities are bound to {kind}:{address}; pass adapter to name one",
+        )
+    if matches:
+        return matches[0]
+    if adapter is not None:
+        # Names the identity that found nothing, not only the pair, so a
+        # caller who passed the right pair but the wrong identity does not
+        # read the same 404 as one who mistyped the address itself.
+        identity = route_identity(kind, adapter)
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"this agent has no {kind}:{address} binding as {identity!r}",
+        )
     raise HTTPException(
         status.HTTP_404_NOT_FOUND,
         f"this agent has no {kind}:{address} binding",
     )
 
 
-def _conflict_message(owner: uuid.UUID | None, agent_id: uuid.UUID, kind: str, address: str) -> str:
-    """The 409 sentence for a taken pair, accurate about WHO holds it.
+def _conflict_message(
+    route_owner: uuid.UUID | None,
+    pair_owner: uuid.UUID | None,
+    agent_id: uuid.UUID,
+    kind: str,
+    adapter: str | None,
+    address: str,
+) -> str:
+    """The 409 sentence for a taken route, accurate about WHO holds it.
 
     The generic map message says "another agent is already bound", which is
-    false -- and actively misleading -- when the duplicate is this agent's own:
-    it sends an operator looking for an agent that does not exist, and the CLI's
-    ensure-bound recheck cannot tell a satisfied desired state from a real
-    collision. A `None` owner means the winning row was deleted between the
-    failed insert and this lookup; the pair is free again, and the generic
-    sentence is the safe answer since either way the caller retries.
+    false -- and actively misleading -- when the duplicate is this agent's
+    own. Two different "this agent's own" cases need two different sentences:
+
+    - `route_owner == agent_id`: the EXACT route this write asked for
+      (kind, resolved identity, address) already exists -- the ordinary
+      idempotent-recheck case.
+    - `route_owner is None` but `pair_owner == agent_id`: the database
+      constraint is still the pair alone (`agent_channels_kind_address_key`,
+      migration 0023, until the contract migration for ADR-0168 decision 3
+      (#3100) widens it), so the identity-precise lookup can answer `None` while
+      this agent still holds `(kind, address)` under a DIFFERENT route -- a
+      custom-transport binding a bare identity-form write collided with, for
+      instance. Reporting the generic "another agent" sentence here is false:
+      no other agent is involved, this agent's own other route is what is in
+      the way.
+    - Otherwise (both `None`, or naming a different agent): the generic map
+      message. Both `None` means the winning row was deleted between the
+      failed insert and this lookup -- the pair is free again -- and the
+      generic sentence is the safe answer either way, since the caller
+      retries.
     """
 
-    if owner is not None and owner == agent_id:
+    if route_owner is not None and route_owner == agent_id:
+        identity = route_identity(kind, adapter)
+        route = f"{kind}:{identity}:{address}" if identity is not None else f"{kind}:{address}"
         return (
-            f"this agent is already bound to {kind}:{address}; the binding you "
+            f"this agent is already bound to {route}; the binding you "
             "asked for already exists, so nothing was changed"
+        )
+    if pair_owner is not None and pair_owner == agent_id:
+        return (
+            f"this agent already holds {kind}:{address} under another route; "
+            "this installation allows only one route per (kind, address) pair "
+            "-- move or delete the other binding first"
         )
     return _UNIQUE_CONSTRAINT_MESSAGES["agent_channels_kind_address_key"]
 
@@ -417,10 +475,24 @@ async def _raise_binding_conflict(
 
     if classify_integrity_error(exc) is None:
         raise exc
-    owner = await crud.agent_id_for_pair(session, channel.kind, channel.address)
+    route_owner = await crud.agent_id_for_route(
+        session, channel.kind, channel.adapter, channel.address
+    )
+    pair_owner = route_owner
+    if route_owner is None:
+        # The database constraint is the PAIR, not the triple
+        # (`agent_channels_kind_address_key`, migration 0023, until the
+        # contract migration for ADR-0168 decision 3 (#3100)). The
+        # identity-precise lookup above can legitimately answer None while
+        # this agent still holds the pair under a DIFFERENT route, so recheck
+        # at the pair level before `_conflict_message` concludes the pair is
+        # free or belongs to someone else.
+        pair_owner = await crud.agent_id_for_channel_pair(session, channel.kind, channel.address)
     raise HTTPException(
         status.HTTP_409_CONFLICT,
-        _conflict_message(owner, agent_id, channel.kind, channel.address),
+        _conflict_message(
+            route_owner, pair_owner, agent_id, channel.kind, channel.adapter, channel.address
+        ),
     ) from exc
 
 
@@ -436,7 +508,15 @@ async def add_agent_channel(
         # serializes this add against a concurrent move or delete of the same
         # agent's bindings, which is what keeps the last-binding guard sound.
         bindings = await crud.lock_agent_bindings(session, agent_id)
-        if any(
+        # A re-POST of a pair this agent already holds is an idempotent
+        # success that changes nothing. `crud.matching_bindings` is the same
+        # rule `_binding_for` selects by, so a re-POST naming no adapter finds
+        # this agent's Slack custom-transport row the way a PATCH or DELETE
+        # naming none does. The pair check behind it covers a repeat naming a
+        # different adapter: migration 0023's `agent_channels_kind_address_key`
+        # lets the pair carry one row, so that repeat cannot be a second route
+        # and would otherwise fail the insert as a conflict with itself.
+        if crud.matching_bindings(bindings, data.kind, data.address, data.adapter) or any(
             binding.kind == data.kind and binding.address == data.address for binding in bindings
         ):
             return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
@@ -449,8 +529,10 @@ async def add_agent_channel(
             # Two concurrent idempotent adds can both observe the pair absent;
             # the winner inserts and the loser reaches the unique constraint.
             # Once the savepoint has rolled back, treat that winner as the same
-            # successful desired state when it belongs to this agent.
-            owner = await crud.agent_id_for_pair(session, data.kind, data.address)
+            # successful desired state when it belongs to this agent. Asked of
+            # the PAIR, the key the violated constraint enforces, for the same
+            # reason as the check above.
+            owner = await crud.agent_id_for_channel_pair(session, data.kind, data.address)
             if owner == agent_id:
                 return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
             await _raise_binding_conflict(exc, session, agent_id, data)
@@ -464,9 +546,14 @@ async def move_agent_channel(
     address: str,
     data: ChannelBindingPatch,
     session: SessionDep,
+    adapter: str | None = None,
     expected_generation: int | None = None,
 ) -> AgentOut:
-    """Move (or re-assert) the binding the `(kind, address)` pair names.
+    """Move (or re-assert) the binding the `(kind, adapter, address)` route names.
+
+    `adapter` selects the IDENTITY (ADR-0168 decision 3): omitted, it means
+    Slack's default identity, and for any other kind it selects the only row
+    on `(kind, address)` -- see `_binding_for`.
 
     `expected_generation` is an OPTIONAL compare-and-set, in the shape
     `routers/state.py` uses for its versioned rows, so the two CAS surfaces read
@@ -479,7 +566,7 @@ async def move_agent_channel(
     async with _deadlock_as_conflict():
         agent = await _agent_or_404(session, agent_id)
         bindings = await crud.lock_agent_bindings(session, agent_id)
-        binding = _binding_for(bindings, kind, address)
+        binding = _binding_for(bindings, kind, address, adapter)
         if expected_generation is not None and expected_generation != binding.generation:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -498,9 +585,12 @@ async def move_agent_channel(
 
 @router.delete("/{agent_id}/channels", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_agent_channel(
-    agent_id: uuid.UUID, kind: str, address: str, session: SessionDep
+    agent_id: uuid.UUID, kind: str, address: str, session: SessionDep, adapter: str | None = None
 ) -> None:
-    """Unbind the pair, unless it is this agent's last binding.
+    """Unbind the route, unless it is this agent's last binding.
+
+    `adapter` selects the IDENTITY (ADR-0168 decision 3), the same as on the
+    move endpoint above -- see `_binding_for`.
 
     The last one is refused: an agent with zero bindings is deployed,
     healthy-looking and unable to receive a turn -- #38's silent-shadow state,
@@ -512,7 +602,7 @@ async def remove_agent_channel(
     async with _deadlock_as_conflict():
         await _agent_or_404(session, agent_id)
         bindings = await crud.lock_agent_bindings(session, agent_id)
-        binding = _binding_for(bindings, kind, address)
+        binding = _binding_for(bindings, kind, address, adapter)
         if len(bindings) <= 1:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,

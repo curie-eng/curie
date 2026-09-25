@@ -111,6 +111,17 @@ LOCK_MODE = "ACCESS EXCLUSIVE"
 #: because `load_declarations` enforces the pair rule the document states.
 SLACK_KIND = "slack"
 
+#: The identity NULL names for a Slack row (ADR-0168 decision 3). The stored
+#: form keeps the installation's one Slack app as NULL, never as this string,
+#: until the contract migration for that decision (#3100) flips it; but
+#: a declaration is an OPERATOR document, not a stored row, and honoring one
+#: has to accept the name a human would actually write. This module may import
+#: only the standard library, `sqlalchemy` and `alembic` (module docstring),
+#: so this is a second copy of `aci_protocol.turn.DEFAULT_IDENTITY` rather
+#: than an import of it -- the same reason `SLACK_KIND` above is a second copy
+#: of `aci_protocol.turn.SLACK_KIND`.
+DEFAULT_IDENTITY = "default"
+
 #: The worker is already quiesced at hook weight -10, so the only remaining
 #: contenders are ordinary API requests whose budgets are sub-second. 15 s
 #: comfortably outlasts one, while three `backoffLimit` retries of a wedged
@@ -385,14 +396,26 @@ def load_declarations() -> dict[str, Declaration]:
         # Slack row names a credential the Slack egress never consults, and
         # would breach 0024's `agent_channels_route_pair_ck` reasoning about
         # what a complete route is.
+        #
+        # ADR-0168 decision 3 widens the Slack half of the rule: a
+        # declaration may now name the default identity EXPLICITLY, as
+        # `'default'`, not only as null -- an operator vouching for a row's
+        # provenance is describing what they observed, and the identity has a
+        # name now. It is still STORED as NULL (below): the column's form is
+        # unchanged until the contract migration for that decision (#3100),
+        # only what a declaration may say moves. Any other name is still
+        # refused: this module cannot import `identities.declared_identities`
+        # (the ORM-import contract above) to check it against the chart's
+        # list, but that list names only the one Slack app until decision 1
+        # (#3102) makes it the chart's, so any second name is unearned.
         kind = str(entry["reply_kind"]).strip()
-        if kind == SLACK_KIND and adapter is not None:
+        if kind == SLACK_KIND and adapter not in (None, DEFAULT_IDENTITY):
             raise _declaration_refusal(
                 raw_path,
                 f"{label} declares reply_kind {SLACK_KIND!r} with a 'reply_adapter' of "
                 f"{adapter!r}; a Slack reply goes back through the worker's configured "
-                "Slack origin and names no egress credential, so its adapter must be "
-                "null",
+                "Slack origin and names only its default identity, so "
+                f"'reply_adapter' must be null or {DEFAULT_IDENTITY!r}",
             )
         if kind != SLACK_KIND and adapter is None:
             raise _declaration_refusal(
@@ -405,10 +428,21 @@ def load_declarations() -> dict[str, Declaration]:
                 "has to be named",
             )
 
+        if adapter is None or (kind == SLACK_KIND and adapter == DEFAULT_IDENTITY):
+            # The stored form is unchanged: the default Slack identity is
+            # still NULL (`route_identity`, migrations 0023/0024),
+            # so a declaration naming it as `'default'` is normalized back to
+            # NULL here -- the same row shape `crud.py`'s raw
+            # `approval.reply_adapter != data.reply_adapter` replay-conflict
+            # check still compares, which a literal `'default'` would fail.
+            stored_adapter = None
+        else:
+            stored_adapter = str(adapter).strip()
+
         declarations[approval_id] = Declaration(
             approval_id=approval_id,
             reply_kind=kind,
-            reply_adapter=None if adapter is None else str(adapter).strip(),
+            reply_adapter=stored_adapter,
             actor=str(entry["actor"]).strip(),
             reason=str(entry["reason"]).strip(),
         )

@@ -215,6 +215,13 @@ def test_ordinary_publication_adapters_still_require_both_route_halves(
     route: dict[str, str | None],
 ) -> None:
     payload = _publication_payload(str(uuid.uuid4()))
+    # An "ordinary" (non-Slack) reply route: `_publication_payload` defaults
+    # to `reply_kind="slack"`, whose route is a declared IDENTITY under
+    # ADR-0168 decision 3, not an arbitrary adapter -- "agentmail-sandbox"
+    # would be refused as an undeclared Slack identity rather than exercising
+    # the both-or-neither rule this test is actually about.
+    payload["reply_kind"] = "email"
+    payload["reply_channel"] = "ops@example.test"
     payload.update(route)
 
     with pytest.raises(ValidationError, match="endpoint and adapter together"):
@@ -227,6 +234,45 @@ def test_ordinary_publication_adapters_still_require_both_route_halves(
     ordinary = PublicationCreate.model_validate(payload)
     assert ordinary.reply_endpoint == "https://adapter.example.test/replies"
     assert ordinary.reply_adapter == "agentmail-sandbox"
+
+
+def test_publication_schema_accepts_a_slack_identity_with_no_endpoint() -> None:
+    """No endpoint: this reply route names its IDENTITY (ADR-0168 decision 3),
+    checked against the identities this installation declares. Omitted and the
+    explicit `"default"` spelling both normalize to the pre-ADR-0168 stored
+    form (None), which is unchanged until the contract migration for that
+    decision (#3100)."""
+
+    omitted = _publication_payload(str(uuid.uuid4()))
+    assert PublicationCreate.model_validate(omitted).reply_adapter is None
+
+    explicit = _publication_payload(str(uuid.uuid4()))
+    explicit["reply_adapter"] = "default"
+    assert PublicationCreate.model_validate(explicit).reply_adapter is None
+
+
+def test_publication_schema_refuses_an_undeclared_slack_identity_with_no_endpoint() -> None:
+    payload = _publication_payload(str(uuid.uuid4()))
+    payload["reply_adapter"] = "second"
+
+    with pytest.raises(ValidationError, match="'second'.*default"):
+        PublicationCreate.model_validate(payload)
+
+
+def test_publication_schema_accepts_a_slack_endpoint_with_a_credential_adapter() -> None:
+    """The old custom-transport form is kept: a Slack reply route WITH an
+    endpoint carries a CREDENTIAL in `reply_adapter`, not an identity -- the
+    hook-approval-proof rig's shape (`charts/curie/ci/hook-approval-proof.py`),
+    which must not 422. The contract migration for ADR-0168 decision 3 (#3100)
+    is what refuses a Slack endpoint outright."""
+
+    payload = _publication_payload(str(uuid.uuid4()))
+    payload["reply_endpoint"] = "http://127.0.0.1:1"
+    payload["reply_adapter"] = "proof-offline"
+
+    publication = PublicationCreate.model_validate(payload)
+    assert publication.reply_endpoint == "http://127.0.0.1:1"
+    assert publication.reply_adapter == "proof-offline"
 
 
 def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
@@ -1850,7 +1896,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
                 )
 
     class WorkspaceBinding:
-        async def resolve(self, kind: str, channel: str) -> ResolvedDeployment:
+        async def resolve(self, kind: str, adapter: str | None, channel: str) -> ResolvedDeployment:
             return ResolvedDeployment(
                 agent_id=uuid.UUID(deployment["agent_id"]),
                 agent_name="acme-bot",
@@ -2155,7 +2201,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     repo, base_sha, base_archive = _local_publication_repository(tmp_path, REPO)
 
     class WorkspaceBinding:
-        async def resolve(self, kind: str, address: str) -> ResolvedDeployment:
+        async def resolve(self, kind: str, adapter: str | None, address: str) -> ResolvedDeployment:
             assert (kind, address) == ("slack", "C0EXAMPLE1")
             return ResolvedDeployment(
                 agent_id=uuid.UUID(deployment["agent_id"]),
@@ -2563,8 +2609,8 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
             self._resolver = resolver
             self.history_keys: list[tuple[str, str, str]] = []
 
-        async def resolve(self, kind: str, address: str) -> Any:
-            return await self._resolver.resolve(kind, address)
+        async def resolve(self, kind: str, adapter: str | None, address: str) -> Any:
+            return await self._resolver.resolve(kind, adapter, address)
 
         def boot_env(
             self,

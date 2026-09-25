@@ -481,9 +481,9 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
     assert fetched.json()["repo_full_name"] == REPO, (
         "a channel write must leave the repository binding unchanged"
     )
-    assert fetched.json()["channels"] == [{"kind": "slack", "address": "C0EXAMPLE4"}], (
-        "the channel write must still take effect"
-    )
+    assert fetched.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE4", "adapter": "default"}
+    ], "the channel write must still take effect"
 
 
 def test_main_push_promotes_and_reuses_the_built_version(

@@ -73,7 +73,9 @@ def test_patch_without_thinking_leaves_it_unchanged(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["thinking"] == "adaptive"
-    assert resp.json()["channels"] == [{"kind": "slack", "address": "CTHINK002"}]
+    assert resp.json()["channels"] == [
+            {"kind": "slack", "address": "CTHINK002", "adapter": "default"}
+        ]
 
 
 def test_the_api_stores_the_value_verbatim_and_does_not_validate_it(

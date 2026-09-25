@@ -197,7 +197,7 @@ def _runner_state_url(*, kind: str, address: str) -> str:
         )
         try:
             resolver = BindingResolver(engine, config)
-            resolved = await resolver.resolve(kind, address)
+            resolved = await resolver.resolve(kind, None, address)
             assert resolved is not None
             env = resolver.boot_env(
                 resolved,

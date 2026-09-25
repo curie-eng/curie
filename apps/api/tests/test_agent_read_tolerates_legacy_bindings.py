@@ -88,7 +88,9 @@ def test_a_legacy_binding_serializes_instead_of_failing(
     response = client.get(f"/agents/{agent_id}", headers=auth_headers)
 
     assert response.status_code == 200, response.text
-    assert response.json()["channels"] == [{"kind": "slack", "address": LEGACY_ADDRESS}]
+    assert response.json()["channels"] == [
+        {"kind": "slack", "address": LEGACY_ADDRESS, "adapter": "default"}
+    ]
 
 
 def test_one_bad_row_does_not_take_the_listing_down(client: Any, auth_headers: Any) -> None:

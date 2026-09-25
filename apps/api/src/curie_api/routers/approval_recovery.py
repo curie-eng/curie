@@ -144,10 +144,31 @@ async def _binding_facts(session: SessionDep, agent_id: uuid.UUID | None) -> tup
         return False, set()
     rows = (
         await session.execute(
-            select(AgentChannel.kind, AgentChannel.adapter).where(AgentChannel.agent_id == agent_id)
+            select(AgentChannel.kind, AgentChannel.adapter, AgentChannel.endpoint).where(
+                AgentChannel.agent_id == agent_id
+            )
         )
     ).all()
-    return bool(rows), {kind for kind, adapter in rows if adapter}
+    return bool(rows), {
+        kind
+        for kind, adapter, endpoint in rows
+        # Defensive, not reachable today: a Slack row's `adapter` is stored
+        # as NULL (the default identity, ADR-0168 decision 3;
+        # `route_identity`) until that decision's contract migration (#3100),
+        # and 0024's `agent_channels_route_pair_ck`
+        # ((endpoint IS NULL) = (adapter IS NULL)) makes "adapter set, no
+        # endpoint" unstorable for ANY kind -- so a Slack row already reads as
+        # bare truthiness excludes it, same as before. Stated explicitly
+        # anyway, so a future write path that ever persisted a non-NULL
+        # Slack identity here (a declared `'default'`, say) still would not
+        # read as adapter-backed egress: this set answers "does a binding
+        # authenticate the reply", and Slack's implicit worker-origin route
+        # authenticates nothing a binding names. The one exception is the
+        # pre-ADR custom-transport form (`endpoint is not None`): there
+        # `adapter` IS a credential slug like any other kind's, so it keeps
+        # today's meaning.
+        if adapter and (kind != _ROUTELESS_REPLY_KIND or endpoint is not None)
+    }
 
 
 async def _observed_facts(session: SessionDep, approval: Approval) -> list[str]:
