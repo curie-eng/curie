@@ -335,7 +335,7 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
 @pytest.mark.parametrize(
     ("number", "detail"),
     [
-        (9916, "run failed: error_max_budget_usd"),
+        (9916, "run failed"),
         (9917, "The run reached its output token limit"),
     ],
 )
@@ -361,6 +361,7 @@ def test_budget_failure_comment_names_both_limits_and_the_usd_command(
     headline = body.splitlines()[0]
     assert headline.startswith("Could not complete:")
     assert "USD cap" in headline
+    assert "daily" not in headline
     assert "output token limit" in headline
     assert "`curie cluster budget <agent> --limit <usd>`" in headline
     assert f"Provider message: {detail}" in body
