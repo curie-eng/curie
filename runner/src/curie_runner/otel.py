@@ -95,6 +95,9 @@ SPAN_ATTRIBUTE_VALUE_TYPES: Mapping[SpanAttributeKey, str] = {
     SpanAttributeKey.USAGE_CACHE_CREATION_INPUT_TOKENS: "int",
     SpanAttributeKey.TOOL_NAME: "str",
     SpanAttributeKey.OPERATION_NAME: "str",
+    SpanAttributeKey.OBSERVATION_INPUT: "str",
+    SpanAttributeKey.OBSERVATION_OUTPUT: "str",
+    SpanAttributeKey.USAGE_SCOPE: "str",
     SpanAttributeKey.PHASE: "str",
     SpanAttributeKey.PHASE_START_KIND: "str",
     SpanAttributeKey.PHASE_END_KIND: "str",
@@ -119,6 +122,25 @@ _USAGE_ATTRIBUTE_KEYS: Mapping[str, SpanAttributeKey] = {
     "cache_read_input_tokens": SpanAttributeKey.USAGE_CACHE_READ_INPUT_TOKENS,
     "cache_creation_input_tokens": SpanAttributeKey.USAGE_CACHE_CREATION_INPUT_TOKENS,
 }
+
+
+# #3128: generation input/output is redacted, then clipped to this many characters.
+_MAX_OBSERVATION_CHARS = 8000
+
+
+def _observation_text(parts: list[str]) -> str | None:
+    """Join, redact, THEN clip generation content; None when there is nothing.
+
+    Redacting first means a credential straddling the clip boundary is replaced
+    whole instead of leaving a raw prefix the pattern can no longer match.
+    """
+
+    text = redact_text("\n".join(part for part in parts if part))
+    if not text:
+        return None
+    if len(text) > _MAX_OBSERVATION_CHARS:
+        text = text[:_MAX_OBSERVATION_CHARS] + "..."
+    return text
 
 
 def _set(span: Any, key: SpanAttributeKey, value: object) -> None:
@@ -428,6 +450,11 @@ class _GenerationSpan:
         self._result_abort_cause: str | None = None
         self._terminal = False
         self._has_activity = False
+        self._generation_input: list[str] = []
+        self._generation_output: list[str] = []
+        self._pending_input: list[str] = []
+        self._tool_names: dict[str, str] = {}
+        self._turn_usage_observed = False
 
     @property
     def result_observed(self) -> bool:
@@ -470,6 +497,49 @@ class _GenerationSpan:
             return
         self._record_model(model)
         self._record_usage(usage)
+
+    def observe_input(self, text: str) -> None:
+        """Buffer generation input: the turn prompt, or tool-result names.
+
+        Text observed while no generation is active opens the next one's input.
+        """
+
+        if not text:
+            return
+        if self._active_generation is not None:
+            self._generation_input.append(text)
+        else:
+            self._pending_input.append(text)
+
+    def observe_output(self, text: str) -> None:
+        """Buffer assistant text or a ``[tool_use NAME]`` marker as output."""
+
+        if not text or self._active_generation is None:
+            return
+        self._generation_output.append(text)
+
+    def record_result_usage(self, usage: Mapping[str, Any] | None) -> None:
+        """Stamp a ResultMessage turn total for result-only providers (#3128).
+
+        Runs only when no generation in the turn received per-message usage, so
+        the turn total is never double counted. The total lands on the final
+        generation (the one active now) with ``curie.usage.scope = "turn"``;
+        earlier generations get nothing fabricated. With no active generation
+        the root is marked ``"unrecorded"`` so the gap stays visible.
+        """
+
+        if self._turn_usage_observed or not usage:
+            return
+        if not any(
+            type(usage.get(field)) is int and usage[field] >= 0
+            for field in _USAGE_ATTRIBUTE_KEYS
+        ):
+            return
+        if self._active_generation is None:
+            _set(self._root, SpanAttributeKey.USAGE_SCOPE, "unrecorded")
+            return
+        self._record_usage(usage)
+        _set(self._active_generation, SpanAttributeKey.USAGE_SCOPE, "turn")
 
     def set_succeeded(self) -> None:
         """Compatibility helper: close an unfinished active run as completed."""
@@ -624,6 +694,7 @@ class _GenerationSpan:
         _set(tool, SpanAttributeKey.TOOL_CALL_INDEX, self._tool_call_index)
         if isinstance(tool_name, str) and tool_name:
             _set(tool, SpanAttributeKey.TOOL_NAME, tool_name)
+            self._tool_names[call_id] = tool_name
         _set(tool, SpanAttributeKey.OPERATION_NAME, "execute_tool")
         self._active_tools[call_id] = (tool, self._tool_call_index)
         self._has_activity = True
@@ -643,6 +714,8 @@ class _GenerationSpan:
             outcome="error" if failed else "success",
             failed=failed,
         )
+        name = self._tool_names.pop(call_id, "unknown")
+        self._pending_input.append(f"[tool_result {name}{' error' if failed else ''}]")
         if not self._active_tools and not self._terminal:
             self._open_generation("tool_result_inferred")
 
@@ -680,6 +753,9 @@ class _GenerationSpan:
         self._generation_model_recorded = False
         self._generation_ttft_recorded = False
         self._generation_usage = {}
+        self._generation_input = self._pending_input
+        self._pending_input = []
+        self._generation_output = []
         _set(self._active_generation, SpanAttributeKey.PHASE, "provider_wait")
         _set(self._active_generation, SpanAttributeKey.PHASE_START_KIND, start_kind)
         _set(
@@ -713,6 +789,7 @@ class _GenerationSpan:
             total = self._generation_usage.get(usage_field, 0) + value
             self._generation_usage[usage_field] = total
             _set(self._active_generation, attribute_key, total)
+            self._turn_usage_observed = True
 
     def _close_deferred_generation(self) -> None:
         end_time_ns = self._deferred_generation_end_ns
@@ -735,6 +812,15 @@ class _GenerationSpan:
         self._deferred_generation_end_ns = None
         if span is None:
             return
+        for key, parts in (
+            (SpanAttributeKey.OBSERVATION_INPUT, self._generation_input),
+            (SpanAttributeKey.OBSERVATION_OUTPUT, self._generation_output),
+        ):
+            text = _observation_text(parts)
+            if text is not None:
+                _set(span, key, text)
+        self._generation_input = []
+        self._generation_output = []
         _set(span, SpanAttributeKey.PHASE_END_KIND, end_kind)
         span.set_status(StatusCode.ERROR if failed else StatusCode.OK)
         if end_time_ns is None:
@@ -765,6 +851,7 @@ class _GenerationSpan:
             self._active_tools.items(), key=lambda item: item[1][1]
         ):
             del self._active_tools[call_id]
+            self._tool_names.pop(call_id, None)
             self._end_tool(
                 tool,
                 end_kind="terminal_inferred",

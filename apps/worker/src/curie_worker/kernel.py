@@ -588,6 +588,79 @@ def _escalation_text(
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
 
+# A factory execute turn that ends done or idle without calling publish_changes
+# is re-prompted once in the same session (#3128). The progress tool's canonical
+# spelling is runner/src/curie_runner/approval.py ``PROGRESS_TOOL_NAME``; the
+# worker cannot import the runner.
+_PROGRESS_TOOL_NAME = "mcp__curie__report_progress"
+# Tools that only gather context: the runner's declared read-only set
+# (runner/src/curie_runner/side_effects.py ``CLAUDE_READONLY_TOOLS``) plus todo
+# bookkeeping. MCP tools named get_/list_/search_/read_ count as context too.
+_CONTEXT_TOOLS = frozenset(
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "LS",
+        "NotebookRead",
+        "WebFetch",
+        "WebSearch",
+        "ToolSearch",
+        "TodoRead",
+        "TodoWrite",
+    }
+)
+_CONTEXT_MCP_PREFIXES = ("get_", "list_", "search_", "read_")
+_APPROVAL_TOOL_NAME = "mcp__curie__request_approval"
+# The API's ``FinishBody.detail`` max_length.
+_FINISH_DETAIL_MAX = 4000
+_EARLY_STOP_PROMPT = (
+    "Your last turn ended before any work was reported or published. Start the "
+    "work on the issue now, report progress as you go, and call publish_changes "
+    "only when the change is complete and reviewed. If it cannot be done, post "
+    "the skill's `Could not complete:` explanation instead."
+)
+_UNPUBLISHED_PROMPT = (
+    "Your last turn ended before the work was published. Continue from the last "
+    "phase and round you reported. Call publish_changes only when the work is "
+    "complete and reviewed. If you cannot finish, post the skill's "
+    "`Could not complete:` explanation instead."
+)
+
+
+def _is_context_tool(name: str) -> bool:
+    if name in _CONTEXT_TOOLS:
+        return True
+    parts = name.split("__", 2)
+    return (
+        len(parts) == 3
+        and parts[0] == "mcp"
+        and parts[2].startswith(_CONTEXT_MCP_PREFIXES)
+    )
+
+
+def _unpublished_cause(tools_called: frozenset[str]) -> str:
+    """``early_stop`` when the turn reported nothing, published nothing and did
+    no work beyond fetching context; otherwise ``no_pull_request``."""
+
+    for name in tools_called:
+        if name == _APPROVAL_TOOL_NAME or _is_context_tool(name):
+            continue
+        return "no_pull_request"
+    return "early_stop"
+
+
+def _finish_detail(text: str) -> str | None:
+    """The agent's last message for the terminal record: redacted, THEN clipped,
+    so a credential straddling the clip can never survive as a raw prefix."""
+
+    detail = redact_text(text.strip())
+    if not detail:
+        return None
+    if len(detail) > _FINISH_DETAIL_MAX:
+        return detail[: _FINISH_DETAIL_MAX - 3] + "..."
+    return detail
+
 # How long the reclaim preflight waits for a previous owner's runner to go idle
 # after the interrupt, and how often it re-reads. Bounded (and further clamped to
 # the delivery's own remaining budget) so recovering one transferred delivery can
@@ -905,6 +978,11 @@ class TurnOutcome:
     # (#2659). Read by `_pause_for_approval` for the notice composition. None on
     # every other turn.
     workspace_inferred_repo: str | None = None
+    # Every tool the turn called, the model's reply without the receipt, and
+    # whether this outcome already includes the one factory continuation (#3128).
+    tools_called: frozenset[str] = frozenset()
+    assistant_text: str = ""
+    continued: bool = False
 
 
 class _FactoryExecutionEnded(Exception):
@@ -1031,6 +1109,7 @@ class _StreamAccumulator:
     error_message: str | None = None
     status: SessionStatus | None = None
     final_text: str | None = None
+    tools_called: set[str] = field(default_factory=set)
     approval_summary: str | None = None
     approval_route: str | None = None
     approval_gate_kind: str | None = None
@@ -2423,6 +2502,7 @@ class Kernel:
                         ),
                         lease=lease,
                         hook_outcome=_hook_success_outcome(),
+                        turn=outcome,
                     )
                     return
 
@@ -2448,7 +2528,7 @@ class Kernel:
                         telemetry_outcome="side_effect_halted",
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
-                        failure=outcome,
+                        turn=outcome,
                     )
                     return
 
@@ -2501,7 +2581,7 @@ class Kernel:
                         ),
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
-                        failure=outcome,
+                        turn=outcome,
                     )
                     return
 
@@ -3152,12 +3232,15 @@ class Kernel:
         telemetry_outcome: str,
         lease: DeliveryLease | None = None,
         hook_outcome: HookRunOutcome | None = None,
-        failure: TurnOutcome | None = None,
+        turn: TurnOutcome | None = None,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
 
-        ``failure`` is the classified turn behind an escalation. A factory run
-        finishes with the cause and provider message it carries (#3073).
+        ``turn`` is the streamed turn behind a delivered or escalated outcome.
+        An escalated factory run finishes with the cause and provider message it
+        carries (#3073); a delivered one that did not publish finishes as
+        ``early_stop`` or ``no_pull_request`` with the agent's last message
+        (#3128).
 
         For a valid cron run, close its Postgres row before these Valkey steps.
 
@@ -3227,15 +3310,22 @@ class Kernel:
                     else:
                         run.held = True
                 elif outcome == "delivered":
+                    ci_fix = parsed is not None and parsed.is_ci_fix
+                    if ci_fix:
+                        cause = "ci_fix_unpublished"
+                    elif turn is None or self._is_approval_resume(qevent.event_id):
+                        cause = "no_pull_request"
+                    else:
+                        cause = _unpublished_cause(turn.tools_called)
                     try:
                         await run.finish(
                             outcome="failed",
-                            cause=(
-                                "ci_fix_unpublished"
-                                if parsed is not None and parsed.is_ci_fix
-                                else "no_pull_request"
+                            cause=cause,
+                            detail=(
+                                None
+                                if ci_fix or turn is None
+                                else _finish_detail(turn.assistant_text)
                             ),
-                            detail=None,
                         )
                     except WorkItemConflict as exc:
                         if exc.code != "publication_pending":
@@ -3247,8 +3337,8 @@ class Kernel:
                 elif outcome == "escalated":
                     await run.finish(
                         outcome="failed",
-                        cause=_escalation_cause(failure),
-                        detail=failure.error_message if failure is not None else None,
+                        cause=_escalation_cause(turn),
+                        detail=turn.error_message if turn is not None else None,
                     )
                 else:
                     await run.finish(outcome="failed", cause="runner_failed", detail=None)
@@ -4115,6 +4205,21 @@ class Kernel:
             async with self._keep_route_alive(thread_key, routed.handle.claim_name):
                 outcome = await self._consume(
                     qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+                )
+                outcome.workspace_inferred_repo = inferred
+                outcome = await self._continue_unpublished(
+                    qevent,
+                    route,
+                    routed.handle,
+                    outcome,
+                    nav,
+                    agent_id,
+                    inferred,
+                    remaining_s=(
+                        None
+                        if remaining_s is None
+                        else remaining_s - (time.monotonic() - attempt_started)
+                    ),
                 )
             outcome.workspace_inferred_repo = inferred
             if verified_review is not None:
@@ -6314,6 +6419,82 @@ class Kernel:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
+    async def _continue_unpublished(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        handle: SandboxHandle,
+        outcome: TurnOutcome,
+        nav: NavAffordance | None,
+        agent_id: uuid.UUID | None,
+        inferred: str | None,
+        *,
+        remaining_s: float | None,
+    ) -> TurnOutcome:
+        """Re-prompt a factory execute turn that ended without publishing, ONCE.
+
+        The returned outcome merges both turns: the tools either called, and the
+        first turn's reply when the continuation said nothing. A continuation
+        that cannot start leaves the first outcome, marked continued (#3128).
+        """
+
+        parsed = parse_work_item_event_id(qevent.event_id)
+        if parsed is None or parsed.kind != "execute":
+            return outcome
+        run = self._work_item_runs.get(parsed.request_id)
+        if (
+            run is None
+            or run.event_id != qevent.event_id
+            or not run.started
+            or run.finished
+        ):
+            return outcome
+        if (
+            not outcome.terminal_ok
+            or outcome.steered
+            or outcome.continued
+            or outcome.status
+            not in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT)
+            or PLATFORM_PUBLISH_TOOL_NAME in outcome.tools_called
+        ):
+            return outcome
+        left = run.bound_remaining_s(remaining_s)
+        if left is not None and left <= _MIN_ATTEMPT_BUDGET_S:
+            return outcome
+        early = _unpublished_cause(outcome.tools_called) == "early_stop"
+        prompt = _EARLY_STOP_PROMPT if early else _UNPUBLISHED_PROMPT
+        logger.info(
+            "work-item continuation for %s (%s)",
+            qevent.event_id,
+            "early_stop" if early else "unpublished",
+        )
+        event = self._to_event(qevent).model_copy(update={"text": prompt})
+        try:
+            turn = await self._runner.start_turn(
+                handle.base_url, event, token=handle.token or None, remaining_s=left
+            )
+        except (RunnerError, aiohttp.ClientError, TimeoutError):
+            logger.warning(
+                "work-item continuation failed to start for %s",
+                qevent.event_id,
+                exc_info=True,
+            )
+            outcome.continued = True
+            return outcome
+        _lifecycle_event("runner.turn.started", "continuation")
+        try:
+            second = await self._consume(
+                qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+            )
+        finally:
+            turn.close()
+        second.tools_called = outcome.tools_called | second.tools_called
+        second.saw_side_effect = outcome.saw_side_effect or second.saw_side_effect
+        second.continued = True
+        if not second.assistant_text.strip():
+            second.assistant_text = outcome.assistant_text
+        return second
+
     async def _consume(
         self,
         qevent: QueuedTurn,
@@ -6450,8 +6631,10 @@ class Kernel:
             await reply.stream(acc.rendered())
         elif isinstance(frame, ToolNote):
             # Tool notes remain available on the ACI stream for internal
-            # consumers, but they are not part of the user-facing reply.
-            pass
+            # consumers, but they are not part of the user-facing reply. The
+            # worker reads the name to classify an unpublished factory turn (#3128).
+            if frame.tool:
+                acc.tools_called.add(frame.tool)
         elif isinstance(frame, SideEffectFlag):
             acc.saw_side_effect = True
             # Persist immediately so a crash before done still blocks auto-retry.
@@ -6524,6 +6707,8 @@ class Kernel:
                 saw_side_effect=acc.saw_side_effect,
                 text=text,
                 status=acc.status,
+                tools_called=frozenset(acc.tools_called),
+                assistant_text=acc.rendered(),
             )
         if acc.status is SessionStatus.AWAITING_APPROVAL:
             # Terminal for this turn, but the placeholder edit is deferred to
@@ -6539,6 +6724,8 @@ class Kernel:
                 approval_gate_kind=acc.approval_gate_kind,
                 approval_granted_tool=acc.approval_granted_tool,
                 approval_display=acc.approval_display,
+                tools_called=frozenset(acc.tools_called),
+                assistant_text=acc.rendered(),
             )
         # classified-failure, or the stream ended with no final at all.
         return TurnOutcome(
@@ -6548,6 +6735,7 @@ class Kernel:
             error_message=acc.error_message,
             text=acc.rendered(),
             status=acc.status,
+            tools_called=frozenset(acc.tools_called),
         )
 
     async def _escalate(

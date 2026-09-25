@@ -283,6 +283,8 @@ def _translate_assistant(
             if block.text:
                 state.assistant_text += block.text
                 events.append(TextDelta(text=block.text))
+                if gen is not None:
+                    gen.observe_output(block.text)
         elif isinstance(block, ToolUseBlock):
             events.append(ToolNote(text=f"running tool {block.name}", tool=block.name))
             if activity is not None:
@@ -293,6 +295,9 @@ def _translate_assistant(
             if gen is not None:
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
+                # Record the tool name only (#3128), before tool_use closes
+                # the generation; tool arguments never reach the span.
+                gen.observe_output(f"[tool_use {block.name}]")
                 gen.tool_use(block.id, block.name)
             if block.name == PLATFORM_PUBLISH_TOOL_NAME:
                 # Wire-level capture only (#2294). The session decides what to

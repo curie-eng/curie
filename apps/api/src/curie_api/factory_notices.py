@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -93,7 +94,8 @@ _CAUSE_TEXT = {
     "workspace_error": "the repository workspace could not be prepared for the run.",
     "runner_escalated": "the run stopped on an error and was handed to a person.",
     "runner_failed": "the run ended without a result.",
-    "no_pull_request": "the run finished but did not open a pull request.",
+    "early_stop": "the agent stopped before doing any work on the issue.",
+    "no_pull_request": "the run ended without publishing a pull request.",
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "no runner capacity came free before the wait expired.",
     "owner_lost": "the worker running this request stopped responding.",
@@ -122,6 +124,10 @@ _CAUSE_TEXT = {
 
 # The CI gate's causes (#3097) carry their own labelled lines, not a provider message.
 _CI_DETAIL_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
+# A run that ended without publishing carries the agent's own last message
+# (#3128). That text is model-authored, so it renders inert inside a code fence.
+_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
+_BACKTICK_RUN = re.compile(r"`+")
 
 
 def cause_text(cause: str) -> str:
@@ -195,13 +201,29 @@ def result_section(
         )
     else:
         text = f"Could not complete: {cause_text(cause)}\n"
-        if detail is not None and detail.strip():
+        if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
+            text += _agent_message_block(detail.strip())
+        elif detail is not None and detail.strip():
             label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
     return text
+
+
+def _agent_message_block(message: str) -> str:
+    """The agent's last message, fenced so GitHub renders none of it.
+
+    The fence is longer than any backtick run in the message, so the message
+    cannot close it and spoof the ``Cause:`` line. HTML comment openers are
+    broken because the marker scan reads the raw body.
+    """
+
+    message = message.replace("<!--", "<\u200b!--")
+    longest = max((len(run) for run in _BACKTICK_RUN.findall(message)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"
 
 
 def _escape_markdown(value: str) -> str:
