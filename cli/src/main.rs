@@ -1807,6 +1807,11 @@ enum LocalAction {
         /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
         /// thread. Pair with --channel to keep multi-turn context.
         #[arg(long)]
@@ -1864,6 +1869,11 @@ enum LocalAction {
         /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Valkey password (compose default `valkeypass`). Prefer the
         /// CURIE_VALKEY_PASSWORD env var over passing a real secret on the
         /// command line, where it leaks via `ps` and shell history.
@@ -2675,6 +2685,11 @@ enum ClusterAction {
         /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
         /// thread. Pair with --channel to keep multi-turn context.
         #[arg(long)]
@@ -2758,6 +2773,11 @@ enum ClusterAction {
         /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -4351,6 +4371,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Message {
                 text,
                 channel,
+                agent,
                 thread,
                 r#continue,
                 valkey_password,
@@ -4383,6 +4404,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         timeout_secs,
                         api_url,
                         api_key,
+                        agent,
                     },
                     state,
                     // Empty is unset (#540), so the recorded-env bail below still
@@ -4394,6 +4416,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 message::message(MessageOpts {
                     text,
                     channel: resolved.channel,
+                    agent: resolved.agent,
                     thread: resolved.thread,
                     namespace: "curie".into(),
                     release: "curie".into(),
@@ -4417,6 +4440,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 cases,
                 case_id,
                 channel,
+                agent,
                 valkey_password,
                 api_url,
                 api_key,
@@ -4432,6 +4456,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     cases,
                     case_ids: case_id,
                     channel,
+                    agent,
                     namespace: "curie".into(),
                     release: "curie".into(),
                     listen_host: None,
@@ -5061,6 +5086,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Message {
                 text,
                 channel,
+                agent,
                 thread,
                 r#continue,
                 namespace,
@@ -5105,6 +5131,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_key: api_key
                             .clone()
                             .unwrap_or_else(|| message::DEFAULT_API_KEY.to_string()),
+                        agent,
                     },
                     state,
                     // Empty is unset (#540), so the recorded-env bail below still
@@ -5142,6 +5169,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 message::message(MessageOpts {
                     text,
                     channel: resolved.channel,
+                    agent: resolved.agent,
                     thread: resolved.thread,
                     namespace: resolved.namespace,
                     release: resolved.release,
@@ -5165,6 +5193,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 cases,
                 case_id,
                 channel,
+                agent,
                 namespace,
                 release,
                 listen_host,
@@ -5205,6 +5234,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     cases,
                     case_ids: case_id,
                     channel,
+                    agent,
                     namespace,
                     release,
                     listen_host,

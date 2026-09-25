@@ -110,6 +110,11 @@ pub struct TurnContext {
     pub timeout_secs: u64,
     pub api_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// The agent `--agent` selected (ADR-0168 decision 8), carried by
+    /// `--continue`. `#[serde(default)]` keeps a record written before this
+    /// field loading as `None`.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 impl TurnContext {
@@ -133,6 +138,7 @@ impl TurnContext {
             api_key_env: env_api_key
                 .filter(|value| value == &opts.api_key)
                 .map(|_| "CURIE_API_KEY".to_string()),
+            agent: opts.agent.clone(),
         }
     }
 }
@@ -167,6 +173,7 @@ pub struct CliTurnArgs {
     pub timeout_secs: Option<u64>,
     pub api_url: Option<String>,
     pub api_key: String,
+    pub agent: Option<String>,
 }
 
 pub struct ResolvedTurnArgs {
@@ -179,6 +186,7 @@ pub struct ResolvedTurnArgs {
     pub timeout_secs: u64,
     pub api_url: Option<String>,
     pub api_key: String,
+    pub agent: Option<String>,
 }
 
 pub fn apply_continue(
@@ -239,6 +247,9 @@ pub fn apply_continue(
             .api_url
             .or_else(|| state.as_ref().and_then(|state| state.api_url.clone())),
         api_key,
+        agent: cli
+            .agent
+            .or_else(|| state.as_ref().and_then(|state| state.agent.clone())),
     })
 }
 
@@ -403,6 +414,7 @@ mod tests {
             timeout_secs: None,
             api_url: None,
             api_key: DEFAULT_API_KEY.into(),
+            agent: None,
         }
     }
 
@@ -418,6 +430,7 @@ mod tests {
             api_key_env: Some("CURIE_API_KEY".into()),
             timeout_secs: 777,
             api_url: Some("http://persisted-api".into()),
+            agent: None,
         }
     }
 
@@ -435,6 +448,7 @@ mod tests {
             api_key_env: Some("CURIE_API_KEY".into()),
             timeout_secs: 321,
             api_url: Some("http://turn-api".into()),
+            agent: None,
         };
 
         save_turn(dir.path(), &state).unwrap();
@@ -458,6 +472,7 @@ mod tests {
         let opts = MessageOpts {
             text: "hi".into(),
             channel: None,
+            agent: None,
             thread: None,
             namespace: "curie".into(),
             release: "curie".into(),
@@ -496,6 +511,7 @@ mod tests {
         let opts = MessageOpts {
             text: "hi".into(),
             channel: None,
+            agent: None,
             thread: None,
             namespace: "curie".into(),
             release: "curie".into(),
@@ -607,6 +623,7 @@ mod tests {
             api_key_env: None,
             timeout_secs: 777,
             api_url: Some("http://persisted-api".into()),
+            agent: None,
         };
 
         let resolved = apply_continue(TurnVerb::Cluster, cli, Some(persisted), None).unwrap();

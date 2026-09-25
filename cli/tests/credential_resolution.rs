@@ -83,6 +83,7 @@ fn project_with_recorded_env_key() -> tempfile::TempDir {
             timeout_secs: 1,
             api_url: None,
             api_key_env: Some("CURIE_API_KEY".into()),
+            agent: None,
         },
     )
     .expect("save turn");

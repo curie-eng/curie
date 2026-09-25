@@ -198,6 +198,15 @@ pub fn synthetic_turn(
     }
 }
 
+/// Stamp the identity a selected route speaks through (ADR-0168 decision 8).
+/// `None` leaves the turn exactly as minted.
+pub fn speak_as(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
+    if let (Some(identity), Some(handle)) = (identity, turn.reply_handle.as_mut()) {
+        handle.adapter = Some(identity.to_string());
+    }
+    turn
+}
+
 /// The JSON blob stored under the stream's single `payload` field.
 pub fn payload_json(turn: &QueuedTurn) -> Result<String> {
     serde_json::to_string(turn).context("serializing the queued turn")

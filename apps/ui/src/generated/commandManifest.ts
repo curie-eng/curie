@@ -1279,6 +1279,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -1400,6 +1408,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
@@ -3884,6 +3900,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -4057,6 +4081,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
