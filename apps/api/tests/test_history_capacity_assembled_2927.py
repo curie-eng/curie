@@ -199,6 +199,9 @@ def _checkpointing_fake(*tags: str, replay_messages: Any = ()) -> Any:
                 ),
             )
 
+        def request_full_checkpoint(self) -> None:
+            """Every export above is already a full checkpoint."""
+
     turns = iter(tags)
 
     def next_turn() -> list[Any]:
