@@ -1421,6 +1421,24 @@ assert spec["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "run
 assert spec["egress"] == [{"to": [{"ipBlock": {"cidr": "104.16.0.0/12"}}], "ports": [{"protocol": "TCP", "port": 443}]}], spec["egress"]
 print(f"ok: {name} selects only agent factory's runners and opens the declared registry CIDR on 443")
 PYEOF
+python3 - "$REG_OK_OUT" "${RELEASE}-agent-factory-runner" "${RELEASE}-worker" <<'PYEOF' || fail "a registry-only agent must get a labeled per-agent sandbox template, and the worker must route it there"
+import pathlib, sys, yaml
+out, template, worker = sys.argv[1], sys.argv[2], sys.argv[3]
+docs = [d for p in pathlib.Path(out).rglob("*.yaml") for d in yaml.safe_load_all(p.read_text()) if d]
+tpl = [d for d in docs if d.get("kind") == "SandboxTemplate" and d["metadata"]["name"] == template]
+assert tpl, f"{template} did not render"
+labels = tpl[0]["spec"]["podTemplate"]["metadata"]["labels"]
+assert labels.get("curietech.ai/agent") == "factory", labels
+pools = [d for d in docs if d.get("kind") == "SandboxWarmPool" and d["metadata"]["name"] == template + "-pool"]
+assert pools, f"{template}-pool did not render"
+env = {}
+for d in docs:
+    if d.get("kind") == "Deployment" and d["metadata"]["name"] == worker:
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            env.update({e["name"]: e.get("value") for e in c.get("env", [])})
+assert env.get("CURIE_AGENT_SANDBOX_POOLS") == "factory", env.get("CURIE_AGENT_SANDBOX_POOLS")
+print(f"ok: {template} labels agent factory's pods and the worker routes factory claims to it")
+PYEOF
 
 echo
 echo "PASS: BYO collector and API egress are required and rendered as runner NetworkPolicies; the in-chart carve-outs are unchanged; the effective runner-facing endpoint fails closed without a declared peer; and no .deploy carve-out lacks a BYO branch."
