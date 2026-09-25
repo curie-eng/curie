@@ -267,4 +267,15 @@ mod tests {
             .to_string();
         assert!(err.contains("Not_A_DNS"), "{err}");
     }
+
+    #[test]
+    fn the_agent_name_self_is_rejected_as_reserved() {
+        // `self` is well-formed RFC 1123, so only a dedicated check catches
+        // it. `admits:` reads `self` as the sentinel for "the deploying
+        // agent"; a real agent named `self` would be indistinguishable from
+        // it wherever `admits` is resolved.
+        let err = helm_secret_pairs("self", &secrets()).unwrap_err().to_string();
+        assert!(err.contains("self"), "{err}");
+        assert!(err.contains("admits"), "{err}");
+    }
 }

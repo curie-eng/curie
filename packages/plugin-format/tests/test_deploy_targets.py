@@ -88,6 +88,19 @@ def test_a_malformed_agent_name_is_rejected() -> None:
     assert "deploy.bad_agent_name" in _codes({"targets": {"p": {"agent": "Acme_Bot"}}})
 
 
+def test_the_agent_name_self_is_refused_as_reserved() -> None:
+    # `self` is well-formed RFC 1123, so only a dedicated check catches it.
+    # `admits:` reads `self` as the sentinel for "the deploying agent", so a
+    # target genuinely named `self` would be indistinguishable from that
+    # sentinel wherever `admits` is resolved.
+    _, errors = validate_deploy_targets({"targets": {"p": {"agent": "self"}}})
+    codes = [c for c, _ in errors]
+    assert codes == ["deploy.bad_agent_name"]
+    message = next(m for c, m in errors if c == "deploy.bad_agent_name")
+    assert "self" in message
+    assert "admits" in message
+
+
 def test_env_defaults_to_dev_so_a_target_must_opt_in_to_prod() -> None:
     parsed, errors = validate_deploy_targets({"targets": {"p": {"agent": "a"}}})
     assert errors == []
