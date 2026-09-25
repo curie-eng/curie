@@ -282,3 +282,61 @@ def test_a_stock_adapter_builds_one_client_per_endpoint_as_before() -> None:
     with pytest.raises(UnconfiguredSlackIdentityError):
         adapter._client_for(None, "ops-bot")
     assert len(adapter._clients) == 1
+
+
+def test_two_identities_on_one_sink_each_keep_their_own_token() -> None:
+    """A cache keyed only on base URL would let whichever identity spoke first
+    go on answering for every identity after it: the wrong-bot reply
+    ADR-0168 decision 5 exists to prevent. ``default``, ``ops-bot``, then
+    ``default`` again, on the SAME sink, must carry three different requests
+    with the right token each time, and the same identity must reuse its own
+    cached client rather than minting a new one per call.
+    """
+
+    async def body(sink: ReplySinkRouter, _port: int) -> None:
+        await sink.emit(_update(), route=TargetRoute(adapter=None))
+        await sink.emit(_update(), route=TargetRoute(adapter="ops-bot"))
+        await sink.emit(_update(), route=TargetRoute(adapter=None))
+        adapter = sink._adapters["slack"]
+        assert len(adapter._clients) == 2
+
+    capture = _run(body)
+
+    assert [auth for _method, auth in capture.requests] == [
+        f"Bearer {_DEFAULT_TOKEN}",
+        f"Bearer {_OPS_TOKEN}",
+        f"Bearer {_DEFAULT_TOKEN}",
+    ]
+
+
+def test_default_is_never_refused_even_with_a_blank_token() -> None:
+    """Decision 3: ``default``'s token is always in the map, blank or not, so
+    a stock install with an empty ``SLACK_BOT_TOKEN`` (a stub or dev stack)
+    still sends exactly what it always sent, rather than being gated by
+    Task 6's refusal check.
+    """
+    capture = _Capture()
+
+    async def go() -> None:
+        server = TestServer(capture.app)
+        await server.start_server()
+        sink: ReplySinkRouter | None = None
+        try:
+            port = server.port
+            assert port is not None
+            sink = build_reply_sink(
+                WorkerConfig(
+                    slack_bot_token="",
+                    slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
+                )
+            )
+            assert sink.undeliverable_reason("slack", TargetRoute()) is None
+            await sink.emit(_update(), route=TargetRoute())
+        finally:
+            if sink is not None:
+                await sink.aclose()
+            await server.close()
+
+    asyncio.run(go())
+
+    assert capture.methods() == ["chat.update"]
