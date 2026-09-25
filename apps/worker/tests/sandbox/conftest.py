@@ -192,6 +192,10 @@ class FakeSandboxClient:
     quota_headroom_calls: list[tuple[QuotaRejection, float]] = field(default_factory=list)
     ready_reason: str | None = None
     ready_message: str | None = None
+    # The scheduler message a pod read reports while no node has room, or
+    # None for a pod that is scheduled (or unknown).
+    unschedulable_message: str | None = None
+    pod_reads: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
@@ -286,6 +290,11 @@ class FakeSandboxClient:
         if isinstance(result, BaseException):
             raise result
         return result
+
+    def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        assert request_timeout_seconds > 0
+        self.pod_reads.append(name)
+        return self.unschedulable_message
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode
