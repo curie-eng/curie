@@ -1743,6 +1743,32 @@ answered with a 422 that says so, on create, add and move alike. Declaring an
 identity readies the chart and the services for it; no binding can route to
 it.
 
+### The connector caller key pair
+
+The worker signs each sandbox's connector caller token (ADR-0168 decision 7)
+with an Ed25519 key it reads from a Secret you name. Nothing verifies the
+token yet. The chart never generates the key, for the reason it never generates
+the sealing key: it has no lookup-persist, so a chart-side key would change on
+every upgrade.
+
+The Secret holds both halves as standard base64: the 32-byte seed under
+`connectorCaller.signingKeyKey` (default `signingKey`) and its 32-byte public
+key under `connectorCaller.verifyKeyKey` (default `verifyKey`). With PyNaCl
+installed:
+
+```bash
+python3 -c 'import base64, nacl.signing as s; k = s.SigningKey.generate(); print(base64.b64encode(bytes(k)).decode()); print(base64.b64encode(bytes(k.verify_key)).decode())'
+```
+
+```yaml
+connectorCaller:
+  existingSecret: my-connector-caller   # holds signingKey and verifyKey
+```
+
+Only the worker receives the signing key. Leaving `existingSecret` empty mints
+no token, and every sandbox boots as before. A plain `curie cluster up` does
+not carry `connectorCaller` forward yet, so pass it with every upgrade.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement

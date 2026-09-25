@@ -645,6 +645,20 @@ sealing:
   previousPrivateKeyExistingSecret: ""
   previousPrivateKeyExistingSecretKey: sealingPreviousPrivateKey
 
+# The connector caller key pair (ADR-0168 decision 7). The worker signs each
+# sandbox's caller token with the private half, and the sandbox presents the
+# token to its hosted connectors. Nothing verifies the token yet.
+#
+# BYO only, and never generated here: the chart has no lookup-persist, so a
+# chart-side key would change on every upgrade. Name a Secret holding both
+# halves as standard base64, a 32-byte Ed25519 seed under signingKeyKey and its
+# 32-byte public key under verifyKeyKey. Empty mints no token, which leaves
+# every sandbox's boot env as it was.
+connectorCaller:
+  existingSecret: ""
+  signingKeyKey: signingKey
+  verifyKeyKey: verifyKey
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
