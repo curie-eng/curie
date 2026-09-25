@@ -18,7 +18,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from curie_api import factory_ci, workitems
+from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
 
 HEAD = "a1" * 20
@@ -85,6 +87,7 @@ def _detail(
 
 def _decide(detail: CiDetail, seconds: float, **kwargs: Any) -> Any:
     kwargs.setdefault("execution_deadline", DEADLINE)
+    kwargs.setdefault("ci_wait_seconds", 1200)
     return factory_ci.decide(
         detail,
         now=PUBLISHED + timedelta(seconds=seconds),
@@ -110,7 +113,6 @@ def _names(items: Any) -> set[str]:
 
 def test_bounds_are_the_planned_constants() -> None:
     assert factory_ci.CI_GRACE_SECONDS == 120
-    assert factory_ci.CI_WAIT_SECONDS == 1200
     assert factory_ci.CI_MAX_ROUNDS == 3
     assert set(factory_ci.PERMANENT_UNREADABLE) == set(PERMANENT)
     assert set(factory_ci.TRANSIENT) == set(TRANSIENT)
@@ -138,6 +140,43 @@ def test_marker_is_the_bundle_contract() -> None:
     line = f"Curie wait_ci round 2 of 3: the checks on {PR_URL} failed at {HEAD}."
     assert factory_ci.MARKER.match(line) is not None
     assert CONTRACT_MARKER.match(line) is not None
+
+
+def test_the_ci_wait_is_an_operator_setting_defaulting_to_1200() -> None:
+    assert Settings().github_factory_ci_wait_s == 1200
+    assert Settings(GITHUB_FACTORY_CI_WAIT_S=3600).github_factory_ci_wait_s == 3600
+
+
+@pytest.mark.parametrize("value", [0, -1, 10801])
+def test_the_ci_wait_is_validated_at_boot(value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(GITHUB_FACTORY_CI_WAIT_S=value)
+
+
+def test_a_wait_longer_than_1200_s_ends_green() -> None:
+    long_deadline = PUBLISHED + timedelta(seconds=10800)
+    pending = _decide(
+        _detail(_run("build", status="in_progress")),
+        1500,
+        execution_deadline=long_deadline,
+        ci_wait_seconds=3600,
+    )
+    assert pending.kind == "pending"
+    green = _decide(
+        _detail(_run("build")), 3000, execution_deadline=long_deadline, ci_wait_seconds=3600
+    )
+    assert green.kind == "green"
+
+
+def test_the_execution_deadline_still_caps_a_longer_wait() -> None:
+    detail = _detail(_run("build", status="in_progress"))
+    assert _decide(detail, 1799, ci_wait_seconds=3600).kind == "pending"
+    assert _decide(detail, 1800, ci_wait_seconds=3600).kind == "timed_out"
+    long_deadline = PUBLISHED + timedelta(seconds=10800)
+    assert (
+        _decide(detail, 3600, execution_deadline=long_deadline, ci_wait_seconds=3600).kind
+        == "timed_out"
+    )
 
 
 # --- decide: verdicts ------------------------------------------------------------
