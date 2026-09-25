@@ -880,6 +880,25 @@ agent gets its own `<release>-agent-<agent>-allow-registry-egress` policy, and
 since NetworkPolicy cannot name a host, list the registry CDN ranges or a
 mirror's address.
 
+For a run that can last three hours, set an illustrative $100 USD cap after
+deploying the agent:
+
+```bash
+curie cluster budget dark-factory --limit 100
+```
+
+Tune the limit to the model and expected workload. It does not guarantee a
+$100 bill. On OpenRouter's Anthropic Messages route, the
+[documented response](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message)
+contains token usage but no billed cost field. The conclusion that the SDK
+cost used for Curie's USD cap is an estimate is an inference from those
+documented response fields, not a live billing measurement. OpenRouter reports
+cost through its separate [generation metadata endpoint](https://openrouter.ai/docs/api/api-reference/generations/get-generation).
+Check OpenRouter Activity or the cost of each generation for actual billing.
+The [SDK budget example](https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py)
+checks the cap after each API call, so the estimate can exceed the limit by
+one API call.
+
 ### Factory work items wait for capacity
 
 Factory execution waits in PostgreSQL rather than on the runs-stream pending
