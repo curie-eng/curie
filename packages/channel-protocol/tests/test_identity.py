@@ -7,7 +7,11 @@ from typing import get_type_hints
 
 import pytest
 from aci_protocol import turn as aci_turn
-from channel_protocol import scoped_conversation_id
+from channel_protocol import (
+    ScopedConversation,
+    parse_scoped_conversation_id,
+    scoped_conversation_id,
+)
 from channel_protocol.identity import DEFAULT_IDENTITY
 
 
@@ -190,3 +194,61 @@ def test_the_identity_form_and_the_pre_identity_form_never_collide() -> None:
     assert not set(three) & set(four)
     assert {key.count(":") for key in three} == {2}
     assert {key.count(":") for key in four} == {3}
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        (
+            "slack:C0EXAMPLE1:1700000000.000100",
+            ScopedConversation("slack", None, "C0EXAMPLE1", "1700000000.000100"),
+        ),
+        (
+            "slack:second-bot:C0EXAMPLE1:1700000000.000100",
+            ScopedConversation("slack", "second-bot", "C0EXAMPLE1", "1700000000.000100"),
+        ),
+        (
+            "email:agentmail-sandbox:agent%40example.test:thread%2F9",
+            ScopedConversation("email", "agentmail-sandbox", "agent@example.test", "thread/9"),
+        ),
+        (
+            "slack:C0EXAMPLE1:eval%3A1720000000.000100",
+            ScopedConversation("slack", None, "C0EXAMPLE1", "eval:1720000000.000100"),
+        ),
+    ],
+)
+def test_parse_reads_back_a_canonical_key(key: str, expected: ScopedConversation) -> None:
+    assert parse_scoped_conversation_id(key) == expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("1700000000.000100", id="bare-conversation-id"),
+        pytest.param("slack:C0EXAMPLE1", id="two-segments"),
+        pytest.param("a:b:c:d:e", id="five-segments"),
+        pytest.param("slack:default:C0EXAMPLE1:t", id="default-is-never-written"),
+        pytest.param("email:agent%40example.test:thread%2f9", id="lowercase-escape"),
+        pytest.param("email:agent%zzexample.test:t", id="invalid-escape"),
+        pytest.param("email:agent%FFexample.test:t", id="not-utf8"),
+    ],
+)
+def test_parse_refuses_a_key_the_builder_could_not_have_written(key: str) -> None:
+    assert parse_scoped_conversation_id(key) is None
+
+
+def test_parse_inverts_the_builder_over_awkward_components() -> None:
+    identities: tuple[str | None, ...] = (
+        None,
+        *(i for i in _AWKWARD if i != "default"),
+    )
+    for kind in _AWKWARD:
+        for identity in identities:
+            for address in _AWKWARD:
+                for conversation_id in _AWKWARD:
+                    key = scoped_conversation_id(
+                        kind, address, conversation_id, identity=identity
+                    )
+                    assert parse_scoped_conversation_id(key) == ScopedConversation(
+                        kind, identity, address, conversation_id
+                    ), key
