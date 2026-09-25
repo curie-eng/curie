@@ -30,11 +30,25 @@
       "thread_key": "slack:second-bot:C0EXAMPLE1:1700000000.000100"
     },
     {
+      "kind": "slack",
+      "adapter": "",
+      "channel": "C0EXAMPLE1",
+      "conversation_id": "1700000000.000100",
+      "thread_key": "slack:C0EXAMPLE1:1700000000.000100"
+    },
+    {
       "kind": "email",
       "adapter": "agentmail-sandbox",
       "channel": "agent@example.test",
       "conversation_id": "thread/9",
       "thread_key": "email:agentmail-sandbox:agent%40example.test:thread%2F9"
+    },
+    {
+      "kind": "email",
+      "adapter": "mail:sandbox",
+      "channel": "agent@example.test",
+      "conversation_id": "thread/9",
+      "thread_key": "email:mail%3Asandbox:agent%40example.test:thread%2F9"
     },
     {
       "kind": "email",

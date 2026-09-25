@@ -63,5 +63,7 @@ def test_the_vector_freezes_the_identity_cases_decision_4_names() -> None:
         ("slack", "second-bot"),
         ("slack", "default"),
         ("slack", None),
+        ("slack", ""),
         ("email", "agentmail-sandbox"),
+        ("email", "mail:sandbox"),
     } <= routes
