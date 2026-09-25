@@ -12,6 +12,7 @@ from aci_protocol import QueuedTurn, ReplyHandle
 from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_dispatcher import handlers as handlers_module
 from curie_dispatcher import queue as queue_module
+from curie_dispatcher.admission import build_admission
 from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.handlers import process_action, process_event
 from curie_dispatcher.queue import (
@@ -273,6 +274,7 @@ def test_accepted_slack_ingress_owns_claim_placeholder_and_enqueue_trace(
                 redis_client=redis_client,
                 config=config,
                 slack_identity=DEFAULT_IDENTITY,
+                admission=build_admission(config),
             )
         else:
             result = process_action(
@@ -287,6 +289,7 @@ def test_accepted_slack_ingress_owns_claim_placeholder_and_enqueue_trace(
                 redis_client=redis_client,
                 config=config,
                 slack_identity=DEFAULT_IDENTITY,
+                admission=build_admission(config),
             )
 
     assert result is not None
@@ -343,6 +346,7 @@ def test_slack_ingress_keeps_claim_placeholder_enqueue_order(
         redis_client=redis_client,
         config=config,
         slack_identity=DEFAULT_IDENTITY,
+        admission=build_admission(config),
     )
 
     assert result is not None
@@ -375,6 +379,7 @@ def test_duplicate_and_refused_slack_inputs_emit_no_enqueue_span(
             redis_client=redis_client,
             config=config,
             slack_identity=DEFAULT_IDENTITY,
+            admission=build_admission(config),
         )
         refused = process_event(
             body={"event_id": "Ev-refused"},
@@ -384,6 +389,7 @@ def test_duplicate_and_refused_slack_inputs_emit_no_enqueue_span(
             redis_client=redis_client,
             config=config,
             slack_identity=DEFAULT_IDENTITY,
+            admission=build_admission(config),
         )
 
     assert duplicate is None

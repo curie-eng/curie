@@ -55,6 +55,22 @@ never subscribed to; a redelivery whose dedupe key is already claimed; and a but
 with nowhere to reply — an App Home or modal click, which carries no channel and no
 message.
 
+Also refused, after all of the above and before the dedupe claim: a caller the
+binding's list does not admit (ADR 0175). A binding may carry a list of who may talk to
+the bot through it. On a mention, a direct message or a button click that would start a
+turn, the dispatcher asks the platform API (`POST /channels/admission`, platform key)
+with the sender's id (plus the bot id when a bot sent it) or the clicking user's id. A
+refused caller gets no placeholder and no reply, and the drop is logged as
+`caller_not_allowed`. Answers are cached per route (the channel plus the Slack identity):
+a route with no list is cached as open to everyone, and an answer counts for
+`CURIE_ADMISSION_CACHE_TTL_SECONDS` (30 seconds), which is how long a list change takes to
+apply in Slack. While the API cannot answer, an expired answer still counts until it is
+`CURIE_ADMISSION_STALE_SECONDS` old (5 minutes); with nothing usable cached the caller is
+refused as `admission_unavailable`, even on a route with no list, so that reason means an
+outage rather than a list typo. Both reasons count on the `curie.turn.refused` metric.
+Approval-card clicks never start a turn and are not asked. The trusted-bot allowlist below
+still runs first, and a bot it admits must also be on the binding's list, if there is one.
+
 Every refusal these handlers make on the message lanes is logged at INFO with its
 enumerated reason and rationale (the full list is `relevance.DROP_RATIONALES`), so an
 operator chasing a message that produced no turn can grep the dispatcher log for
@@ -201,10 +217,12 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_BACKOFF_INITIAL_SECONDS` | `1.0` | first reconnect backoff |
 | `CURIE_BACKOFF_MAX_SECONDS` | `30.0` | backoff cap |
 | `CURIE_BACKOFF_MULTIPLIER` | `2.0` | backoff growth factor |
-| `CURIE_API_URL` | `http://localhost:8000` | platform API used to resolve approval clicks (compose: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias. |
-| `CURIE_API_KEY` | `curie-dev-key` | platform administrative key; sent for compatibility with API plumbing, but it is not resolver identity and cannot authorize a resolution alone |
+| `CURIE_API_URL` | `http://localhost:8000` | platform API used to resolve approval clicks and to ask whether a caller may start a turn (compose: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias. |
+| `CURIE_API_KEY` | `curie-dev-key` | platform administrative key; authenticates the caller-list question (`POST /channels/admission`), and is sent with approval clicks for compatibility with API plumbing, but it is not resolver identity and cannot authorize a resolution alone |
 | `CURIE_APPROVAL_CHAT_ATTESTER_SECRET` | `curie-dev-approval-chat-attester` | independent HMAC secret shared only with the API; signs short-lived, approval-bound `chat` principals. Must be nonblank and must not equal `CURIE_API_KEY`. |
 | `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` | `30.0` | API-health budget, followed by a fresh same-size discovery-and-Slack budget; the Helm chart supplies 120 seconds while a directly run dispatcher keeps this 30-second default; must be positive |
+| `CURIE_ADMISSION_CACHE_TTL_SECONDS` | `30.0` | how long a caller-list answer from the platform API counts (ADR 0175), and so how long a list change takes to apply in Slack; must be positive and finite |
+| `CURIE_ADMISSION_STALE_SECONDS` | `300.0` | how old an expired caller-list answer may be and still count while the API cannot answer; past it, with nothing cached, the caller is refused. Must be finite and at least the TTL |
 
 ### Boot preflights
 

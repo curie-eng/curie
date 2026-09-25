@@ -1,13 +1,25 @@
 """Shared fixtures. Stream/dedupe tests run against the REAL Valkey from the
 compose stack (per repo test discipline: never mock Valkey). The Slack Web API
 and socket transport are faked; `_black_hole_api` is not a fake but a real
-loopback socket standing in for an endpoint that never answers."""
+loopback socket standing in for an endpoint that never answers.
 
+The platform API is another service to the dispatcher, reached over HTTP, so
+`admission_api` stands it in with a real loopback HTTP server for
+`POST /channels/admission` (ADR 0175), the same boundary the preflight suite
+uses. Its caller lists are plain sets: the dispatcher decides nothing about who
+is listed, it only relays the API's answer, so the fake need only answer
+consistently."""
+
+import json
 import logging
 import socket
+import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
@@ -141,6 +153,83 @@ def _black_hole_api() -> Iterator[str]:
         sock.close()
 
 
+@dataclass
+class FakeAdmissionApi:
+    """A loopback stand-in for the platform API's ``POST /channels/admission``.
+
+    Attributes:
+        url: the base URL to hand the dispatcher as ``api_base_url``.
+        lists: ``(address, adapter) -> caller ids`` for every route that
+            carries a list; a route absent here is open to everyone.
+        down: when True every request answers 503, the API-outage case.
+        requests: every request body received, in order.
+        headers: the ``X-API-Key`` each request carried, in order.
+    """
+
+    url: str
+    lists: dict[tuple[str, str | None], set[str]] = dataclass_field(default_factory=dict)
+    down: bool = False
+    requests: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    headers: list[str | None] = dataclass_field(default_factory=list)
+
+
+@contextmanager
+def fake_admission_api() -> Iterator[FakeAdmissionApi]:
+    """Serve a `FakeAdmissionApi` on a free loopback port until the block exits."""
+
+    state = FakeAdmissionApi(url="")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+            state.requests.append(body)
+            state.headers.append(self.headers.get("X-API-Key"))
+            if self.path != "/channels/admission":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if state.down:
+                self.send_response(503)
+                self.end_headers()
+                return
+            listed = state.lists.get((body.get("address"), body.get("adapter")))
+            if listed is None:
+                answer = {"allowed": True, "restricted": False}
+            else:
+                allowed = any(caller in listed for caller in body.get("callers", []))
+                answer = {"allowed": allowed, "restricted": True}
+            payload = json.dumps(answer).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            """Keep the test server out of the process's terminal log."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    state.url = f"http://{host!s}:{port}"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+@pytest.fixture
+def admission_api() -> Iterator[FakeAdmissionApi]:
+    """A fresh fake platform API per test; every route open unless listed."""
+
+    with fake_admission_api() as api:
+        yield api
+
+
 # Compose defaults and connection params come from the shared curie_test_support.valkey helper.
 
 
@@ -152,9 +241,12 @@ def redis_client() -> Iterator[redis.Redis]:
 
 
 @pytest.fixture
-def config(redis_client: redis.Redis) -> Iterator[DispatcherConfig]:
+def config(
+    redis_client: redis.Redis, admission_api: FakeAdmissionApi
+) -> Iterator[DispatcherConfig]:
     """A config with a per-test-unique stream and dedupe prefix so tests do not
-    collide, cleaned up afterwards."""
+    collide, cleaned up afterwards. Its platform API is the per-test
+    `admission_api`, so the caller-list check (ADR 0175) has something to ask."""
     token = uuid.uuid4().hex
     cfg = DispatcherConfig(
         slack_app_token="xapp-test",
@@ -170,6 +262,7 @@ def config(redis_client: redis.Redis) -> Iterator[DispatcherConfig]:
         # Socket Mode interactions become a chat principal only when the
         # dispatcher can sign an attestation with this dedicated credential.
         approval_chat_attester_secret="dispatcher-attester-test-secret",
+        api_base_url=admission_api.url,
     )
     yield cfg
     keys = list(redis_client.scan_iter(f"test:curie:dedupe:{token}:*"))
