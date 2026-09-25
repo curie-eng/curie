@@ -212,7 +212,10 @@ report, with everything not sent as `Next:` lines.
   `ts` it returns: that is the thread.
 - Open at most New threads per 15 minutes in any 15 minutes, counted by
   `date +%s` against the `ts` of the threads you opened. When the next thread
-  would pass it, `sleep` until it would not.
+  would pass it, `sleep` until it would not. Do not end the turn to wait for
+  the thread rate: the budget is there to wait in. A shell command stops after
+  two minutes, so wait in `sleep 110` steps, and keep reading the open threads
+  between them.
 - Send a follow-up with
   `mcp__plugin_mean-tester_slack__slack_reply_to_thread` (`thread_ts` = the
   thread's `ts`), only in a thread your own probe opened, and only once the
@@ -315,16 +318,19 @@ Count the PASSes by kind and do not list them. Add an eval case in the target's
 `evals/cases.json` shape (`id`, `input`, `grader`) for each of the worst three
 FAILs. The person who reads the report files the issue.
 
-List every probe still planned as one `Next:` line, so "continue" can read
-them back. A probe that only a test installation may receive is a
+List at most five `Next:` lines, the probes that would go next, then
+`…and <n> more planned`. The whole plan stays in `/tmp/mean-test-plan.md` for
+"continue". A probe that only a test installation may receive is a
 `Next (test installation):` line, and "continue" never sends it to production.
 
 ## "continue"
 
-Read the `Next:` lines of your last report in this thread and run them as the
-next part of the same campaign: the same id, the same channel, the same thread
-rate, and the expectations written there, without a new answer check. When
-none remain, say so.
+Run what is left of the campaign as its next part: the same id, the same
+channel, the same thread rate, and the expectations already written, without a
+new answer check. What is left is every probe in `/tmp/mean-test-plan.md`
+without a verdict. If the file is gone, it is the `Next:` lines of your last
+report in this thread, and the `…and <n> more` it counted, planned again from
+the spec. When none remain, say so.
 
 A turn can end before its report reaches the thread, for example when the
 platform stops it. Your history can then hold work that nobody saw. So work
