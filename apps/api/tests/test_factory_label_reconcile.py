@@ -60,9 +60,18 @@ class GitHubAPI:
     def __init__(self) -> None:
         self.open_issues: dict[int, datetime] = {}
         self.permission = "write"
+        # Older events that precede the labeled event, and a newer relabel.
+        self.padding_events = 0
+        self.relabel_by_bot = False
 
     def label(self, number: int, *, age: timedelta) -> None:
         self.open_issues[number] = datetime.now(UTC) - age
+
+    @staticmethod
+    def _page(request: httpx.Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        per_page = int(request.url.params.get("per_page", "30"))
+        page = int(request.url.params.get("page", "1"))
+        return items[(page - 1) * per_page : page * per_page]
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -71,29 +80,39 @@ class GitHubAPI:
         if path == f"/repos/{REPO}/issues":
             assert request.url.params.get("labels") == LABEL
             assert request.url.params.get("state") == "open"
-            return httpx.Response(
-                200,
-                json=[
-                    {"number": n, "state": "open", "labels": [{"name": LABEL}]}
-                    for n in self.open_issues
-                ],
-            )
+            issues = [
+                {"number": n, "state": "open", "labels": [{"name": LABEL}]}
+                for n in self.open_issues
+            ]
+            return httpx.Response(200, json=self._page(request, issues))
         if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
             number = int(path.split("/")[-2])
-            labeled_at = self.open_issues[number]
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": 800000 + number,
-                        "event": "labeled",
-                        "label": {"name": LABEL},
-                        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
-                        "performed_via_github_app": None,
-                        "created_at": labeled_at.isoformat().replace("+00:00", "Z"),
-                    }
-                ],
+            labeled_at = self.open_issues[number].isoformat().replace("+00:00", "Z")
+            human = {"id": SENDER_ID, "login": SENDER, "type": "User"}
+            events: list[dict[str, Any]] = [
+                {
+                    "id": 700000 + i,
+                    "event": "labeled",
+                    "label": {"name": LABEL},
+                    "actor": human,
+                    "performed_via_github_app": None,
+                    "created_at": labeled_at,
+                }
+                for i in range(self.padding_events)
+            ]
+            events.append(
+                {
+                    "id": 800000 + number,
+                    "event": "labeled",
+                    "label": {"name": LABEL},
+                    "actor": {"id": 42, "login": "some-bot[bot]", "type": "Bot"}
+                    if self.relabel_by_bot
+                    else human,
+                    "performed_via_github_app": None,
+                    "created_at": labeled_at,
+                }
             )
+            return httpx.Response(200, json=self._page(request, events))
         if path.startswith(f"/repos/{REPO}/issues/"):
             number = int(path.rsplit("/", 1)[1])
             labeled = number in self.open_issues
@@ -266,6 +285,22 @@ def test_a_labeler_without_write_permission_is_not_admitted(
     number = next(_ISSUES)
     github.label(number, age=timedelta(minutes=30))
     github.permission = "read"
+
+    assert _reconcile(github) == 0
+
+    assert _requests(number) == []
+
+
+def test_a_newer_bot_relabel_on_a_later_event_page_is_not_admitted(
+    factory: tuple[TestClient, GitHubAPI],
+) -> None:
+    """The newest label event decides, even past the first page of events."""
+
+    _client, github = factory
+    number = next(_ISSUES)
+    github.label(number, age=timedelta(minutes=30))
+    github.padding_events = 120
+    github.relabel_by_bot = True
 
     assert _reconcile(github) == 0
 

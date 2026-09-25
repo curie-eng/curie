@@ -43,36 +43,44 @@ from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
-# One page of each listing per pass. A backlog larger than this drains over
-# later passes, because admitted issues drop out of the candidate set.
 _PER_PAGE = 100
+# Listings longer than this many pages are not trusted to be complete.
+_MAX_PAGES = 50
 
 
 class _Unavailable(Exception):
     """GitHub could not answer; try the repository again next pass."""
 
 
-async def _get_list(
+async def _get_all(
     client: httpx.AsyncClient, *, api: str, token: str, path: str, params: dict[str, Any]
 ) -> list[Any]:
-    try:
-        response = await client.get(
-            f"{api}{path}",
-            params=params,
-            headers=github_headers(token),
-            follow_redirects=False,
-        )
-    except httpx.HTTPError:
-        raise _Unavailable(path) from None
-    if response.status_code != 200:
-        raise _Unavailable(path)
-    try:
-        result = response.json()
-    except ValueError:
-        raise _Unavailable(path) from None
-    if not isinstance(result, list):
-        raise _Unavailable(path)
-    return result
+    """Every page of one listing, in GitHub's order, or _Unavailable."""
+
+    items: list[Any] = []
+    for page in range(1, _MAX_PAGES + 1):
+        try:
+            response = await client.get(
+                f"{api}{path}",
+                params={**params, "per_page": _PER_PAGE, "page": page},
+                headers=github_headers(token),
+                follow_redirects=False,
+            )
+        except httpx.HTTPError:
+            raise _Unavailable(path) from None
+        if response.status_code != 200:
+            raise _Unavailable(path)
+        try:
+            result = response.json()
+        except ValueError:
+            raise _Unavailable(path) from None
+        if not isinstance(result, list):
+            raise _Unavailable(path)
+        items.extend(result)
+        if len(result) < _PER_PAGE:
+            return items
+    # A partial listing could hide the newest label event; decide nothing.
+    raise _Unavailable(path)
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -173,12 +181,12 @@ async def _reconcile_repository(
     repository_id = repository.get("id")
     if type(repository_id) is not int or repository_id <= 0:
         raise _Unavailable(repo_path)
-    issues = await _get_list(
+    issues = await _get_all(
         client,
         api=api,
         token=token,
         path=f"{repo_path}/issues",
-        params={"state": "open", "labels": label, "per_page": _PER_PAGE},
+        params={"state": "open", "labels": label},
     )
     numbers = [
         issue["number"]
@@ -199,12 +207,12 @@ async def _reconcile_repository(
     grace = timedelta(seconds=settings.github_factory_reconcile_grace_s)
     admitted = 0
     for number in missing:
-        events = await _get_list(
+        events = await _get_all(
             client,
             api=api,
             token=token,
             path=f"{repo_path}/issues/{number}/events",
-            params={"per_page": _PER_PAGE},
+            params={},
         )
         event = _last_label_event(events, label)
         if event is None or type(event.get("id")) is not int:
