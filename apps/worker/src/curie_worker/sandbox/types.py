@@ -52,12 +52,17 @@ def agent_warm_pool_name(base_pool: str, agent_name: str | None) -> str:
 
 
 def claim_warm_pool(
-    base_pool: str, env: Mapping[str, str] | None, agent_name: str | None
+    base_pool: str,
+    env: Mapping[str, str] | None,
+    agent_name: str | None,
+    agent_pools: frozenset[str],
 ) -> str:
-    """Route connector-secret claims to the per-agent pool, otherwise the generic pool."""
+    """Route connector-secret claims, and agents the chart gave their own pool
+    (``agentSandbox.registryEgress``, #3083), to the per-agent pool; otherwise
+    the generic pool."""
 
     marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
-    if marker and agent_name:
+    if agent_name and (marker or agent_name in agent_pools):
         return agent_warm_pool_name(base_pool, agent_name)
     return base_pool
 
@@ -196,6 +201,9 @@ class SubstrateConfig:
 
     namespace: str
     warm_pool: str
+    # Agents the chart renders a per-agent pool for without connector secrets
+    # (agentSandbox.registryEgress, #3083), from CURIE_AGENT_SANDBOX_POOLS.
+    agent_pools: frozenset[str] = frozenset()
     runner_port: int = 8080
     # How long a live route stays bound with no touch. After expiry the claim
     # is an orphan and reap_orphans() deletes it.

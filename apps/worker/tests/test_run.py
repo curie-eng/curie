@@ -1320,6 +1320,5 @@ def test_valkey_tls_defaults_false_on_a_clean_env(
 
 def test_substrate_config_reads_agent_sandbox_pools() -> None:
     assert _substrate_config({}).agent_pools == frozenset()
-    assert _substrate_config({"CURIE_AGENT_SANDBOX_POOLS": "factory, acme-a,"}).agent_pools == frozenset(
-        {"factory", "acme-a"}
-    )
+    config = _substrate_config({"CURIE_AGENT_SANDBOX_POOLS": "factory, acme-a,"})
+    assert config.agent_pools == frozenset({"factory", "acme-a"})

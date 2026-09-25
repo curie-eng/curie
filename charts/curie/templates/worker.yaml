@@ -355,6 +355,11 @@ spec:
                   key: langfuseInitProjectSecretKey
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
+            # Agents with a per-agent pool but no connector secrets
+            # (agentSandbox.registryEgress, #3083); the worker routes their
+            # claims to that pool so the registry NetworkPolicy selects them.
+            - name: CURIE_AGENT_SANDBOX_POOLS
+              value: {{ keys (.Values.agentSandbox.registryEgress | default dict) | sortAlpha | join "," | quote }}
             - name: CURIE_RUNNER_PORT
               value: {{ .Values.agentSandbox.runner.port | quote }}
             # Heartbeat file the worker's asyncio loop touches each tick; the
