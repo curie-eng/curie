@@ -692,6 +692,21 @@ mod tests {
         assert_eq!(value["reply_handle"]["placeholder"], "1717.42");
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn speak_as_stamps_a_named_identity_and_leaves_the_default_alone() {
+        let turn = || synthetic_turn("slack", "C0EXAMPLE1", "U1", "hi", "1.0", "1.1", None);
+        let named = speak_as(turn(), Some("ops-bot"));
+        assert_eq!(
+            named.reply_handle.as_ref().unwrap().adapter.as_deref(),
+            Some("ops-bot")
+        );
+        assert_eq!(thread_key_for_turn(&named), "slack:ops-bot:C0EXAMPLE1:1.0");
+        let default = speak_as(turn(), None);
+        assert_eq!(default.reply_handle.as_ref().unwrap().adapter, None);
+        assert_eq!(thread_key_for_turn(&default), "slack:C0EXAMPLE1:1.0");
+    }
+
     #[test]
     fn synthetic_ids_are_distinct_and_slack_shaped() {
         let (thread_ts, placeholder_ts) = synthetic_thread_and_placeholder();

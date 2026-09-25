@@ -6318,6 +6318,23 @@ mod tests {
         on_parse_stack(|| Cli::command().debug_assert());
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn the_drivers_take_an_agent_selector() {
+        for argv in [
+            ["curie", "local", "message", "--agent", "ops", "hi"],
+            ["curie", "cluster", "message", "--agent", "ops", "hi"],
+        ] {
+            assert!(try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        for argv in [
+            ["curie", "local", "eval", "--agent", "ops"],
+            ["curie", "cluster", "eval", "--agent", "ops"],
+        ] {
+            assert!(try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+    }
+
     /// clap's derived parser is deep enough that debug bin tests overflow the
     /// default thread stack once apply/diff/doctor grew `--context`. The
     /// released binary still parses on the process stack; only the test

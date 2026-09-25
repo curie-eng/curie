@@ -664,6 +664,44 @@ mod tests {
         assert_eq!(resolved.api_key, "sk-live-flag");
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn continue_carries_the_agent_the_last_turn_selected() {
+        let mut saved = TurnContext::from_turn(
+            &MessageOpts {
+                agent: Some("ops".into()),
+                ..MessageOpts::default()
+            },
+            TurnVerb::Local,
+            "C0EXAMPLE1",
+            "1.0",
+            None,
+        );
+        assert_eq!(saved.agent.as_deref(), Some("ops"));
+        let cli = || CliTurnArgs {
+            channel: None,
+            thread: None,
+            namespace: None,
+            release: None,
+            chart: None,
+            listen_host: None,
+            timeout_secs: None,
+            api_url: None,
+            api_key: DEFAULT_API_KEY.into(),
+            agent: None,
+        };
+        let resolved = apply_continue(TurnVerb::Local, cli(), Some(saved.clone()), None).unwrap();
+        assert_eq!(resolved.agent.as_deref(), Some("ops"));
+        saved.agent = None;
+        let older: TurnContext = serde_json::from_str(
+            &serde_json::to_string(&saved)
+                .unwrap()
+                .replace(",\"agent\":null", ""),
+        )
+        .expect("a state file written before the field still loads");
+        assert_eq!(older.agent, None);
+    }
+
     #[test]
     fn api_key_env_recorded_and_still_set_is_reread_without_error() {
         // Turn 1 recorded api_key_env = Some("CURIE_API_KEY"); on continue the env is still

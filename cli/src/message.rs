@@ -6159,6 +6159,101 @@ mod tests {
         }
     }
 
+    fn agent_on(name: &str, routes: &[(&str, Option<&str>)]) -> Agent {
+        let mut agent = test_agent_bound_to(name, &[]);
+        agent.channels = routes
+            .iter()
+            .map(|(address, adapter)| crate::api::ChannelBinding {
+                kind: "slack".to_string(),
+                address: address.to_string(),
+                adapter: adapter.map(str::to_string),
+            })
+            .collect();
+        agent
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_selector_picks_that_agents_binding_and_identity() {
+        let agents = [
+            agent_on("sre-bot", &[("C0EXAMPLE1", Some("default"))]),
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+        ];
+        let route = select_agent_route(&agents, "ops", None).unwrap();
+        assert_eq!(route.channel, "C0EXAMPLE1");
+        assert_eq!(route.identity.as_deref(), Some("ops-bot"));
+        assert_eq!(route.agent, "ops");
+        let default = select_agent_route(&agents, "sre-bot", None).unwrap();
+        assert_eq!(default.identity, None, "the default identity stamps nothing");
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_selector_accepts_the_agent_id() {
+        let agents = [agent_on("ops", &[("C0EXAMPLE1", None)])];
+        assert_eq!(select_agent_route(&agents, "id-ops", None).unwrap().agent, "ops");
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_unknown_agent_is_a_usage_error_listing_the_deployed_ones() {
+        let agents = [agent_on("ops", &[("C0EXAMPLE1", None)])];
+        let err = select_agent_route(&agents, "opz", None).unwrap_err();
+        assert_eq!(crate::exit::classify(&err).0.code(), 2);
+        assert!(err.to_string().contains("ops"), "{err}");
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_on_several_routes_needs_a_channel_and_lists_them() {
+        let agents = [agent_on(
+            "ops",
+            &[("C0EXAMPLE1", Some("ops-bot")), ("C0EXAMPLE2", None)],
+        )];
+        let err = select_agent_route(&agents, "ops", None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("C0EXAMPLE1") && text.contains("C0EXAMPLE2"), "{text}");
+        assert!(text.contains("ops-bot"), "{text}");
+        let one = select_agent_route(&agents, "ops", Some("C0EXAMPLE2")).unwrap();
+        assert_eq!((one.channel.as_str(), one.identity), ("C0EXAMPLE2", None));
+        assert!(select_agent_route(&agents, "ops", Some("C0EXAMPLE9")).is_err());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn select_agent_id_prefers_the_agent_selector() {
+        let agents = [
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+        ];
+        assert_eq!(
+            select_agent_id(&agents, Some("ops"), Some("C0EXAMPLE1")).unwrap(),
+            "id-ops"
+        );
+        assert!(select_agent_id(&agents, Some("nobody"), None).is_err());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_named_route_is_refused_where_the_turn_cannot_speak_as_it() {
+        assert!(refuse_named_route(None, "ops", "C0EXAMPLE1", "the relay").is_ok());
+        let err =
+            refuse_named_route(Some("ops-bot"), "ops", "C0EXAMPLE1", "the relay").unwrap_err();
+        assert_eq!(crate::exit::classify(&err).0.code(), 2);
+        let text = err.to_string();
+        assert!(text.contains("ops-bot") && text.contains("the relay"), "{text}");
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_flag_is_not_counted_as_a_positional() {
+        let args: Vec<String> = ["local", "message", "--agent", "ops", "hi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(reject_agent_named_message(&args).is_none());
+    }
+
     fn opts(channel: Option<&str>) -> MessageOpts {
         MessageOpts {
             text: "hi".into(),
