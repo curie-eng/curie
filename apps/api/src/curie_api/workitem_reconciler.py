@@ -448,8 +448,21 @@ class WorkItemReconciler:
             )
 
     async def _sync_status_comments(self) -> None:
+        paused_for_upgrade = False
+        try:
+            paused_for_upgrade = bool(
+                await self._valkey.exists(self._settings.upgrade_quiesce_key())
+            )
+        except Exception:
+            logger.warning(
+                "work item reconciler could not read the upgrade quiesce marker;"
+                " treating the installation as not paused",
+                exc_info=True,
+            )
         async with self._sessionmaker() as session:
-            await factory_notices.sync_status_comments(session, self._settings)
+            await factory_notices.sync_status_comments(
+                session, self._settings, paused_for_upgrade=paused_for_upgrade
+            )
 
     async def _publish_execute_wakes(self) -> None:
         async with self._sessionmaker() as session:

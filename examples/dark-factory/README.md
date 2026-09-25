@@ -145,8 +145,9 @@ stops the run.
 
 `evals/cases.json` checks the parts of the workflow a single turn can show: the
 issue tool it reads with, the execution bound, refusing an injected credential
-request, stopping on an ambiguous request, never pushing, and approvals with
-notes ending the review loop. With a
+request, stopping on an ambiguous request, never pushing, reporting each phase
+once, never ending a message without a tool call, and approvals with notes
+ending the review loop. With a
 live-model runner up from this directory:
 
 ```bash

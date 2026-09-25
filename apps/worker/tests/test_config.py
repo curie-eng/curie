@@ -1471,3 +1471,13 @@ def test_the_chart_defaults_match_the_worker_defaults() -> None:
     assert chart["maxFileBytes"] == fields["attachment_max_file_bytes"].default
     assert chart["referenceTtlSeconds"] == fields["attachment_reference_ttl_seconds"].default
     assert chart["retentionTtlSeconds"] == fields["attachment_retention_ttl_seconds"].default
+
+
+def test_quiesce_ttl_may_be_at_or_below_the_drain_wait() -> None:
+    """#3127: the marker is a renewed lease while waiting, so the roll hold no
+    longer has to outlast the drain wait; the chart caps it AT the wait."""
+    for ttl in (60.0, 30.0):
+        config = WorkerConfig(
+            upgrade_drain_timeout_s=60.0, upgrade_quiesce_ttl_s=ttl
+        )
+        assert config.upgrade_quiesce_ttl_s == ttl

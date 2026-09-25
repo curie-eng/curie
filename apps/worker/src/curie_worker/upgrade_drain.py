@@ -45,23 +45,35 @@ the rule this follows: the maintenance path must not ``SCAN`` a production
 Valkey, and this runs against exactly the release an operator is upgrading.
 
 **A refusal must not wedge the fleet.** The quiesce marker is always written
-with a TTL, and :func:`main` clears it explicitly when the drain is refused. A
-postponed upgrade leaves the cluster exactly as it found it -- still serving,
-still claiming -- which is what makes "refuse" an acceptable normal-path answer
-rather than an outage.
+with a TTL, and :func:`run_gate` clears it explicitly when the drain is refused
+or the Job is terminated (SIGTERM from a Job deletion or
+``activeDeadlineSeconds``). A postponed upgrade leaves the cluster exactly as it
+found it -- still serving, still claiming -- which is what makes "refuse" an
+acceptable normal-path answer rather than an outage.
+
+**A killed gate must not wedge the fleet either (#3127).** While it waits, the
+gate holds the marker as a short LEASE (:func:`quiesce_lease_s`) that it renews
+every poll, so a gate that dies without running any cleanup (SIGKILL, node
+loss) stops renewing and the fleet resumes within one lease. Only after a clean
+drain is the marker extended to the roll hold (``upgrade_quiesce_ttl_s``), which
+the chart caps at the effective drain wait; the post-upgrade release clears it
+long before that in the normal path.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
+import math
+import signal
 import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
@@ -165,6 +177,30 @@ class ClaimStatus(TypedDict):
     state: Literal["claims_enabled", "quiescing", "unknown"]
     since: str | None
     revision: int | None
+    # Whole seconds until the marker lapses on its own (#3127). Present ONLY on
+    # a quiescing state whose marker has a positive PTTL, so the other shapes
+    # stay byte-identical for observers that deny unknown fields.
+    ttl_seconds: NotRequired[int]
+
+
+# The waiting marker's lease floor. A lease shorter than a few polls would lapse
+# between renewals under ordinary Valkey latency and resume the fleet mid-drain.
+_QUIESCE_LEASE_FLOOR_S = 30.0
+
+
+def quiesce_lease_s(config: WorkerConfig) -> float:
+    """The marker TTL the gate holds and renews while it waits (#3127).
+
+    Three polls, floored at thirty seconds: long enough that one slow renewal
+    never lets the fleet resume mid-drain, short enough that a gate killed
+    without cleanup releases the fleet within about half a minute rather than
+    the whole roll hold. Capped at the drain timeout: a lease that outlives
+    the whole wait it bounds would defeat the point.
+    """
+    return min(
+        max(_QUIESCE_LEASE_FLOOR_S, 3 * config.upgrade_drain_poll_interval_s),
+        config.upgrade_drain_timeout_s,
+    )
 
 
 @dataclass(frozen=True)
@@ -280,6 +316,20 @@ class UpgradeDrainGate:
             return {"state": "unknown", "since": None, "revision": None}
         if raw is None:
             return {"state": "claims_enabled", "since": None, "revision": None}
+        status: ClaimStatus = self._parse_marker(raw)
+        try:
+            pttl = await self._redis.pttl(self._config.upgrade_quiesce_key())
+        except Exception:
+            # The remaining lifetime is optional diagnostics; the state read
+            # above already established pause authority.
+            logger.warning("quiesce marker TTL could not be read")
+            return status
+        if isinstance(pttl, int) and not isinstance(pttl, bool) and pttl > 0:
+            status["ttl_seconds"] = math.ceil(pttl / 1000)
+        return status
+
+    @staticmethod
+    def _parse_marker(raw: str | bytes) -> ClaimStatus:
         try:
             marker = json.loads(raw)
             if not isinstance(marker, dict):
@@ -389,12 +439,20 @@ class UpgradeDrainGate:
         reporting drained over a fleet that is still claiming is the failure
         the gate exists to prevent.
 
-        The flag is deliberately left set on BOTH outcomes of a write that
-        succeeded. On success it is what keeps the replacement pods from
-        reclaiming while the roll is in progress, and the post-upgrade release
-        clears it; on refusal, clearing it is the caller's decision (see
-        :func:`main`), because a caller that wants to retry the gate immediately
-        should not have to re-quiesce a fleet that just resumed.
+        While waiting, the flag is a short lease (:func:`quiesce_lease_s`)
+        renewed every third of a lease by an independent heartbeat task, so a
+        slow delivery scan cannot let it lapse and a gate that dies without
+        cleanup releases the fleet within one lease (#3127). A renewal fenced
+        by a newer revision cancels the wait and raises
+        :class:`QuiesceWriteRefused`: this gate no longer holds pause
+        authority. The heartbeat is always stopped before the roll hold is
+        written or the call returns. On a clean drain the flag is extended
+        once to the roll hold (``upgrade_quiesce_ttl_s``): that is what keeps
+        the replacement pods from reclaiming while the roll is in progress, and
+        the post-upgrade release clears it. On refusal the lease is left set
+        and clearing it is the caller's decision (see :func:`run_gate`),
+        because a caller that wants to retry the gate immediately should not
+        have to re-quiesce a fleet that just resumed.
         """
         timeout = self._config.upgrade_drain_timeout_s if timeout_s is None else timeout_s
         interval = (
@@ -402,20 +460,61 @@ class UpgradeDrainGate:
             if poll_interval_s is None
             else poll_interval_s
         )
-        await self.request_quiesce()
+        lease = quiesce_lease_s(self._config)
+        await self.request_quiesce(ttl_s=lease)
         started = time.monotonic()
-        deadline = started + timeout
+        heartbeat = asyncio.ensure_future(self._renew_lease(lease))
+        waiter = asyncio.ensure_future(
+            self._wait_settled(started + timeout, interval)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {heartbeat, waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if waiter not in done:
+                # The heartbeat only ends by raising (QuiesceWriteRefused or a
+                # Valkey failure); surface that instead of a verdict.
+                heartbeat.result()
+                raise RuntimeError("quiesce lease heartbeat stopped unexpectedly")
+            remaining = waiter.result()
+        finally:
+            for task in (heartbeat, waiter):
+                task.cancel()
+            for task in (heartbeat, waiter):
+                with contextlib.suppress(BaseException):
+                    await task
+        if not remaining:
+            # The roll hold: the replacement pods must not claim until the
+            # post-upgrade release clears the marker.
+            await self.request_quiesce(ttl_s=self._config.upgrade_quiesce_ttl_s)
+            return DrainOutcome(
+                drained=True, remaining=(), waited_s=time.monotonic() - started
+            )
+        return DrainOutcome(
+            drained=False, remaining=remaining, waited_s=time.monotonic() - started
+        )
+
+    async def _renew_lease(self, lease: float) -> None:
+        """Renew the waiting lease every third of a lease until cancelled.
+
+        The write retains the same-revision marker byte for byte and only
+        refreshes its TTL; a fenced write raises :class:`QuiesceWriteRefused`.
+        """
+        while True:
+            await asyncio.sleep(lease / 3)
+            await self.request_quiesce(ttl_s=lease)
+
+    async def _wait_settled(
+        self, deadline: float, interval: float
+    ) -> tuple[str, ...]:
+        """Poll until nothing is in flight or the deadline passes."""
         while True:
             remaining = await self.unsettled_deliveries()
             if not remaining:
-                return DrainOutcome(
-                    drained=True, remaining=(), waited_s=time.monotonic() - started
-                )
+                return ()
             now = time.monotonic()
             if now >= deadline:
-                return DrainOutcome(
-                    drained=False, remaining=remaining, waited_s=now - started
-                )
+                return remaining
             logger.info(
                 "upgrade drain waiting on %d in-flight deliver%s: %s",
                 len(remaining),
@@ -454,8 +553,32 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
             )
             return 0
         gate = UpgradeDrainGate(redis, config)
+        # Job deletion and activeDeadlineSeconds deliver SIGTERM. Cancel the
+        # wait and clear the marker at once rather than leaving the fleet paused
+        # until the lease lapses (#3127).
+        drain = asyncio.ensure_future(gate.await_drained())
+        loop = asyncio.get_running_loop()
+        installed: list[signal.Signals] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, drain.cancel)
+            except (NotImplementedError, RuntimeError, ValueError):
+                continue
+            installed.append(sig)
         try:
-            outcome = await gate.await_drained()
+            outcome = await drain
+        except asyncio.CancelledError:
+            if not drain.cancelled():
+                # run_gate itself was cancelled, not the wait by a signal.
+                drain.cancel()
+                raise
+            await gate.clear_quiesce()
+            logger.error(
+                "refusing the upgrade: the drain gate was terminated while "
+                "waiting. The quiesce marker was cleared, nothing was rolled, "
+                "and the fleet is claiming again."
+            )
+            return 1
         except QuiesceWriteRefused:
             logger.error(
                 "refusing the upgrade: quiesce marker write was fenced by a "
@@ -463,6 +586,14 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
                 "Nothing was rolled."
             )
             return 1
+        except Exception:
+            # An unreadable lane (or any other failure) refuses the upgrade;
+            # release the fleet before propagating the non-zero exit.
+            await gate.clear_quiesce()
+            raise
+        finally:
+            for sig in installed:
+                loop.remove_signal_handler(sig)
         if outcome.drained:
             logger.info(
                 "upgrade drain complete after %.1fs; no delivery is in flight",
@@ -517,6 +648,15 @@ def main(argv: list[str] | None = None) -> int:
         help="write the status result as exactly one JSON object",
     )
     parser.add_argument(
+        "--with-ttl",
+        action="store_true",
+        help=(
+            "include ttl_seconds in the --json status document. Opt-in so an "
+            "older CLI's strict schema keeps parsing the default three-field "
+            "shape (#3127)."
+        ),
+    )
+    parser.add_argument(
         "--installation-id-observed",
         type=_observed_arg,
         default=True,
@@ -539,16 +679,26 @@ def main(argv: list[str] | None = None) -> int:
     config = WorkerConfig()
     if args.mode == "status":
         status = asyncio.run(_read_claim_status(config))
+        if not args.with_ttl:
+            status.pop("ttl_seconds", None)
         if args.json:
             sys.stdout.write(json.dumps(status, separators=(",", ":")) + "\n")
-        elif status["state"] == "quiescing" and status["revision"] is not None:
-            logger.info(
-                "worker claims are quiescing since %s for upgrade revision %d",
-                status["since"],
-                status["revision"],
-            )
         else:
-            logger.info("worker claim state: %s", status["state"])
+            ttl = status.get("ttl_seconds")
+            expiry = (
+                f"; the marker expires in {ttl}s unless released or renewed"
+                if ttl is not None
+                else ""
+            )
+            if status["state"] == "quiescing" and status["revision"] is not None:
+                logger.info(
+                    "worker claims are quiescing since %s for upgrade revision %d%s",
+                    status["since"],
+                    status["revision"],
+                    expiry,
+                )
+            else:
+                logger.info("worker claim state: %s%s", status["state"], expiry)
         return 0
     return asyncio.run(run_gate(config, mode=args.mode))
 
