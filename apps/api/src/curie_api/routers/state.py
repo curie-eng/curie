@@ -114,14 +114,19 @@ async def _binding_scope(
     the first place).
 
     No caller here NAMES an adapter -- the state API has no such parameter --
-    so this always resolves `adapter=None` through `crud.binding_for_route`
-    (ADR-0168 decision 3): the default Slack identity, or the single row a
-    non-Slack pair holds under migration 0023's pair constraint, exactly what
-    every caller before the ADR meant by naming only kind and address.
+    and ADR-0168 decision 4 rules that this agent's own bindings on one pair
+    share ONE binding-state scope whichever identity holds them: unlike a
+    route-resolution reader (`crud.binding_for_route`), which narrows to one
+    identity via `crud.matching_bindings` because it must pick the single row
+    a turn resolves through, this reader asks a strictly coarser question --
+    does this agent hold ANY row here -- so it must not narrow by identity
+    first. `crud.agent_id_for_channel_pair` is the "ignoring identity" pair
+    lookup for exactly that reason; `crud.binding_for_route`'s identity-
+    narrowed one is what 404'd every named-identity binding's own state (A3).
     """
 
-    binding = await crud.binding_for_route(session, kind, None, address)
-    if binding is None or binding.agent_id != agent_id:
+    owner = await crud.agent_id_for_channel_pair(session, kind, address)
+    if owner is None or owner != agent_id:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"this agent has no {kind}:{address} binding"
         )
