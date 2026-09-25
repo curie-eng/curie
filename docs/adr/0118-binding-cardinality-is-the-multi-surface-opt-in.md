@@ -4,6 +4,12 @@ Date: 2026-08-21
 
 Status: Accepted
 
+**Superseded in part by [ADR-0168](0168-one-installation-hosts-several-bot-identities.md)**
+(back link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decision 4's session key becomes `(kind, adapter, address, conversation_id)`,
+so two identities in one thread no longer share a sandbox route and a history.
+The rest of this ADR stands.
+
 Accepted with explicit maintainer approval on 2026-08-21 for issue #1525.
 
 This decision amends one consequence of

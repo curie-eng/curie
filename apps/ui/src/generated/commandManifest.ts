@@ -2626,7 +2626,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
+              "help": "The worker's composed key: kind[:identity]:channel:thread-ts, each part percent-encoded; identity only when the route names one other than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,
@@ -5022,7 +5022,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
+              "help": "The worker's composed key: kind[:identity]:channel:thread-ts, each part percent-encoded; identity only when the route names one other than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,

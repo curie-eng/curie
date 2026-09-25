@@ -1,6 +1,11 @@
 """Rendering-neutral messages shared by Curie channel adapters."""
 
-from .identity import hook_conversation_id, scoped_conversation_id
+from .identity import (
+    ScopedConversation,
+    hook_conversation_id,
+    parse_scoped_conversation_id,
+    scoped_conversation_id,
+)
 from .models import (
     MESSAGE_VERSION,
     Action,
@@ -29,6 +34,7 @@ from .reply import (
 __all__ = [
     "MESSAGE_VERSION",
     "REPLY_WIRE_VERSION",
+    "ScopedConversation",
     "Action",
     "ChannelCapability",
     "ChannelCapabilities",
@@ -48,5 +54,6 @@ __all__ = [
     "TurnCompleted",
     "TurnStatus",
     "hook_conversation_id",
+    "parse_scoped_conversation_id",
     "scoped_conversation_id",
 ]

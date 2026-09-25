@@ -81,6 +81,24 @@ OFFLINE_ADAPTER = "proof-offline"
 COMMAND_TIMEOUT_SECONDS = 180
 
 
+def _thread_key(conversation_id: str) -> str:
+    """The worker's internal thread key for this proof's Slack route.
+
+    This rig's route names ``OFFLINE_ADAPTER``, which is neither absent nor the
+    default identity, so per ADR-0168 decision 4 it is a segment after the
+    kind: ``channel_protocol.identity.scoped_conversation_id`` called with
+    ``identity=aci_protocol.turn.route_identity("slack", OFFLINE_ADAPTER)``,
+    which the worker's own ``_thread_key_for`` builds the same way. This
+    script cannot import those packages -- they need pydantic and a newer
+    Python than the bare ``python3`` this rig runs under -- so the rule is
+    reproduced here instead of called.
+    """
+    return ":".join(
+        urllib.parse.quote(part, safe="")
+        for part in ("slack", OFFLINE_ADAPTER, CHANNEL, conversation_id)
+    )
+
+
 class ProofError(RuntimeError):
     pass
 
@@ -778,10 +796,7 @@ class Proof:
         return value
 
     def transcript(self, conversation_id: str) -> list[dict[str, Any]] | None:
-        thread_key = ":".join(
-            urllib.parse.quote(part, safe="")
-            for part in ("slack", CHANNEL, conversation_id)
-        )
+        thread_key = _thread_key(conversation_id)
         encoded_key = urllib.parse.quote(thread_key, safe="")
         try:
             _, entry = self.request(
@@ -1011,10 +1026,7 @@ class Proof:
                 raise ProofError("first signed hook delivery was reported as duplicate")
             event_id = str(first["event_id"])
             conversation_id = str(first["conversation_id"])
-            self.thread_key = ":".join(
-                urllib.parse.quote(part, safe="")
-                for part in ("slack", CHANNEL, conversation_id)
-            )
+            self.thread_key = _thread_key(conversation_id)
             if not event_id or not conversation_id or not first.get("stream_id"):
                 raise ProofError("first hook receipt has empty identity fields")
             original_events = self.stream_events(event_id)

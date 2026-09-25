@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
-from channel_protocol import scoped_conversation_id
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
@@ -61,6 +60,12 @@ from .schemas import (
     ReviewRevisionReserve,
     SourceBindingConfig,
     VersionCreate,
+)
+from .threadkeys import (
+    fence_key_forms,
+    legacy_producer_thread_key,
+    route_thread_key_matches,
+    thread_key_forms,
 )
 from .workspace_policy import repository_is_allowed
 
@@ -126,7 +131,7 @@ async def _adopt_publication_replay(
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else scoped_conversation_id(
+        else legacy_producer_thread_key(
             data.reply_kind,
             data.reply_channel,
             data.conversation_id,
@@ -1061,6 +1066,31 @@ async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
 _ACTIVE_WORK_ITEM_STATUSES = ("waiting", "running", "cancellation_requested")
 
 
+async def _work_item_for_thread(
+    session: AsyncSession, *, agent_id: uuid.UUID, conversation_id: str
+) -> WorkItem | None:
+    """This agent's work item on this thread, under its key or its pre-identity
+    key (ADR-0168 decision 4).
+
+    Unguarded (`fence_key_forms`, not `thread_key_forms`): both callers are a
+    REFUSAL already scoped to `agent_id`, where over-matching is the safe
+    direction, and the guard would fail open the moment the binding that
+    proved the old key is gone -- exactly when a cancelled legacy work item
+    still has to fence credential redemption.
+    """
+
+    for form in fence_key_forms(conversation_id):
+        work_item: WorkItem | None = await session.scalar(
+            select(WorkItem)
+            .where(WorkItem.agent_id == agent_id, WorkItem.conversation_id == form)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+        if work_item is not None:
+            return work_item
+    return None
+
+
 async def publication_cancellation_conflict(
     session: AsyncSession,
     *,
@@ -1073,14 +1103,8 @@ async def publication_cancellation_conflict(
     active request already in ``cancellation_requested``, may not.
     """
 
-    work_item = await session.scalar(
-        select(WorkItem)
-        .where(
-            WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id == conversation_id,
-        )
-        .with_for_update(read=True)
-        .execution_options(populate_existing=True)
+    work_item = await _work_item_for_thread(
+        session, agent_id=agent_id, conversation_id=conversation_id
     )
     if work_item is None:
         return None
@@ -1114,14 +1138,8 @@ async def _refuse_fenced_work_item(
     request_id: uuid.UUID | None,
     runtime_epoch: int | None,
 ) -> ExecutionRequest | None:
-    work_item = await session.scalar(
-        select(WorkItem)
-        .where(
-            WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id == conversation_id,
-        )
-        .with_for_update(read=True)
-        .execution_options(populate_existing=True)
+    work_item = await _work_item_for_thread(
+        session, agent_id=agent_id, conversation_id=conversation_id
     )
     if work_item is None:
         return None
@@ -1182,7 +1200,7 @@ async def create_publication(
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else scoped_conversation_id(
+        else legacy_producer_thread_key(
             data.reply_kind,
             data.reply_channel,
             data.conversation_id,
@@ -1509,7 +1527,9 @@ async def _bind_running_work_item_lineage(
         update(WorkItem)
         .where(
             WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id == conversation_id,
+            WorkItem.conversation_id.in_(
+                await thread_key_forms(session, agent_id, conversation_id)
+            ),
             WorkItem.cancelled_at.is_(None),
             WorkItem.publication_lineage_id.is_(None),
             select(ExecutionRequest.id)
@@ -3215,8 +3235,13 @@ async def _require_review_binding(
         or binding.agent_id != lineage.agent_id
         or binding.generation != lineage.binding_generation
         or not lineage.reply_conversation_id
-        or scoped_conversation_id(binding.kind, binding.address, lineage.reply_conversation_id)
-        != lineage.conversation_id
+        or not route_thread_key_matches(
+            binding.kind,
+            binding.adapter,
+            binding.address,
+            lineage.reply_conversation_id,
+            lineage.conversation_id,
+        )
     ):
         raise PublicationLineageConflict(
             "publication.review_ineligible",

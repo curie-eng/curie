@@ -315,6 +315,45 @@ def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
     }
 
 
+def test_a_named_non_slack_adapter_still_builds_the_pre_identity_workspace_key(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The workspace-key fallback (no `reply_conversation_id`) only ever runs
+    for a request shaped like a pre-#2274 producer, which wrote every route's
+    key unidentified. A NAMED non-Slack adapter must not turn into an identity
+    segment here either -- not only the built-in relay sentinel -- because
+    such a producer predates the identity segment itself and never wrote one.
+    """
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    address = "acme-legacy-mail@example.test"
+    payload = _publication_payload(deployment["id"], dedupe_key="legacy-named-mail-adapter")
+    payload.update(
+        reply_kind="email",
+        reply_channel=address,
+        reply_endpoint="http://acme-legacy-mail-adapter:8080/",
+        reply_adapter="acme-legacy-mail",
+    )
+
+    # `_workspace_identity` builds the bare form for this payload shape
+    # (no `reply_conversation_id`), same as `legacy_producer_thread_key`:
+    # the selection call and the publication create must agree on it.
+    status_code, publication = _create_publication(client, payload)
+    assert status_code == 201, publication
+
+    stored = _rows(
+        "SELECT conversation_id FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": publication["lineage_id"]},
+    )[0]
+    assert stored["conversation_id"] == _workspace_identity(payload)
+    assert stored["conversation_id"] == channel_protocol.scoped_conversation_id(
+        "email", address, payload["conversation_id"]
+    )
+
+
 def _create_publication(
     client: TestClient,
     payload: dict[str, Any],

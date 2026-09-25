@@ -555,8 +555,9 @@ fn advertised_url(host: &str, port: u16) -> String {
 /// Reserved built-in worker adapter for disconnected `cluster message` turns.
 /// It is intentionally language-local and byte-identical to the worker/API
 /// literal: the frozen queue contract already has an adapter slot, so no wire
-/// change is needed.
-const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
+/// change is needed. `pub(crate)` so `queue::thread_key_for` shares this one
+/// constant instead of duplicating the literal.
+pub(crate) const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
 
 /// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
 /// Deployment NAME is unit-testable without a cluster (#1533).
