@@ -67,7 +67,7 @@ is a judgement call, not something derivable from the tree.
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **twenty-one** columns:
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **21** columns:
    `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
    `hook_partitions`, `source_bindings`, `runner_resources`, `changed_paths`, `evidence`, `arguments`,
    `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, `declaration`, `activity`, and `value`. The last one is
