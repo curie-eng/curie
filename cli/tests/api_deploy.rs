@@ -1456,7 +1456,11 @@ async fn a_default_binding_on_the_channel_does_not_hold_a_named_identity() {
         )),
         ("POST", p) if *p == channels_path() => Response::json(
             201,
-            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, "default"), (BOUND, IDENTITY)]),
+            &agent_json_routes(
+                AGENT_ID,
+                AGENT_NAME,
+                &[(BOUND, "default"), (BOUND, IDENTITY)],
+            ),
         ),
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
         (m, p) => panic!("unexpected request: {m} {p}"),
@@ -1551,7 +1555,10 @@ async fn a_named_identity_the_database_cannot_store_is_a_usage_error_naming_it()
     assert_eq!(class.code(), 2, "a usage error, not a generic failure");
     let message = err.to_string();
     assert!(message.contains(IDENTITY), "{message}");
-    assert!(message.contains(REFUSAL), "the platform's own reason, verbatim: {message}");
+    assert!(
+        message.contains(REFUSAL),
+        "the platform's own reason, verbatim: {message}"
+    );
     assert!(!message.contains("failed with 422"), "{message}");
     assert!(fix.expect("a fix").contains("--identity"));
 }

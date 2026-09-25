@@ -1505,15 +1505,56 @@ fn agent_create_body(
     name: &str,
     slack_channel: &str,
     repo_full_name: Option<&str>,
+    identity: Option<&str>,
 ) -> serde_json::Value {
-    let mut body = json!({
-        "name": name,
-        "channel": {"kind": "slack", "address": slack_channel},
-    });
+    let mut channel = json!({"kind": "slack", "address": slack_channel});
+    // @spec ADR-0168 d8: only a named identity travels; the default is omitted,
+    // exactly as every create sent it before the identity existed.
+    if let Some(identity) = named_identity("slack", identity) {
+        channel["adapter"] = json!(identity);
+    }
+    let mut body = json!({"name": name, "channel": channel});
     if let Some(repo) = repo_full_name {
         body["repo_full_name"] = json!(repo);
     }
     body
+}
+
+/// `adapter` as a request names it, with the default Slack identity dropped,
+/// the same reading [`ChannelBinding::named_adapter`] gives a stored binding.
+fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
+    adapter.filter(|adapter| !(kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
+}
+
+/// A binding write the platform refused over the identity it names.
+///
+/// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
+/// identity, or a database that cannot yet store one), so it is carried
+/// verbatim rather than restated.
+fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| match &value["detail"] {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| item["msg"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    crate::exit::CliError::usage(format!(
+        "the platform refused the {kind} binding on {address} under identity `{identity}`: {detail}"
+    ))
+    .with_fix(
+        "deploy under the installation's default identity (drop --identity, or `identity:` from \
+         the deploy.yaml target), or declare the identity in the chart if the platform says it \
+         is not declared",
+    )
+    .into()
 }
 
 /// The `PATCH /agents/{id}` body for the fields deploy reconciles. Pure so the
@@ -1961,8 +2002,9 @@ impl ApiClient {
         name: &str,
         slack_channel: &str,
         repo_full_name: Option<&str>,
+        identity: Option<&str>,
     ) -> Result<Agent> {
-        let body = agent_create_body(name, slack_channel, repo_full_name);
+        let body = agent_create_body(name, slack_channel, repo_full_name, identity);
         let resp = self
             .send_request(
                 self.http
@@ -1972,6 +2014,12 @@ impl ApiClient {
                 "POST /agents",
             )
             .await?;
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            if let Some(identity) = named_identity("slack", identity) {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(identity_refusal("slack", slack_channel, identity, &body));
+            }
+        }
         Self::expect_ok(resp, "creating the agent")
             .await?
             .json()
@@ -1988,7 +2036,7 @@ impl ApiClient {
         {
             return Ok(existing);
         }
-        self.create_agent(name, slack_channel, None).await
+        self.create_agent(name, slack_channel, None, None).await
     }
 
     /// `PATCH /agents/{id}` with a body the caller already built (see
@@ -2032,12 +2080,12 @@ impl ApiClient {
     /// Add one channel binding: `POST /agents/{id}/channels` (201 with the
     /// agent as stored).
     ///
-    /// A 409 is AMBIGUOUS: the pair's uniqueness is platform-wide, so the
+    /// A 409 is AMBIGUOUS: the route's uniqueness is platform-wide, so the
     /// conflict may be another agent holding it (a real error) or this very
-    /// agent, when a concurrent deploy won the race to add the same pair. This
+    /// agent, when a concurrent deploy won the race to add the same route. This
     /// is ensure-bound, a statement about the END STATE, so the conflict is
     /// rechecked against a fresh read and answered as success only when this
-    /// agent now owns the pair.
+    /// agent now owns the route.
     pub async fn add_agent_channel(
         &self,
         agent_id: &str,
@@ -2046,6 +2094,7 @@ impl ApiClient {
         endpoint: Option<&str>,
         adapter: Option<&str>,
     ) -> Result<Agent> {
+        let wanted = named_identity(kind, adapter);
         let resp = self
             .http
             .post(format!("{}/agents/{agent_id}/channels", self.base_url))
@@ -2054,6 +2103,12 @@ impl ApiClient {
             .send()
             .await
             .context("POST /agents/{id}/channels")?;
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY && endpoint.is_none() {
+            if let Some(identity) = wanted.filter(|_| kind == "slack") {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(identity_refusal(kind, address, identity, &body));
+            }
+        }
         if resp.status() == reqwest::StatusCode::CONFLICT {
             let conflict = Self::expect_ok(resp, "adding the channel binding")
                 .await
@@ -2062,7 +2117,7 @@ impl ApiClient {
             if agent
                 .channels
                 .iter()
-                .any(|b| b.kind == kind && b.address == address)
+                .any(|b| b.kind == kind && b.address == address && b.named_adapter() == wanted)
             {
                 return Ok(agent);
             }
@@ -2169,6 +2224,17 @@ impl ApiClient {
             .context("decoding updated agent")
     }
 
+    /// [`Self::resolve_agent_as`] under the default identity.
+    pub async fn resolve_agent(
+        &self,
+        name: &str,
+        slack_channel: Option<&str>,
+        repo_full_name: Option<&str>,
+    ) -> Result<(Agent, ChannelOutcome, Option<String>)> {
+        self.resolve_agent_as(name, slack_channel, repo_full_name, None)
+            .await
+    }
+
     /// Find the agent by name (or create it), reconciling its Slack channel and
     /// its repo binding with an explicitly-passed `--slack-channel`/`--repo`.
     ///
@@ -2182,15 +2248,20 @@ impl ApiClient {
     ///
     /// Public so the command layer can judge the resolved agent (approval-route
     /// pre-check, #2448) before any version is created.
-    pub async fn resolve_agent(
+    ///
+    /// `identity` names the binding's identity (ADR-0168 decision 8); the
+    /// default is written exactly as before.
+    pub async fn resolve_agent_as(
         &self,
         name: &str,
         slack_channel: Option<&str>,
         repo_full_name: Option<&str>,
+        identity: Option<&str>,
     ) -> Result<(Agent, ChannelOutcome, Option<String>)> {
         if let Some(repo_full_name) = repo_full_name {
             validate_repo_full_name(repo_full_name)?;
         }
+        let identity = named_identity("slack", identity);
 
         let existing = self
             .list_agents()
@@ -2209,10 +2280,9 @@ impl ApiClient {
                 // address it already answers on is nothing to do; anything else
                 // is added beside what is there, never on top of it.
                 let channel_add = slack_channel.filter(|c| {
-                    !agent
-                        .channels
-                        .iter()
-                        .any(|b| b.kind == "slack" && b.address == **c)
+                    !agent.channels.iter().any(|b| {
+                        b.kind == "slack" && b.address == **c && b.named_adapter() == identity
+                    })
                 });
                 let current_repo = agent.repo_full_name.as_deref();
                 let (repo_bind, mut repo_note) = match (repo_full_name, current_repo) {
@@ -2239,7 +2309,7 @@ impl ApiClient {
                 // with no channel does not.
                 let agent = match channel_add {
                     Some(address) => {
-                        self.add_agent_channel(&agent.id, "slack", address, None, None)
+                        self.add_agent_channel(&agent.id, "slack", address, None, identity)
                             .await?
                     }
                     None => agent,
@@ -2279,7 +2349,9 @@ impl ApiClient {
             }
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
-                let agent = self.create_agent(name, channel, repo_full_name).await?;
+                let agent = self
+                    .create_agent(name, channel, repo_full_name, identity)
+                    .await?;
                 // `AgentCreate` still carries the singular channel, so a created
                 // agent holds exactly the one binding it was created with.
                 let outcome = ChannelOutcome::Created(
@@ -3559,7 +3631,7 @@ mod tests {
         // A value the caller did not pass is not a binding the caller intended.
         // The column is no longer unique (ADR-0091, migration 0018), so an
         // unsolicited value would silently bind rather than 409.
-        let body = agent_create_body("bot", "C123", None);
+        let body = agent_create_body("bot", "C123", None, None);
         assert_eq!(body["name"], "bot");
         assert_eq!(body["channel"]["kind"], "slack");
         assert_eq!(body["channel"]["address"], "C123");
@@ -3570,7 +3642,7 @@ mod tests {
     fn create_agent_body_binds_the_repo_when_asked() {
         // Creation is the first chance to bind, and the only one that needs no
         // second request: AgentUpdate carries repo_full_name too (#1194).
-        let body = agent_create_body("bot", "C123", Some("acme/bundle"));
+        let body = agent_create_body("bot", "C123", Some("acme/bundle"), None);
         assert_eq!(body["repo_full_name"], "acme/bundle");
     }
 
