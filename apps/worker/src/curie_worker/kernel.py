@@ -497,6 +497,7 @@ _ESCALATION_CAUSES = {
     "runner-timeout": "runner_timeout",
     "runner-timeout-unconfirmed": "runner_timeout",
     "workspace-error": "workspace_error",
+    "history-persistence-error": "history_capacity",
 }
 
 
@@ -552,6 +553,10 @@ def _join_reply_blocks(*parts: str | None) -> str:
 # Operator guidance appended to an escalation lead for classifications whose
 # fix is a known knob (#3071). Keyed by the displayed classification token.
 _CLASSIFICATION_GUIDANCE = {
+    "history-persistence-error": (
+        "Conversation history capacity exceeded. Work already performed may have side "
+        "effects; inspect the result. The run can be retried."
+    ),
     "max-turns": (
         "The run used its whole turn budget; raise worker.workItemMaxTurns "
         "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns."

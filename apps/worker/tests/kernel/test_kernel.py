@@ -6103,6 +6103,16 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
     asyncio.run(go())
 
 
+def test_history_persistence_error_has_dedicated_factory_cause() -> None:
+    failure = kernel_module.TurnOutcome(
+        terminal_ok=False,
+        classification="history-persistence-error",
+        error_message="conversation history capacity exceeded",
+    )
+
+    assert kernel_module._escalation_cause(failure) == "history_capacity"
+
+
 @pytest.mark.parametrize(
     ("with_side_effect", "event_id"),
     [
@@ -6123,7 +6133,7 @@ def test_history_persistence_error_never_retries_and_settles_once(
             h.runner.default_script = [
                 *prefix,
                 ErrorEvent(
-                    message="Transcript history could not be saved.",
+                    message="conversation history capacity exceeded",
                     classification="history-persistence-error",
                 ),
                 Final(text="failed", status=FAIL),
@@ -6134,6 +6144,8 @@ def test_history_persistence_error_never_retries_and_settles_once(
             assert h.runner.opened == ["go"]
             assert h.sink.last_text is not None
             assert "(history-persistence-error)" in h.sink.last_text
+            assert "history capacity exceeded" in h.sink.last_text.lower()
+            assert "can be retried" in h.sink.last_text.lower()
             assert len(h.sink.completions) == 1
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
 

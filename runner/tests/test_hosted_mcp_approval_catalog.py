@@ -61,8 +61,9 @@ class _TranscriptStore:
     async def load(self) -> list[TurnRecord]:
         return list(self.records)
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.records.append(record)
+        return record.harness_replay is not None
 
 
 class _LoopbackHttp:

@@ -118,6 +118,11 @@ class _SeededSessionStore:
             entries=tuple(json.loads(json.dumps(selected))),
         )
 
+    def request_full_checkpoint(self) -> None:
+        """The prior native export was not durable; reset the delta baseline."""
+
+        self._checkpoint_required = True
+
 
 @dataclass(frozen=True)
 class StructuredResume:
@@ -501,6 +506,14 @@ class ClaudeAgentSession:
         if isinstance(store, _SeededSessionStore):
             return await store.export_replay_state()
         return None
+
+    def request_full_checkpoint(self) -> None:
+        """Make the next native export self contained after a bounded write."""
+
+        store = self._options.session_store
+        if not isinstance(store, _SeededSessionStore):
+            raise RuntimeError("native replay store is unavailable")
+        store.request_full_checkpoint()
 
     async def ensure_mcp_server(self, name: str) -> bool:
         """Confirm the SDK session's own MCP connection to ``name`` (#2634).

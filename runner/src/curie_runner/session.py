@@ -58,7 +58,6 @@ from .history import (
     NullTranscriptStore,
     TranscriptStore,
     TurnRecord,
-    bound_turn_record,
     close_suspended_tool_calls,
 )
 from .mcp_tool_capability import ConnectorAvailability, ConnectorCapabilityFailure
@@ -437,36 +436,39 @@ class SessionRunner:
                         self._session_id,
                         type(exc).__name__,
                     )
-            record = bound_turn_record(
-                TurnRecord(
-                    user=event.text,
-                    assistant=state.final_text,
-                    ts=utcnow_iso(),
-                    messages=messages,
-                    status=self._status.value,
-                    approval=(
-                        ApprovalContext(
-                            summary=state.approval_summary,
-                            route=state.approval_route,
-                            gate_kind=state.approval_gate_kind,
-                            granted_tool=state.approval_granted_tool,
-                            decision=self._approval_decision,
+            record = TurnRecord(
+                user=event.text,
+                assistant=state.final_text,
+                ts=utcnow_iso(),
+                messages=messages,
+                status=self._status.value,
+                approval=(
+                    ApprovalContext(
+                        summary=state.approval_summary,
+                        route=state.approval_route,
+                        gate_kind=state.approval_gate_kind,
+                        granted_tool=state.approval_granted_tool,
+                        decision=self._approval_decision,
+                    )
+                    if any(
+                        (
+                            state.approval_summary,
+                            state.approval_route,
+                            state.approval_gate_kind,
+                            state.approval_granted_tool,
+                            self._approval_decision,
                         )
-                        if any(
-                            (
-                                state.approval_summary,
-                                state.approval_route,
-                                state.approval_gate_kind,
-                                state.approval_granted_tool,
-                                self._approval_decision,
-                            )
-                        )
-                        else None
-                    ),
-                    harness_replay=harness_replay,
-                )
+                    )
+                    else None
+                ),
+                harness_replay=harness_replay,
             )
-            await self._history.append(record)
+            native_retained = await self._history.append(record)
+            if harness_replay is not None and not native_retained:
+                requester = getattr(self._session, "request_full_checkpoint", None)
+                if not callable(requester):
+                    raise RuntimeError("native replay exporter cannot reset its checkpoint")
+                requester()
         except HistoryCapacityError as exc:
             self._history_loss_observed = True
             self._history_durable = False

@@ -95,6 +95,10 @@ _CAUSE_TEXT = {
     ),
     "runner_timeout": "the run took longer than its time limit.",
     "workspace_error": "the repository workspace could not be prepared for the run.",
+    "history_capacity": (
+        "conversation history capacity exceeded. Work may have happened. "
+        "Inspect the result and retry."
+    ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
     "runner_failed": "the run ended without a result.",
     "early_stop": "the agent stopped before doing any work on the issue.",
@@ -218,7 +222,7 @@ def result_section(
         text = f"Could not complete: {cause_text(cause)}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
-        elif detail is not None and detail.strip():
+        elif cause != "history_capacity" and detail is not None and detail.strip():
             label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"

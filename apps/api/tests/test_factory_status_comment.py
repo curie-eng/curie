@@ -381,8 +381,34 @@ def test_budget_failure_comment_names_both_limits_and_the_usd_command(
     assert "Cause: budget_exceeded" in body
     assert "Status: FAILED" in body
     assert FINAL_MARKER in body
-    assert _curie_labels(sink, number) == {"curie:needs-human"}
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     assert sink.posts == 1
+
+
+def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9921
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    epoch = _start_running(request_id)
+    _finish_failed(
+        client,
+        request_id,
+        epoch,
+        "history_capacity",
+        detail="conversation history capacity exceeded",
+    )
+    _reconcile()
+
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"].lower()
+    assert "history capacity exceeded" in body
+    assert body.count("history capacity exceeded") == 1
+    assert "provider message:" not in body
+    assert "retry" in body
+    assert "cause: history_capacity" in body
+    assert "status: failed" in body
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
 
 
 def test_unlabel_while_waiting_stops_and_clears_every_state_label(
