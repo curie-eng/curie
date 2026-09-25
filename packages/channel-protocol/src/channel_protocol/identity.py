@@ -1,7 +1,8 @@
 """Canonical internal identities for channel conversations."""
 
 import uuid
-from urllib.parse import quote
+from typing import NamedTuple
+from urllib.parse import quote, unquote
 
 #: The identity whose thread key carries no identity segment: the one Slack app
 #: every route had before ADR-0168. A copy of ``aci_protocol.turn.DEFAULT_IDENTITY``,
@@ -33,6 +34,39 @@ def scoped_conversation_id(
         else (kind, identity, address, conversation_id)
     )
     return ":".join(quote(component, safe="") for component in components)
+
+
+class ScopedConversation(NamedTuple):
+    """The route and conversation a thread key was built from."""
+
+    kind: str
+    identity: str | None
+    address: str
+    conversation_id: str
+
+
+def parse_scoped_conversation_id(key: str) -> ScopedConversation | None:
+    """Invert ``scoped_conversation_id``, or None when it could not have built ``key``.
+
+    Only the canonical form reads back: a key that does not rebuild byte for
+    byte (a lowercase escape, an invalid one, a written default identity) is
+    refused rather than guessed at.
+    """
+
+    try:
+        parts = [unquote(part, errors="strict") for part in key.split(":")]
+    except UnicodeDecodeError:
+        return None
+    if len(parts) == 3:
+        parsed = ScopedConversation(parts[0], None, parts[1], parts[2])
+    elif len(parts) == 4:
+        parsed = ScopedConversation(parts[0], parts[1], parts[2], parts[3])
+    else:
+        return None
+    rebuilt = scoped_conversation_id(
+        parsed.kind, parsed.address, parsed.conversation_id, identity=parsed.identity
+    )
+    return parsed if rebuilt == key else None
 
 
 def hook_conversation_id(
