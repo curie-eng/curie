@@ -353,3 +353,13 @@ def test_a_campaign_plans_to_fill_its_budget():
     # read as permission to stop early.
     plan = _section("Planning a campaign")
     assert "Plan to fill the budget" in plan
+
+
+def test_a_campaign_waits_for_its_next_window_instead_of_ending():
+    # MEASURED: a campaign planned nine threads, opened the six its first
+    # window allowed, then ended the turn as part 1 rather than waiting out the
+    # window, and its report listed every unsent probe as a Next: line.
+    run = _section("Running a campaign")
+    assert "Do not end the turn to wait for the thread rate" in run
+    report = _section("Reporting")
+    assert "at most five `Next:` lines" in report
