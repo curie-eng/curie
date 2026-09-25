@@ -10,8 +10,10 @@ target's Slack surface shows, and it files nothing. See
 and [ADR-0172](../../docs/adr/0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md).
 
 It is one skill, a manifest and `.mcp.json`. It reaches Slack and GitHub through
-two off-the-shelf stdio MCP servers that the runner image preinstalls:
-`slack-mcp` (`@zencoderai/slack-mcp-server@0.0.1`) and `mcp-server-github`.
+two off-the-shelf stdio MCP servers that this bundle's `runner.Dockerfile`
+installs on the platform runner: `slack-mcp`
+(`@zencoderai/slack-mcp-server@0.0.1`) and `mcp-server-github`
+(`@modelcontextprotocol/server-github@2025.4.8`).
 
 This README is the bundle's design. It departs from those ADRs in five places:
 - the spec may come with the request, and Git is only one source of it
@@ -64,8 +66,8 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
 - **Its own Curie installation.** Its Slack app must **not** be the app of any
   agent it will test. A bot's own posts never reach its own dispatcher, so a
   shared app would make the tester invisible to itself.
-- **A runner image that carries `slack-mcp`**: the release that ships this
-  bundle, or later.
+- **Stdio MCP servers**: this bundle's `runner.Dockerfile` installs them onto
+  the platform runner. The platform runner image does not carry them.
 - **Invitations.** Invite the tester's app only to the channels it should
   probe, and to one channel of its own for requests (see "Use it"). The
   invitation list is the allowlist: the bot can post anywhere it is invited.
@@ -122,6 +124,9 @@ curie cluster deploy --plugin-dir examples/mean-tester --target dev \
   --secret MEAN_TESTER_SLACK_BOT_TOKEN --secret MEAN_TESTER_SLACK_TEAM_ID \
   --secret GITHUB_PERSONAL_ACCESS_TOKEN
 ```
+
+That deploy still starts the platform runner. The Slack and GitHub servers
+are installed by this bundle's `runner.Dockerfile`, not by the platform image.
 
 ### Where the secrets are stored
 
