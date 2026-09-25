@@ -4900,6 +4900,9 @@ pub struct PreparedDeploy {
     step: crate::ui::Step,
     tier: DeployTier,
     plugin_dir: PathBuf,
+    /// The resolved target's connector allowlist (ADR-0168 decision 8); `None`
+    /// when no target was resolved or it lists none, which runs every one.
+    connector_allowlist: Option<Vec<String>>,
 }
 
 fn is_documentation_placeholder_channel(channel: &str) -> bool {
@@ -5247,6 +5250,20 @@ async fn prepare_deploy_with_commit_sha(
         .with_fix("pass --slack-channel <id>, or add slack_channel to the deploy.yaml target")
         .into());
     }
+    // @spec ADR-0168 d8. Only a resolved target narrows the CLI's own work; the
+    // API render and the runner narrow every deploy's pods regardless.
+    let connector_allowlist = resolved.as_ref().and_then(|r| r.connectors.clone());
+    let record_secret_names = if opts.tier == DeployTier::Cluster {
+        merge_secret_env(
+            opts.secret.clone(),
+            &crate::connector_build::hosted_env_secret_names(&crate::connector_build::restrict_to(
+                &connector_decl,
+                connector_allowlist.as_deref(),
+            )),
+        )
+    } else {
+        opts.secret.clone()
+    };
     let record_secrets = match opts.tier {
         DeployTier::Local => secrets.clone(),
         // Names-only placeholders over the EFFECTIVE set, not just
@@ -5258,7 +5275,7 @@ async fn prepare_deploy_with_commit_sha(
         // resolved cluster-scoped later (#1913) and reaches the pod
         // through the per-agent Helm Secret, never through the record.
         DeployTier::Cluster => {
-            crate::cluster_secrets::agent_record_secret_names(&effective_secret_names)
+            crate::cluster_secrets::agent_record_secret_names(&record_secret_names)
         }
     };
     let cl = ui.checklist();
@@ -5317,6 +5334,7 @@ async fn prepare_deploy_with_commit_sha(
         step,
         tier: opts.tier,
         plugin_dir,
+        connector_allowlist,
     })
 }
 
@@ -5402,6 +5420,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         step,
         tier,
         plugin_dir,
+        connector_allowlist,
     } = prepared;
     let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
@@ -5506,7 +5525,11 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             namespace: "default".to_string(),
         };
         let project = crate::local::current_resources()?.project;
-        bring_up_local(&plugin_dir, &lock, &identity, &project).await?;
+        let decl = crate::connector_build::restrict_to(
+            &crate::connector_build::load(&plugin_dir)?,
+            connector_allowlist.as_deref(),
+        );
+        bring_up_local(&plugin_dir, &decl, &lock, &identity, &project).await?;
     }
 
     Ok(DeployOutput {
@@ -13539,13 +13562,13 @@ async fn compose_connector_readiness_targets(
 /// dialed another.
 pub async fn bring_up_local(
     plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
     lock: &crate::connector_build::ConnectorLockFileDecl,
     identity: &crate::connector_build::ConnectorScope,
     project: &str,
 ) -> Result<()> {
     use crate::connector_build as cb;
 
-    let decl = cb::load(plugin_dir)?;
     let hosted: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
         .connectors
         .iter()
@@ -13564,7 +13587,7 @@ pub async fn bring_up_local(
     // connector comes up authenticating with nothing. It runs above the reap so
     // a bundle that cannot come up does not first tear down the connectors that
     // are serving.
-    refuse_missing_connector_secrets(&decl)?;
+    refuse_missing_connector_secrets(decl)?;
 
     // Reconcile before starting: compose only ADDS the services the overlay
     // names, so a connector this bundle version dropped or renamed would keep
@@ -13618,7 +13641,7 @@ pub async fn bring_up_local(
         }
     }
 
-    let overlay = cb::compose_overlay(lock, &decl, identity, project, plugin_dir)?;
+    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir)?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(

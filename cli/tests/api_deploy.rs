@@ -1742,5 +1742,9 @@ async fn a_targeted_cluster_deploy_binds_only_its_connectors_secret_names() {
         .filter_map(|body| body["secrets"].as_object())
         .flat_map(|map| map.keys().cloned())
         .collect();
-    assert_eq!(secrets, ["GRAFANA_TOKEN"], "loki is not this target's connector");
+    assert_eq!(
+        secrets,
+        ["GRAFANA_TOKEN"],
+        "loki is not this target's connector"
+    );
 }

@@ -1217,7 +1217,7 @@ async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
         "curie",
     )
     .await
-        .expect_err("a declared secret with no value must refuse the bring-up");
+    .expect_err("a declared secret with no value must refuse the bring-up");
 
     let message = format!("{error:#}");
     assert!(

@@ -1743,6 +1743,23 @@ pub fn hosted_env_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// `decl` narrowed to a target's connector allowlist; `None` keeps every one.
+/// @spec ADR-0168 d8. The API's `connectors_for_agent` decides the list; this
+/// only applies the answer a resolved target carried.
+pub fn restrict_to(decl: &ConnectorsFileDecl, allowlist: Option<&[String]>) -> ConnectorsFileDecl {
+    match allowlist {
+        None => decl.clone(),
+        Some(allowed) => ConnectorsFileDecl {
+            connectors: decl
+                .connectors
+                .iter()
+                .filter(|(name, _)| allowed.contains(name))
+                .map(|(name, spec)| (name.clone(), spec.clone()))
+                .collect(),
+        },
+    }
+}
+
 /// The non-`CURIE_`-prefixed names a connector secret must never claim.
 ///
 /// The twin of `_CREDENTIAL_KEYS | _REDIRECT_CAPTURE_KEYS` in
