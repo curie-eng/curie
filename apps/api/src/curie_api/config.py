@@ -10,7 +10,9 @@ Override any field via the matching environment variable for shared or
 production deployments.
 """
 
+import json
 from functools import lru_cache
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 from aci_protocol import (
@@ -20,8 +22,8 @@ from aci_protocol import (
     WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
-from pydantic import AliasChoices, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .workspace_policy import valid_allowlist_entry
 
@@ -34,7 +36,11 @@ _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: a boot ValidationError renders the whole env-sourced
+    # input dict as `input_value`, secrets included (CURIE_OIDC_CLIENT_SECRET,
+    # API_KEY, ...), and that message lands in container logs. The validators'
+    # own messages still name the offending variables, never their values.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     # Deploy environment the API boots as, "dev" or "prod" (the chart renders it
     # from api.environment onto the ENVIRONMENT var). "prod" arms the production
@@ -81,6 +87,49 @@ class Settings(BaseSettings):
     internal_worker_token: str = Field(
         default=_DEV_DEFAULT_INTERNAL_WORKER_TOKEN,
         validation_alias=AliasChoices("CURIE_INTERNAL_WORKER_TOKEN", "INTERNAL_WORKER_TOKEN"),
+    )
+
+    # Generic OIDC console login (#2908, ADR 0155): authorization code + PKCE
+    # against any standards-compliant IdP. OFF when the issuer is empty, which
+    # is the default, so an appliance without an IdP keeps the ADR-0083
+    # login-code flow and nothing else. Issuer, audience, JWKS URL and redirect
+    # URI are all-or-none (see `_validate_oidc`): a half-configured login would
+    # fail at the first callback instead of at boot.
+    #
+    # The audience doubles as the OIDC client_id. The ID token's `aud` must
+    # contain the client_id anyway, so a separate CLIENT_ID setting could only
+    # ever be a second copy that is allowed to disagree.
+    oidc_issuer: str = Field(default="", validation_alias="CURIE_OIDC_ISSUER")
+    oidc_audience: str = Field(default="", validation_alias="CURIE_OIDC_AUDIENCE")
+    oidc_jwks_url: str = Field(default="", validation_alias="CURIE_OIDC_JWKS_URL")
+    # Optional: empty makes Curie a public client whose code exchange is bound
+    # by the PKCE verifier alone (RFC 7636), which some IdPs require for
+    # public registrations.
+    oidc_client_secret: str = Field(default="", validation_alias="CURIE_OIDC_CLIENT_SECRET")
+    oidc_redirect_uri: str = Field(default="", validation_alias="CURIE_OIDC_REDIRECT_URI")
+    # Claims a validated ID token must carry to be admitted, as a JSON object of
+    # claim name -> required string, e.g. {"groups": "curie-admins"}. A string
+    # claim must equal the value; a list claim must contain it as an element.
+    # Authentication at the IdP says who someone is, not that they belong here:
+    # without a requirement every account the IdP will sign in is admitted.
+    # NoDecode: the validator below parses the JSON itself, so malformed input
+    # is a ValidationError naming the variable rather than a settings-source
+    # crash.
+    oidc_required_claims: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=dict, validation_alias="CURIE_OIDC_REQUIRED_CLAIMS"
+    )
+    # Space-separated scopes the authorize redirect requests. Configurable
+    # because the claims above are often released only for an extra scope
+    # (e.g. "groups"); `openid` is mandatory, since without it there is no ID
+    # token to validate.
+    oidc_scopes: str = Field(default="openid email profile", validation_alias="CURIE_OIDC_SCOPES")
+    # The explicit "every account the IdP authenticates may log in" switch.
+    # Under prod an enabled OIDC login must name its admission policy: either
+    # required claims or this flag, never neither (an IdP shared with the whole
+    # company would otherwise admit the whole company by omission) and never
+    # both (the claims would read as a restriction that does not apply).
+    oidc_admit_all_authenticated: bool = Field(
+        default=False, validation_alias="CURIE_OIDC_ADMIT_ALL_AUTHENTICATED"
     )
 
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
@@ -620,6 +669,93 @@ class Settings(BaseSettings):
                 "complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
             )
+        return self
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """Whether generic OIDC login is configured (the issuer is the switch)."""
+        return bool(self.oidc_issuer.strip())
+
+    @field_validator("oidc_required_claims", mode="before")
+    @classmethod
+    def _parse_oidc_required_claims(cls, value: Any) -> Any:
+        """Accept only a JSON object of non-blank claim names to string values.
+
+        Checked here rather than left to the dict[str, str] coercion so that
+        nothing is coerced: a number, boolean, null or list value is refused at
+        boot instead of becoming a requirement no token could meet as written.
+        """
+        if isinstance(value, str):
+            try:
+                value = json.loads(value) if value.strip() else {}
+            except ValueError:
+                raise ValueError("CURIE_OIDC_REQUIRED_CLAIMS must be a JSON object") from None
+        if not isinstance(value, dict):
+            raise ValueError("CURIE_OIDC_REQUIRED_CLAIMS must be a JSON object")
+        for name, required in value.items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(required, str):
+                raise ValueError(
+                    "CURIE_OIDC_REQUIRED_CLAIMS maps non-blank claim names to string values"
+                )
+        return value
+
+    @field_validator("oidc_scopes")
+    @classmethod
+    def _require_openid_scope(cls, value: str) -> str:
+        if "openid" not in value.split():
+            raise ValueError("CURIE_OIDC_SCOPES must include openid")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_oidc(self) -> "Settings":
+        """Refuse a partial OIDC configuration, and plaintext IdP URLs or a
+        missing admission policy in prod.
+
+        Every one of the four is load-bearing on the first login: without the
+        audience no token can be accepted, without the JWKS URL no signature can
+        be checked, and without the redirect URI the IdP has nowhere to send the
+        browser back. Booting with a subset would advertise a login that can
+        only fail, so the subset is a boot error instead. Under prod the issuer,
+        the key source and the redirect must be https: the redirect carries the
+        authorization code, and a plaintext JWKS fetch lets anyone on the path
+        substitute the keys every ID token is checked against.
+        """
+        values = {
+            "CURIE_OIDC_ISSUER": self.oidc_issuer,
+            "CURIE_OIDC_AUDIENCE": self.oidc_audience,
+            "CURIE_OIDC_JWKS_URL": self.oidc_jwks_url,
+            "CURIE_OIDC_REDIRECT_URI": self.oidc_redirect_uri,
+        }
+        blank = [name for name, value in values.items() if not value.strip()]
+        if len(blank) == len(values):
+            return self
+        if blank:
+            raise ValueError(
+                "OIDC login needs all of CURIE_OIDC_ISSUER, CURIE_OIDC_AUDIENCE, "
+                "CURIE_OIDC_JWKS_URL and CURIE_OIDC_REDIRECT_URI, or none of them; "
+                f"missing: {', '.join(blank)}"
+            )
+        if self.environment.strip().lower() == "prod":
+            plaintext = [
+                name
+                for name in ("CURIE_OIDC_ISSUER", "CURIE_OIDC_JWKS_URL", "CURIE_OIDC_REDIRECT_URI")
+                if not values[name].lower().startswith("https://")
+            ]
+            if plaintext:
+                raise ValueError(
+                    f"ENVIRONMENT=prod requires https URLs for: {', '.join(plaintext)}"
+                )
+            if not self.oidc_required_claims and not self.oidc_admit_all_authenticated:
+                raise ValueError(
+                    "ENVIRONMENT=prod with OIDC login needs an admission policy: set "
+                    "CURIE_OIDC_REQUIRED_CLAIMS, or CURIE_OIDC_ADMIT_ALL_AUTHENTICATED=true "
+                    "to admit every account the IdP authenticates"
+                )
+            if self.oidc_required_claims and self.oidc_admit_all_authenticated:
+                raise ValueError(
+                    "CURIE_OIDC_REQUIRED_CLAIMS and CURIE_OIDC_ADMIT_ALL_AUTHENTICATED=true "
+                    "contradict each other; set one of them"
+                )
         return self
 
     @model_validator(mode="after")

@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
 from starlette.routing import Match
 
-from . import __version__, crud
+from . import __version__, crud, oidc
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import create_engine, create_sessionmaker
@@ -376,6 +376,8 @@ def create_app() -> FastAPI:
     # Which credential the platform will clone with (ADR-0092, #1262). One
     # line, no secret, and a warning when the App is set up only halfway.
     log_credential_path(get_settings())
+    # And whether an enabled OIDC login admits everyone its IdP signs in.
+    oidc.log_admission_policy(get_settings())
     app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health", tags=["health"])

@@ -185,5 +185,6 @@ def test_v0_6_x_console_sessions_survives_the_upgrade(
     assert [row[0] for row in indexes] == [
         "console_sessions_pkey",
         "ix_console_sessions_login_code_hash",
+        "ix_console_sessions_principal_id",
         "ix_console_sessions_session_token_hash",
     ]

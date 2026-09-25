@@ -1,17 +1,28 @@
-"""Single-API-key authentication.
+"""Single-API-key authentication, plus the human principal session guard.
 
 MVP auth is one shared key delivered in the `X-API-Key` header and compared
 against Settings.api_key. J1 replaces this with GitHub-App-scoped identities.
+
+`require_principal_session` (#2908, ADR 0155) is the first human credential
+dependency here. It is a separate dependency on purpose: the machine-credential
+dependencies above it never learn to accept a session, so no route guarded by
+one of them widens because a person logged in.
 """
 
 import hmac
 from typing import Annotated
 
-from fastapi import Header, HTTPException, status
+from fastapi import Cookie, Header, HTTPException, status
 
+from . import crud
 from .config import get_settings
+from .deps import SessionDep
+from .models import Principal
 
 API_KEY_HEADER = "X-API-Key"
+#: The console session cookie (ADR-0083). Defined here rather than beside its
+#: approval consumer so this module can read it without an import cycle.
+CONSOLE_SESSION_COOKIE = "curie_console_session"
 
 
 def verify_platform_key(x_api_key: str | None) -> bool:
@@ -90,3 +101,42 @@ async def require_internal_adapter_secret(
             detail="missing or invalid internal adapter secret",
             headers={"Cache-Control": "no-store"},
         )
+
+
+async def require_principal_session(
+    session: SessionDep,
+    console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
+) -> Principal:
+    """Authenticate a person by their OIDC console session; return the principal.
+
+    Accepts only a live console session bound to a principal that is active in
+    an active tenant. Re-checked on every request, so revoking the session,
+    disabling the principal or suspending the tenant ends access at once rather
+    than at session expiry. A login-code session (no principal) and the
+    platform key are both refused: neither identifies a person.
+
+    The principal must also belong to the IdP configured now: with OIDC
+    disabled, or with ``CURIE_OIDC_ISSUER`` pointed elsewhere, a session minted
+    under the old issuer is refused. A comparison, never a revocation, so
+    restoring the configuration readmits the same sessions. OIDC is the only
+    source of principal sessions today; a future one (e.g. a SAML adapter via
+    the service hook in #3003) must extend this check to its own issuer, or its
+    sessions will be refused here.
+
+    Every refusal is the same 401, so the response does not tell a caller
+    whether the cookie was unknown, expired, or valid for someone disabled.
+    """
+
+    principal = await crud.live_principal_session(session, console_session or "")
+    settings = get_settings()
+    if (
+        principal is None
+        or not settings.oidc_enabled
+        or principal.idp_issuer != settings.oidc_issuer
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing, invalid, or expired principal session",
+            headers={"Cache-Control": "no-store"},
+        )
+    return principal

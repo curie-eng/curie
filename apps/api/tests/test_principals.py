@@ -1,8 +1,9 @@
 """Principals, teams and memberships: schema-only slice (#2907).
 
 Migration 0057 adds ``principals``, ``teams`` and ``principal_teams`` with no
-callers yet. A principal is keyed by ``(tenant_id, idp_subject)``; email and
-display name are attributes, never the identity. Teams are either mirrored IdP
+callers yet. A principal is keyed by ``(tenant_id, idp_issuer, idp_subject)``
+(0058, #2908: an OIDC ``sub`` is only unique per issuer); email and display name
+are attributes, never the identity. Teams are either mirrored IdP
 groups (which must carry the IdP's ``external_id``) or Curie-managed. A
 membership row is a composite-keyed link that cascades away with either side.
 
@@ -65,6 +66,17 @@ def test_principal_model_shape() -> None:
     assert idp_subject_col.type.python_type is str
     assert idp_subject_col.nullable is False
 
+    # 0058 (#2908): the issuer is part of the identity key.
+    idp_issuer_col = columns["idp_issuer"]
+    assert idp_issuer_col.type.python_type is str
+    assert idp_issuer_col.nullable is False
+    assert idp_issuer_col.server_default is not None
+    assert {
+        tuple(c.name for c in constraint.columns)
+        for constraint in Principal.__table__.constraints
+        if getattr(constraint, "name", None) == "principals_tenant_issuer_subject_key"
+    } == {("tenant_id", "idp_issuer", "idp_subject")}
+
     type_col = columns["type"]
     assert type_col.type.python_type is str
     assert type_col.nullable is False
@@ -97,7 +109,7 @@ def test_principal_model_shape() -> None:
     # (tenant_id, id) is the composite target principal_teams' tenant-scoped
     # FK points at, so a membership can never link across tenants.
     assert {
-        "principals_tenant_idp_subject_key",
+        "principals_tenant_issuer_subject_key",
         "principals_tenant_id_id_key",
     } <= _unique_constraint_names(Principal.__table__)
 
@@ -367,10 +379,36 @@ def test_duplicate_tenant_idp_subject_rejected(migrated: None) -> None:
                 "type": "human",
                 "email": None,
             },
-            constraint="principals_tenant_idp_subject_key",
+            constraint="principals_tenant_issuer_subject_key",
         )
 
     _rolled_back(body)
+
+
+def test_same_subject_under_different_issuers_accepted(migrated: None) -> None:
+    """#2908: an OIDC ``sub`` is unique only per issuer, so an IdP switch must
+    not let the new IdP's subject collide with (or inherit) an old principal."""
+
+    async def body(conn: AsyncConnection) -> int:
+        for issuer in ("https://old-idp.example", "https://new-idp.example"):
+            await _exec(
+                conn,
+                "INSERT INTO curie.principals "
+                "(id, tenant_id, idp_issuer, idp_subject, type) "
+                "VALUES (:id, :tenant_id, :issuer, 'shared-sub', 'human')",
+                {
+                    "id": uuid.uuid4(),
+                    "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+                    "issuer": issuer,
+                },
+            )
+        rows = await _exec(
+            conn,
+            "SELECT count(*) AS n FROM curie.principals WHERE idp_subject = 'shared-sub'",
+        )
+        return int(rows[0]["n"])
+
+    assert _rolled_back(body) == 2
 
 
 def test_unique_constraint_is_named(migrated: None) -> None:
@@ -378,15 +416,18 @@ def test_unique_constraint_is_named(migrated: None) -> None:
         return await _exec(
             conn,
             "SELECT conname FROM pg_constraint "
-            "WHERE conname IN ('principals_tenant_idp_subject_key', "
+            "WHERE conname IN ('principals_tenant_issuer_subject_key', "
+            "'principals_tenant_idp_subject_key', "
             "'teams_tenant_source_external_id_key', "
             "'principals_tenant_id_id_key', 'teams_tenant_id_id_key') "
             "AND contype = 'u'",
         )
 
     names = {row["conname"] for row in _rolled_back(body)}
+    # 0058 (#2908) replaced the (tenant_id, idp_subject) key with one that
+    # includes the issuer; the old name must be gone, not kept alongside.
     assert names == {
-        "principals_tenant_idp_subject_key",
+        "principals_tenant_issuer_subject_key",
         "teams_tenant_source_external_id_key",
         "principals_tenant_id_id_key",
         "teams_tenant_id_id_key",

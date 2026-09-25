@@ -4344,6 +4344,61 @@
         "title": "PodLogs",
         "type": "object"
       },
+      "PrincipalOut": {
+        "description": "The principal an OIDC console session authenticates (#2908).\n\nIdentity and display attributes only. ``idp_issuer`` and the authorization\nversion are server bookkeeping the console has no use for, and the session\ntoken never appears here for the same reason it is absent from\n``ConsoleSessionOut``.",
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "idp_subject": {
+            "title": "Idp Subject",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "idp_subject",
+          "display_name",
+          "email",
+          "status"
+        ],
+        "title": "PrincipalOut",
+        "type": "object"
+      },
       "ProgressReport": {
         "additionalProperties": false,
         "properties": {
@@ -11388,6 +11443,208 @@
           }
         },
         "summary": "Create Login Code",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/console/logout": {
+      "post": {
+        "description": "Revoke the session in the cookie, whichever login minted it, and clear it.\n\nDeliberately no credential beyond the cookie itself: the cookie names the\none session this can end, and ``X-API-Key`` is not a way to name one.\nAlways the same 204, whether the cookie was live, unknown, already revoked\nor absent, so logout is idempotent and says nothing about which it was.\nSameSite=Strict keeps a cross-site page from logging someone out.",
+        "operationId": "logout_console_logout_post",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/console/oidc/callback": {
+      "get": {
+        "description": "Finish an OIDC login and mint a principal console session.\n\nThe order is the security argument: bind ``state`` to this browser's\ncookie, then spend the server-side attempt (single use, committed before\nanything else can fail), and only then touch the IdP with the code and the\nstored PKCE verifier. The ID token is validated against the attempt's\nnonce, the principal is resolved and must be active in an active tenant,\nand only then does a session exist. Every terminal response clears the\nstate cookie, and every refusal looks the same.\n\nThe ``code`` and ``state`` in the query may land in access logs. That is\ntolerated: the code is useless without the verifier that never left the\nserver, and the state is single-use and cookie-bound.",
+        "operationId": "oidc_callback_console_oidc_callback_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_oidc_state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Oidc State"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "The login was refused"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Oidc Callback",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/console/oidc/login": {
+      "get": {
+        "description": "Start an OIDC login: persist an attempt and redirect to the IdP.\n\nDiscovery runs first so a misconfigured or mixed-up IdP fails here, before\nan attempt row exists and before the browser is sent anywhere.",
+        "operationId": "oidc_login_console_oidc_login_get",
+        "responses": {
+          "302": {
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Oidc Login",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/console/principal": {
+      "get": {
+        "description": "Return the principal the OIDC session cookie authenticates.",
+        "operationId": "current_principal_console_principal_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrincipalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Current Principal",
         "tags": [
           "console"
         ]
