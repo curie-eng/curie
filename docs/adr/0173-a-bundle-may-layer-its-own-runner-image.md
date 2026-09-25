@@ -2,7 +2,10 @@
 
 Date: 2026-09-24
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-09-25 with explicit maintainer approval from Brian Conn, recorded
+on the publishing pull request.
 
 This ADR builds on [ADR-0113](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md)
 and [ADR-0158](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md).
@@ -38,6 +41,11 @@ fits only a server that speaks HTTP, and it is heavy: every connector of every
 agent is its own Deployment, Service and NetworkPolicies, and an example's is
 also its own release rows. Hosted connectors should stay limited to servers
 that need their own process, or must hold a credential away from the sandbox.
+
+The dark factory dogfood on curie-eng/curie (2026-09-25) needs uv, pnpm and a
+Rust toolchain in its runner. The stock runner has none of them. Today the only
+way to add them is a release wide custom runner image, which every agent on the
+install must then run.
 
 `curie build --plugin-dir <dir> --registry <ref>` already builds a bundle's
 declared connector sources. It pushes them and records each digest in
@@ -107,7 +115,7 @@ runner. Every other agent keeps the platform image.**
 
 ## Tracking
 
-On acceptance, file an issue each for:
+One implementation issue, #3170, carries all four workstreams as a checklist:
 - the bundle declaration and its `curie build` (decisions 1 and 2);
 - per-agent template rendering and prewarm (decisions 3 and 4);
 - the deploy refusal and the upgrade report (decision 5);
