@@ -561,12 +561,15 @@ async def update_channel_binding(
     row id is a stable identity, so a credential minted against this binding
     before the move stays pointed at the row afterwards and would follow it to
     its NEW owner. The generation is what makes the rebind observable to that
-    credential. It is bumped UNCONDITIONALLY on any binding write, including one
-    whose values are identical -- an operator re-asserting a binding is the "I
-    think something is wrong with this route" gesture that should invalidate
-    outstanding credentials, and guarding the bump on a value change would leave
-    that case silently valid. `POST /channels/token` is the sibling bump: a
-    remint increments the same counter so rotation revokes (#2379).
+    credential. It is bumped UNCONDITIONALLY on every write to the ROUTE through
+    this function, including one whose values are identical -- an operator
+    re-asserting a binding is the "I think something is wrong with this route"
+    gesture that should invalidate outstanding credentials, and guarding the
+    bump on a value change would leave that case silently valid. `POST
+    /channels/token` is the sibling bump: a remint increments the same counter
+    so rotation revokes (#2379). Not every binding write bumps it: editing the
+    caller list (`set_allowed_callers`) deliberately does not (ADR 0175
+    decision 4).
 
     FLUSHES rather than commits, so the caller can run it inside a SAVEPOINT:
     the unique violation this raises has to be recoverable without discarding
@@ -641,6 +644,28 @@ async def delete_channel_binding(session: AsyncSession, binding: AgentChannel) -
 
     await session.delete(binding)
     await session.flush()
+
+
+async def set_allowed_callers(
+    session: AsyncSession, binding: AgentChannel, allowed_callers: list[str] | None
+) -> AgentChannel:
+    """Replace ONE binding's caller list, leaving its generation alone (ADR 0175).
+
+    The one writer of `allowed_callers`. Who may use a route is a separate
+    question from the route itself (decision 4), so this does not bump
+    `generation`: an adapter's `chn` token is issued for a generation (#2379),
+    and revoking it on every list edit would take an inbox offline each time an
+    operator adds a person. The caller has already validated the list against
+    the binding's kind (`schemas.validate_allowed_callers`) under the binding
+    lock, so this only stores it.
+
+    Flushes rather than commits, like the other binding writers, so the caller
+    decides when the transaction ends.
+    """
+
+    binding.allowed_callers = allowed_callers
+    await session.flush()
+    return binding
 
 
 async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:

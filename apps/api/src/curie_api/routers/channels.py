@@ -1,7 +1,7 @@
 """The channel ingress API (ADR-0096 phase 2, #1459).
 
-Two endpoints, and every request/response model they use lives here rather than
-in ``schemas.py``:
+Three endpoints, and every request/response model they use lives here rather
+than in ``schemas.py``:
 
 - ``POST /channels/token`` (platform key, or an adapter principal serving the
   binding, ADR-0154) mints a ``chn`` token over a binding ROW's id plus a
@@ -9,7 +9,10 @@ in ``schemas.py``:
   exactly one binding instead of the platform key, and a remint revokes the
   token it replaces.
 - ``POST /channels/turns`` (platform key OR a ``chn`` token) enqueues a
-  ``QueuedTurn`` for the binding named in the BODY.
+  ``QueuedTurn`` for the binding named in the BODY, once the binding's caller
+  list (ADR 0175) admits the turn's author; a refused author is a 403.
+- ``POST /channels/admission`` (platform key only) answers the same admission
+  question for the Slack dispatcher, which has no database of its own.
 
 **Kind and address ride in the BODY, not the path.** An address is an opaque
 routing key matched on equality; it may contain ``@``, ``.``, ``/``, ``?`` or
@@ -59,8 +62,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
 from .. import adapter_principal, channel_token, crud
+from ..admission import AdmissionDecision, admit
 from ..approval_auth import platform_key_or_adapter
-from ..auth import verify_platform_key
+from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..delivery import (
@@ -102,6 +106,19 @@ _AUTH_DETAIL = "missing or invalid credential"
 # sharing an upstream id space -- two AgentMail inboxes, two webhook sources --
 # cannot swallow each other's turns (E16).
 _CLAIM_PREFIX = "curie:channel"
+
+# The 403 a refused caller earns at the channel port (ADR 0175 decision 2). The
+# adapter has already proved it speaks for this binding, so saying "refused"
+# reveals nothing it did not know; the detail still names no list entry and no
+# message content. Every adapter treats the 403 as final and settles the
+# delivery without a turn (`docs/interfaces/port-adapter-service/INTERFACE.md`).
+_CALLER_REFUSED_DETAIL = "this binding does not admit the turn's author"
+
+# The bound on how many ids one admission question may carry. The dispatcher
+# sends at most two (a sender plus the bot id that posted as it); the headroom
+# is for a future channel, and the cap keeps one request from making the check
+# walk an arbitrarily long list.
+_MAX_ADMISSION_CALLERS = 10
 
 
 # --- request/response models --------------------------------------------------
@@ -159,6 +176,35 @@ class TurnIn(ChannelBinding):
     author: str
     text: str
     reply_ref: str
+
+
+class AdmissionIn(ChannelBinding):
+    """One admission question from the Slack dispatcher (ADR 0175 decision 2).
+
+    Subclasses `ChannelBinding` so the route pair is judged by the same
+    `_validate_channel_binding` every other binding surface runs. `adapter`
+    names the identity half of the route (ADR-0168 decision 3), resolved
+    exactly as `POST /channels/token` resolves it: omitted means the default
+    Slack identity. `callers` is every id the channel reports for the caller;
+    any one of them on the list admits.
+    """
+
+    adapter: str | None = None
+    callers: list[Annotated[str, Field(max_length=256)]] = Field(
+        default_factory=list, max_length=_MAX_ADMISSION_CALLERS
+    )
+
+
+class AdmissionOut(BaseModel):
+    """The admission answer.
+
+    `restricted` says whether the route carries a list at all, so the
+    dispatcher can cache an unrestricted route as open to every caller and ask
+    again only when that entry expires.
+    """
+
+    allowed: bool
+    restricted: bool
 
 
 class TurnAccepted(BaseModel):
@@ -403,6 +449,29 @@ def _authorize(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
 
+def _record_refusal(row: AgentChannel, decision: AdmissionDecision, *, surface: str) -> None:
+    """Log one refused caller: the binding and the reason, never the message.
+
+    The log line is what an operator greps when a listed person reports the bot
+    is silent, so it names the binding row and the stable reason token. It never
+    names the caller id or any of the message: a refused caller is by definition
+    someone the operator did not expect, and their text is not ours to keep.
+
+    Args:
+        row: the binding the caller was refused on.
+        decision: the refusal `admit` returned.
+        surface: which endpoint refused, for the log line.
+    """
+
+    logger.info(
+        "caller refused surface=%s binding=%s kind=%s reason=%s",
+        surface,
+        row.id,
+        row.kind,
+        decision.reason.value,
+    )
+
+
 def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
     """Build the `QueuedTurn` from the BINDING ROW plus the delivery's content.
 
@@ -473,7 +542,10 @@ async def ingest_turn(
     4. the binding row, loaded only for a caller that already authenticated;
     5. the claims bound to that row, and only then does an unknown pair earn a
        404 -- a caller with no credential learns nothing about which bindings
-       exist.
+       exist;
+    6. the binding's caller list (ADR 0175), before any claim, quota slot or
+       queue write, so a refused author costs nothing but this request and
+       answers 403.
     """
 
     settings = get_settings()
@@ -501,6 +573,20 @@ async def ingest_turn(
         # The mint's refusal, on the ingress. Enqueuing here would hand the
         # worker a turn with nowhere to reply and no credential to reply with.
         raise _unroutable(body.kind, body.address)
+
+    # ADR 0175: the one admission check, after the credential proved it speaks
+    # for this binding and before anything is claimed or queued. The adapter is
+    # trusted to send the sender it authenticated, as it always was; `author`
+    # is that sender. The platform key is not exempt: the list is about who
+    # wrote the message, not who carried it.
+    decision = admit(row, [body.author])
+    if not decision.allowed:
+        _record_refusal(row, decision, surface="channel-port")
+        record_metric(
+            "curie.turn.refused",
+            attributes={"service.name": "curie-api", "reason": decision.reason.value},
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _CALLER_REFUSED_DETAIL)
 
     # One hash of the `delivery_id`, shared by the two names derived from it.
     digest = sha16(body.delivery_id)
@@ -647,3 +733,39 @@ async def ingest_turn(
 
     response.status_code = status.HTTP_202_ACCEPTED
     return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)
+
+
+# --- POST /channels/admission ---------------------------------------------------
+
+
+@router.post(
+    "/admission",
+    response_model=AdmissionOut,
+    dependencies=[Depends(require_api_key)],
+)
+async def check_admission(data: AdmissionIn, session: SessionDep) -> AdmissionOut:
+    """Answer whether a caller may start a turn on a route (platform key only).
+
+    The Slack dispatcher's half of ADR 0175 decision 2: it has no database, so
+    it asks here, after its own filters and before it claims the event or posts
+    a placeholder. The answer comes from the same `admission.admit` the channel
+    port runs, so the two channels cannot disagree about one list.
+
+    Platform key only, never a `chn` token or an adapter principal: an adapter
+    already gets its answer as the 403 on `POST /channels/turns`, and this
+    route would otherwise let a token scoped to one binding ask about every
+    other binding's list.
+
+    An unbound route answers allowed and unrestricted: the list lives on the
+    binding, and what happens to a mention of an unbound channel is routing's
+    call, unchanged by this ADR.
+    """
+
+    row = await crud.binding_for_route(session, data.kind, data.adapter, data.address)
+    decision = admit(row, data.callers)
+    if not decision.allowed and row is not None:
+        # The dispatcher counts its own refusal (`curie.turn.refused` with
+        # service curie-dispatcher); counting it here too would double every
+        # Slack refusal, so this side only logs the binding and reason.
+        _record_refusal(row, decision, surface="admission")
+    return AdmissionOut(allowed=decision.allowed, restricted=decision.restricted)

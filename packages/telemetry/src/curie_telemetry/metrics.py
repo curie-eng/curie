@@ -64,6 +64,14 @@ _TURN_COMPLETED_ATTRIBUTES = {
     "source": _TURN_SOURCES,
     "outcome": _TURN_OUTCOMES,
 }
+# A caller refused before any turn starts (ADR 0175 decision 3). Labeled only by
+# service and reason: never by binding, caller or channel, so the series count
+# stays fixed however many bindings carry a list, and nothing about who was
+# refused leaves the log line.
+_TURN_REFUSED_ATTRIBUTES = {
+    "service.name": ["curie-api", "curie-dispatcher"],
+    "reason": ["caller_not_allowed", "admission_unavailable"],
+}
 _HISTORY_CACHE_ATTRIBUTES = {
     "service.name": ["curie-runner"],
     "source": ["runner"],
@@ -199,6 +207,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/behavior-packs",
     "/agents/{agent_id}/budget",
     "/agents/{agent_id}/channels",
+    "/agents/{agent_id}/channels/callers",
     "/agents/{agent_id}/cost",
     "/agents/{agent_id}/kill",
     "/agents/{agent_id}/memory",
@@ -228,6 +237,7 @@ _HTTP_OPERATIONS = [
     # Break-glass recovery (#2753).
     "/approvals/identity-report",
     "/approvals/{approval_id}/recover",
+    "/channels/admission",
     "/channels/token",
     "/channels/turns",
     "/cluster-message-replies/{reply_ref}",
@@ -342,6 +352,13 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.turn.completed": _definition(
         "counter", "{turn}", "Turns reaching a terminal result.", True, _TURN_COMPLETED_ATTRIBUTES
+    ),
+    "curie.turn.refused": _definition(
+        "counter",
+        "{turn}",
+        "Callers refused before a turn by a binding's caller list.",
+        True,
+        _TURN_REFUSED_ATTRIBUTES,
     ),
     "curie.turn.duration": _definition(
         "histogram", "s", "End to end turn duration.", False, _TURN_COMPLETED_ATTRIBUTES

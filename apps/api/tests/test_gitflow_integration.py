@@ -482,7 +482,7 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
         "a channel write must leave the repository binding unchanged"
     )
     assert fetched.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE4", "adapter": "default"}
+        {"kind": "slack", "address": "C0EXAMPLE4", "adapter": "default", "allowed_callers": None}
     ], "the channel write must still take effect"
 
 

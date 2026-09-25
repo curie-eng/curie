@@ -238,7 +238,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         "released 0.9.2 must stop at its schema compatibility head"
     );
     assert_eq!(
-        catalog["windows"]["0.10.0"]["schema_head"], "0058",
+        catalog["windows"]["0.10.0"]["schema_head"], "0059",
         "the candidate 0.10.0 rollback head must match this tree"
     );
     assert!(

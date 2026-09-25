@@ -305,6 +305,132 @@ def _validate_channel_endpoint(endpoint: str) -> str:
     return endpoint
 
 
+# The caller list a binding may carry (ADR 0175 decision 1). Exact ids only: no
+# wildcards, domains or patterns, because a pattern is a rule an operator has to
+# reason about and an id is a fact they can check.
+MAX_ALLOWED_CALLERS = 100
+# The kind whose caller ids are email addresses, compared lowercase because the
+# mail adapter sends the sender that way (`_bare_address` lowercases it).
+EMAIL_KIND = "email"
+# A Slack caller is a user (U), an enterprise-grid user (W) or a bot (B). Same
+# allowlist discipline as `_SLACK_USER_ID`, widened by exactly the bot prefix:
+# the dispatcher asks with the bot id when a bot sent the message.
+_SLACK_CALLER_ID = re.compile(r"^[UWB][A-Z0-9]{7,}$")
+# One bare address: exactly one `@`, something on each side, and none of the
+# characters that would make it a display-name form, a list or a wildcard. `*`
+# is legal in a mailbox name but refused here: `*@example.com` is how an
+# operator spells "the whole domain", and an exact match would silently read it
+# as one mailbox literally named `*`.
+_EMAIL_CALLER = re.compile(r'^[^@\s<>,;"()*]+@[^@\s<>,;"()*]+$')
+# Longer than any real address (RFC 5321 caps a path at 256 octets) or provider
+# id, so a longer entry is a paste error rather than a caller.
+_CALLER_MAX_CHARS = 256
+
+
+def normalize_caller_id(kind: str, caller: str) -> str:
+    """The form a caller id is stored and compared in, for this binding kind.
+
+    Email ids are lowercased, exactly as the mail adapter sends a sender; every
+    other kind's ids are compared as sent, because Slack ids are uppercase by
+    construction and an unknown kind's ids are opaque.
+
+    Args:
+        kind: the binding's channel kind.
+        caller: one caller id, as sent or as stored.
+
+    Returns:
+        The id in its comparison form.
+    """
+
+    return caller.lower() if kind == EMAIL_KIND else caller
+
+
+def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] | None:
+    """Check a binding's caller list against its kind and return the stored form.
+
+    The authoritative gate for every caller of the list's endpoint (CLI, API,
+    console): None means everyone and passes through; an empty list is refused
+    because one operator reads it as "no limit" and the next as "nobody"; every
+    entry must be an exact id of the binding's kind. Duplicates are dropped
+    (after normalizing, so two spellings of one address count once) and the
+    order of first appearance is kept, so a read shows the list as written.
+
+    Args:
+        kind: the binding's channel kind, which chooses the id shape.
+        callers: the list as sent, or None.
+
+    Returns:
+        None, or the deduplicated, normalized list.
+
+    Raises:
+        ValueError: the list is empty, too long, or holds an id the kind rejects.
+    """
+
+    if callers is None:
+        return None
+    if not callers:
+        raise ValueError(
+            "allowed_callers must not be empty: an empty list reads as \"nobody\" "
+            "to one operator and \"no limit\" to the next. Send null to let "
+            "everyone talk to the bot through this binding, or list at least one "
+            "caller id."
+        )
+    stored: list[str] = []
+    for caller in callers:
+        if len(caller) > _CALLER_MAX_CHARS:
+            raise ValueError(
+                f"caller id is longer than {_CALLER_MAX_CHARS} characters, which "
+                "no real id is; the value is not echoed here."
+            )
+        if kind == SLACK_KIND:
+            if not _SLACK_CALLER_ID.match(caller):
+                raise ValueError(
+                    f"caller {caller!r} is not a Slack user or bot id: a Slack "
+                    "binding's callers are exact ids starting with U, W or B "
+                    "(e.g. U0123ABCD), never a @handle, a display name or an "
+                    "email. Find a person's id in their profile, under "
+                    "\"Copy member ID\"."
+                )
+        elif kind == EMAIL_KIND:
+            if not _EMAIL_CALLER.match(caller):
+                raise ValueError(
+                    f"caller {caller!r} is not one bare email address: an email "
+                    "binding's callers are exact addresses like "
+                    "person@example.com, with no display name, no angle "
+                    "brackets and no domain-only or wildcard entries."
+                )
+        elif not caller or _ADDRESS_WHITESPACE.search(caller):
+            raise ValueError(
+                f"caller {caller!r} is not a caller id: it must be non-empty and "
+                "contain no whitespace, because it is matched exactly against "
+                "the id the channel reports for the sender."
+            )
+        normalized = normalize_caller_id(kind, caller)
+        if normalized not in stored:
+            stored.append(normalized)
+    if len(stored) > MAX_ALLOWED_CALLERS:
+        raise ValueError(
+            f"allowed_callers holds {len(stored)} distinct ids; the limit is "
+            f"{MAX_ALLOWED_CALLERS} per binding."
+        )
+    return stored
+
+
+class ChannelCallersWrite(BaseModel):
+    """The body of `PUT /agents/{agent_id}/channels/callers` (ADR 0175).
+
+    `allowed_callers` is REQUIRED, with null as an explicit value: a body that
+    omits it is a 422 rather than a silent "clear", so removing a binding's
+    protection is always something the caller wrote down. The kind-specific
+    checks run in the handler, since the kind comes from the selected binding
+    rather than from this body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_callers: list[str] | None
+
+
 class AppConfig(BaseModel):
     """Open app-level config the UI reads before auth (org/workspace name)."""
 
@@ -875,6 +1001,10 @@ class ChannelBindingOut(BaseModel):
     `adapter` is part of the route's identity, not a credential, so it belongs
     on the read side; `endpoint` stays write-only, unchanged from before.
     `ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.
+
+    `allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the
+    exact ids that may start a turn through this binding. It is written only by
+    `PUT /agents/{agent_id}/channels/callers`, never by a binding write.
     """
 
     model_config = ConfigDict(extra="forbid", from_attributes=True)
@@ -882,6 +1012,7 @@ class ChannelBindingOut(BaseModel):
     kind: str
     address: str
     adapter: str | None = None
+    allowed_callers: list[str] | None = None
 
     @model_validator(mode="after")
     def _present_route_identity(self) -> "ChannelBindingOut":
@@ -1156,6 +1287,11 @@ class ApprovalTargetOut(ChannelBindingOut):
     model_config = ConfigDict(extra="ignore")
 
     adapter: str | None = Field(default=None, exclude=True)
+    # A binding's caller list (ADR 0175), inherited from `ChannelBindingOut`,
+    # has no meaning on an approval target, which is where a card is posted,
+    # not a place a caller starts a turn; excluded for the same reason as
+    # `adapter` above, so this read shape stays exactly as it was.
+    allowed_callers: list[str] | None = Field(default=None, exclude=True)
 
 
 class ApprovalApproversOut(BaseModel):
