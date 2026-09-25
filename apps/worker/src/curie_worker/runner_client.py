@@ -431,11 +431,15 @@ class RunnerClient:
             deadline = asyncio.get_running_loop().time() + stream_timeout_s
             resp = await self._session.post(
                 f"{base_url}/v1/event",
-                json=event.model_dump(),
+                json=event.model_dump(mode="json"),
                 headers=headers,
                 timeout=request_timeout,
             )
             if resp.status != 200:
+                if event.publication_context is not None:
+                    # A validation response can echo the submitted capability.
+                    resp.release()
+                    raise RunnerError(f"/v1/event -> {resp.status}")
                 body = await resp.text()
                 resp.release()
                 raise RunnerError(f"/v1/event -> {resp.status}: {body}")
@@ -505,13 +509,15 @@ class RunnerClient:
         async def request(headers: dict[str, str] | None) -> tuple[bool, str]:
             async with self._session.post(
                 f"{base_url}/v1/steer",
-                json=event.model_dump(),
+                json=event.model_dump(mode="json"),
                 headers=headers,
                 timeout=self._request_timeout(remaining_s),
             ) as resp:
                 if resp.status == 409:
                     return False, "conflict"
                 if resp.status != 200:
+                    if event.publication_context is not None:
+                        raise RunnerError(f"/v1/steer -> {resp.status}")
                     body = await resp.text()
                     raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
                 return True, "success"

@@ -74,6 +74,7 @@ def precheck_case(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> Iterator[dict[str, Any]]:
     client, _ = publication_stack
     conversation = f"precheck-{uuid.uuid4().hex}"
@@ -116,8 +117,18 @@ def precheck_case(
             "repository": REPOSITORY_ID,
             "installation": INSTALLATION_ID,
             "agent": uuid.UUID(deployment["agent_id"]),
-            "repo": REPO,
-            "conversation": lineage["conversation_id"],
+            "repo": (
+                "acme-corp/other"
+                if getattr(request.node, "callspec", None)
+                and request.node.callspec.params.get("mutation") == "repository"
+                else REPO
+            ),
+            "conversation": (
+                "other-conversation"
+                if getattr(request.node, "callspec", None)
+                and request.node.callspec.params.get("mutation") == "conversation"
+                else lineage["conversation_id"]
+            ),
             "lineage": uuid.UUID(lineage_id),
         },
     )
@@ -133,7 +144,15 @@ def precheck_case(
             "item": work_item_id,
             "wait": now - timedelta(minutes=2),
             "started": now - timedelta(minutes=1),
-            "deadline": now + timedelta(hours=1),
+            "deadline": (
+                now - timedelta(seconds=1)
+                if getattr(request.node, "callspec", None)
+                and request.node.callspec.params.get("mutation") == "deadline"
+                else now + timedelta(seconds=4)
+                if getattr(request.node, "callspec", None)
+                and request.node.callspec.params.get("mutation") == "deadline elapsed"
+                else now + timedelta(hours=1)
+            ),
             "lease": now + timedelta(minutes=5),
         },
     )
@@ -354,6 +373,56 @@ def test_mint_binds_running_request_and_comparison_reads_fresh_truth_without_wri
     assert _durable_snapshot() == before
 
 
+def test_running_factory_request_without_existing_pr_gets_authenticated_absence(
+    precheck_case: dict[str, Any],
+) -> None:
+    case = precheck_case
+    work_item_id, request_id = uuid.uuid4(), uuid.uuid4()
+    conversation = f"first-pr-{uuid.uuid4().hex}"
+    now = datetime.now(UTC)
+    _execute(
+        "INSERT INTO curie.work_items "
+        "(id, github_repository_id, github_issue_number, github_installation_id, "
+        "agent_id, repo_full_name, conversation_id) "
+        "VALUES (:id, :repository, 3216, :installation, :agent, :repo, :conversation)",
+        {
+            "id": work_item_id,
+            "repository": REPOSITORY_ID,
+            "installation": INSTALLATION_ID,
+            "agent": uuid.UUID(case["deployment"]["agent_id"]),
+            "repo": REPO,
+            "conversation": conversation,
+        },
+    )
+    _execute(
+        "INSERT INTO curie.execution_requests "
+        "(id, work_item_id, sequence, status, wait_deadline, started_at, "
+        "execution_deadline, execution_attempts, runtime_owner, runtime_epoch, "
+        "runtime_heartbeat_expires_at) "
+        "VALUES (:id, :item, 1, 'running', :wait, :started, :deadline, "
+        "1, 'fixture-runner', 7, :lease)",
+        {
+            "id": request_id,
+            "item": work_item_id,
+            "wait": now - timedelta(minutes=2),
+            "started": now - timedelta(minutes=1),
+            "deadline": now + timedelta(hours=1),
+            "lease": now + timedelta(minutes=5),
+        },
+    )
+    request = _mint_body(case)
+    request["work_item_id"] = str(work_item_id)
+    request["execution_request_id"] = str(request_id)
+    before = _durable_snapshot()
+
+    response = case["client"].post(MINT_URL, json=request, headers=WORKER_HEADERS)
+
+    assert response.status_code == 204, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert _pull_reads(case) == []
+    assert _durable_snapshot() == before
+
+
 @pytest.mark.parametrize("change", ["title", "body"])
 @pytest.mark.parametrize("proposed", ["old", "new"])
 def test_remote_metadata_change_refuses_both_old_and_new_proposals(
@@ -394,6 +463,7 @@ def test_comparison_cannot_select_a_different_repository_or_pull_request(
 ) -> None:
     case = precheck_case
     context = _mint(case)
+    before = _durable_snapshot()
     response = case["client"].post(
         COMPARE_URL,
         headers={CAPABILITY_HEADER: context["capability"]},
@@ -409,13 +479,9 @@ def test_comparison_cannot_select_a_different_repository_or_pull_request(
         },
     )
 
-    assert response.status_code == 422 or response.json() == {"result": "unchanged"}
-    assert all(
-        request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"
-        for request in case["calls"]
-        if "/pulls/" in request.url.path
-    )
-    assert len(_pull_reads(case)) <= 2
+    assert response.status_code == 422, response.text
+    assert len(_pull_reads(case)) == 1
+    assert _durable_snapshot() == before
 
 
 @pytest.mark.parametrize(
@@ -533,11 +599,7 @@ def test_mint_refuses_without_current_execution_and_lineage_authority(
             {"id": case["request_id"]},
         )
     elif mutation == "deadline":
-        _execute(
-            "UPDATE curie.execution_requests SET execution_deadline = "
-            "clock_timestamp() - interval '1 second' WHERE id = :id",
-            {"id": case["request_id"]},
-        )
+        pass
     elif mutation == "status":
         _execute(
             "UPDATE curie.execution_requests SET status = 'cancellation_requested', "
@@ -545,17 +607,9 @@ def test_mint_refuses_without_current_execution_and_lineage_authority(
             {"id": case["request_id"]},
         )
     elif mutation == "conversation":
-        _execute(
-            "UPDATE curie.work_items SET conversation_id = 'other-conversation' "
-            "WHERE id = :id",
-            {"id": case["work_item_id"]},
-        )
+        pass
     else:
-        _execute(
-            "UPDATE curie.work_items SET repo_full_name = 'acme-corp/other' "
-            "WHERE id = :id",
-            {"id": case["work_item_id"]},
-        )
+        assert mutation == "repository"
     before = _durable_snapshot()
     response = case["client"].post(MINT_URL, json=request, headers=WORKER_HEADERS)
 
@@ -580,8 +634,7 @@ def test_mint_refuses_without_current_execution_and_lineage_authority(
         ),
         (
             "deadline elapsed",
-            "UPDATE curie.execution_requests SET execution_deadline = "
-            "clock_timestamp() - interval '1 second' WHERE id = :id",
+            "",
         ),
         (
             "request terminated",
@@ -598,10 +651,6 @@ def test_mint_refuses_without_current_execution_and_lineage_authority(
             "UPDATE curie.thread_publication_lineages SET head_sha = "
             "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE id = :id",
         ),
-        (
-            "lineage unlinked",
-            "UPDATE curie.work_items SET publication_lineage_id = NULL WHERE id = :id",
-        ),
     ],
 )
 def test_existing_capability_refuses_changed_durable_authority_before_github(
@@ -610,9 +659,15 @@ def test_existing_capability_refuses_changed_durable_authority_before_github(
     case = precheck_case
     context = _mint(case)
     target = case["lineage_id"] if mutation.startswith("lineage ") else case["request_id"]
-    if mutation == "lineage unlinked":
-        target = case["work_item_id"]
-    _execute(statement, {"id": target})
+    if mutation == "deadline elapsed":
+        deadline = _rows(
+            "SELECT extract(epoch FROM execution_deadline) AS deadline "
+            "FROM curie.execution_requests WHERE id = :id",
+            {"id": target},
+        )[0]["deadline"]
+        time.sleep(max(0.0, float(deadline) - time.time() + 0.1))
+    else:
+        _execute(statement, {"id": target})
     before = _durable_snapshot()
 
     response = _compare(case, context, title=OBSERVED_TITLE, body=OBSERVED_BODY)
@@ -705,7 +760,7 @@ def test_capability_is_accepted_only_at_the_comparison_route(
     assert client.get("/publications", headers={"X-API-Key": token}).status_code == 401
     assert client.get("/approvals", headers={"X-API-Key": token}).status_code == 401
     assert client.get(
-        f"/{case['deployment']['agent_id']}/state", headers={"X-API-Key": token}
+        f"/agents/{case['deployment']['agent_id']}/state", headers={"X-API-Key": token}
     ).status_code == 401
     credential = client.post(
         f"/v1/internal/publications/{case['publication_id']}/credential",

@@ -204,7 +204,12 @@ class PublicationPrecheck:
                 return _UNAVAILABLE
             if not isinstance(result, dict):
                 return _UNAVAILABLE
-            if response.status == 409 and result.get("detail") == "stale_context":
+            detail = result.get("detail")
+            if (
+                response.status == 409
+                and isinstance(detail, dict)
+                and detail.get("code") == "stale_context"
+            ):
                 return (
                     "stale_context: Pull request metadata or execution authority changed. "
                     "Preserve external edits and obtain a fresh trusted Event."

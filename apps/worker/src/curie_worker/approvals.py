@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
-from aci_protocol import ApprovalRequest, QueuedTurn
+from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, QueuedTurn
 from curie_telemetry import inject_trace_context
 
 from .workspace import WorkspaceSelectionRefused
@@ -51,6 +51,7 @@ _REVIEW_EVENT_ID_RE = re.compile(
 # margin while still bounding this worker-side HTTP hop independently of the
 # much longer model/session client timeout.
 _REVIEW_RESERVE_HTTP_TIMEOUT_S = 3.0
+_PUBLICATION_CONTEXT_HTTP_TIMEOUT_S = 10.0
 
 
 def _publication_refusal(response: httpx.Response) -> str | None:
@@ -254,6 +255,16 @@ class PublicationCreator(Protocol):
         conversation_id: str,
         repo_full_name: str,
     ) -> PublicationLineage | None: ...
+
+    async def get_publication_precheck_context(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        work_item_id: uuid.UUID,
+        execution_request_id: uuid.UUID,
+        runtime_epoch: int,
+        queued_event_id: str,
+    ) -> PublicationContext | None: ...
 
     async def verify_review_feedback(
         self,
@@ -531,6 +542,61 @@ class ApprovalClient:
             )
         except (ValueError, KeyError) as exc:
             raise ApprovalBackendError("publication create returned an unusable body") from exc
+
+    async def get_publication_precheck_context(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        work_item_id: uuid.UUID,
+        execution_request_id: uuid.UUID,
+        runtime_epoch: int,
+        queued_event_id: str,
+    ) -> PublicationContext | None:
+        """Obtain one execution's scoped read capability from the trusted API."""
+
+        if not self._worker_headers:
+            raise ApprovalBackendError("publication context requires internal worker auth")
+        headers = {**self._worker_headers, "Content-Type": "application/json"}
+        inject_trace_context(headers)
+        try:
+            response = await self._client.post(
+                f"{self._publication_url}/precheck/context",
+                json={
+                    "deployment_id": str(deployment_id),
+                    "work_item_id": str(work_item_id),
+                    "execution_request_id": str(execution_request_id),
+                    "runtime_epoch": runtime_epoch,
+                    "queued_event_id": queued_event_id,
+                },
+                headers=headers,
+                follow_redirects=False,
+                timeout=_PUBLICATION_CONTEXT_HTTP_TIMEOUT_S,
+            )
+        except httpx.HTTPError:
+            raise ApprovalBackendError("publication context transport unavailable") from None
+        if response.status_code == 204:
+            # Only the authenticated API can establish first publication
+            # absence. Auth, provider and authority errors are never absence.
+            return None
+        if response.status_code != 200:
+            raise ApprovalBackendError("publication context unavailable")
+        try:
+            context = PublicationContext.model_validate(
+                response.json(), context=READER_CONTEXT
+            )
+        except (TypeError, ValueError):
+            # Validation errors can contain the capability. Do not propagate
+            # their body or chain into the worker's ordinary error logging.
+            raise ApprovalBackendError("publication context returned an unusable body") from None
+        if (
+            context.deployment_id != deployment_id
+            or context.work_item_id != work_item_id
+            or context.execution_request_id != execution_request_id
+            or context.runtime_epoch != runtime_epoch
+            or context.queued_event_id != queued_event_id
+        ):
+            raise ApprovalBackendError("publication context identity was refused")
+        return context
 
     async def get_publication_lineage(
         self,

@@ -9,6 +9,7 @@ import subprocess
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from shutil import which
 from typing import Any
 
 import anyio
@@ -24,12 +25,24 @@ from claude_agent_sdk import (
     UserMessage,
 )
 from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
+from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import ApprovalGate, build_approval_hook, build_can_use_tool
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+from starlette.requests import Request
+from starlette.responses import StreamingResponse
+
+from .test_hosted_mcp_approval_catalog import (
+    _ProviderCapture,
+    _sdk_env,
+    _serve,
+    _sse,
+    _text_frames,
+    _tool_use_frames,
+)
 
 REPO = "acme-corp/acme-bot"
 TITLE = "Update documentation"
@@ -142,6 +155,8 @@ async def _boot(
     repo: Path,
     api_url: str,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    sdk_env: dict[str, str] | None = None,
 ) -> SessionRunner:
     bundle = tmp_path / "bundle"
     (bundle / ".claude-plugin").mkdir(parents=True)
@@ -161,7 +176,9 @@ async def _boot(
     # Production boot performs synchronous capability discovery with anyio.run.
     # Keep that boot outside this test server's running event loop.
     return await anyio.to_thread.run_sync(
-        lambda: build_runner(config, workspace_path=repo, fake_model=False)
+        lambda: build_runner(
+            config, workspace_path=repo, fake_model=False, sdk_env=sdk_env
+        )
     )
 
 
@@ -370,7 +387,7 @@ def test_refused_proposal_can_be_corrected_with_a_file_change_in_the_same_turn(
     ("status", "reply", "reason"),
     [
         (200, {"result": "metadata_changed"}, "metadata_only_unsupported"),
-        (409, {"detail": "stale_context"}, "stale_context"),
+        (409, {"detail": {"code": "stale_context"}}, "stale_context"),
         (503, {"detail": "precheck_unavailable"}, "precheck_unavailable"),
     ],
 )
@@ -427,7 +444,10 @@ def test_identical_arguments_with_a_new_call_id_require_fresh_truth(
 ) -> None:
     async def go() -> None:
         repo, head = workspace
-        replies = [(200, {"result": "unchanged"}), (409, {"detail": "stale_context"})]
+        replies = [
+            (200, {"result": "unchanged"}),
+            (409, {"detail": {"code": "stale_context"}}),
+        ]
         async with _api(replies) as (url, calls):
             runner = await _boot(tmp_path, repo, url, monkeypatch)
             gate = runner._approval_gate
@@ -575,5 +595,142 @@ def test_fake_permission_callback_receives_the_stream_tool_use_id() -> None:
             await model.close()
         assert seen == [block.id]
         assert isinstance(messages[-1], ResultMessage)
+
+    anyio.run(go)
+
+
+@pytest.mark.skipif(which("claude") is None, reason="local Claude CLI is unavailable")
+def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
+    tmp_path: Path,
+    workspace: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PublicationProvider(_ProviderCapture):
+        def __init__(self) -> None:
+            super().__init__()
+            self.message_count = 0
+
+        async def respond(self, request: Request) -> StreamingResponse:
+            self.message_count += 1
+            # The first response can arrive during SDK tool catalog setup;
+            # offer the same tool call again after that setup completes.
+            frames = (
+                _tool_use_frames(PLATFORM_PUBLISH_TOOL_NAME, {"title": TITLE, "body": BODY})
+                if self.message_count <= 2
+                else _text_frames("The publication request was refused.")
+            )
+            return StreamingResponse(_sse(frames), media_type="text/event-stream")
+
+    stream_ids: list[str] = []
+    hook_ids: list[str | None] = []
+    permission_ids: list[str | None] = []
+    hook_results: list[dict[str, Any]] = []
+    permission_results: list[PermissionResultDeny] = []
+    order: list[str] = []
+
+    real_build_hook = boot.build_approval_hook
+    real_build_permission = boot.build_can_use_tool
+
+    def observe_hook(gate: ApprovalGate):
+        matchers = real_build_hook(gate)
+        callback = matchers["PreToolUse"][0].hooks[0]
+
+        async def capture(hook_input: Any, tool_use_id: str | None, context: Any):
+            result = await callback(hook_input, tool_use_id, context)
+            tool_name = (
+                hook_input.get("tool_name")
+                if isinstance(hook_input, dict)
+                else getattr(hook_input, "tool_name", None)
+            )
+            if tool_name != PLATFORM_PUBLISH_TOOL_NAME:
+                return result
+            order.append("hook")
+            hook_ids.append(tool_use_id)
+            hook_results.append(result)
+            # Let the SDK reach can_use_tool after the real hook has made its
+            # decision so all three SDK identifiers are observable in one call.
+            return {}
+
+        matchers["PreToolUse"][0].hooks[0] = capture
+        return matchers
+
+    def observe_permission(gate: ApprovalGate):
+        callback = real_build_permission(gate)
+
+        async def capture(name: str, args: dict[str, Any], context: ToolPermissionContext):
+            result = await callback(name, args, context)
+            if name == PLATFORM_PUBLISH_TOOL_NAME:
+                order.append("permission")
+                permission_ids.append(context.tool_use_id)
+                assert isinstance(result, PermissionResultDeny)
+                permission_results.append(result)
+            return result
+
+        return capture
+
+    class ObservingSession(boot.ClaudeAgentSession):
+        def receive_turn(self):
+            upstream = super().receive_turn()
+
+            async def observe():
+                async for message in upstream:
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if (
+                                isinstance(block, ToolUseBlock)
+                                and block.name == PLATFORM_PUBLISH_TOOL_NAME
+                            ):
+                                order.append("stream")
+                                stream_ids.append(block.id)
+                    yield message
+
+            return observe()
+
+    monkeypatch.setattr(boot, "build_approval_hook", observe_hook)
+    monkeypatch.setattr(boot, "build_can_use_tool", observe_permission)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", ObservingSession)
+
+    async def go() -> None:
+        repo, head = workspace
+        provider = PublicationProvider()
+        async with _api([(200, {"result": "unchanged"})]) as (url, calls):
+            with _serve(provider.app()) as provider_url:
+                runner = await _boot(
+                    tmp_path,
+                    repo,
+                    url,
+                    monkeypatch,
+                    sdk_env=_sdk_env(provider_url, tmp_path / "claude-publication"),
+                )
+                gate = runner._approval_gate
+                assert gate is not None
+                await runner.start()
+                try:
+                    with anyio.fail_after(45):
+                        frames = [
+                            json.loads(line)
+                            async for line in runner.run_turn(_event(_context(head, url)))
+                        ]
+                finally:
+                    await runner.close()
+
+        assert provider.message_count >= 2
+        assert stream_ids == ["toolu_loopback_1"]
+        assert hook_ids == stream_ids
+        assert permission_ids == stream_ids
+        assert order == ["stream", "hook", "permission"]
+        assert "no_change" in hook_results[0]["hookSpecificOutput"][
+            "permissionDecisionReason"
+        ]
+        assert "no_change" in permission_results[0].message
+        assert permission_results[0].interrupt is False
+        assert len(calls) == 1
+        assert calls[0]["body"]["proposed_title"] == TITLE
+        assert calls[0]["body"]["proposed_body"] == BODY
+        assert frames[-1]["status"] == "done"
+        assert not any(frame["type"] == "error" for frame in frames)
+        assert gate.pending_summary is None
+        assert gate.pending_granted_tool is None
+        assert gate.pending_halt is False
 
     anyio.run(go)
