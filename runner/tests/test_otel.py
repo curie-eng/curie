@@ -2168,3 +2168,24 @@ def test_a_parallel_tool_response_records_every_output_block() -> None:
     assert "[tool_use Grep]" in output
     assert "Both started." in output
     assert _TOOL_ARGUMENT not in output
+
+
+def test_an_echoed_user_prompt_is_replaced_in_the_generation_output() -> None:
+    """The user prompt text is never exported, even when the model repeats it."""
+
+    prompt = "What is the weather in private-city-PLACEHOLDER tomorrow"
+    placeholder = f"[user prompt: {len(prompt)} chars]"
+    script: list[object] = [
+        AssistantMessage(
+            content=[TextBlock(text=f"You asked: {prompt}. Answer: sunny")],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _result(text="done"),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script), prompt=prompt)
+    [generation] = _spans_by_name(finished)["llm.generation"]
+
+    assert prompt not in _span_wire_material(finished)
+    output = generation.attributes[_OUTPUT]
+    assert f"You asked: {placeholder}. Answer: sunny" in output
