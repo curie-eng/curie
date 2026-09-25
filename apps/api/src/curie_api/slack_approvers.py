@@ -32,6 +32,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+import httpx
+from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
 from pydantic import ValidationError
 
 from .approvers import (
@@ -41,9 +43,14 @@ from .approvers import (
     MembershipVerdict,
     UnboundRoute,
 )
+from .config import Settings
+from .identities import slack_bot_tokens
 from .models import Approval
 from .schemas import ApprovalApprovers
+from .slack_usergroups import SlackUserGroupClient
 from .usergroups import GroupMembershipSource, UserGroupLookupError
+
+_NO_API_TOKEN = "no Slack bot token is configured for the API"
 
 
 class SlackChannelMembers:
@@ -104,13 +111,20 @@ class SlackUserGroupMembers:
     # is required. Operator tokens remain explicit-user-only per ADR-0106.
     console_eligible = True
 
-    def __init__(self, group_id: str, source: GroupMembershipSource | None) -> None:
+    def __init__(
+        self,
+        group_id: str,
+        source: GroupMembershipSource | None,
+        *,
+        missing_source_reason: str = _NO_API_TOKEN,
+    ) -> None:
         self._group_id = group_id
         self._source = source
+        self._missing_source_reason = missing_source_reason
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         if self._source is None:
-            return self._undetermined("no Slack bot token is configured for the API")
+            return self._undetermined(self._missing_source_reason)
         try:
             membership = await self._source.members(self._group_id)
         except UserGroupLookupError as exc:
@@ -165,12 +179,28 @@ class SlackUserGroupMembers:
         )
 
 
+def approval_token_identity(approval: Approval) -> str:
+    """The Slack identity whose token resolves this approval's groups (ADR-0168 decision 5).
+
+    A Slack row with an endpoint is the pre-ADR custom-transport form, whose
+    ``reply_adapter`` is a credential slug; any other kind's card is posted by
+    ``default``. Both keep ``default``'s token. The rule itself is
+    ``aci_protocol.turn.slack_speaking_identity``, shared with the worker so
+    the two cannot disagree about a route.
+    """
+
+    kind = approval.reply_kind or ""
+    return slack_speaking_identity(kind, approval.reply_adapter, approval.reply_endpoint)
+
+
 class SlackApproverSetSelector:
     """Reads a route binding and picks the set it calls for (``ApproverSetSelector``).
 
     Holds the ``GroupMembershipSource`` so it can hand it to a user-group set;
     None when no bot token is configured, which is a normal Slack-free deployment
     (a route bound to a group then fails closed at resolve time).
+    ``identity_clients`` holds each named Slack identity's own source
+    (ADR-0168 decision 5); ``group_client`` is ``default``'s.
 
     The no-approvers case is a three-way split, not a single fallback
     (ADR-0123): a binding present with no ``approvers`` block and a routeless
@@ -178,8 +208,14 @@ class SlackApproverSetSelector:
     with no binding to read is refused outright.
     """
 
-    def __init__(self, group_client: GroupMembershipSource | None) -> None:
+    def __init__(
+        self,
+        group_client: GroupMembershipSource | None,
+        *,
+        identity_clients: Mapping[str, GroupMembershipSource] | None = None,
+    ) -> None:
         self._group_client = group_client
+        self._identity_clients = dict(identity_clients or {})
 
     def __call__(self, approval: Approval, binding: Any) -> ApproverSet:
         """Precedence, exactly as issue #420 states it: ``users`` wins over
@@ -232,7 +268,36 @@ class SlackApproverSetSelector:
             # the platform cannot make sense of denies, exactly as one that does
             # not parse does.
             return InvalidApprovers("approvers block declares neither users nor group")
-        return SlackUserGroupMembers(group, self._group_client)
+        identity = approval_token_identity(approval)
+        if identity == DEFAULT_IDENTITY:
+            return SlackUserGroupMembers(group, self._group_client)
+        return SlackUserGroupMembers(
+            group,
+            self._identity_clients.get(identity),
+            missing_source_reason=f"{_NO_API_TOKEN} for identity {identity!r}",
+        )
+
+
+def build_approver_set_selector(
+    http: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> SlackApproverSetSelector:
+    """The API's selector, with one user-group client per Slack identity.
+
+    Each client keeps its own member cache, so one bot's answer never stands
+    in for another's. A stock install builds the one client, or none, that it
+    always built.
+    """
+
+    clients = {
+        name: SlackUserGroupClient(http, token=token, ttl_s=settings.slack_usergroup_cache_ttl_s)
+        for name, token in slack_bot_tokens(settings, environ=environ).items()
+    }
+    return SlackApproverSetSelector(
+        clients.pop(DEFAULT_IDENTITY, None), identity_clients=clients
+    )
 
 
 def _parse_approvers(
