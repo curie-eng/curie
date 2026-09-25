@@ -149,8 +149,10 @@ answer, report that as a FAIL and stop.
 
 ## Planning a campaign
 
-Write the whole plan before you send anything. A turn has one reply, at its
-end, so the plan cannot be posted ahead of the probes: the report carries it.
+Write the whole plan before you send anything, into a file:
+`/tmp/mean-test-plan.md`, with the shell. Never write it in your reply. Read
+the file back as you run the campaign, and add each verdict to it as you
+judge, so the report can be built from it.
 
 A campaign is threads. A thread is one root probe, then up to Follow-ups per
 thread follow-ups inside it. Group probes into threads by kind, so a thread's
@@ -190,6 +192,12 @@ When the request gave the exact probe, the plan is that one probe, in one
 thread.
 
 ## Running a campaign
+
+Write nothing but tool calls until the report. The platform streams every word
+you write outside a tool call into the Slack message people are watching, and
+Slack refuses that message past 3,000 characters. A refused update ends the
+turn with probes already sent. So narrate nothing, and keep notes in
+`/tmp/mean-test-plan.md`.
 
 Note the time with `date +%s` before the first probe. Once the Turn budget
 less five minutes has passed, open no more threads: finish the open ones and
