@@ -980,7 +980,12 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
 1. Installs the candidate commit's published `sha-<commit>` images from that
    commit's chart into a namespace it creates (`test-factory-<commit>` by
    default, or `--namespace test-factory-<slug>`). If the cluster already runs
-   the agent-sandbox controller, the install is consumer mode.
+   the agent-sandbox controller, the install is consumer mode. Without
+   `--candidate`, the candidate is the newest first-parent commit of
+   `origin/next`, within its last 30, whose images are all published. A tip
+   that CI is still building is skipped and logged, and the run is refused
+   when none of the 30 has its images. An explicit `--candidate` is used as
+   given and refused when its images are not published.
 2. Turns on factory intake, binds one agent to the fixture repository, deploys
    the default factory bundle (`examples/dark-factory`) onto it with a
    short-lived installation token limited to Issues: Read as the bundle's
@@ -992,6 +997,41 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
 4. Passes when GitHub's delivery log shows that the `issues.labeled` delivery
    got HTTP 200 and `factory_admitted`, and
    `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
+
+Before it creates its namespace, the driver removes what a crashed run on this
+machine left behind. Each namespace it creates carries its run id and a
+`curie.dev/factory-e2e-holder` annotation of `<hostname>:<pid>`. A harness
+namespace whose holder is on this host with a dead process is stale: the driver
+uninstalls its release, deletes it, its publication namespace, and its cluster
+roles, role bindings and PriorityClasses, and waits until they are gone. Each
+install creates the chart CRDs the cluster lacks itself, already carrying the
+harness owner label, before Helm runs; once every stale release is removed and
+no other harness namespace remains, the sweep deletes the CRDs carrying that
+label. A namespace held from another host, or one with no holder (written
+before holders existed), is reported in the evidence and left alone, since
+another machine may still own it; delete it by hand once you know its run
+ended.
+
+If the App webhook already points at a quick tunnel when the run starts, the
+driver probes that tunnel's health endpoint up to four times, ten seconds
+apart, and only calls it dead if every probe fails; one 200 response counts it
+alive. A live tunnel belongs to another run, so the run is refused. A dead
+tunnel is a crashed run's: the run goes ahead and its teardown leaves the
+webhook on `CURIE_FACTORY_WEBHOOK_RESTORE_URL`, or, when that is unset, parks
+it on `https://example.com/curie-factory-e2e/parked` until you set a real
+URL.
+
+`--hold` (on `preflight` and `run`) keeps a passing install up instead of
+tearing it down at once. The driver logs the kube context, namespace,
+release, local api URL, tunnel and webhook URL, fixture repository and
+factory agent, and writes them under `hold` in the evidence file straight
+away, so a second shell can read them. The api key is never printed: the
+evidence names a `0600` file in the run's private work directory that holds
+it. Every minute the driver reopens the api port-forward or the tunnel if
+either died and refreshes the bundle's installation token when it is due; a
+failed check is logged and the hold continues. Ctrl-C or
+`kill -TERM <pid>` ends the hold and runs the normal teardown, and the result
+stays `passed`. A run that fails never holds.
 
 On every exit it restores the webhook URL, resets the fixture again, stops the
 tunnel, and deletes the namespace and its publication namespace. Each undo is
@@ -1008,10 +1048,11 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_APP_ID`, `CURIE_FACTORY_INSTALLATION_ID` | Override `app.json` |
 | `CURIE_FACTORY_APP_PRIVATE_KEY_FILE`, `CURIE_FACTORY_WEBHOOK_SECRET_FILE` | Override the files in the App directory |
 | `CURIE_FACTORY_REPO` | Fixture repository `owner/name` |
-| `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A human account with write access that opens the issue (a `gh` login for the second) |
+| `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A dedicated test GitHub account with write access that opens issues, comments and moves the fixture branch (a `gh` login for the second). It must not be the operator's own account |
+| `CURIE_FACTORY_OPERATOR_LOGIN` | The operator's GitHub login, compared with the actor's (default: the login of the default `gh` account). The run is refused when they match, and refused too when neither is known, naming this variable to set |
 | `CURIE_FACTORY_LABEL`, `CURIE_FACTORY_MENTION` | Intake label (default `curie-factory`) and mention login (default the App slug) |
 | `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses instead of creating them |
-| `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start) |
+| `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start, or the parked URL when that was a dead quick tunnel) |
 | `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
 | `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
