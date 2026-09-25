@@ -13,13 +13,14 @@ from typing import Any
 
 import pytest
 from channel_protocol import scoped_conversation_id
+from curie_api import crud
 from curie_api.config import get_settings
 from curie_api.threadkeys import (
     pre_identity_thread_key,
     route_thread_key,
     route_thread_key_matches,
 )
-from curie_api.workitem_dispatch import admit, readmit
+from curie_api.workitem_dispatch import admit, cancel, readmit, running_for_conversation
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -209,5 +210,65 @@ def test_readmit_accepts_a_work_item_admitted_before_the_identity(
         agent_id, _work_item_id, _version = await _legacy_mail_work_item(session)
         again = await readmit(session, _facts(agent_id))
         assert getattr(again, "code", None) != "identity_mismatch", again
+
+    _with_session(body)
+
+
+# --- pre-identity work items still fence their thread ---------------------------
+
+
+def test_a_continuation_finds_a_work_item_keyed_before_the_identity(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        await _legacy_mail_work_item(session)
+        state, _ = await running_for_conversation(session, NEW_KEY)
+        # Waiting, not running: found, so "ended", never "absent".
+        assert state == "ended"
+
+    _with_session(body)
+
+
+def test_a_cancelled_work_item_keyed_before_the_identity_still_fences_publication(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id, work_item_id, version = await _legacy_mail_work_item(session)
+        cancelled = await cancel(
+            session, work_item_id=work_item_id, expected_version=version
+        )
+        assert getattr(cancelled, "work_item", None) is not None, cancelled
+        conflict = await crud.publication_cancellation_conflict(
+            session, agent_id=agent_id, conversation_id=NEW_KEY
+        )
+        assert conflict is not None
+
+    _with_session(body)
+
+
+def test_a_named_slack_key_never_finds_the_default_apps_work_item(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = uuid.uuid4()
+        await session.execute(
+            text("INSERT INTO curie.agents (id, name, repo_full_name) VALUES (:id, :n, :r)"),
+            {"id": agent_id, "n": f"acme-slack-{agent_id.hex[:8]}", "r": "acme-corp/acme-bot"},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+                "VALUES (:id, :a, 'slack', 'C0EXAMPLE1')"
+            ),
+            {"id": uuid.uuid4(), "a": agent_id},
+        )
+        await session.commit()
+        await admit(
+            session,
+            _facts(agent_id, kind="slack", address="C0EXAMPLE1", reply_conversation_id=SLACK_TS),
+        )
+        named = scoped_conversation_id("slack", "C0EXAMPLE1", SLACK_TS, identity="second-bot")
+        state, _ = await running_for_conversation(session, named)
+        assert state == "absent"
 
     _with_session(body)

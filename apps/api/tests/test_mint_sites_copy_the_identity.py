@@ -1,13 +1,23 @@
 """The API's row-backed mint sites copy `adapter` unchanged from a binding or
 approval row (ADR-0168 decision 3).
 
-Pinned here: the channel ingress, the hook ingress, resumes, GitHub reviews
-and the work-item execute wake. Two first-party sites mint `adapter=None`
-instead and are not pinned: the work-item terminate wake
-(`workitem_reconciler.py::_publish_terminate_wakes`) and the CLI's stub turn
+Pinned here: the channel ingress, the hook ingress, resumes, GitHub reviews,
+the work-item execute wake and the work-item terminate wake. One first-party
+site still mints `adapter=None` and is not pinned: the CLI's stub turn
 (`cli/src/queue.rs`), whose route is the configured Slack dev origin. The Slack
 dispatcher also still mints `adapter=None`; ADR-0168 decision 3 names it as
 the one mint site that changes.
+
+The terminate wake is a narrower case than the others: `ExecutionRequest`
+carries no `reply_adapter` column, and the owning agent's channel may already
+be gone by the time termination fires
+(`test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel` deletes
+it outright), so there is no live binding row left to copy from. It copies
+from the work item's OWN stored route instead -- decoded back out of
+`WorkItem.conversation_id`, which `route_thread_key` folded the adapter into
+at admission -- and the case below checks that decoded adapter reproduces
+the exact key the worker used for this thread, not just that some adapter
+made it onto the wake.
 
 Each case seeds a row whose `adapter` is a distinctive, non-default value on a
 non-Slack kind (0024's `agent_channels_route_pair_ck` and the approval-side
@@ -38,6 +48,7 @@ from curie_api.models import (
     ThreadPublicationLineage,
 )
 from curie_api.resumequeue import build_resume_turn
+from curie_api.threadkeys import route_thread_key
 from curie_api.workitem_dispatch import admit
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import (
@@ -350,3 +361,73 @@ def test_work_item_execute_copies_the_binding_identity(
     assert handle["kind"] == "webhook"
     assert handle["endpoint"] == endpoint
     assert handle["adapter"] == adapter
+
+
+# --- work-item terminate (workitem_reconciler.py) --------------------------------
+
+
+def test_work_item_terminate_keys_the_same_thread_the_worker_used(
+    clean_db, allowlisted, valkey, runs_stream
+) -> None:
+    """`WorkItemReconciler._publish_terminate_wakes` decodes the adapter back
+    out of the work item's OWN stored `conversation_id` -- there is no live
+    binding left to copy from once a channel is gone -- and the terminate
+    wake's `route_thread_key` must land on the exact key the worker used to
+    admit this thread (ADR-0168 decision 4), or a named route's terminate
+    interrupts and locks a thread that does not exist."""
+
+    endpoint = "http://acme-workitem-terminate-adapter:8080/"
+    adapter = "acme-workitem-terminate"
+    address = "acme-workitem-terminate@example.test"
+
+    async def steps(maker, reconciler, _client) -> tuple[uuid.UUID, str]:
+        async with maker() as session:
+            agent_id = await _agent_with_route(
+                session, kind="webhook", address=address, endpoint=endpoint, adapter=adapter
+            )
+            facts = _facts(agent_id, kind="webhook", address=address)
+            admitted = await admit(session, facts)
+            assert admitted.request is not None
+            request_id = admitted.request.id
+            await session.execute(
+                sql_text(
+                    "UPDATE curie.execution_requests e SET "
+                    "status = 'cancellation_requested', "
+                    "started_at = s.ts, "
+                    "execution_deadline = s.ts + interval '1800 seconds', "
+                    "execution_attempts = 1, "
+                    "terminal_cause = 'owner_lost', "
+                    "runtime_owner = NULL, "
+                    "runtime_heartbeat_expires_at = s.ts + interval '59 seconds', "
+                    "version = version + 1 "
+                    "FROM (SELECT clock_timestamp() - interval '60 seconds' AS ts) s "
+                    "WHERE e.id = :id"
+                ),
+                {"id": request_id},
+            )
+            await session.commit()
+        await reconciler.run_once()
+        await reconciler.run_once()
+        return request_id, admitted.work_item.conversation_id
+
+    request_id, thread_key = _run(steps, runs_stream)
+
+    terminate = [
+        payload
+        for payload in _payloads(valkey, runs_stream)
+        if payload["event_id"] == f"work-item-{request_id}-terminate"
+    ]
+    assert len(terminate) == 1
+    handle = terminate[0]["reply_handle"]
+    assert handle["kind"] == "webhook"
+    assert handle["channel"] == address
+    assert handle["adapter"] == adapter
+    assert (
+        route_thread_key(
+            handle["kind"],
+            handle["adapter"],
+            handle["channel"],
+            terminate[0]["conversation_id"],
+        )
+        == thread_key
+    )
