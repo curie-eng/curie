@@ -34,14 +34,19 @@ from `--slack-channel` when supplied.
 
 The installer applies `manifests/kubernetes-access.yaml`, waits for the one
 ServiceAccount token, constructs one kubeconfig, and reconciles it as
-`K8S_KUBECONFIG`. That credential combines non-secret operational reads with
-workload writes only in `sre-demo`.
+`K8S_KUBECONFIG`. Under that default grant, the credential combines non-secret
+operational reads with workload writes only in `sre-demo`. The installer never
+applies the opt-in operator grant, `manifests/kubernetes-operator-access.yaml`,
+which widens the same credential's reads and writes to every built-in kind
+except Secrets and ServiceAccount tokens; see the README before applying it.
 
 There is no write allowlist flag and no separate scale identity. The exact 13
 read tools execute immediately, the exact six mutating core tools require
 one-shot approval, and unmatched tools deny. The config toolset and
-multi-cluster support are disabled at server startup. RBAC, not approval, keeps
-the write blast radius inside the disposable workload namespace.
+multi-cluster support are disabled at server startup. Under the default grant,
+RBAC, not approval, keeps the write blast radius inside the disposable workload
+namespace; under the operator grant, approval is what stands in front of Secret
+contents.
 
 ## Upgrade path: `--platform-upgrade`
 

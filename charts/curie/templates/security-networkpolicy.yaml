@@ -225,7 +225,8 @@ wins over this auto carve-out.
 {{- end -}}
 {{/*
 Validate one BYO endpoint egress entry (rustfs.egress, rustfs.stsEgress,
-otelCollector.egress, api.egress, agentSandbox.connectorEgress.<agent>). Each of
+otelCollector.egress, api.egress, agentSandbox.connectorEgress.<agent>,
+agentSandbox.registryEgress.<agent>). Each of
 those lists names ONE external peer the runner must reach, not the model
 allowlist. Require cidr + a ports list, require the address to parse as IPv4 or
 IPv6, refuse an explicit empty `except: []` (it would drop the metadata
@@ -720,21 +721,25 @@ spec:
   egress:
     {{- include "curie.egress.ipBlockRules" $np.allowedEgress | trim | nindent 4 }}
 {{- end }}
-{{- $connectorEgress := .Values.agentSandbox.connectorEgress | default dict }}
-{{- range $agent := keys $connectorEgress | sortAlpha }}
+{{- /* Per-agent egress: connectorEgress (connector hosts) and registryEgress
+       (package registries such as npm or PyPI, #3083). Both are closed unless
+       an agent is declared, and each declaring agent gets its own policy. */}}
+{{- range $kind := list (dict "key" "connectorEgress" "suffix" "allow-egress") (dict "key" "registryEgress" "suffix" "allow-registry-egress") }}
+{{- $perAgent := index $.Values.agentSandbox $kind.key | default dict }}
+{{- range $agent := keys $perAgent | sortAlpha }}
 {{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
-{{- fail (printf "agentSandbox.connectorEgress.%s has an invalid agent name" $agent) }}
+{{- fail (printf "agentSandbox.%s.%s has an invalid agent name" $kind.key $agent) }}
 {{- end }}
-{{- $entries := index $connectorEgress $agent }}
+{{- $entries := index $perAgent $agent }}
 {{- range $entries }}
-{{- include "curie.objectStore.egressEntry" (dict "key" (printf "agentSandbox.connectorEgress.%s" $agent) "entry" .) }}
+{{- include "curie.objectStore.egressEntry" (dict "key" (printf "agentSandbox.%s.%s" $kind.key $agent) "entry" .) }}
 {{- end }}
 {{- if $entries }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "curie.fullname" $ }}-agent-{{ $agent }}-allow-egress
+  name: {{ include "curie.fullname" $ }}-agent-{{ $agent }}-{{ $kind.suffix }}
   labels:
     {{- include "curie.labels" $ | nindent 4 }}
     app.kubernetes.io/component: agent-sandbox
@@ -747,6 +752,7 @@ spec:
   policyTypes: [Egress]
   egress:
     {{- include "curie.egress.ipBlockRules" $entries | trim | nindent 4 }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if $np.lockIngress }}

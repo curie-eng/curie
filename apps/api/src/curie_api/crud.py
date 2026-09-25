@@ -45,6 +45,7 @@ from .publication_policy import (
     publication_branch_name,
     publication_row_prefix,
 )
+from .resumequeue import parse_resume_event_id
 from .schemas import (
     ActionComplete,
     ActionRecord,
@@ -2094,6 +2095,66 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
         select(Approval).where(Approval.dedupe_key == dedupe_key)
     )
     return result
+
+
+# How far back the re-raise guard walks a chain of platform-authored resume
+# turns. A chain is one approval per hop, so this is far past any real run; it
+# only bounds the walk against a corrupt row whose dedupe_key loops.
+_RERAISE_CHAIN_LIMIT = 64
+
+
+def _same_approval(prior: Approval, data: "ApprovalRequest") -> bool:
+    """Whether ``data`` asks for the same human decision ``prior`` recorded (#2885).
+
+    Same agent, same thread, same manifest route, and the same gate: a policy
+    gate, or a permission gate on the same denied tool. The summary is left out
+    on purpose. It is model-authored free text, so keying on it would let a
+    reworded retry through, and a reworded retry is exactly the failure this
+    guard exists for. ``route=""`` reads as routeless, matching
+    ``get_approval_route_binding``.
+    """
+
+    return (
+        prior.agent_id == data.agent_id
+        and prior.conversation_id == data.conversation_id
+        and (prior.route or None) == (data.route or None)
+        and prior.gate_kind == data.gate_kind
+        and prior.granted_tool == data.granted_tool
+    )
+
+
+async def find_rejected_reraise(
+    session: AsyncSession, data: "ApprovalRequest"
+) -> Approval | None:
+    """The rejected approval ``data`` would re-raise with nobody asking, or None.
+
+    The worker stamps each request with the event id of the turn that raised
+    it, and a resume turn's event id is ``resume_event_id(<approval id>)``. So
+    a request whose ``dedupe_key`` parses as a resume id was raised by a turn
+    the platform authored, not one a person typed, and following those ids
+    back walks every approval raised since the last turn a person started.
+    If any of them was rejected and is the same approval (``_same_approval``),
+    this request is the agent asking again on its own, and that rejected
+    record is returned. A request raised from a person's turn (any other
+    event id) ends the walk at once: a person asking is the explicit ask.
+
+    Reads only; the caller decides the response and writes the audit row.
+    """
+
+    seen: set[uuid.UUID] = set()
+    dedupe_key = data.dedupe_key
+    for _ in range(_RERAISE_CHAIN_LIMIT):
+        prior_id = parse_resume_event_id(dedupe_key)
+        if prior_id is None or prior_id in seen:
+            return None
+        seen.add(prior_id)
+        prior = await session.get(Approval, prior_id)
+        if prior is None:
+            return None
+        if prior.status == ApprovalStatus.rejected and _same_approval(prior, data):
+            return prior
+        dedupe_key = prior.dedupe_key
+    return None
 
 
 # Per served agent: its approval route map, read fresh, and the (kind, address)

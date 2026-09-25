@@ -84,6 +84,7 @@ from .approvals import (
     ApprovalBackendError,
     ApprovalCreator,
     ApprovalReader,
+    ApprovalRefused,
     ApprovalRequest,
     CreatedApproval,
     PublicationCreateRequest,
@@ -5957,6 +5958,18 @@ class Kernel:
                 deployment_id,
                 thread_key,
                 exc.public_detail,
+            )
+            await self._reply_for(qevent, route, exc.public_detail)
+            return
+        except ApprovalRefused as exc:
+            # #2885: a person rejected this approval in this thread and nobody
+            # has asked since. The API refused it and audited the refusal; the
+            # turn reports that instead of pausing, escalating, or retrying.
+            logger.info(
+                "approval re-raise refused for agent=%s thread=%s event=%s",
+                agent_id,
+                thread_key,
+                qevent.event_id,
             )
             await self._reply_for(qevent, route, exc.public_detail)
             return

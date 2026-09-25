@@ -815,6 +815,17 @@ waiting work and requests termination of a running execution. Cancellation
 stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
+GitHub does not retry a label delivery that failed, for example while the API
+was unreachable. The work item reconciler covers that gap: every
+`GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0 disables) it lists the
+open issues carrying the factory label on each bound repository and admits any
+that has no work item, once the label is older than
+`GITHUB_FACTORY_RECONCILE_GRACE_S` (default 300). It applies the same checks as
+a delivery, including the labeling user's current write permission, and it
+never admits an issue that already has a work item, so it does not duplicate a
+delivery that arrived. A manual redelivery of the lost label after the
+reconciler admitted the issue counts as a relabel and starts a second run.
+
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
 the review subscriptions when both gates are on. Give the App **Issues: Read and write**
 so Curie can re-read the issue, keep its one status comment, and set the
@@ -858,7 +869,12 @@ bounds a run. For a run of up to three hours, set the agent's deadline with
 `curie cluster overrides <agent> --execution-deadline 10800` and both worker
 values to 10800; the chart raises the worker termination grace to match. Whether a run
 executes the repository's tests is the bundle's instruction. The platform does
-not check it.
+not check it. To let the agent install dependencies (`npm ci`, `pip install`)
+and run those checks, declare its package registry CIDRs under
+`agentSandbox.registryEgress.<agent>`. Nothing opens by default; each declaring
+agent gets its own `<release>-agent-<agent>-allow-registry-egress` policy, and
+since NetworkPolicy cannot name a host, list the registry CDN ranges or a
+mirror's address.
 
 ### Factory work items wait for capacity
 

@@ -112,7 +112,7 @@ def _label_names(issue: dict[str, Any]) -> set[str]:
     return names
 
 
-async def _verify_current(
+async def verify_current(
     notice: FactoryNotice,
     *,
     settings: Settings,
@@ -269,11 +269,13 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> 
     )
 
 
-async def _work_item(session: AsyncSession, notice: FactoryNotice) -> WorkItem | None:
+async def work_item_for(
+    session: AsyncSession, repository_id: int, issue_number: int
+) -> WorkItem | None:
     found: WorkItem | None = await session.scalar(
         select(WorkItem).where(
-            WorkItem.github_repository_id == notice.repository_id,
-            WorkItem.github_issue_number == notice.issue_number,
+            WorkItem.github_repository_id == repository_id,
+            WorkItem.github_issue_number == issue_number,
         )
     )
     return found
@@ -295,14 +297,14 @@ def _admission_result(
     return _ignored(code)
 
 
-async def _admit(
+async def admit_notice(
     session: AsyncSession,
     notice: FactoryNotice,
     settings: Settings,
 ) -> WebhookResult:
     binding = await _binding(session, notice)
     if notice.disposition == "mention":
-        existing = await _work_item(session, notice)
+        existing = await work_item_for(session, notice.repository_id, notice.issue_number)
         if existing is None:
             raise FactoryRefused("not_admitted")
     facts = _facts(notice, binding, settings)
@@ -314,7 +316,7 @@ async def _admit(
 
 
 async def _cancel(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:
-    item = await _work_item(session, notice)
+    item = await work_item_for(session, notice.repository_id, notice.issue_number)
     if item is None:
         raise FactoryRefused("work_item_absent")
     if (
@@ -384,11 +386,11 @@ async def handle_factory_delivery(
         if not repository_is_allowed(notice.repo_full_name, settings.github_repo_allowlist):
             raise FactoryRefused("repository_not_allowed")
         await _lock_issue(session, notice)
-        await _verify_current(notice, settings=settings, client=client)
+        await verify_current(notice, settings=settings, client=client)
         if notice.disposition == "cancel":
             outcome = await _cancel(session, notice)
         else:
-            outcome = await _admit(session, notice, settings)
+            outcome = await admit_notice(session, notice, settings)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()

@@ -14,6 +14,7 @@ import json
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
@@ -1965,6 +1966,130 @@ def test_worker_approval_http_does_not_fabricate_a_parent() -> None:
 
         assert len(seen) == 1
         assert "traceparent" not in seen[0].headers
+
+    asyncio.run(go())
+
+
+_RERAISE_VECTOR = (
+    Path(__file__).resolve().parents[4] / "tests" / "vectors" / "approval-reraise-refusal.json"
+)
+_RERAISE_MESSAGE = (
+    'Not requesting approval again: "File the quarterly form" (approval '
+    "00000000-0000-4000-8000-000000000001) was rejected by U0REJECT01 at "
+    "2026-09-18 17:07 UTC, and nobody has asked for it since. Nothing was done. "
+    "To raise it again, a person must ask for it in this thread."
+)
+
+
+def _reraise_code() -> str:
+    vector = json.loads(_RERAISE_VECTOR.read_text(encoding="utf-8"))
+    assert set(vector) == {"comment", "refusal_code"}
+    code = vector["refusal_code"]
+    assert isinstance(code, str) and code
+    return code
+
+
+def _approval_create_client(response: httpx.Response) -> tuple[httpx.AsyncClient, ApprovalClient]:
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: response))
+    client = ApprovalClient(
+        api_base_url="https://api.example.test",
+        api_key="platform-test-key",
+        client=http,
+        read_timeout_s=1.0,
+    )
+    return http, client
+
+
+def _gate_request() -> ApprovalRequest:
+    return ApprovalRequest(
+        conversation_id="1700000000.000100",
+        author="U0REJECT01",
+        summary="File the quarterly form",
+        reply_kind="slack",
+        reply_channel="C0EXAMPLE1",
+        reply_placeholder="1700000000.000001",
+        dedupe_key="approval-00000000-0000-4000-8000-000000000001-resolved",
+        route="filings",
+    )
+
+
+def test_rejected_reraise_409_is_a_terminal_refusal() -> None:
+    """#2885: the API's re-raise refusal becomes a refusal carrying its message.
+
+    Only the frozen code does; any other 409 is still a backend failure, so an
+    unrelated conflict cannot post an API body into the thread.
+    """
+
+    from curie_worker.approvals import ApprovalRefused
+
+    async def go() -> None:
+        refused = httpx.Response(
+            409,
+            json={
+                "detail": {
+                    "code": _reraise_code(),
+                    "message": _RERAISE_MESSAGE,
+                    "approval_id": "00000000-0000-4000-8000-000000000001",
+                    "rejected_by": "U0REJECT01",
+                    "rejected_at": "2026-09-18T17:07:00",
+                }
+            },
+        )
+        http, client = _approval_create_client(refused)
+        async with http:
+            with pytest.raises(ApprovalRefused) as excinfo:
+                await client.create(_gate_request())
+        assert excinfo.value.public_detail == _RERAISE_MESSAGE
+
+        other = httpx.Response(
+            409, json={"detail": {"code": "approval.other", "message": "do not post me"}}
+        )
+        http, client = _approval_create_client(other)
+        async with http:
+            with pytest.raises(ApprovalBackendError):
+                await client.create(_gate_request())
+
+    asyncio.run(go())
+
+
+class RefusingApprovals:
+    """An ApprovalCreator fake standing in for the API's re-raise refusal."""
+
+    def __init__(self) -> None:
+        self.create_calls = 0
+
+    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        from curie_worker.approvals import ApprovalRefused
+
+        self.create_calls += 1
+        raise ApprovalRefused(_RERAISE_MESSAGE)
+
+
+def test_refused_reraise_reports_the_rejection_instead_of_pausing(make_harness) -> None:
+    """#2885: a refused re-raise ends the turn with the refusal, not a pause.
+
+    The thread reads the refusal (which approval, who rejected it, how to ask
+    again), nothing is suspended, no card is posted, and the turn is done rather
+    than escalated or retried.
+    """
+
+    async def go() -> None:
+        approvals = RefusingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("File the quarterly form")
+            ev = _qevent(
+                "[approval resolved] The request was rejected by U0REJECT01.",
+                event_id="approval-00000000-0000-4000-8000-000000000001-resolved",
+            )
+            await h.kernel.process_event(ev)
+
+            assert approvals.create_calls == 1
+            assert h.sink.last_text == _RERAISE_MESSAGE
+            assert "could not be created" not in (h.sink.last_text or "")
+            modes = [s.operating_mode for s in h.fake_k8s.sandboxes.values()]
+            assert modes == ["Running"]
+            assert h.sink.posts == []
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 

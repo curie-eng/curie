@@ -3172,3 +3172,259 @@ def test_pending_inventory_ignores_filtered_page_and_counts_more_than_200(
         "operation": "observe",
         "outcome": "pending",
     }
+
+
+# --- no re-raise after a rejection (#2885) -------------------------------------
+#
+# A resume turn's event id is ``resume_event_id(<approval id>)``, and the worker
+# persists the event id of the turn that raised a request as its dedupe_key. So a
+# request whose dedupe_key is a resume id was raised by a platform-authored turn
+# nobody typed, and the chain of such ids leads back to the last turn a person
+# started. These tests drive exactly that wire shape through the real route.
+
+_RERAISE_VECTOR = (
+    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "approval-reraise-refusal.json"
+)
+_EXPECTED_RERAISE_VECTOR_KEYS = frozenset({"comment", "refusal_code"})
+_RERAISE_CARD = "C0EXAMPLE7"
+_REJECTER = "U0REJECT01"
+
+
+def _reraise_code() -> str:
+    vector = json.loads(_RERAISE_VECTOR.read_text(encoding="utf-8"))
+    assert set(vector) == _EXPECTED_RERAISE_VECTOR_KEYS
+    code = vector["refusal_code"]
+    assert isinstance(code, str) and code
+    return code
+
+
+def _reraise_payload(client: TestClient, auth_headers: dict[str, str]) -> dict[str, Any]:
+    """A request on the ``filings`` route of an agent that also binds ``notices``.
+
+    Both routes name the rejecter as their only approver, so the operator principal can
+    settle them without Slack.
+    """
+
+    bound = {"resolution": _slack_resolution(_RERAISE_CARD), "approvers": {"users": [_REJECTER]}}
+    agent_id = _agent_with_routes(
+        client, auth_headers, {"filings": bound, "notices": bound}
+    )
+    return _payload(agent_id=agent_id, route="filings", card_channel=_RERAISE_CARD)
+
+
+def _raise_and_resolve(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    payload: dict[str, Any],
+    decision: str,
+) -> dict[str, Any]:
+    """Create an approval from ``payload`` and settle it as the operator."""
+
+    created = client.post("/approvals", json=payload, headers=auth_headers)
+    assert created.status_code == 201, created.text
+    approval_id = created.json()["id"]
+    resolved = client.post(
+        f"/approvals/{approval_id}/resolve",
+        json={"decision": decision},
+        headers=_operator_resolve_headers(_REJECTER, base=auth_headers),
+    )
+    assert resolved.status_code == 200, resolved.text
+    body: dict[str, Any] = resolved.json()
+    return body
+
+
+def _conversation_rows(
+    client: TestClient, auth_headers: dict[str, str], conversation_id: str
+) -> list[dict[str, Any]]:
+    listed = client.get(
+        "/approvals", params={"conversation_id": conversation_id}, headers=auth_headers
+    )
+    assert listed.status_code == 200, listed.text
+    rows: list[dict[str, Any]] = listed.json()
+    return rows
+
+
+def test_reraise_refusal_code_matches_the_frozen_vector() -> None:
+    from curie_api.routers.approvals import APPROVAL_REJECTED_IN_THREAD_CODE
+
+    assert _reraise_code() == APPROVAL_REJECTED_IN_THREAD_CODE
+
+
+def test_reraise_of_a_rejected_approval_from_its_resume_turn_is_refused_and_audited(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """The observed failure: the resumed turn asks again, and a fresh card goes out.
+
+    Same agent, same route, same payload, raised from the rejection's own resume
+    turn. The API must refuse it with the frozen code, create no second record,
+    and write the refusal onto the rejected approval's audit trail.
+    """
+
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _reraise_payload(approvals_client, auth_headers)
+    rejected = _raise_and_resolve(approvals_client, auth_headers, payload, "rejected")
+
+    again = approvals_client.post(
+        "/approvals",
+        json={**payload, "dedupe_key": resume_event_id(rejected["id"])},
+        headers=auth_headers,
+    )
+
+    assert again.status_code == 409, again.text
+    detail = again.json()["detail"]
+    assert detail["code"] == _reraise_code()
+    assert detail["approval_id"] == rejected["id"]
+    assert detail["rejected_by"] == _REJECTER
+    assert detail["rejected_at"] is not None
+    # The message is what the worker posts to the thread: it names the rejected
+    # approval, who rejected it, and how a person raises it again.
+    assert rejected["id"] in detail["message"]
+    assert f"rejected by {_REJECTER}" in detail["message"]
+    assert "a person" in detail["message"]
+    # No second card: the conversation still holds exactly the rejected record.
+    assert [row["id"] for row in _conversation_rows(
+        approvals_client, auth_headers, payload["conversation_id"]
+    )] == [rejected["id"]]
+
+    audit = approvals_client.get(f"/approvals/{rejected['id']}/audit", headers=auth_headers)
+    assert audit.status_code == 200, audit.text
+    refusals = [row for row in audit.json() if row["action"] == "reraise_refused"]
+    assert len(refusals) == 1
+    assert refusals[0]["authorized"] is False
+    assert refusals[0]["evidence"]["dedupe_key"] == resume_event_id(rejected["id"])
+    assert refusals[0]["evidence"]["route"] == "filings"
+
+
+def test_reraise_refusal_does_not_key_on_the_model_authored_summary(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """Rewording the summary is not a new request; it is the same retry."""
+
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _reraise_payload(approvals_client, auth_headers)
+    rejected = _raise_and_resolve(approvals_client, auth_headers, payload, "rejected")
+
+    again = approvals_client.post(
+        "/approvals",
+        json={
+            **payload,
+            "summary": "Retrying: " + payload["summary"],
+            "dedupe_key": resume_event_id(rejected["id"]),
+        },
+        headers=auth_headers,
+    )
+
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"]["approval_id"] == rejected["id"]
+
+
+def test_a_person_asking_again_may_reraise_a_rejected_approval(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """A turn a person started (a non-resume event id) is an explicit ask."""
+
+    payload = _reraise_payload(approvals_client, auth_headers)
+    _raise_and_resolve(approvals_client, auth_headers, payload, "rejected")
+
+    asked = approvals_client.post(
+        "/approvals",
+        json={**payload, "dedupe_key": f"Ev-human-{uuid.uuid4().hex}"},
+        headers=auth_headers,
+    )
+
+    assert asked.status_code == 201, asked.text
+    assert asked.json()["status"] == "pending"
+
+
+def test_a_different_approval_may_follow_a_rejection_in_its_resume_turn(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """Only the SAME approval is refused: another route, or another gated tool,
+    is a different request and the resume turn may raise it."""
+
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _reraise_payload(approvals_client, auth_headers)
+    rejected = _raise_and_resolve(approvals_client, auth_headers, payload, "rejected")
+
+    other_route = approvals_client.post(
+        "/approvals",
+        json={**payload, "route": "notices", "dedupe_key": resume_event_id(rejected["id"])},
+        headers=auth_headers,
+    )
+    assert other_route.status_code == 201, other_route.text
+
+
+def test_reraise_after_an_approval_is_not_refused(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """The guard is about rejections; an approved step may be followed by the
+    next request on the same route from its resume turn."""
+
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _reraise_payload(approvals_client, auth_headers)
+    approved = _raise_and_resolve(approvals_client, auth_headers, payload, "approved")
+
+    next_step = approvals_client.post(
+        "/approvals",
+        json={**payload, "dedupe_key": resume_event_id(approved["id"])},
+        headers=auth_headers,
+    )
+    assert next_step.status_code == 201, next_step.text
+
+
+def test_reraise_refusal_follows_the_resume_chain_back_to_the_last_person(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """A detour through another approval does not launder the rejection.
+
+    Rejected A; its resume turn raises B (a permission gate, a different
+    approval); B is approved; B's resume turn raises A's approval again. No
+    person spoke in between, so it is still refused, and it names A.
+    """
+
+    from curie_api.resumequeue import resume_event_id
+
+    payload = _reraise_payload(approvals_client, auth_headers)
+    rejected = _raise_and_resolve(approvals_client, auth_headers, payload, "rejected")
+
+    detour = _raise_and_resolve(
+        approvals_client,
+        auth_headers,
+        {
+            **payload,
+            "gate_kind": "permission",
+            "granted_tool": "mcp__filings__submit",
+            "dedupe_key": resume_event_id(rejected["id"]),
+        },
+        "approved",
+    )
+
+    again = approvals_client.post(
+        "/approvals",
+        json={**payload, "dedupe_key": resume_event_id(detour["id"])},
+        headers=auth_headers,
+    )
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"]["approval_id"] == rejected["id"]

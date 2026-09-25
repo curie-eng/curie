@@ -43,6 +43,8 @@ _TERMINAL_WORKSPACE_CONFLICT_DETAILS = {
     "publication repository differs from the thread workspace",
     "thread workspace repository is no longer allowed",
 }
+# Frozen with the API in tests/vectors/approval-reraise-refusal.json (#2885).
+_REJECTED_IN_THREAD_CODE = "approval.rejected_in_thread"
 _REVIEW_EVENT_ID_RE = re.compile(
     r"github-feedback-"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -77,11 +79,33 @@ def _publication_refusal(response: httpx.Response) -> str | None:
         return detail
     return None
 
+def _rejected_reraise_refusal(response: httpx.Response) -> str | None:
+    """The thread message of an API re-raise refusal (#2885), or None.
+
+    Only a 409 carrying the frozen code and a non-empty message counts, so an
+    unrelated conflict is never reflected into a conversation.
+    """
+
+    if response.status_code != 409:
+        return None
+    try:
+        detail = response.json()["detail"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(detail, dict) or detail.get("code") != _REJECTED_IN_THREAD_CODE:
+        return None
+    message = detail.get("message")
+    if isinstance(message, str) and message.strip():
+        return message
+    return None
+
+
 __all__ = [
     "ApprovalBackendError",
     "ApprovalClient",
     "ApprovalCreator",
     "ApprovalReader",
+    "ApprovalRefused",
     "ApprovalRequest",
     "CreatedApproval",
     "SettledApproval",
@@ -196,6 +220,20 @@ class PublicationLineage:
 class ApprovalBackendError(Exception):
     """The approval record could not be created; the kernel escalates rather
     than suspending a session no resolution could ever wake."""
+
+
+class ApprovalRefused(Exception):
+    """The API refused to raise this approval (#2885): a person rejected the
+    same approval in this thread and nobody has asked for it since.
+
+    Terminal, not a backend failure: the kernel posts ``public_detail`` (the
+    API-authored message naming the rejected approval, who rejected it and
+    when) to the thread and ends the turn, instead of escalating or pausing.
+    """
+
+    def __init__(self, detail: str) -> None:
+        self.public_detail = detail
+        super().__init__(detail)
 
 
 class ReviewAuthorityUnavailable(Exception):
@@ -449,6 +487,9 @@ class ApprovalClient:
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"approval create failed: {exc}") from exc
+        refusal = _rejected_reraise_refusal(response)
+        if refusal is not None:
+            raise ApprovalRefused(refusal)
         # 201 is a fresh record; 200 is the idempotent dedupe_key replay.
         if response.status_code not in (200, 201):
             raise ApprovalBackendError(
