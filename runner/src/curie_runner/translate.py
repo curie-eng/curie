@@ -278,6 +278,15 @@ def _translate_assistant(
 
     if activity is not None:
         activity.observe_assistant_message()
+    if gen is not None:
+        # Record the whole message's output first (#3128): the first tool_use
+        # below closes the generation, so a later block in a parallel tool
+        # response would otherwise be dropped. Tool names only, never arguments.
+        for block in message.content:
+            if isinstance(block, TextBlock) and block.text:
+                gen.observe_output(block.text)
+            elif isinstance(block, ToolUseBlock):
+                gen.observe_output(f"[tool_use {block.name}]")
     for block in message.content:
         if isinstance(block, TextBlock):
             if block.text:

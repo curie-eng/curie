@@ -1014,6 +1014,8 @@ class SessionRunner:
 
         assert self._session is not None
         gen.query_observed()
+        # The prompt text never reaches OTel (e2e ladder gate); record its size only.
+        gen.observe_prompt(event.text)
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
             if isinstance(message, StreamedToolUseBoundary):
@@ -1108,6 +1110,7 @@ class SessionRunner:
                         decided_result_final = _apply_approval_override(
                             self._reclassify(sdk_final), state
                         )
+                gen.record_result_usage(getattr(message, "usage", None))
                 gen.result_boundary_observed(
                     failed=result_failed,
                     terminal_reason=terminal_reason,

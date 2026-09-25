@@ -119,6 +119,16 @@ keys:
   `curie.phase`, `curie.phase.start_kind`, `curie.phase.end_kind`,
   `curie.terminal.cause`, `curie.terminal.status`, `curie.generation.ttft_ms`,
   `curie.generation.round`, `curie.tool.call.index`, and `curie.tool.outcome`.
+  Generation content adds `langfuse.observation.input` and `langfuse.observation.output`
+  (#3128), on `llm.generation` spans only, redacted and then clipped to 8000 characters.
+  Input is a `[user prompt: N chars]` placeholder (never the prompt text) or the names
+  of the tool results that opened the round
+  (`[tool_result NAME]`, `[tool_result NAME error]`); output is assistant text and
+  `[tool_use NAME]` markers. Tool arguments and tool results are never recorded.
+  `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
+  turn received per-message usage, the turn total is stamped on the final generation
+  with scope `turn`, earlier generations carry no usage, and if no generation is active
+  at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
   value type: the four usage counts, generation TTFT, generation round, and bounded tool

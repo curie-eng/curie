@@ -647,7 +647,11 @@ def test_consecutive_work_items_with_the_same_budget_adopt_the_sandbox(
             envs = h.fake_k8s.claim_envs
             assert len(envs) == 1
             assert (envs[0] or {}).get("CURIE_MAX_TURNS") == "5"
-            assert len(h.runner.opened) == 2
+            # Each execution ends without publishing, so each gets its one
+            # continuation turn (#3128) on the same adopted runner.
+            assert len(h.runner.opened) == 4
+            assert h.runner.opened[0] == f"Resolve {ISSUE_URL}"
+            assert h.runner.opened[2] == f"Resolve {ISSUE_URL}"
 
     asyncio.run(exercise())
 

@@ -934,10 +934,15 @@ When publication succeeds, the result names the exact pull request
 URL. When the run cannot complete, the result starts with `Could not complete:`
 and a plain sentence for the cause. When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
-of keys and tokens. A last `Cause:` line names the platform cause code
+of keys and tokens. An execute turn that ends without publishing is prompted
+once more in the same session. If it still does not publish, it ends as
+`early_stop` (it called no work tool and never reported progress) or
+`no_pull_request`, and an `Agent's last message:` block carries the agent's
+final reply, redacted and shown inside a code fence so none of it renders.
+A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
-`publication_denied`, `publication_expired`, `publication_failed`, or a
+`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
 classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
 `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`, or
 `workspace_error`). A model provider that answers HTTP 402 or reports exhausted
@@ -1108,7 +1113,7 @@ the session-title side request and `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to declare t
 model's context window (`CURIE_FACTORY_MODEL_CONTEXT_TOKENS`), which silences the notice. A request that
 has not started, a delivery the tunnel rejected, or a run that escalates in
 the first few seconds is cancelled and opened again. A refusal still has to
-end as `no_pull_request`, and the budget case still has to end as
+end as `no_pull_request` or `early_stop`, and the budget case still has to end as
 `execution_deadline`. The case is given up well before the hour-long
 never-started cap. Hidden checks run
 against each resulting pull request and are not part of the ticket. The JSON evidence
@@ -1127,11 +1132,13 @@ comment` requires no pull request, and `--expect any` accepts either. A success
 comment must name the exact opened pull request URL anywhere in its body. A
 failure comment must contain `Could not complete:` followed by an explanation.
 Its cause must be one the run accepts: each `--expect-cause` given, or by
-default `no_pull_request` for `--expect comment` and `no_pull_request` or
+default `no_pull_request` or `early_stop` for `--expect comment`, plus
 `execution_deadline` for `--expect any`. When `--expect comment` or `--expect
-any` accepts a `no_pull_request` ending, the agent's final transcript reply must
-separately contain `Could not complete:` followed by its reason. Each
-`--expect-reason` must match that transcript reply, ignoring case. The platform
+any` accepts a `no_pull_request` or `early_stop` ending, the agent's final reply
+must separately contain `Could not complete:` followed by its reason. The reply
+is read from the final comment's `Agent's last message:` block, and from the
+thread transcript only when the comment has none. Each `--expect-reason` must
+match that reply, ignoring case. The platform
 cause does not establish the agent's reason. Only a comment the App posted with
 this run's execution request marker counts, and more than one fails. A rename out of
 `.github/` fails like a change inside it. A known secret or credential-shaped
