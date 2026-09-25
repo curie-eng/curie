@@ -113,11 +113,27 @@ export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
 curie cluster deploy --plugin-dir examples/dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot \
   --secret GITHUB_PERSONAL_ACCESS_TOKEN
+# Illustrative USD cap for a run that can last 3 hours. Tune it for your model.
+curie cluster budget dark-factory --limit 100
 curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+The $100 cap is an example for this three hour recipe. Tune it to the model
+and expected workload. The SDK applies it to each session; it does not meter
+daily spend across runs. It does not guarantee a $100 bill. On OpenRouter's
+Anthropic Messages route, the
+[documented response](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message)
+contains token usage but no billed cost field. The conclusion that the SDK
+cost used for Curie's USD cap is an estimate is an inference from those
+documented response fields, not a live billing measurement. OpenRouter reports
+cost through its separate [generation metadata endpoint](https://openrouter.ai/docs/api/api-reference/generations/get-generation).
+Check OpenRouter Activity or the cost of each generation for actual billing.
+The [SDK budget example](https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py)
+checks the cap after each API call, so the estimate can exceed the limit by
+one API call.
 
 Label an issue in `acme-corp/acme-bot` with the configured factory label. The
 run ends as one pull request or one comment on the issue that names the cause.
