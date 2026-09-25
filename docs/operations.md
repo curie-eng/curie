@@ -887,7 +887,8 @@ deploying the agent:
 curie cluster budget dark-factory --limit 100
 ```
 
-Tune the limit to the model and expected workload. It does not guarantee a
+Tune the limit to the model and expected workload. The SDK applies it to each
+session; it does not meter daily spend across runs. It does not guarantee a
 $100 bill. On OpenRouter's Anthropic Messages route, the
 [documented response](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message)
 contains token usage but no billed cost field. The conclusion that the SDK

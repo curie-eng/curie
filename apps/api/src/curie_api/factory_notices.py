@@ -90,8 +90,8 @@ _CAUSE_TEXT = {
     ),
     "model_error": "the model provider returned an error the run could not recover from.",
     "budget_exceeded": (
-        "the run reached its output token limit or daily USD cap before it finished. "
-        "To raise the USD cap, run curie cluster budget <agent> --limit <usd>, then retry."
+        "the run reached its output token limit or USD cap before it finished. "
+        "To raise the USD cap, run `curie cluster budget <agent> --limit <usd>`, then retry."
     ),
     "runner_timeout": "the run took longer than its time limit.",
     "workspace_error": "the repository workspace could not be prepared for the run.",

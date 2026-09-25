@@ -236,7 +236,7 @@ def test_sdk_usd_budget_result_is_classified_budget_exceeded() -> None:
     assert [event.type for event in events] == ["error", "final"]
     assert isinstance(events[0], ErrorEvent)
     assert events[0].classification == "budget-exceeded"
-    assert "error_max_budget_usd" in events[0].message
+    assert events[0].message == msg.result
     assert state.error_classification == "budget-exceeded"
     assert isinstance(events[1], Final)
     assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
