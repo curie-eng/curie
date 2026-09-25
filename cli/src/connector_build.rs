@@ -55,7 +55,25 @@ const DIGEST_LEN: usize = 8;
 pub struct ConnectorsFileDecl {
     #[serde(default)]
     pub connectors: BTreeMap<String, ConnectorSpecDecl>,
+    /// The bundle's own runner layer (ADR 0173), built on the platform runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<RunnerSpecDecl>,
 }
+
+/// `runner:` in `connectors.yaml`: where the bundle's runner layer is built
+/// from. Source only, never an `image:` -- the lock records what it built to.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerSpecDecl {
+    pub build: ConnectorBuildDecl,
+}
+
+/// The build argument a runner Dockerfile takes its base from (ADR 0173).
+pub const RUNNER_BASE_ARG: &str = "CURIE_RUNNER_IMAGE";
+
+/// The key the runner's recomputed `source_digest` rides under beside the
+/// connectors'. `@` is never part of a connector name, so it cannot collide.
+pub const RUNNER_DIGEST_KEY: &str = "@runner";
 
 /// One declared connector, a full mirror of `plugin_format.ConnectorSpec`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -169,6 +187,24 @@ pub struct ConnectorLockFileDecl {
     pub version: u32,
     #[serde(default)]
     pub connectors: BTreeMap<String, ConnectorLockEntryDecl>,
+    /// The built runner layer, when the declaration has one. Omitted when
+    /// absent so a lock with no runner stays byte-identical to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<RunnerLockEntryDecl>,
+}
+
+/// The resolved identity of the bundle's runner layer (ADR 0173). `image` and
+/// `base` both obey the digest shape of `delivery`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerLockEntryDecl {
+    pub image: String,
+    /// The platform runner the layer was built on, pinned.
+    pub base: String,
+    pub delivery: Delivery,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    pub source_digest: String,
 }
 
 /// The resolved identity of one built connector.
@@ -202,7 +238,13 @@ pub enum Delivery {
 /// second copy -- the whole point of `tests/vectors/connector-fields.json` is
 /// that neither language can drift alone.
 fn field_names<T: Serialize + Default>() -> BTreeSet<String> {
-    match serde_json::to_value(T::default()) {
+    field_names_of(T::default())
+}
+
+/// [`field_names`] for a value whose optional fields are filled in, so a key
+/// skipped when absent still counts.
+fn field_names_of<T: Serialize>(value: T) -> BTreeSet<String> {
+    match serde_json::to_value(value) {
         Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
         _ => BTreeSet::new(),
     }
@@ -217,7 +259,25 @@ pub fn build_field_names() -> BTreeSet<String> {
 }
 
 pub fn lock_file_field_names() -> BTreeSet<String> {
-    field_names::<ConnectorLockFileDecl>()
+    field_names_of(ConnectorLockFileDecl {
+        runner: Some(RunnerLockEntryDecl::default()),
+        ..Default::default()
+    })
+}
+
+pub fn connectors_file_field_names() -> BTreeSet<String> {
+    field_names_of(ConnectorsFileDecl {
+        runner: Some(RunnerSpecDecl::default()),
+        ..Default::default()
+    })
+}
+
+pub fn runner_spec_field_names() -> BTreeSet<String> {
+    field_names::<RunnerSpecDecl>()
+}
+
+pub fn runner_lock_entry_field_names() -> BTreeSet<String> {
+    field_names::<RunnerLockEntryDecl>()
 }
 
 pub fn lock_entry_field_names() -> BTreeSet<String> {
@@ -238,6 +298,9 @@ pub fn parse_connectors(document: &str) -> Result<ConnectorsFileDecl> {
     for (name, spec) in &file.connectors {
         check_name(name)?;
         check_spec(name, spec)?;
+    }
+    if let Some(runner) = &file.runner {
+        check_build("runner", &runner.build)?;
     }
     Ok(file)
 }
@@ -295,7 +358,107 @@ pub fn parse_lock(document: &str) -> Result<ConnectorLockFileDecl> {
         check_name(name)?;
         check_lock_entry(name, entry)?;
     }
+    if let Some(runner) = &lock.runner {
+        check_runner_lock_entry(runner)?;
+    }
     Ok(lock)
+}
+
+/// The runner entry's two references, each held to the connector rule.
+fn check_runner_lock_entry(entry: &RunnerLockEntryDecl) -> Result<()> {
+    for (field, reference) in [("image", &entry.image), ("base", &entry.base)] {
+        if !reference_matches_delivery(reference, entry.delivery) {
+            let (delivery, expected) = delivery_shape(entry.delivery);
+            bail!(
+                "runner: {CONNECTOR_LOCK_FILE} records {field} {reference:?} for delivery \
+                 `{delivery}`, which is not that delivery's digest shape -- it must be \
+                 {expected}. A mutable tag is never run or rendered: it can be repointed at a \
+                 different artifact after review. Regenerate the lock with \
+                 `curie build --plugin-dir <dir>`."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a runner Dockerfile whose first `FROM` is not the
+/// `CURIE_RUNNER_IMAGE` build argument declared before it (ADR 0173).
+///
+/// `curie build` pins the platform runner to a digest and passes it as that
+/// argument, so a literal base would build on something other than what the
+/// lock records. Frozen against `tests/vectors/runner-dockerfile-base.json`;
+/// the Python twin is `connector_lock.check_runner_dockerfile`.
+pub fn check_runner_dockerfile(body: &str) -> Result<()> {
+    let mut declared = false;
+    for instruction in dockerfile_instructions(body) {
+        let mut words = instruction.split_whitespace();
+        let Some(keyword) = words.next() else {
+            continue;
+        };
+        if keyword.eq_ignore_ascii_case("ARG") {
+            declared |= words
+                .any(|word| word.split_once('=').map_or(word, |(name, _)| name) == RUNNER_BASE_ARG);
+            continue;
+        }
+        if !keyword.eq_ignore_ascii_case("FROM") {
+            continue;
+        }
+        let rest: Vec<&str> = words.filter(|word| !word.starts_with("--")).collect();
+        let image = rest.first().copied().unwrap_or("");
+        let is_arg =
+            image == format!("${{{RUNNER_BASE_ARG}}}") || image == format!("${RUNNER_BASE_ARG}");
+        let tail_ok = match &rest[1.min(rest.len())..] {
+            [] => true,
+            [as_word, _name] => as_word.eq_ignore_ascii_case("AS"),
+            _ => false,
+        };
+        if !is_arg || !tail_ok {
+            bail!(
+                "the runner Dockerfile's first FROM is {:?}; it must be `FROM \
+                 ${{{RUNNER_BASE_ARG}}}` so `curie build` can build on the digest-pinned \
+                 platform runner it records in {CONNECTOR_LOCK_FILE}",
+                instruction.trim()
+            );
+        }
+        if !declared {
+            bail!(
+                "the runner Dockerfile uses ${{{RUNNER_BASE_ARG}}} without declaring it: add \
+                 `ARG {RUNNER_BASE_ARG}` before the first FROM"
+            );
+        }
+        return Ok(());
+    }
+    bail!(
+        "the runner Dockerfile has no FROM; it must start from `ARG {RUNNER_BASE_ARG}` and \
+         `FROM ${{{RUNNER_BASE_ARG}}}`"
+    )
+}
+
+/// A Dockerfile's instructions: comments and blank lines dropped, `\\`
+/// continuations joined.
+fn dockerfile_instructions(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if current.is_empty() && (trimmed.is_empty() || trimmed.starts_with('#')) {
+            continue;
+        }
+        match trimmed.strip_suffix('\\') {
+            Some(head) => {
+                current.push_str(head);
+                current.push(' ');
+            }
+            None => {
+                current.push_str(trimmed);
+                out.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// The digest suffix both well-formed references carry: `sha256:` plus 64
@@ -313,14 +476,18 @@ const IMAGE_DIGEST_HEX: usize = 64;
 /// reports. Nothing else, a tag included: a tag can be repointed at a different
 /// artifact after review, which is the failure ADR 0113 exists to close.
 fn image_matches_delivery(entry: &ConnectorLockEntryDecl) -> bool {
-    match entry.delivery {
+    reference_matches_delivery(&entry.image, entry.delivery)
+}
+
+fn reference_matches_delivery(image: &str, delivery: Delivery) -> bool {
+    match delivery {
         // Split on the FIRST `@`, so a reference carrying a second one leaves it
         // inside the digest half, where it is not hex -- the repository half
         // admits neither an `@` nor whitespace, as Python's `[^@\s]+` does.
-        Delivery::Registry => entry.image.split_once('@').is_some_and(|(repo, digest)| {
+        Delivery::Registry => image.split_once('@').is_some_and(|(repo, digest)| {
             !repo.is_empty() && !repo.contains(char::is_whitespace) && is_image_digest(digest)
         }),
-        Delivery::LocalDaemon => is_image_digest(&entry.image),
+        Delivery::LocalDaemon => is_image_digest(image),
     }
 }
 
@@ -345,7 +512,19 @@ fn check_lock_entry(name: &str, entry: &ConnectorLockEntryDecl) -> Result<()> {
     if image_matches_delivery(entry) {
         return Ok(());
     }
-    let (delivery, expected) = match entry.delivery {
+    let (delivery, expected) = delivery_shape(entry.delivery);
+    bail!(
+        "connectors.{name}: {CONNECTOR_LOCK_FILE} records image {:?} for delivery `{delivery}`, \
+         which is not that delivery's digest shape -- it must be {expected}. A mutable tag is \
+         never run or rendered: it can be repointed at a different artifact after review. \
+         Regenerate the lock with `curie build --plugin-dir <dir>`.",
+        entry.image
+    );
+}
+
+/// A delivery's name and the reference shape it requires, for a refusal.
+fn delivery_shape(delivery: Delivery) -> (&'static str, &'static str) {
+    match delivery {
         Delivery::Registry => (
             "registry",
             "`<repo>@sha256:` plus 64 lowercase hex characters, the manifest digest a registry \
@@ -356,14 +535,7 @@ fn check_lock_entry(name: &str, entry: &ConnectorLockEntryDecl) -> Result<()> {
             "a bare `sha256:` plus 64 lowercase hex characters, the image id the local daemon \
              reports",
         ),
-    };
-    bail!(
-        "connectors.{name}: {CONNECTOR_LOCK_FILE} records image {:?} for delivery `{delivery}`, \
-         which is not that delivery's digest shape -- it must be {expected}. A mutable tag is \
-         never run or rendered: it can be repointed at a different artifact after review. \
-         Regenerate the lock with `curie build --plugin-dir <dir>`.",
-        entry.image
-    );
+    }
 }
 
 /// Read a bundle's `connectors.yaml`, or an empty declaration when it has none.
@@ -419,35 +591,36 @@ fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
         );
     }
     if let Some(build) = &spec.build {
-        check_build(name, build)?;
+        check_build(&format!("connectors.{name}"), build)?;
     }
     Ok(())
 }
 
-fn check_build(name: &str, build: &ConnectorBuildDecl) -> Result<()> {
+/// `where_` names the block in a refusal: `connectors.<name>` or `runner`.
+fn check_build(where_: &str, build: &ConnectorBuildDecl) -> Result<()> {
     if escapes(&build.context) {
         bail!(
-            "connectors.{name}: `build.context` is {:?}; it must be a path inside the bundle",
+            "{where_}: `build.context` is {:?}; it must be a path inside the bundle",
             build.context
         );
     }
     if escapes(&build.dockerfile) {
         bail!(
-            "connectors.{name}: `build.dockerfile` is {:?}; it must be a path inside the build \
+            "{where_}: `build.dockerfile` is {:?}; it must be a path inside the build \
              context",
             build.dockerfile
         );
     }
     if build.platforms.is_empty() {
         bail!(
-            "connectors.{name}: `build.platforms` is empty. A silently single-arch build fails \
+            "{where_}: `build.platforms` is empty. A silently single-arch build fails \
              after apply as `no matching manifest`, so the target set is stated, never guessed"
         );
     }
     for platform in &build.platforms {
         if !is_platform(platform) {
             bail!(
-                "connectors.{name}: `{platform}` is not an OCI platform. Use `os/arch` or \
+                "{where_}: `{platform}` is not an OCI platform. Use `os/arch` or \
                  `os/arch/variant`, such as `linux/amd64` or `linux/arm/v7`"
             );
         }
@@ -967,6 +1140,9 @@ pub struct ConnectorBuildPlan {
     pub source_digest: String,
     /// Where buildx writes its build result metadata; registry delivery only.
     pub metadata_file: Option<PathBuf>,
+    /// `--build-arg NAME=VALUE` pairs, in order. Empty for a connector; the
+    /// runner layer passes its pinned base here.
+    pub build_args: Vec<(String, String)>,
 }
 
 /// The OCI platform of the machine running the CLI.
@@ -1003,7 +1179,7 @@ pub fn build_plan(
     let build = spec.build.as_ref().ok_or_else(|| {
         anyhow!("connectors.{connector}: declares no `build` block, so there is nothing to build")
     })?;
-    check_build(connector, build)?;
+    check_build(&format!("connectors.{connector}"), build)?;
     let context = resolve_context(bundle_root, &build.context)
         .with_context(|| format!("connectors.{connector}"))?;
     let dockerfile = resolve_dockerfile(&context, &build.dockerfile)
@@ -1034,6 +1210,81 @@ pub fn build_plan(
         image_ref,
         source_digest,
         metadata_file,
+        build_args: Vec::new(),
+    })
+}
+
+/// The tag a local-daemon runner-layer build produces, isolation-prefixed like
+/// [`local_build_tag`].
+fn local_runner_build_tag(bundle_name: &str) -> Result<String> {
+    let resources = crate::local::current_resources()?;
+    if resources.isolated() {
+        Ok(format!(
+            "curie-runner-layer-{}-{bundle_name}:build",
+            resources.project
+        ))
+    } else {
+        Ok(format!("curie-runner-layer-{bundle_name}:build"))
+    }
+}
+
+/// Read and check the runner Dockerfile the declaration names, before anything
+/// is built or resolved. Returns the canonical context and Dockerfile.
+pub fn check_runner_source(
+    bundle_root: &Path,
+    runner: &RunnerSpecDecl,
+) -> Result<(PathBuf, PathBuf)> {
+    check_build("runner", &runner.build)?;
+    let context = resolve_context(bundle_root, &runner.build.context).context("runner")?;
+    let dockerfile = resolve_dockerfile(&context, &runner.build.dockerfile).context("runner")?;
+    let body = std::fs::read_to_string(&dockerfile)
+        .with_context(|| format!("runner: read {}", dockerfile.display()))?;
+    // Not `.context`: the top-level report shows only the outer message, and
+    // the refusal's point is naming the build argument.
+    check_runner_dockerfile(&body).map_err(|error| anyhow!("runner: {error}"))?;
+    Ok((context, dockerfile))
+}
+
+/// The runner layer's build (ADR 0173): the connector plan, with the pinned
+/// platform runner passed as [`RUNNER_BASE_ARG`].
+///
+/// `base_arg` is what the build uses: the `<repo>@sha256:` reference for a
+/// registry build, the inspected reference for a local-daemon one.
+pub fn runner_build_plan(
+    bundle_root: &Path,
+    bundle_name: &str,
+    runner: &RunnerSpecDecl,
+    registry: Option<&str>,
+    base_arg: &str,
+    host_platform: &str,
+    metadata_dir: &Path,
+) -> Result<ConnectorBuildPlan> {
+    let (context, dockerfile) = check_runner_source(bundle_root, runner)?;
+    let source_digest = source_digest_of(&context, &runner.build).context("runner")?;
+    let (delivery, image_ref, metadata_file) = match registry {
+        Some(registry) => (
+            Delivery::Registry,
+            registry_image_ref(registry, bundle_name, "runner", &source_digest),
+            // `@` is never in a connector name, so this cannot collide with one.
+            Some(metadata_dir.join("@runner.metadata.json")),
+        ),
+        None => (
+            Delivery::LocalDaemon,
+            local_runner_build_tag(bundle_name)?,
+            None,
+        ),
+    };
+    Ok(ConnectorBuildPlan {
+        connector: "runner".to_string(),
+        context,
+        dockerfile,
+        platforms: runner.build.platforms.clone(),
+        host_platform: host_platform.to_string(),
+        delivery,
+        image_ref,
+        source_digest,
+        metadata_file,
+        build_args: vec![(RUNNER_BASE_ARG.to_string(), base_arg.to_string())],
     })
 }
 
@@ -1061,6 +1312,10 @@ pub fn build_argv(plan: &ConnectorBuildPlan) -> crate::ops::OpsCommand {
                 args.push(metadata.display().to_string());
             }
         }
+    }
+    for (name, value) in &plan.build_args {
+        args.push("--build-arg".into());
+        args.push(format!("{name}={value}"));
     }
     args.push("-f".into());
     args.push(plan.dockerfile.display().to_string());
@@ -1161,7 +1416,7 @@ pub fn lock_overwrite_refusal(
         return None;
     }
     let existing = existing?;
-    let downgraded: Vec<&str> = next
+    let mut downgraded: Vec<&str> = next
         .connectors
         .iter()
         .filter(|(name, entry)| {
@@ -1173,6 +1428,17 @@ pub fn lock_overwrite_refusal(
         })
         .map(|(name, _)| name.as_str())
         .collect();
+    let runner_downgraded = next
+        .runner
+        .as_ref()
+        .is_some_and(|entry| entry.delivery == Delivery::LocalDaemon)
+        && existing
+            .runner
+            .as_ref()
+            .is_some_and(|prior| prior.delivery == Delivery::Registry);
+    if runner_downgraded {
+        downgraded.push("the runner layer");
+    }
     if downgraded.is_empty() {
         return None;
     }

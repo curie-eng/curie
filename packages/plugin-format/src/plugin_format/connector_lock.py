@@ -88,6 +88,23 @@ class ConnectorLockEntry(BaseModel):
     source_digest: str
 
 
+class RunnerLockEntry(BaseModel):
+    """The resolved identity of the bundle's runner layer (ADR 0173).
+
+    ``image`` is the built layer and ``base`` the platform runner it was built
+    on; both must be digests of ``delivery``'s shape, checked in
+    ``resolve_runner_image``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    image: str
+    base: str
+    delivery: Literal["registry", "local-daemon"]
+    platforms: list[str]
+    source_digest: str
+
+
 class ConnectorLockFile(BaseModel):
     """The parsed ``connectors.lock.yaml``."""
 
@@ -95,6 +112,8 @@ class ConnectorLockFile(BaseModel):
 
     version: int
     connectors: dict[str, ConnectorLockEntry] = Field(default_factory=dict)
+    # Present exactly when the declaration has a `runner:` block.
+    runner: RunnerLockEntry | None = None
 
 
 def validate_connector_lock(data: Any) -> tuple[ConnectorLockFile | None, list[tuple[str, str]]]:
@@ -141,9 +160,121 @@ def _image_matches_delivery(entry: ConnectorLockEntry) -> bool:
     reference means nothing to the local daemon.
     """
 
-    if entry.delivery == "registry":
-        return bool(re.fullmatch(rf"[^@\s]+@sha256:{_HEX}", entry.image))
-    return bool(re.fullmatch(rf"sha256:{_HEX}", entry.image))
+    return _reference_matches_delivery(entry.image, entry.delivery)
+
+
+def _reference_matches_delivery(reference: str, delivery: str) -> bool:
+    if delivery == "registry":
+        return bool(re.fullmatch(rf"[^@\s]+@sha256:{_HEX}", reference))
+    return bool(re.fullmatch(rf"sha256:{_HEX}", reference))
+
+
+# The build argument a runner Dockerfile takes its base from (ADR 0173).
+RUNNER_BASE_ARG = "CURIE_RUNNER_IMAGE"
+
+
+def resolve_runner_image(
+    connectors: ConnectorsFile, lock: ConnectorLockFile | None, *, portable: bool
+) -> str | None:
+    """The runner layer image a renderer uses, or None for the platform runner.
+
+    The single runner resolver (ADR 0173 decision 2): None when the bundle
+    declares no ``runner:``; otherwise exactly the recorded digest. Raises
+    ``ValueError`` when the runner is declared but unlocked, when its image or
+    base is not a digest of its delivery's shape, or when ``portable`` and the
+    layer lives only in a local daemon. ``portable`` is keyword-only for the
+    same reason it is on ``apply_lock``.
+    """
+
+    if connectors.runner is None:
+        return None
+    entry = lock.runner if lock is not None else None
+    if entry is None:
+        raise ValueError(
+            f"connectors.yaml declares a runner layer but {CONNECTOR_LOCK_FILE} has no runner "
+            "entry for it. Run `curie build --plugin-dir <dir>` to build it and record what it "
+            "resolved to."
+        )
+    for field, reference in (("image", entry.image), ("base", entry.base)):
+        if not _reference_matches_delivery(reference, entry.delivery):
+            raise ValueError(
+                f"runner: {CONNECTOR_LOCK_FILE} records {field} {reference!r} for delivery "
+                f"{entry.delivery!r}, which is not a digest of that delivery's shape. A mutable "
+                "tag is never rendered: it can be repointed at a different artifact after review."
+            )
+    if portable and entry.delivery == "local-daemon":
+        raise ValueError(
+            f"runner: {CONNECTOR_LOCK_FILE} records a local-daemon runner image, which names "
+            "nothing a Kubernetes node can pull. Rebuild with `curie build --plugin-dir <dir> "
+            "--registry <ref>`."
+        )
+    return entry.image
+
+
+def _dockerfile_instructions(text: str) -> list[str]:
+    """A Dockerfile's instructions: comments and blanks dropped, ``\\`` joined."""
+
+    out: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        if stripped.endswith("\\"):
+            current += stripped[:-1] + " "
+            continue
+        out.append(current + stripped)
+        current = ""
+    if current.strip():
+        out.append(current)
+    return out
+
+
+def check_runner_dockerfile(text: str) -> str | None:
+    """Why this runner Dockerfile is refused, or None when its base is the argument.
+
+    The first ``FROM`` must be ``${CURIE_RUNNER_IMAGE}`` (or ``$CURIE_RUNNER_IMAGE``),
+    optionally ``AS name``, with ``ARG CURIE_RUNNER_IMAGE`` declared before it:
+    ``curie build`` passes the digest-pinned platform runner through that
+    argument, so a literal base builds on something the lock does not record.
+    Frozen against ``tests/vectors/runner-dockerfile-base.json``; the Rust twin
+    is ``connector_build::check_runner_dockerfile``.
+    """
+
+    declared = False
+    for instruction in _dockerfile_instructions(text):
+        words = instruction.split()
+        if not words:
+            continue
+        keyword = words[0].upper()
+        if keyword == "ARG":
+            declared = declared or any(
+                word.split("=", 1)[0] == RUNNER_BASE_ARG for word in words[1:]
+            )
+            continue
+        if keyword != "FROM":
+            continue
+        rest = [word for word in words[1:] if not word.startswith("--")]
+        image = rest[0] if rest else ""
+        is_arg = image in {f"${{{RUNNER_BASE_ARG}}}", f"${RUNNER_BASE_ARG}"}
+        tail = rest[1:]
+        tail_ok = not tail or (len(tail) == 2 and tail[0].upper() == "AS")
+        if not is_arg or not tail_ok:
+            return (
+                f"the runner Dockerfile's first FROM is {instruction.strip()!r}; it must be "
+                f"`FROM ${{{RUNNER_BASE_ARG}}}` so `curie build` can build on the digest-pinned "
+                f"platform runner it records in {CONNECTOR_LOCK_FILE}"
+            )
+        if not declared:
+            return (
+                f"the runner Dockerfile uses ${{{RUNNER_BASE_ARG}}} without declaring it: add "
+                f"`ARG {RUNNER_BASE_ARG}` before the first FROM"
+            )
+        return None
+    return (
+        f"the runner Dockerfile has no FROM; it must start from `ARG {RUNNER_BASE_ARG}` and "
+        f"`FROM ${{{RUNNER_BASE_ARG}}}`"
+    )
 
 
 def apply_lock(

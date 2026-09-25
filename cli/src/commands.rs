@@ -2256,6 +2256,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             if let Err(err) = build_connectors(ConnectorBuildOpts {
                 plugin_dir: plugin_dir.clone(),
                 registry: None,
+                runner_image: None,
                 force: false,
             })
             .await
@@ -4972,7 +4973,7 @@ async fn prepare_deploy_with_commit_sha(
     }
     {
         let decl = &connector_decl;
-        if decl.connectors.values().any(|spec| spec.build.is_some()) {
+        if decl.runner.is_some() || decl.connectors.values().any(|spec| spec.build.is_some()) {
             let recomputed = recompute_source_digests(&plugin_dir, decl)?;
             let lock = crate::connector_build::load_lock(&plugin_dir)?;
             lock_preflight(
@@ -5456,6 +5457,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             crate::connector_build::ConnectorLockFileDecl {
                 version: crate::connector_build::LOCK_VERSION,
                 connectors: std::collections::BTreeMap::new(),
+                runner: None,
             }
         });
         let identity = crate::connector_build::ConnectorScope {
@@ -12879,6 +12881,9 @@ pub struct ConnectorBuildOpts {
     /// `Some(ref)` pushes a multi-platform index there; `None` builds the host
     /// platform into the local Docker daemon.
     pub registry: Option<String>,
+    /// The platform runner a declared runner layer builds on; `None` is the
+    /// same default `curie skill up` runs.
+    pub runner_image: Option<String>,
     /// Replace a registry lock with a local-daemon one deliberately.
     pub force: bool,
 }
@@ -12902,10 +12907,15 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         .iter()
         .filter(|(_, spec)| spec.build.is_some())
         .collect();
-    if buildable.is_empty() {
+    if buildable.is_empty() && decl.runner.is_none() {
         return Ok(ConnectorBuildOutput {
             connectors: Vec::new(),
         });
+    }
+    // The runner Dockerfile's base rule is checked before anything is resolved
+    // or built: a literal base builds on something the lock would not record.
+    if let Some(runner) = &decl.runner {
+        cb::check_runner_source(&plugin_dir, runner)?;
     }
     if !on_path("docker") {
         bail!(
@@ -12928,6 +12938,26 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     let mut records = Vec::new();
     let mut entries = std::collections::BTreeMap::new();
     let mut failure = None;
+    let mut runner_entry = None;
+    // Resolve the platform runner to an immutable identity before any build, so
+    // a base that cannot be resolved fails before minutes of connector builds.
+    let runner_base = match &decl.runner {
+        Some(_) => {
+            let image = crate::artifacts::resolve_image(
+                opts.runner_image.as_deref(),
+                crate::artifacts::Channel::current(),
+                crate::artifacts::version(),
+            );
+            match resolve_runner_base(&image, opts.registry.is_some()).await {
+                Ok(base) => Some(base),
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&metadata_dir);
+                    return Err(err);
+                }
+            }
+        }
+        None => None,
+    };
     for (connector, spec) in buildable {
         let plan = match cb::build_plan(
             &plugin_dir,
@@ -12969,6 +12999,41 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
             }
         }
     }
+    if let (None, Some(runner), Some((base_arg, base))) = (&failure, &decl.runner, &runner_base) {
+        let built = match cb::runner_build_plan(
+            &plugin_dir,
+            &bundle_name,
+            runner,
+            opts.registry.as_deref(),
+            base_arg,
+            &host,
+            &metadata_dir,
+        ) {
+            Ok(plan) => run_one_connector_build(&plan, ui)
+                .await
+                .map(|image| (plan, image)),
+            Err(err) => Err(err),
+        };
+        match built {
+            Ok((plan, image)) => {
+                runner_entry = Some(cb::RunnerLockEntryDecl {
+                    image: image.clone(),
+                    base: base.clone(),
+                    delivery: plan.delivery,
+                    platforms: plan.platforms.clone(),
+                    source_digest: plan.source_digest.clone(),
+                });
+                records.push(ConnectorBuildRecord {
+                    name: "runner".to_string(),
+                    image,
+                    delivery: plan.delivery,
+                    platforms: plan.platforms,
+                    source_digest: plan.source_digest,
+                });
+            }
+            Err(err) => failure = Some(err),
+        }
+    }
     let _ = std::fs::remove_dir_all(&metadata_dir);
     if let Some(err) = failure {
         // A build that could not run writes no lock: a partial lock would claim
@@ -12981,12 +13046,59 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         &cb::ConnectorLockFileDecl {
             version: cb::LOCK_VERSION,
             connectors: entries,
+            runner: runner_entry,
         },
         opts.force,
     )?;
     Ok(ConnectorBuildOutput {
         connectors: records,
     })
+}
+
+/// Pin the platform runner a runner layer builds on (ADR 0173).
+///
+/// Returns `(build_arg, recorded_base)`. Registry delivery records and builds
+/// on `<repo>@sha256:<manifest digest>`, asked of the registry unless the
+/// reference already carries one. Local-daemon delivery builds on the
+/// reference it inspected and records the daemon's image id for it.
+async fn resolve_runner_base(image: &str, registry: bool) -> Result<(String, String)> {
+    use crate::connector_build as cb;
+
+    if !registry {
+        let id = crate::docker::docker(&cb::image_inspect_argv(image).argv())
+            .await
+            .with_context(|| format!("runner: inspect the platform runner {image}"))?;
+        return Ok((image.to_string(), id.trim().to_string()));
+    }
+    if image.contains("@sha256:") {
+        return Ok((image.to_string(), image.to_string()));
+    }
+    let inspect = cb::plain_command(
+        "docker",
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+            "--format".into(),
+            "{{json .Manifest}}".into(),
+        ],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&inspect).await?;
+    if !ok {
+        bail!(
+            "runner: could not resolve the platform runner {image} in its registry: {}",
+            stderr.trim()
+        );
+    }
+    let manifest: serde_json::Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("runner: parse the manifest of {image}"))?;
+    let digest = manifest
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow::anyhow!("runner: the manifest of {image} names no digest"))?;
+    let base = cb::digest_pinned_ref(image, digest);
+    Ok((base.clone(), base))
 }
 
 /// Create a directory only its owner can enter, in one step.
@@ -13114,6 +13226,41 @@ pub fn lock_preflight(
                     "connectors.{connector} is locked to an image in your local Docker daemon, \
                      which no cluster node can pull. Push it to a registry first."
                 ))
+                .with_fix(rebuild_hint(plugin_dir, true)),
+            ));
+        }
+    }
+    if decl.runner.is_some() {
+        let Some(entry) = lock.and_then(|lock| lock.runner.as_ref()) else {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{} declares a runner layer, but {} records no runner image for it. Build \
+                     it before deploying.",
+                    crate::connector_build::CONNECTORS_FILE,
+                    crate::connector_build::CONNECTOR_LOCK_FILE
+                ))
+                .with_fix(rebuild_hint(plugin_dir, false)),
+            ));
+        };
+        if let Some(fresh) = recomputed.get(crate::connector_build::RUNNER_DIGEST_KEY) {
+            if &entry.source_digest != fresh {
+                return Err(anyhow::Error::from(
+                    crate::exit::CliError::usage(format!(
+                        "the runner layer has changed since {} was written, so the locked \
+                         runner image no longer matches this source.",
+                        crate::connector_build::CONNECTOR_LOCK_FILE
+                    ))
+                    .with_fix(rebuild_hint(plugin_dir, false)),
+                ));
+            }
+        }
+        if tier == DeployTier::Cluster && entry.delivery == Delivery::LocalDaemon {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(
+                    "the runner layer is locked to an image in your local Docker daemon, which \
+                     no cluster node can pull. Push it to a registry first."
+                        .to_string(),
+                )
                 .with_fix(rebuild_hint(plugin_dir, true)),
             ));
         }
@@ -13311,6 +13458,14 @@ pub fn recompute_source_digests(
             connector.clone(),
             crate::connector_build::source_digest_of(&context, build)
                 .with_context(|| format!("connectors.{connector}"))?,
+        );
+    }
+    if let Some(runner) = &decl.runner {
+        let context = crate::connector_build::resolve_context(plugin_dir, &runner.build.context)
+            .context("runner")?;
+        digests.insert(
+            crate::connector_build::RUNNER_DIGEST_KEY.to_string(),
+            crate::connector_build::source_digest_of(&context, &runner.build).context("runner")?,
         );
     }
     Ok(digests)
@@ -13706,6 +13861,7 @@ async fn start_skill_connectors(
     let lock = cb::load_lock(plugin_dir)?.unwrap_or_else(|| cb::ConnectorLockFileDecl {
         version: cb::LOCK_VERSION,
         connectors: std::collections::BTreeMap::new(),
+        runner: None,
     });
     let mut started = Vec::new();
     let mut readiness_targets = Vec::new();
