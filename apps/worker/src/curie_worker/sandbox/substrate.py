@@ -55,6 +55,7 @@ from .types import (
     SandboxView,
     SubstrateConfig,
     SuspendedThreadError,
+    UnschedulableClaimError,
     claim_warm_pool,
 )
 
@@ -1187,6 +1188,7 @@ class SandboxSubstrate:
         last_quota_rejection = None
         last_ready_condition: tuple[str | None, str | None] | None = None
         consecutive_quota = 0
+        last_unschedulable: str | None = None
         sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
             claim = self._k8s.get_claim(
@@ -1212,6 +1214,18 @@ class SandboxSubstrate:
                     last_ready_condition = (claim.ready_reason, claim.ready_message)
                 if claim.ready and claim.sandbox_name:
                     return claim.sandbox_name
+                if claim.quota_rejection is None:
+                    # The latest read wins: a pod placed after an early
+                    # Unschedulable is a slow start, not missing capacity.
+                    # Cold-path pods carry the claim's name until the claim
+                    # reports its sandbox (#3169).
+                    last_unschedulable = self._k8s.pod_unschedulable(
+                        claim.sandbox_name or claim_name,
+                        request_timeout_seconds=min(
+                            _CONTROL_REQUEST_TIMEOUT_S,
+                            max(0.001, deadline - time.monotonic()),
+                        ),
+                    )
             # Clamped to the time left in the shared budget: an unclamped
             # backed-off sleep would overshoot the deadline by up to the cap and
             # steal that much from the serviceFQDN phase downstream.
@@ -1222,6 +1236,11 @@ class SandboxSubstrate:
         if last_ready_condition is not None:
             reason, message = last_ready_condition
             condition_detail = f"last Ready condition had reason={reason!r} and message={message!r}"
+        if last_unschedulable is not None:
+            raise UnschedulableClaimError(
+                f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
+                f"its pod is Unschedulable: {last_unschedulable}"
+            )
         raise ClaimTimeoutError(
             f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
             f"{condition_detail}."

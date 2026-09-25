@@ -27,6 +27,7 @@ from curie_worker.sandbox import (
     SandboxView,
     SubstrateConfig,
     SuspendedThreadError,
+    UnschedulableClaimError,
 )
 from curie_worker.sandbox.k8s import _claim_view
 
@@ -2248,3 +2249,71 @@ def test_touch_live_refuses_suspended_and_foreign_routes(
     ttl = affinity._redis.ttl(affinity._key("T-suspended"))
     assert ttl > 2
     assert substrate.touch_live("T-missing", live.claim_name) is False
+
+
+def test_unschedulable_claim_times_out_as_unschedulable_and_cleans_up(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """#3169: a pod no node has room for surfaces distinctly at the claim
+    timeout, so a factory work item can defer as capacity instead of failing."""
+
+    fake_k8s.bind_ready = False
+    fake_k8s.unschedulable_message = "0/1 nodes are available: 1 Insufficient cpu."
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.05)
+    )
+
+    with pytest.raises(UnschedulableClaimError) as excinfo:
+        substrate.claim("T1")
+
+    assert isinstance(excinfo.value, ClaimTimeoutError)
+    assert "Insufficient cpu" in str(excinfo.value)
+    # The unready claim has no sandbox name yet; the cold-path pod carries
+    # the claim's own name.
+    assert fake_k8s.pod_reads and set(fake_k8s.pod_reads) == set(fake_k8s.created)
+    assert fake_k8s.deleted == fake_k8s.created
+    assert affinity.get("T1") is None
+
+
+def test_scheduled_but_unready_claim_keeps_the_plain_claim_timeout(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """A pod that is scheduled but slow (image pull, init) is not capacity."""
+
+    fake_k8s.bind_ready = False
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.05)
+    )
+
+    with pytest.raises(ClaimTimeoutError) as excinfo:
+        substrate.claim("T1")
+
+    assert not isinstance(excinfo.value, UnschedulableClaimError)
+    assert fake_k8s.deleted == fake_k8s.created
+
+
+def test_a_pod_that_becomes_schedulable_is_not_reported_unschedulable(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """Only the latest pod observation counts: a pod that was placed after an
+    early Unschedulable read is a slow start, not missing capacity."""
+
+    fake_k8s.bind_ready = False
+    fake_k8s.unschedulable_message = "0/1 nodes are available: 1 Insufficient cpu."
+    original = fake_k8s.pod_unschedulable
+
+    def placed_after_first_read(name: str, *, request_timeout_seconds: float) -> str | None:
+        message = original(name, request_timeout_seconds=request_timeout_seconds)
+        fake_k8s.unschedulable_message = None
+        return message
+
+    fake_k8s.pod_unschedulable = placed_after_first_read  # type: ignore[method-assign]
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.05)
+    )
+
+    with pytest.raises(ClaimTimeoutError) as excinfo:
+        substrate.claim("T1")
+
+    assert not isinstance(excinfo.value, UnschedulableClaimError)
+    assert len(fake_k8s.pod_reads) >= 2

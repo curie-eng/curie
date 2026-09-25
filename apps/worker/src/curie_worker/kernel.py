@@ -143,6 +143,7 @@ from .sandbox.types import (
     SandboxError,
     SandboxHandle,
     SuspendedThreadError,
+    UnschedulableClaimError,
 )
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .workitem_dispatch import (
@@ -4024,6 +4025,31 @@ class Kernel:
             # for the whole reclaim window.
             record_reclaimed_retry()
             release_order()
+            if isinstance(exc, UnschedulableClaimError):
+                # No node has room for the pod the quota admitted (#3169). A
+                # factory execution waits for capacity exactly as on a quota
+                # refusal; every other delivery keeps the retry below.
+                parsed_execute = parse_work_item_event_id(qevent.event_id)
+                run = (
+                    self._work_item_runs.get(parsed_execute.request_id)
+                    if parsed_execute is not None and parsed_execute.kind in {"execute"}
+                    else None
+                )
+                if run is not None and not run.started:
+                    logger.warning(
+                        "sandbox unschedulable for event %s; deferring for capacity: %s",
+                        qevent.event_id,
+                        exc,
+                    )
+                    try:
+                        await run.defer("capacity", capacity=True)
+                    except WorkItemConflict as conflict:
+                        logger.info(
+                            "work-item capacity defer refused for %s: %s",
+                            qevent.event_id,
+                            conflict.code,
+                        )
+                    raise _WorkItemDeferred() from None
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         assert routed is not None
