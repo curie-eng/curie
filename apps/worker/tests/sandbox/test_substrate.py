@@ -2199,3 +2199,52 @@ def test_terminate_thread_does_not_succeed_on_an_empty_list_while_sandbox_remain
     assert fake_k8s.get_sandbox(sql_sandbox, request_timeout_seconds=1.0) is None
     assert sql_claim in str(second.claims)
     assert sql_sandbox in str(second.sandboxes)
+
+
+def _aged_past_reap_grace(fake_k8s: FakeSandboxClient, claim_name: str) -> None:
+    fake_k8s.claims[claim_name].created_at = datetime.now(UTC) - timedelta(seconds=3600)
+
+
+def test_touch_live_keeps_a_streaming_route_past_its_ttl_so_reap_spares_it(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # #3188: a turn that streams longer than route_ttl_seconds lost its route
+    # to TTL expiry and the reaper deleted the claim mid-turn.
+    substrate = SandboxSubstrate(fake_k8s, affinity, replace(config, route_ttl_seconds=2))
+    handle = substrate.claim("T-keepalive")
+    _aged_past_reap_grace(fake_k8s, handle.claim_name)
+
+    for _ in range(4):
+        time.sleep(0.8)
+        assert substrate.touch_live("T-keepalive", handle.claim_name) is True
+
+    assert substrate.reap_orphans() == []
+    assert substrate.lookup("T-keepalive") == handle
+
+
+def test_untouched_route_expires_and_reap_deletes_its_claim(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # Negative control for the keepalive test above.
+    substrate = SandboxSubstrate(fake_k8s, affinity, replace(config, route_ttl_seconds=2))
+    handle = substrate.claim("T-idle")
+    _aged_past_reap_grace(fake_k8s, handle.claim_name)
+
+    time.sleep(3.2)
+
+    assert substrate.reap_orphans() == [handle.claim_name]
+
+
+def test_touch_live_refuses_suspended_and_foreign_routes(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, replace(config, route_ttl_seconds=2))
+    live = substrate.claim("T-live")
+    assert substrate.touch_live("T-live", "some-other-claim") is False
+
+    suspended = substrate.claim("T-suspended")
+    substrate.suspend("T-suspended", history_ref="sdk-session-abc")
+    assert substrate.touch_live("T-suspended", suspended.claim_name) is False
+    ttl = affinity._redis.ttl(affinity._key("T-suspended"))
+    assert ttl > 2
+    assert substrate.touch_live("T-missing", live.claim_name) is False

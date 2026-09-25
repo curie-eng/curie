@@ -6335,3 +6335,43 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
             assert reason, f"the drop reason is empty: {message!r}"
 
     asyncio.run(go())
+
+
+def test_streaming_turn_keeps_its_route_alive_until_the_stream_ends(make_harness) -> None:
+    # #3188: a turn streaming past route_ttl_seconds must refresh its route,
+    # else the reaper deletes the claim mid-turn.
+    async def go() -> None:
+        async with make_harness() as h:
+            h.kernel._route_ttl_seconds = 1
+            calls: list[tuple[str, str]] = []
+            inner = h.substrate.touch_live
+
+            def spy(thread_key: str, claim_name: str) -> bool:
+                calls.append((thread_key, claim_name))
+                return inner(thread_key, claim_name)
+
+            h.substrate.touch_live = spy  # type: ignore[method-assign]
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working ")]
+            h.runner.tail = [Final(text="working done", status=DONE)]
+            ev = _qevent("long turn")
+
+            async def release_later() -> None:
+                await asyncio.sleep(1.5)
+                hold.set()
+
+            releaser = asyncio.create_task(release_later())
+            await asyncio.wait_for(h.kernel.process_event(ev), timeout=10.0)
+            await releaser
+            assert h.sink.last_text == "working done"
+            thread_key = _thread_key("th-1")
+            handle = h.substrate.lookup(thread_key)
+            assert handle is not None
+            assert calls, "touch_live was never called while the turn streamed"
+            assert set(calls) == {(thread_key, handle.claim_name)}
+            during = len(calls)
+            await asyncio.sleep(1.3)
+            assert len(calls) == during
+
+    asyncio.run(go())
