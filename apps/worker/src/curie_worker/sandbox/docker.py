@@ -591,6 +591,13 @@ class DockerSandboxClient:
         del rejection, request_timeout_seconds
         return False
 
+    def pod_unschedulable(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> str | None:
+        # A Docker runner has no scheduler; it starts or fails.
+        del name, request_timeout_seconds
+        return None
+
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         # Docker has no cold suspend; pause freezes the process while keeping the
         # published port, which is all the substrate's liveness check reads back.
