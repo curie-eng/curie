@@ -724,7 +724,6 @@ async def _observe_ci(
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=settings.github_app_timeout_seconds,
-            auth=None,
             follow_redirects=False,
         )
     except httpx.TimeoutException:
