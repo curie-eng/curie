@@ -2,7 +2,10 @@
 
 Date: 2026-09-25
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-09-25 with explicit maintainer approval from Brian Conn, recorded
+on the publishing pull request.
 
 This ADR builds on [ADR 0086](0086-bundles-declare-connectors-the-platform-hosts-them.md)
 (bundles declare connectors, the platform hosts them),
@@ -136,10 +139,10 @@ independent check.**
   collection policy keyed on the same run labels the reaper uses.
 - The reaper is a new platform component with its own failure mode: a reaper
   that stops running leaks namespaces and quota. It needs its own health signal
-  and alert, named in the implementation issue.
+  and alert, named in the implementation issue (#3245).
 - The connector's identity is a new privileged principal. Its role, its
   namespace prefix rule and its refusal of cluster scoped objects need a
-  security review before this ADR is accepted.
+  security review before the connector ships (#3243).
 - An installation without a test cluster configured has no end to end
   connector. Its factory runs behave as they do today, with CI as the only
   end to end signal.
@@ -179,6 +182,16 @@ independent check.**
 
 ## Tracking
 
-The implementation issue is filed when this ADR is accepted. It will carry the
-connector and its tool schema, the connector identity and its role, the reaper,
-the image builder, and the concurrency cap as a checklist.
+#3242 tracks the implementation. Each ticket is one pull request against `next`:
+- #3243, the connector identity on the test cluster and its security review
+  (decision 4);
+- #3244, the connector, its bundle declaration and a bounded `env_create`
+  (decisions 1 to 3);
+- #3245, the platform reaper with its health signal and alert (decision 4);
+- #3246, daemonless image builds and registry retention (decision 6);
+- #3247, deploy by digest and the refusal of cluster scoped objects
+  (decisions 1 and 5);
+- #3248, the per installation cap and waiting inside the run deadline
+  (decision 7);
+- #3249, the dark factory adoption, the pull request note when only CI
+  proves a change, and the acceptance run (decisions 5 and 8).
