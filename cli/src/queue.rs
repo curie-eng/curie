@@ -27,6 +27,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::api::DEFAULT_SLACK_IDENTITY;
+
 pub const DEFAULT_STREAM: &str = RUNS_STREAM_DEFAULT;
 pub const DEFAULT_VALKEY_URL: &str = "redis://:valkeypass@localhost:26379";
 /// The worker's consumer group (CURIE_CONSUMER_GROUP default); used to detect
@@ -71,16 +73,35 @@ fn percent_encode_unreserved(s: &str) -> String {
 }
 
 /// The worker's internal sandbox key for a turn: percent-encoded
-/// `kind:channel:conversation_id`. Frozen with the Python `_thread_key_for`
-/// helper in `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member
-/// that is only the conversation_id cannot release the sandbox (#2259).
-pub fn thread_key_for(kind: &str, channel: &str, conversation_id: &str) -> String {
-    [
-        percent_encode_unreserved(kind),
-        percent_encode_unreserved(channel),
-        percent_encode_unreserved(conversation_id),
-    ]
-    .join(":")
+/// `kind:channel:conversation_id`, with the route's identity as a segment after
+/// `kind` unless it is none or the default Slack app (ADR-0168 decision 4).
+/// Frozen with the Python `_thread_key_for` helper in
+/// `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member that is only
+/// the conversation_id cannot release the sandbox (#2259).
+pub fn thread_key_for(
+    kind: &str,
+    adapter: Option<&str>,
+    channel: &str,
+    conversation_id: &str,
+) -> String {
+    // `aci_protocol.turn.route_identity`: a Slack route with no adapter is the
+    // default app; any other kind's adapter is its identity as stored.
+    let identity = if kind == "slack" {
+        Some(
+            adapter
+                .filter(|name| !name.is_empty())
+                .unwrap_or(DEFAULT_SLACK_IDENTITY),
+        )
+    } else {
+        adapter
+    };
+    let mut segments = vec![percent_encode_unreserved(kind)];
+    if let Some(identity) = identity.filter(|name| *name != DEFAULT_SLACK_IDENTITY) {
+        segments.push(percent_encode_unreserved(identity));
+    }
+    segments.push(percent_encode_unreserved(channel));
+    segments.push(percent_encode_unreserved(conversation_id));
+    segments.join(":")
 }
 
 /// [`thread_key_for`] from a minted `QueuedTurn`.
@@ -91,6 +112,7 @@ pub fn thread_key_for_turn(turn: &QueuedTurn) -> String {
         .expect("thread keys require a targeted turn");
     thread_key_for(
         &reply_handle.kind,
+        reply_handle.adapter.as_deref(),
         &reply_handle.channel,
         &turn.conversation_id,
     )
