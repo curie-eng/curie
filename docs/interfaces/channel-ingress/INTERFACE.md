@@ -71,9 +71,11 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `apps/api/src/curie_api/resumequeue.py`, and the Rust CLI through the generated constant in
   `cli/src/queue.rs`), so a second ingress adopts the package constant rather than copying
   the literal.
-  For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread
-  ts, `author` is the Slack user id, and `reply_handle` carries the `slack` kind, Slack
-  channel, and placeholder ts.
+  For the Slack adapter, `event_id` is the Slack event id (suffixed `:<identity>`
+  on any Slack identity but `default`), `conversation_id` is the thread ts,
+  `author` is the Slack user id, and `reply_handle` carries the `slack` kind,
+  Slack channel, placeholder ts and, in `adapter`, the identity whose Bolt app
+  the delivery arrived on -- null for `default` until #3146 (ADR-0168 decision 2).
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
