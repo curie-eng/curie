@@ -332,6 +332,45 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     assert sink.posts == 1
 
 
+@pytest.mark.parametrize(
+    ("number", "detail"),
+    [
+        (9916, "SDK estimated spend reached $10.42 on a $10.00 daily cap"),
+        (9917, "The run reached its output token limit"),
+    ],
+)
+def test_budget_failure_comment_names_both_limits_and_the_usd_command(
+    admitted: Any, number: int, detail: str  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    comment_id = _notices(request_id)[0]["comment_id"]
+    sink.requests.clear()
+
+    epoch = _start_running(request_id)
+    _finish_failed(client, request_id, epoch, "budget_exceeded", detail=detail)
+    _reconcile()
+
+    assert _posts(sink) == []
+    assert [path for path, _ in _patches(sink)] == [
+        f"/repos/{REPO}/issues/comments/{comment_id}"
+    ]
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    headline = body.splitlines()[0]
+    assert headline.startswith("Could not complete:")
+    assert "daily USD cap" in headline
+    assert "output token limit" in headline
+    assert "curie cluster budget <agent> --limit" in headline
+    assert f"Provider message: {detail}" in body
+    assert "Cause: budget_exceeded" in body
+    assert "Status: FAILED" in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {"curie:needs-human"}
+    assert sink.posts == 1
+
+
 def test_unlabel_while_waiting_stops_and_clears_every_state_label(
     admitted: Any,  # noqa: F811
 ) -> None:
