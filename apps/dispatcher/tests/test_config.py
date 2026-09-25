@@ -140,6 +140,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.slack_app_token == ""
     assert config.slack_bot_token == ""
     assert config.slack_signing_secret == ""
+    assert config.slack_identities == ()
     assert config.approval_chat_attester_secret == _CHAT_ATTESTER_SECRET
     assert config.valkey_host == "localhost"
     assert config.valkey_port == 6379

@@ -16,8 +16,11 @@ of the env this case set up.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from curie_api.config import Settings
+from curie_dispatcher.config import DispatcherConfig
 from curie_worker.config import WorkerConfig
 
 
@@ -126,3 +129,38 @@ class TestResumeDeadLetterStreamCoherence:
         resolved = settings.resume_dead_letter_stream or settings.dead_letter_stream_name()
 
         assert resolved == "custom:grave"
+
+
+def test_the_three_lanes_parse_one_slack_identity_declaration_alike(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0168 decision 1: the chart renders ONE `CURIE_SLACK_IDENTITIES`
+    string into the dispatcher, the worker and the API, and each must read the
+    same identities from it. Decisions 2 and 5 then pick tokens by these names."""
+
+    declaration = json.dumps(
+        [
+            {
+                "name": "default",
+                "app_token_env": "SLACK_APP_TOKEN",
+                "bot_token_env": "SLACK_BOT_TOKEN",
+                "signing_secret_env": "SLACK_SIGNING_SECRET",
+            },
+            {
+                "name": "second",
+                "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                "signing_secret_env": None,
+            },
+        ]
+    )
+    monkeypatch.setenv("CURIE_SLACK_IDENTITIES", declaration)
+    # The dispatcher refuses to boot without an independent attester secret.
+    monkeypatch.setenv("CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "parity-attester-secret")
+
+    api = Settings().slack_identities
+    worker = WorkerConfig().slack_identities
+    dispatcher = DispatcherConfig().slack_identities
+
+    assert api == worker == dispatcher
+    assert [identity.name for identity in api] == ["default", "second"]
