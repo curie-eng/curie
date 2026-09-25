@@ -10,6 +10,7 @@ BaseSettings refactor.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -21,6 +22,7 @@ import pytest
 import yaml
 from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
+from nacl.signing import SigningKey
 from pydantic import AliasChoices, ValidationError
 
 
@@ -1498,3 +1500,52 @@ def test_a_malformed_slack_identity_declaration_refuses_worker_boot(
 
     with pytest.raises(ValidationError, match="CURIE_SLACK_IDENTITIES"):
         WorkerConfig()
+
+
+# The connector caller signing key (ADR-0168 decision 7).
+
+
+def _caller_seed() -> str:
+    return base64.b64encode(bytes(SigningKey.generate())).decode()
+
+
+def test_the_caller_signing_key_is_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unset is a stock install: no token is minted and the boot env is the one
+    # it had before the key existed.
+    _clear_all_config_env(monkeypatch)
+    assert WorkerConfig().connector_caller_signing_key == ""
+
+
+def test_the_caller_signing_key_reads_only_its_curie_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    seed = _caller_seed()
+    monkeypatch.setenv("CONNECTOR_CALLER_SIGNING_KEY", _caller_seed())
+    assert WorkerConfig().connector_caller_signing_key == ""
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", seed)
+    assert WorkerConfig().connector_caller_signing_key == seed
+
+
+@pytest.mark.parametrize("raw", ["not base64!", base64.b64encode(b"short").decode()])
+def test_a_malformed_caller_signing_key_is_a_startup_error(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    # Refusing at boot names the variable; minting at the first turn would fail
+    # every turn instead.
+    from curie_worker.config import CallerSigningKeyError
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", raw)
+    with pytest.raises(CallerSigningKeyError) as refused:
+        WorkerConfig()
+    assert "CURIE_CONNECTOR_CALLER_SIGNING_KEY" in str(refused.value)
+    assert raw not in str(refused.value)
+    assert refused.value.__cause__ is None and refused.value.__suppress_context__
+
+
+def test_the_caller_signing_key_stays_out_of_the_config_repr() -> None:
+    seed = _caller_seed()
+    config = WorkerConfig(connector_caller_signing_key=seed)
+    assert config.connector_caller_signing_key == seed
+    assert seed not in repr(config)
