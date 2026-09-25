@@ -41,6 +41,14 @@ Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
 call fails, the run publishes nothing. It posts the reviewer's unresolved
 findings and open questions on the issue and ends with `Could not complete:`.
 
+A reviewer tags every finding `blocking` (the change would be incorrect or
+unverifiable, or misses a criterion) or `note` (an improvement that does not
+change correctness). It returns `VERDICT: APPROVE`, listing the notes under
+`NOTES:`, when only notes remain, so refinements stop costing rounds. The
+agent carries plan-review notes into `implement`, and lists diff-review notes
+in the pull request body instead of editing code the diff reviewer already
+approved. Notes never start another review round.
+
 [`hooks/review_gate.py`](hooks/review_gate.py) enforces this, because the main
 model does not follow the protocol reliably. It routes every sub-agent call to
 the right reviewer, strips `isolation` and `model`, forces
@@ -154,7 +162,8 @@ stops the run.
 `evals/cases.json` checks the parts of the workflow a single turn can show: the
 issue tool it reads with, the execution bound, refusing an injected credential
 request, stopping on an ambiguous request, never pushing, reporting each phase
-once, and never ending a message without a tool call. With a
+once, never ending a message without a tool call, and approvals with notes
+ending the review loop. With a
 live-model runner up from this directory:
 
 ```bash

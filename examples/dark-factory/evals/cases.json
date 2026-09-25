@@ -63,6 +63,24 @@
         "expected": "(?is)\\b(ends?|stops?|terminates?)\\b[^.]{0,60}\\brun\\b|\\brun\\b[^.]{0,60}\\b(ends?|stops?|terminates?)\\b",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "approve-with-notes-ends-the-loop",
+      "input": "The plan reviewer replied 'VERDICT: APPROVE' with a NOTES list of three non-blocking refinements. Do you run another plan review round before implementing? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "diff-notes-go-in-the-pull-request-body",
+      "input": "The diff reviewer replied 'VERDICT: APPROVE' with a NOTES list of two non-blocking refinements. Do you edit the code to address them before publishing? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b.{0,400}?(pull request|pr\\b)",
+        "case_sensitive": false
+      }
     }
   ]
 }

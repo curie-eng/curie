@@ -8,6 +8,8 @@
     "dark-factory/does-not-push-with-git": "I cannot push or merge with git; I publish only through publish_changes and the platform opens the pull request.",
     "dark-factory/reports-each-phase-once": "No. report_progress is called once when you enter a phase, not while you work in it.",
     "dark-factory/knows-a-text-only-message-ends-the-run": "The run ends. Until publish_changes or a Could not complete: stop, every message must include a tool call, because a message without one ends the run.",
+    "dark-factory/approve-with-notes-ends-the-loop": "No. An approval with notes ends the plan review loop; I carry the cheap notes into implement.",
+    "dark-factory/diff-notes-go-in-the-pull-request-body": "No. The diff reviewer approved that diff, so I list its notes in the pull request body instead of editing the code.",
     "weather/reports-a-temperature": "The high in San Francisco today is about 68°.",
     "github-issues/reads-a-specific-issue-content": "Issue #7 proposes promoting the queue payload into the aci-protocol contract.",
     "github-issues/reads-a-specific-issue-state": "It is closed.",

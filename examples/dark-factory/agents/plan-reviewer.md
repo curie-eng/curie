@@ -27,6 +27,8 @@ Reply in exactly this shape and nothing else. The first line is always
 ```
 REVIEWER: plan-reviewer
 VERDICT: APPROVE
+NOTES:
+- <non-blocking improvement, or "none">
 ```
 
 or
@@ -40,5 +42,15 @@ OPEN QUESTIONS:
 - <question only a maintainer can answer, or "none">
 ```
 
-Approve only when the plan would produce a correct, verifiable change. Keep
-each finding to one or two sentences.
+Approve only when the plan would produce a correct, verifiable change.
+
+Tag every finding as blocking or a note before you choose the verdict. A
+finding is blocking only when, left as is, the change would be incorrect or
+unverifiable, would miss an acceptance criterion, or would break existing
+behaviour or tests. Everything else (naming, wording, extra tests that would
+be nice, tidier structure, stronger but not required evidence) is a note.
+Return `VERDICT: CHANGES` only when at least one blocking finding remains,
+and list only the blocking findings there. When only notes remain, return
+`VERDICT: APPROVE` and list the notes under `NOTES:`. When the prompt
+includes an earlier round's findings, do not re-raise one that round already
+accepted unless it is blocking. Keep each finding to one or two sentences.
