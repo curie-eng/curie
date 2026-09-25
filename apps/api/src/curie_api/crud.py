@@ -453,6 +453,34 @@ async def agent_id_for_channel_pair(
     return owner
 
 
+async def agent_holds_channel_pair(
+    session: AsyncSession, agent_id: uuid.UUID, kind: str, address: str
+) -> bool:
+    """Does THIS agent hold a row on `(kind, address)`, under any identity?
+
+    Not `agent_id_for_channel_pair`: that answers who (if anyone) holds the
+    pair with one arbitrary row when several could match, which only holds
+    today because `agent_channels_kind_address_key` (migration 0023) still
+    caps the pair to one row; once the contract migration for ADR-0168
+    decision 3 (#3146) widens it to the triple, two agents can hold the same
+    pair under two identities, and picking an arbitrary row would answer the
+    wrong agent's question. This asks the narrower thing every caller here
+    actually needs -- filtered on `agent_id` in the query itself, so it stays
+    correct on either side of that migration.
+    """
+
+    held = await session.scalar(
+        select(AgentChannel.id)
+        .where(
+            AgentChannel.agent_id == agent_id,
+            AgentChannel.kind == kind,
+            AgentChannel.address == address,
+        )
+        .limit(1)
+    )
+    return held is not None
+
+
 def matching_bindings(
     bindings: list[AgentChannel], kind: str, address: str, adapter: str | None
 ) -> list[AgentChannel]:

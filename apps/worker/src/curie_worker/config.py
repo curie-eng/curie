@@ -36,6 +36,7 @@ from aci_protocol.service_config import (
     derive_dead_letter_stream_name,
     warn_if_deprecated_api_url_env,
 )
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from pydantic import AliasChoices, BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
@@ -170,6 +171,10 @@ class WorkerConfig(BaseSettings):
 
     # Slack
     slack_bot_token: str = ""
+    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
+    # here so a malformed declaration refuses boot; nothing reads it until
+    # decision 5 picks a reply's bot token by the route identity.
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # The worker's DEFAULT Slack Web API base URL: the endpoint used to finalize a
     # turn whose reply handle carries no per-turn endpoint (issue #19). Unset = the
     # real Slack API. A turn that carries its own reply endpoint (e.g. a CLI stub)

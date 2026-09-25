@@ -20,6 +20,7 @@ from aci_protocol import (
     WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -433,6 +434,14 @@ class Settings(BaseSettings):
     # boot gate deliberately -- Slack is optional, and that resolve-time denial
     # is the enforcement.
     slack_bot_token: str = ""
+    # The Slack identities the chart declares (ADR-0168 decision 1), which
+    # `identities.declared_identities` checks a binding against; see
+    # `aci_protocol.slack_identities.declared_slack_identity_names` for what
+    # an empty declaration means. Reads only the chart's reserved name, like
+    # the worker and dispatcher: no bare `slack_identities` kwarg alias, or a
+    # same-named stray env var would let this service alone admit names the
+    # other two never see.
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # How long a fetched user-group member set is reused (#420).
     # usergroups.users.list is a Slack Tier 2 method (~20 req/min), so a fetch
     # per click would let a busy approval channel hit the rate limit; 60s of

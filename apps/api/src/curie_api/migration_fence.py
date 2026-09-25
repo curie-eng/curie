@@ -405,9 +405,10 @@ def load_declarations() -> dict[str, Declaration]:
         # unchanged until the contract migration for that decision (#3100),
         # only what a declaration may say moves. Any other name is still
         # refused: this module cannot import `identities.declared_identities`
-        # (the ORM-import contract above) to check it against the chart's
-        # list, but that list names only the one Slack app until decision 1
-        # (#3102) makes it the chart's, so any second name is unearned.
+        # (the ORM-import contract above) to check a name against the chart's
+        # list, and a declaration vouches for a row written before a second
+        # Slack identity could exist. The contract migration for ADR-0168
+        # decision 3 (#3146) is what widens this.
         kind = str(entry["reply_kind"]).strip()
         if kind == SLACK_KIND and adapter not in (None, DEFAULT_IDENTITY):
             raise _declaration_refusal(

@@ -11,6 +11,7 @@ BaseSettings refactor.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import socket
 from pathlib import Path
@@ -206,6 +207,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Slack
     assert config.slack_bot_token == ""
     assert config.slack_api_base_url == ""
+    assert config.slack_identities == ()
     # Postgres
     assert (
         config.database_url
@@ -1471,3 +1473,28 @@ def test_the_chart_defaults_match_the_worker_defaults() -> None:
     assert chart["maxFileBytes"] == fields["attachment_max_file_bytes"].default
     assert chart["referenceTtlSeconds"] == fields["attachment_reference_ttl_seconds"].default
     assert chart["retentionTtlSeconds"] == fields["attachment_retention_ttl_seconds"].default
+
+
+def test_a_malformed_slack_identity_declaration_refuses_worker_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker parses `CURIE_SLACK_IDENTITIES` with the same shared parser
+    as the API and dispatcher (ADR-0168 decision 1), so a declaration the
+    chart would never render must refuse boot here too, not only at the API."""
+
+    monkeypatch.setenv(
+        "CURIE_SLACK_IDENTITIES",
+        json.dumps(
+            [
+                {
+                    "name": "second",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "PATH",
+                    "signing_secret_env": None,
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="CURIE_SLACK_IDENTITIES"):
+        WorkerConfig()

@@ -1,18 +1,22 @@
 """Which identities an installation declares (ADR-0168 decisions 1 and 3).
 
-Decision 1 (#3102) makes this the chart's list. Until then the one Slack app is
-the only Slack identity, and an out-of-process adapter's name cannot be listed
-by the API, so other kinds keep the slug rule the write schema already applies.
+Slack's are the chart's list, read from `CURIE_SLACK_IDENTITIES`, until
+ADR-0155's `provider_installations` exists (#2909). An out-of-process adapter's
+name cannot be listed by the API, so other kinds keep the slug rule the write
+schema already applies.
 """
 
-from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND
+from aci_protocol.slack_identities import declared_slack_identity_names
+from aci_protocol.turn import SLACK_KIND
+
+from .config import get_settings
 
 
 def declared_identities(kind: str) -> frozenset[str] | None:
     """The identities a binding of ``kind`` may name, or None when not enumerable."""
 
     if kind == SLACK_KIND:
-        return frozenset({DEFAULT_IDENTITY})
+        return declared_slack_identity_names(get_settings().slack_identities)
     return None
 
 

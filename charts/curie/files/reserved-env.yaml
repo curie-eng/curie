@@ -54,6 +54,7 @@ worker:
   CURIE_SEALING_PREVIOUS_PRIVATE_KEY: sealing.previousPrivateKeyExistingSecret
   CURIE_SEALING_PRIVATE_KEY: sealing.privateKeyExistingSecret
   CURIE_SHIMMER: worker.shimmer
+  CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
   CURIE_SLACK_TRUSTED_ORIGINS: worker.slackTrustedOrigins
   CURIE_STATUS_TEXT: worker.statusText
   CURIE_SUSPENDED_ROUTE_TTL_SECONDS: worker.suspendedRouteTtlSeconds
@@ -100,6 +101,7 @@ api:
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
+  CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
   DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode
   DB_SCHEMA: the chart-managed database schema (remove this override)
   ENVIRONMENT: api.environment
@@ -142,6 +144,7 @@ dispatcher:
   CURIE_API_URL: dispatcher.apiBaseUrl
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
+  CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
   SLACK_APP_TOKEN: dispatcher.slack.appTokenExistingSecret
   SLACK_BOT_TOKEN: dispatcher.slack.botTokenExistingSecret
   SLACK_SIGNING_SECRET: dispatcher.slack.signingSecretExistingSecret

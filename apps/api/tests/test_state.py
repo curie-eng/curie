@@ -1443,6 +1443,261 @@ def test_binding_scoped_route_404s_for_a_pair_that_is_not_this_agents(
     assert "binding" in resp.text.lower()
 
 
+_ROUTE_PAIR_CHECK = "agent_channels_route_pair_ck"
+_PAIR_UNIQUE = "agent_channels_kind_address_key"
+
+
+async def _constraint_definition(connection: Any, name: str) -> str:
+    """`pg_get_constraintdef` for one `curie.agent_channels` constraint, so a
+    caller can restore the EXACT installed definition rather than a
+    hand-copied guess that would silently drift from whatever a later
+    migration (the contract migration for ADR-0168 decision 3, #3146)
+    installs."""
+
+    definition = await connection.fetchval(
+        """
+        SELECT pg_get_constraintdef(catalog_constraint.oid)
+        FROM pg_constraint AS catalog_constraint
+        JOIN pg_class AS relation ON relation.oid = catalog_constraint.conrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'curie'
+          AND relation.relname = 'agent_channels'
+          AND catalog_constraint.conname = $1
+        """,
+        name,
+    )
+    assert isinstance(definition, str), definition
+    return definition
+
+
+async def _seed_named_identity_binding(
+    agent_id: str, address: str, adapter: str, state: dict[str, Any]
+) -> None:
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        if not state["dropped"]:
+            # Attempt the plain shape first, in its own transaction: if this
+            # already inserts cleanly, the database admits a named Slack
+            # binding (#3146) and this whole fixture is due for deletion.
+            probe_id = uuid.uuid4()
+            try:
+                async with connection.transaction():
+                    await connection.execute(
+                        "INSERT INTO curie.agent_channels "
+                        "(id, agent_id, kind, address, adapter) "
+                        "VALUES ($1, $2, 'slack', $3, $4)",
+                        probe_id,
+                        uuid.UUID(agent_id),
+                        address,
+                        adapter,
+                    )
+            except asyncpg.PostgresError:
+                pass
+            else:
+                state["seeded_ids"].append(probe_id)
+                pytest.fail(
+                    "a named Slack binding now inserts through the plain "
+                    "shape (#3146) -- "
+                    "seed it through the API instead and delete "
+                    "_seed_named_identity_binding, seed_named_identity_binding "
+                    "and _constraint_definition."
+                )
+
+            async with connection.transaction():
+                state["route_pair_def"] = await _constraint_definition(
+                    connection, _ROUTE_PAIR_CHECK
+                )
+                state["pair_unique_def"] = await _constraint_definition(
+                    connection, _PAIR_UNIQUE
+                )
+                await connection.execute(
+                    f"ALTER TABLE curie.agent_channels DROP CONSTRAINT {_ROUTE_PAIR_CHECK}"
+                )
+                await connection.execute(
+                    f"ALTER TABLE curie.agent_channels DROP CONSTRAINT {_PAIR_UNIQUE}"
+                )
+                row_id = uuid.uuid4()
+                await connection.execute(
+                    "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                    "VALUES ($1, $2, 'slack', $3, $4)",
+                    row_id,
+                    uuid.UUID(agent_id),
+                    address,
+                    adapter,
+                )
+            state["seeded_ids"].append(row_id)
+            state["dropped"] = True
+        else:
+            row_id = uuid.uuid4()
+            await connection.execute(
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                "VALUES ($1, $2, 'slack', $3, $4)",
+                row_id,
+                uuid.UUID(agent_id),
+                address,
+                adapter,
+            )
+            state["seeded_ids"].append(row_id)
+    finally:
+        await connection.close()
+
+
+async def _restore_route_pair_constraints(state: dict[str, Any]) -> None:
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        async with connection.transaction():
+            if state["seeded_ids"]:
+                await connection.execute(
+                    "DELETE FROM curie.agent_channels WHERE id = ANY($1::uuid[])",
+                    state["seeded_ids"],
+                )
+            await connection.execute(
+                f"ALTER TABLE curie.agent_channels "
+                f"ADD CONSTRAINT {_ROUTE_PAIR_CHECK} {state['route_pair_def']}"
+            )
+            await connection.execute(
+                f"ALTER TABLE curie.agent_channels "
+                f"ADD CONSTRAINT {_PAIR_UNIQUE} {state['pair_unique_def']}"
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.fixture
+def seed_named_identity_binding() -> Iterator[Callable[[str, str, str], None]]:
+    """A callable that directly persists a Slack `agent_channels` row under a
+    NAMED identity with no endpoint, the shape `_binding_scope` must resolve
+    to this agent's own binding state (#3147).
+
+    `agent_channels_route_pair_ck` (migration 0024, `(endpoint IS NULL) =
+    (adapter IS NULL)`) and `agent_channels_kind_address_key` (migration
+    0023, UNIQUE `kind, address`) both still refuse this shape from the
+    ordinary write path -- a named identity with no endpoint, and a second
+    row sharing a pair another agent already holds. The database refuses a
+    named Slack binding from the ordinary API until
+    [#3146](https://github.com/curie-eng/curie/issues/3146), the contract
+    migration for ADR-0168 decision 3, widens both, so the callable drops both
+    constraints, inside one transaction with the insert, on the disposable
+    per-run test database only -- never a migration or any committed schema.
+    It first attempts the plain insert on its own, so the first run on a
+    database that admits the shape fails loudly here instead of quietly
+    passing on retired plumbing, naming what to delete. Teardown removes the
+    seeded rows and restores each constraint's EXACT saved definition
+    (`pg_get_constraintdef`), VALID, so the schema commutes back to what it
+    was regardless of how the test exits.
+    """
+
+    state: dict[str, Any] = {
+        "seeded_ids": [],
+        "dropped": False,
+        "route_pair_def": "",
+        "pair_unique_def": "",
+    }
+
+    def _seed(agent_id: str, address: str, adapter: str) -> None:
+        asyncio.run(_seed_named_identity_binding(agent_id, address, adapter, state))
+
+    yield _seed
+
+    if state["dropped"]:
+        asyncio.run(_restore_route_pair_constraints(state))
+
+
+def test_binding_scoped_state_reaches_a_binding_held_only_under_a_named_identity(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """An agent's rows on one pair share one binding-state scope whichever
+    identity holds them. Before this, `_binding_scope` resolved the pair
+    through the default identity alone (#3147), so an agent bound on a pair
+    ONLY under a named identity got a 404 from every one of its own
+    `/state/bindings/...` routes."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE10")
+    seed_named_identity_binding(aid, "C0EXAMPLE11", "second")
+
+    url = f"/agents/{aid}/state/bindings/slack/C0EXAMPLE11/ns/k"
+    put = client.put(url, json={"value": "named-identity"}, headers=auth_headers)
+    assert put.status_code == 200, put.text
+    got = client.get(url, headers=auth_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["value"] == "named-identity"
+
+
+def test_binding_scoped_route_admits_this_agent_regardless_of_row_order(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """Distinguishes a check that names an arbitrary holder of the pair from
+    one that asks whether THIS agent holds a row on it. Agent B holds the
+    pair under the default identity, inserted FIRST; agent A holds the SAME
+    pair under a named identity, inserted second. A picking the pair's first
+    row would answer B for A's own request, so both agents must reach their
+    own binding state, regardless of which was inserted first."""
+    address = "C0EXAMPLE20"
+    b = _agent(client, auth_headers, address=address, name="agent-b-default")
+    a = _agent(client, auth_headers, address="C0EXAMPLE21", name="agent-a-named")
+    seed_named_identity_binding(a, address, "second")
+
+    a_url = f"/agents/{a}/state/bindings/slack/{address}/ns/k"
+    put_a = client.put(a_url, json={"value": "agent-a"}, headers=auth_headers)
+    assert put_a.status_code == 200, put_a.text
+    got_a = client.get(a_url, headers=auth_headers)
+    assert got_a.status_code == 200, got_a.text
+    assert got_a.json()["value"] == "agent-a"
+
+    b_url = f"/agents/{b}/state/bindings/slack/{address}/ns/k"
+    put_b = client.put(b_url, json={"value": "agent-b"}, headers=auth_headers)
+    assert put_b.status_code == 200, put_b.text
+    got_b = client.get(b_url, headers=auth_headers)
+    assert got_b.status_code == 200, got_b.text
+    assert got_b.json()["value"] == "agent-b"
+
+
+def test_binding_scoped_route_404s_when_this_agents_binding_on_the_address_is_a_different_kind(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Widening the check to any identity must not widen it to any kind: a
+    kind-blind existence check would let this agent's binding under a
+    DIFFERENT kind admit a Slack query for the same address string."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE12")
+    other_kind = client.post(
+        f"/agents/{aid}/channels",
+        json={"kind": "webhook", "address": "C0EXAMPLE13"},
+        headers=auth_headers,
+    )
+    assert other_kind.status_code == 201, other_kind.text
+
+    resp = client.get(
+        f"/agents/{aid}/state/bindings/slack/C0EXAMPLE13/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
+def test_binding_scoped_route_404s_when_only_another_agent_holds_the_pair(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    seed_named_identity_binding: Callable[[str, str, str], None],
+) -> None:
+    """Widening the check across identities must not widen it across agents
+    -- another agent's binding on this pair, held under a named identity,
+    still does not admit a different agent."""
+    owner = _agent(client, auth_headers, address="C0EXAMPLE14", name="pair-owner")
+    seed_named_identity_binding(owner, "C0EXAMPLE15", "second")
+
+    other = _agent(client, auth_headers, address="C0EXAMPLE16", name="not-the-owner")
+    resp = client.get(
+        f"/agents/{other}/state/bindings/slack/C0EXAMPLE15/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
 def test_binding_scoped_route_accepts_the_same_scoped_token_shape_as_the_plain_route(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:

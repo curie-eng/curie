@@ -1692,6 +1692,57 @@ runs a full `helm upgrade --install` with no `--reuse-values`, so the CLI
 explicitly re-supplies each recorded source that the invocation does not
 replace or clear. That preservation lives in `cli/src/ops/up.rs`.
 
+### Several Slack identities
+
+`dispatcher.slack` is the Slack identity named `default`
+([ADR-0168](../../docs/adr/0168-one-installation-hosts-several-bot-identities.md)
+decision 1). `dispatcher.slack.identities` lists more, each by
+`existingSecret` reference only; a plain token in an entry fails the render.
+Once the list is non-empty, `default` takes its secrets by reference too: a
+plain `appToken`, `botToken` or `signingSecret` in the `dispatcher.slack` block
+fails the render, so `curie cluster comms --slack`, which writes plain block
+tokens, is refused on such an install. With no entries the block keeps
+accepting plain values, as it always has.
+
+```yaml
+dispatcher:
+  slack:
+    appTokenExistingSecret: my-slack-tokens
+    botTokenExistingSecret: my-slack-tokens
+    identities:
+      - name: sales
+        appTokenExistingSecret: slack-sales      # key defaults to slackAppToken
+        botTokenExistingSecret: slack-sales      # key defaults to slackBotToken
+```
+
+With no entries the chart renders exactly the objects it rendered before the
+key existed. With entries, the dispatcher, worker and API each receive
+`CURIE_SLACK_IDENTITIES`, which names every identity and the env vars holding
+its tokens, from one helper (`templates/_slack-identities.tpl`). Entry `n`'s bot
+token is `CURIE_SLACK_BOT_TOKEN__<n>` in all three, and the dispatcher also
+gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set, `CURIE_SLACK_SIGNING_SECRET__<n>`.
+`default` always keeps the `SLACK_*` names. The render refuses a duplicate
+name, a name that is not lowercase letters and digits in runs joined by single
+hyphens (at most 40 characters, so every name is one a binding's `adapter` can
+carry), a name of `curie-cluster-message` (reserved for the platform's
+built-in cluster-message reply adapter), a missing token reference, `default`
+configured twice or not at all, and an `extraEnv` entry naming any of these
+variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
+
+A plain `curie cluster up` re-supplies a recorded list along with the
+`dispatcher.slack` token fields, so an operator does not need to pass it again
+on a later `up`. The one shape `up` refuses outright is a list explicitly
+recorded as empty (`[]`, as opposed to the key being absent); leave the key out
+rather than clearing it to an empty list.
+
+The API validates a Slack binding's identity against this declared list, but
+the database refuses to store a Slack binding naming any identity other than
+`default` until
+[#3146](https://github.com/curie-eng/curie/issues/3146). Such a binding is
+answered with a 422 that says so, on create, add and move alike. Declaring an
+identity readies the chart and the services for it; no binding can route to
+it.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement

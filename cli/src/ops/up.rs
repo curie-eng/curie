@@ -926,6 +926,11 @@ const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 /// secret classifier below all read the one key.
 const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
 
+/// The declared Slack identities beyond `default` (ADR-0168 decision 1). `up`
+/// carries them with the release's other recorded values; named here so
+/// `diff`'s reset reporting and the secret classifier read the one key.
+const SLACK_IDENTITIES_KEY: &str = "dispatcher.slack.identities";
+
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
@@ -1292,7 +1297,8 @@ fn is_retained_mail_key(key: &str) -> bool {
 /// [`resolve_preserved_runner_identity_values`], and
 /// [`resolve_preserved_runner_egress_values`],
 /// [`resolve_preserved_gvisor_mode_value`], and
-/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, which survive
+/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, plus the
+/// [`SLACK_IDENTITIES_KEY`] list the live-value overlay carries, which survive
 /// untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
@@ -1318,6 +1324,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
+        || key_is_or_descends_from(key, SLACK_IDENTITIES_KEY)
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1364,8 +1371,13 @@ pub fn is_secret_value_key(key: &str) -> bool {
     // A Slack trusted-origin list (issue #1897) is the same shape: it is
     // operator-visible dev configuration -- hostnames, not a token -- and
     // masking it would hide the very value the operator opens `curie diff` to
-    // confirm survived the upgrade.
-    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY && key != SLACK_TRUSTED_ORIGINS_KEY)
+    // confirm survived the upgrade. The Slack identity list is the same: its
+    // names are configuration, and its Secret references are masked below by
+    // their key names, exactly as before the family was preserved.
+    if (is_preserved_by_up(key)
+        && key != GVISOR_MODE_KEY
+        && key != SLACK_TRUSTED_ORIGINS_KEY
+        && !key_is_or_descends_from(key, SLACK_IDENTITIES_KEY))
         || key == GITHUB_TOKEN_KEY
         || key == MODEL_CREDENTIAL_KEY
     {
@@ -4951,6 +4963,84 @@ mod tests {
         );
     }
 
+    /// `dispatcher.slack.identities` (ADR-0168 decision 1) sits beside the
+    /// `default` block `comms` records. `up` is a full upgrade, so a list it
+    /// did not re-pass would silently undeclare every named identity, and the
+    /// API would then refuse every binding that names one.
+    #[test]
+    fn plain_up_re_supplies_recorded_slack_identities_without_reuse_values() {
+        let existing = serde_json::json!({
+            "dispatcher": {"slack": {
+                "appToken": "xapp-EXAMPLE",
+                "botToken": "xoxb-EXAMPLE",
+                "identities": [
+                    {
+                        "name": "second",
+                        "appTokenExistingSecret": "slack-second",
+                        "botTokenExistingSecret": "slack-second",
+                        "signingSecretExistingSecret": "slack-second"
+                    },
+                    {
+                        "name": "third",
+                        "appTokenExistingSecret": "slack-third",
+                        "appTokenExistingSecretKey": "app",
+                        "botTokenExistingSecret": "slack-third",
+                        "botTokenExistingSecretKey": "bot"
+                    }
+                ]
+            }}
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                retained_mail_values: None,
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                adopt: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for assignment in [
+            "dispatcher.slack.identities[0].name=second",
+            "dispatcher.slack.identities[0].appTokenExistingSecret=slack-second",
+            "dispatcher.slack.identities[0].botTokenExistingSecret=slack-second",
+            "dispatcher.slack.identities[0].signingSecretExistingSecret=slack-second",
+            "dispatcher.slack.identities[1].name=third",
+            "dispatcher.slack.identities[1].appTokenExistingSecret=slack-third",
+            "dispatcher.slack.identities[1].appTokenExistingSecretKey=app",
+            "dispatcher.slack.identities[1].botTokenExistingSecret=slack-third",
+            "dispatcher.slack.identities[1].botTokenExistingSecretKey=bot",
+        ] {
+            assert!(
+                argv.contains(&format!("--set-string {assignment}")),
+                "plain up dropped recorded Slack identity leaf {assignment}: {argv}"
+            );
+        }
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
     /// A plain `cluster up` for an unrelated reason must not silently switch
     /// the worker back to refusing every dev reply endpoint the operator had
     /// already trusted (issue #1897).
@@ -5210,6 +5300,62 @@ mod tests {
             !is_secret_value_key("worker.slackTrustedOrigins"),
             "the trusted-origin list is operator-visible configuration, not a credential"
         );
+    }
+
+    /// `up` hands a recorded `dispatcher.slack.identities` list straight back
+    /// (`plain_up_re_supplies_recorded_slack_identities_without_reuse_values`),
+    /// so `diff` must not announce a reset for any of its leaves. An identity's
+    /// name is configuration an operator reads to confirm which bots survive;
+    /// its Secret references stay masked exactly as their names already say.
+    #[test]
+    fn slack_identities_are_preserved_and_their_names_never_masked() {
+        for key in [
+            "dispatcher.slack.identities",
+            "dispatcher.slack.identities[0].name",
+            "dispatcher.slack.identities[1].name",
+            "dispatcher.slack.identities[0].appTokenExistingSecret",
+            "dispatcher.slack.identities[0].botTokenExistingSecretKey",
+            "dispatcher.slack.identities[1].signingSecretExistingSecret",
+        ] {
+            assert!(
+                is_preserved_by_up(key),
+                "diff must not report a reset for {key}, which up re-supplies"
+            );
+        }
+        for key in [
+            "dispatcher.slack.identities[0].name",
+            "dispatcher.slack.identities[1].name",
+        ] {
+            assert!(
+                !is_secret_value_key(key),
+                "{key} is an identity name, not a credential"
+            );
+            let expression = format!("{key}=second");
+            assert_eq!(
+                mask_helm_set_expression(&expression),
+                expression,
+                "the plan must show {key} as written"
+            );
+        }
+        for key in [
+            "dispatcher.slack.identities[0].appTokenExistingSecret",
+            "dispatcher.slack.identities[0].appTokenExistingSecretKey",
+            "dispatcher.slack.identities[0].botTokenExistingSecret",
+            "dispatcher.slack.identities[0].botTokenExistingSecretKey",
+            "dispatcher.slack.identities[0].signingSecretExistingSecret",
+            "dispatcher.slack.identities[0].signingSecretExistingSecretKey",
+        ] {
+            assert!(
+                is_secret_value_key(key),
+                "{key} must stay masked as it is today"
+            );
+            let expression = format!("{key}=slack-second");
+            assert_ne!(
+                mask_helm_set_expression(&expression),
+                expression,
+                "the plan must mask {key}"
+            );
+        }
     }
 
     #[test]

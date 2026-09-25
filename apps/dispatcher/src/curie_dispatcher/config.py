@@ -11,6 +11,7 @@ Env mapping:
     SLACK_BOT_TOKEN            -> slack_bot_token   (xoxb-..., Web API)
     SLACK_SIGNING_SECRET       -> slack_signing_secret (optional; unused in
                                   Socket Mode, kept for Bolt App construction)
+    CURIE_SLACK_IDENTITIES     -> slack_identities (ADR-0168 decision 1)
     VALKEY_HOST                -> valkey_host
     VALKEY_PORT                -> valkey_port
     VALKEY_PASSWORD            -> valkey_password
@@ -45,6 +46,7 @@ from aci_protocol.service_config import (
     api_url_validation_alias,
     warn_if_deprecated_api_url_env,
 )
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
@@ -101,6 +103,10 @@ class DispatcherConfig(BaseSettings):
     slack_app_token: str = ""
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
+    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
+    # here so a malformed declaration refuses boot; the supervisor still runs
+    # the one app above until decision 2 runs one Bolt app per identity.
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     slack_threaded_bot_allowlist: Annotated[tuple[ThreadedBotAdmission, ...], NoDecode] = Field(
         default=(), validation_alias="CURIE_SLACK_THREADED_BOT_ALLOWLIST"
     )

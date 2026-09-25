@@ -1552,6 +1552,10 @@ class TestHelmCiWorkflowTriggers:
         # recorded upgrade boundary, so its subject and its stub driver both
         # live outside charts/, and a PR restoring the YAML 1.2 emitter must
         # still match this filter.
+        # The last three are the Slack identities gate's (ADR-0168 decision
+        # 1): it feeds the rendered declaration through the shared parser,
+        # which reads names from turn.py, and the worker env through the
+        # sandbox filter, so a PR loosening either must still run it.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             "examples/sre-bot/observability/**",
@@ -1567,6 +1571,9 @@ class TestHelmCiWorkflowTriggers:
             "compose.dev.yaml",
             "cli/src/ops/upgrade.rs",
             "cli/tests/data/upgrade-driver.py",
+            "packages/aci-protocol/src/aci_protocol/slack_identities.py",
+            "packages/aci-protocol/src/aci_protocol/turn.py",
+            "apps/worker/src/curie_worker/sandbox/types.py",
         ]
 
 
