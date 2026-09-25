@@ -141,6 +141,43 @@ fresh connection; `request_stop` (wired to SIGINT/SIGTERM) closes the current
 connection and exits the loop without reconnecting. The Socket Mode adapter
 (`app.SocketModeConnection`) is the thin production `Connection`.
 
+## One app per identity
+
+The dispatcher runs one Bolt app per Slack identity the chart declares
+(`CURIE_SLACK_IDENTITIES`, ADR-0168 decisions 1 and 2), each with its own Web
+client, Socket Mode connection and supervisor, all feeding the one stream. With
+no declaration it runs `default` alone, from the `SLACK_*` variables, exactly as
+before. Several dispatcher replicas serving one identity remain out of scope
+(#2248).
+
+A turn carries the identity of the app it arrived on, never a field of the
+delivery. `default` still mints a null `reply_handle.adapter` until #3146;
+every other identity mints its name, and its deliveries are claimed under
+`<slack id>:<identity>`. The enqueue log line names both: the existing
+`identity=` field is the release identity, unchanged, and a new
+`slack_identity=` field is the identity whose app the delivery arrived on.
+Every placeholder, card stamp, ephemeral and dialog is made with the token of
+the app the delivery arrived on, which for a card click is the app that posted
+the card.
+
+A named identity's app connects and preflights like any other, but the
+database refuses to store a binding naming it until #3146; until that lands,
+a named identity is declared and connected, not yet usable for routing a turn.
+
+Preflight runs per identity. An identity with a blank token, a missing
+`channels:read` scope, or one the shared preflight deadline left unattempted is
+logged at ERROR by name and does not connect; the others do. The pod refuses to
+boot only when no identity passes. After boot, an identity that loses its
+connection reconnects with its own backoff while the others keep serving, and
+the heartbeat stays fresh: one identity can be down while the pod is healthy.
+Each identity adds its own threads and websocket: on slack_bolt 1.30.0 and
+slack_sdk 3.44.1, up to 5 Bolt listener workers, up to 10 Socket Mode message
+workers, 3 Socket Mode client threads and a supervisor thread; the chart's
+dispatcher requests and limits are sized for one app, so measure before
+declaring many.
+A cron-hook agent's approval destinations are not preflighted under `default`,
+since a cron trigger is not carried by the projection preflight reads.
+
 ## Config surface (env vars)
 
 Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSettings`).
@@ -150,7 +187,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `SLACK_APP_TOKEN` | "" | app-level token (`xapp-...`), Socket Mode |
 | `SLACK_BOT_TOKEN` | "" | bot token (`xoxb-...`), Web API |
 | `SLACK_SIGNING_SECRET` | "" | optional; unused in Socket Mode, kept for Bolt App construction |
-| `CURIE_SLACK_IDENTITIES` | unset | JSON naming each declared Slack identity and the env vars holding its tokens (ADR-0168 decision 1); unset means the one app, `default`. Parsed at boot; the supervisor still runs only `default` |
+| `CURIE_SLACK_IDENTITIES` | unset | JSON naming each declared Slack identity and the env vars holding its tokens (ADR-0168 decision 1); unset means the one app, `default`. The dispatcher connects one Bolt app per declared identity (see *One app per identity*) |
 | `VALKEY_HOST` | `localhost` | Valkey host (in-cluster: `valkey`) |
 | `VALKEY_PORT` | `6379` | Valkey port (compose maps it to `26379` on the host) |
 | `VALKEY_PASSWORD` | "" | Valkey password (compose dev: `valkeypass`) |

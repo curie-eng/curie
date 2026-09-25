@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import QueuedTurn
+from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.handlers import process_event
 from curie_dispatcher.inbound_text import derive_text
@@ -95,6 +96,7 @@ def _mint(
         web_client=_WebClient(),  # type: ignore[arg-type]
         redis_client=redis_client,
         config=config,
+        slack_identity=DEFAULT_IDENTITY,
     )
     assert stream_id is not None, "the delivery must be enqueued, not refused"
     entries = redis_client.xrange(config.stream)

@@ -104,8 +104,8 @@ class DispatcherConfig(BaseSettings):
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
     # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
-    # here so a malformed declaration refuses boot; the supervisor still runs
-    # the one app above until decision 2 runs one Bolt app per identity.
+    # here so a malformed declaration refuses boot; the dispatcher connects one
+    # Bolt app per declared identity (decision 2, `identities.py`).
     slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     slack_threaded_bot_allowlist: Annotated[tuple[ThreadedBotAdmission, ...], NoDecode] = Field(
         default=(), validation_alias="CURIE_SLACK_THREADED_BOT_ALLOWLIST"

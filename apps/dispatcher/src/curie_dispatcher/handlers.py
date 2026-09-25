@@ -34,10 +34,12 @@ these listeners by Bolt's own middleware (self events, authorization, listener
 matching) are documented in ``docs/interfaces/channel-ingress/INTERFACE.md``
 rather than re-implemented here.
 
-We use the dispatcher's own ``WebClient`` (built from the bot token) rather than
-Bolt's per-request injected client so the Web API surface is a single, mockable
-seam. Routing, retries, and run orchestration are the worker's job (F1), not the
-dispatcher's.
+Each identity's Bolt app is registered with that identity's own ``WebClient``
+(built from its bot token) rather than Bolt's per-request injected client, so the
+Web API surface is a single, mockable seam per identity, and every placeholder,
+card stamp and ephemeral is made by the app the delivery arrived on (ADR-0168
+decision 2). Routing, retries, and run orchestration are the worker's job (F1),
+not the dispatcher's.
 """
 
 import logging
@@ -47,6 +49,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
+from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_telemetry import operation_span
 from opentelemetry.trace import SpanKind
 from slack_bolt import App
@@ -72,6 +75,7 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
+from .identities import delivery_key, minted_adapter
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
@@ -208,6 +212,7 @@ def _mint_turn(
     attachments: list[Attachment],
     channel: str,
     thread_ts: str,
+    slack_identity: str,
 ) -> str:
     """Post the placeholder, enqueue the turn, and return its Stream id.
 
@@ -233,6 +238,10 @@ def _mint_turn(
     at the call site, for the same reason ``source`` and ``adapter`` are stated
     rather than defaulted. A silent default here is how the next lane to grow
     files would quietly keep dropping them.
+
+    ``slack_identity`` is the identity whose app this delivery arrived on,
+    stated by the caller for the same reason. It is never read from the
+    delivery.
     """
     placeholder = _post_placeholder(
         web_client=web_client,
@@ -266,12 +275,16 @@ def _mint_turn(
         source=TurnSource.SLACK,
         # The literal "slack" is this dispatcher stating what it is; it never
         # comes from config, because a Slack Socket Mode dispatcher that could
-        # claim another kind is a misrouting vector. `adapter=None` is explicit
-        # rather than defaulted so a reader sees that Slack's route is the
-        # worker's configured origin, not an oversight (ADR-0096 D4.4). Same
-        # literal, same reason, on both lanes.
+        # claim another kind is a misrouting vector. `adapter` is the identity
+        # of the app this delivery arrived on, never a field of the delivery
+        # (ADR-0168 decision 2); `minted_adapter` keeps `default` as None until
+        # #3146, so a stock install mints the handle it always did. Same rule,
+        # same reason, on both lanes.
         reply_handle=ReplyHandle(
-            kind="slack", channel=channel, placeholder=placeholder_ts, adapter=None
+            kind="slack",
+            channel=channel,
+            placeholder=placeholder_ts,
+            adapter=minted_adapter(slack_identity),
         ),
         received_at=clock(),
         # Refs only, and derived BESIDE the text rather than folded into it: see
@@ -281,11 +294,12 @@ def _mint_turn(
     )
     stream_id = enqueue(redis_client, config, queued)
     log.info(
-        "enqueued %s %s as stream entry %s identity=%s",
+        "enqueued %s %s as stream entry %s identity=%s slack_identity=%s",
         delivery_kind,
         slack_event_id,
         stream_id,
         release_identity(),
+        slack_identity,
     )
     return stream_id
 
@@ -298,6 +312,7 @@ def process_event(
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
+    slack_identity: str,
     bot_user_id: str | None = None,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
@@ -307,6 +322,11 @@ def process_event(
     ``lane`` says which subscribed lane the delivery arrived on; the
     bot-authorship rule is lane-specific (see ``relevance.classify``) and cannot
     be inferred from the event body alone.
+
+    ``slack_identity`` is the identity whose app this delivery arrived on. It
+    is fixed when the listener is registered, and nothing in ``body`` or
+    ``event`` can change it. It has no default, so a lane that forgets to pass
+    it fails instead of minting ``default``'s turn.
 
     Returns the Valkey Stream id when a job was enqueued, or None when the event
     was refused. Every refusal is logged with its enumerated ``DropReason``.
@@ -351,8 +371,9 @@ def process_event(
         kind=SpanKind.CONSUMER,
         attributes={"service.name": "curie-dispatcher", "source": "dispatcher"},
     ):
-        if not claim_event(redis_client, config, slack_event_id):
-            drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
+        delivery_id = delivery_key(slack_event_id, slack_identity)
+        if not claim_event(redis_client, config, delivery_id):
+            drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
             return None
 
         return _mint_turn(
@@ -361,7 +382,7 @@ def process_event(
             config=config,
             log=log,
             clock=clock,
-            slack_event_id=slack_event_id,
+            slack_event_id=delivery_id,
             delivery_kind="slack event",
             author=event.get("user", ""),
             # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
@@ -377,6 +398,7 @@ def process_event(
             attachments=derive_attachments(event),
             channel=channel,
             thread_ts=thread_ts,
+            slack_identity=slack_identity,
         )
 
 
@@ -407,6 +429,7 @@ def process_action(
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
+    slack_identity: str,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
 ) -> str | None:
@@ -416,6 +439,7 @@ def process_action(
 
     Same four steps as ``process_event`` (ack is Bolt's, before this runs); no
     decision about *how* the turn is answered lives here -- that is the worker's.
+    ``slack_identity`` is required for the same reason as on ``process_event``.
     """
     log = logger or logging.getLogger(__name__)
 
@@ -469,7 +493,7 @@ def process_action(
     if missing:
         drop(log, DropReason.MALFORMED_ENVELOPE, event_id=interaction_id, missing=missing)
         return None
-    slack_event_id = f"action-{interaction}"
+    slack_event_id = delivery_key(f"action-{interaction}", slack_identity)
     with operation_span(
         "curie.turn.ingress",
         kind=SpanKind.CONSUMER,
@@ -501,6 +525,7 @@ def process_action(
             attachments=[],
             channel=channel,
             thread_ts=thread_ts,
+            slack_identity=slack_identity,
         )
 
 
@@ -513,10 +538,13 @@ def register_handlers(
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
     resolver: ApprovalResolveClient | None = None,
+    slack_identity: str = DEFAULT_IDENTITY,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
-    injectable for tests; None builds the production client from config."""
+    injectable for tests; None builds the production client from config.
+    ``slack_identity`` is the identity this app is; every turn either lane
+    mints carries it."""
 
     approval_resolver = resolver if resolver is not None else build_resolver(config)
     # Resolved once here rather than per listener: the lane filter below drops
@@ -535,6 +563,7 @@ def register_handlers(
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            slack_identity=slack_identity,
             bot_user_id=context.get("bot_user_id"),
             clock=clock,
             logger=logger,
@@ -566,6 +595,7 @@ def register_handlers(
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            slack_identity=slack_identity,
             bot_user_id=context.get("bot_user_id"),
             clock=clock,
             logger=logger,
@@ -744,6 +774,7 @@ def register_handlers(
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            slack_identity=slack_identity,
             clock=clock,
             logger=logger,
         )
