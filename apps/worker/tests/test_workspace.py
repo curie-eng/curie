@@ -1874,3 +1874,27 @@ def test_object_reference_digest_is_the_streamed_archive_digest(
     assert prepared.sha256 == hashlib.sha256(payload).hexdigest()
     assert decoded.sha256 == prepared.sha256
     assert prepared.claim_env()["CURIE_WORKSPACE_SHA256"] == prepared.sha256
+
+
+def test_repo_fact_carries_url_or_bare_provenance(workspace: Any) -> None:
+    """#2947: a bare slug is a guess the allowlist decides; a URL is a statement."""
+
+    from_url = workspace.parse_github_repo_fact("see https://github.com/acme/app")
+    bare = workspace.parse_github_repo_fact("profit/loss for the quarter")
+
+    assert from_url == "acme/app" and from_url.bare is False
+    assert bare == "profit/loss" and bare.bare is True
+
+
+def test_unallowlisted_selection_is_the_allowlist_refusal_type(workspace: Any) -> None:
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(status=403, headers={}, body=b"")
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspaceRepositoryNotAllowed):
+        client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "a/b")
