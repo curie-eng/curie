@@ -2434,7 +2434,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Worker credential selector for the reply adapter. Requires --endpoint",
+              "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
               "positional": false,
@@ -4756,7 +4756,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Worker credential selector for the reply adapter. Requires --endpoint",
+              "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
               "positional": false,

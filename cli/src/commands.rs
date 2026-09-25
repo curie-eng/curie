@@ -3048,6 +3048,10 @@ pub enum ChannelChange {
     Remove {
         kind: String,
         address: String,
+        /// Which identity's binding to drop (ADR-0168 decision 3). Omitted
+        /// keeps today's selection: the default Slack identity, or the single
+        /// row on a non-Slack pair.
+        adapter: Option<String>,
     },
 }
 
@@ -3061,6 +3065,10 @@ impl ChannelChange {
     /// Args:
     ///   add: the `--add KIND=ADDRESS` value, if passed.
     ///   remove: the `--remove KIND=ADDRESS` value, if passed.
+    ///   adapter: `--adapter`, valid alongside either -- a Slack identity name
+    ///     on `--add` (with no `--endpoint`) or the identity to drop on
+    ///     `--remove` (ADR-0168 decision 3). Meaningless with neither, since
+    ///     there is no write and no removal selector for it to name.
     ///
     /// Returns:
     ///   The intent, or a usage error when the pair is malformed.
@@ -3073,6 +3081,18 @@ impl ChannelChange {
         match (add, remove) {
             (Some(spec), _) => {
                 let (kind, address) = parse_channel_pair(&spec)?;
+                // A non-Slack kind still needs BOTH endpoint and adapter for
+                // the custom-transport form (ADR-0168 decision 3): clap only
+                // enforces `--endpoint` requires `--adapter`, not the other
+                // way, so `--adapter` alone on a non-Slack kind reaches here
+                // and must be refused before any I/O -- the API would refuse
+                // it too, but only after a round trip.
+                if kind != "slack" && adapter.is_some() && endpoint.is_none() {
+                    return Err(crate::exit::usage(format!(
+                        "--adapter on a non-Slack kind ({kind}) also needs --endpoint; \
+                         a Slack identity needs no endpoint, but a {kind} reply route does"
+                    )));
+                }
                 Ok(ChannelChange::Add {
                     kind,
                     address,
@@ -3082,9 +3102,20 @@ impl ChannelChange {
             }
             (None, Some(spec)) => {
                 let (kind, address) = parse_channel_pair(&spec)?;
-                Ok(ChannelChange::Remove { kind, address })
+                Ok(ChannelChange::Remove {
+                    kind,
+                    address,
+                    adapter,
+                })
             }
-            (None, None) => Ok(ChannelChange::List),
+            (None, None) => {
+                if adapter.is_some() {
+                    return Err(crate::exit::usage(
+                        "--adapter needs --add or --remove".to_string(),
+                    ));
+                }
+                Ok(ChannelChange::List)
+            }
         }
     }
 }
@@ -3133,11 +3164,21 @@ struct ChannelBindingPresentation<'a> {
     kind: &'a str,
     address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'static str>,
 }
 
 fn channel_binding_never_resolves(kind: &str, address: &str) -> bool {
     kind == "slack" && address.trim_start().starts_with('#')
+}
+
+/// The binding's identity, when it is worth printing: present and not the
+/// default Slack identity every pre-ADR install already reads as (ADR-0168
+/// decision 3). Naming that one on every row would make single-identity
+/// output noisier for no new information.
+fn channel_binding_named_identity(binding: &crate::api::ChannelBinding) -> Option<&str> {
+    binding.named_adapter()
 }
 
 fn channel_binding_presentation(
@@ -3146,6 +3187,7 @@ fn channel_binding_presentation(
     ChannelBindingPresentation {
         kind: &binding.kind,
         address: &binding.address,
+        adapter: channel_binding_named_identity(binding),
         warning: channel_binding_never_resolves(&binding.kind, &binding.address)
             .then_some(CHANNEL_BINDING_NEVER_RESOLVES_WARNING),
     }
@@ -3191,7 +3233,10 @@ impl crate::ui::CliOutput for ChannelsOutput {
                 } else {
                     channels
                         .iter()
-                        .map(|c| format!("{}:{}", c.kind, c.address))
+                        .map(|c| match channel_binding_named_identity(c) {
+                            Some(identity) => format!("{}:{} ({identity})", c.kind, c.address),
+                            None => format!("{}:{}", c.kind, c.address),
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
@@ -3234,30 +3279,50 @@ pub async fn channel_bindings(
 ) -> Result<ChannelsOutput> {
     let ui = crate::ui::ui();
     if opts.dry_run {
-        let plan =
-            match &change {
-                ChannelChange::List => format!(
-                    "GET {}/agents  (read-only: would resolve agent {:?} and print its surfaces)",
-                    opts.api_url, opts.agent
-                ),
-                ChannelChange::Add {
-                    kind,
-                    address,
-                    endpoint,
-                    adapter,
-                } => format!(
-                "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"}}  \
-                 (would resolve agent {:?} first; reply route: {})",
-                opts.api_url,
-                opts.agent,
-                if endpoint.is_some() && adapter.is_some() { "configured" } else { "implicit" }
+        let plan = match &change {
+            ChannelChange::List => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print its surfaces)",
+                opts.api_url, opts.agent
             ),
-                ChannelChange::Remove { kind, address } => format!(
-                    "DELETE {}/agents/<id>/channels?kind={kind}&address={address}  \
-                 (would resolve agent {:?} first)",
+            ChannelChange::Add {
+                kind,
+                address,
+                endpoint,
+                adapter,
+            } => {
+                // Three reply-route shapes (ADR-0168 decision 3): the
+                // pre-ADR custom transport (endpoint + adapter together),
+                // a named Slack identity (adapter alone), or the implicit
+                // default nothing names.
+                let reply_route = if endpoint.is_some() && adapter.is_some() {
+                    "configured".to_string()
+                } else if let Some(adapter) = adapter {
+                    format!("identity {adapter}")
+                } else {
+                    "implicit".to_string()
+                };
+                format!(
+                        "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"}}  \
+                         (would resolve agent {:?} first; reply route: {reply_route})",
+                        opts.api_url, opts.agent,
+                    )
+            }
+            ChannelChange::Remove {
+                kind,
+                address,
+                adapter,
+            } => {
+                let selector = match adapter {
+                    Some(adapter) => format!("kind={kind}&address={address}&adapter={adapter}"),
+                    None => format!("kind={kind}&address={address}"),
+                };
+                format!(
+                    "DELETE {}/agents/<id>/channels?{selector}  \
+                         (would resolve agent {:?} first)",
                     opts.api_url, opts.agent
-                ),
-            };
+                )
+            }
+        };
         return Ok(ChannelsOutput::DryRun(crate::ui::DryRunPlan {
             lines: vec![plan],
         }));
@@ -3275,7 +3340,7 @@ pub async fn channel_bindings(
             });
         }
         ChannelChange::Add { kind, address, .. } => (kind, address, true),
-        ChannelChange::Remove { kind, address } => (kind, address, false),
+        ChannelChange::Remove { kind, address, .. } => (kind, address, false),
     };
     let cl = ui.checklist();
     let verb = if adding { "adding" } else { "removing" };
@@ -3297,7 +3362,14 @@ pub async fn channel_bindings(
         // The DELETE answers 204 with no body, so the remaining set comes from
         // a fresh read rather than from locally subtracting the pair -- the CLI
         // reports what the API holds, never what it assumes it holds.
-        match client.remove_agent_channel(&agent.id, kind, address).await {
+        let adapter = match &change {
+            ChannelChange::Remove { adapter, .. } => adapter.as_deref(),
+            _ => None,
+        };
+        match client
+            .remove_agent_channel(&agent.id, kind, address, adapter)
+            .await
+        {
             Ok(()) => client.get_agent(&agent.id).await,
             Err(err) => Err(err),
         }
@@ -3364,6 +3436,7 @@ mod channels_tests {
             ChannelChange::Remove {
                 kind: "slack".into(),
                 address: "C0EXAMPLE2".into(),
+                adapter: None,
             }
         );
 
@@ -3372,6 +3445,104 @@ mod channels_tests {
             ChannelChange::resolve(None, None, None, None).unwrap(),
             ChannelChange::List
         );
+    }
+
+    #[test]
+    fn channel_change_resolve_carries_the_adapter_on_add_and_remove() {
+        // ADR-0168 decision 3: --adapter names the identity on --add (a Slack
+        // identity, with no --endpoint) and selects which identity's binding
+        // --remove drops.
+        let add = ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            None,
+            Some("default".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            add,
+            ChannelChange::Add {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                endpoint: None,
+                adapter: Some("default".into()),
+            }
+        );
+
+        let remove = ChannelChange::resolve(
+            None,
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            Some("default".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            remove,
+            ChannelChange::Remove {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: Some("default".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn channel_change_rejects_a_bare_adapter_with_no_add_or_remove() {
+        // `--adapter` with neither `--add` nor `--remove` names nothing: there
+        // is no write for it to name an identity on, and no removal for it to
+        // select. It refuses before any I/O rather than reading as the
+        // read-only `List`, which would drop the flag without a word.
+        let err = ChannelChange::resolve(None, None, None, Some("default".into())).unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--adapter"), "{err}");
+        assert!(err.to_string().contains("--add"), "{err}");
+        assert!(err.to_string().contains("--remove"), "{err}");
+
+        // Plain `List` (no adapter at all) is unaffected.
+        assert_eq!(
+            ChannelChange::resolve(None, None, None, None).unwrap(),
+            ChannelChange::List
+        );
+    }
+
+    #[test]
+    fn channel_change_rejects_a_non_slack_adapter_with_no_endpoint() {
+        // ADR-0168 decision 3: a non-Slack ingress still needs BOTH endpoint
+        // and adapter for its reply route. Clap's `--endpoint requires
+        // --adapter` only covers one direction; `--adapter` alone on a
+        // non-Slack kind must be refused here, before the round trip the API
+        // would otherwise spend refusing it.
+        let err = ChannelChange::resolve(
+            Some("discord=111111111111111111".into()),
+            None,
+            None,
+            Some("discord-main".into()),
+        )
+        .unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--endpoint"), "{err}");
+
+        // The same pairing on a Slack kind is exactly the bare-identity case
+        // and must still succeed.
+        assert!(ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            None,
+            Some("second-bot".into())
+        )
+        .is_ok());
+
+        // Both endpoint and adapter together on a non-Slack kind is the
+        // pre-ADR custom-transport form and must still succeed.
+        assert!(ChannelChange::resolve(
+            Some("discord=111111111111111111".into()),
+            None,
+            Some("https://discord-adapter.example.com/replies".into()),
+            Some("discord-main".into()),
+        )
+        .is_ok());
     }
 
     #[test]

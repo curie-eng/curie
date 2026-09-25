@@ -324,10 +324,15 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     ChannelBinding {
                         kind: "slack".to_string(),
                         address: "#legacy-alerts".to_string(),
+                        adapter: None,
                     },
+                    // A named, non-default identity (ADR-0168 decision 3)
+                    // alongside the default-identity row above, so the schema
+                    // gate sees both the present and the omitted `adapter`.
                     ChannelBinding {
                         kind: "slack".to_string(),
                         address: "C0EXAMPLE1".to_string(),
+                        adapter: Some("ops-secondary".to_string()),
                     },
                 ],
                 changed: true,
