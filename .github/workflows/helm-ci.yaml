@@ -463,6 +463,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sealing-key-assertions.sh
 
+      # Prove the connector caller signing key (ADR-0168 decision 7) renders
+      # nowhere on a stock install and, once a Secret is named, only into the
+      # worker, by reference.
+      - name: helm render assertions (connector caller key)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/connector-caller-key-assertions.sh
+
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
       # exactly the four kinds the client handles. `create` is load-bearing --
