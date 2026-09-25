@@ -1023,6 +1023,26 @@ enum SreBotAction {
         #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
         workspace_repo: Vec<String>,
     },
+    /// Provision the observability stack on an existing Curie release and
+    /// require the Grafana connector token. Does not install the platform
+    /// and does not deploy the SRE bot.
+    ProvisionObservability {
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
+        /// Chart directory. When omitted, use the same chart resolution as install.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the ordered plan without calling kubectl or helm.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3748,36 +3768,54 @@ async fn run(command: Option<Command>) -> Result<()> {
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
-            action:
-                ExampleAction::SreBot {
-                    action:
-                        SreBotAction::Install {
-                            observability,
-                            dry_run,
-                            slack_channel,
-                            platform_upgrade,
-                            namespace,
-                            release,
-                            observability_namespace,
-                            workspace_repo,
-                            approvers,
-                        },
+            action: ExampleAction::SreBot { action },
+        }) => match action {
+            SreBotAction::Install {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            })
+            .await?
+            {
+                curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+                curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            },
+            SreBotAction::ProvisionObservability {
+                namespace,
+                release,
+                observability_namespace,
+                chart,
+                dry_run,
+            } => match curie::examples::provision_observability(
+                curie::examples::ObservabilityProvisionOpts {
+                    namespace,
+                    release,
+                    observability_namespace,
+                    chart,
+                    dry_run,
                 },
-        }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
-            observability,
-            dry_run,
-            slack_channel,
-            platform_upgrade,
-            namespace,
-            release,
-            observability_namespace,
-            workspace_repo,
-            approvers,
-        })
-        .await?
-        {
-            curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
-            curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            )
+            .await?
+            {
+                curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
+                curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
+            },
         },
         Some(Command::Build {
             tag,
