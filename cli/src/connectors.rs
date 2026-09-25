@@ -1331,6 +1331,7 @@ mod tests {
             "curie-acme-bot-mcp-github",
             "CrashLoopBackOff",
             Some("Error: unknown command \"http\" for \"server\""),
+            None,
         );
         let text = format!("{err:#}");
         assert!(text.contains("connector github"), "{text}");
