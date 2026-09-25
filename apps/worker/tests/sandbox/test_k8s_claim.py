@@ -621,6 +621,36 @@ def test_host_credentials_are_never_written_to_the_claim(
     assert "CURIE_CREDENTIALS" not in claim_env_names
 
 
+def test_no_slack_identity_token_reaches_the_claim() -> None:
+    """The k8s counterpart of the docker filter test (#3147 finding 8): the
+    same `filter_agent_child_env` backs both substrates (`k8s.py:254`,
+    `docker.py:367`), but only the docker call site had a test naming the
+    indexed Slack token prefixes."""
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-slack-identities",
+        pool="pool",
+        env={
+            "CURIE_SLACK_BOT_TOKEN__0": "placeholder",
+            "CURIE_SLACK_BOT_TOKEN__1": "placeholder",
+            "CURIE_SLACK_APP_TOKEN__0": "placeholder",
+            "CURIE_SLACK_SIGNING_SECRET__0": "placeholder",
+            "CURIE_SLACK_IDENTITIES": "[]",
+        },
+    )
+
+    claim_env_names = {entry["name"] for entry in _env_entries(api)}
+    assert claim_env_names.isdisjoint(
+        {
+            "CURIE_SLACK_BOT_TOKEN__0",
+            "CURIE_SLACK_BOT_TOKEN__1",
+            "CURIE_SLACK_APP_TOKEN__0",
+            "CURIE_SLACK_SIGNING_SECRET__0",
+        }
+    )
+    assert "CURIE_SLACK_IDENTITIES" in claim_env_names
+
+
 def test_runner_token_is_a_plaintext_env_entry_credential_excluded() -> None:
     # The per-sandbox runner token intentionally rides the generic env loop as a
     # plaintext {name, value} entry on the claim (there is no secretKeyRef path
