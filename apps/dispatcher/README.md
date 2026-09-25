@@ -170,6 +170,11 @@ logged at ERROR by name and does not connect; the others do. The pod refuses to
 boot only when no identity passes. After boot, an identity that loses its
 connection reconnects with its own backoff while the others keep serving, and
 the heartbeat stays fresh: one identity can be down while the pod is healthy.
+Each identity adds its own threads and websocket: on slack_bolt 1.30.0 and
+slack_sdk 3.44.1, up to 5 Bolt listener workers, up to 10 Socket Mode message
+workers, 3 Socket Mode client threads and a supervisor thread; the chart's
+dispatcher requests and limits are sized for one app, so measure before
+declaring many.
 A cron-hook agent's approval destinations are not preflighted under `default`,
 since a cron trigger is not carried by the projection preflight reads.
 

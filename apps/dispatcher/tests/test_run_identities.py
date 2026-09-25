@@ -64,8 +64,8 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     real_register_handlers = app_module.register_handlers
 
     def recording_register_handlers(app: App, **kwargs: Any) -> None:
-        # D-c's central property: which client a delivery to THIS app answers
-        # through. Recorded at the seam ``build_app`` calls through, so a
+        # Which client a delivery to THIS app answers through (ADR-0168
+        # decision 2). Recorded at the seam ``build_app`` calls through, so a
         # mistake that hands one identity's app another's client shows here
         # even though every ``WebClient(...)`` call still logs its own token.
         calls.registered.append((app, kwargs["web_client"]))
@@ -149,9 +149,9 @@ def test_two_identities_build_two_connections_each_from_its_own_tokens(
     ]
     assert connections[0].app is not connections[1].app
     assert connections[0].supervisor is not connections[1].supervisor
-    # D-c: a delivery to one app's handlers must answer through that app's own
-    # client, never another identity's -- so pin what register_handlers, not
-    # just what WebClient(...), was actually given.
+    # ADR-0168 decision 2: a delivery to one app's handlers must answer
+    # through that app's own client, never another identity's -- so pin what
+    # register_handlers, not just what WebClient(...), was actually given.
     assert recorded.registered == [
         (connections[0].app, connections[0].web_client),
         (connections[1].app, connections[1].web_client),

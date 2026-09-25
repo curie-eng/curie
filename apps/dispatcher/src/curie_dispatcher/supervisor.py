@@ -14,6 +14,7 @@ protocol lives in ``app.py``.
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -85,7 +86,9 @@ class Supervisor:
     def request_stop(self) -> None:
         """Ask the supervisor to shut down and unblock the current connection.
 
-        Safe to call from a signal handler or another thread.
+        Safe to call from another thread. Not from a signal handler: this takes
+        the supervisor's lock and the stop event's, which the interrupted
+        thread may hold, so a handler defers the call to a thread.
         """
         self._stop.set()
         with self._lock:
@@ -145,6 +148,7 @@ class SupervisorGroup:
         members: Mapping[str, Supervisor],
         *,
         join_interval_s: float = 1.0,
+        stop_timeout_s: float = 10.0,
         restart_backoff: BackoffPolicy | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -152,6 +156,7 @@ class SupervisorGroup:
             raise ValueError("a supervisor group needs at least one member")
         self._members = dict(members)
         self._join_interval_s = join_interval_s
+        self._stop_timeout_s = stop_timeout_s
         self._restart_backoff = restart_backoff or BackoffPolicy()
         self._logger = logger or logging.getLogger(__name__)
 
@@ -160,9 +165,27 @@ class SupervisorGroup:
         return dict(self._members)
 
     def request_stop(self) -> None:
-        """Ask every member to stop. Safe from a signal handler or another thread."""
-        for member in self._members.values():
-            member.request_stop()
+        """Ask every member to stop, closing their connections at once.
+
+        Closing one Socket Mode connection takes most of a second, so members
+        are closed concurrently: shutdown then costs one close, not one per
+        identity. Waits at most ``stop_timeout_s`` for the closes in total;
+        a close still running past it is left to the process exit. Safe from
+        another thread; not from a signal handler, which must defer to one.
+        """
+        members = list(self._members.values())
+        if len(members) == 1:
+            members[0].request_stop()
+            return
+        closers = [
+            threading.Thread(target=member.request_stop, name=f"stop-{name}", daemon=True)
+            for name, member in self._members.items()
+        ]
+        for closer in closers:
+            closer.start()
+        deadline = time.monotonic() + self._stop_timeout_s
+        for closer in closers:
+            closer.join(max(0.0, deadline - time.monotonic()))
 
     def run(self) -> None:
         """Run every member until each has stopped. Blocks."""

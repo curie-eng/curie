@@ -82,13 +82,14 @@ def build_identity_connections(
 ) -> tuple[IdentityConnection, ...]:
     """One connection per identity, all feeding the one stream ``redis_client`` writes.
 
-    Whether a connection is labelled comes from ``declared_count``, how many
-    Slack identities the installation named before preflight -- never from how
-    many of ``identities`` were admitted. Defaults to ``len(identities)`` for a
-    caller that already IS the declared set. A one-identity declaration is
-    built exactly as the single app always was: no label on its supervisor, no
-    identity on its connection's log lines -- even when preflight leaves
-    exactly one survivor of a larger declaration, that survivor still names
+    Whether a connection is labelled comes from ``declared_count``: how many
+    Slack identities were resolved before preflight (an identity with a blank
+    token already excluded), the same count preflight's own labelling uses --
+    never how many of ``identities`` preflight admitted. It defaults to
+    ``len(identities)``, for a caller whose ``identities`` are that resolved
+    set. A count of one is built exactly as the single app always was: no
+    label on its supervisor, no identity on its connection's log lines. When
+    preflight leaves one survivor of a larger count, that survivor still names
     itself.
     """
     several = (declared_count if declared_count is not None else len(identities)) > 1
@@ -143,11 +144,10 @@ def build_supervisor(
     """Assemble one supervisor per admitted identity, run together.
 
     ``identities`` defaults to ``default`` from the settings, the stock
-    install. ``declared_count`` is how many identities the installation named
-    before preflight; a direct caller that already filtered to what passed
-    still gets the labelling its own declaration deserves, so this defaults to
-    ``len(identities)`` (or 1, for the stock default) rather than silently
-    reading admission as declaration.
+    install. ``declared_count`` is passed through to
+    ``build_identity_connections``, which says what it counts; ``main`` passes
+    the number of identities resolved before preflight. It defaults to the
+    number of ``identities`` (1, for the stock default).
     """
     admitted = (
         tuple(identities)

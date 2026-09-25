@@ -21,9 +21,9 @@ can produce and route the same payload:
                     ``ReplyHandle``)
     received_at     ISO-8601 UTC timestamp of when the adapter received it
 
-For the Slack adapter today, ``event_id`` is the Slack event id, ``conversation_id``
-is the thread ts, ``author`` is the Slack user id, and ``reply_handle`` carries the
-Slack channel plus the placeholder message ts. The Valkey Stream wire encoding (a
+How the Slack adapter fills these fields, including the ``:<identity>`` suffix
+``event_id`` carries for any Slack identity but ``default``, is stated once, in
+``docs/interfaces/channel-ingress/INTERFACE.md``. The Valkey Stream wire encoding (a
 single ``payload`` field holding this model's JSON) is a transport detail and
 stays outside this package, in the dispatcher's queue module.
 """
