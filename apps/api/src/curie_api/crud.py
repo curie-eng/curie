@@ -413,7 +413,8 @@ async def agent_id_for_route(
     )
     for owner_id, stored_adapter in result.all():
         if route_identity(kind, stored_adapter) == wanted:
-            return owner_id
+            owner: uuid.UUID = owner_id
+            return owner
     return None
 
 
@@ -438,11 +439,12 @@ async def agent_id_for_channel_pair(
     only because the pair constraint has not widened yet.
     """
 
-    return await session.scalar(
+    owner: uuid.UUID | None = await session.scalar(
         select(AgentChannel.agent_id).where(
             AgentChannel.kind == kind, AgentChannel.address == address
         )
     )
+    return owner
 
 
 def matching_bindings(

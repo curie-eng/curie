@@ -367,7 +367,9 @@ async def ingest_hook(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "hook reply surface requires both kind and address",
         )
-    if kind is None:
+    # Both or neither, checked just above; naming both here lets the type
+    # checker see that the `else` branch holds a full pair.
+    if kind is None or address is None:
         if len(agent.channels) != 1:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
