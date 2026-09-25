@@ -2110,3 +2110,57 @@ def test_generation_content_keys_are_never_on_the_root_or_tool_spans() -> None:
         keys = set(span.attributes or {})
         assert _INPUT not in keys
         assert _OUTPUT not in keys
+
+
+# --- review r1 --------------------------------------------------------------------
+
+
+def test_zero_placeholder_message_usage_still_takes_the_result_total() -> None:
+    """A provider that sends zero counts per message reports usage only on the result."""
+
+    script: list[object] = [
+        AssistantMessage(
+            content=[TextBlock(text="hi")],
+            model="observed-model",
+            usage={"input_tokens": 0, "output_tokens": 0},
+        ),
+        _result(text="hi", usage={"input_tokens": 21, "output_tokens": 4}),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    [generation] = _spans_by_name(finished)["llm.generation"]
+
+    assert generation.attributes["gen_ai.usage.input_tokens"] == 21
+    assert generation.attributes["gen_ai.usage.output_tokens"] == 4
+    assert generation.attributes[_SCOPE] == "turn"
+
+
+def test_a_parallel_tool_response_records_every_output_block() -> None:
+    script: list[object] = [
+        AssistantMessage(
+            content=[
+                TextBlock(text="Checking two things."),
+                ToolUseBlock(id="call-a", name="Bash", input={"command": _TOOL_ARGUMENT}),
+                ToolUseBlock(id="call-b", name="Grep", input={"pattern": _TOOL_ARGUMENT}),
+                TextBlock(text="Both started."),
+            ],
+            model="observed-model",
+            usage={"input_tokens": 2, "output_tokens": 2},
+        ),
+        _tool_result("call-a"),
+        _tool_result("call-b"),
+        AssistantMessage(
+            content=[TextBlock(text="Finished.")],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _result(text="Finished."),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    first = _spans_by_name(finished)["llm.generation"][0]
+    output = first.attributes[_OUTPUT]
+
+    assert "Checking two things." in output
+    assert "[tool_use Bash]" in output
+    assert "[tool_use Grep]" in output
+    assert "Both started." in output
+    assert _TOOL_ARGUMENT not in output

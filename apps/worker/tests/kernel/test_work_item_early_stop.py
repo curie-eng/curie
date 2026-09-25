@@ -620,3 +620,44 @@ def test_an_ordinary_chat_turn_is_never_continued(make_harness) -> None:
             assert h.runner.opened == ["hello there"]
 
     asyncio.run(exercise())
+
+
+# --- review r1: a continuation that cannot start is a runner failure ---------------
+
+
+def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness) -> None:
+    """The agent never saw the continuation prompt, so the ending is not the
+    agent's: the kernel's runner failure policy decides, not early_stop."""
+
+    from curie_worker.runner_client import RunnerError
+
+    async def exercise() -> None:
+        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.runner.turn_scripts = [list(ZERO_WORK_TURN)]
+            h.runner.default_script = [_done("later attempts are refused before this")]
+            real_start = h.kernel._runner.start_turn
+            opened: list[str] = []
+
+            async def start_turn(base_url: str, event: object, *args: object, **kwargs: object):
+                opened.append(event.text)  # type: ignore[attr-defined]
+                if len(opened) > 1:
+                    raise RunnerError("runner refused the continuation turn")
+                return await real_start(base_url, event, *args, **kwargs)
+
+            h.kernel._runner.start_turn = start_turn  # type: ignore[method-assign]
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            )
+
+            assert len(opened) >= 2, "the continuation must have been attempted"
+            assert "publish_changes" in opened[1]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] not in {"early_stop", "no_pull_request"}
+            assert finish["cause"] in {"runner_failed", "runner_escalated"}
+
+    asyncio.run(exercise())
