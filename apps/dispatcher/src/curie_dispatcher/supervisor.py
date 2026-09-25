@@ -38,8 +38,15 @@ class BackoffPolicy:
     multiplier: float = 2.0
 
     def delay(self, attempt: int) -> float:
-        """Delay before reconnect ``attempt`` (0-based): initial * multiplier**attempt, capped."""
-        raw = self.initial_seconds * (self.multiplier**attempt)
+        """Delay before reconnect ``attempt`` (0-based): initial * multiplier**attempt, capped.
+
+        Never raises: a float power overflows after about a thousand attempts,
+        which a revoked token reaches within hours, and by then the cap applies.
+        """
+        try:
+            raw = self.initial_seconds * (self.multiplier**attempt)
+        except OverflowError:
+            return self.max_seconds
         return min(self.max_seconds, raw)
 
 
@@ -66,10 +73,12 @@ class Supervisor:
     ) -> None:
         self._connect = connect
         self._backoff = backoff or BackoffPolicy()
-        self._sleep = sleep if sleep is not None else _default_sleep
+        self._stop = threading.Event()
+        # The default sleep waits on the stop event, so a stop request ends a
+        # backoff at once instead of after it.
+        self._sleep = sleep if sleep is not None else self._stop.wait
         self._logger = logger or logging.getLogger(__name__)
         self._prefix = f"{label}: " if label else ""
-        self._stop = threading.Event()
         self._current: Connection | None = None
         self._lock = threading.Lock()
 
@@ -84,8 +93,12 @@ class Supervisor:
         if current is not None:
             try:
                 current.close()
-            except Exception:  # pragma: no cover - close is best-effort on shutdown
-                self._logger.exception("error closing connection during shutdown")
+            except Exception:  # close is best-effort on shutdown
+                self._logger.exception("%serror closing connection during shutdown", self._prefix)
+
+    def wait_for_stop(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for a stop request; True once one arrives."""
+        return self._stop.wait(timeout)
 
     def run(self) -> None:
         """Run the supervise loop until ``request_stop`` is called. Blocks."""
@@ -94,7 +107,14 @@ class Supervisor:
             try:
                 connection = self._connect()
                 with self._lock:
-                    self._current = connection
+                    # A stop that arrived while connecting found nothing to
+                    # close; checked under the lock, it cannot be missed.
+                    stopped = self._stop.is_set()
+                    if not stopped:
+                        self._current = connection
+                if stopped:
+                    connection.close()
+                    break
                 connection.run()
             except Exception as exc:
                 self._logger.warning("%sconnection failed: %s", self._prefix, exc)
@@ -120,11 +140,20 @@ class SupervisorGroup:
     runs its member on the calling thread, exactly as a lone supervisor ran.
     """
 
-    def __init__(self, members: Mapping[str, Supervisor], *, join_interval_s: float = 1.0) -> None:
+    def __init__(
+        self,
+        members: Mapping[str, Supervisor],
+        *,
+        join_interval_s: float = 1.0,
+        restart_backoff: BackoffPolicy | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
         if not members:
             raise ValueError("a supervisor group needs at least one member")
         self._members = dict(members)
         self._join_interval_s = join_interval_s
+        self._restart_backoff = restart_backoff or BackoffPolicy()
+        self._logger = logger or logging.getLogger(__name__)
 
     @property
     def members(self) -> Mapping[str, Supervisor]:
@@ -141,7 +170,9 @@ class SupervisorGroup:
             next(iter(self._members.values())).run()
             return
         threads = [
-            threading.Thread(target=member.run, name=f"supervisor-{name}", daemon=True)
+            threading.Thread(
+                target=self._run_member, args=(name, member), name=f"supervisor-{name}", daemon=True
+            )
             for name, member in self._members.items()
         ]
         for thread in threads:
@@ -152,8 +183,24 @@ class SupervisorGroup:
             while thread.is_alive():
                 thread.join(self._join_interval_s)
 
+    def _run_member(self, name: str, member: Supervisor) -> None:
+        """Run one member on its own thread, restarting it if it raises.
 
-def _default_sleep(seconds: float) -> None:
-    import time
-
-    time.sleep(seconds)
+        A lone supervisor that raises ends the process, and the restart brings
+        it back. A member thread that raised would end alone and leave its
+        identity down while the others serve, so it is logged and restarted
+        after a backoff that a stop request interrupts.
+        """
+        restarts = 0
+        while True:
+            try:
+                member.run()
+                return
+            except Exception:
+                delay = self._restart_backoff.delay(restarts)
+                restarts += 1
+                self._logger.exception(
+                    "supervisor for %s stopped unexpectedly; restarting in %.1fs", name, delay
+                )
+            if member.wait_for_stop(delay):
+                return
