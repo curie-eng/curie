@@ -77,13 +77,20 @@ def build_identity_connections(
     *,
     redis_client: redis.Redis,
     logger: logging.Logger,
+    declared_count: int | None = None,
 ) -> tuple[IdentityConnection, ...]:
     """One connection per identity, all feeding the one stream ``redis_client`` writes.
 
-    A lone identity is built exactly as the single app always was: no label on
-    its supervisor, no identity on its connection's log lines.
+    Whether a connection is labelled comes from ``declared_count``, how many
+    Slack identities the installation named before preflight -- never from how
+    many of ``identities`` were admitted. Defaults to ``len(identities)`` for a
+    caller that already IS the declared set. A one-identity declaration is
+    built exactly as the single app always was: no label on its supervisor, no
+    identity on its connection's log lines -- even when preflight leaves
+    exactly one survivor of a larger declaration, that survivor still names
+    itself.
     """
-    several = len(identities) > 1
+    several = (declared_count if declared_count is not None else len(identities)) > 1
     backoff = BackoffPolicy(
         initial_seconds=config.backoff_initial_seconds,
         max_seconds=config.backoff_max_seconds,
@@ -130,20 +137,39 @@ def build_supervisor(
     *,
     logger: logging.Logger,
     identities: Sequence[PreflightedIdentity] | None = None,
+    declared_count: int | None = None,
 ) -> SupervisorGroup:
     """Assemble one supervisor per admitted identity, run together.
 
-    ``identities`` defaults to ``default`` from the settings, the stock install.
+    ``identities`` defaults to ``default`` from the settings, the stock
+    install. ``declared_count`` is how many identities the installation named
+    before preflight; a direct caller that already filtered to what passed
+    still gets the labelling its own declaration deserves, so this defaults to
+    ``len(identities)`` (or 1, for the stock default) rather than silently
+    reading admission as declaration.
     """
     admitted = (
         tuple(identities)
         if identities is not None
         else (PreflightedIdentity(default_identity_credentials(config), None),)
     )
-    connections = build_identity_connections(
-        config, admitted, redis_client=build_redis(config), logger=logger
+    backoff = BackoffPolicy(
+        initial_seconds=config.backoff_initial_seconds,
+        max_seconds=config.backoff_max_seconds,
+        multiplier=config.backoff_multiplier,
     )
-    return SupervisorGroup({c.name: c.supervisor for c in connections})
+    connections = build_identity_connections(
+        config,
+        admitted,
+        redis_client=build_redis(config),
+        logger=logger,
+        declared_count=declared_count if declared_count is not None else len(admitted),
+    )
+    return SupervisorGroup(
+        {c.name: c.supervisor for c in connections},
+        logger=logger,
+        restart_backoff=backoff,
+    )
 
 
 def main() -> None:
@@ -179,7 +205,9 @@ def main() -> None:
             logger.error("%s", exc)
             raise SystemExit(1) from exc
 
-        supervisor = build_supervisor(config, logger=logger, identities=admitted)
+        supervisor = build_supervisor(
+            config, logger=logger, identities=admitted, declared_count=len(identities)
+        )
         hb_stop = start_heartbeat(config.heartbeat_file, config.heartbeat_interval_s)
 
         def _handle_signal(signum: int, _frame: object) -> None:
