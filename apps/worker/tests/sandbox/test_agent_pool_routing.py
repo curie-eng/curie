@@ -86,3 +86,20 @@ def test_two_agents_with_the_same_secret_name_target_distinct_pools(
         handle = substrate.claim(f"T-{agent}", env=env, agent_name=agent)
         assert fake_k8s.claims[handle.claim_name].pool == f"curie-agent-{agent}-runner-pool"
         assert fake_k8s.claims[handle.claim_name].labels[AGENT_LABEL] == agent
+
+
+def test_registry_egress_agent_without_secrets_targets_its_per_agent_pool(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # #3083: agentSandbox.registryEgress.<agent> renders a NetworkPolicy that
+    # selects curietech.ai/agent=<agent> pods, which only the per-agent template
+    # labels. The chart names those agents in CURIE_AGENT_SANDBOX_POOLS.
+    substrate = SandboxSubstrate(
+        fake_k8s,
+        affinity,
+        replace(config, warm_pool="curie-runner-pool", agent_pools=frozenset({"factory"})),
+    )
+    declared = substrate.claim("T-reg", env={"CURIE_BUDGET": "{}"}, agent_name="factory")
+    other = substrate.claim("T-other", env={"CURIE_BUDGET": "{}"}, agent_name="acme-a")
+    assert fake_k8s.claims[declared.claim_name].pool == "curie-agent-factory-runner-pool"
+    assert fake_k8s.claims[other.claim_name].pool == "curie-runner-pool"

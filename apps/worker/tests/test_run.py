@@ -1316,3 +1316,9 @@ def test_valkey_tls_defaults_false_on_a_clean_env(
     # test.
     monkeypatch.delenv("VALKEY_TLS", raising=False)
     assert WorkerConfig().valkey_tls is False
+
+
+def test_substrate_config_reads_agent_sandbox_pools() -> None:
+    assert _substrate_config({}).agent_pools == frozenset()
+    config = _substrate_config({"CURIE_AGENT_SANDBOX_POOLS": "factory, acme-a,"})
+    assert config.agent_pools == frozenset({"factory", "acme-a"})
