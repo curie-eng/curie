@@ -403,6 +403,8 @@ def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None: 
     (comment,) = _marked(sink, request_id)
     body = comment["body"].lower()
     assert "history capacity exceeded" in body
+    assert body.count("history capacity exceeded") == 1
+    assert "provider message:" not in body
     assert "retry" in body
     assert "cause: history_capacity" in body
     assert "status: failed" in body

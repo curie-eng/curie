@@ -373,6 +373,14 @@ upgrade phase and the last known-good version.
 
 ### `curie cluster upgrade`
 
+For the 0.10.1 history capacity change, deploy the API image with the
+`X-Curie-Transcript-Max-Bytes` response header to every API pod before
+deploying the new worker or runner image. Keep the previous worker and runner
+image pins during that API rollout. Check the header on transcript GET responses
+for both an existing key and a missing key through every API pod, then roll out
+the worker and runner. The new runner requires that header at boot, so a mixed
+API rollout can refuse to start a history backed turn.
+
 ```bash
 # release build: --chart defaults to the version-pinned release asset for --to
 curie cluster upgrade --to 0.9.0
@@ -964,8 +972,10 @@ A last `Cause:` line names the platform cause code
 `owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
 classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
-`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`, or
-`workspace_error`). A model provider that answers HTTP 402 or reports exhausted
+`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+`workspace_error`, or `history_capacity`). A history capacity result tells the
+operator to inspect work already done and retry. A model provider that answers
+HTTP 402 or reports exhausted
 credits ends the run as `model_credit_exhausted` without retrying. A run that a
 relabel replaced ends with `Stopped: the label was added again, so a new run
 replaced this one.`, and the new run gets its own status comment. The

@@ -312,9 +312,9 @@ def test_bounding_preserves_or_omits_complete_signed_and_image_blocks() -> None:
             ),
         ),
     )
-    bounded = bound_turn_record(record, max_value_bytes=3_000)
+    bounded = bound_turn_record(record, max_value_bytes=18_000)
 
-    assert _size([bounded.to_dict()]) <= 3_000
+    assert _size([bounded.to_dict()]) <= 18_000
     assert bounded.user == record.user
     assert bounded.assistant == record.assistant
     final_blocks = bounded.messages[-1].content
@@ -333,6 +333,54 @@ def test_bounding_preserves_or_omits_complete_signed_and_image_blocks() -> None:
             for nested in block["content"]:
                 if nested.get("type") == "image":
                     assert nested == image
+
+    with pytest.raises(HistoryError, match="cannot fit"):
+        bound_turn_record(record, max_value_bytes=3_000)
+
+
+def test_bounding_only_reduces_portable_text_and_tool_result_text() -> None:
+    opaque = "opaque-" + "z" * 7_000
+    safe = "safe-" + "x" * 7_000
+    document = {"type": "document", "source": {"type": "base64", "data": opaque}}
+    record = TurnRecord(
+        user="Read the report",
+        assistant="Report read",
+        messages=(
+            ConversationMessage(role="user", content="Read the report"),
+            ConversationMessage(
+                role="assistant",
+                content=[
+                    {"type": "tool_use", "id": "read", "name": "Read", "input": {"text": opaque}}
+                ],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "read",
+                        "content": [
+                            document,
+                            {"type": "text", "text": safe, "encrypted_content": opaque},
+                        ],
+                    }
+                ],
+            ),
+            ConversationMessage(
+                role="assistant", content=[{"type": "text", "text": "Report read"}]
+            ),
+        ),
+    )
+
+    bounded = bound_turn_record(record, max_value_bytes=24_000)
+
+    result_blocks = bounded.messages[2].content
+    assert isinstance(result_blocks, list)
+    nested = result_blocks[0]["content"]
+    assert nested[0] == document
+    assert nested[1]["encrypted_content"] == opaque
+    assert nested[1]["text"] != safe
+    assert bounded.messages[1].content == record.messages[1].content
 
 
 def test_explicit_cap_and_reserve_are_honored() -> None:

@@ -365,6 +365,9 @@ class _CheckpointingFake(FakeModelSession):
             ),
         )
 
+    def request_full_checkpoint(self) -> None:
+        self._kind = "checkpoint"
+
 
 def _runner(
     store: StateApiTranscriptStore,
@@ -779,6 +782,22 @@ def test_factory_sized_turn_persists_with_old_tool_calls_compacted() -> None:
     assert '"id": "u0"' not in stored_text
     assert f'"id": "u{_FACTORY_CALLS - 1}"' in stored_text
     assert "tool" in stored_text.lower() and "omitted" in stored_text.lower()
+    seen_uses: set[str] = set()
+    marker_positions: list[int] = []
+    for index, message in enumerate(stored.messages):
+        if not isinstance(message.content, list):
+            continue
+        for block in message.content:
+            if block.get("type") == "tool_use":
+                seen_uses.add(block["id"])
+            elif block.get("type") == "tool_result":
+                assert block["tool_use_id"] in seen_uses
+            elif block.get("type") == "text" and "tool groups omitted" in block.get("text", ""):
+                marker_positions.append(index)
+    assert marker_positions
+    assert marker_positions[0] < len(stored.messages) - 1
+    assert stored.messages[-1].role == "assistant"
+    assert stored.messages[-1].content == [{"type": "text", "text": _FACTORY_FINAL}]
 
 
 def test_factory_sized_turn_preserves_long_final_answer_and_first_user() -> None:

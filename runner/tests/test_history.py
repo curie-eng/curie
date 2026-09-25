@@ -20,6 +20,7 @@ from curie_runner.history import (
     ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
+    HistoryCapacityError,
     HistoryError,
     NullTranscriptStore,
     StateApiTranscriptStore,
@@ -370,6 +371,102 @@ def test_claude_native_checkpoint_is_restored_and_then_exports_only_a_delta(tmp_
     )
 
 
+def test_dropped_native_export_requests_a_fresh_adapter_checkpoint(tmp_path) -> None:
+    resume = build_structured_resume(
+        (), curie_session_id="curie-thread-bounded", cwd=str(tmp_path)
+    )
+    assert resume.session_store is not None
+    options = build_options(
+        plugins=[], model=None, system_prompt=None, max_turns=2,
+        max_budget_usd=1.0, resume=resume.resume, session_id=resume.session_id,
+        session_store=resume.session_store,
+    )
+    session = ClaudeAgentSession(options)
+    first_entry = {"type": "assistant", "uuid": "entry-1", "payload": "n" * 60_000}
+    anyio.run(resume.session_store.append, resume.session_key, [first_entry])
+    first_export = anyio.run(session.export_replay_state)
+    assert first_export is not None and first_export.kind == "checkpoint"
+    record = TurnRecord(
+        user="q", assistant="answer",
+        messages=(
+            ConversationMessage(role="user", content="q"),
+            ConversationMessage(role="assistant", content=[{"type": "text", "text": "answer"}]),
+        ),
+        harness_replay=first_export,
+    )
+    bounded = bound_turn_record(record, max_value_bytes=8_000)
+    assert bounded.harness_replay is None
+
+    session.request_full_checkpoint()
+    second_entry = {"type": "assistant", "uuid": "entry-2"}
+    anyio.run(resume.session_store.append, resume.session_key, [second_entry])
+    next_export = anyio.run(session.export_replay_state)
+    assert next_export == HarnessReplayState(
+        harness="claude", kind="checkpoint", entries=(first_entry, second_entry)
+    )
+
+
+def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> None:
+    from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
+    from curie_runner import RunTracer, SideEffectClassifier
+    from curie_runner.fake import FakeModelSession, default_turn
+    from curie_runner.session import SessionRunner
+
+    resume = build_structured_resume(
+        (), curie_session_id="curie-thread-state-write", cwd=str(tmp_path)
+    )
+    assert resume.session_store is not None
+    options = build_options(
+        plugins=[], model=None, system_prompt=None, max_turns=2,
+        max_budget_usd=1.0, resume=resume.resume, session_id=resume.session_id,
+        session_store=resume.session_store,
+    )
+    adapter = ClaudeAgentSession(options)
+
+    class AdapterBackedFake(FakeModelSession):
+        async def export_replay_state(self) -> HarnessReplayState | None:
+            return await adapter.export_replay_state()
+
+        def request_full_checkpoint(self) -> None:
+            adapter.request_full_checkpoint()
+
+    first_entry = {"type": "assistant", "uuid": "entry-1", "payload": "n" * 60_000}
+    second_entry = {"type": "assistant", "uuid": "entry-2"}
+    app, log, rejected_sizes = _capped_state_app()
+
+    async def go() -> None:
+        await resume.session_store.append(resume.session_key, [first_entry])
+        async with TestServer(app) as server:
+            history = StateApiTranscriptStore(
+                str(server.make_url("/agents/A/state/transcript/t1")), token=None
+            )
+            runner = SessionRunner(
+                session_factory=lambda: AdapterBackedFake(default_turn),
+                ceiling=0, tracer=RunTracer(None), classifier=SideEffectClassifier(),
+                trace_name="bounded-native-reset", session_id="session-native-reset",
+                history_store=history,
+            )
+            await runner.start()
+            lines = [
+                line async for line in runner.run_inbound(
+                    Event(type="message", text="q", user="U", ts="1")
+                )
+            ]
+            final = parse_ndjson_line(lines[-1])
+            assert isinstance(final, Final)
+            assert final.status is SessionStatus.DONE
+            assert runner.history_durable is True
+            assert len(log) == 1 and log[0]["harness_replay"] is None
+            assert rejected_sizes == []
+            await resume.session_store.append(resume.session_key, [second_entry])
+            next_export = await adapter.export_replay_state()
+            assert next_export == HarnessReplayState(
+                harness="claude", kind="checkpoint", entries=(first_entry, second_entry)
+            )
+
+    anyio.run(go)
+
+
 def test_replay_folds_native_checkpoint_and_deltas_but_drops_them_at_compaction() -> None:
     turns = [
         TurnRecord(
@@ -686,8 +783,8 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
     from curie_runner.fake import FakeModelSession
     from curie_runner.session import SessionRunner
 
-    tool_payload = "tool-output-" + ("x" * 42_000)
-    assistant_payload = "assistant-output-" + ("y" * 42_000)
+    tool_payload = "tool-output-" + ("x" * 20_000)
+    assistant_payload = "assistant-output-" + ("y" * 20_000)
     native_payload = "native-checkpoint-" + ("z" * 42_000)
     harness_replay = HarnessReplayState(
         harness="claude",
@@ -742,12 +839,15 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
                 [raw_without_native.to_dict()], separators=(",", ":")
             ).encode("utf-8")
         )
-        > _STATE_VALUE_MAX_BYTES
+        > _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
     )
 
     class ReplayExportingFake(FakeModelSession):
         async def export_replay_state(self) -> HarnessReplayState:
             return harness_replay
+
+        def request_full_checkpoint(self) -> None:
+            pass
 
     script = lambda: [  # noqa: E731 - compact fixed SDK transcript fixture
         AssistantMessage(
@@ -843,13 +943,13 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
             assert isinstance(bounded, TurnRecord)
             assert bounded.harness_replay is None
             assert bounded.user == "inspect the example workspace"
-            _assert_digest_marker(bounded.assistant, assistant_payload)
+            assert bounded.assistant == assistant_payload
             tool_result = bounded.messages[2].content
             assert isinstance(tool_result, list)
             _assert_digest_marker(tool_result[0]["content"], tool_payload)
             assistant_text = bounded.messages[3].content
             assert isinstance(assistant_text, list)
-            _assert_digest_marker(assistant_text[0]["text"], assistant_payload)
+            assert assistant_text[0]["text"] == assistant_payload
 
     anyio.run(go)
 
@@ -899,13 +999,13 @@ def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> 
         runner, Event(type="message", text="q", user="U", ts="1")
     )
 
-    assert final.status is SessionStatus.DONE
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
     assert runner.history_durable is False
     assert store.append_attempts == 0
     assert store.turns == []
     assert any(
         "history append failed" in record.getMessage()
-        and "HistoryError" in record.getMessage()
+        and "HistoryCapacityError" in record.getMessage()
         for record in caplog.records
     )
 
@@ -965,7 +1065,7 @@ def test_history_durability_failure_is_sticky_after_later_successful_append() ->
         ]
         first_final = parse_ndjson_line(first_lines[-1])
         assert isinstance(first_final, Final)
-        assert first_final.status is SessionStatus.DONE
+        assert first_final.status is SessionStatus.CLASSIFIED_FAILURE
         assert runner.history_durable is False
         assert store.append_attempts == 0
 
@@ -1055,8 +1155,9 @@ class _RecordingStore:
     async def load(self) -> list[TurnRecord]:
         return list(self.turns)
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.turns.append(record)
+        return record.harness_replay is not None
 
 
 class _BoundedRecordingStore(_RecordingStore):
@@ -1064,13 +1165,17 @@ class _BoundedRecordingStore(_RecordingStore):
         super().__init__()
         self.append_attempts = 0
 
-    async def append(self, record: TurnRecord) -> None:
-        bounded = bound_turn_record(
-            record,
-            max_value_bytes=_STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES,
-        )
+    async def append(self, record: TurnRecord) -> bool:
+        try:
+            bounded = bound_turn_record(
+                record,
+                max_value_bytes=_STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES,
+            )
+        except HistoryError:
+            raise HistoryCapacityError(413) from None
         self.append_attempts += 1
         await super().append(bounded)
+        return bounded.harness_replay is not None
 
 
 def _run_recording_turn(runner, event):
@@ -1128,7 +1233,7 @@ def test_failed_transcript_append_fails_closed_for_runner_replacement() -> None:
     from aci_protocol import Event, SessionStatus
 
     class FailingStore(_RecordingStore):
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             del record
             raise HistoryError("injected append failure")
 
@@ -1366,7 +1471,7 @@ def test_record_turn_swallows_store_failure() -> None:
         async def load(self) -> list[TurnRecord]:
             return []
 
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             raise HistoryError("state API unavailable")
 
     runner = SessionRunner(
@@ -1397,7 +1502,7 @@ def test_successful_turn_survives_transcript_store_failure() -> None:
         async def load(self) -> list[TurnRecord]:
             return []
 
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             self.append_attempts += 1
             raise HistoryError("state API unavailable")
 
