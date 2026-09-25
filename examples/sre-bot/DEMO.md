@@ -90,11 +90,13 @@ If the App private key already lives in a Secret you manage, use
 `curie cluster github-app --app-id "$CURIE_GITHUB_APP_ID" --existing-secret my-github-app`
 instead of `--private-key`.
 
+The fresh installer command above creates the observability stack, Kubernetes
+identity, kubeconfig, and bundle. It requires `--workspace-repo` and
+`--approvers`; the latter binds named Slack users to approve Kubernetes gates,
+including with `curie cluster approvals sre-bot --resolve`. The command above
+binds `U0EXAMPLE1` and enables that user to resolve approvals from the CLI.
 Name `--workspace` on a followup deploy so the demo matches the documented
-command surface. The fresh install requires `--approvers`, which binds named
-Slack users to approve Kubernetes gates, including with
-`curie cluster approvals sre-bot --resolve`. The command above binds
-`U0EXAMPLE1` and enables that user to resolve approvals from the CLI.
+command surface.
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot --workspace --slack-channel C0EXAMPLE1

@@ -20,6 +20,7 @@ from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..models import Agent, AgentChannel
+from ..publication_policy import PublicationPolicyConflict
 from ..schemas import (
     AgentCreate,
     AgentOut,
@@ -208,6 +209,10 @@ async def update_agent(
         agent = await crud.update_agent_model(session, agent, data.model)
     if "thinking" in sent:
         agent = await crud.update_agent_thinking(session, agent, data.thinking)
+    if "execution_deadline_seconds" in sent:
+        agent = await crud.update_agent_execution_deadline(
+            session, agent, data.execution_deadline_seconds
+        )
     if data.memory is not None:
         # Omitted leaves it unchanged; unlike `model`/`thinking` there is no
         # separate "platform default" a null would clear back to, so this
@@ -242,6 +247,32 @@ async def update_agent(
         agent = await crud.update_agent_hook_partitions(session, agent, data.hook_partitions)
     if data.source_bindings is not None:
         agent = await crud.update_agent_source_bindings(session, agent, data.source_bindings)
+    if (
+        "publication_policy" in sent
+        or "publication_draft" in sent
+        or "publication_branch_prefix" in sent
+    ):
+        try:
+            agent = await crud.update_agent_publication_policy(
+                session,
+                agent,
+                policy=data.publication_policy if "publication_policy" in sent else None,
+                draft=data.publication_draft if "publication_draft" in sent else None,
+                branch_prefix=(
+                    data.publication_branch_prefix
+                    if "publication_branch_prefix" in sent
+                    else None
+                ),
+                prefix_sent="publication_branch_prefix" in sent,
+            )
+        except PublicationPolicyConflict as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "publication.policy_version_conflict",
+                    "message": "publication policy version changed; retry the read",
+                },
+            ) from exc
     return AgentOut.model_validate(agent)
 
 
@@ -393,9 +424,7 @@ async def _raise_binding_conflict(
     ) from exc
 
 
-@router.post(
-    "/{agent_id}/channels", response_model=AgentOut, status_code=status.HTTP_201_CREATED
-)
+@router.post("/{agent_id}/channels", response_model=AgentOut, status_code=status.HTTP_201_CREATED)
 async def add_agent_channel(
     agent_id: uuid.UUID, data: ChannelBindingWrite, session: SessionDep
 ) -> AgentOut:
@@ -408,8 +437,7 @@ async def add_agent_channel(
         # agent's bindings, which is what keeps the last-binding guard sound.
         bindings = await crud.lock_agent_bindings(session, agent_id)
         if any(
-            binding.kind == data.kind and binding.address == data.address
-            for binding in bindings
+            binding.kind == data.kind and binding.address == data.address for binding in bindings
         ):
             return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
         try:
@@ -455,8 +483,7 @@ async def move_agent_channel(
         if expected_generation is not None and expected_generation != binding.generation:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"generation mismatch: expected {expected_generation}, "
-                f"stored {binding.generation}",
+                f"generation mismatch: expected {expected_generation}, stored {binding.generation}",
             )
         try:
             async with session.begin_nested():  # SAVEPOINT
@@ -619,6 +646,8 @@ async def read_version_connectors(
                 # secretKeyRef, and resolving it would defeat the point (#1163).
                 owned_secret_name=secret_name,
                 owned_secret_keys=bundles.owned_secret_keys(declared),
+                version_id=version.id,
+                triggers=bundles.read_manifest_triggers(Path(tmp)),
             )
 
     # `object_name` fails closed on an agent name that forges its `-mcp-` join

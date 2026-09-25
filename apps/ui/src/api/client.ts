@@ -439,6 +439,99 @@ export async function getAgents(): Promise<AgentOut[]> {
   return jsonOrThrow<AgentOut[]>(resp);
 }
 
+// ---- Work items (#2577): factory outcomes for a GitHub-issue-driven agent ----
+
+export type WorkItemState =
+  | "waiting"
+  | "running"
+  | "cancellation_requested"
+  | "cancelled"
+  | "awaiting_approval"
+  | "publishing"
+  | "published"
+  | "failed"
+  | "expired"
+  | "completed_unpublished";
+
+export interface WorkItemPr {
+  number: number;
+  url: string;
+  status: string;
+}
+
+export interface WorkItemPublication {
+  status: string;
+  revision_number: number | null;
+  approval_status: string | null;
+}
+
+// The console never re-derives correctness from the diff; it renders exactly
+// what the API asserts (currently always unasserted, owned by the bundle).
+export interface WorkItemCorrectness {
+  asserted: boolean;
+  owner: string;
+}
+
+export interface WorkItemCi {
+  state: string;
+  reason: string | null;
+  head_sha: string | null;
+  observed_at: string | null;
+}
+
+export interface WorkItemRequest {
+  sequence: number;
+  status: string;
+  created_at: string;
+  wait_deadline: string;
+  started_at: string | null;
+  execution_deadline: string | null;
+  terminal_at: string | null;
+  terminal_cause: string | null;
+  termination_observation: string | null;
+  capacity_deferrals: number;
+  last_deferral_reason: string | null;
+}
+
+export interface WorkItemOutcome {
+  id: string;
+  agent_id: string;
+  repo_full_name: string;
+  github_issue_number: number;
+  issue_url: string;
+  cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
+  objective: string | null;
+  objective_truncated: boolean;
+  requester: string | null;
+  state: WorkItemState;
+  actionable_cause: string;
+  pr: WorkItemPr | null;
+  publication: WorkItemPublication | null;
+  correctness: WorkItemCorrectness;
+  // null on the list response; present (possibly null-fielded) on the detail
+  // fetch, since CI status is a per-item lookup the list endpoint skips.
+  ci: WorkItemCi | null;
+  requests: WorkItemRequest[];
+}
+
+export interface WorkItemsList {
+  items: WorkItemOutcome[];
+  limit: number;
+  truncated: boolean;
+}
+
+export async function listWorkItems(params: { agentId?: string } = {}): Promise<WorkItemsList> {
+  const resp = await fetch(url(`/work-items${query({ agent_id: params.agentId })}`), { headers: headers() });
+  return jsonOrThrow<WorkItemsList>(resp);
+}
+
+export async function getWorkItem(id: string): Promise<WorkItemOutcome> {
+  const resp = await fetch(url(`/work-items/${encodeURIComponent(id)}`), { headers: headers() });
+  return jsonOrThrow<WorkItemOutcome>(resp);
+}
+
 // The open /config endpoint (no API key required) carries the configurable
 // org/workspace name the shared chrome renders.
 export async function getConfig(): Promise<AppConfig> {
@@ -801,7 +894,7 @@ export interface ApprovalAudit {
   actor_channel: string | null;
   // Proof attached to the derived actor (ADR-0106). Historical rows retain a
   // null kind and authenticated=false rather than being retroactively trusted.
-  principal_kind: "chat" | "console" | "operator" | "adapter" | null;
+  principal_kind: "chat" | "console" | "operator" | "adapter" | "platform" | null;
   // The adapter that carried the decision (ADR-0154); null for other kinds.
   principal_subject: string | null;
   authenticated: boolean;

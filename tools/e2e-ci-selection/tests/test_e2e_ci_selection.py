@@ -53,6 +53,7 @@ def _invoke_selector(
     *paths: str,
     registry: Path = REGISTRY,
     push: bool = False,
+    omit_kind: bool = False,
     base: str | None = None,
     head: str | None = None,
     cwd: Path | None = None,
@@ -61,6 +62,8 @@ def _invoke_selector(
     command = [sys.executable, str(SELECTOR), "--registry", str(registry)]
     if push:
         command.append("--push")
+    if omit_kind:
+        command.append("--omit-kind")
     if base is not None:
         command.extend(("--base", base))
     if head is not None:
@@ -350,6 +353,34 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
     )
 
 
+def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> None:
+    kept = tuple(tier for tier in TIERS if tier not in {"cluster", "released-upgrade"})
+    completed, output = _invoke_selector(tmp_path, push=True, omit_kind=True)
+    assert completed.returncode == 0, completed.stderr
+    assert output == _expected_output(
+        *kept, images_needed=True, cli_release_needed=True
+    )
+
+    chart, chart_output = _invoke_selector(
+        tmp_path,
+        "charts/curie/values.yaml",
+        omit_kind=True,
+    )
+    assert chart.returncode == 0, chart.stderr
+    assert chart_output == _expected_output(pytest_needed=True)
+
+    untouched, untouched_output = _invoke_selector(
+        tmp_path,
+        "charts/curie/values.yaml",
+    )
+    assert untouched.returncode == 0, untouched.stderr
+    assert untouched_output == _expected_output(
+        "cluster",
+        "released-upgrade",
+        pytest_needed=True,
+    )
+
+
 def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
@@ -514,6 +545,34 @@ AGGREGATE_EXPRESSIONS = {
     ),
     "upgrade_matrix_result": "${{ needs.e2e-cluster-upgrade-matrix.result }}",
 }
+
+
+def test_next_omits_kind_and_dispatch_keeps_it() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    trigger = workflow[True]
+    assert trigger["workflow_dispatch"] is None
+    group = workflow["concurrency"]["group"]
+    assert group == (
+        "${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}"
+    )
+    run = next(
+        step["run"]
+        for step in workflow["jobs"]["changes"]["steps"]
+        if step.get("id") == "filter"
+    )
+    assert "github.event_name" in run
+    assert "refs/heads/next" in run
+    assert '"$base_ref" = "next"' in run
+    assert run.count("select_tiers.py") == 3
+    pull_request, rest = run.split("elif", 1)
+    assert "git fetch" in pull_request
+    assert "--omit-kind" in pull_request
+    next_push, main_or_dispatch = rest.split("else", 1)
+    assert "--omit-kind" in next_push
+    assert "--push" in next_push
+    assert "workflow_dispatch" in main_or_dispatch
+    assert "--push" in main_or_dispatch
+    assert "--omit-kind" not in main_or_dispatch
 
 
 def test_workflow_consumes_each_selection_output_exactly() -> None:

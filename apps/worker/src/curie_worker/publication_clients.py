@@ -12,8 +12,8 @@ import httpx
 
 from .publication_loop import (
     PublicationCredential,
-    PublicationIdentity,
     PublicationIdentityUnavailable,
+    PublicationLineageRefused,
     PublicationPullState,
     PublicationReconcileError,
     PublicationRemoteTerminalError,
@@ -185,60 +185,8 @@ class PublicationCredentialClient:
         )
 
 
-def _bounded_int(value: object) -> int:
-    """Accept only a positive integer, never a bool and never a numeric string.
-
-    The upper bound matches ``_positive_id`` in the API's publication_authority
-    and the BigInteger columns the value is written to. A second line of defence
-    that is weaker than the first only misses the case it exists for.
-    """
-
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or not 0 < value < 2**63
-    ):
-        raise ValueError("publication identity integer is out of bounds")
-    return value
-
-
-def _bounded_text(value: object, *, limit: int) -> str:
-    if not isinstance(value, str) or not value or len(value) > limit:
-        raise ValueError("publication identity string is out of bounds")
-    return value
-
-
-# The identity request timeout is derived from the publication lease rather than
-# written down as its own number, so the two can never drift apart.
-#
-# The endpoint is the slowest call the worker makes. Its nominal budget is a
-# blocking installation-token mint plus two sequential GitHub GETs (the
-# repository and the pull request), each hop bounded by the API's own
-# github_app_timeout_seconds (15s by default), so three requests is 45s. The
-# shared client's 30s default sits below that, which is why this request carries
-# its own timeout at all.
-#
-# The request must nonetheless finish inside publication_lease_seconds. A
-# request that outlives the lease lets claim_next() hand the publication to
-# another worker while it is still in flight: the first worker's _terminal_cas()
-# then loses its version check and rolls the lineage advance back, and because a
-# successful identity read clears the uncharged-escape counter, repeated slow
-# successes never charge a durable reconcile_attempts tick. That turns a slow
-# success into an unbounded reclaim loop instead of a bounded failure.
-#
-# Timing out early is therefore the safe direction: an expired request enters the
-# bounded uncharged-escape path that already exists, which converges on a visible
-# failed publication. 0.8 of the lease is 48s at the 60s default, which covers
-# the 45s nominal three-request budget and still leaves 12s of lease for the rest
-# of the reconcile pass (the credential redemption, the cluster and GitHub reads,
-# and the terminal compare-and-swap) to run inside the lease the timeout shares.
-# A larger fraction buys only the cache-miss tail while eating the headroom those
-# steps need, and at 1.0 the request could outlive the lease outright.
-_IDENTITY_VERIFY_LEASE_FRACTION = 0.8
-
-
-class PublicationIdentityClient:
-    """Read the API's verified GitHub identity without ever holding App auth."""
+class PublicationLineageClient:
+    """Ask the API to verify GitHub identity and advance a published lineage."""
 
     def __init__(
         self,
@@ -246,94 +194,60 @@ class PublicationIdentityClient:
         api_base_url: str,
         worker_token: str,
         client: httpx.AsyncClient,
-        lease_seconds: int,
     ) -> None:
         if not worker_token:
-            raise ValueError("publication identity requires internal worker auth")
+            raise ValueError("publication lineage requires internal worker auth")
         self._base = api_base_url.rstrip("/")
         self._headers = {"X-Curie-Worker-Token": worker_token}
         self._client = client
-        self._timeout = lease_seconds * _IDENTITY_VERIFY_LEASE_FRACTION
 
-    async def verify(
+    async def advance(
         self,
         publication_id: uuid.UUID,
         *,
-        lineage_id: uuid.UUID,
         expected_version: int,
         expected_head_sha: str | None,
+        expected_publication_version: int,
+        lease_owner: str,
         pr_number: int,
         pr_url: str,
         head_sha: str,
-    ) -> PublicationIdentity | None:
-        """Return the verified identity, or ``None`` when it is not eligible."""
-
+    ) -> None:
         try:
-            response = await self._client.post(
-                f"{self._base}/v1/internal/publications/{publication_id}"
-                "/lineage/identity",
+            response = await self._client.patch(
+                f"{self._base}/v1/internal/publications/{publication_id}/lineage",
                 headers=self._headers,
                 json={
                     "expected_version": expected_version,
                     "expected_head_sha": expected_head_sha,
+                    "expected_publication_version": expected_publication_version,
+                    "lease_owner": lease_owner,
                     "state": "open",
                     "pr_number": pr_number,
                     "pr_url": pr_url,
                     "head_sha": head_sha,
                 },
                 follow_redirects=False,
-                timeout=self._timeout,
             )
         except httpx.HTTPError as exc:
-            # Transport loss is not a refusal. Only the unavailable class is
-            # uncharged, so conflating the two either dead-letters a completed
-            # push or loops a stable refusal forever.
             raise PublicationIdentityUnavailable(
-                "publication identity endpoint is unreachable"
+                "publication lineage endpoint is unreachable"
             ) from exc
-        if response.status_code == 503:
-            raise PublicationIdentityUnavailable(
-                "publication identity verification is temporarily unavailable"
-            )
         if response.status_code == 409:
             terminal = self._remote_terminal_state(response)
             if terminal is not None:
                 raise PublicationRemoteTerminalError(terminal)
+            raise PublicationLineageRefused(
+                f"publication lineage advance was refused: {response.text[:500]}"
+            )
+        if response.status_code == 503:
+            raise PublicationIdentityUnavailable(
+                "publication lineage verification is temporarily unavailable"
+            )
         if response.status_code != 200:
             raise PublicationReconcileError(
-                "publication identity verification returned HTTP "
-                f"{response.status_code}"
+                f"publication lineage advance returned HTTP {response.status_code}"
             )
-        try:
-            body = response.json()
-            answered = uuid.UUID(str(body["lineage_id"]))
-            eligible = body["eligible"]
-            if not isinstance(eligible, bool):
-                raise TypeError("publication identity eligibility is not a boolean")
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "publication identity response was unusable"
-            ) from exc
-        if answered != lineage_id:
-            # The echo cannot bind the four values, but it does stop a swapped,
-            # reordered or retried answer being written onto another lineage.
-            raise PublicationReconcileError(
-                f"publication identity answered lineage {answered} "
-                f"for lineage {lineage_id}"
-            )
-        if not eligible:
-            return None
-        try:
-            return PublicationIdentity(
-                repository_id=_bounded_int(body["repository_id"]),
-                installation_id=_bounded_int(body["installation_id"]),
-                pr_node_id=_bounded_text(body["pr_node_id"], limit=256),
-                base_ref=_bounded_text(body["base_ref"], limit=1024),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "publication identity response carried unusable provider fields"
-            ) from exc
 
     @staticmethod
     def _remote_terminal_state(
@@ -498,6 +412,7 @@ class GitHubPublicationLookup:
         *,
         expected_head_sha: str,
         authorization_header: str,
+        draft: bool = False,
     ) -> PublicationPullState | None:
         """Adopt a PR, or create it only when its deterministic branch exists."""
 
@@ -521,6 +436,7 @@ class GitHubPublicationLookup:
             base=default_branch,
             expected_head_sha=expected_head_sha,
             authorization_header=authorization_header,
+            draft=draft,
         )
         if existing is not None:
             return existing
@@ -566,6 +482,7 @@ class GitHubPublicationLookup:
                     "head": branch,
                     "base": default_branch,
                     "body": body,
+                    **({"draft": True} if draft else {}),
                 },
                 follow_redirects=False,
             )
@@ -580,6 +497,7 @@ class GitHubPublicationLookup:
                 body=body,
                 base=default_branch,
                 expected_head_sha=expected_head_sha,
+                draft=draft,
             )
 
         # A lost POST response or a concurrent reconciler is ambiguous. Query
@@ -592,6 +510,7 @@ class GitHubPublicationLookup:
             base=default_branch,
             expected_head_sha=expected_head_sha,
             authorization_header=authorization_header,
+            draft=draft,
         )
         if recovered is not None:
             return recovered
@@ -647,6 +566,7 @@ class GitHubPublicationLookup:
         body: str,
         base: str,
         expected_head_sha: str,
+        draft: bool = False,
     ) -> PublicationPullState:
         try:
             payload = response.json()
@@ -703,6 +623,8 @@ class GitHubPublicationLookup:
             raise PublicationReconcileError(
                 "GitHub pull request does not match the approved publication contract"
             )
+        if draft and payload.get("draft") is not True:
+            raise PublicationReconcileError("GitHub pull request is not the required draft")
         head_sha = actual["head_sha"]
         if (
             not isinstance(head_sha, str)
@@ -753,6 +675,7 @@ class GitHubPublicationLookup:
         base: str,
         expected_head_sha: str,
         authorization_header: str,
+        draft: bool = False,
     ) -> PublicationPullState | None:
         owner = repo_full_name.split("/", 1)[0]
         try:
@@ -790,4 +713,5 @@ class GitHubPublicationLookup:
             body=body,
             base=base,
             expected_head_sha=expected_head_sha,
+            draft=draft,
         )

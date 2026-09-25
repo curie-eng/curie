@@ -167,6 +167,9 @@ XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
    -> XACK
 ```
 
+A targeted cron turn posts one message containing the final reply and does not
+show the booting caption or stream partial edits.
+
 Rules (detailed-architecture 2b), each with an integration test that provokes it
 (`tests/kernel/`):
 
@@ -186,7 +189,8 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   `side_effect_flag` escalates to a human (the placeholder is edited to say so)
   instead of retrying. The flag is persisted to Valkey the instant it is seen, so
   a worker crash mid-side-effect still escalates on reclaim rather than re-running
-  a non-idempotent action. Flag-clean failures retry by classification:
+  a non-idempotent action. For noncron turns, flag-clean failures retry by
+  classification:
   `rate-limit`, `runner-error`, `runner-timeout` and `workspace-error` are
   transient (bounded exponential backoff); `budget-exceeded` and everything else
   escalate.
@@ -472,6 +476,22 @@ adapter mutates one stable target.
 | `SlackReplyAdapter`, placeholder-less turn (`reply_ref is None`, the ADR-0079 triggered turn) | `chat.postMessage` — a **create**, not a mutation, until the minted ts is adopted as the turn's ref. | No. | Explicitly at-least-once for that first post; the edits that follow it are covered by the row above. |
 | `HttpReplyAdapter` (`reply_sink.py`) | Whatever the binding's operator-controlled endpoint does with one POST. `turn.completed` carries `event_id` in the body, so the key is on the wire, but this repo cannot verify what the receiver does with it. | Unknown — receiver-owned, unverifiable from here. | **Explicitly at-least-once.** May not advertise exactly-once terminal effect. |
 | Eval report (`eval/stream.py` `_report` → `POST /evals/report`) | The platform API's report endpoint. `EvalReport` carries `repo_full_name`, `sha`, and counts — no idempotency key. | No. | **Explicitly at-least-once.** The pre-send lease check closes most of the window, not the send-then-lose-the-ack window; closing it needs eval-report idempotency at the platform API (follow-up F2). |
+
+### Cron hook run outcomes
+
+A cron turn carries a `hook_run` carrier with `agent_id`, `name`, and `slot_utc`.
+The scheduler producer must supply all three fields for every cron turn, with
+`slot_utc` as an ISO8601 UTC timestamp.
+
+When a started turn exits, the worker writes `ran` for a normal exit, including
+an approval pause, or `failed` for a bad exit or deadline, with `ended_at`
+before writing the done marker. A prestart deferral leaves the row open for
+scheduler reconciliation. A cron failure is not retried within its fire.
+Slack and webhook turns perform no hook run writes.
+
+If persistence fails before durable closure, the delivery stays pending and
+may run again on redelivery. The close and the done marker use PostgreSQL and
+Valkey, so they are not atomic across both systems.
 
 ## The sandbox substrate (`curie_worker.sandbox`)
 

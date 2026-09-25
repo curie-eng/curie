@@ -28,8 +28,8 @@ is documentation of where the code already draws the line, not a new abstraction
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
-| Triggers | SOFT | 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
-| CLI output (agent-facing `--json`) | CLEAN | 49 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
+| Triggers | SOFT | 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) + per-agent cron scheduler (worker cron_loop) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
+| CLI output (agent-facing `--json`) | CLEAN | 51 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
 | Harness package (declared contribution) | CLEAN | 1 (built-in Claude) behind the entry-point registry | not separately graded | #844 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |
 | Sealed credential (cluster-sealed connector secrets) | SOFT | 2 halves (Rust sealer, Python opener) over one frozen wire | not separately graded | #1240 | [Sealed credential (cluster-sealed connector secrets)](interfaces/sealed-credential/INTERFACE.md) |

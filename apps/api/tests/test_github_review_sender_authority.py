@@ -141,12 +141,40 @@ def test_permission_timeout_never_grants_contributor_authority(review_app_key, m
 @pytest.mark.parametrize("signed,fetched", [
     ("CONTRIBUTOR", "MEMBER"), ("MEMBER", "CONTRIBUTOR"),
 ])
+@pytest.mark.parametrize("permission", ["write", "admin"])
+def test_association_drift_is_admitted_on_proven_write_permission(
+    review_app_key, monkeypatch, signed, fetched, permission,
+):
+    # Issue #2794: a live webhook said MEMBER while the App's re-read said
+    # CONTRIBUTOR for the same unedited comment. Association is a claim; only
+    # the permission read grants authority.
+    truth = PermissionTruth("issue_comment", review_app_key, signed)
+    truth.comment["author_association"] = fetched
+    truth.permission["permission"] = permission
+    assert asyncio.run(verify_truth(truth, monkeypatch)) == HEAD
+    assert truth.calls.count(PERMISSION_PATH) == 1
+
+
+@pytest.mark.parametrize("signed,fetched", [
+    ("CONTRIBUTOR", "MEMBER"), ("MEMBER", "CONTRIBUTOR"),
+])
 def test_association_drift_never_selects_an_easier_authorization_path(
     review_app_key, monkeypatch, signed, fetched,
 ):
     truth = PermissionTruth("issue_comment", review_app_key, signed)
     truth.comment["author_association"] = fetched
-    with pytest.raises(FeedbackIgnored, match="feedback_changed"):
+    truth.permission["permission"] = "read"
+    with pytest.raises(FeedbackIgnored, match="sender_permission_refused"):
+        asyncio.run(verify_truth(truth, monkeypatch))
+    assert truth.calls.count(PERMISSION_PATH) == 1
+
+
+def test_fetched_association_outside_the_allowlist_is_still_refused(
+    review_app_key, monkeypatch,
+):
+    truth = PermissionTruth("issue_comment", review_app_key, "MEMBER")
+    truth.comment["author_association"] = "NONE"
+    with pytest.raises(FeedbackIgnored, match="unauthorized_association"):
         asyncio.run(verify_truth(truth, monkeypatch))
     assert PERMISSION_PATH not in truth.calls
 

@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "slack": {
+      "command": "slack-mcp",
+      "args": [],
+      "env": {
+        "SLACK_BOT_TOKEN": "${MEAN_TESTER_SLACK_BOT_TOKEN}",
+        "SLACK_TEAM_ID": "${MEAN_TESTER_SLACK_TEAM_ID}"
+      }
+    },
+    "github": {
+      "command": "mcp-server-github",
+      "args": [],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    }
+  }
+}

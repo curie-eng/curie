@@ -7,6 +7,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use super::{plain, run_capture, CommonOpts, OpsCommand};
 
@@ -129,6 +131,34 @@ fn namespace<'a>(value: &'a Value, opts: &'a CommonOpts) -> &'a str {
         .pointer("/metadata/namespace")
         .and_then(Value::as_str)
         .unwrap_or(&opts.namespace)
+}
+
+/// Helm v3 status JSON marshals `pkg/time.Time` as RFC3339Nano; Kubernetes
+/// `creationTimestamp` is RFC3339 truncated to whole seconds. Zero-year
+/// sentinel values are missing.
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/time/time.go
+/// https://github.com/kubernetes/apimachinery/blob/v0.34.1/pkg/apis/meta/v1/time.go
+fn rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .filter(|stamp| stamp.year() > 1)
+}
+
+/// Issue #2858: a leftover hook Job from an earlier release of the same name
+/// is older than the current revision. Helm hook Jobs typically have no owner
+/// UID pointing at the current revision Secret, so creation time is the
+/// observable. Compare whole seconds so a Helm RFC3339Nano `last_deployed`
+/// cannot mark a same-second current Job stale. Unparseable timestamps fail
+/// closed and still count. Helm `last_run.phase=Failed` stays unfiltered:
+/// that is this revision's own hook record, even when a leftover Job is older.
+fn hook_job_predates_revision(job: &Value, last_deployed: Option<OffsetDateTime>) -> bool {
+    match (
+        rfc3339(text(job, "/metadata/creationTimestamp")),
+        last_deployed,
+    ) {
+        (Some(created), Some(deployed)) => created.unix_timestamp() < deployed.unix_timestamp(),
+        _ => false,
+    }
 }
 
 async fn capture(command: OpsCommand, description: &str) -> Result<String> {
@@ -669,6 +699,7 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         .filter(|version| *version > 0)
         .context("Helm release has no verifiable revision")?;
     let mut result = Observation::default();
+    let last_deployed = rfc3339(text(&status, "/info/last_deployed"));
     if text(&status, "/info/status") != "deployed" {
         result.issue(
             Facet::Rollout,
@@ -813,7 +844,9 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         for job in namespaces[namespace(&hook_manifest, opts)]
             .iter()
             .filter(|item| {
-                text(item, "/kind") == "Job" && text(item, "/metadata/name") == text(hook, "/name")
+                text(item, "/kind") == "Job"
+                    && text(item, "/metadata/name") == text(hook, "/name")
+                    && !hook_job_predates_revision(item, last_deployed)
             })
         {
             for condition in array(job, "/status/conditions") {
@@ -953,5 +986,57 @@ pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
         }
         carried = result;
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rfc3339_parses_helm_and_kubernetes_stamps() {
+        assert!(rfc3339("2026-09-21T12:00:00Z").is_some());
+        assert!(rfc3339("2026-09-21T12:00:00.123456789Z").is_some());
+        assert!(rfc3339("2026-09-21T12:00:00+00:00").is_some());
+        assert!(rfc3339("0001-01-01T00:00:00Z").is_none());
+        assert!(rfc3339("").is_none());
+    }
+
+    fn deployed(stamp: &str) -> Option<OffsetDateTime> {
+        rfc3339(stamp)
+    }
+
+    #[test]
+    fn older_job_predates_the_current_revision() {
+        let stale = json!({"metadata": {"creationTimestamp": "2026-09-21T11:53:16Z"}});
+        assert!(hook_job_predates_revision(
+            &stale,
+            deployed("2026-09-21T12:00:00Z")
+        ));
+        let current = json!({"metadata": {"creationTimestamp": "2026-09-21T12:00:01Z"}});
+        assert!(!hook_job_predates_revision(
+            &current,
+            deployed("2026-09-21T12:00:00Z")
+        ));
+        assert!(!hook_job_predates_revision(&stale, None));
+        assert!(!hook_job_predates_revision(
+            &json!({}),
+            deployed("2026-09-21T12:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn fractional_last_deployed_does_not_mark_a_same_second_job_stale() {
+        let same_second = json!({"metadata": {"creationTimestamp": "2026-09-21T12:00:00Z"}});
+        assert!(!hook_job_predates_revision(
+            &same_second,
+            deployed("2026-09-21T12:00:00.217175126Z")
+        ));
+        let previous_second = json!({"metadata": {"creationTimestamp": "2026-09-21T11:59:59Z"}});
+        assert!(hook_job_predates_revision(
+            &previous_second,
+            deployed("2026-09-21T12:00:00.217175126Z")
+        ));
     }
 }

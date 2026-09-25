@@ -107,7 +107,7 @@ parenthetical is what the Slack adapter maps onto each one:
 | `conversation_id` | canonical thread/conversation key (the thread ts) |
 | `author` | who authored the message (the Slack user id) |
 | `text` | message text |
-| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per-turn `endpoint`. The Slack adapter currently supplies the ts of its already posted placeholder. |
+| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter always supplies the ts of its already posted placeholder. The worker currently rejects targetless execution. |
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level

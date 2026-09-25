@@ -220,6 +220,75 @@ fn unrelated_same_named_hook_in_another_namespace_does_not_fail_status() {
     assert_eq!(Fixture::json(&output)["healthy"], true);
 }
 
+/// Issue #2858: a leftover failed hook Job from an earlier release of the
+/// same name must not fail a healthy current revision. Helm last_run is empty
+/// because a fresh install never runs the pre-upgrade hook.
+#[test]
+fn stale_same_named_hook_job_from_before_this_revision_does_not_fail_convergence() {
+    for verb in ["up", "status"] {
+        let output = Fixture::new().run(verb, "stale-hook-job");
+        assert!(
+            output.status.success(),
+            "{verb}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if verb == "status" {
+            assert_eq!(Fixture::json(&output)["healthy"], true);
+        }
+        let shown = format!(
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !shown.contains("BackoffLimitExceeded"),
+            "{verb} treated a pre-revision Job as the current hook: {shown}"
+        );
+    }
+}
+
+/// Negative for #2858: Helm last_run Failed still fails even when the live
+/// Job predates this revision and would otherwise be ignored.
+#[test]
+fn helm_recorded_hook_failure_still_fails_when_the_job_is_stale() {
+    let output = Fixture::new().run("status", "stale-job-last-run-failed");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{} / {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = Fixture::json(&output);
+    assert!(json.to_string().contains("Helm hook failed"), "{json}");
+    assert_eq!(json["healthy"], false);
+}
+
+/// Negative for #2858: a Failed Job created after last_deployed still fails
+/// convergence even when Helm last_run is empty.
+#[test]
+fn current_revision_failed_hook_job_still_fails_convergence() {
+    for verb in ["up", "status"] {
+        let output = Fixture::new().run(verb, "current-hook-job");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{verb}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = Fixture::json(&output);
+        assert!(
+            json.to_string().contains("BackoffLimitExceeded"),
+            "{verb}: {json}"
+        );
+        if verb == "status" {
+            assert_eq!(json["healthy"], false);
+        }
+    }
+}
+
 #[test]
 fn failed_helm_up_reports_the_actual_hook_reason_and_redacts_pod_reason_text() {
     let output = Fixture::new().run("up", "helm-hook-fails");

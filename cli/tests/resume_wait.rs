@@ -43,17 +43,18 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
         conversation_id: "1720000000.000100".into(),
         author: "U-curie-message".into(),
         text: "(resumed after approval)".into(),
-        reply_handle: ReplyHandle {
+        reply_handle: Some(ReplyHandle {
             kind: "slack".into(),
             channel: "C-SIM-x".into(),
             placeholder: Some(PLACEHOLDER_TS.into()),
             endpoint: Some(endpoint.to_string()),
             adapter: None,
-        },
+        }),
         received_at: "2026-07-21T00:00:00Z".into(),
         // A resume continues the turn a person started, matching what
         // `resumequeue._build_turn` mints on the Python side.
         source: TurnSource::Slack,
+        hook_run: None,
         // Empty, matching `resumequeue._build_turn`: it replays the original
         // placeholder and endpoint, not the original files. Whether a resumed
         // turn should carry the attachments of the turn it continues is a real
@@ -478,13 +479,15 @@ async fn run_local_message_terminal(debug: bool) -> Option<String> {
         tokio::time::sleep(Duration::from_millis(40)).await;
     };
 
-    let endpoint = turn
+    let reply_handle = turn
         .reply_handle
+        .as_ref()
+        .expect("local message turns are targeted");
+    let endpoint = reply_handle
         .endpoint
         .as_deref()
         .expect("local message turn carries the live reply endpoint");
-    let placeholder = turn
-        .reply_handle
+    let placeholder = reply_handle
         .placeholder
         .as_deref()
         .expect("local message turn carries its placeholder");

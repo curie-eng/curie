@@ -88,6 +88,7 @@ BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_VERSION_ENV = BootEnv.env_key("bundle_version")
 PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
 BUDGET_ENV = BootEnv.env_key("budget")
+MAX_TURNS_ENV = BootEnv.env_key("max_turns")
 SESSION_ID_ENV = BootEnv.env_key("session_id")
 FAKE_MODEL_ENV = BootEnv.env_key("fake_model")
 CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
@@ -134,6 +135,10 @@ GRANT_TOOL_ENV = BootEnv.env_key("approval_grant_tool")
 # confers nothing -- the runner reads it only to decide whether to emit an
 # observe-only warning when the approved business action never ran.
 RESUMED_KIND_ENV = BootEnv.env_key("approval_resumed_kind")
+# #3077 live factory status card: the request-bound report_progress URL and
+# scoped token, minted by the kernel's resume overlay per work-item execution.
+PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
+PROGRESS_TOKEN_ENV = BootEnv.env_key("progress_token")
 # ADR-0076 Stone 3 (#889, epic #512): the resolved terminal decision
 # ('approved'/'rejected'/'expired') of the approval this resume boot is
 # resuming from, so the runner can stamp it on the turn's OTel span and close
@@ -233,6 +238,37 @@ JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
+"""
+
+# A targetless cron turn (#2963) is routed by the hook run's agent, not by a
+# binding, so this selects the same active deployment as _RESOLVE_SQL (the
+# ORDER BY key is duplicated verbatim for the same tiebreak reason) with no
+# agent_channels join. endpoint/adapter are NULL: there is no reply route.
+_RESOLVE_AGENT_SQL = """
+SELECT a.id AS agent_id,
+       a.name AS agent_name,
+       a.max_usd_per_day AS max_usd_per_day,
+       a.max_output_tokens_per_run AS max_output_tokens_per_run,
+       a.behavior_packs AS behavior_packs,
+       a.model AS model,
+       a.thinking AS thinking,
+       a.approval_required_tools AS approval_required_tools,
+       a.approval_routes AS approval_routes,
+       a.secrets AS secrets,
+       d.id AS deployment_id,
+       d.workspace_enabled AS workspace_enabled,
+       a.memory AS memory,
+       v.id AS version_id,
+       v.version_label AS version_label,
+       v.bundle_ref AS bundle_ref,
+       NULL AS endpoint,
+       NULL AS adapter
+FROM {schema}.agents a
+JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
+JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
+WHERE a.id = :agent_id
+ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
+LIMIT 1
 """
 
 # ``resolve`` deliberately requires an active deployment: it is the only
@@ -363,6 +399,25 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
     )
 
 
+def _deployment_from_row(data: dict[str, Any]) -> ResolvedDeployment:
+    # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
+    # trigger SQLAlchemy's json deserializer); decode it to the dict/list the
+    # model expects. A dict/list (or None) passes through untouched.
+    packs = data.get("behavior_packs")
+    if isinstance(packs, str):
+        data["behavior_packs"] = json.loads(packs)
+    gates = data.get("approval_required_tools")
+    if isinstance(gates, str):
+        data["approval_required_tools"] = json.loads(gates)
+    routes = data.get("approval_routes")
+    if isinstance(routes, str):
+        data["approval_routes"] = json.loads(routes)
+    conn_secrets = data.get("secrets")
+    if isinstance(conn_secrets, str):
+        data["secrets"] = json.loads(conn_secrets)
+    return ResolvedDeployment.model_validate(data)
+
+
 class BindingResolver:
     """Resolves a channel address to its active agent deployment (read-only)."""
 
@@ -374,6 +429,7 @@ class BindingResolver:
         self._undeployed_binding_sql = text(
             _UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema)
         )
+        self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
 
     async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
         """Resolve the ``(kind, address)`` routing pair to its active deployment.
@@ -388,23 +444,18 @@ class BindingResolver:
         if not rows:
             return None
         warn_if_multiple_agents_bound(kind, address, rows)
-        data = dict(rows[0])
-        # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
-        # trigger SQLAlchemy's json deserializer); decode it to the dict/list the
-        # model expects. A dict/list (or None) passes through untouched.
-        packs = data.get("behavior_packs")
-        if isinstance(packs, str):
-            data["behavior_packs"] = json.loads(packs)
-        gates = data.get("approval_required_tools")
-        if isinstance(gates, str):
-            data["approval_required_tools"] = json.loads(gates)
-        routes = data.get("approval_routes")
-        if isinstance(routes, str):
-            data["approval_routes"] = json.loads(routes)
-        conn_secrets = data.get("secrets")
-        if isinstance(conn_secrets, str):
-            data["secrets"] = json.loads(conn_secrets)
-        return ResolvedDeployment.model_validate(data)
+        return _deployment_from_row(dict(rows[0]))
+
+    async def resolve_agent(self, agent_id: uuid.UUID) -> ResolvedDeployment | None:
+        """Resolve an explicit agent to its active deployment, with no binding.
+
+        Only for a targetless cron turn (#2963), whose agent is the hook run
+        row's validated id. Never a fallback for a binding miss.
+        """
+        async with self._engine.connect() as conn:
+            result = await conn.execute(self._resolve_agent_sql, {"agent_id": agent_id})
+            row = result.mappings().first()
+        return None if row is None else _deployment_from_row(dict(row))
 
     async def undeployed_binding(self, kind: str, address: str) -> BoundAgent | None:
         """Return a bound agent after ``resolve`` found no active deployment.
@@ -618,16 +669,21 @@ class BindingResolver:
         value: str | None = row[0]
         return value
 
-    async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
-        """The agent's thinking depth for eval sandbox boots."""
-        sql = text(f"SELECT thinking FROM {self._config.db_schema}.agents WHERE id = :id")
+    async def model_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str | None, str | None]:
+        """The agent's model and thinking settings for eval sandbox boots."""
+        sql = text(
+            f"SELECT model, thinking FROM {self._config.db_schema}.agents WHERE id = :id"
+        )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         if row is None:
-            return None
-        value: str | None = row[0]
-        return value
+            return None, None
+        model: str | None = row[0]
+        thinking: str | None = row[1]
+        return model, thinking
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).

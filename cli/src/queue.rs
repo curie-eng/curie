@@ -85,9 +85,13 @@ pub fn thread_key_for(kind: &str, channel: &str, conversation_id: &str) -> Strin
 
 /// [`thread_key_for`] from a minted `QueuedTurn`.
 pub fn thread_key_for_turn(turn: &QueuedTurn) -> String {
+    let reply_handle = turn
+        .reply_handle
+        .as_ref()
+        .expect("thread keys require a targeted turn");
     thread_key_for(
-        &turn.reply_handle.kind,
-        &turn.reply_handle.channel,
+        &reply_handle.kind,
+        &reply_handle.channel,
         &turn.conversation_id,
     )
 }
@@ -141,7 +145,7 @@ pub fn synthetic_turn(
         conversation_id: conversation_id.into(),
         author: author.into(),
         text: text.into(),
-        reply_handle: ReplyHandle {
+        reply_handle: Some(ReplyHandle {
             kind: kind.into(),
             channel: channel.into(),
             placeholder: Some(placeholder.into()),
@@ -149,7 +153,7 @@ pub fn synthetic_turn(
             // The CLI's stub keeps the Slack shape, so its route is the
             // configured `SLACK_API_BASE_URL` dev origin, not a named adapter.
             adapter: None,
-        },
+        }),
         received_at: now_rfc3339(),
         // The CLI drives a turn on a person's behalf, so it is a message and not
         // a job: `local message` and `cluster message` are someone typing. Named
@@ -161,6 +165,7 @@ pub fn synthetic_turn(
         // no attachment REFERENCES to carry (#2567). Empty, and said out loud
         // for the same reason `source` is.
         attachments: Vec::new(),
+        hook_run: None,
     }
 }
 
@@ -528,7 +533,13 @@ mod tests {
         );
         assert!(turn.conversation_id.starts_with(EVAL_ISOLATE_THREAD_PREFIX));
         assert_eq!(turn.text, "ping");
-        assert_eq!(turn.reply_handle.channel, "C1");
+        assert_eq!(
+            turn.reply_handle
+                .as_ref()
+                .expect("eval cases are targeted")
+                .channel,
+            "C1"
+        );
     }
 
     #[test]
@@ -577,6 +588,7 @@ mod tests {
                 "author",
                 "conversation_id",
                 "event_id",
+                "hook_run",
                 "received_at",
                 "reply_handle",
                 // ADR-0079: what STARTED this turn, as distinct from where its
@@ -587,6 +599,7 @@ mod tests {
             ]
         );
         assert_eq!(object["source"], "slack");
+        assert!(object["hook_run"].is_null());
         // channel and placeholder are nested in the channel-neutral reply_handle.
         assert_eq!(object["reply_handle"]["channel"], "C-SIM-x");
         assert_eq!(object["reply_handle"]["placeholder"], "1720000000.000200");
@@ -609,7 +622,11 @@ mod tests {
             Some("http://10.1.2.3:8155/api/".to_string()),
         );
         assert_eq!(
-            turn.reply_handle.endpoint.as_deref(),
+            turn.reply_handle
+                .as_ref()
+                .expect("synthetic turns are targeted")
+                .endpoint
+                .as_deref(),
             Some("http://10.1.2.3:8155/api/")
         );
         let json = payload_json(&turn).unwrap();
@@ -634,9 +651,13 @@ mod tests {
             "1717.42",
             None,
         );
-        assert!(turn.reply_handle.endpoint.is_none());
+        let reply_handle = turn
+            .reply_handle
+            .as_ref()
+            .expect("synthetic turns are targeted");
+        assert!(reply_handle.endpoint.is_none());
         // The placeholder is the real Slack ts we posted, not a stub-minted one.
-        assert_eq!(turn.reply_handle.placeholder, Some("1717.42".into()));
+        assert_eq!(reply_handle.placeholder, Some("1717.42".into()));
         let value: serde_json::Value = serde_json::from_str(&payload_json(&turn).unwrap()).unwrap();
         assert!(value["reply_handle"]["endpoint"].is_null());
         assert_eq!(value["reply_handle"]["placeholder"], "1717.42");
@@ -661,16 +682,17 @@ mod tests {
             conversation_id: "1720000000.000100".into(),
             author: "U-curie-message".into(),
             text: "hi".into(),
-            reply_handle: ReplyHandle {
+            reply_handle: Some(ReplyHandle {
                 kind: "slack".into(),
                 channel: "C-SIM-x".into(),
                 placeholder: Some("1720000000.000200".into()),
                 endpoint: None,
                 adapter: None,
-            },
+            }),
             received_at: "2026-07-21T00:00:00Z".into(),
             source: TurnSource::Slack,
             attachments: Vec::new(),
+            hook_run: None,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

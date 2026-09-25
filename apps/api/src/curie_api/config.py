@@ -11,11 +11,13 @@ production deployments.
 """
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
     RUNS_STREAM_DEFAULT,
     STREAM_ENV,
+    WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
 from pydantic import AliasChoices, Field, model_validator
@@ -149,6 +151,16 @@ class Settings(BaseSettings):
     # form a complete bootable configuration.
     github_review_ingress_enabled: bool = False
     github_review_reconciler_interval_s: float = 5.0
+    # Factory issue intake is separately gated from push and review handling.
+    # The label is the initial admission convention. The mention is the login
+    # an authorized human must name to request another bounded execution.
+    github_factory_ingress_enabled: bool = False
+    github_factory_label: str = ""
+    github_factory_mention: str = ""
+    # Public origin GitHub's image proxy fetches the live status card from
+    # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
+    # status comment still carries the checklist and the result.
+    github_factory_card_base_url: str = ""
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -316,6 +328,96 @@ class Settings(BaseSettings):
     resume_dead_letter_stream: str = ""
     resume_dead_letter_scan_limit: int = 1000
 
+    work_item_reconciler_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RECONCILER_ENABLED",
+            "WORK_ITEM_RECONCILER_ENABLED",
+        ),
+    )
+    work_item_reconciler_interval_seconds: int = Field(
+        default=5,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS",
+            "WORK_ITEM_RECONCILER_INTERVAL_SECONDS",
+        ),
+    )
+    work_item_batch_limit: int = Field(
+        default=50,
+        gt=0,
+        validation_alias=AliasChoices("CURIE_WORK_ITEM_BATCH_LIMIT", "WORK_ITEM_BATCH_LIMIT"),
+    )
+    work_item_wait_budget_seconds: int = Field(
+        default=86400,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS",
+            "WORK_ITEM_WAIT_BUDGET_SECONDS",
+        ),
+    )
+    work_item_dispatch_lease_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS",
+            "WORK_ITEM_DISPATCH_LEASE_SECONDS",
+        ),
+    )
+    work_item_acquire_lease_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+            "WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+        ),
+    )
+    work_item_runtime_ttl_seconds: int = Field(
+        default=45,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS",
+            "WORK_ITEM_RUNTIME_TTL_SECONDS",
+        ),
+    )
+    work_item_cancel_settle_seconds: int = Field(
+        default=120,
+        ge=1,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS",
+            "WORK_ITEM_CANCEL_SETTLE_SECONDS",
+        ),
+    )
+    work_item_backoff_base_seconds: int = Field(
+        default=10,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS",
+            "WORK_ITEM_BACKOFF_BASE_SECONDS",
+        ),
+    )
+    work_item_backoff_max_seconds: int = Field(
+        default=120,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS",
+            "WORK_ITEM_BACKOFF_MAX_SECONDS",
+        ),
+    )
+    work_item_terminate_retry_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS",
+            "WORK_ITEM_TERMINATE_RETRY_SECONDS",
+        ),
+    )
+    runs_consumer_group: str = Field(
+        default=WORKER_GROUP_DEFAULT,
+        min_length=1,
+        validation_alias=AliasChoices("CURIE_CONSUMER_GROUP", "RUNS_CONSUMER_GROUP"),
+    )
+
     # The Slack bot token the API uses for its OWN user-group lookups (#420),
     # rather than trusting a caller's claim about who is in a group. The same
     # token the dispatcher and worker already hold; empty is the normal state
@@ -342,6 +444,13 @@ class Settings(BaseSettings):
     # namespace are both bounded. Sizes are the serialized-JSON byte length.
     state_max_value_bytes: int = 64 * 1024  # 64 KiB per value
     state_max_namespace_bytes: int = 1024 * 1024  # 1 MiB per (agent, namespace)
+    # Conversation transcripts (ADR-0170, #3070) live in their own table, capped
+    # per thread with no agent-wide total, so many threads never share a budget.
+    # The default matches the runner's own transcript bound, which compacts the
+    # thread when an append is refused. A thread with no WorkItem expires after
+    # this long without an append; a WorkItem thread is deleted at its terminal.
+    transcript_max_thread_bytes: int = 64 * 1024  # 64 KiB per thread
+    transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
     # Cap on behavior-packs content per agent (#936, introduced by #883). Packs
     # are stored on the agent row and injected verbatim into the runner context
     # at each bind, so an uncapped pack bloats both the row and the prompt. Size
@@ -469,6 +578,70 @@ class Settings(BaseSettings):
                 "complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_github_factory_ingress(self) -> "Settings":
+        if not self.github_factory_ingress_enabled:
+            return self
+        from .github_review_events import valid_github_login
+
+        offenders = []
+        if not self.github_app_id.strip():
+            offenders.append("GITHUB_APP_ID")
+        if not self.github_app_private_key.strip():
+            offenders.append("GITHUB_APP_PRIVATE_KEY")
+        if (
+            not self.github_webhook_secret.strip()
+            or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
+        ):
+            offenders.append("GITHUB_WEBHOOK_SECRET")
+        label = self.github_factory_label
+        if (
+            not label
+            or label != label.strip()
+            or len(label) > 50
+            or any(character.isspace() for character in label)
+        ):
+            offenders.append("GITHUB_FACTORY_LABEL")
+        if not valid_github_login(self.github_factory_mention):
+            offenders.append("GITHUB_FACTORY_MENTION")
+        if not self.github_repo_allowlist:
+            offenders.append("GITHUB_REPO_ALLOWLIST")
+        if offenders:
+            raise ValueError(
+                "GitHub factory ingress (GITHUB_FACTORY_INGRESS_ENABLED) requires "
+                "complete active configuration; "
+                f"set valid values for: {', '.join(offenders)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_factory_card_base_url(self) -> "Settings":
+        """Empty, or an https origin (http localhost only in dev), no query or fragment."""
+        value = self.github_factory_card_base_url.strip()
+        if value.endswith("/"):
+            value = value[:-1]
+        if value:
+            parts = urlsplit(value)
+            local_dev = (
+                self.environment.strip().lower() == "dev"
+                and parts.scheme == "http"
+                and parts.hostname in ("localhost", "127.0.0.1")
+            )
+            if (
+                not (parts.scheme == "https" or local_dev)
+                or not parts.netloc
+                or parts.query
+                or parts.fragment
+                or "?" in value
+                or "#" in value
+            ):
+                raise ValueError(
+                    "GITHUB_FACTORY_CARD_BASE_URL must be empty or an https:// URL "
+                    "with no query or fragment"
+                )
+        self.github_factory_card_base_url = value
         return self
 
     @model_validator(mode="after")

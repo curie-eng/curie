@@ -104,17 +104,35 @@ pub fn live_in_window(live: &str, window: &Window) -> bool {
     live_idx >= min_idx && live_idx <= head_idx
 }
 
-fn version_key(version: &str) -> Vec<u32> {
-    normalize_app_version(version)
-        .split('.')
-        .map(|part| {
-            part.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .parse()
-                .unwrap_or(0)
-        })
-        .collect()
+type VersionKey = (u64, u64, u64, u8, u64);
+
+fn version_key(version: &str) -> Option<VersionKey> {
+    let normalized = normalize_app_version(version);
+    let (core, release_candidate) = match normalized.split_once("-rc.") {
+        Some((core, rc)) => (core, Some(rc)),
+        None => (normalized.as_str(), None),
+    };
+    let parse_number = |part: &str| {
+        if part.is_empty()
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
+        part.parse::<u64>().ok()
+    };
+    let mut parts = core.split('.');
+    let major = parse_number(parts.next()?)?;
+    let minor = parse_number(parts.next()?)?;
+    let patch = parse_number(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (stable, rc) = match release_candidate {
+        Some(value) => (0, parse_number(value)?),
+        None => (1, 0),
+    };
+    Some((major, minor, patch, stable, rc))
 }
 
 /// Newest catalogued application version in `candidates` whose window contains
@@ -129,6 +147,9 @@ pub fn newest_fail_forward<'a>(
         if version.is_empty() {
             continue;
         }
+        let Some(key) = version_key(&version) else {
+            continue;
+        };
         let Some(window) = window_for(&version) else {
             continue;
         };
@@ -137,7 +158,7 @@ pub fn newest_fail_forward<'a>(
         }
         match &best {
             None => best = Some(version),
-            Some(current) if version_key(&version) > version_key(current) => {
+            Some(current) if Some(key) > version_key(current) => {
                 best = Some(version);
             }
             Some(_) => {}
@@ -330,23 +351,72 @@ mod tests {
     }
 
     #[test]
-    fn released_090_and_091_share_0044_for_rollback_compatibility() {
-        let n = window_for("0.9.0").expect("0.9.0 is catalogued for the next-train matrix");
-        let n1 = window_for("0.9.1").expect("0.9.1 is catalogued for the next-train matrix");
+    fn released_v090_and_v091_remain_at_0044_and_v091_refuses_0046() {
+        let v090 = window_for("0.9.0").expect("0.9.0 is catalogued");
+        let v091 = window_for("0.9.1").expect("0.9.1 is catalogued");
+        assert_eq!(v090.schema_head, "0044");
+        assert_eq!(v091.schema_head, "0044");
+
+        let err = check_target_schema(
+            "0.9.1",
+            &v091,
+            "0046",
+            &["0.9.1".to_string(), "0.10.0".to_string()],
+        )
+        .expect_err("published 0.9.1 must refuse live revision 0046");
+        assert!(err.message.contains("0.9.1"));
+        assert!(err.message.contains("0046"));
+        assert!(err.message.contains("0044"));
+    }
+
+    #[test]
+    fn released_v092_accepts_adapter_0045_and_refuses_later_live_revisions() {
+        let v092 = window_for("0.9.2").expect("0.9.2 is catalogued");
+        assert_eq!(v092.schema_min, "0045");
+        assert_eq!(v092.schema_head, "0045");
+
+        check_target_schema(
+            "0.9.2",
+            &v092,
+            "0045",
+            &["0.9.2".to_string(), "0.10.0".to_string()],
+        )
+        .expect("published 0.9.2 accepts its adapter schema");
+
+        for live in ["0046", "0047", "0048", "0049", "0050"] {
+            let err = check_target_schema(
+                "0.9.2",
+                &v092,
+                live,
+                &["0.9.2".to_string(), "0.10.0".to_string()],
+            )
+            .expect_err("published 0.9.2 must refuse later live revisions");
+            assert!(err.message.contains("0.9.2"));
+            assert!(err.message.contains(live));
+            assert!(err.message.contains("0045"));
+        }
+    }
+
+    #[test]
+    fn packaged_n_and_n1_share_this_tree_head_so_rollback_is_compatible() {
+        let n = window_for("0.10.0").expect("0.10.0 is catalogued for the next train matrix");
+        let n1 = window_for("0.10.1").expect("0.10.1 is catalogued for the next train matrix");
+        assert_eq!(n.schema_min, "0045");
+        assert_eq!(n.schema_head, "0057");
         assert_eq!(n.schema_min, n1.schema_min);
         assert_eq!(n.schema_head, n1.schema_head);
         check_target_schema(
-            "0.9.0",
+            "0.10.0",
             &n,
-            &n.schema_head,
-            &["0.9.0".to_string(), "0.9.1".to_string()],
+            "0057",
+            &["0.10.0".to_string(), "0.10.1".to_string()],
         )
-        .expect("0.9.1 to 0.9.0 is the same schema window");
+        .expect("N+1 to N is the same schema window");
         let err = check_target_schema(
             "0.8.7",
             &window_for("0.8.7").expect("0.8.7 window"),
             &n.schema_head,
-            &["0.8.7".to_string(), "0.9.0".to_string()],
+            &["0.8.7".to_string(), "0.10.0".to_string()],
         )
         .expect_err("0.8.7 cannot start on this tree's head");
         assert!(

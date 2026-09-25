@@ -1005,6 +1005,24 @@ class _FakeTransport:
         pass
 
 
+class _FakeCronLoop:
+    """Stands in for ``CronSchedulerLoop``. By default it records itself and
+    returns, like the fake consumers; with ``wait_for_stop`` it blocks on the
+    stop event ``_run`` hands it, which is how the cron test proves the loop is
+    wired to the shared shutdown flag rather than to a private one."""
+
+    def __init__(self, events: list[str], *, wait_for_stop: bool = False) -> None:
+        self._events = events
+        self._wait_for_stop = wait_for_stop
+
+    async def run_forever(self, stop: asyncio.Event | None = None) -> None:
+        self._events.append("cron")
+        if self._wait_for_stop:
+            assert stop is not None
+            await stop.wait()
+            self._events.append("cron-stopped")
+
+
 class _FakeRuntime:
     """Exactly the attributes ``_run`` touches -- deliberately not a real
     ``Runtime``, so nothing here reaches Valkey, Postgres, or the substrate."""
@@ -1015,6 +1033,7 @@ class _FakeRuntime:
         self.killswitch = _FakeSupervisedTask(events, "killswitch")
         self.eval_consumer = _FakeSupervisedTask(events, "evals")
         self.connector_loop = None
+        self.cron_loop = _FakeCronLoop(events)
         self.runner = _FakeTransport()
         self.sink = _FakeTransport()
         self.eval_http = _FakeTransport()
@@ -1022,6 +1041,7 @@ class _FakeRuntime:
         self.pressure_async_redis = _FakeTransport()
         self.eval_redis = _FakeTransport()
         self.engine = _FakeTransport()
+        self.orphan_sweeper = None
 
 
 def _boot(
@@ -1057,6 +1077,39 @@ def _boot(
     # regression that leaves _run blocked must fail this suite, not hang CI.
     asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
     return events
+
+
+def test_run_supervises_the_cron_loop_until_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cron loop is always on (#268): _run must start it under the same
+    # supervisor as its siblings and hand it the shared shutdown flag, so a
+    # SIGTERM that stops the consumers also stops the scheduler.
+    events: list[str] = []
+    card_store = _FakeCardStore(events)
+    runtime = _FakeRuntime(card_store, events)
+    runtime.cron_loop = _FakeCronLoop(events, wait_for_stop=True)
+
+    async def stopping_heartbeat(_file: Any, _interval: Any, shutdown: asyncio.Event) -> None:
+        # Let the cron loop start first, then request shutdown the way the
+        # signal handler would.
+        while "cron" not in events:
+            await asyncio.sleep(0)
+        shutdown.set()
+
+    monkeypatch.setattr(run, "build", lambda config, env: runtime)
+    monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
+    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
+
+    assert events.count("cron") == 1
+    assert "cron-stopped" in events
+
+
+def test_cron_tick_interval_reads_its_env_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CURIE_CRON_TICK_INTERVAL_S", raising=False)
+    assert WorkerConfig().cron_tick_interval_s == 30
+    monkeypatch.setenv("CURIE_CRON_TICK_INTERVAL_S", "5")
+    assert WorkerConfig().cron_tick_interval_s == 5
 
 
 def test_run_migrates_legacy_card_refs_once_at_boot(

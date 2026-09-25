@@ -23,6 +23,26 @@ _LOGIN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 _MAX_FEEDBACK_LENGTH = 65536
 
 
+def valid_github_login(value: str) -> bool:
+    """True when value is one GitHub login the review sender check accepts."""
+
+    return _LOGIN.fullmatch(value) is not None
+
+
+def human_sender(value: Any) -> tuple[int, str]:
+    """The review ingress human-sender check, shared with factory intake."""
+
+    return _human(value)
+
+
+def payload_object(value: Any, code: str) -> dict[str, Any]:
+    return _object(value, code)
+
+
+def positive_identifier(value: Any, code: str, maximum: int = 2**63 - 1) -> int:
+    return _positive(value, code, maximum)
+
+
 class FeedbackIgnored(ValueError):
     """An observable refusal code that never includes webhook/model contents."""
 
@@ -149,7 +169,10 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
     # CONTRIBUTOR is only a claim here. The shared truth verifier additionally
     # requires current App-proven write/admin permission before admitting it.
     if not isinstance(association, str) or association not in {
-        "OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"
+        "OWNER",
+        "MEMBER",
+        "COLLABORATOR",
+        "CONTRIBUTOR",
     }:
         raise FeedbackIgnored("unauthorized_association")
     feedback_id = _positive(feedback.get("id"), "invalid_feedback")
@@ -196,7 +219,11 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
     else:
         created = _instant(feedback.get("created_at"), "invalid_feedback_time")
         updated = _instant(feedback.get("updated_at"), "invalid_feedback_time")
-        if updated != created:
+        # An inline comment written into a pending review gets updated_at
+        # bumped when that review is submitted, with no edit (#2794: created
+        # 15:24:44, updated 15:24:52, same body). For that family the truth
+        # verifier's body equality on a fresh read is the edit check.
+        if event == "issue_comment" and updated != created:
             raise FeedbackIgnored("edited_feedback")
     if event == "pull_request_review_comment":
         path = feedback.get("path")

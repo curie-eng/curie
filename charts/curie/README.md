@@ -1541,8 +1541,9 @@ namespace separately; the chart deliberately does not copy the platform Secret.
 `curie ... deploy --workspace` and `--no-workspace` are deprecated compatibility
 options and no longer enable or disable coding. Every session exposes the Claude
 Code file tools and `mcp__curie__publish_changes`. The publication tool is only
-an approval request: it cannot publish without a managed workspace and a human
-approval, publication still runs outside the sandbox, and no GitHub credential
+an approval request: it cannot publish without a managed workspace. Human
+approval is the default. An operator can set one agent's publication policy to
+automatic, and publication still runs outside the sandbox. No GitHub credential
 is mounted into the sandbox.
 
 One allowed root `https://github.com/owner/repository` URL in the initial

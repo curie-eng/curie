@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    parser::ValueSource, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 use curie::api;
 use curie::artifacts;
 use curie::channel_token as crate_channel_token;
@@ -817,13 +819,14 @@ enum Command {
     /// `dump-commands`.
     #[command(hide = true, alias = "dump-commands")]
     Schema,
-    /// Print the committed, versioned JSON Schemas for the `--json` result outputs.
+    /// Print the committed, versioned JSON Schemas for `--json` results and the
+    /// `curie.yaml` installation input (`curie-yaml`).
     ///
     /// With no NAME, emits the schema inventory index (`cli/schema/index.json`):
     /// every agent-facing result family, the schema file it maps to, and its
-    /// version. With a NAME (e.g. `kill`, or `kill.schema.json`), emits that
-    /// schema. The schemas are embedded in the binary, so this works from a
-    /// released `curie` with no source checkout (issue #634).
+    /// version. With a NAME (e.g. `kill`, or `kill.schema.json`, or
+    /// `curie-yaml`), emits that schema. The schemas are embedded in the binary,
+    /// so this works from a released `curie` with no source checkout (issue #634).
     SchemaIndex {
         /// The schema to print (short name like `kill`, or `kill.schema.json`).
         /// Omit to print the inventory index of all result schemas.
@@ -845,11 +848,24 @@ enum Command {
     /// the `--set`/`--reuse-values` shape kept producing.
     ///
     /// A worked common installation is available at `examples/curie.yaml` in
-    /// the Curie repository.
+    /// the Curie repository. A released binary writes the same starter with
+    /// `curie apply --init`.
     Apply {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
         file: std::path::PathBuf,
+        /// Write a starter `curie.yaml` from this binary and exit. Refuses to
+        /// overwrite an existing file.
+        #[arg(
+            long,
+            conflicts_with_all = ["dry_run", "chart", "migrate_store", "allow_stateful_removal", "context"]
+        )]
+        init: bool,
+        /// Kubernetes context for every helm and kubectl call. Wins over
+        /// `install.context` in the file. Defaults to the kubeconfig
+        /// current-context, which is resolved once and pinned.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
         /// Print the plan without touching the cluster.
         #[arg(long)]
         dry_run: bool,
@@ -908,6 +924,11 @@ enum Command {
     ///
     /// Read-only. Safe to run anywhere, including against production.
     Doctor {
+        /// Kubernetes context for every helm and kubectl call. Wins over
+        /// `install.context` in `curie.yaml`. Defaults to the kubeconfig
+        /// current-context, which is resolved once and pinned.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
         /// Kubernetes namespace to inspect. Defaults to `curie.yaml`'s `install:`
         /// block when one is present in this directory, otherwise `curie`.
         #[arg(long)]
@@ -936,6 +957,12 @@ enum Command {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
         file: std::path::PathBuf,
+        /// Kubernetes context for every helm and kubectl call. Wins over
+        /// `install.context` in the file. Defaults to the kubeconfig
+        /// current-context, which is resolved once and pinned. Diff prints the
+        /// cluster this context names.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
         /// Chart reference override, as `cluster up` takes. Diff RENDERS this
         /// chart to detect stateful components the apply would delete, so point
         /// it at the same chart `curie apply --chart` would use.
@@ -1033,6 +1060,20 @@ enum DevAction {
     SreDemoE2e,
     /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
     TwoReleaseApprovalE2e,
+    /// Drive the dark factory against a disposable install on a named kube
+    /// context, a real GitHub App and a fixture repository (#2966,
+    /// `python3 tools/factory-e2e/factory_e2e.py`). `preflight` installs the
+    /// candidate's published images with factory intake on, tunnels the api
+    /// webhook, labels one issue, asserts the delivery is accepted and a
+    /// WorkItem is admitted, then undoes every change and writes JSON evidence.
+    /// `run --scenario <name>` adds one scenario driver after the preflight.
+    /// Every identity comes from CURIE_FACTORY_* variables or files.
+    FactoryE2e {
+        /// `preflight` or `run --scenario <name>`, then driver flags; see
+        /// `curie dev factory-e2e -- --help`.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -1456,6 +1497,16 @@ enum SkillAction {
         commands::MEMORY_REASON, commands::MEMORY_ALT,
     ))]
     Memory,
+    #[command(about = format!(
+        "Not available at this tier: {}; {}",
+        commands::WORK_ITEMS_REASON, commands::WORK_ITEMS_ALT,
+    ))]
+    WorkItems {
+        /// Accepts any arguments so every form reaches the exit-4 capability
+        /// refusal instead of a clap usage error (#2577, like #1955).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _rest: Vec<String>,
+    },
     #[command(about = format!(
         "Not available at this tier: {}; {}",
         commands::OBSERVABILITY_REASON, commands::OBSERVABILITY_ALT,
@@ -2029,6 +2080,42 @@ enum LocalAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
+        #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
+        api_url: String,
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read or set one agent's publication policy (`PATCH /agents/{id}`).
+    ///
+    /// With no change flags this inspects. `approve` is the default and keeps
+    /// the human gate. `auto` lets the platform resolve that same approval.
+    PublicationPolicy {
+        /// Agent name or id.
+        agent: String,
+        /// `approve` or `auto`.
+        #[arg(long, value_parser = ["approve", "auto"])]
+        policy: Option<String>,
+        /// Open the pull request as a draft. Only applied while policy is auto.
+        #[arg(long, conflicts_with = "no_draft")]
+        draft: bool,
+        /// Open the pull request ready for review.
+        #[arg(long)]
+        no_draft: bool,
+        /// Required branch prefix, ending in `/`.
+        #[arg(long, conflicts_with = "clear_branch_prefix")]
+        branch_prefix: Option<String>,
+        /// Remove the branch prefix.
+        #[arg(long)]
+        clear_branch_prefix: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -2119,6 +2206,27 @@ enum LocalAction {
         /// Confirm the action; it interrupts any live turn on the thread.
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List factory work item outcomes (`GET /work-items`), or read one with
+    /// its live CI (`GET /work-items/{id}`).
+    WorkItems {
+        /// Work item id to read. Omit to list.
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        /// Scope to one agent (name or id).
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
         #[arg(long)]
         dry_run: bool,
     },
@@ -2817,6 +2925,41 @@ enum ClusterAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// default is 1800s).
+        #[arg(long)]
+        execution_deadline: Option<String>,
+        /// Clear the execution-deadline override back to the platform default.
+        #[arg(long)]
+        clear_execution_deadline: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read or set one agent's publication policy (`PATCH /agents/{id}`).
+    ///
+    /// With no change flags this inspects. `approve` is the default and keeps
+    /// the human gate. `auto` lets the platform resolve that same approval.
+    PublicationPolicy {
+        /// Agent name or id.
+        agent: String,
+        /// `approve` or `auto`.
+        #[arg(long, value_parser = ["approve", "auto"])]
+        policy: Option<String>,
+        /// Open the pull request as a draft. Only applied while policy is auto.
+        #[arg(long, conflicts_with = "no_draft")]
+        draft: bool,
+        /// Open the pull request ready for review.
+        #[arg(long)]
+        no_draft: bool,
+        /// Required branch prefix, ending in `/`.
+        #[arg(long, conflicts_with = "clear_branch_prefix")]
+        branch_prefix: Option<String>,
+        /// Remove the branch prefix.
+        #[arg(long)]
+        clear_branch_prefix: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -2928,6 +3071,21 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List factory work item outcomes (`GET /work-items`), or read one with
+    /// its live CI (`GET /work-items/{id}`).
+    WorkItems {
+        /// Work item id to read. Omit to list.
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        /// Scope to one agent (name or id).
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
         #[command(flatten)]
@@ -3002,6 +3160,302 @@ enum ClusterAction {
         #[command(flatten)]
         recovery: ApprovalRecoveryArgs,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClusterTargetSources {
+    namespace_supplied: bool,
+    namespace_from_environment: bool,
+    release_supplied: bool,
+}
+
+impl ClusterTargetSources {
+    fn from_matches(matches: &clap::ArgMatches) -> Self {
+        let Some(("cluster", cluster_matches)) = matches.subcommand() else {
+            return Self::default();
+        };
+        let Some((_, action_matches)) = cluster_matches.subcommand() else {
+            return Self::default();
+        };
+        Self {
+            namespace_supplied: matches!(
+                action_matches.value_source("namespace"),
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            ),
+            namespace_from_environment: matches!(
+                action_matches.value_source("namespace"),
+                Some(ValueSource::EnvVariable)
+            ),
+            release_supplied: matches!(
+                action_matches.value_source("release"),
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            ),
+        }
+    }
+}
+
+fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>) {
+    match action {
+        ClusterAction::Up {
+            namespace, release, ..
+        }
+        | ClusterAction::Down {
+            namespace, release, ..
+        }
+        | ClusterAction::Rollback {
+            namespace, release, ..
+        }
+        | ClusterAction::Upgrade {
+            namespace, release, ..
+        }
+        | ClusterAction::MigrateStore {
+            namespace, release, ..
+        }
+        | ClusterAction::Status {
+            namespace, release, ..
+        }
+        | ClusterAction::Observability {
+            namespace, release, ..
+        }
+        | ClusterAction::Comms {
+            namespace, release, ..
+        }
+        | ClusterAction::GithubApp {
+            namespace, release, ..
+        }
+        | ClusterAction::Eval {
+            namespace, release, ..
+        }
+        | ClusterAction::Deploy {
+            namespace, release, ..
+        } => (Some(namespace.as_str()), Some(release.as_str())),
+        ClusterAction::Message {
+            namespace, release, ..
+        } => (namespace.as_deref(), release.as_deref()),
+        ClusterAction::Kill { conn, .. }
+        | ClusterAction::Resume { conn, .. }
+        | ClusterAction::Overrides { conn, .. }
+        | ClusterAction::PublicationPolicy { conn, .. }
+        | ClusterAction::Surfaces { conn, .. }
+        | ClusterAction::ChannelToken { conn, .. }
+        | ClusterAction::Budget { conn, .. }
+        | ClusterAction::ResetThread { conn, .. }
+        | ClusterAction::WorkItems { conn, .. }
+        | ClusterAction::Delete { conn, .. } => {
+            (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
+        }
+        ClusterAction::Versions { target }
+        | ClusterAction::Memory { target, .. }
+        | ClusterAction::Approvals { target, .. } => (
+            Some(target.conn.namespace.as_str()),
+            Some(target.conn.release.as_str()),
+        ),
+    }
+}
+
+fn retarget_cluster_action(
+    action: &mut ClusterAction,
+    namespace: Option<String>,
+    release: Option<String>,
+) {
+    let replace = |current: &mut String, value: &Option<String>| {
+        if let Some(value) = value {
+            *current = value.clone();
+        }
+    };
+    match action {
+        ClusterAction::Up {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Down {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Rollback {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Upgrade {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::MigrateStore {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Status {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Observability {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Comms {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::GithubApp {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Eval {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Deploy {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        } => {
+            replace(current_namespace, &namespace);
+            replace(current_release, &release);
+        }
+        ClusterAction::Message {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        } => {
+            *current_namespace = namespace;
+            *current_release = release;
+        }
+        ClusterAction::Kill { conn, .. }
+        | ClusterAction::Resume { conn, .. }
+        | ClusterAction::Overrides { conn, .. }
+        | ClusterAction::PublicationPolicy { conn, .. }
+        | ClusterAction::Surfaces { conn, .. }
+        | ClusterAction::ChannelToken { conn, .. }
+        | ClusterAction::Budget { conn, .. }
+        | ClusterAction::ResetThread { conn, .. }
+        | ClusterAction::WorkItems { conn, .. }
+        | ClusterAction::Delete { conn, .. } => {
+            replace(&mut conn.namespace, &namespace);
+            replace(&mut conn.release, &release);
+        }
+        ClusterAction::Versions { target }
+        | ClusterAction::Memory { target, .. }
+        | ClusterAction::Approvals { target, .. } => {
+            replace(&mut target.conn.namespace, &namespace);
+            replace(&mut target.conn.release, &release);
+        }
+    }
+}
+
+fn load_declared_cluster_target() -> Result<Option<curie::installation::Installation>> {
+    let path = std::path::Path::new("curie.yaml");
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => curie::installation::Installation::load(path)
+            .map(Some)
+            .map_err(|source| {
+                anyhow::Error::from(
+                    curie::exit::CliError::usage(format!(
+                        "curie.yaml could not supply the cluster namespace and release: {source:#}"
+                    ))
+                    .with_fix(
+                        "Fix curie.yaml, or pass both --namespace and --release to select the target explicitly.",
+                    ),
+                )
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(anyhow::Error::from(
+            curie::exit::CliError::usage(format!(
+                "curie.yaml could not be inspected for the cluster namespace and release: {source}"
+            ))
+            .with_fix(
+                "Make curie.yaml readable, or pass both --namespace and --release to select the target explicitly.",
+            ),
+        )),
+    }
+}
+
+fn resolve_cluster_command_target(
+    command: Option<&mut Command>,
+    sources: ClusterTargetSources,
+) -> Result<()> {
+    let Some(Command::Cluster { action, .. }) = command else {
+        return Ok(());
+    };
+
+    let (current_namespace, current_release) = cluster_action_target(action);
+    let supplied_namespace = sources
+        .namespace_supplied
+        .then(|| current_namespace.map(str::to_owned))
+        .flatten();
+    let supplied_release = sources
+        .release_supplied
+        .then(|| current_release.map(str::to_owned))
+        .flatten();
+
+    if matches!(
+        action,
+        ClusterAction::Message {
+            r#continue: true,
+            ..
+        }
+    ) {
+        retarget_cluster_action(action, supplied_namespace, supplied_release);
+        return Ok(());
+    }
+
+    let declared = if supplied_namespace.is_none() || supplied_release.is_none() {
+        load_declared_cluster_target()?
+    } else {
+        None
+    };
+    let target = curie::doctor::resolve_target(
+        supplied_namespace.as_deref(),
+        supplied_release.as_deref(),
+        declared.as_ref().map(|config| {
+            (
+                config.install.namespace.as_str(),
+                config.install.release.as_str(),
+            )
+        }),
+    );
+    let curie::doctor::Target {
+        namespace,
+        release,
+        announcement,
+    } = target;
+    let announcement = announcement.map(|_| {
+        let namespace_source = if sources.namespace_supplied {
+            if sources.namespace_from_environment {
+                "CURIE_NAMESPACE"
+            } else {
+                "flag"
+            }
+        } else if declared.is_some() {
+            "curie.yaml"
+        } else {
+            "default"
+        };
+        let release_source = if sources.release_supplied {
+            "flag"
+        } else if declared.is_some() {
+            "curie.yaml"
+        } else {
+            "default"
+        };
+        format!(
+            "target: namespace {namespace} ({namespace_source}), release {release} ({release_source})"
+        )
+    });
+    retarget_cluster_action(action, Some(namespace), Some(release));
+    if let Some(announcement) = announcement {
+        ui::ui().note(&announcement);
+    }
+    Ok(())
 }
 
 /// Resolve, and materialize, the compose file for a local verb.
@@ -3221,14 +3675,21 @@ async fn main() {
         std::process::exit(class.code());
     }
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cluster_target_sources = ClusterTargetSources::from_matches(&matches);
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     ui::init(Ui::from_process(cli.color, cli.debug, cli.quiet, cli.json));
     // main never returns Err (which would give anyhow's default exit 1 and skip
     // classification). Run the command, then map any error to a semantic exit
     // code: the JSON payload goes to stdout under --json. Otherwise the human
     // presentation goes to stderr, debug receives the full cause chain, and the
     // class picks the exit code.
-    if let Err(err) = run(cli.command).await {
+    let result = match resolve_cluster_command_target(cli.command.as_mut(), cluster_target_sources)
+    {
+        Ok(()) => run(cli.command).await,
+        Err(error) => Err(error),
+    };
+    if let Err(err) = result {
         let (class, _fix) = curie::exit::classify(&err);
         if ui::ui().json() {
             let payload = curie::exit::wrapped_json_payload(&err)
@@ -3378,6 +3839,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
             DevAction::TwoReleaseApprovalE2e => {
                 commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
+            }
+            DevAction::FactoryE2e { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
             }
             DevAction::E2eCiSelection {
                 path,
@@ -3643,6 +4108,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             // the verb reports why and exits 4 (issue #459, ADR-0041).
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
+            SkillAction::WorkItems { .. } => Err(commands::skill_work_items_unavailable()),
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
@@ -3956,6 +4422,24 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
             }
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
+            LocalAction::WorkItems {
+                id,
+                agent,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit({
+                let id = commands::validated_work_item_id(id)?;
+                commands::work_items(commands::WorkItemsOpts {
+                    api_url,
+                    api_key,
+                    id,
+                    agent,
+                    dry_run,
+                    tier: "local",
+                })
+                .await?
+            }),
             LocalAction::Memory { target, add } => match add {
                 None => emit(commands::memory(target.into()).await?),
                 Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
@@ -4020,6 +4504,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
                 api_url,
                 api_key,
                 dry_run,
@@ -4033,6 +4519,36 @@ async fn run(command: Option<Command>) -> Result<()> {
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
+                    commands::OverrideChange::resolve_execution_deadline(
+                        execution_deadline,
+                        clear_execution_deadline,
+                    )?,
+                )
+                .await?,
+            ),
+            LocalAction::PublicationPolicy {
+                agent,
+                policy,
+                draft,
+                no_draft,
+                branch_prefix,
+                clear_branch_prefix,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit(
+                commands::publication_policy(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    policy,
+                    draft,
+                    no_draft,
+                    branch_prefix,
+                    clear_branch_prefix,
                 )
                 .await?,
             ),
@@ -5092,6 +5608,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_model,
                 thinking,
                 clear_thinking,
+                execution_deadline,
+                clear_execution_deadline,
                 conn,
                 dry_run,
             } => {
@@ -5102,6 +5620,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
+                let execution_deadline = commands::OverrideChange::resolve_execution_deadline(
+                    execution_deadline,
+                    clear_execution_deadline,
+                )?;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
@@ -5114,6 +5636,35 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         model,
                         thinking,
+                        execution_deadline,
+                    )
+                    .await?,
+                )
+            }
+            ClusterAction::PublicationPolicy {
+                agent,
+                policy,
+                draft,
+                no_draft,
+                branch_prefix,
+                clear_branch_prefix,
+                conn,
+                dry_run,
+            } => {
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::publication_policy(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        policy,
+                        draft,
+                        no_draft,
+                        branch_prefix,
+                        clear_branch_prefix,
                     )
                     .await?,
                 )
@@ -5217,6 +5768,31 @@ async fn run(command: Option<Command>) -> Result<()> {
                         thread_key,
                         yes,
                     )
+                    .await?,
+                )
+            }
+            ClusterAction::WorkItems {
+                id,
+                agent,
+                conn,
+                dry_run,
+            } => {
+                // Validate before any network access, through the centralized
+                // structured error path (cli/CLAUDE.md error contract).
+                let id = commands::validated_work_item_id(id)?;
+                // `_cluster_api_pf` is the port-forward guard; it must live for
+                // the whole call.
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::work_items(commands::WorkItemsOpts {
+                        api_url,
+                        api_key,
+                        id,
+                        agent,
+                        dry_run,
+                        tier: "cluster",
+                    })
                     .await?,
                 )
             }
@@ -5391,12 +5967,31 @@ async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Guide) => curie::guide::run(),
         Some(Command::Apply {
             file,
+            init,
+            context,
             dry_run,
             chart,
             migrate_store,
             allow_stateful_removal,
         }) => {
+            if init {
+                curie::installation::write_starter(&file)?;
+                return emit(curie::installation::ApplyOutput::WroteStarter {
+                    path: file.display().to_string(),
+                });
+            }
             let cfg = curie::installation::Installation::load(&file)?;
+            if let Some(target) =
+                curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
+                    context.as_deref(),
+                    cfg.install.context.as_deref(),
+                ))?
+            {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
+            }
             let local = curie::installation::plan_installation(cfg, dry_run)?;
             let resolved = artifacts::resolve_chart(
                 chart.as_deref(),
@@ -5435,6 +6030,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             .await?,
         ),
         Some(Command::Doctor {
+            context,
             namespace,
             release,
             api_url,
@@ -5465,6 +6061,19 @@ async fn run(command: Option<Command>) -> Result<()> {
                          falling back to the {defaults}"
                     ));
                 }
+            }
+            if let Some(target) =
+                curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
+                    context.as_deref(),
+                    declared
+                        .as_ref()
+                        .and_then(|cfg| cfg.install.context.as_deref()),
+                ))?
+            {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
             }
             let target = curie::doctor::resolve_target(
                 namespace.as_deref(),
@@ -5511,8 +6120,27 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             emit(out)
         }
-        Some(Command::Diff { file, chart }) => {
+        Some(Command::Diff {
+            file,
+            context,
+            chart,
+        }) => {
             let cfg = curie::installation::Installation::load(&file)?;
+            let cluster = match curie::kube_context::pin_for_cluster_command(
+                curie::installation::resolve_context(
+                    context.as_deref(),
+                    cfg.install.context.as_deref(),
+                ),
+            )? {
+                Some(target) => {
+                    ui::ui().note(&format!(
+                        "Kubernetes context: {} (cluster {})",
+                        target.context, target.cluster
+                    ));
+                    Some(target.cluster).filter(|name| !name.is_empty())
+                }
+                None => None,
+            };
             // Lenient on purpose: `diff` mutates nothing, so a credential it
             // cannot resolve must not withhold the answer. See
             // installation::resolve_credentials_lenient.
@@ -5550,6 +6178,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 curie::installation::diff(curie::installation::DiffOpts {
                     local,
                     unresolved_credentials: missing,
+                    cluster,
                     chart,
                     chart_target,
                 })
@@ -5566,7 +6195,33 @@ mod tests {
 
     #[test]
     fn clap_surface_is_valid() {
-        Cli::command().debug_assert();
+        on_parse_stack(|| Cli::command().debug_assert());
+    }
+
+    /// clap's derived parser is deep enough that debug bin tests overflow the
+    /// default thread stack once apply/diff/doctor grew `--context`. The
+    /// released binary still parses on the process stack; only the test
+    /// harness needs the extra room.
+    fn on_parse_stack<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name("cli-parse".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn cli parse thread")
+            .join()
+            .expect("cli parse thread")
+    }
+
+    fn try_parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T> + Send + 'static,
+        T: Into<std::ffi::OsString> + Clone + Send + 'static,
+    {
+        on_parse_stack(move || Cli::try_parse_from(args))
     }
 
     fn message_value_flags(path: &[&str]) -> std::collections::BTreeSet<String> {
@@ -5621,16 +6276,18 @@ mod tests {
 
     #[test]
     fn message_preflight_value_flags_match_clap_command_graph() {
-        let mut derived = message_value_flags(&["local", "message"]);
-        derived.extend(message_value_flags(&["cluster", "message"]));
-        let source = message_value_flags_from_source();
-        let missing: Vec<_> = derived.difference(&source).cloned().collect();
-        let stale: Vec<_> = source.difference(&derived).cloned().collect();
+        on_parse_stack(|| {
+            let mut derived = message_value_flags(&["local", "message"]);
+            derived.extend(message_value_flags(&["cluster", "message"]));
+            let source = message_value_flags_from_source();
+            let missing: Vec<_> = derived.difference(&source).cloned().collect();
+            let stale: Vec<_> = source.difference(&derived).cloned().collect();
 
-        assert!(
-            missing.is_empty() && stale.is_empty(),
-            "message value flag inventory drifted from clap: missing={missing:?}, stale={stale:?}, derived={derived:?}, source={source:?}"
-        );
+            assert!(
+                missing.is_empty() && stale.is_empty(),
+                "message value flag inventory drifted from clap: missing={missing:?}, stale={stale:?}, derived={derived:?}, source={source:?}"
+            );
+        });
     }
 
     /// Serializes the `cluster_connector_bind_values` cases that mutate the
@@ -5722,9 +6379,9 @@ mod tests {
     fn skill_approvals_accepts_list_and_resolve_to_decline_them() {
         // The flags exist so the skill tier DECLINES them with a reason
         // (ADR-0077), not clap-erroring like an unknown-flag typo.
-        Cli::try_parse_from(["curie", "skill", "approvals", "--list"])
+        try_parse_from(["curie", "skill", "approvals", "--list"])
             .expect("skill approvals --list should parse");
-        Cli::try_parse_from(["curie", "skill", "approvals", "--resolve", "abc"])
+        try_parse_from(["curie", "skill", "approvals", "--resolve", "abc"])
             .expect("skill approvals --resolve should parse");
     }
 
@@ -5777,10 +6434,10 @@ mod tests {
         let previous = std::env::var("CURIE_GITHUB_TOKEN").ok();
 
         std::env::set_var("CURIE_GITHUB_TOKEN", "ghp-SENTINEL-1124-leak-canary"); // gitleaks:allow -- test leak canary, not a real token
-        let from_env = Cli::try_parse_from(["curie", "cluster", "up"])
+        let from_env = try_parse_from(["curie", "cluster", "up"])
             .expect("cluster up should parse with only the env var set");
         std::env::remove_var("CURIE_GITHUB_TOKEN");
-        let without = Cli::try_parse_from(["curie", "cluster", "up"])
+        let without = try_parse_from(["curie", "cluster", "up"])
             .expect("cluster up should parse with nothing set");
         match previous {
             Some(value) => std::env::set_var("CURIE_GITHUB_TOKEN", value),
@@ -5811,9 +6468,8 @@ mod tests {
 
     #[test]
     fn cluster_upgrade_requires_to_and_reads_namespace_env() {
-        let parsed =
-            Cli::try_parse_from(["curie", "cluster", "upgrade", "--to", "0.9.0", "--dry-run"])
-                .expect("cluster upgrade --to should parse");
+        let parsed = try_parse_from(["curie", "cluster", "upgrade", "--to", "0.9.0", "--dry-run"])
+            .expect("cluster upgrade --to should parse");
         match parsed.command {
             Some(Command::Cluster {
                 action:
@@ -5831,7 +6487,7 @@ mod tests {
             }
             _ => panic!("expected cluster upgrade"),
         }
-        let missing = Cli::try_parse_from(["curie", "cluster", "upgrade"]);
+        let missing = try_parse_from(["curie", "cluster", "upgrade"]);
         assert!(missing.is_err(), "--to is required");
     }
 
@@ -5846,7 +6502,7 @@ mod tests {
         let previous = std::env::var("CURIE_GITHUB_TOKEN").ok();
         std::env::remove_var("CURIE_GITHUB_TOKEN");
 
-        let both = Cli::try_parse_from([
+        let both = try_parse_from([
             "curie",
             "cluster",
             "up",
@@ -5856,14 +6512,14 @@ mod tests {
         ]);
         // Each alone still parses, so the rejection is the conflict and not a
         // broken flag.
-        let set_only = Cli::try_parse_from([
+        let set_only = try_parse_from([
             "curie",
             "cluster",
             "up",
             "--github-token",
             "ghp-SENTINEL-1124-leak-canary",
         ]);
-        let clear_only = Cli::try_parse_from(["curie", "cluster", "up", "--clear-github-token"]);
+        let clear_only = try_parse_from(["curie", "cluster", "up", "--clear-github-token"]);
 
         if let Some(value) = previous {
             std::env::set_var("CURIE_GITHUB_TOKEN", value);
@@ -5888,20 +6544,20 @@ mod tests {
         // `conflicts_with` declared on one arg is mutual. Each flag alone must
         // still parse: a conflict naming an arg id that does not exist panics
         // at parse time, and the "alone" arms are what catch that.
-        let both = Cli::try_parse_from([
+        let both = try_parse_from([
             "curie",
             "apply",
             "--migrate-store",
             "--allow-stateful-removal",
         ]);
-        let reversed = Cli::try_parse_from([
+        let reversed = try_parse_from([
             "curie",
             "apply",
             "--allow-stateful-removal",
             "--migrate-store",
         ]);
-        let migrate_only = Cli::try_parse_from(["curie", "apply", "--migrate-store"]);
-        let allow_only = Cli::try_parse_from(["curie", "apply", "--allow-stateful-removal"]);
+        let migrate_only = try_parse_from(["curie", "apply", "--migrate-store"]);
+        let allow_only = try_parse_from(["curie", "apply", "--allow-stateful-removal"]);
 
         assert!(
             both.is_err(),
@@ -5920,12 +6576,12 @@ mod tests {
 
     #[test]
     fn build_defaults_tag_and_accepts_override() {
-        let cli = Cli::try_parse_from(["curie", "build"]).expect("build should parse");
+        let cli = try_parse_from(["curie", "build"]).expect("build should parse");
         match cli.command {
             Some(Command::Build { tag, .. }) => assert_eq!(tag, "curie-runner"),
             _ => panic!("expected build command"),
         }
-        let cli = Cli::try_parse_from(["curie", "build", "--tag", "my-runner:dev"])
+        let cli = try_parse_from(["curie", "build", "--tag", "my-runner:dev"])
             .expect("build --tag should parse");
         match cli.command {
             Some(Command::Build { tag, .. }) => assert_eq!(tag, "my-runner:dev"),
@@ -5935,13 +6591,13 @@ mod tests {
 
     #[test]
     fn list_agents_parses() {
-        let cli = Cli::try_parse_from(["curie", "list-agents"]).expect("list-agents should parse");
+        let cli = try_parse_from(["curie", "list-agents"]).expect("list-agents should parse");
         assert!(matches!(cli.command, Some(Command::ListAgents)));
     }
 
     #[test]
     fn deploy_local_parses_the_folder_positional_and_defaults() {
-        let cli = Cli::try_parse_from(["curie", "deploy-local", "revenue-leak"])
+        let cli = try_parse_from(["curie", "deploy-local", "revenue-leak"])
             .expect("deploy-local should parse");
         match cli.command {
             Some(Command::DeployLocal {
@@ -5960,13 +6616,13 @@ mod tests {
 
     #[test]
     fn no_subcommand_defaults_to_interactive() {
-        let cli = Cli::try_parse_from(["curie"]).expect("bare curie should parse");
+        let cli = try_parse_from(["curie"]).expect("bare curie should parse");
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn install_parses() {
-        let cli = Cli::try_parse_from(["curie", "install"]).expect("install should parse");
+        let cli = try_parse_from(["curie", "install"]).expect("install should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Install { update: false })
@@ -5975,8 +6631,7 @@ mod tests {
 
     #[test]
     fn install_update_parses() {
-        let cli =
-            Cli::try_parse_from(["curie", "install", "--update"]).expect("install should parse");
+        let cli = try_parse_from(["curie", "install", "--update"]).expect("install should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Install { update: true })
@@ -5986,7 +6641,7 @@ mod tests {
     #[test]
     fn skill_eval_model_is_repeatable_for_a_sweep() {
         // No --model -> drive the running runner (empty models vec).
-        match Cli::try_parse_from(["curie", "skill", "eval"])
+        match try_parse_from(["curie", "skill", "eval"])
             .expect("skill eval should parse")
             .command
         {
@@ -5996,7 +6651,7 @@ mod tests {
             _ => panic!("expected skill eval"),
         }
         // Repeated --model collects into the sweep list.
-        match Cli::try_parse_from([
+        match try_parse_from([
             "curie",
             "skill",
             "eval",
@@ -6018,7 +6673,7 @@ mod tests {
     #[test]
     fn local_and_cluster_eval_model_are_repeatable_for_a_sweep() {
         // local eval --model repeats into the sweep list (#526).
-        match Cli::try_parse_from([
+        match try_parse_from([
             "curie", "local", "eval", "--model", "opus", "--model", "sonnet",
         ])
         .expect("local eval sweep should parse")
@@ -6030,7 +6685,7 @@ mod tests {
             _ => panic!("expected local eval sweep"),
         }
         // Bare local eval -> no models (the in-CLI parity gate).
-        match Cli::try_parse_from(["curie", "local", "eval"])
+        match try_parse_from(["curie", "local", "eval"])
             .expect("local eval should parse")
             .command
         {
@@ -6040,7 +6695,7 @@ mod tests {
             _ => panic!("expected local eval"),
         }
         // cluster eval --model likewise.
-        match Cli::try_parse_from(["curie", "cluster", "eval", "--model", "opus"])
+        match try_parse_from(["curie", "cluster", "eval", "--model", "opus"])
             .expect("cluster eval sweep should parse")
             .command
         {
@@ -6057,7 +6712,7 @@ mod tests {
         // #2007: `--case-id` is the eval case SELECTOR (distinct from `--cases`,
         // the suite FILE). Absent means the whole suite; repeated means a subset,
         // and a value matching nothing exits 2 rather than greening an empty run.
-        match Cli::try_parse_from([
+        match try_parse_from([
             "curie",
             "skill",
             "eval",
@@ -6074,7 +6729,7 @@ mod tests {
             }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
             _ => panic!("expected skill eval with a selector"),
         }
-        match Cli::try_parse_from(["curie", "skill", "eval"])
+        match try_parse_from(["curie", "skill", "eval"])
             .expect("skill eval should parse")
             .command
         {
@@ -6083,7 +6738,7 @@ mod tests {
             }) => assert!(case_id.is_empty(), "no selector -> the whole suite"),
             _ => panic!("expected skill eval"),
         }
-        match Cli::try_parse_from([
+        match try_parse_from([
             "curie",
             "local",
             "eval",
@@ -6100,7 +6755,7 @@ mod tests {
             }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
             _ => panic!("expected local eval with a selector"),
         }
-        match Cli::try_parse_from(["curie", "local", "eval"])
+        match try_parse_from(["curie", "local", "eval"])
             .expect("local eval should parse")
             .command
         {
@@ -6109,7 +6764,7 @@ mod tests {
             }) => assert!(case_id.is_empty()),
             _ => panic!("expected local eval"),
         }
-        match Cli::try_parse_from([
+        match try_parse_from([
             "curie",
             "cluster",
             "eval",
@@ -6127,7 +6782,7 @@ mod tests {
             }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
             _ => panic!("expected cluster eval with a selector"),
         }
-        match Cli::try_parse_from(["curie", "cluster", "eval"])
+        match try_parse_from(["curie", "cluster", "eval"])
             .expect("cluster eval should parse")
             .command
         {
@@ -6141,13 +6796,13 @@ mod tests {
 
     #[test]
     fn update_parses_with_and_without_image() {
-        let bare = Cli::try_parse_from(["curie", "update"]).expect("update should parse");
+        let bare = try_parse_from(["curie", "update"]).expect("update should parse");
         assert!(matches!(
             bare.command,
             Some(Command::Update { image: false })
         ));
         let with_image =
-            Cli::try_parse_from(["curie", "update", "--image"]).expect("update should parse");
+            try_parse_from(["curie", "update", "--image"]).expect("update should parse");
         assert!(matches!(
             with_image.command,
             Some(Command::Update { image: true })
@@ -6156,17 +6811,17 @@ mod tests {
 
     #[test]
     fn interactive_parses_with_aliases() {
-        let cli = Cli::try_parse_from(["curie", "interactive"]).expect("interactive should parse");
+        let cli = try_parse_from(["curie", "interactive"]).expect("interactive should parse");
         assert!(matches!(cli.command, Some(Command::Interactive)));
-        let cli = Cli::try_parse_from(["curie", "ui"]).expect("ui alias should parse");
+        let cli = try_parse_from(["curie", "ui"]).expect("ui alias should parse");
         assert!(matches!(cli.command, Some(Command::Interactive)));
-        let cli = Cli::try_parse_from(["curie", "tui"]).expect("tui alias should parse");
+        let cli = try_parse_from(["curie", "tui"]).expect("tui alias should parse");
         assert!(matches!(cli.command, Some(Command::Interactive)));
     }
 
     #[test]
     fn secrets_subcommands_parse() {
-        let cli = Cli::try_parse_from(["curie", "secrets", "set", "GITHUB_TOKEN"])
+        let cli = try_parse_from(["curie", "secrets", "set", "GITHUB_TOKEN"])
             .expect("secrets set should parse");
         assert!(matches!(
             cli.command,
@@ -6174,7 +6829,7 @@ mod tests {
                 action: SecretsAction::Set { .. }
             })
         ));
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "secrets",
             "set",
@@ -6192,15 +6847,14 @@ mod tests {
                 }
             })
         ));
-        let cli =
-            Cli::try_parse_from(["curie", "secrets", "list"]).expect("secrets list should parse");
+        let cli = try_parse_from(["curie", "secrets", "list"]).expect("secrets list should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Secrets {
                 action: SecretsAction::List
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "secrets", "unset", "GITHUB_TOKEN"])
+        let cli = try_parse_from(["curie", "secrets", "unset", "GITHUB_TOKEN"])
             .expect("secrets unset should parse");
         assert!(matches!(
             cli.command,
@@ -6208,7 +6862,7 @@ mod tests {
                 action: SecretsAction::Unset { .. }
             })
         ));
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "secrets",
             "set",
@@ -6240,22 +6894,22 @@ mod tests {
     #[test]
     fn dev_subcommands_parse() {
         let cli =
-            Cli::try_parse_from(["curie", "dev", "contracts"]).expect("dev contracts should parse");
+            try_parse_from(["curie", "dev", "contracts"]).expect("dev contracts should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
                 action: DevAction::Contracts
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "chart-check"])
-            .expect("dev chart-check should parse");
+        let cli =
+            try_parse_from(["curie", "dev", "chart-check"]).expect("dev chart-check should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
                 action: DevAction::ChartCheck
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "e2e"]).expect("dev e2e should parse");
+        let cli = try_parse_from(["curie", "dev", "e2e"]).expect("dev e2e should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
@@ -6263,14 +6917,14 @@ mod tests {
             })
         ));
         let cli =
-            Cli::try_parse_from(["curie", "dev", "docs-lint"]).expect("dev docs-lint should parse");
+            try_parse_from(["curie", "dev", "docs-lint"]).expect("dev docs-lint should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
                 action: DevAction::DocsLint
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "agent-skills"])
+        let cli = try_parse_from(["curie", "dev", "agent-skills"])
             .expect("dev agent-skills should parse");
         assert!(matches!(
             cli.command,
@@ -6278,7 +6932,7 @@ mod tests {
                 action: DevAction::AgentSkills
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "eval-falsifiability"])
+        let cli = try_parse_from(["curie", "dev", "eval-falsifiability"])
             .expect("dev eval-falsifiability should parse");
         assert!(matches!(
             cli.command,
@@ -6286,15 +6940,15 @@ mod tests {
                 action: DevAction::EvalFalsifiability
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "e2e-ladder"])
-            .expect("dev e2e-ladder should parse");
+        let cli =
+            try_parse_from(["curie", "dev", "e2e-ladder"]).expect("dev e2e-ladder should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
                 action: DevAction::E2eLadder
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "sre-demo-e2e"])
+        let cli = try_parse_from(["curie", "dev", "sre-demo-e2e"])
             .expect("dev sre-demo-e2e should parse");
         assert!(matches!(
             cli.command,
@@ -6302,7 +6956,7 @@ mod tests {
                 action: DevAction::SreDemoE2e
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "two-release-approval-e2e"])
+        let cli = try_parse_from(["curie", "dev", "two-release-approval-e2e"])
             .expect("dev two-release-approval-e2e should parse");
         assert!(matches!(
             cli.command,
@@ -6310,7 +6964,23 @@ mod tests {
                 action: DevAction::TwoReleaseApprovalE2e
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e"])
+        let cli = try_parse_from([
+            "curie",
+            "dev",
+            "factory-e2e",
+            "run",
+            "--scenario",
+            "revision",
+        ])
+        .expect("dev factory-e2e should pass its mode and flags through");
+        match cli.command {
+            Some(Command::Dev {
+                action: DevAction::FactoryE2e { args },
+            }) => assert_eq!(args, ["run", "--scenario", "revision"]),
+            _ => panic!("dev factory-e2e parsed as another command"),
+        }
+        assert!(try_parse_from(["curie", "dev", "factory-e2e"]).is_err());
+        let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
             .expect("dev chart-runtime-e2e should parse");
         assert!(matches!(
             cli.command,
@@ -6321,7 +6991,7 @@ mod tests {
         // The script's context guard names `--force` as its only override, so the
         // flag has to survive the `curie dev` hop or the guard is unoverridable
         // through the documented entry point.
-        let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e", "--force"])
+        let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e", "--force"])
             .expect("dev chart-runtime-e2e --force should parse");
         assert!(matches!(
             cli.command,
@@ -6329,7 +6999,7 @@ mod tests {
                 action: DevAction::ChartRuntimeE2e { force: true }
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "restore-drill"])
+        let cli = try_parse_from(["curie", "dev", "restore-drill"])
             .expect("dev restore-drill should parse");
         assert!(matches!(
             cli.command,
@@ -6341,7 +7011,7 @@ mod tests {
                 }
             })
         ));
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "dev",
             "restore-drill",
@@ -6363,7 +7033,7 @@ mod tests {
                 }
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "recovery-drill"])
+        let cli = try_parse_from(["curie", "dev", "recovery-drill"])
             .expect("dev recovery-drill should parse");
         assert!(matches!(
             cli.command,
@@ -6371,7 +7041,7 @@ mod tests {
                 action: DevAction::RecoveryDrill { .. }
             })
         ));
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "dev",
             "recovery-drill",
@@ -6401,7 +7071,7 @@ mod tests {
             }
             _ => panic!("expected recovery-drill"),
         }
-        let cli = Cli::try_parse_from(["curie", "dev", "lease-expiry-cluster-proof"])
+        let cli = try_parse_from(["curie", "dev", "lease-expiry-cluster-proof"])
             .expect("dev lease-expiry-cluster-proof should parse");
         assert!(matches!(
             cli.command,
@@ -6409,7 +7079,7 @@ mod tests {
                 action: DevAction::LeaseExpiryClusterProof { .. }
             })
         ));
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "dev",
             "lease-expiry-cluster-proof",
@@ -6433,7 +7103,7 @@ mod tests {
             }
             _ => panic!("expected lease-expiry-cluster-proof"),
         }
-        let cli = Cli::try_parse_from(["curie", "dev", "upgrade-drill"])
+        let cli = try_parse_from(["curie", "dev", "upgrade-drill"])
             .expect("dev upgrade-drill should parse");
         assert!(matches!(
             cli.command,
@@ -6441,7 +7111,7 @@ mod tests {
                 action: DevAction::UpgradeDrill { .. }
             })
         ));
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "dev",
             "upgrade-drill",
@@ -6472,7 +7142,7 @@ mod tests {
             }
             _ => panic!("expected upgrade-drill"),
         }
-        let cli = Cli::try_parse_from(["curie", "dev", "release-accept"])
+        let cli = try_parse_from(["curie", "dev", "release-accept"])
             .expect("dev release-accept should parse");
         assert!(matches!(
             cli.command,
@@ -6483,7 +7153,7 @@ mod tests {
                 }
             })
         ));
-        let cli = Cli::try_parse_from(["curie", "dev", "release-accept", "--self-test"])
+        let cli = try_parse_from(["curie", "dev", "release-accept", "--self-test"])
             .expect("dev release-accept --self-test should parse");
         match cli.command {
             Some(Command::Dev {
@@ -6494,9 +7164,8 @@ mod tests {
             }
             _ => panic!("expected release-accept"),
         }
-        let cli =
-            Cli::try_parse_from(["curie", "dev", "release-accept", "--ledger", "ledger.json"])
-                .expect("dev release-accept --ledger should parse");
+        let cli = try_parse_from(["curie", "dev", "release-accept", "--ledger", "ledger.json"])
+            .expect("dev release-accept --ledger should parse");
         match cli.command {
             Some(Command::Dev {
                 action: DevAction::ReleaseAccept { ledger, self_test },
@@ -6506,7 +7175,7 @@ mod tests {
             }
             _ => panic!("expected release-accept"),
         }
-        let cli = Cli::try_parse_from(["curie", "dev", "cluster-upgrade-matrix"])
+        let cli = try_parse_from(["curie", "dev", "cluster-upgrade-matrix"])
             .expect("dev cluster-upgrade-matrix should parse");
         assert!(matches!(
             cli.command,
@@ -6514,7 +7183,7 @@ mod tests {
                 action: DevAction::ClusterUpgradeMatrix { .. }
             })
         ));
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "dev",
             "cluster-upgrade-matrix",
@@ -6550,13 +7219,13 @@ mod tests {
     // ship without ever being caught by the positive-path tests above.
     #[test]
     fn dev_unknown_subcommand_rejected() {
-        let result = Cli::try_parse_from(["curie", "dev", "e2e-ladder-typo"]);
+        let result = try_parse_from(["curie", "dev", "e2e-ladder-typo"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn local_message_accepts_api_key() {
-        let cli = Cli::try_parse_from(["curie", "local", "message", "--api-key", "K", "hi"])
+        let cli = try_parse_from(["curie", "local", "message", "--api-key", "K", "hi"])
             .expect("local message --api-key should parse");
         match cli.command {
             Some(Command::Local {
@@ -6571,7 +7240,7 @@ mod tests {
     /// handler discovers the release's own Secret instead.
     #[test]
     fn cluster_message_credentials_default_to_discovery() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "message", "hi"])
+        let cli = try_parse_from(["curie", "cluster", "message", "hi"])
             .expect("cluster message should parse");
         match cli.command {
             Some(Command::Cluster {
@@ -6595,7 +7264,7 @@ mod tests {
 
     #[test]
     fn cluster_message_accepts_explicit_credentials() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "message",
@@ -6628,8 +7297,7 @@ mod tests {
     /// mirror the same "no default, resolves to None" contract here.
     #[test]
     fn cluster_eval_credentials_default_to_discovery() {
-        let cli =
-            Cli::try_parse_from(["curie", "cluster", "eval"]).expect("cluster eval should parse");
+        let cli = try_parse_from(["curie", "cluster", "eval"]).expect("cluster eval should parse");
         match cli.command {
             Some(Command::Cluster {
                 action:
@@ -6652,7 +7320,7 @@ mod tests {
 
     #[test]
     fn cluster_eval_accepts_explicit_credentials() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "eval",
@@ -6685,8 +7353,7 @@ mod tests {
     /// message` (#1652 / #1740).
     #[test]
     fn cluster_eval_omitted_ports_default_to_ephemeral() {
-        let cli =
-            Cli::try_parse_from(["curie", "cluster", "eval"]).expect("cluster eval should parse");
+        let cli = try_parse_from(["curie", "cluster", "eval"]).expect("cluster eval should parse");
         match cli.command {
             Some(Command::Cluster {
                 action:
@@ -6719,8 +7386,8 @@ mod tests {
     /// PR did not reach. An omitted flag must request a kernel-assigned port.
     #[test]
     fn cluster_deploy_defaults_api_local_port_to_zero() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "deploy"])
-            .expect("cluster deploy should parse");
+        let cli =
+            try_parse_from(["curie", "cluster", "deploy"]).expect("cluster deploy should parse");
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { api_local_port, .. },
@@ -6738,7 +7405,7 @@ mod tests {
     /// occupied-port refusal when it is squatted).
     #[test]
     fn an_explicit_api_local_port_is_honoured() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "deploy", "--api-local-port", "18123"])
+        let cli = try_parse_from(["curie", "cluster", "deploy", "--api-local-port", "18123"])
             .expect("cluster deploy with an explicit port should parse");
         match cli.command {
             Some(Command::Cluster {
@@ -6751,7 +7418,7 @@ mod tests {
 
     #[test]
     fn cluster_eval_preserves_explicit_port_overrides() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "eval",
@@ -6784,8 +7451,8 @@ mod tests {
 
     #[test]
     fn cluster_deploy_defaults_to_proxy_discovery() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "deploy"])
-            .expect("cluster deploy should parse");
+        let cli =
+            try_parse_from(["curie", "cluster", "deploy"]).expect("cluster deploy should parse");
         match cli.command {
             Some(Command::Cluster {
                 action:
@@ -6807,7 +7474,7 @@ mod tests {
 
     #[test]
     fn cluster_deploy_accepts_explicit_api_url() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "deploy",
@@ -6826,7 +7493,7 @@ mod tests {
 
     #[test]
     fn cluster_deploy_captures_namespace_and_release() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "deploy",
@@ -6860,7 +7527,7 @@ mod tests {
         ];
 
         for (argv, verb) in cases {
-            let cli = Cli::try_parse_from(argv).expect("local verb accepts -f");
+            let cli = try_parse_from(argv).expect("local verb accepts -f");
             match cli.command {
                 Some(Command::Local {
                     action: LocalAction::Up { files, .. },
@@ -6887,7 +7554,7 @@ mod tests {
 
     #[test]
     fn local_up_parses_minimal_flag() {
-        let cli = Cli::try_parse_from(["curie", "local", "up", "--minimal"])
+        let cli = try_parse_from(["curie", "local", "up", "--minimal"])
             .expect("local up --minimal should parse");
         match cli.command {
             Some(Command::Local {
@@ -6899,7 +7566,7 @@ mod tests {
 
     #[test]
     fn local_up_parses_slack_flag() {
-        let cli = Cli::try_parse_from(["curie", "local", "up", "--slack"])
+        let cli = try_parse_from(["curie", "local", "up", "--slack"])
             .expect("local up --slack should parse");
         match cli.command {
             Some(Command::Local {
@@ -6911,7 +7578,7 @@ mod tests {
 
     #[test]
     fn local_comms_parses_slack_disconnect_and_app_token() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "local",
             "comms",
@@ -6963,7 +7630,7 @@ mod tests {
     fn cluster_governance_verbs_take_namespace_and_release() {
         // The discovery flags exist on a cluster governance verb so an omitted
         // --api-url/--api-key can be resolved from the named release (#524).
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "versions",
@@ -6993,7 +7660,7 @@ mod tests {
 
     #[test]
     fn cluster_kill_parses_agent_and_yes() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "kill", "deal-desk", "--yes"])
+        let cli = try_parse_from(["curie", "cluster", "kill", "deal-desk", "--yes"])
             .expect("cluster kill should parse");
         match cli.command {
             Some(Command::Cluster {
@@ -7009,7 +7676,7 @@ mod tests {
 
     #[test]
     fn cluster_kill_defaults_yes_and_dry_run_off() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "kill", "a"])
+        let cli = try_parse_from(["curie", "cluster", "kill", "a"])
             .expect("cluster kill without flags should parse");
         match cli.command {
             Some(Command::Cluster {
@@ -7032,7 +7699,7 @@ mod tests {
 
     #[test]
     fn cluster_resume_parses_agent_and_dry_run() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "resume", "a", "--dry-run"])
+        let cli = try_parse_from(["curie", "cluster", "resume", "a", "--dry-run"])
             .expect("cluster resume should parse");
         match cli.command {
             Some(Command::Cluster {
@@ -7048,7 +7715,7 @@ mod tests {
 
     #[test]
     fn cluster_budget_parses_agent_and_limit() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "budget", "a", "--limit", "12.5"])
+        let cli = try_parse_from(["curie", "cluster", "budget", "a", "--limit", "12.5"])
             .expect("cluster budget should parse");
         match cli.command {
             Some(Command::Cluster {
@@ -7064,7 +7731,7 @@ mod tests {
 
     #[test]
     fn cluster_reset_thread_parses_agent_thread_key_and_yes() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "reset-thread",
@@ -7095,7 +7762,7 @@ mod tests {
 
     #[test]
     fn cluster_reset_thread_defaults_yes_and_dry_run_off() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "reset-thread",
@@ -7128,14 +7795,14 @@ mod tests {
     #[test]
     fn cluster_reset_thread_requires_thread_key() {
         // --thread-key has no default; omitting it must be a parse error.
-        assert!(Cli::try_parse_from(["curie", "cluster", "reset-thread", "a", "--yes"]).is_err());
+        assert!(try_parse_from(["curie", "cluster", "reset-thread", "a", "--yes"]).is_err());
     }
 
     #[test]
     fn local_platform_verbs_parse() {
         // The inspection/governance verbs mirrored onto the local tier.
         assert!(matches!(
-            Cli::try_parse_from(["curie", "local", "versions", "gh"])
+            try_parse_from(["curie", "local", "versions", "gh"])
                 .expect("local versions")
                 .command,
             Some(Command::Local {
@@ -7143,7 +7810,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            Cli::try_parse_from(["curie", "local", "memory", "gh"])
+            try_parse_from(["curie", "local", "memory", "gh"])
                 .expect("local memory")
                 .command,
             Some(Command::Local {
@@ -7151,7 +7818,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            Cli::try_parse_from(["curie", "local", "observability"])
+            try_parse_from(["curie", "local", "observability"])
                 .expect("local observability")
                 .command,
             Some(Command::Local {
@@ -7159,13 +7826,13 @@ mod tests {
             })
         ));
         // local budget/kill/resume are the mirrored lifecycle verbs.
-        assert!(Cli::try_parse_from(["curie", "local", "budget", "gh", "--limit", "1"]).is_ok());
-        assert!(Cli::try_parse_from(["curie", "local", "kill", "gh", "--yes"]).is_ok());
+        assert!(try_parse_from(["curie", "local", "budget", "gh", "--limit", "1"]).is_ok());
+        assert!(try_parse_from(["curie", "local", "kill", "gh", "--yes"]).is_ok());
     }
 
     #[test]
     fn local_memory_add_parses_agent_and_content() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "local",
             "memory",
@@ -7187,7 +7854,7 @@ mod tests {
 
     #[test]
     fn cluster_memory_add_parses_agent_and_content() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "memory",
@@ -7211,7 +7878,7 @@ mod tests {
     #[test]
     fn local_memory_list_still_parses_without_add() {
         assert!(matches!(
-            Cli::try_parse_from(["curie", "local", "memory", "translation-bot"])
+            try_parse_from(["curie", "local", "memory", "translation-bot"])
                 .expect("local memory list")
                 .command,
             Some(Command::Local {
@@ -7222,7 +7889,7 @@ mod tests {
 
     #[test]
     fn local_reset_thread_parses_agent_thread_key_and_yes() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "local",
             "reset-thread",
@@ -7256,7 +7923,7 @@ mod tests {
     fn local_reset_thread_dry_run_skips_yes_requirement_at_parse_time() {
         // --dry-run parses fine without --yes; the refusal-without-yes check
         // happens in commands::reset_thread, not at the clap layer.
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "local",
             "reset-thread",
@@ -7285,7 +7952,7 @@ mod tests {
     #[test]
     fn local_observability_open_flag_defaults_off_and_parses() {
         // Bare `local observability` must NOT open a browser (agent-first default).
-        match Cli::try_parse_from(["curie", "local", "observability"])
+        match try_parse_from(["curie", "local", "observability"])
             .expect("local observability")
             .command
         {
@@ -7295,7 +7962,7 @@ mod tests {
             _ => panic!("expected local observability command"),
         }
         // `--open` is the explicit human opt-in.
-        match Cli::try_parse_from(["curie", "local", "observability", "--open"])
+        match try_parse_from(["curie", "local", "observability", "--open"])
             .expect("local observability --open")
             .command
         {
@@ -7308,7 +7975,7 @@ mod tests {
 
     #[test]
     fn cluster_observability_parses_with_namespace_release_defaults() {
-        match Cli::try_parse_from(["curie", "cluster", "observability"])
+        match try_parse_from(["curie", "cluster", "observability"])
             .expect("cluster observability")
             .command
         {
@@ -7336,7 +8003,7 @@ mod tests {
     fn cluster_observability_accepts_the_global_json_flag() {
         // `--json` is a GLOBAL flag on `Cli` (issue #456), not a subcommand flag,
         // so it parses onto the top-level struct while the subcommand still binds.
-        let cli = Cli::try_parse_from(["curie", "cluster", "observability", "--json"])
+        let cli = try_parse_from(["curie", "cluster", "observability", "--json"])
             .expect("cluster observability --json");
         assert!(cli.json, "--json must set the global json flag");
         assert!(matches!(
@@ -7350,7 +8017,7 @@ mod tests {
 
     #[test]
     fn cluster_observability_parses_open_and_dry_run_together() {
-        match Cli::try_parse_from(["curie", "cluster", "observability", "--open", "--dry-run"])
+        match try_parse_from(["curie", "cluster", "observability", "--open", "--dry-run"])
             .expect("cluster observability --open --dry-run")
             .command
         {
@@ -7367,7 +8034,7 @@ mod tests {
 
     #[test]
     fn approvals_parses_repeatable_gate_and_clear() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "local",
             "approvals",
@@ -7395,19 +8062,19 @@ mod tests {
             _ => panic!("expected local approvals command"),
         }
         // --clear parses on both tiers.
-        assert!(Cli::try_parse_from(["curie", "cluster", "approvals", "gh", "--clear"]).is_ok());
+        assert!(try_parse_from(["curie", "cluster", "approvals", "gh", "--clear"]).is_ok());
     }
 
     #[test]
     fn cluster_budget_requires_limit() {
         // `--limit` has no default, so omitting it is a parse error (not a silent
         // zero-budget request).
-        assert!(Cli::try_parse_from(["curie", "cluster", "budget", "a"]).is_err());
+        assert!(try_parse_from(["curie", "cluster", "budget", "a"]).is_err());
     }
 
     #[test]
     fn cluster_delete_parses_agent_and_yes() {
-        let cli = Cli::try_parse_from(["curie", "cluster", "delete", "a", "--yes"])
+        let cli = try_parse_from(["curie", "cluster", "delete", "a", "--yes"])
             .expect("cluster delete should parse");
         match cli.command {
             Some(Command::Cluster {
@@ -7423,7 +8090,7 @@ mod tests {
 
     #[test]
     fn skill_approvals_parses_plugin_dir_and_repeatable_gate() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "skill",
             "approvals",
@@ -7455,7 +8122,7 @@ mod tests {
 
     #[test]
     fn skill_approvals_parses_clear() {
-        let cli = Cli::try_parse_from(["curie", "skill", "approvals", "--clear"])
+        let cli = try_parse_from(["curie", "skill", "approvals", "--clear"])
             .expect("skill approvals --clear should parse");
         match cli.command {
             Some(Command::Skill {
@@ -7472,9 +8139,7 @@ mod tests {
     fn skill_approvals_clear_and_gate_parse_ok_at_clap_layer() {
         // The --clear + --gate conflict is a RUNTIME usage error (asserted in the
         // commands.rs handler tests), not a clap parse error.
-        assert!(
-            Cli::try_parse_from(["curie", "skill", "approvals", "--clear", "--gate", "X"]).is_ok()
-        );
+        assert!(try_parse_from(["curie", "skill", "approvals", "--clear", "--gate", "X"]).is_ok());
     }
 
     #[test]
@@ -7482,7 +8147,7 @@ mod tests {
         // The verb EXISTS at the skill tier (answered, not a clap unknown
         // subcommand): parsing succeeds and the runtime reports unavailability.
         assert!(matches!(
-            Cli::try_parse_from(["curie", "skill", "versions"])
+            try_parse_from(["curie", "skill", "versions"])
                 .expect("skill versions should parse")
                 .command,
             Some(Command::Skill {
@@ -7495,7 +8160,7 @@ mod tests {
     fn cluster_deploy_accepts_secret_flag() {
         // `--secret` must PARSE (not error like a typo). Cluster delivery is
         // implemented (#1488); this lock is the clap surface, not the helm path.
-        match Cli::try_parse_from([
+        match try_parse_from([
             "curie",
             "cluster",
             "deploy",
@@ -7512,7 +8177,7 @@ mod tests {
             _ => panic!("expected cluster deploy"),
         }
         // Bare cluster deploy still parses with no secrets.
-        match Cli::try_parse_from(["curie", "cluster", "deploy"])
+        match try_parse_from(["curie", "cluster", "deploy"])
             .expect("bare cluster deploy should parse")
             .command
         {
@@ -7527,7 +8192,7 @@ mod tests {
     #[test]
     fn skill_memory_parses_as_a_known_verb() {
         assert!(matches!(
-            Cli::try_parse_from(["curie", "skill", "memory"])
+            try_parse_from(["curie", "skill", "memory"])
                 .expect("skill memory should parse")
                 .command,
             Some(Command::Skill {
@@ -7538,7 +8203,7 @@ mod tests {
 
     #[test]
     fn cluster_comms_parses_slack_disconnect_and_app_token() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "curie",
             "cluster",
             "comms",

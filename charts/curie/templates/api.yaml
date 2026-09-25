@@ -176,6 +176,14 @@ spec:
               value: {{ .Values.api.githubReviewIngressEnabled | quote }}
             - name: GITHUB_REVIEW_RECONCILER_INTERVAL_S
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
+            - name: GITHUB_FACTORY_INGRESS_ENABLED
+              value: {{ .Values.api.githubFactoryIngressEnabled | quote }}
+            - name: GITHUB_FACTORY_LABEL
+              value: {{ .Values.api.githubFactoryLabel | quote }}
+            - name: GITHUB_FACTORY_MENTION
+              value: {{ .Values.api.githubFactoryMention | quote }}
+            - name: GITHUB_FACTORY_CARD_BASE_URL
+              value: {{ .Values.api.githubFactoryCardBaseUrl | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the
@@ -220,6 +228,10 @@ spec:
               value: {{ .Values.api.environment | quote }}
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
+            # Runner sandboxes are claimed in the release namespace (the
+            # worker's CURIE_NAMESPACE), so the Logs tab's pod list reads there.
+            - name: RUNNER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             - name: COMMIT_POLL_INTERVAL_S
               value: {{ .Values.api.commitPollIntervalSeconds | quote }}
             - name: GITHUB_CLONE_BASE

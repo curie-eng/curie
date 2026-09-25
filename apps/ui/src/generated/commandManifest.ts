@@ -472,6 +472,24 @@ export const commandManifest = {
           "name": "memory"
         },
         {
+          "about": "Not available at this tier: the skill tier runs one bundle against a local runner and admits no factory work items; there is no platform API here to own them; use `curie local work-items` or `curie cluster work-items` against a platform API",
+          "args": [
+            {
+              "global": false,
+              "help": "Accepts any arguments so every form reaches the exit-4 capability refusal instead of a clap usage error (#2577, like #1955)",
+              "id": "_rest",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "work-items"
+        },
+        {
           "about": "Not available at this tier: the skill tier runs only a bundle runner and has no platform API or observability read service; `--otel-endpoint` can export telemetry but does not create a query API; use `curie local observability runs|run|metrics` or `curie cluster observability runs|run|metrics`; to export this skill runner's telemetry, restart it with `curie skill up --otel-endpoint <OTLP_URL>` and query through a platform API",
           "hidden": false,
           "name": "observability",
@@ -2194,6 +2212,26 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pin this agent's run deadline in seconds (60-10800; platform default is 1800s)",
+              "id": "execution_deadline",
+              "long": "execution-deadline",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the execution-deadline override back to the platform default",
+              "id": "clear_execution_deadline",
+              "long": "clear-execution-deadline",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -2230,6 +2268,110 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`).\n\nWith no flags this inspects. Both fields are nullable operator overrides of a platform default, so clearing is `--clear-<field>` (which sends JSON null) and never an empty value, which would skip the platform default rather than restore it.",
           "name": "overrides"
+        },
+        {
+          "about": "Read or set one agent's publication policy (`PATCH /agents/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "`approve` or `auto`",
+              "id": "policy",
+              "long": "policy",
+              "positional": false,
+              "possible_values": [
+                "approve",
+                "auto"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request as a draft. Only applied while policy is auto",
+              "id": "draft",
+              "long": "draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request ready for review",
+              "id": "no_draft",
+              "long": "no-draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Required branch prefix, ending in `/`",
+              "id": "branch_prefix",
+              "long": "branch-prefix",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the branch prefix",
+              "id": "clear_branch_prefix",
+              "long": "clear-branch-prefix",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set one agent's publication policy (`PATCH /agents/{id}`).\n\nWith no change flags this inspects. `approve` is the default and keeps the human gate. `auto` lets the platform resolve that same approval.",
+          "name": "publication-policy"
         },
         {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
@@ -2538,6 +2680,62 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "reset-thread"
+        },
+        {
+          "about": "List factory work item outcomes (`GET /work-items`), or read one with its live CI (`GET /work-items/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Work item id to read. Omit to list",
+              "id": "id",
+              "positional": true,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Scope to one agent (name or id)",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be requested and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "work-items"
         },
         {
           "about": "Delete an agent via the local platform API",
@@ -4329,6 +4527,26 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pin this agent's run deadline in seconds (60-10800; platform default is 1800s)",
+              "id": "execution_deadline",
+              "long": "execution-deadline",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the execution-deadline override back to the platform default",
+              "id": "clear_execution_deadline",
+              "long": "clear-execution-deadline",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -4385,6 +4603,130 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`).\n\nWith no flags this inspects. Both fields are nullable operator overrides of a platform default, so clearing is `--clear-<field>` (which sends JSON null) and never an empty value, which would skip the platform default rather than restore it.",
           "name": "overrides"
+        },
+        {
+          "about": "Read or set one agent's publication policy (`PATCH /agents/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "`approve` or `auto`",
+              "id": "policy",
+              "long": "policy",
+              "positional": false,
+              "possible_values": [
+                "approve",
+                "auto"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request as a draft. Only applied while policy is auto",
+              "id": "draft",
+              "long": "draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Open the pull request ready for review",
+              "id": "no_draft",
+              "long": "no-draft",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Required branch prefix, ending in `/`",
+              "id": "branch_prefix",
+              "long": "branch-prefix",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the branch prefix",
+              "id": "clear_branch_prefix",
+              "long": "clear-branch-prefix",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set one agent's publication policy (`PATCH /agents/{id}`).\n\nWith no change flags this inspects. `approve` is the default and keeps the human gate. `auto` lets the platform resolve that same approval.",
+          "name": "publication-policy"
         },
         {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
@@ -4833,6 +5175,81 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "delete"
+        },
+        {
+          "about": "List factory work item outcomes (`GET /work-items`), or read one with its live CI (`GET /work-items/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Work item id to read. Omit to list",
+              "id": "id",
+              "positional": true,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Scope to one agent (name or id)",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be requested and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "work-items"
         },
         {
           "about": "List an agent's immutable versions (`GET /agents/{id}/versions`)",
@@ -5671,6 +6088,24 @@ export const commandManifest = {
           "name": "two-release-approval-e2e"
         },
         {
+          "about": "Drive the dark factory against a disposable install on a named kube context, a real GitHub App and a fixture repository (#2966, `python3 tools/factory-e2e/factory_e2e.py`). `preflight` installs the candidate's published images with factory intake on, tunnels the api webhook, labels one issue, asserts the delivery is accepted and a WorkItem is admitted, then undoes every change and writes JSON evidence. `run --scenario <name>` adds one scenario driver after the preflight. Every identity comes from CURIE_FACTORY_* variables or files",
+          "args": [
+            {
+              "global": false,
+              "help": "`preflight` or `run --scenario <name>`, then driver flags; see `curie dev factory-e2e -- --help`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "factory-e2e"
+        },
+        {
           "about": "Select the end to end tiers CI would run for paths or revisions",
           "args": [
             {
@@ -6096,7 +6531,7 @@ export const commandManifest = {
       "name": "schema"
     },
     {
-      "about": "Print the committed, versioned JSON Schemas for the `--json` result outputs",
+      "about": "Print the committed, versioned JSON Schemas for `--json` results and the `curie.yaml` installation input (`curie-yaml`)",
       "args": [
         {
           "global": false,
@@ -6107,7 +6542,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Print the committed, versioned JSON Schemas for the `--json` result outputs.\n\nWith no NAME, emits the schema inventory index (`cli/schema/index.json`): every agent-facing result family, the schema file it maps to, and its version. With a NAME (e.g. `kill`, or `kill.schema.json`), emits that schema. The schemas are embedded in the binary, so this works from a released `curie` with no source checkout (issue #634).",
+      "long_about": "Print the committed, versioned JSON Schemas for `--json` results and the `curie.yaml` installation input (`curie-yaml`).\n\nWith no NAME, emits the schema inventory index (`cli/schema/index.json`): every agent-facing result family, the schema file it maps to, and its version. With a NAME (e.g. `kill`, or `kill.schema.json`, or `curie-yaml`), emits that schema. The schemas are embedded in the binary, so this works from a released `curie` with no source checkout (issue #634).",
       "name": "schema-index"
     },
     {
@@ -6130,6 +6565,26 @@ export const commandManifest = {
           "positional": false,
           "required": false,
           "short": "f"
+        },
+        {
+          "global": false,
+          "help": "Write a starter `curie.yaml` from this binary and exit. Refuses to overwrite an existing file",
+          "id": "init",
+          "long": "init",
+          "positional": false,
+          "possible_values": [
+            "true",
+            "false"
+          ],
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Kubernetes context for every helm and kubectl call. Wins over `install.context` in the file. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
         },
         {
           "global": false,
@@ -6177,7 +6632,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.\n\nA worked common installation is available at `examples/curie.yaml` in the Curie repository.",
+      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.\n\nA worked common installation is available at `examples/curie.yaml` in the Curie repository. A released binary writes the same starter with `curie apply --init`.",
       "name": "apply"
     },
     {
@@ -6245,6 +6700,14 @@ export const commandManifest = {
       "args": [
         {
           "global": false,
+          "help": "Kubernetes context for every helm and kubectl call. Wins over `install.context` in `curie.yaml`. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
           "help": "Kubernetes namespace to inspect. Defaults to `curie.yaml`'s `install:` block when one is present in this directory, otherwise `curie`",
           "id": "namespace",
           "long": "namespace",
@@ -6296,6 +6759,14 @@ export const commandManifest = {
           "positional": false,
           "required": false,
           "short": "f"
+        },
+        {
+          "global": false,
+          "help": "Kubernetes context for every helm and kubectl call. Wins over `install.context` in the file. Defaults to the kubeconfig current-context, which is resolved once and pinned. Diff prints the cluster this context names",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
         },
         {
           "global": false,

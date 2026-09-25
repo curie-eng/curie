@@ -273,12 +273,8 @@ raise SystemExit(90)
             "FAKE_CONNECTORS": ",".join(connectors),
             "FAKE_SANDBOX_UNREACHABLE": ",".join(sandbox_unreachable),
             "FAKE_OUTSIDE_REACHABLE": ",".join(outside_reachable),
-            "FAKE_SANDBOX_DNS_UNREACHABLE": (
-                "1" if sandbox_dns_unreachable else "0"
-            ),
-            "FAKE_OUTSIDE_DNS_UNREACHABLE": (
-                "1" if outside_dns_unreachable else "0"
-            ),
+            "FAKE_SANDBOX_DNS_UNREACHABLE": ("1" if sandbox_dns_unreachable else "0"),
+            "FAKE_OUTSIDE_DNS_UNREACHABLE": ("1" if outside_dns_unreachable else "0"),
             "FAKE_SANDBOX_TO_DENY_TARGET_REACHABLE": (
                 "1" if sandbox_to_deny_target_reachable else "0"
             ),
@@ -287,15 +283,11 @@ raise SystemExit(90)
             ),
             "FAKE_CONNECTOR_NOT_READY": ",".join(connector_not_ready),
             "FAKE_FOREIGN_REACHABLE": ",".join(foreign_reachable),
-            "FAKE_FOREIGN_DNS_UNREACHABLE": (
-                "1" if foreign_dns_unreachable else "0"
-            ),
+            "FAKE_FOREIGN_DNS_UNREACHABLE": ("1" if foreign_dns_unreachable else "0"),
             "FAKE_FOREIGN_TO_DENY_TARGET_REACHABLE": (
                 "1" if foreign_to_deny_target_reachable else "0"
             ),
-            "FAKE_FOREIGN_NAMESPACE_UNCREATABLE": (
-                "1" if foreign_namespace_uncreatable else "0"
-            ),
+            "FAKE_FOREIGN_NAMESPACE_UNCREATABLE": ("1" if foreign_namespace_uncreatable else "0"),
             "FAKE_FOREIGN_NAMESPACE_POLICIES": ",".join(foreign_namespace_policies),
             "FAKE_FOREIGN_NAMESPACE_POLICIES_UNREADABLE": (
                 "1" if foreign_namespace_policies_unreadable else "0"
@@ -303,15 +295,11 @@ raise SystemExit(90)
             # Default to the labels a correct apply produces, so every other test
             # exercises the read-back on its passing path rather than skipping it.
             "FAKE_FOREIGN_POD_LABELS": (
-                "curie curie runner-sandbox"
-                if foreign_pod_labels is None
-                else foreign_pod_labels
+                "curie curie runner-sandbox" if foreign_pod_labels is None else foreign_pod_labels
             ),
             "FAKE_FOREIGN_FQDN_UNRESOLVABLE": ",".join(foreign_fqdn_unresolvable),
             "FAKE_FOREIGN_NAMESPACE_EXISTS": ("1" if foreign_namespace_exists else "0"),
-            "FAKE_FOREIGN_NAMESPACE_CREATE_RACES": (
-                "1" if foreign_namespace_create_races else "0"
-            ),
+            "FAKE_FOREIGN_NAMESPACE_CREATE_RACES": ("1" if foreign_namespace_create_races else "0"),
         }
     )
     # Popped rather than left alone: an ambient CURIE_NETPOL_FOREIGN_NS on the
@@ -461,8 +449,7 @@ def test_non_enforcing_cni_fails_before_connector_checks(tmp_path: Path) -> None
     assert result.returncode != 0
     assert "CNI is not enforcing NetworkPolicy" in result.stderr
     assert not any(
-        target.startswith("curie-mcp-")
-        for _, _, target in _curl_events(result.kubectl_calls)
+        target.startswith("curie-mcp-") for _, _, target in _curl_events(result.kubectl_calls)
     )
 
 

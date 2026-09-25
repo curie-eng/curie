@@ -159,8 +159,8 @@ pub fn primer() -> Primer {
             },
             Rung {
                 tier: "cluster",
-                command: "curie cluster up",
-                purpose: "Install the release on Kubernetes via Helm.",
+                command: "curie apply --init",
+                purpose: "Write a starter curie.yaml, then `curie apply` / `curie diff --context`.",
             },
             Rung {
                 tier: "cluster",

@@ -13,7 +13,7 @@
       "result": "ApplyOutput",
       "kind": "CliOutput",
       "schema": "apply.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ApprovalsOutput",
@@ -115,7 +115,7 @@
       "result": "DiffOutput",
       "kind": "CliOutput",
       "schema": "diff.schema.json",
-      "version": "2.2"
+      "version": "2.3"
     },
     {
       "result": "DoctorOutput",
@@ -241,6 +241,12 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
+      "version": "1.1"
+    },
+    {
+      "result": "PublicationPolicyOutput",
+      "kind": "CliOutput",
+      "schema": "publication-policy.schema.json",
       "version": "1.0"
     },
     {
@@ -295,6 +301,12 @@
       "result": "VersionsOutput",
       "kind": "CliOutput",
       "schema": "versions.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "WorkItemsOutput",
+      "kind": "CliOutput",
+      "schema": "work-items.schema.json",
       "version": "1.0"
     },
     {
@@ -356,6 +368,12 @@
       "kind": "builder",
       "schema": "sweep.schema.json",
       "version": "1.1"
+    },
+    {
+      "result": "InstallationFile",
+      "kind": "input",
+      "schema": "curie-yaml.schema.json",
+      "version": "1.0"
     }
   ],
   "raw_emit_sites": {

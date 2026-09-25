@@ -1399,6 +1399,7 @@ enum DeployTargetChannels {
 #[derive(Clone, Copy)]
 struct ClusterDeployFixture {
     all_targets: bool,
+    cron_trigger: bool,
     deploy_failure: DeployFixtureFailure,
     connectors: ConnectorFixture,
     kubectl_failure: KubectlFixtureFailure,
@@ -1410,6 +1411,7 @@ impl Default for ClusterDeployFixture {
     fn default() -> Self {
         Self {
             all_targets: true,
+            cron_trigger: false,
             deploy_failure: DeployFixtureFailure::None,
             connectors: ConnectorFixture::Empty,
             kubectl_failure: KubectlFixtureFailure::None,
@@ -1585,7 +1587,9 @@ fn deploy_api_response(
                     "manifests": manifests,
                     "owned_secret_name": owned_secret_name,
                     "owned_secret_keys": owned_secret_keys,
-                    "mcp_entries": {}
+                    "mcp_entries": {},
+                    "version_id": format!("version-{target}"),
+                    "triggers": []
                 }),
             )
         }
@@ -1654,6 +1658,23 @@ fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
 fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
     let plugin = tempfile::tempdir().expect("plugin tempdir");
     curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
+    if fixture.cron_trigger {
+        let manifest_path = plugin.path().join(".claude-plugin/plugin.json");
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("read scaffolded manifest"),
+        )
+        .expect("scaffolded manifest is JSON");
+        manifest["triggers"] = json!([{
+            "type": "cron",
+            "name": "acme-nightly",
+            "schedule": "0 2 * * *"
+        }]);
+        fs::write(
+            manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize cron manifest"),
+        )
+        .expect("write cron manifest");
+    }
     let dev_channel = target_config("dev", fixture.target_channels).2;
     let prod_channel = target_config("prod", fixture.target_channels).2;
     fs::write(
@@ -1884,6 +1905,34 @@ fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
             ]
         })
     );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("cron trigger"),
+        "a bundle with no cron trigger must not report one"
+    );
+}
+
+#[test]
+fn cluster_deploy_with_cron_trigger_emits_no_cron_warning() {
+    // The worker scheduler fires cron triggers on cluster installs (#268), so
+    // deploy has nothing to warn about for single or all target invocations.
+    for all_targets in [false, true] {
+        let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+            all_targets,
+            cron_trigger: true,
+            ..ClusterDeployFixture::default()
+        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "cluster deploy failed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("cron trigger") && !stderr.contains("#268"),
+            "cluster deploy must not warn about a cron trigger: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -2057,4 +2106,8 @@ fn cluster_deploy_json_single_target_shape_is_unchanged() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(one_stdout_object(&output), expected_deploy("dev"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("cron trigger"),
+        "a bundle with no cron trigger must not report one"
+    );
 }

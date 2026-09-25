@@ -40,7 +40,8 @@ use curie::api::{
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
+    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
+    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -187,6 +188,54 @@ fn approval_record() -> ApprovalRecord {
     .expect("ApprovalRecord mirror deserializes from its own wire shape")
 }
 
+fn work_item_outcome() -> Box<curie::api::WorkItemOutcome> {
+    Box::new(
+        serde_json::from_value(serde_json::json!({
+            "id": "33333333-3333-4333-8333-333333333333",
+            "agent_id": "44444444-4444-4444-8444-444444444444",
+            "repo_full_name": "curie-eng/curie",
+            "github_issue_number": 2577,
+            "issue_url": "https://github.com/curie-eng/curie/issues/2577",
+            "cancelled_at": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:05:00Z",
+            "state": "published",
+            "actionable_cause": "",
+            "objective": "ship the work-items verb",
+            "objective_truncated": false,
+            "requester": "U123",
+            "pr": {"number": 42, "url": "https://github.com/curie-eng/curie/pull/42", "status": "merged"},
+            "publication": {"status": "published", "revision_number": 1, "approval_status": "approved"},
+            "correctness": {"asserted": false, "owner": "bundle"},
+            "ci": {"state": "passing", "reason": null, "head_sha": "abc1234", "observed_at": "2026-01-01T00:04:00Z"},
+            "requests": [
+                {
+                    "sequence": 1,
+                    "status": "completed",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "wait_deadline": "2026-01-01T00:10:00Z",
+                    "started_at": "2026-01-01T00:01:00Z",
+                    "execution_deadline": "2026-01-01T00:20:00Z",
+                    "terminal_at": "2026-01-01T00:05:00Z",
+                    "terminal_cause": "success",
+                    "termination_observation": null,
+                    "capacity_deferrals": 0,
+                    "last_deferral_reason": null
+                }
+            ]
+        }))
+        .expect("WorkItemOutcome mirror deserializes from its own wire shape"),
+    )
+}
+
+fn work_item_list() -> curie::api::WorkItemList {
+    curie::api::WorkItemList {
+        items: vec![*work_item_outcome()],
+        limit: 50,
+        truncated: false,
+    }
+}
+
 fn cluster_status() -> Box<ClusterStatus> {
     Box::new(ClusterStatus {
         namespace: "curie".to_string(),
@@ -243,7 +292,22 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 agent: "a".to_string(),
                 model: Some("kimi-k2".to_string()),
                 thinking: Some("adaptive".to_string()),
+                execution_deadline_seconds: Some(90),
                 changed: true,
+            },
+        ],
+    );
+    m.insert(
+        "PublicationPolicyOutput",
+        samples![
+            "DryRun" => PublicationPolicyOutput::DryRun(plan()),
+            "Done" => PublicationPolicyOutput::Done {
+                agent: "acme-bot".to_string(),
+                publication_policy: "approve".to_string(),
+                publication_policy_version: 1,
+                publication_draft: false,
+                publication_branch_prefix: None,
+                changed: false,
             },
         ],
     );
@@ -401,6 +465,14 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "WorkItemsOutput",
+        samples![
+            "DryRun" => WorkItemsOutput::DryRun(plan()),
+            "List" => WorkItemsOutput::List { list: work_item_list() },
+            "Detail" => WorkItemsOutput::Detail { item: work_item_outcome() },
+        ],
+    );
+    m.insert(
         "SkillApprovalsOutput",
         samples![
             "Gates" => SkillApprovalsOutput::Gates {
@@ -421,6 +493,9 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 namespace: "acme-bot".to_string(),
                 release: "acme-bot".to_string(),
                 comms: true,
+            },
+            "WroteStarter" => ApplyOutput::WroteStarter {
+                path: "curie.yaml".to_string(),
             },
         ],
     );

@@ -22,6 +22,7 @@ transcript key -- is the caller's job.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 import time
@@ -33,7 +34,8 @@ from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
-from ..binding import RUNNER_TOKEN_ENV
+from ..binding import MAX_TURNS_ENV, RUNNER_TOKEN_ENV
+from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .types import (
     AGENT_LABEL,
@@ -641,6 +643,183 @@ class SandboxSubstrate:
             raise error
         return released
 
+    def terminate_thread(
+        self,
+        thread_key: str,
+        *,
+        claim_name: str | None,
+        sandbox_name: str | None,
+        observer: str = "",
+    ) -> TerminationObservation | None:
+        """Delete every claim for the thread and observe claim+sandbox absence.
+
+        SQL-stored names from ``start`` are always in the target set, plus any
+        ``list_claims`` match on the thread hash and the affinity record. An
+        empty listing is not success while a named sandbox is still present.
+        Timeout returns None and keeps the stored names for a later retry.
+        """
+
+        observation: TerminationObservation | None = None
+        error: Exception | None = None
+        timed_out = False
+        with operation_span(
+            "curie.sandbox.terminate",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "terminate"},
+        ) as span:
+            try:
+                observation = self._observe_thread_gone(
+                    thread_key,
+                    claim_name=claim_name,
+                    sandbox_name=sandbox_name,
+                    observer=observer,
+                )
+                if observation is None:
+                    timed_out = True
+                    span.add_event(
+                        "sandbox.terminate.timeout",
+                        {"outcome": "timeout"},
+                    )
+                else:
+                    span.add_event(
+                        "sandbox.terminated",
+                        {"outcome": "terminated"},
+                    )
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.terminate.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+        if error is not None:
+            outcome = "failed"
+        elif timed_out:
+            outcome = "timeout"
+        else:
+            outcome = "terminated"
+        attributes = _sandbox_attributes("terminate", outcome)
+        record_metric("curie.sandbox.lifecycle", attributes=attributes)
+        if error is not None:
+            raise error
+        return observation
+
+    def _observe_thread_gone(
+        self,
+        thread_key: str,
+        *,
+        claim_name: str | None,
+        sandbox_name: str | None,
+        observer: str,
+    ) -> TerminationObservation | None:
+        claim_names: set[str] = set()
+        sandbox_names: set[str] = set()
+        if claim_name:
+            claim_names.add(claim_name)
+        if sandbox_name:
+            sandbox_names.add(sandbox_name)
+        record = self._affinity.get(thread_key)
+        if not claim_names and not sandbox_names and record is not None:
+            claim_names.add(record.handle.claim_name)
+            sandbox_names.add(record.handle.sandbox_name)
+        if not claim_names:
+            thread_hash = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()[:10]
+            try:
+                labelled = self._k8s.list_claims(
+                    label_selector=f"{THREAD_HASH_LABEL}={thread_hash}"
+                )
+            except Exception as exc:  # noqa: BLE001 - still terminate known names
+                logger.warning(
+                    "terminate could not list claims for thread %s: %s",
+                    thread_key,
+                    type(exc).__name__,
+                )
+                labelled = []
+            for view in labelled:
+                claim_names.add(view.name)
+                if view.sandbox_name:
+                    sandbox_names.add(view.sandbox_name)
+        affinity_claim = record.handle.claim_name if record is not None else None
+        for name in list(claim_names):
+            try:
+                self._k8s.delete_claim(
+                    name,
+                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                )
+            except Exception as exc:  # noqa: BLE001 - absence poll still decides
+                logger.warning(
+                    "terminate delete of claim %s failed: %s",
+                    name,
+                    type(exc).__name__,
+                )
+            if affinity_claim is not None and name == affinity_claim:
+                self._affinity.delete_if_claim(thread_key, name)
+
+        deadline = time.monotonic() + self._config.release_gone_timeout_seconds
+        sleeps = _poll_sleeps(self._config)
+        while time.monotonic() < deadline:
+            remaining_claims = set()
+            remaining_sandboxes = set()
+            timeout = min(
+                _GONE_READ_TIMEOUT_S,
+                max(0.001, deadline - time.monotonic()),
+            )
+            for name in claim_names:
+                try:
+                    claim_view = self._k8s.get_claim(
+                        name,
+                        request_timeout_seconds=timeout,
+                    )
+                except Exception as exc:  # noqa: BLE001 - absence is not proven
+                    logger.warning(
+                        "terminate gone wait could not read claim %s: %s",
+                        name,
+                        type(exc).__name__,
+                    )
+                    remaining_claims.add(name)
+                    continue
+                if claim_view is not None:
+                    remaining_claims.add(name)
+                    if claim_view.sandbox_name:
+                        sandbox_names.add(claim_view.sandbox_name)
+            timeout = min(
+                _GONE_READ_TIMEOUT_S,
+                max(0.001, deadline - time.monotonic()),
+            )
+            for name in sandbox_names:
+                try:
+                    sandbox_view = self._k8s.get_sandbox(
+                        name,
+                        request_timeout_seconds=timeout,
+                    )
+                except Exception as exc:  # noqa: BLE001 - absence is not proven
+                    logger.warning(
+                        "terminate gone wait could not read sandbox %s: %s",
+                        name,
+                        type(exc).__name__,
+                    )
+                    remaining_sandboxes.add(name)
+                    continue
+                if sandbox_view is not None:
+                    remaining_sandboxes.add(name)
+            if not remaining_claims and not remaining_sandboxes:
+                return TerminationObservation(
+                    claims=tuple(sorted(claim_names)),
+                    sandboxes=tuple(sorted(sandbox_names)),
+                    observed_at=datetime.now(UTC),
+                    observer=observer,
+                )
+            time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
+        logger.warning(
+            "terminate of thread %s timed out after %.1fs; claims=%s sandboxes=%s",
+            thread_key,
+            self._config.release_gone_timeout_seconds,
+            ",".join(sorted(claim_names)) or "-",
+            ",".join(sorted(sandbox_names)) or "-",
+        )
+        return None
+
     def _await_quota_freed(self, claim_name: str, sandbox_name: str) -> None:
         """Poll until the deleted claim AND its sandbox are absent.
 
@@ -945,6 +1124,7 @@ class SandboxSubstrate:
             workspace_materialized_head=workspace_materialized_head,
             publication_visible_outcome_revision=publication_visible_outcome_revision,
             generation=generation,
+            max_turns=(env or {}).get(MAX_TURNS_ENV),
         )
         if not publish:
             return handle

@@ -249,6 +249,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # match the pod selector the connector NetworkPolicy uses.
         "CURIE_CONNECTOR_RECONCILE",
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        # Cron scheduler tick (#268), read by the worker process only.
+        "CURIE_CRON_TICK_INTERVAL_S",
+        # WorkItem orphan sweep cadence (#3076), read by the worker process only.
+        "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
@@ -323,6 +327,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
         #   decided before any sandbox exists.
         "CURIE_DELIVERY_BUDGET_S",
+        # The factory turn budget (#3071): a worker setting whose VALUE the
+        # worker writes into a work-item claim under the BootEnv key
+        # CURIE_MAX_TURNS. This name itself never enters a sandbox.
+        "CURIE_WORK_ITEM_MAX_TURNS",
         "CURIE_RUNNER_TOTAL_TIMEOUT_S",
         "CURIE_DELIVERY_LEASE_TTL_S",
         "CURIE_DELIVERY_LEASE_HEARTBEAT_S",

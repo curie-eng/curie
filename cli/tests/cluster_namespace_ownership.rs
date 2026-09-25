@@ -136,6 +136,8 @@ if program == "helm":
     if args[:2] == ["get", "manifest"]:
         print('{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"acme-probe"}}')
         raise SystemExit(0)
+    if args and args[0] == "history":
+        fail("Error: release: not found")
     if args and args[0] == "uninstall":
         if state["release_exists"]:
             state["release_exists"] = False

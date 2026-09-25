@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v1.json",
+  "title": "curie <tier> work-items --json",
+  "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dry_run",
+        "plan"
+      ],
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "status",
+        "created_at",
+        "wait_deadline",
+        "started_at",
+        "execution_deadline",
+        "terminal_at",
+        "terminal_cause",
+        "termination_observation",
+        "capacity_deferrals",
+        "last_deferral_reason"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "wait_deadline": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_deadline": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminal_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminal_cause": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "termination_observation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capacity_deferrals": {
+          "type": "integer"
+        },
+        "last_deferral_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "pr": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "number",
+            "url",
+            "status"
+          ],
+          "properties": {
+            "number": {
+              "type": "integer"
+            },
+            "url": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "publication": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "revision_number",
+            "approval_status"
+          ],
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "revision_number": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "approval_status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ci": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "reason",
+            "head_sha",
+            "observed_at"
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "passing",
+                "failing",
+                "pending",
+                "none",
+                "unavailable",
+                "not_applicable"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "head_sha": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "agent_id",
+        "repo_full_name",
+        "github_issue_number",
+        "issue_url",
+        "cancelled_at",
+        "created_at",
+        "updated_at",
+        "state",
+        "actionable_cause",
+        "objective",
+        "objective_truncated",
+        "requester",
+        "pr",
+        "publication",
+        "correctness",
+        "ci",
+        "requests"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "repo_full_name": {
+          "type": "string"
+        },
+        "github_issue_number": {
+          "type": "integer"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "cancelled_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "description": "API-derived state, rendered verbatim. Known values: waiting, running, cancellation_requested, cancelled, expired, failed, awaiting_approval, publishing, published, completed_unpublished; clients must tolerate new values."
+        },
+        "actionable_cause": {
+          "type": "string"
+        },
+        "objective": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "objective_truncated": {
+          "type": "boolean"
+        },
+        "requester": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pr": {
+          "$ref": "#/$defs/pr"
+        },
+        "publication": {
+          "$ref": "#/$defs/publication"
+        },
+        "correctness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "asserted",
+            "owner"
+          ],
+          "properties": {
+            "asserted": {
+              "const": false
+            },
+            "owner": {
+              "const": "bundle"
+            }
+          }
+        },
+        "ci": {
+          "$ref": "#/$defs/ci"
+        },
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/request"
+          }
+        }
+      }
+    },
+    "list": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items",
+        "limit",
+        "truncated"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/item"
+          }
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "item"
+      ],
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/item"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/list"
+    },
+    {
+      "$ref": "#/$defs/detail"
+    },
+    {
+      "$ref": "#/$defs/dryRun"
+    }
+  ]
+}

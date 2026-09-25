@@ -159,8 +159,17 @@ Pod uses, so that Job inherits the platform upgrader's namespace-wide powers.
 
 The connector cannot construct that request: its zero-argument tool posts an
 operator-written CronJob template verbatim. A token holder can bypass the
-connector. Mitigate with admission policy constraining ServiceAccount choice,
-separate namespaces, or no long-lived connector token. If none is acceptable,
+connector. The hole is open. Draft
+[ADR-0141](../../../docs/adr/0141-admission-pins-jobs-a-connector-token-may-create.md)
+proposes in-tree admission that pins a Job from this identity to the live
+CronJob template (ServiceAccount, image, command, env, and volumes together).
+Constraining ServiceAccount choice alone is not enough: allowing
+`curie-platform-upgrader` preserves the escalation, and denying it breaks the
+legitimate Job.
+
+`manifests/upgrade-job-admission.yaml` is that sketch. It is not applied by
+`curie example sre-bot install --platform-upgrade`, and applying it is not
+authorized while the ADR is Draft. If the proposed control is not acceptable,
 do not install the upgrade connector.
 
 ## Retention and evidence

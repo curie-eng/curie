@@ -28,12 +28,12 @@ from ..publication_authority import (
     PublicationRemoteTerminal,
     verify_publication_identity,
 )
+from ..publication_policy import policy_still_authorizes
 from ..repo_full_name import repo_url_path
 from ..repository_auth import resolve_repository_credential
 from ..schemas import (
     PublicationCreate,
     PublicationLineageAdvance,
-    PublicationLineageIdentityOut,
     PublicationLineageOut,
     PublicationOut,
     RepositoryCredentialOut,
@@ -343,6 +343,11 @@ async def advance_publication_lineage(
         publication = await crud.get_publication(session, publication_id)
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
+        conflict = crud.publication_lineage_outcome_conflict(
+            publication, publication.lineage, data
+        )
+        if conflict is not None:
+            raise conflict
         identity = await verify_publication_identity(
             publication.lineage,
             data,
@@ -355,6 +360,17 @@ async def advance_publication_lineage(
             data,
             identity=identity,
         )
+    except PublicationRemoteTerminal as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.lineage_terminal",
+                "message": (
+                    "the pull request for this thread is merged or closed; start a new thread"
+                ),
+                "observed_state": exc.state,
+            },
+        ) from None
     except AuthorityUnavailable:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -387,92 +403,6 @@ async def advance_publication_lineage(
     return await _publication_lineage_out(session, lineage)
 
 
-@internal_router.post(
-    "/{publication_id}/lineage/identity",
-    response_model=PublicationLineageIdentityOut,
-    dependencies=[Depends(require_internal_worker_token)],
-)
-async def verify_publication_lineage_identity(
-    publication_id: uuid.UUID,
-    data: PublicationLineageAdvance,
-    session: SessionDep,
-    request: Request,
-) -> PublicationLineageIdentityOut:
-    """Hand the worker one verified identity and write nothing (#2903).
-
-    The worker persists these four values inside the same compare-and-set that
-    first sets `pr_number`, so the two facts can never be observed apart. The
-    App credentials stay here; the worker receives values, never authority.
-    """
-
-    try:
-        publication = await crud.get_publication(session, publication_id)
-        if publication is None or publication.lineage is None:
-            raise LookupError("publication lineage not found")
-        lineage = publication.lineage
-        conflict = crud.publication_lineage_outcome_conflict(publication, lineage, data)
-        if conflict is not None:
-            raise conflict
-        identity = await verify_publication_identity(
-            lineage,
-            data,
-            get_settings(),
-            request.app.state.http_client,
-        )
-        if identity is None:
-            # Not an error: a token-mode install and a pre-App pull request are
-            # both permanently ineligible, and both must answer without failing.
-            return PublicationLineageIdentityOut(lineage_id=lineage.id, eligible=False)
-        # The PATCH sibling runs this recheck inside its write transaction. Here
-        # the API answers and the worker writes, so dropping it would mean
-        # nothing rechecks a revoked workspace or a deactivated deployment.
-        await crud.require_current_lineage_workspace(
-            session,
-            lineage,
-            conflict_code="publication.lineage_stale",
-            conflict_message="publication workspace or deployment is no longer authorized",
-        )
-    except PublicationRemoteTerminal as exc:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            {
-                "code": "publication.lineage_terminal",
-                "message": (
-                    "the pull request for this thread is merged or closed; start a new thread"
-                ),
-                "observed_state": exc.state,
-            },
-        ) from None
-    except AuthorityUnavailable:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            _GITHUB_UNAVAILABLE_DETAIL,
-        ) from None
-    except AuthorityRefused:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            {
-                "code": "publication.lineage_stale",
-                "message": "current GitHub publication identity was refused",
-            },
-        ) from None
-    except LookupError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except crud.PublicationLineageConflict as exc:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            {"code": exc.code, "message": exc.message},
-        ) from exc
-    return PublicationLineageIdentityOut(
-        lineage_id=lineage.id,
-        eligible=True,
-        repository_id=identity.repository_id,
-        installation_id=identity.installation_id,
-        pr_node_id=identity.pr_node_id,
-        base_ref=identity.base_ref,
-    )
-
-
 @router.get("", response_model=list[PublicationOut])
 async def list_publications(session: SessionDep, limit: int = 100) -> list[PublicationOut]:
     rows = await crud.list_publications(session, limit=min(max(limit, 1), 200))
@@ -485,6 +415,20 @@ async def get_publication(publication_id: uuid.UUID, session: SessionDep) -> Pub
     if publication is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "publication not found")
     return PublicationOut.model_validate(publication)
+
+
+def _credential_issue_detail(settings: Any, approval: Any) -> str:
+    """Name the credential mode, and the policy when the platform resolved it."""
+
+    detail = "server-derived repository credential issued via " + credential_mode(
+        app_id=settings.github_app_id,
+        app_private_key=settings.github_app_private_key,
+        token=settings.github_token,
+    )
+    identity = getattr(approval, "policy_identity", None)
+    if identity:
+        detail += f" under {identity} version {approval.policy_version} by {approval.resolved_by}"
+    return detail
 
 
 @internal_router.post(
@@ -566,6 +510,25 @@ async def redeem_publication_credential(
             status.HTTP_403_FORBIDDEN,
             "publication repository is no longer authorized for this thread",
         )
+    agent = await crud.get_agent(session, deployment.agent_id)
+    if not policy_still_authorizes(agent, approval):
+        await refused(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.policy_revoked",
+                "message": "publication policy no longer authorizes this approval",
+            },
+        )
+    cancelled = await crud.publication_cancellation_conflict(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+    )
+    if cancelled is not None:
+        await refused(
+            status.HTTP_409_CONFLICT,
+            {"code": cancelled.code, "message": cancelled.message},
+        )
     try:
         clone_url, authorization_header = await run_in_threadpool(
             resolve_repository_credential, repo, settings
@@ -592,14 +555,7 @@ async def redeem_publication_credential(
         deployment_id=publication.deployment_id,
         publication_id=publication.id,
         repo_full_name=repo,
-        detail=(
-            "server-derived repository credential issued via "
-            + credential_mode(
-                app_id=settings.github_app_id,
-                app_private_key=settings.github_app_private_key,
-                token=settings.github_token,
-            )
-        ),
+        detail=_credential_issue_detail(settings, approval),
     )
     return RepositoryCredentialOut(
         repo_full_name=repo,

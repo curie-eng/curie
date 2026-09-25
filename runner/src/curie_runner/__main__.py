@@ -77,6 +77,7 @@ from .mcp_tool_capability import (
 from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
+from .progress import ProgressActivity, build_progress_tool, resolve_progress
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
 from .server import bind_status_attestation, create_app
@@ -391,6 +392,16 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    # The live status card (#3077): a factory execution carries a progress URL
+    # and token, and the bundle declares its phases. A malformed phase file is
+    # logged and mounts no tool; progress never stops a boot.
+    try:
+        progress = resolve_progress(os.environ, Path(config.session.plugin_dir))
+    except ValueError as exc:
+        logger.warning("report_progress not mounted: %s", exc)
+        progress = None
+    progress_activity = ProgressActivity()
+    progress_activity.model = config.model
     # Tell the gate whether the platform's own ``curie-state`` tools exist this
     # session (#2286 adversarial round). The toolPolicy exemption is by exact
     # live tool name, and a name the platform never published is not ours -- an
@@ -502,6 +513,11 @@ def build_runner(
                 approval_gate,
                 managed_workspace=mounted_workspace is not None,
                 include_request_approval=carries_request_approval,
+                progress_tool=(
+                    build_progress_tool(progress[1], progress[0], progress_activity)
+                    if progress is not None
+                    else None
+                ),
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -630,6 +646,7 @@ def build_runner(
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
+            progress_activity=progress_activity if progress is not None else None,
             connector_failures=connector_failures
             or (
                 capability.connector_failures

@@ -341,6 +341,10 @@ if [ "$1" = upgrade ]; then
     fi
     exit 0
 fi
+if [ "$1" = "history" ]; then
+    printf '%s\n' 'Error: release: not found' >&2
+    exit 1
+fi
 printf 'unexpected helm invocation: %s\n' "$*" >&2
 exit 64
 "#,

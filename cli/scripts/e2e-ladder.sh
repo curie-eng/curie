@@ -2127,10 +2127,10 @@ if "valueFrom" in entry:
     fail("must be a literal value and must not use valueFrom")
 value = entry.get("value")
 if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
-    fail(f"must be a literal integer from 60 through 1800, found {value!r}")
+    fail(f"must be a literal integer from 60 through 10800, found {value!r}")
 budget = int(value)
-if not 60 <= budget <= 1800:
-    fail(f"must be from 60 through 1800, found {budget}")
+if not 60 <= budget <= 10800:
+    fail(f"must be from 60 through 10800, found {budget}")
 timeout = budget + 60
 print(
     f"cluster: worker delivery budget {budget}s plus 60s reply observation headroom; waiting {timeout}s",

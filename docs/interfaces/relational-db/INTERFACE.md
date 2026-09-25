@@ -67,11 +67,12 @@ is a judgement call, not something derivable from the tree.
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **seventeen** columns:
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **twenty** columns:
    `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
    `hook_partitions`, `source_bindings`, `changed_paths`, `evidence`, `arguments`,
-   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, and `value`. The last one is
-   `apps/api/src/curie_api/models.py::WorkflowStateEntry.value`; `evidence` is used
+   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, `declaration`, `activity`, and `value`. The last one is
+   declared twice, on `apps/api/src/curie_api/models.py::WorkflowStateEntry.value` and on
+   `ThreadTranscript.value`, which holds one thread's transcript (ADR-0170); `evidence` is used
    by both approval and action audit rows. Three of them are
    load-bearing rather than incidental: the workflow-state store exists precisely because
    Postgres JSONB meant no new datastore was needed (see that class's docstring), the

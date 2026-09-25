@@ -4369,7 +4369,7 @@ fn cluster_ladder_rejects_invalid_worker_budgets_before_enqueue() {
         ("budget_nonliteral", "600", "nonliteral budget"),
         ("valid", "six hundred", "nonnumeric budget"),
         ("valid", "59", "budget below minimum"),
-        ("valid", "1801", "budget above maximum"),
+        ("valid", "10801", "budget above maximum"),
     ];
 
     for (mode, budget, label) in cases {

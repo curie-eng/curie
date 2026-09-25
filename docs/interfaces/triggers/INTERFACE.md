@@ -1,7 +1,7 @@
 ---
 seam: Triggers
 kind: SOFT
-impls: 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook)
+impls: 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) + per-agent cron scheduler (worker cron_loop)
 grade: not separately graded
 epics:
   - "#29"
@@ -13,7 +13,7 @@ order: 17
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) + per-agent cron scheduler (worker cron_loop) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -42,12 +42,17 @@ another hardcoded handler. The five that exist:
 - **GitHub push** — `apps/api/src/curie_api/routers/github.py::github_webhook`:
   `@router.post("/webhook")` verifies the HMAC signature, then branches on
   `x_github_event`; a `"push"` event is handed to `process_push(...)`, a `"ping"`
-  is answered `"pong"`, and unsupported events are `"ignored"`.
+  is answered `"pong"`, review events follow the review ingress when
+  `github_review_ingress_enabled` is on, and `issues` events plus plain issue
+  comments follow signed factory intake when `github_factory_ingress_enabled`
+  is on. Every other event is `"ignored"`.
 - **GitHub review feedback**: `apps/api/src/curie_api/routers/github.py::github_webhook`
   accepts actionable `issue_comment`, `pull_request_review_comment`, and
-  `pull_request_review` deliveries after HMAC verification. It claims the delivery UUID,
-  persists a durable `GitHubReviewFeedback` outbox row, and exposes worker-only provider
-  truth and lineage checks through `apps/api/src/curie_api/routers/github_reviews.py`.
+  `pull_request_review` deliveries after HMAC verification. Plain issue comments
+  take the factory path first when that gate is on. Review ingress claims the
+  delivery UUID, persists a durable `GitHubReviewFeedback` outbox row, and exposes
+  worker-only provider truth and lineage checks through
+  `apps/api/src/curie_api/routers/github_reviews.py`.
 
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
   a timer in the API asks GitHub whether the deploy branches moved and hands any
@@ -92,29 +97,39 @@ the same `curie:runs` stream, and a truthful inventory names them:
   recorded below.
 
 **Declaration vs. consumption (#273/#270).** The bundle manifest now carries deploy-time-validated
-`triggers` declarations (`cron` with a `schedule`, `webhook` with a `path`; `TriggerDeclaration` in
-`packages/plugin-format`, `triggers.*` validation codes), so an agent's non-chat wake-ups ship in one
-reviewable artifact and a malformed declaration is rejected at deploy. This is the *declaration*
-surface only. A generic HMAC hook ingress is shipped (`ingest_hook` above); bundle-declared
-`cron` / `webhook` *consumption* -- a per-agent scheduler that fires a declared schedule, or a
-mapping from a declared webhook path onto that handler -- is still the open Epic #29
-question and is not built. Declaring a trigger validates its shape; it does not yet
-wire a live wake-up for that declaration.
+`triggers` declarations (`TriggerDeclaration` in `packages/plugin-format`, `triggers.*` validation
+codes), so an agent's non-chat wake-ups ship in one reviewable artifact and a malformed declaration
+is rejected at deploy. A cron declaration needs a unique non-empty name, a non-empty prompt, and a
+five-field schedule; timezone, when present, is an IANA zone name matching an exact key in packaged
+tzdata, so host only aliases such as `localtime` are rejected; it defaults to UTC only when omitted and is legal only with a
+schedule; target, when present, is a non-empty channel address string; schedule is forbidden on other
+types; webhook `{type, path}` is unchanged. Declared `cron` triggers are consumed: the worker's
+per-agent cron scheduler (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop`, ADR-0099,
+#268) fires each declared schedule as a CRON `QueuedTurn`. See
+[Cron triggers](../../guides/cron-triggers.md) for the operator guide. A generic HMAC hook ingress
+is shipped (`ingest_hook` above); mapping a declared `webhook` path onto that handler is still the
+open Epic #29 question and is not built, so a declared webhook validates its shape but does not yet
+wire a live wake-up.
 
 ## Implementations today
 
-Five external triggers, all hardcoded, in two different processes:
+Five hardcoded external triggers in two different processes, plus the declared per-agent cron
+scheduler in the worker:
 
 1. Slack `app_mention` in the dispatcher (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`).
 2. GitHub `push` webhook in the API (`apps/api/src/curie_api/routers/github.py::github_webhook`).
 3. Commit poll in the API (`apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`),
    opt-in via `api.commitPollIntervalSeconds`. Timer-driven wake is therefore no longer
-   entirely unbuilt: this one is real, though it is a single hardcoded platform timer and
-   not the per-agent declared `cron` the trigger DECLARATION surface anticipates.
+   entirely unbuilt: this one is real, though it is a single hardcoded platform timer. The
+   per-agent declared `cron` is item 6.
 4. Generic HMAC hook in the API (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`).
 5. GitHub review feedback in the API
    (`apps/api/src/curie_api/routers/github.py::github_webhook`), with worker-only
    provider truth and lineage checks in `apps/api/src/curie_api/routers/github_reviews.py`.
+6. Declared cron triggers in the worker
+   (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop.run_forever`, ADR-0099, #268):
+   each tick reads every in-force deployment's `cron` triggers, records the due slot in
+   `hook_runs`, and enqueues one CRON turn. Operator guide: [Cron triggers](../../guides/cron-triggers.md).
 
 Plus three further wake paths that also enqueue a run without going through any of those
 five: the Slack block-action handler
@@ -150,4 +165,4 @@ first thing a real `Trigger` port would have to take ownership of.
 
 - **Epic(s):** #29 — triggers: decide whether "trigger" is a real seam (extract an `EventSource` port) or just new event types on the existing ingresses.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six swappable jobs; not separately graded.
-- **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) — hooks are bundle-declared turns the system starts.
+- **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Accepted) — hooks are bundle-declared turns the system starts.

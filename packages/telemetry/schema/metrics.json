@@ -534,7 +534,8 @@
           "release",
           "suspend",
           "cleanup",
-          "reclaim"
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -545,6 +546,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "terminated",
           "expiry-unsupported",
           "race-lost",
           "reclaimed",
@@ -556,7 +558,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 102
+      "cardinality_bound": 126
     },
     "curie.sandbox.claim.duration": {
       "type": "histogram",
@@ -573,7 +575,8 @@
           "release",
           "suspend",
           "cleanup",
-          "reclaim"
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -584,6 +587,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "terminated",
           "expiry-unsupported",
           "race-lost",
           "reclaimed",
@@ -595,7 +599,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 102
+      "cardinality_bound": 126
     },
     "curie.sandbox.resume.duration": {
       "type": "histogram",
@@ -612,7 +616,8 @@
           "release",
           "suspend",
           "cleanup",
-          "reclaim"
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -623,6 +628,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "terminated",
           "expiry-unsupported",
           "race-lost",
           "reclaimed",
@@ -634,7 +640,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 102
+      "cardinality_bound": 126
     },
     "curie.sandbox.release.duration": {
       "type": "histogram",
@@ -651,7 +657,8 @@
           "release",
           "suspend",
           "cleanup",
-          "reclaim"
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -662,6 +669,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "terminated",
           "expiry-unsupported",
           "race-lost",
           "reclaimed",
@@ -673,7 +681,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 102
+      "cardinality_bound": 126
     },
     "curie.sandbox.active": {
       "type": "gauge",
@@ -726,7 +734,8 @@
           "release",
           "suspend",
           "cleanup",
-          "reclaim"
+          "reclaim",
+          "terminate"
         ],
         "outcome": [
           "claimed",
@@ -737,6 +746,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "terminated",
           "expiry-unsupported",
           "race-lost",
           "reclaimed",
@@ -748,7 +758,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 102
+      "cardinality_bound": 126
     },
     "curie.runner.rpc.request.duration": {
       "type": "histogram",
@@ -1102,10 +1112,27 @@
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
-          "/v1/internal/publications/{publication_id}/lineage/identity",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/work-items",
+          "/work-items/{work_item_id}",
           "unmatched"
         ],
         "role": [
@@ -1129,7 +1156,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3280
+      "cardinality_bound": 3960
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1218,10 +1245,27 @@
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
-          "/v1/internal/publications/{publication_id}/lineage/identity",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/work-items",
+          "/work-items/{work_item_id}",
           "unmatched"
         ],
         "role": [
@@ -1245,7 +1289,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3280
+      "cardinality_bound": 3960
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1334,10 +1378,27 @@
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
-          "/v1/internal/publications/{publication_id}/lineage/identity",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/work-items",
+          "/work-items/{work_item_id}",
           "unmatched"
         ],
         "role": [
@@ -1354,7 +1415,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 656
+      "cardinality_bound": 792
     },
     "curie.background.loop": {
       "type": "counter",

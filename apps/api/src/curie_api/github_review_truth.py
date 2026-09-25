@@ -35,6 +35,87 @@ class BoundReviewLineage:
     base_ref: str
 
 
+def github_headers(token: str) -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+async def get_github_json(
+    client: httpx.AsyncClient,
+    *,
+    api: str,
+    token: str,
+    path: str,
+    refusal: str,
+) -> dict[str, Any]:
+    """Read one GitHub JSON object. Claimed webhook URLs are never fetched."""
+
+    try:
+        response = await client.get(
+            f"{api}{path}",
+            headers=github_headers(token),
+            follow_redirects=False,
+        )
+    except httpx.HTTPError:
+        raise FeedbackUnavailable(refusal) from None
+    # A 404 can conceal missing App permissions; it cannot distinguish a
+    # deleted resource from a temporary inability to prove current authority.
+    if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
+        raise FeedbackUnavailable(refusal)
+    if response.status_code != 200:
+        raise FeedbackIgnored(refusal)
+    try:
+        result = response.json()
+    except ValueError:
+        raise FeedbackIgnored(refusal) from None
+    if not isinstance(result, dict):
+        raise FeedbackIgnored(refusal)
+    return result
+
+
+def repository_identity_matches(value: Any, *, repository_id: int, repo_full_name: str) -> bool:
+    return (
+        isinstance(value, dict)
+        and type(value.get("id")) is int
+        and value["id"] == repository_id
+        and isinstance(value.get("full_name"), str)
+        and value["full_name"].casefold() == repo_full_name.casefold()
+    )
+
+
+async def verify_sender_write_permission(
+    client: httpx.AsyncClient,
+    *,
+    api: str,
+    token: str,
+    repo_path: str,
+    sender_id: int,
+    sender_login: str,
+) -> None:
+    """Require current write or admin for the immutable sender id.
+
+    https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+    The documented legacy field folds maintain into write. Descriptive
+    role_name and unexpected values cannot grant authority.
+    """
+
+    permission = await get_github_json(
+        client,
+        api=api,
+        token=token,
+        path=f"{repo_path}/collaborators/{sender_login}/permission",
+        refusal="sender_permission_unavailable",
+    )
+    user = permission.get("user")
+    if not isinstance(user, dict) or type(user.get("id")) is not int or user["id"] != sender_id:
+        raise FeedbackIgnored("sender_permission_identity_mismatch")
+    if permission.get("permission") not in ("write", "admin"):
+        raise FeedbackIgnored("sender_permission_refused")
+
+
 async def verify_feedback_truth(
     feedback: UnverifiedFeedback,
     lineage: BoundReviewLineage,
@@ -68,51 +149,27 @@ async def verify_feedback_truth(
 
     api = settings.github_api_url.rstrip("/")
     repo_path = f"/repos/{repo_url_path(lineage.repo_full_name)}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
 
-    async def read(path: str, refusal: str) -> dict[str, Any]:
-        try:
-            response = await client.get(
-                f"{api}{path}",
-                headers=headers,
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            raise FeedbackUnavailable(refusal) from None
-        # A 404 can conceal missing App permissions; it cannot distinguish a
-        # deleted comment from a temporary inability to prove current authority.
-        # Neither case may execute. Operators can redeliver after correcting
-        # setup; GitHub does not automatically retry failed webhook deliveries.
-        if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
-            raise FeedbackUnavailable(refusal)
-        if response.status_code != 200:
-            raise FeedbackIgnored(refusal)
-        try:
-            result = response.json()
-        except ValueError:
-            raise FeedbackIgnored(refusal) from None
-        if not isinstance(result, dict):
-            raise FeedbackIgnored(refusal)
-        return result
-
-    repository = await read(repo_path, "repository_unavailable")
-
-    def same_repository(value: Any) -> bool:
-        return (
-            isinstance(value, dict)
-            and type(value.get("id")) is int
-            and value["id"] == lineage.repository_id
-            and isinstance(value.get("full_name"), str)
-            and value["full_name"].casefold() == lineage.repo_full_name.casefold()
-        )
-
-    if not same_repository(repository):
+    repository = await get_github_json(
+        client,
+        api=api,
+        token=token,
+        path=repo_path,
+        refusal="repository_unavailable",
+    )
+    if not repository_identity_matches(
+        repository,
+        repository_id=lineage.repository_id,
+        repo_full_name=lineage.repo_full_name,
+    ):
         raise FeedbackIgnored("repository_mismatch")
-    pr = await read(f"{repo_path}/pulls/{lineage.pr_number}", "pull_request_unavailable")
+    pr = await get_github_json(
+        client,
+        api=api,
+        token=token,
+        path=f"{repo_path}/pulls/{lineage.pr_number}",
+        refusal="pull_request_unavailable",
+    )
     head, base = pr.get("head"), pr.get("base")
     if (
         not isinstance(head, dict)
@@ -127,7 +184,15 @@ async def verify_feedback_truth(
         or head.get("ref") != lineage.branch
     ):
         raise FeedbackIgnored("pull_request_mismatch")
-    if not same_repository(head.get("repo")) or not same_repository(base.get("repo")):
+    if not repository_identity_matches(
+        head.get("repo"),
+        repository_id=lineage.repository_id,
+        repo_full_name=lineage.repo_full_name,
+    ) or not repository_identity_matches(
+        base.get("repo"),
+        repository_id=lineage.repository_id,
+        repo_full_name=lineage.repo_full_name,
+    ):
         raise FeedbackIgnored("repository_mismatch")
     if pr.get("state") != "open" or pr.get("merged") is not False:
         raise FeedbackIgnored("terminal_pull_request")
@@ -142,7 +207,9 @@ async def verify_feedback_truth(
         path = f"{repo_path}/pulls/comments/{feedback.feedback_id}"
     else:
         path = f"{repo_path}/pulls/{lineage.pr_number}/reviews/{feedback.feedback_id}"
-    current = await read(path, "feedback_unavailable")
+    current = await get_github_json(
+        client, api=api, token=token, path=path, refusal="feedback_unavailable"
+    )
     if feedback.event == "issue_comment" and current.get("issue_url") != (
         f"{api}{repo_path}/issues/{lineage.pr_number}"
     ):
@@ -177,27 +244,28 @@ async def verify_feedback_truth(
     observed = parse_feedback(feedback.event, canonical, str(feedback.delivery_id))
     # Repository spelling may differ in a signed payload; it is case-insensitive
     # identity. The canonical URL retained for the model comes from our lineage.
-    expected = replace(feedback, repo_full_name=observed.repo_full_name, url=observed.url)
+    # author_association is a descriptive claim GitHub recomputes per read (a
+    # live webhook said MEMBER, the App's re-read said CONTRIBUTOR, #2794).
+    # Both values already passed the parse-time allowlist; authority comes
+    # only from the permission read below, so drift is not a change.
+    expected = replace(
+        feedback,
+        repo_full_name=observed.repo_full_name,
+        url=observed.url,
+        author_association=observed.author_association,
+    )
     if observed != expected:
         raise FeedbackIgnored("feedback_changed")
     # A webhook association is provenance, never current write authority. Read
     # effective permission for every accepted association on every verifier
     # pass, using the immutable user id fetched with the feedback to prevent a
     # renamed or replaced login from selecting another principal.
-    # https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
-    permission = await read(
-        f"{repo_path}/collaborators/{observed.sender_login}/permission",
-        "sender_permission_unavailable",
+    await verify_sender_write_permission(
+        client,
+        api=api,
+        token=token,
+        repo_path=repo_path,
+        sender_id=observed.sender_id,
+        sender_login=observed.sender_login,
     )
-    user = permission.get("user")
-    if (
-        not isinstance(user, dict)
-        or type(user.get("id")) is not int
-        or user["id"] != observed.sender_id
-    ):
-        raise FeedbackIgnored("sender_permission_identity_mismatch")
-    # The documented legacy field folds maintain into write. Descriptive
-    # role_name and unexpected values cannot grant authority.
-    if permission.get("permission") not in ("write", "admin"):
-        raise FeedbackIgnored("sender_permission_refused")
     return lineage.head_sha

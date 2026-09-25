@@ -49,6 +49,11 @@ pub struct Installation {
 pub struct Install {
     pub namespace: String,
     pub release: String,
+    /// Kubernetes context this file targets. Optional: omitted means the
+    /// kubeconfig current-context, the same default `curie cluster --context`
+    /// uses. `--context` on apply/diff wins over this field.
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -65,11 +70,77 @@ pub struct Platform {
     pub inference_persistence: Option<bool>,
     #[serde(default)]
     pub inference_pull_model: Option<bool>,
+    /// `None` leaves the chart default (install the vendored controller).
+    /// `Some(false)` is the shared-cluster opt-out: one agent-sandbox
+    /// controller per cluster.
+    #[serde(default)]
+    pub sandbox_controller: Option<bool>,
+    #[serde(default)]
+    pub priority_classes: PriorityClasses,
+    /// gVisor RuntimeClass mode. `None` leaves the chart default (`auto`).
+    #[serde(default)]
+    pub gvisor: Option<GvisorMode>,
     /// Named providers, resolved to narrow host CIDRs at install time. Named
     /// hosts rather than hand-written CIDRs because the allowlist is a security
     /// control, and a hand-copied range is how it silently goes wrong.
     #[serde(default)]
     pub egress: Vec<Egress>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityClasses {
+    #[serde(default)]
+    pub platform: Option<bool>,
+    #[serde(default)]
+    pub sandbox: Option<bool>,
+}
+
+/// Chart `security.gvisor.mode` tri-state. Unknown values are refused by name
+/// so an operator is not sent to `set:` for a modeled field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GvisorMode {
+    Auto,
+    Require,
+    Off,
+}
+
+impl GvisorMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Require => "require",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GvisorMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = GvisorMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("auto, require, or off")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<GvisorMode, E> {
+                match value {
+                    "auto" => Ok(GvisorMode::Auto),
+                    "require" => Ok(GvisorMode::Require),
+                    "off" => Ok(GvisorMode::Off),
+                    other => Err(E::custom(format!(
+                        "platform.gvisor must be auto, require, or off, not {other:?}"
+                    ))),
+                }
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<GvisorMode, E> {
+                Err(E::custom(format!(
+                    "platform.gvisor must be auto, require, or off, not {value}"
+                )))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -122,9 +193,96 @@ impl Installation {
     /// Parse and validate, naming the file in every error so a schema mistake
     /// reads like a compiler message rather than a serde dump.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&raw).with_context(|| format!("in {}", path.display()))
+        let path_text = path.display().to_string();
+        let quoted_path = crate::ops::shell_quote(&path_text);
+        // Keep the same concise pair on both output surfaces while retaining
+        // the original source for debug plumbing.
+        let render = |source: anyhow::Error, message: String, remedy: Option<String>| {
+            let payload = serde_json::json!({ "error": &message, "fix": &remedy });
+            crate::exit::operator_context(
+                crate::exit::with_json_payload(source, payload),
+                message,
+                remedy,
+            )
+        };
+        let raw = std::fs::read_to_string(path).map_err(|source| {
+            let (message, remedy, source) = if source.kind() == std::io::ErrorKind::NotFound {
+                let message = format!("installation file {path_text} was not found");
+                let remedy = format!(
+                    "create it with `vi -- {quoted_path}` and add the required `version` and `install` fields, or select an existing file with `--file PATH`"
+                );
+                // Classification walks the source chain, so the typed error
+                // remains the source and the raw cause is debug context.
+                let source = anyhow::Error::new(
+                    crate::exit::CliError::usage(message.clone()).with_fix(remedy.clone()),
+                )
+                .context(source);
+                (message, remedy, source)
+            } else {
+                let message = format!("installation file {path_text} could not be read");
+                let remedy = format!(
+                    "inspect it with `ls -ld -- {quoted_path}`, then pass a readable file with `--file PATH`"
+                );
+                let source = anyhow::Error::new(
+                    crate::exit::CliError::failure(message.clone()).with_fix(remedy.clone()),
+                )
+                .context(source);
+                (message, remedy, source)
+            };
+            render(source, message, Some(remedy))
+        })?;
+
+        Self::parse(&raw).map_err(|source| {
+            if let Some(parse_error) = source.downcast_ref::<serde_norway::Error>() {
+                let detail = parse_error
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let location = parse_error.location();
+                let diagnostic = location.as_ref().map_or(detail.as_str(), |location| {
+                    let suffix = format!(
+                        " at line {} column {}",
+                        location.line(),
+                        location.column()
+                    );
+                    detail.strip_suffix(&suffix).unwrap_or(detail.as_str())
+                });
+                let message = match location.as_ref() {
+                    Some(location) => format!(
+                        "installation file {path_text} has invalid YAML at line {} column {}, {diagnostic}",
+                        location.line(),
+                        location.column()
+                    ),
+                    None => {
+                        format!("installation file {path_text} has invalid YAML, {diagnostic}")
+                    }
+                };
+                let remedy = location.map_or_else(
+                    || format!("edit the file with `vi -- {quoted_path}`"),
+                    |location| {
+                        format!(
+                            "edit the reported location with `vi +{} -- {quoted_path}`",
+                            location.line()
+                        )
+                    },
+                );
+                let classified = crate::exit::CliError::usage(message.clone())
+                    .with_fix(remedy.clone());
+                // Keep the usage tag in the source chain while the parser
+                // error remains available to debug output.
+                let source = anyhow::Error::new(classified).context(source);
+                render(source, message, Some(remedy))
+            } else {
+                let (message, _) = crate::exit::present_error(&source);
+                let (_, remedy) = crate::exit::classify(&source);
+                render(
+                    source,
+                    format!("installation file {path_text} is invalid, {message}"),
+                    remedy,
+                )
+            }
+        })
     }
 
     pub fn parse(raw: &str) -> Result<Self> {
@@ -147,6 +305,14 @@ impl Installation {
         }
         if self.install.release.trim().is_empty() {
             bail!("install.release must not be empty");
+        }
+        if self
+            .install
+            .context
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("install.context must not be empty");
         }
         for e in &self.platform.egress {
             if e.host.trim().is_empty() {
@@ -177,10 +343,24 @@ impl Installation {
                 .iter()
                 .any(|reserved| trimmed.eq_ignore_ascii_case(reserved))
             {
+                let modeled = modeled_field_for_set_key(key);
+                let remedy = match modeled {
+                    Some("platform.gvisor") => {
+                        "Use `platform.gvisor` (`auto`, `require`, or `off`). An empty \
+                         string under set: is the chart default (auto), not off."
+                            .to_string()
+                    }
+                    Some(field) => format!(
+                        "Use `{field}` for typed boolean or null behavior, or set the value \
+                         to an empty string (\"\") under set:."
+                    ),
+                    None => "Use a modeled curie.yaml field for typed boolean or null behavior, \
+                         or set the value to an empty string (\"\") under set:."
+                        .to_string(),
+                };
                 bail!(
                     "set.{key} cannot use `{value}` because set values are always strings and \
-                     Helm treats every nonempty string as true in template conditions. \
-                     Use a modeled curie.yaml field for typed boolean or null behavior."
+                     Helm treats every nonempty string as true in template conditions. {remedy}"
                 );
             }
         }
@@ -279,6 +459,18 @@ impl Installation {
                 crate::ops::INFERENCE_PULL_MODEL_KEY
             ));
         }
+        if let Some(controller) = self.platform.sandbox_controller {
+            out.push(format!("agentSandbox.controller.deploy={controller}"));
+        }
+        if let Some(create) = self.platform.priority_classes.platform {
+            out.push(format!("priorityClasses.platform.create={create}"));
+        }
+        if let Some(create) = self.platform.priority_classes.sandbox {
+            out.push(format!("priorityClasses.sandbox.create={create}"));
+        }
+        if let Some(mode) = self.platform.gvisor {
+            out.push(format!("security.gvisor.mode={}", mode.as_str()));
+        }
         out
     }
 
@@ -321,6 +513,50 @@ impl Installation {
         }
         names
     }
+}
+
+/// Chart keys `set:` still accepts as strings, mapped to the modeled field that
+/// expresses the typed form. Used only in the boolean/null refusal so the
+/// operator is sent to the field that works rather than to `""` first.
+fn modeled_field_for_set_key(key: &str) -> Option<&'static str> {
+    match key {
+        "agentSandbox.controller.deploy" => Some("platform.sandbox_controller"),
+        "priorityClasses.platform.create" => Some("platform.priority_classes.platform"),
+        "priorityClasses.sandbox.create" => Some("platform.priority_classes.sandbox"),
+        "security.gvisor.mode" => Some("platform.gvisor"),
+        _ => None,
+    }
+}
+
+/// Flag wins over the file; empty strings are absent. Same precedence ADR-0097
+/// set for every other flag/file pair.
+pub fn resolve_context<'a>(flag: Option<&'a str>, file: Option<&'a str>) -> Option<&'a str> {
+    flag.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| file.map(str::trim).filter(|value| !value.is_empty()))
+}
+
+/// The starter file a released binary writes. Same bytes as `examples/curie.yaml`.
+pub const STARTER_CURIE_YAML: &str = include_str!("../../examples/curie.yaml");
+
+/// Write the starter installation file. Refuses to overwrite: a file the
+/// operator already edited is not a template.
+pub fn write_starter(path: &Path) -> Result<()> {
+    if path.exists() {
+        bail!(
+            "refusing to overwrite {}; delete it first or pass a different --file",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, STARTER_CURIE_YAML)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -497,7 +733,30 @@ mod tests {
                 message.contains("Use a modeled curie.yaml field"),
                 "error must give the operator a safe next action: {message}"
             );
+            assert!(
+                message.contains("empty string"),
+                "error must name the empty-string form: {message}"
+            );
         }
+    }
+
+    #[test]
+    fn boolean_set_for_a_modeled_key_names_the_field_and_empty_string() {
+        let raw = format!(
+            "{}set:\n  agentSandbox.controller.deploy: \"false\"\n",
+            minimal()
+        );
+        let err =
+            Installation::parse(&raw).expect_err("modeled boolean must be refused under set:");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("platform.sandbox_controller"),
+            "error must name the modeled field: {message}"
+        );
+        assert!(
+            message.contains("empty string"),
+            "error must still name the empty-string form: {message}"
+        );
     }
 
     #[test]
@@ -518,6 +777,10 @@ mod tests {
             (
                 "version: 1\ninstall:\n  namespace: a\n  release: a\nplatform:\n  egress:\n    - host: \"\"\n",
                 "host",
+            ),
+            (
+                "version: 1\ninstall:\n  namespace: a\n  release: a\n  context: \"\"\n",
+                "context",
             ),
         ] {
             let err = Installation::parse(raw).expect_err(&format!("empty {field} must fail"));
@@ -561,6 +824,98 @@ comms:
         assert_eq!(
             cfg.credential_names(),
             vec!["ANTHROPIC_API_KEY", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn install_context_is_accepted_and_empty_is_refused() {
+        let cfg = Installation::parse(
+            "version: 1\ninstall:\n  namespace: a\n  release: a\n  context: k8\n",
+        )
+        .expect("named context must parse");
+        assert_eq!(cfg.install.context.as_deref(), Some("k8"));
+    }
+
+    #[test]
+    fn resolve_context_lets_the_flag_win() {
+        assert_eq!(resolve_context(Some("flag"), Some("file")), Some("flag"));
+        assert_eq!(resolve_context(None, Some("file")), Some("file"));
+        assert_eq!(resolve_context(Some(""), Some("file")), Some("file"));
+        assert_eq!(resolve_context(None, None), None);
+    }
+
+    #[test]
+    fn modeled_singleton_opt_outs_and_gvisor_emit_typed_helm_sets() {
+        let raw = format!(
+            "{}platform:\n  sandbox_controller: false\n  priority_classes:\n    \
+             platform: false\n    sandbox: false\n  gvisor: off\n",
+            minimal()
+        );
+        let cfg = Installation::parse(&raw).expect("modeled singleton fields must parse");
+        assert_eq!(
+            cfg.helm_sets(),
+            vec![
+                "agentSandbox.controller.deploy=false",
+                "priorityClasses.platform.create=false",
+                "priorityClasses.sandbox.create=false",
+                "security.gvisor.mode=off",
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_yaml_off_is_gvisor_off() {
+        let raw = format!("{}platform:\n  gvisor: off\n", minimal());
+        let cfg = Installation::parse(&raw).expect("unquoted off must parse as gvisor off");
+        assert_eq!(cfg.helm_sets(), vec!["security.gvisor.mode=off"]);
+    }
+
+    #[test]
+    fn gvisor_boolean_is_refused() {
+        let raw = format!("{}platform:\n  gvisor: false\n", minimal());
+        let err = Installation::parse(&raw).expect_err("boolean gvisor must fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("auto, require, or off"),
+            "error must name the allowed set: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_gvisor_mode_is_refused_by_name() {
+        let raw = format!("{}platform:\n  gvisor: \"\"\n", minimal());
+        let err = Installation::parse(&raw).expect_err("empty gvisor must fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("auto, require, or off"),
+            "error must name the allowed set: {message}"
+        );
+    }
+
+    #[test]
+    fn empty_string_set_for_controller_deploy_is_accepted() {
+        let raw = format!(
+            "{}set:\n  agentSandbox.controller.deploy: \"\"\n",
+            minimal()
+        );
+        let cfg = Installation::parse(&raw).expect("empty string is the working set: form");
+        assert_eq!(
+            cfg.helm_set_strings(),
+            vec!["agentSandbox.controller.deploy="]
+        );
+    }
+
+    #[test]
+    fn write_starter_emits_a_parseable_file_and_refuses_overwrite() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("curie.yaml");
+        write_starter(&path).expect("first write");
+        let cfg = Installation::load(&path).expect("starter must parse");
+        assert_eq!(cfg.install.namespace, "acme-bot");
+        let err = write_starter(&path).expect_err("overwrite must fail");
+        assert!(
+            format!("{err:#}").contains("refusing to overwrite"),
+            "overwrite refusal: {err:#}"
         );
     }
 }
@@ -647,6 +1002,9 @@ pub enum ApplyOutput {
         release: String,
         comms: bool,
     },
+    WroteStarter {
+        path: String,
+    },
 }
 
 impl crate::ui::CliOutput for ApplyOutput {
@@ -665,6 +1023,10 @@ impl crate::ui::CliOutput for ApplyOutput {
                 "release": release,
                 "comms": comms,
             }),
+            ApplyOutput::WroteStarter { path } => serde_json::json!({
+                "wrote": true,
+                "path": path,
+            }),
         }
     }
 
@@ -682,6 +1044,9 @@ impl crate::ui::CliOutput for ApplyOutput {
                 if *comms {
                     ui.payload_plain("slack comms configured");
                 }
+            }
+            ApplyOutput::WroteStarter { path } => {
+                ui.payload_plain(&format!("wrote {path}"));
             }
         }
     }
@@ -1649,6 +2014,10 @@ pub struct DiffOutput {
     pub unresolved_credentials: Vec<String>,
     pub namespace: String,
     pub release: String,
+    /// Cluster the comparison targeted, from the pinned kube context. Null when
+    /// no context could be resolved. Always emitted so a consumer can tell
+    /// "unknown cluster" from "a CLI that does not report one".
+    pub cluster: Option<String>,
     /// `false` when helm has no record of the release. Known values are creates,
     /// while unavailable credential values remain unknown.
     pub release_exists: bool,
@@ -1718,6 +2087,7 @@ impl crate::ui::CliOutput for DiffOutput {
         serde_json::json!({
             "namespace": self.namespace,
             "release": self.release,
+            "cluster": self.cluster,
             "release_exists": self.release_exists,
             "unresolved_credentials": self.unresolved_credentials,
             "chart_deployed": self.chart_deployed,
@@ -1784,6 +2154,9 @@ impl crate::ui::CliOutput for DiffOutput {
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
+        if let Some(cluster) = &self.cluster {
+            ui.payload_plain(&format!("target cluster: {cluster}"));
+        }
         if !self.release_exists {
             ui.payload_plain(&format!(
                 "release '{}' does not exist in namespace '{}'; every known value below would be created, while entries marked `?` remain unknown",
@@ -1951,6 +2324,8 @@ pub struct DiffOpts {
     /// Credential NAMES the file declares that have no value available here.
     /// Reported, never fatal: diff mutates nothing.
     pub unresolved_credentials: Vec<String>,
+    /// Cluster the pinned kube context points at, if one was resolved.
+    pub cluster: Option<String>,
     pub local: LocalInstallationPlan,
     /// The chart `apply` would use, already materialized.
     ///
@@ -1980,6 +2355,7 @@ pub struct DiffOpts {
 pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
     let DiffOpts {
         unresolved_credentials,
+        cluster,
         mut local,
         chart,
         chart_target,
@@ -2026,6 +2402,7 @@ pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
         unresolved_credentials,
         namespace: plan.cfg.install.namespace,
         release: plan.cfg.install.release,
+        cluster,
         release_exists: plan.live.is_some(),
         chart_deployed,
         chart_target,
@@ -2499,6 +2876,7 @@ mod diff_tests {
             unresolved_credentials: vec!["CURIE_1426_GITHUB_CREDENTIAL".to_string()],
             namespace: "acme".to_string(),
             release: "acme".to_string(),
+            cluster: None,
             release_exists: true,
             chart_deployed: Some("curie-0.6.0".to_string()),
             chart_target: "0.6.0".to_string(),
@@ -2852,6 +3230,7 @@ mod diff_tests {
             unresolved_credentials: Vec::new(),
             namespace: "acme-bot".into(),
             release: "acme-bot".into(),
+            cluster: None,
             release_exists: true,
             chart_deployed: Some("curie-0.5.1".into()),
             chart_target: "0.6.0".into(),
@@ -2873,6 +3252,7 @@ mod diff_tests {
             unresolved_credentials: Vec::new(),
             namespace: "acme-bot".into(),
             release: "acme-bot".into(),
+            cluster: None,
             release_exists: true,
             chart_deployed: Some("curie-0.6.0".into()),
             chart_target: "0.6.0".into(),
@@ -2890,6 +3270,7 @@ mod diff_tests {
             unresolved_credentials: Vec::new(),
             namespace: "acme-bot".into(),
             release: "acme-bot".into(),
+            cluster: None,
             release_exists: false,
             chart_deployed: None,
             chart_target: "0.6.0".into(),
@@ -2926,6 +3307,7 @@ mod diff_tests {
             unresolved_credentials: Vec::new(),
             namespace: "acme".into(),
             release: "acme".into(),
+            cluster: None,
             release_exists: true,
             chart_deployed: Some("curie-0.6.0".into()),
             chart_target: "0.6.0".into(),
@@ -2940,6 +3322,26 @@ mod diff_tests {
         assert_eq!(json["changes"], serde_json::json!(1));
         assert_eq!(json["release_exists"], serde_json::json!(true));
         assert_eq!(json["entries"][0]["kind"], serde_json::json!("change"));
+        assert_eq!(json["cluster"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn diff_names_the_target_cluster() {
+        use crate::ui::CliOutput;
+        let out = DiffOutput {
+            unresolved_credentials: Vec::new(),
+            namespace: "acme".into(),
+            release: "acme".into(),
+            cluster: Some("k8scratch".into()),
+            release_exists: false,
+            chart_deployed: None,
+            chart_target: "0.6.0".into(),
+            entries: vec![],
+            stateful_removals: Vec::new(),
+            migration: None,
+        };
+        let json = out.to_json();
+        assert_eq!(json["cluster"], serde_json::json!("k8scratch"));
     }
 }
 

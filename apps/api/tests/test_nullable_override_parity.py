@@ -76,11 +76,13 @@ BLANKS = ("", "   ")
 # for -- it WIDENS the sweep onto those bodies rather than exempting them.
 KNOWN_BODY_MODULES = frozenset(
     {
+        "curie_api.factory_progress",
         "curie_api.schemas",
         "aci_protocol.turn",
         "aci_protocol.wire",
         "curie_api.routers.channels",
         "curie_api.routers.github_reviews",
+        "curie_api.routers.work_items",
     }
 )
 # FastAPI synthesises one wrapper model per multi-param body (`Body_<operation>`)

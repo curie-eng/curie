@@ -8,8 +8,10 @@ errors instead of raising, so the caller can surface every problem at once.
 import json
 import re
 from collections.abc import Callable, Mapping
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -75,6 +77,9 @@ _TRIGGERS_ADAPTER = TypeAdapter(list[TriggerDeclaration])
 
 # Claude Code plugin names are kebab-case: lowercase alphanumerics and hyphens.
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_TZDATA_ZONES = frozenset(
+    files("tzdata").joinpath("zones").read_text(encoding="utf-8").splitlines()
+)
 
 
 class ValidationIssue(BaseModel):
@@ -815,13 +820,148 @@ def _validate_hooks(root: Path, manifest: PluginManifest, c: _Collector) -> None
                     )
 
 
+_MONTH_NAMES: dict[str, int] = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_DOW_NAMES: dict[str, int] = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
+# minute, hour, day of month, month, day of week. Names only on the last two.
+_CRON_FIELDS: tuple[tuple[int, int, Mapping[str, int] | None], ...] = (
+    (0, 59, None),
+    (0, 23, None),
+    (1, 31, None),
+    (1, 12, _MONTH_NAMES),
+    (0, 7, _DOW_NAMES),
+)
+_CRON_PART_RE = re.compile(
+    r"^(?:\*|(?P<start>[A-Za-z]+|[0-9]+)(?:-(?P<end>[A-Za-z]+|[0-9]+))?)(?:/(?P<step>[0-9]+))?$"
+)
+
+
+def _stripped(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _cron_bound(token: str, low: int, high: int, names: Mapping[str, int] | None) -> int | None:
+    if token.isdigit():
+        # Cron fields are at most two digits. A longer digit string is not a
+        # field, and int() raises ValueError past the interpreter digit cap.
+        if len(token) > 4:
+            return None
+        try:
+            value = int(token)
+        except ValueError:
+            return None
+    elif names is None:
+        return None
+    else:
+        found = names.get(token.lower())
+        if found is None:
+            return None
+        value = found
+    if value < low or value > high:
+        return None
+    return value
+
+
+def _cron_part_ok(part: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+    match = _CRON_PART_RE.fullmatch(part)
+    if match is None:
+        return False
+    step_text = match.group("step")
+    if step_text is not None:
+        if len(step_text) > 4:
+            return False
+        try:
+            step = int(step_text)
+        except ValueError:
+            return False
+        if step < 1:
+            return False
+    start_text = match.group("start")
+    if start_text is None:
+        return True
+    start = _cron_bound(start_text, low, high, names)
+    if start is None:
+        return False
+    end_text = match.group("end")
+    if end_text is None:
+        return True
+    end = _cron_bound(end_text, low, high, names)
+    return end is not None and start <= end
+
+
+def _cron_field_ok(field: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+    # Reject empty fields and leading, trailing, or doubled commas before parts.
+    if not field or field.startswith(",") or field.endswith(",") or ",," in field:
+        return False
+    return all(_cron_part_ok(part, low, high, names) for part in field.split(","))
+
+
+def _five_field_cron(expression: str) -> bool:
+    """True when ``expression`` is five cron fields, not an alias or quartz form."""
+
+    fields = expression.split()
+    if len(fields) != len(_CRON_FIELDS):
+        return False
+    return all(
+        _cron_field_ok(field, low, high, names)
+        for field, (low, high, names) in zip(fields, _CRON_FIELDS, strict=True)
+    )
+
+
+def _target_acceptable(value: object) -> bool:
+    """A nonblank channel address string."""
+
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _iana_timezone(value: object) -> bool:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if value not in _TZDATA_ZONES:
+        return False
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
+
+
 def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
     """Validate the manifest ``triggers`` declarations (deploy-time gate, #273).
 
-    ``triggers`` is a list of ``{type, ...}``. ``type`` must be a known kind
-    (``cron``/``webhook``); a ``cron`` trigger requires a non-empty ``schedule``
-    and a ``webhook`` trigger a non-empty ``path``. Malformed declarations are
-    rejected at deploy so an agent's non-chat wake-ups fail loudly before ship.
+    ``triggers`` is a list of ``{type, ...}``. ``type`` is ``cron`` or
+    ``webhook``. A ``cron`` trigger needs a non-empty ``name``, a non-empty
+    ``prompt``, and a five-field ``schedule`` (ADR-0099). ``timezone`` is an
+    IANA name and is legal only with a non-empty schedule; a missing key means
+    UTC and is not written back. ``target``, when present, is a nonblank
+    channel address string.
+    ``schedule`` on any other known type is forbidden. A ``webhook`` still needs
+    a non-empty ``path``. Presence is raw key membership, so an explicit JSON
+    null is present. The parsed model collapses an omitted key and null to
+    ``None``. One trigger may emit more than one code. Names are unique after
+    strip, case-sensitive, and a blank name is not a duplicate.
     """
 
     declared = manifest.triggers
@@ -838,6 +978,7 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
             c.error("triggers.invalid", issue, "plugin.json (triggers)")
         return
 
+    seen_names: set[str] = set()
     for i, trigger in enumerate(parsed):
         loc = f"plugin.json (triggers[{i}])"
         if trigger.type not in _TRIGGER_TYPES:
@@ -847,18 +988,78 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
                 loc,
             )
             continue
-        if trigger.type == "cron" and not (trigger.schedule and trigger.schedule.strip()):
+        raw_item = declared[i]
+        if not isinstance(raw_item, dict):
+            c.error("triggers.invalid", "each trigger must be an object", loc)
+            continue
+        # Key presence is membership on the original object. Explicit JSON null
+        # is present; the model collapses that and an omitted key to None.
+        schedule_text = _stripped(trigger.schedule)
+        name_text = _stripped(trigger.name)
+        if trigger.type != "cron" and "schedule" in raw_item:
             c.error(
-                "triggers.cron_missing_schedule",
-                "a 'cron' trigger must define a non-empty 'schedule'",
+                "triggers.schedule_forbidden",
+                f"a {trigger.type!r} trigger must not define a 'schedule'",
                 loc,
             )
-        if trigger.type == "webhook" and not (trigger.path and trigger.path.strip()):
+        if "timezone" in raw_item and not schedule_text:
+            c.error(
+                "triggers.timezone_without_schedule",
+                "a 'timezone' requires a non-empty 'schedule'",
+                loc,
+            )
+        if trigger.type == "cron":
+            if not schedule_text:
+                c.error(
+                    "triggers.cron_missing_schedule",
+                    "a 'cron' trigger must define a non-empty 'schedule'",
+                    loc,
+                )
+            elif not _five_field_cron(schedule_text):
+                c.error(
+                    "triggers.cron_invalid_schedule",
+                    "a 'cron' trigger 'schedule' must be a five-field cron expression",
+                    loc,
+                )
+            if not name_text:
+                c.error(
+                    "triggers.cron_missing_name",
+                    "a 'cron' trigger must define a non-empty 'name'",
+                    loc,
+                )
+            if not _stripped(trigger.prompt):
+                c.error(
+                    "triggers.cron_missing_prompt",
+                    "a 'cron' trigger must define a non-empty 'prompt'",
+                    loc,
+                )
+            if "timezone" in raw_item and schedule_text and not _iana_timezone(trigger.timezone):
+                c.error(
+                    "triggers.timezone_invalid",
+                    "a 'cron' trigger 'timezone' must be an IANA time zone name",
+                    loc,
+                )
+        if "target" in raw_item and not _target_acceptable(trigger.target):
+            c.error(
+                "triggers.target_invalid",
+                "a trigger 'target', when set, must be a nonblank channel address string",
+                loc,
+            )
+        if trigger.type == "webhook" and not _stripped(trigger.path):
             c.error(
                 "triggers.webhook_missing_path",
                 "a 'webhook' trigger must define a non-empty 'path'",
                 loc,
             )
+        if name_text:
+            if name_text in seen_names:
+                c.error(
+                    "triggers.duplicate_name",
+                    f"trigger 'name' {name_text!r} duplicates an earlier trigger 'name'",
+                    loc,
+                )
+            else:
+                seen_names.add(name_text)
 
 
 def _validate_approval_policy(

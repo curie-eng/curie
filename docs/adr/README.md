@@ -128,8 +128,8 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0096 | [A third-party port adapter is a deployed service, not a loaded plugin](0096-port-adapters-are-deployed-services.md) | Accepted |
 | 0097 | [One file declares an installation](0097-one-file-declares-an-installation.md) | Accepted |
 | 0098 | [Thinking depth is an operator knob, never a bundle one](0098-thinking-depth-is-an-operator-knob-never-a-bundle-one.md) | Accepted |
-| 0099 | [Hooks are bundle-declared turns the system starts](0099-hooks-are-bundle-declared-turns-the-system-starts.md) | Draft |
-| 0100 | [Agents search their own surface through the channel port](0100-agents-search-their-own-surface-through-the-channel-port.md) | Draft |
+| 0099 | [Hooks are bundle-declared turns the system starts](0099-hooks-are-bundle-declared-turns-the-system-starts.md) | Accepted |
+| 0100 | [Agents search their own surface through the channel port](0100-agents-search-their-own-surface-through-the-channel-port.md) | Accepted |
 | 0101 | [Closed schemas version on every change: minor for optional, major for required](0101-schema-compatibility-for-closed-schemas.md) | Accepted |
 | 0102 | [Accepted alongside implementation with explicit approval](0102-accepted-alongside-implementation-with-explicit-approval.md) | Accepted |
 | 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
@@ -170,14 +170,31 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
 | 0139 | [Bundle owners classify every vanilla MCP tool](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) | Draft |
 | 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Draft |
+| 0141 | [Admission pins the Jobs a connector token may create](0141-admission-pins-jobs-a-connector-token-may-create.md) | Draft |
 | 0142 | [Database compatibility is a release contract; migrations run in one upgrade phase](0142-database-compatibility-windows-and-a-single-upgrade-phase.md) | Accepted |
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |
 | 0144 | [The cluster lifecycle admits before it mutates, and its pause authority is installation-scoped](0144-the-upgrade-lifecycle-admits-before-it-mutates.md) | Draft |
+| 0145 | [A labelled issue is a backlog item and the stream is its queue](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md) | Accepted |
+| 0146 | [For a headless lane, at capacity means wait, not reply](0146-headless-capacity-is-a-wait-not-a-reply.md) | Accepted |
+| 0147 | [Publication approval is a per-agent operator policy, not a platform constant](0147-publication-approval-is-a-per-agent-operator-policy.md) | Accepted |
 | 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
 | 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
 | 0153 | [A channel-port turn carries its attachments, and the worker fetches them from the adapter that produced them](0153-a-channel-port-turn-carries-its-attachments.md) | Accepted |
-| 0154 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0154-adapter-principal-with-a-scoped-credential.md) | Accepted |
-| 0155 | [Tenant boundary and principal identity land together](0155-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
+| 0154 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0154-adapter-principal-with-a-scoped-credential.md) | Superseded by [ADR-0156](0156-adapter-principal-with-a-scoped-credential.md) |
+| 0155 | [Tenant boundary and principal identity land together](0155-tenant-boundary-and-principal-identity-land-together.md) | Superseded by [ADR-0166](0166-tenant-boundary-and-principal-identity-land-together.md) |
+| 0156 | [A channel adapter is a principal, and its credential is scoped to what an adapter does](0156-adapter-principal-with-a-scoped-credential.md) | Accepted |
+| 0157 | [Factory work dispatches from SQL over the runs stream](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md) | Accepted |
 | 0158 | [A custom connector is a bundle built HTTP MCP server that holds its own credential](0158-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md) | Draft |
+| 0159 | [A canary is a weighted second active deployment and every trace carries its version](0159-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
+| 0160 | [A long scheduled sweep stays on one sandbox](0160-a-long-scheduled-sweep-stays-on-one-sandbox.md) | Accepted |
+| 0161 | [Signed GitHub issue events admit one WorkItem](0161-signed-github-issue-events-admit-one-work-item.md) | Accepted |
+| 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
+| 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
+| 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
 | 0168 | [One installation hosts several bot identities](0168-one-installation-hosts-several-bot-identities.md) | Accepted |
+| 0169 | [A mean tester tests an agent the way a person does, from any installation](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md) | Accepted |
+| 0170 | [Conversation transcripts live in their own per-thread table](0170-conversation-transcripts-live-in-their-own-per-thread-table.md) | Accepted |
+| 0171 | [A factory run may take three hours and is bounded by time, not turns](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md) | Accepted |
+| 0172 | [The mean tester is one bundle on off-the-shelf MCP servers, and it only reports](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md) | Accepted |
+| 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Draft |
 <!-- END GENERATED: adr-index -->

@@ -28,12 +28,23 @@ from .models import (
     CredentialRedemptionAuditEntry,
     Deployment,
     Environment,
+    ExecutionRequest,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
     ThreadWorkspace,
+    WorkItem,
 )
 from .publication_authority import VerifiedPublicationIdentity
+from .publication_policy import (
+    PLATFORM_ACTOR,
+    PLATFORM_AUTHORIZER,
+    POLICY_AUTO,
+    POLICY_IDENTITY,
+    PublicationPolicyConflict,
+    publication_branch_name,
+    publication_row_prefix,
+)
 from .schemas import (
     ActionComplete,
     ActionRecord,
@@ -245,6 +256,9 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         source_bindings=_stored_source_bindings(data.source_bindings),
         secrets=data.secrets,
         memory=data.memory,
+        publication_policy=data.publication_policy,
+        publication_draft=data.publication_draft,
+        publication_branch_prefix=data.publication_branch_prefix,
     )
     session.add(agent)
     return await refresh_with_channels(session, agent)
@@ -301,6 +315,7 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     # match the FK ondelete=CASCADE already declared on every child table. Bundle
     # objects in RustFS are intentionally left in place (out of scope).
     await session.execute(delete(AgentChannel).where(AgentChannel.agent_id == agent_id))
+    await session.execute(delete(WorkItem).where(WorkItem.agent_id == agent_id))
     await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
     await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
     await session.execute(delete(Agent).where(Agent.id == agent_id))
@@ -444,6 +459,61 @@ async def update_agent_model(session: AsyncSession, agent: Agent, model: str | N
 
 async def update_agent_thinking(session: AsyncSession, agent: Agent, thinking: str | None) -> Agent:
     agent.thinking = thinking
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_execution_deadline(
+    session: AsyncSession, agent: Agent, seconds: int | None
+) -> Agent:
+    agent.execution_deadline_seconds = seconds
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_publication_policy(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    policy: str | None,
+    draft: bool | None,
+    branch_prefix: str | None,
+    prefix_sent: bool,
+) -> Agent:
+    """Apply one operator publication-policy write and bump the version once.
+
+    A request that names a field but does not change its stored value does not
+    bump the version, so a repeated PATCH cannot revoke an in-flight approval.
+    """
+
+    values: dict[str, Any] = {}
+    if policy is not None and policy != agent.publication_policy:
+        values["publication_policy"] = policy
+    if draft is not None and draft != agent.publication_draft:
+        values["publication_draft"] = draft
+    if prefix_sent and branch_prefix != agent.publication_branch_prefix:
+        values["publication_branch_prefix"] = branch_prefix
+    if not values:
+        return agent
+    expected_version = agent.publication_policy_version
+    values["publication_policy_version"] = expected_version + 1
+    # The version predicate is the compare-and-set. Two writers that read the
+    # same version cannot both commit, so a publication created under the
+    # winning version is revoked when the loser retries and bumps again.
+    updated_version = await session.scalar(
+        update(Agent)
+        .where(
+            Agent.id == agent.id,
+            Agent.publication_policy_version == expected_version,
+        )
+        .values(**values)
+        .returning(Agent.publication_policy_version)
+    )
+    if updated_version is None:
+        await session.rollback()
+        raise PublicationPolicyConflict("publication policy version changed; retry the read")
     await session.commit()
     await session.refresh(agent)
     return agent
@@ -828,6 +898,108 @@ async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
 # -- approvals (#244, ADR-0010) -------------------------------------------------
 
 
+_ACTIVE_WORK_ITEM_STATUSES = ("waiting", "running", "cancellation_requested")
+
+
+async def publication_cancellation_conflict(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+) -> PublicationLineageConflict | None:
+    """Refuse credential redemption after the owning work item is cancelled.
+
+    A running request may still publish. Cancellation of the work item, or an
+    active request already in ``cancellation_requested``, may not.
+    """
+
+    work_item = await session.scalar(
+        select(WorkItem)
+        .where(
+            WorkItem.agent_id == agent_id,
+            WorkItem.conversation_id == conversation_id,
+        )
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    if work_item is None:
+        return None
+    if work_item.cancelled_at is not None:
+        return PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    active = await session.scalar(
+        select(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.status == "cancellation_requested",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if active is None:
+        return None
+    return PublicationLineageConflict(
+        "publication.work_item_cancelled",
+        "this conversation's work item is cancelled",
+    )
+
+
+async def _refuse_fenced_work_item(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    request_id: uuid.UUID | None,
+    runtime_epoch: int | None,
+) -> ExecutionRequest | None:
+    work_item = await session.scalar(
+        select(WorkItem)
+        .where(
+            WorkItem.agent_id == agent_id,
+            WorkItem.conversation_id == conversation_id,
+        )
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    if work_item is None:
+        return None
+    if work_item.cancelled_at is not None:
+        raise PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    active = await session.scalar(
+        select(ExecutionRequest)
+        .where(
+            ExecutionRequest.work_item_id == work_item.id,
+            ExecutionRequest.status.in_(_ACTIVE_WORK_ITEM_STATUSES),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if active is None:
+        return None
+    if active.status == "cancellation_requested":
+        raise PublicationLineageConflict(
+            "publication.work_item_cancelled",
+            "this conversation's work item is cancelled",
+        )
+    # A resumed approval turn does not carry the execute event id. The only
+    # running request for this conversation owns the publication.
+    if request_id is None and runtime_epoch is None:
+        return active
+    if active.status == "running" and (
+        request_id != active.id or runtime_epoch != active.runtime_epoch
+    ):
+        raise PublicationLineageConflict(
+            "publication.work_item_stale_owner",
+            "the publication is not owned by the running work item request",
+        )
+    return active
+
+
 async def create_publication(
     session: AsyncSession,
     data: PublicationCreate,
@@ -861,7 +1033,18 @@ async def create_publication(
         data,
         conversation_id=workspace_conversation_id,
     )
+    agent = await get_agent(session, deployment.agent_id)
+    if agent is None:
+        raise LookupError("agent not found")
+    auto = agent.publication_policy == POLICY_AUTO
 
+    owned_request = await _refuse_fenced_work_item(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+        request_id=data.work_item_request_id,
+        runtime_epoch=data.work_item_runtime_epoch,
+    )
     lineage = await _get_thread_publication_lineage(
         session,
         agent_id=deployment.agent_id,
@@ -898,7 +1081,11 @@ async def create_publication(
             conversation_id=workspace_conversation_id,
             repo_full_name=thread_workspace.repo_full_name,
             base_sha=data.base_sha,
-            branch=f"curie/publication-{lineage_id.hex}",
+            branch=publication_branch_name(
+                lineage_id.hex,
+                prefix=agent.publication_branch_prefix,
+                auto=auto,
+            ),
             status="open",
             version=1,
             latest_revision=1,
@@ -1004,13 +1191,25 @@ async def create_publication(
         lineage.latest_revision = revision_number
         lineage.updated_at = func.now()
 
+    if (
+        auto
+        and agent.publication_branch_prefix
+        and not lineage.branch.startswith(agent.publication_branch_prefix)
+    ):
+        raise PublicationLineageConflict(
+            "publication.branch_prefix",
+            "the publication branch does not carry the operator branch prefix",
+        )
+
     expected_prior_head = lineage.head_sha or lineage.base_sha
     expires_at = None
     if data.expires_in_seconds is not None:
         expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
             seconds=data.expires_in_seconds
         )
+    resolved_at = datetime.now(UTC).replace(tzinfo=None) if auto else None
     approval = Approval(
+        id=uuid.uuid4(),
         agent_id=deployment.agent_id,
         conversation_id=data.reply_conversation_id or data.conversation_id,
         author=data.author,
@@ -1028,6 +1227,17 @@ async def create_publication(
         granted_tool="mcp__curie__publish_changes",
         purpose="publication",
         expires_at=expires_at,
+        status=ApprovalStatus.approved if auto else ApprovalStatus.pending,
+        resolved_by=PLATFORM_ACTOR if auto else None,
+        resolution_note=(
+            f"authorized by {POLICY_IDENTITY} version {agent.publication_policy_version}"
+            if auto
+            else None
+        ),
+        resolved_at=resolved_at,
+        resumed_at=resolved_at,
+        policy_identity=POLICY_IDENTITY if auto else None,
+        policy_version=agent.publication_policy_version if auto else None,
     )
     session.add(approval)
     publication = Publication(
@@ -1039,7 +1249,14 @@ async def create_publication(
         revision_number=revision_number,
         expected_prior_head=expected_prior_head,
         repo_full_name=thread_workspace.repo_full_name,
-        status="pending",
+        status="approved" if auto else "pending",
+        open_as_draft=bool(auto and agent.publication_draft),
+        branch_prefix=publication_row_prefix(
+            lineage.branch,
+            operator_prefix=agent.publication_branch_prefix,
+            auto=auto,
+        ),
+        approval_card_reported_at=resolved_at,
         version=1,
         base_sha=data.base_sha,
         patch_bytes=patch,
@@ -1052,7 +1269,37 @@ async def create_publication(
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
     )
+    if owned_request is not None:
+        publication.execution_request_id = owned_request.id
     session.add(publication)
+    await _bind_running_work_item_lineage(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+        lineage_id=lineage.id,
+    )
+    if auto:
+        session.add(
+            ApprovalAuditEntry(
+                approval_id=approval.id,
+                action="resolved",
+                actor=PLATFORM_ACTOR,
+                actor_channel=None,
+                principal_kind="platform",
+                authenticated=True,
+                decision=ApprovalStatus.approved,
+                authorizer=PLATFORM_AUTHORIZER,
+                authorized=True,
+                reason=approval.resolution_note,
+                evidence={
+                    "policy_identity": POLICY_IDENTITY,
+                    "policy_version": agent.publication_policy_version,
+                    "agent_id": str(agent.id),
+                    "publication_draft": bool(agent.publication_draft),
+                    "publication_branch_prefix": agent.publication_branch_prefix,
+                },
+            )
+        )
     try:
         await session.commit()
     except IntegrityError as exc:
@@ -1070,6 +1317,42 @@ async def create_publication(
     await session.refresh(publication)
     await session.refresh(publication, ["lineage"])
     return publication, True
+
+
+async def _bind_running_work_item_lineage(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    lineage_id: uuid.UUID,
+) -> None:
+    """Point the running factory request at this publication before commit.
+
+    The publication transaction already holds the work item. A conversation
+    with no running request is left alone.
+    """
+
+    await session.execute(
+        update(WorkItem)
+        .where(
+            WorkItem.agent_id == agent_id,
+            WorkItem.conversation_id == conversation_id,
+            WorkItem.cancelled_at.is_(None),
+            WorkItem.publication_lineage_id.is_(None),
+            select(ExecutionRequest.id)
+            .where(
+                ExecutionRequest.work_item_id == WorkItem.id,
+                ExecutionRequest.status == "running",
+                ExecutionRequest.execution_deadline > func.clock_timestamp(),
+            )
+            .exists(),
+        )
+        .values(
+            publication_lineage_id=lineage_id,
+            version=WorkItem.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+    )
 
 
 async def get_publication(session: AsyncSession, publication_id: uuid.UUID) -> Publication | None:
@@ -1356,10 +1639,10 @@ def publication_lineage_outcome_conflict(
 ) -> PublicationLineageConflict | None:
     """Preconditions one revision outcome must meet before it may claim a lineage.
 
-    Pure, so the advancing writer and the read-only identity endpoint reach the
-    same verdict with the same code rather than drifting apart. The order is
-    load bearing and carried over unchanged: which check fires first decides
-    which conflict code the caller sees, and the worker branches on that code.
+    Pure, so the route can reject a stale outcome before it contacts GitHub and
+    the advancing writer can repeat the same verdict under its row locks. The
+    order is load bearing and carried over unchanged. Which check fires first
+    decides which conflict code the caller sees, and the worker branches on it.
     """
 
     if lineage.status != "open":
@@ -1394,6 +1677,14 @@ def publication_lineage_outcome_conflict(
         return PublicationLineageConflict(
             "publication.lineage_stale",
             "pull request lineage version or expected head is stale",
+        )
+    if (
+        publication.version != data.expected_publication_version
+        or publication.lease_owner != data.lease_owner
+    ):
+        return PublicationLineageConflict(
+            "publication.lease_lost",
+            "publication lease is no longer held by this worker",
         )
     if publication.status not in ("approved", "launching", "running"):
         return PublicationLineageConflict(
@@ -1518,9 +1809,15 @@ async def advance_publication_lineage(
         "status": publication_status,
         "version": Publication.version + 1,
         "patch_bytes": None,
+        # Settle the worker's publication lease with the outcome, exactly as
+        # its terminal CAS would, so the result outbox is claimable at once.
+        "lease_owner": None,
+        "lease_expires_at": None,
         "terminal_at": func.now(),
         "updated_at": func.now(),
         "result_url": data.pr_url,
+        # Success replaces an earlier attempt's error, as the worker CAS did.
+        "error": None,
     }
     if terminal_state:
         publication_values["error"] = (
@@ -1531,7 +1828,8 @@ async def advance_publication_lineage(
         .where(
             Publication.id == publication.id,
             Publication.status == publication.status,
-            Publication.version == publication.version,
+            Publication.version == data.expected_publication_version,
+            Publication.lease_owner == data.lease_owner,
         )
         .values(**publication_values)
         .returning(Publication.id)
@@ -1959,6 +2257,16 @@ async def claim_approval_resolution(
     # Publication outcomes are reported by the platform worker, never by a
     # resumed model turn. Mark the approval as owing no wake in the same CAS.
     publication = await get_publication_by_approval(session, approval_id)
+    if (
+        publication is not None
+        and publication.execution_request_id is not None
+        and decision == ApprovalStatus.approved
+    ):
+        owning = await session.get(ExecutionRequest, publication.execution_request_id)
+        if owning is None or owning.status != "running":
+            decision = ApprovalStatus.rejected
+            values["status"] = decision
+            values["resolution_note"] = "the factory run already ended"
     if publication is not None:
         values["resumed_at"] = func.now()
 

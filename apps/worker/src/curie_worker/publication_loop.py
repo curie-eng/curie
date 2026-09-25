@@ -28,6 +28,7 @@ from .publication_k8s import (
     PublicationResourceNames,
     build_publication_resources,
     deterministic_publication_branch,
+    publication_branch_is_valid,
     publication_resource_names,
 )
 from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
@@ -81,16 +82,6 @@ class PublicationCredential:
 
 
 @dataclass(frozen=True)
-class PublicationIdentity:
-    """Immutable GitHub facts the API verified against provider truth."""
-
-    repository_id: int
-    installation_id: int
-    pr_node_id: str
-    base_ref: str
-
-
-@dataclass(frozen=True)
 class PublicationPullState:
     number: int
     url: str
@@ -124,9 +115,6 @@ class PublicationWork:
     branch: str
     pr_number: int | None
     pr_url: str | None
-    # Read from the same row version as lineage_version, so the capture gate in
-    # _verified_identity and the CAS that writes identity are bound together.
-    github_repository_id: int | None
     expected_prior_head: str
     expected_remote_head: str | None
     base_sha: str
@@ -137,6 +125,12 @@ class PublicationWork:
     target: ReplyTarget
     route: TargetRoute
     version: int
+    lease_owner: str
+    # False only when this publication already launched and its execution is
+    # no longer running. New launches stay excluded by the claim query.
+    owner_running: bool = True
+    open_as_draft: bool = False
+    branch_prefix: str | None = None
 
 
 class PublicationStore(Protocol):
@@ -169,12 +163,6 @@ class PublicationStore(Protocol):
         outcome: str,
         pr_url: str | None,
         error: str | None,
-        # Typed on purpose while the rest of the lineage facts travel in the
-        # bag: identity narrowed out of an untyped value was how a wrong type
-        # became a silent None and published a lineage with no identity, which
-        # is the defect #2903 is.
-        identity: PublicationIdentity | None = None,
-        **lineage: Any,
     ) -> None | Awaitable[None]: ...
 
     def pending_result(self, publication_id: uuid.UUID | None = None) -> Any: ...
@@ -195,6 +183,8 @@ class PublicationStore(Protocol):
         self, publication_id: uuid.UUID, *, error: str
     ) -> None | Awaitable[None]: ...
 
+    def release(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
+
     def mark_lineage_terminal(
         self,
         lineage_id: uuid.UUID,
@@ -214,22 +204,23 @@ class PublicationCredentialSource(Protocol):
     ) -> PublicationCredential | Awaitable[PublicationCredential]: ...
 
 
-class PublicationIdentitySource(Protocol):
-    def verify(
+class PublicationLineageRefused(PublicationReconcileError):
+    """The API refused the lineage advance for this exact publication outcome."""
+
+
+class PublicationLineageAuthority(Protocol):
+    def advance(
         self,
         publication_id: uuid.UUID,
         *,
-        lineage_id: uuid.UUID,
         expected_version: int,
         expected_head_sha: str | None,
+        expected_publication_version: int,
+        lease_owner: str,
         pr_number: int,
         pr_url: str,
         head_sha: str,
-    ) -> (
-        PublicationIdentity
-        | None
-        | Awaitable[PublicationIdentity | None]
-    ): ...
+    ) -> None | Awaitable[None]: ...
 
 
 class PublicationCluster(Protocol):
@@ -284,6 +275,7 @@ class PublicationGitHub(Protocol):
         *,
         expected_head_sha: str,
         authorization_header: str,
+        draft: bool = False,
     ) -> PublicationPullState | None | Awaitable[PublicationPullState | None]: ...
 
 
@@ -357,17 +349,17 @@ class PublicationReconciler:
         *,
         store: PublicationStore,
         credentials: PublicationCredentialSource,
-        identity: PublicationIdentitySource,
         cluster: PublicationCluster,
         github: PublicationGitHub,
         replies: ReplySink,
+        lineage: PublicationLineageAuthority,
         job_settings: PublicationJobSettings,
         card_store: ApprovalCardStore | None = None,
         transcript: PublicationTranscript | None = None,
     ) -> None:
         self._store = store
+        self._lineage = lineage
         self._credentials = credentials
-        self._identity = identity
         self._cluster = cluster
         self._github = github
         self._replies = replies
@@ -499,9 +491,6 @@ class PublicationReconciler:
         outcome: str,
         pr_url: str | None = None,
         error: str | None = None,
-        pr_number: int | None = None,
-        new_head: str | None = None,
-        identity: PublicationIdentity | None = None,
     ) -> None:
         await _resolve(
             self._store.persist_result(
@@ -509,13 +498,6 @@ class PublicationReconciler:
                 outcome=outcome,
                 pr_url=pr_url,
                 error=error,
-                lineage_id=work.lineage_id,
-                lineage_version=work.lineage_version,
-                revision_id=work.revision_id,
-                expected_prior_head=work.expected_prior_head,
-                pr_number=pr_number,
-                new_head=new_head,
-                identity=identity,
             )
         )
         # Terminal: this publication is never reconciled again, so its escape
@@ -731,23 +713,67 @@ class PublicationReconciler:
         error: str | None = None,
         pr_number: int | None = None,
         new_head: str | None = None,
-        identity: PublicationIdentity | None = None,
         names: PublicationResourceNames,
     ) -> None:
         # The durable outcome is the source of truth. Resource cleanup and reply
         # delivery are independent outboxes; result claims remain gated until
         # cleanup has durably completed.
+        if new_head is not None:
+            if pr_url is None or pr_number is None:
+                raise PublicationReconcileError(
+                    "publication success omitted pull request identity"
+                )
+            await self._advance_lineage(
+                work, pr_url=pr_url, pr_number=pr_number, new_head=new_head
+            )
         await self._persist_result(
             work,
             outcome=outcome,
             pr_url=pr_url,
             error=error,
-            pr_number=pr_number,
-            new_head=new_head,
-            identity=identity,
         )
         await self.deliver_pending_cleanup()
         await self.deliver_pending_result(work.publication_id)
+
+    async def _advance_lineage(
+        self,
+        work: PublicationWork,
+        *,
+        pr_url: str,
+        pr_number: int,
+        new_head: str,
+    ) -> None:
+        # ADR 0143: the API verifies GitHub identity and advances the lineage
+        # with the publication outcome in one compare-and-set, fenced by this
+        # worker's claimed publication version and lease.
+        try:
+            await _resolve(
+                self._lineage.advance(
+                    work.publication_id,
+                    expected_version=work.lineage_version,
+                    expected_head_sha=work.expected_remote_head,
+                    expected_publication_version=work.version,
+                    lease_owner=work.lease_owner,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    head_sha=new_head,
+                )
+            )
+        except PublicationRemoteTerminalError as terminal:
+            await self._mark_lineage_terminal(
+                work,
+                terminal.state,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                head_sha=new_head,
+            )
+            raise PublicationReconcileError(str(terminal)) from None
+        except PublicationLineageRefused:
+            # A replay after a lost response finds its own settled outcome.
+            if not await _resolve(self._store.is_terminal(work.publication_id)):
+                raise
+        else:
+            self._identity_escapes.pop(work.publication_id, None)
 
     async def _mark_lineage_terminal(
         self,
@@ -769,56 +795,6 @@ class PublicationReconciler:
                 head_sha=head_sha,
             )
         )
-
-    async def _verified_identity(
-        self,
-        work: PublicationWork,
-        *,
-        pr_number: int,
-        pr_url: str,
-        head_sha: str,
-    ) -> PublicationIdentity | None:
-        """Ask the API for provider-verified identity exactly once per lineage."""
-
-        # The capture gate. Identity is captured only in the same write that
-        # first sets pr_number, so the two facts can never be observed apart
-        # (#2903). A later revision has nothing left to capture, so it makes no
-        # API call at all and a GitHub App outage can never fail it. A lineage
-        # carrying pr_number with NULL identity is a PR published before the App
-        # existed; it stays ineligible by design and is never backfilled.
-        if work.pr_number is not None or work.github_repository_id is not None:
-            return None
-        try:
-            identity = await _resolve(
-                self._identity.verify(
-                    work.publication_id,
-                    lineage_id=work.lineage_id,
-                    expected_version=work.lineage_version,
-                    expected_head_sha=work.expected_remote_head,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    head_sha=head_sha,
-                )
-            )
-        except PublicationRemoteTerminalError as terminal:
-            # GitHub merged or closed this PR between the push and the identity
-            # read. End the lineage here with the facts this call was handed:
-            # the next publication could never recover it, because commit
-            # verification demands this publication's own revision marker.
-            await self._mark_lineage_terminal(
-                work,
-                terminal.state,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                head_sha=head_sha,
-            )
-            raise PublicationReconcileError(str(terminal)) from None
-        # The provider answered, so the escapes that preceded it were the
-        # transient outage they claimed to be. Only CONSECUTIVE escapes count:
-        # otherwise an intermittent provider creeps to the bound over unrelated
-        # incidents and dead-letters a publication that was never stuck.
-        self._identity_escapes.pop(work.publication_id, None)
-        return identity
 
     async def _identity_unavailable(
         self,
@@ -886,6 +862,8 @@ class PublicationReconciler:
             pr_url=work.pr_url,
             title=work.title,
             body=work.body,
+            open_as_draft=work.open_as_draft,
+            branch_prefix=work.branch_prefix,
         )
 
     async def _read_stored_pull(
@@ -923,14 +901,23 @@ class PublicationReconciler:
         observation: PublicationJobObservation,
         names: PublicationResourceNames,
     ) -> bool:
-        if observation.phase in {"pending", "running"}:
-            return False
         pr_url = _validated_pr_url(
             work, observation.pr_url or _marker_url(observation.logs)
         )
         pr_number = observation.pr_number or _marker_number(observation.logs)
         commit_sha = observation.commit_sha or _marker_commit(observation.logs)
         pr_state = observation.pr_state or _marker_state(observation.logs)
+        if observation.phase in {"pending", "running"} and (
+            pr_state is not None
+            or pr_url is None
+            or pr_number is None
+            or commit_sha is None
+        ):
+            # The commit marker is the script's final line, so a complete
+            # success triple already proves the pull request exists. Settle it
+            # now instead of waiting on pod exit and Job status (#3074). Any
+            # other in-flight shape waits for the terminal phase.
+            return False
         if pr_state is not None:
             if pr_url is None or pr_number is None or commit_sha is None:
                 raise PublicationReconcileError(
@@ -966,19 +953,12 @@ class PublicationReconciler:
                 raise PublicationReconcileError(
                     "publication Job returned a different stored pull request"
                 )
-            identity = await self._verified_identity(
-                work,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                head_sha=commit_sha,
-            )
             await self._terminalize(
                 work,
                 outcome="published",
                 pr_url=pr_url,
                 pr_number=pr_number,
                 new_head=commit_sha,
-                identity=identity,
                 names=names,
             )
             return True
@@ -1002,7 +982,7 @@ class PublicationReconciler:
             "publication Job succeeded without complete lineage markers"
         )
 
-    async def reconcile(self, work: PublicationWork) -> None:
+    async def reconcile(self, work: PublicationWork, *, allow_launch: bool = True) -> None:
         names = publication_resource_names(work.publication_id)
         if await _resolve(self._store.is_terminal(work.publication_id)):
             # Terminalized by another lane (denial, expiry, a peer worker);
@@ -1014,6 +994,17 @@ class PublicationReconciler:
         # terminalized by the API/store lane, as is denial; neither creates a
         # cluster or GitHub side effect here.
         if work.decision != "approved":
+            return
+        if not publication_branch_is_valid(work.branch, work.branch_prefix):
+            await self._bounded_setup_failure(
+                work,
+                PublicationReconcileError(
+                    "publication branch does not carry the required prefix"
+                    if work.branch_prefix
+                    and not work.branch.startswith(work.branch_prefix)
+                    else "publication branch is not a valid stored lineage branch"
+                ),
+            )
             return
 
         try:
@@ -1043,6 +1034,30 @@ class PublicationReconciler:
                 await self._bounded_setup_failure(work, exc)
                 return
             if observation.phase in {"pending", "running"}:
+                try:
+                    if await self._finish_observation(
+                        work, observation, probe_resources.names
+                    ):
+                        return
+                except PublicationIdentityUnavailable as identity_exc:
+                    await self._identity_unavailable(work, identity_exc)
+                    return
+                except Exception as exc:
+                    if await _resolve(self._store.is_terminal(work.publication_id)):
+                        raise
+                    await self._bounded_setup_failure(work, exc)
+                    return
+                if not allow_launch:
+                    await _resolve(
+                        self._store.persist_result(
+                            work.publication_id,
+                            outcome="failed",
+                            pr_url=None,
+                            error="the factory run already ended",
+                        )
+                    )
+                    return
+                await self._release_in_flight(work)
                 return
             marker_url = observation.pr_url or _marker_url(observation.logs)
             marker_number = observation.pr_number or _marker_number(observation.logs)
@@ -1062,16 +1077,26 @@ class PublicationReconciler:
                         work, observation, probe_resources.names
                     )
                 except PublicationIdentityUnavailable as identity_exc:
-                    # A transient identity read must never consume a reconcile
-                    # attempt: the lease expiry retries it uncharged, so a
-                    # GitHub outage cannot dead-letter a completed push. Bounded
-                    # so a permanent one does not retry forever.
+                    # A transient lineage verification failure must never consume
+                    # a reconcile attempt. Lease expiry retries it uncharged,
+                    # bounded so a permanent failure still converges.
                     await self._identity_unavailable(work, identity_exc)
                 except Exception as exc:
                     if await _resolve(self._store.is_terminal(work.publication_id)):
                         raise
                     await self._bounded_setup_failure(work, exc)
                 return
+
+        if not allow_launch:
+            await _resolve(
+                self._store.persist_result(
+                    work.publication_id,
+                    outcome="failed",
+                    pr_url=None,
+                    error="the factory run already ended",
+                )
+            )
+            return
 
         credential: PublicationCredential
         try:
@@ -1109,6 +1134,7 @@ class PublicationReconciler:
                             work.body,
                             expected_head_sha=branch_head,
                             authorization_header=credential.authorization_header,
+                            draft=work.open_as_draft,
                         )
                     )
                     if recovered is None:
@@ -1141,19 +1167,12 @@ class PublicationReconciler:
                         raise PublicationReconcileError(
                             "GitHub pull request state is invalid"
                         )
-                    identity = await self._verified_identity(
-                        work,
-                        pr_number=recovered.number,
-                        pr_url=validated_url,
-                        head_sha=recovered.head_sha,
-                    )
                     await self._terminalize(
                         work,
                         outcome="published",
                         pr_url=validated_url,
                         pr_number=recovered.number,
                         new_head=recovered.head_sha,
-                        identity=identity,
                         names=names,
                     )
                     return
@@ -1222,13 +1241,25 @@ class PublicationReconciler:
             # exact marked commit with the expected parent. Persisting the
             # lineage CAS may expose cleanup or reply-outbox failures; those
             # must escape as outbox work, never be charged as another attempt
-            # at the already completed publication mutation.
+            # at the already completed publication mutation. The API's lineage
+            # advance is not yet committed, so its refusal or outage is bounded.
+            try:
+                await self._advance_lineage(
+                    work,
+                    pr_url=pull.url,
+                    pr_number=pull.number,
+                    new_head=pull.head_sha,
+                )
+            except PublicationIdentityUnavailable as identity_exc:
+                await self._identity_unavailable(work, identity_exc)
+                return
+            except Exception as exc:
+                await self._bounded_setup_failure(work, exc)
+                return
             await self._terminalize(
                 work,
                 outcome="published",
                 pr_url=pull.url,
-                pr_number=pull.number,
-                new_head=pull.head_sha,
                 names=names,
             )
             return
@@ -1295,12 +1326,13 @@ class PublicationReconciler:
                 observation = await _cluster_call(
                     self._cluster.observe, resources.names.job
                 )
-                if observation.exists and observation.phase in {"pending", "running"}:
-                    return
-                if observation.exists and await self._finish_observation(
-                    work, observation, resources.names
-                ):
-                    return
+                in_flight = False
+                if observation.exists:
+                    if await self._finish_observation(
+                        work, observation, resources.names
+                    ):
+                        return
+                    in_flight = observation.phase in {"pending", "running"}
             except PublicationIdentityUnavailable as identity_exc:
                 await self._identity_unavailable(work, identity_exc)
                 return
@@ -1314,6 +1346,9 @@ class PublicationReconciler:
                     ),
                 )
                 return
+            if in_flight:
+                await self._release_in_flight(work)
+                return
             await self._bounded_setup_failure(work, apply_exc)
             return
 
@@ -1321,7 +1356,9 @@ class PublicationReconciler:
             observation = await _cluster_call(
                 self._cluster.observe, resources.names.job
             )
-            await self._finish_observation(work, observation, resources.names)
+            finished = await self._finish_observation(
+                work, observation, resources.names
+            )
         except PublicationIdentityUnavailable as identity_exc:
             await self._identity_unavailable(work, identity_exc)
             return
@@ -1330,6 +1367,15 @@ class PublicationReconciler:
                 raise
             await self._bounded_setup_failure(work, exc)
             return
+        if not finished:
+            await self._release_in_flight(work)
+
+    async def _release_in_flight(self, work: PublicationWork) -> None:
+        # The Job is still in flight. Release the lease uncharged so the next
+        # pass observes it promptly instead of waiting out the lease. A
+        # re-claim adopts the deterministic Job and never re-redeems, because
+        # redeem runs only when no Job exists.
+        await _resolve(self._store.release(work.publication_id))
 
 
 class PublicationReconcileLoop:
@@ -1341,12 +1387,16 @@ class PublicationReconcileLoop:
         store: Any,
         reconciler: PublicationReconciler,
         interval_seconds: float = 2.0,
+        batch_limit: int = 16,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("publication reconciliation interval must be positive")
+        if batch_limit <= 0:
+            raise ValueError("publication reconciliation batch limit must be positive")
         self._store = store
         self._reconciler = reconciler
         self._interval = interval_seconds
+        self._batch_limit = batch_limit
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         while not shutdown.is_set():
@@ -1367,18 +1417,32 @@ class PublicationReconcileLoop:
                 # error escaped. Publication mutation remains terminal and is
                 # never repeated because a reply transport is unavailable.
                 logger.exception("publication result delivery failed")
-            try:
-                work = await self._store.claim_next()
-            except Exception as exc:
-                logger.exception(
-                    "publication claim_next failed cause=%s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                raise
-            if work is not None:
+            # Drain claimable work each pass so concurrent publications do not
+            # serialize one per interval, bounded so outboxes still run. An
+            # in-flight Job releases its lease, so the claim excludes what this
+            # pass already reconciled instead of returning the oldest one again
+            # and starving the rest behind it.
+            seen: set[uuid.UUID] = set()
+            for _ in range(self._batch_limit):
                 try:
-                    await self._reconciler.reconcile(work)
+                    work = await self._store.claim_next(exclude=seen)
+                except Exception as exc:
+                    logger.exception(
+                        "publication claim_next failed cause=%s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise
+                if work is None:
+                    break
+                seen.add(work.publication_id)
+                try:
+                    if not work.owner_running:
+                        # Observe a pull request the job already opened.
+                        # Do not launch a new job after the factory run ended.
+                        await self._reconciler.reconcile(work, allow_launch=False)
+                    else:
+                        await self._reconciler.reconcile(work)
                 except Exception:
                     # The lease is intentionally left in place. A worker crash
                     # or ambiguous apiserver response is retried only after it
@@ -1395,9 +1459,10 @@ class PublicationReconcileLoop:
 
 __all__ = [
     "PublicationCredential",
-    "PublicationIdentity",
     "PublicationIdentityUnavailable",
     "PublicationJobObservation",
+    "PublicationLineageAuthority",
+    "PublicationLineageRefused",
     "PublicationPullState",
     "PublicationReconcileError",
     "PublicationReconciler",

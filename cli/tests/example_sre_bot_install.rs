@@ -342,6 +342,11 @@ if [ "$1" = "upgrade" ] && [ "$2" != "--install" ]; then
     exit 0
 fi
 
+if [ "$1" = "history" ]; then
+    printf '%s\n' 'Error: release: not found' >&2
+    exit 1
+fi
+
 printf 'unexpected helm invocation: %s\n' "$*" >&2
 exit 64
 "#,
@@ -403,7 +408,7 @@ exit 64
                 {
                     Response::json(
                         200,
-                        r#"{"manifests":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"curie-sre-bot-kubernetes"}}],"owned_secret_name":"curie-sre-bot-connector-secrets","owned_secret_keys":["K8S_KUBECONFIG"],"mcp_entries":{"kubernetes":{"url":"http://curie-sre-bot-kubernetes.curie.svc.cluster.local:8000/mcp"}}}"#,
+                        r#"{"manifests":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"curie-sre-bot-kubernetes"}}],"owned_secret_name":"curie-sre-bot-connector-secrets","owned_secret_keys":["K8S_KUBECONFIG"],"mcp_entries":{"kubernetes":{"url":"http://curie-sre-bot-kubernetes.curie.svc.cluster.local:8000/mcp"}},"version_id":"00000000-0000-0000-0000-000000000002","triggers":[]}"#,
                     )
                 }
                 ("POST", path) if path == format!("/agents/{AGENT_ID}/channels") => {

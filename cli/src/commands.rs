@@ -218,7 +218,16 @@ pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result
         )
     })?;
 
-    crate::ui::ui().emit(&CheckOutput { report: &report });
+    let ui = crate::ui::ui();
+    ui.emit(&CheckOutput { report: &report });
+    // The runner owns bundle validation. Only report a declared cron after it
+    // confirms that the bundle is structurally valid, while preserving the MCP
+    // verdict as the command's eventual outcome.
+    if report.verdict != "invalid_bundle" {
+        if let Ok(Some(warning)) = cron_trigger_warning_from_bundle(&plugin_dir) {
+            ui.warn(&warning);
+        }
+    }
     check_outcome(&report).map_err(anyhow::Error::from)
 }
 
@@ -4865,6 +4874,7 @@ async fn prepare_deploy_with_commit_sha(
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
+    let packed_manifest = read_packed_bundle_manifest(&archive);
     // #2448: the bundle's declared approval routes, read from the PACKED
     // archive -- the exact bytes `pack_tar_gz` just produced and that
     // `deploy_prepared` uploads -- rather than the source tree. A manifest
@@ -4874,7 +4884,13 @@ async fn prepare_deploy_with_commit_sha(
     // would find must be the one judged instead. Fail-open: an unreadable or
     // absent packed policy only warns, and the API's own fail-closed refusal
     // decides.
-    let declared_routes: Option<BTreeSet<String>> = match read_packed_bundle_gates(&archive) {
+    let packed_gates: Result<Vec<(String, String)>> = match &packed_manifest {
+        Ok((location, body)) => {
+            parse_manifest_gates(body, &format!("packed bundle manifest ({location})"))
+        }
+        Err(err) => Err(anyhow::anyhow!("{err:#}")),
+    };
+    let declared_routes: Option<BTreeSet<String>> = match packed_gates {
         Ok(gates) => Some(declared_approval_routes(&gates)),
         Err(err) => {
             ui.warn(&format!(
@@ -5309,7 +5325,8 @@ pub(crate) async fn deploy_with_commit_sha(
     opts: DeployOpts,
     installer_commit_sha: Option<&str>,
 ) -> Result<DeployOutput> {
-    deploy_prepared(prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?).await
+    let prepared = prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?;
+    deploy_prepared(prepared).await
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment
@@ -7752,6 +7769,84 @@ fn gates_summary_line(gates: &[(String, String)]) -> String {
     }
 }
 
+/// Render the advisory for cron triggers that passed the authoritative bundle
+/// validator. This formatter deliberately does not parse cron expressions: the
+/// declaration validator remains the single authority for accepted syntax.
+fn cron_trigger_warning_from_manifest(body: &str) -> Result<Option<String>> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(body).context("plugin manifest is not valid JSON")?;
+    let Some(triggers) = manifest.get("triggers").and_then(|value| value.as_array()) else {
+        return Ok(None);
+    };
+
+    let identities: Vec<String> = triggers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, trigger)| {
+            if trigger.get("type").and_then(|value| value.as_str()) != Some("cron") {
+                return None;
+            }
+            let schedule = trigger
+                .get("schedule")
+                .and_then(|value| value.as_str())?
+                .trim();
+            if schedule.is_empty() {
+                return None;
+            }
+            let name = trigger
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            Some(match name {
+                Some(name) => {
+                    serde_json::to_string(name).expect("serializing a manifest string cannot fail")
+                }
+                None => format!(
+                    "{} with schedule {}",
+                    index + 1,
+                    serde_json::to_string(schedule)
+                        .expect("serializing a manifest string cannot fail")
+                ),
+            })
+        })
+        .collect();
+
+    let warning = match identities.as_slice() {
+        [] => return Ok(None),
+        [identity] => format!(
+            "cron trigger {identity} is declared, but the skill tier has no scheduler and does not fire it; cron triggers fire only on local and cluster installs"
+        ),
+        [first, second] => format!(
+            "cron triggers {first} and {second} are declared, but the skill tier has no scheduler and does not fire them; cron triggers fire only on local and cluster installs"
+        ),
+        many => {
+            let (last, rest) = many.split_last().expect("cron identities are not empty");
+            format!(
+                "cron triggers {}, and {last} are declared, but the skill tier has no scheduler and does not fire them; cron triggers fire only on local and cluster installs",
+                rest.join(", ")
+            )
+        }
+    };
+    Ok(Some(warning))
+}
+
+fn read_bundle_manifest(plugin_dir: &Path) -> Result<(String, String)> {
+    let manifest_path = MANIFEST_LOCATIONS
+        .iter()
+        .map(|loc| plugin_dir.join(loc))
+        .find(|path| path.is_file())
+        .ok_or_else(|| crate::exit::usage(crate::scaffold::no_manifest_message(plugin_dir)))?;
+    let body = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    Ok((manifest_path.display().to_string(), body))
+}
+
+fn cron_trigger_warning_from_bundle(plugin_dir: &Path) -> Result<Option<String>> {
+    let (_, body) = read_bundle_manifest(plugin_dir)?;
+    cron_trigger_warning_from_manifest(&body)
+}
+
 /// Read the bundle's declared approval gates as `(gate, route)` pairs.
 ///
 /// The manifest is probed at `.claude-plugin/plugin.json` then `plugin.json`,
@@ -7768,19 +7863,13 @@ fn gates_summary_line(gates: &[(String, String)]) -> String {
 /// list, declares no gate: no gates and no error. A bundle with no manifest is a
 /// usage error (the plugin dir is simply wrong).
 fn read_bundle_gates(plugin_dir: &Path) -> Result<Vec<(String, String)>> {
-    let manifest_path = MANIFEST_LOCATIONS
-        .iter()
-        .map(|loc| plugin_dir.join(loc))
-        .find(|path| path.is_file())
-        .ok_or_else(|| crate::exit::usage(crate::scaffold::no_manifest_message(plugin_dir)))?;
-    let body = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading {}", manifest_path.display()))?;
-    parse_manifest_gates(&body, &manifest_path.display().to_string())
+    let (location, body) = read_bundle_manifest(plugin_dir)?;
+    parse_manifest_gates(&body, &location)
 }
 
-/// Read the bundle's declared approval gates from a PACKED tar.gz archive
-/// (#2448), not the source tree -- the same bytes `pack_tar_gz` produces and
-/// `local`/`cluster deploy` upload. A source-tree read can name a manifest a
+/// Read the manifest from a PACKED tar.gz archive, not the source tree. These
+/// are the same bytes `pack_tar_gz` produces and `local`/`cluster deploy`
+/// upload. A source-tree read can name a manifest a
 /// root `.curieignore` (or one of the packer's built-in exclusions) keeps out
 /// of the archive entirely, or miss a manifest the archive packs from a
 /// location the source read never looked at; reading the archive itself is
@@ -7796,7 +7885,7 @@ fn read_bundle_gates(plugin_dir: &Path) -> Result<Vec<(String, String)>> {
 /// unreadable archive, or no manifest found by that resolution) are reported
 /// the same way `read_bundle_gates` reports a missing manifest, and the
 /// caller treats them identically: fail-open, warn, skip the pre-check.
-fn read_packed_bundle_gates(archive: &[u8]) -> Result<Vec<(String, String)>> {
+fn read_packed_bundle_manifest(archive: &[u8]) -> Result<(String, String)> {
     let mut tar_archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let entries = tar_archive
         .entries()
@@ -7867,14 +7956,13 @@ fn read_packed_bundle_gates(archive: &[u8]) -> Result<Vec<(String, String)>> {
             _ => None,
         },
     };
-    let (location, content) = resolved.ok_or_else(|| {
+    resolved.ok_or_else(|| {
         crate::exit::usage(
             "the packed bundle archive contains no plugin manifest \
              (.claude-plugin/plugin.json or plugin.json)"
                 .to_string(),
         )
-    })?;
-    parse_manifest_gates(&content, &format!("packed bundle manifest ({location})"))
+    })
 }
 
 /// Parse the `approvalPolicy` gates out of a plugin-manifest JSON body, mirroring
@@ -8430,6 +8518,213 @@ pub fn skill_versions_unavailable() -> anyhow::Error {
 /// (issue #459, ADR-0041).
 pub fn skill_memory_unavailable() -> anyhow::Error {
     crate::exit::unsupported("memory", MEMORY_REASON, MEMORY_ALT)
+}
+
+/// Why `skill work-items` cannot be answered at this tier.
+pub const WORK_ITEMS_REASON: &str =
+    "the skill tier runs one bundle against a local runner and admits no factory work items; there is no platform API here to own them";
+/// Where to read factory work items instead.
+pub const WORK_ITEMS_ALT: &str =
+    "use `curie local work-items` or `curie cluster work-items` against a platform API";
+
+/// `skill work-items`: understood, but unavailable at this tier (#2577,
+/// ADR-0041). Work items are admitted and owned by the platform API.
+pub fn skill_work_items_unavailable() -> anyhow::Error {
+    crate::exit::unsupported("work-items", WORK_ITEMS_REASON, WORK_ITEMS_ALT)
+}
+
+/// A work item ID must be a UUID. Refused locally as a usage error (exit 2)
+/// before any request is made, through the centralized error path so `--json`
+/// still gets the structured `{error, ...}` payload.
+pub fn validated_work_item_id(id: Option<String>) -> Result<Option<String>> {
+    match id {
+        None => Ok(None),
+        Some(raw) => match uuid::Uuid::parse_str(&raw) {
+            Ok(_) => Ok(Some(raw)),
+            Err(_) => Err(crate::exit::usage(format!(
+                "work item ID must be a UUID, got {raw:?}"
+            ))),
+        },
+    }
+}
+
+/// Inputs for `<tier> work-items [ID] [--agent NAME_OR_ID]` (#2577).
+pub struct WorkItemsOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub id: Option<String>,
+    pub agent: Option<String>,
+    pub dry_run: bool,
+    /// "local" or "cluster", for the transient-error remediation hint.
+    pub tier: &'static str,
+}
+
+/// Output of `<tier> work-items`. The list and detail carry the API payload
+/// through typed mirrors under a stable envelope; `state` and
+/// `actionable_cause` are the API's strings, never recomputed here.
+pub enum WorkItemsOutput {
+    List {
+        list: crate::api::WorkItemList,
+    },
+    Detail {
+        item: Box<crate::api::WorkItemOutcome>,
+    },
+    DryRun(crate::ui::DryRunPlan),
+}
+
+fn work_item_pr_cell(item: &crate::api::WorkItemOutcome) -> String {
+    item.pr
+        .as_ref()
+        .map(|pr| format!("#{} {}", pr.number, pr.status))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+impl crate::ui::CliOutput for WorkItemsOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            WorkItemsOutput::List { list } => serde_json::to_value(list).unwrap_or_default(),
+            WorkItemsOutput::Detail { item } => serde_json::json!({ "item": item }),
+            WorkItemsOutput::DryRun(plan) => plan.to_json(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            WorkItemsOutput::DryRun(plan) => plan.render(ui),
+            WorkItemsOutput::List { list } => {
+                if list.items.is_empty() {
+                    ui.payload("no work items");
+                    return;
+                }
+                let rows: Vec<Vec<String>> = list
+                    .items
+                    .iter()
+                    .map(|item| {
+                        vec![
+                            item.id.clone(),
+                            format!("{}#{}", item.repo_full_name, item.github_issue_number),
+                            item.state.clone(),
+                            work_item_pr_cell(item),
+                            item.actionable_cause.clone(),
+                        ]
+                    })
+                    .collect();
+                // The last column is never padded: a long cause must not
+                // trail every row with spaces out to the widest cause.
+                let table = crate::ui::table(&["ID", "ISSUE", "STATE", "PR", "CAUSE"], &rows, &[]);
+                let trimmed: Vec<&str> = table.lines().map(str::trim_end).collect();
+                ui.payload_plain(&trimmed.join("\n"));
+                if list.truncated {
+                    ui.payload_plain(&format!(
+                        "(showing the first {} work items; more exist)",
+                        list.limit
+                    ));
+                }
+            }
+            WorkItemsOutput::Detail { item } => {
+                let line = |key: &str, value: &str| ui.payload_plain(&format!("{key:<12} {value}"));
+                line("id", &item.id);
+                line(
+                    "issue",
+                    &format!("{}#{}", item.repo_full_name, item.github_issue_number),
+                );
+                line("state", &item.state);
+                line("cause", &item.actionable_cause);
+                line(
+                    "pr",
+                    &item
+                        .pr
+                        .as_ref()
+                        .map(|pr| format!("#{} {} {}", pr.number, pr.status, pr.url))
+                        .unwrap_or_else(|| "-".into()),
+                );
+                if let Some(publication) = &item.publication {
+                    line(
+                        "publication",
+                        &format!(
+                            "{} (approval {})",
+                            publication.status,
+                            publication.approval_status.as_deref().unwrap_or("-")
+                        ),
+                    );
+                }
+                match &item.ci {
+                    Some(ci) => line(
+                        "ci",
+                        &match ci.reason.as_deref() {
+                            Some(reason) => format!("{} ({reason})", ci.state),
+                            None => ci.state.clone(),
+                        },
+                    ),
+                    None => line("ci", "-"),
+                }
+                line(
+                    "correctness",
+                    "not asserted by the platform (owned by the bundle)",
+                );
+                if let Some(objective) = &item.objective {
+                    line("objective", objective);
+                }
+                for request in &item.requests {
+                    line(
+                        "request",
+                        &format!(
+                            "#{} {} {}",
+                            request.sequence,
+                            request.status,
+                            request.terminal_cause.as_deref().unwrap_or("")
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `<tier> work-items [ID]`: list or read factory work item outcomes
+/// (`GET /work-items`, `GET /work-items/{id}`, #2577). An `--agent` that
+/// matches no agent is a failure (exit 1) and never falls back to the
+/// unfiltered list.
+pub async fn work_items(opts: WorkItemsOpts) -> Result<WorkItemsOutput> {
+    if opts.dry_run {
+        let path = match &opts.id {
+            Some(id) => format!("GET {}/work-items/{id}", opts.api_url),
+            None => format!(
+                "GET {}/work-items?limit={}",
+                opts.api_url,
+                ApiClient::WORK_ITEMS_LIST_LIMIT
+            ),
+        };
+        let mut lines = vec![path];
+        if let Some(agent) = &opts.agent {
+            lines.push(format!("(would resolve agent {agent:?} to its id first)"));
+        }
+        return Ok(WorkItemsOutput::DryRun(crate::ui::DryRunPlan { lines }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent_id = match &opts.agent {
+        // The observability-classified lookup (#1948): a 5xx/unreachable/hang
+        // on `GET /agents` must exit 3 (transient) and never fall through to
+        // an unfiltered `/work-items` call (#2577).
+        Some(agent) => Some(
+            client
+                .find_agent_observability(agent)
+                .await
+                .map_err(|error| crate::observability::classify_api_error(error, opts.tier))?
+                .id,
+        ),
+        None => None,
+    };
+    match opts.id {
+        Some(id) => Ok(WorkItemsOutput::Detail {
+            item: Box::new(client.get_work_item(&id, agent_id.as_deref()).await?),
+        }),
+        None => Ok(WorkItemsOutput::List {
+            list: client
+                .list_work_items(agent_id.as_deref(), ApiClient::WORK_ITEMS_LIST_LIMIT)
+                .await?,
+        }),
+    }
 }
 
 /// `skill observability runs|run|metrics`: understood, but unavailable here.
@@ -11513,6 +11808,66 @@ impl OverrideChange {
             OverrideChange::Set(v) => Some(serde_json::Value::String(v.clone())),
         }
     }
+
+    /// Same as [`patch_value`](Self::patch_value), but for `Set` the stored
+    /// string is parsed and emitted as a JSON NUMBER rather than a string.
+    ///
+    /// `execution_deadline_seconds` is an int on the wire, unlike `model`/
+    /// `thinking`, which are always strings. The value has already been range
+    /// checked by [`resolve_execution_deadline`](Self::resolve_execution_deadline),
+    /// so the parse here cannot fail for a `Set` this function is meant to see.
+    fn patch_value_as_number(&self) -> Option<serde_json::Value> {
+        match self {
+            OverrideChange::Unchanged => None,
+            OverrideChange::Clear => Some(serde_json::Value::Null),
+            OverrideChange::Set(v) => Some(serde_json::Value::Number(
+                v.parse::<i64>()
+                    .expect("execution deadline Set must already be a validated integer")
+                    .into(),
+            )),
+        }
+    }
+
+    /// Resolve the `--execution-deadline`/`--clear-execution-deadline` pair
+    /// into one intent, with the same three-way semantics as
+    /// [`resolve`](Self::resolve) plus client-side range validation.
+    ///
+    /// Args:
+    ///   value: the `--execution-deadline` value, if the operator passed one.
+    ///   clear: whether `--clear-execution-deadline` was passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error when both were passed, the value is not
+    ///   an integer, or it falls outside 60..=10800 seconds.
+    pub fn resolve_execution_deadline(value: Option<String>, clear: bool) -> Result<Self> {
+        const MIN_SECONDS: i64 = 60;
+        const MAX_SECONDS: i64 = 10800;
+        match (value, clear) {
+            (Some(_), true) => Err(crate::exit::usage(
+                "--execution-deadline and --clear-execution-deadline contradict each other; \
+                 pass one. --clear-execution-deadline restores the platform default"
+                    .to_string(),
+            )),
+            (Some(v), false) => {
+                let trimmed = v.trim();
+                let seconds: i64 = trimmed.parse().map_err(|_| {
+                    crate::exit::usage(format!(
+                        "--execution-deadline must be a whole number of seconds \
+                         between {MIN_SECONDS} and {MAX_SECONDS}, got {v:?}"
+                    ))
+                })?;
+                if !(MIN_SECONDS..=MAX_SECONDS).contains(&seconds) {
+                    return Err(crate::exit::usage(format!(
+                        "--execution-deadline must be between {MIN_SECONDS} and \
+                         {MAX_SECONDS} seconds, got {seconds}"
+                    )));
+                }
+                Ok(OverrideChange::Set(seconds.to_string()))
+            }
+            (None, true) => Ok(OverrideChange::Clear),
+            (None, false) => Ok(OverrideChange::Unchanged),
+        }
+    }
 }
 
 /// The `PATCH /agents/{id}` body for a `<tier> overrides` write, or `None` when
@@ -11532,6 +11887,7 @@ impl OverrideChange {
 pub fn overrides_patch_body(
     model: &OverrideChange,
     thinking: &OverrideChange,
+    execution_deadline: &OverrideChange,
 ) -> Option<serde_json::Value> {
     let mut body = serde_json::Map::new();
     if let Some(v) = model.patch_value() {
@@ -11539,6 +11895,9 @@ pub fn overrides_patch_body(
     }
     if let Some(v) = thinking.patch_value() {
         body.insert("thinking".to_string(), v);
+    }
+    if let Some(v) = execution_deadline.patch_value_as_number() {
+        body.insert("execution_deadline_seconds".to_string(), v);
     }
     if body.is_empty() {
         return None;
@@ -11570,14 +11929,18 @@ pub fn overrides_summary(
     agent: &str,
     model: &Option<String>,
     thinking: &Option<String>,
+    execution_deadline_seconds: &Option<u32>,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
+    let deadline = execution_deadline_seconds
+        .map(|s| format!("{s} s"))
+        .unwrap_or_else(|| "platform default".to_string());
     // The verb carries its own leading space, so an inspect closes straight
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}",
+        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}",
         show(model),
         show(thinking)
     )
@@ -11598,6 +11961,7 @@ pub enum OverridesOutput {
         agent: String,
         model: Option<String>,
         thinking: Option<String>,
+        execution_deadline_seconds: Option<u32>,
         changed: bool,
     },
 }
@@ -11610,11 +11974,13 @@ impl crate::ui::CliOutput for OverridesOutput {
                 agent,
                 model,
                 thinking,
+                execution_deadline_seconds,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
                 "model": model,
                 "thinking": thinking,
+                "execution_deadline_seconds": execution_deadline_seconds,
                 "changed": changed,
             }),
         }
@@ -11627,9 +11993,16 @@ impl crate::ui::CliOutput for OverridesOutput {
                 agent,
                 model,
                 thinking,
+                execution_deadline_seconds,
                 changed,
             } => {
-                ui.payload(&overrides_summary(agent, model, thinking, *changed));
+                ui.payload(&overrides_summary(
+                    agent,
+                    model,
+                    thinking,
+                    execution_deadline_seconds,
+                    *changed,
+                ));
             }
         }
     }
@@ -11660,9 +12033,10 @@ pub async fn overrides(
     opts: AgentActionOpts,
     model: OverrideChange,
     thinking: OverrideChange,
+    execution_deadline: OverrideChange,
 ) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let body = overrides_patch_body(&model, &thinking);
+    let body = overrides_patch_body(&model, &thinking, &execution_deadline);
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(
@@ -11687,6 +12061,7 @@ pub async fn overrides(
             agent: agent.name,
             model: agent.model,
             thinking: agent.thinking,
+            execution_deadline_seconds: agent.execution_deadline_seconds,
             changed: false,
         });
     };
@@ -11706,8 +12081,195 @@ pub async fn overrides(
         agent: saved.name,
         model: saved.model,
         thinking: saved.thinking,
+        execution_deadline_seconds: saved.execution_deadline_seconds,
         changed: true,
     })
+}
+
+/// Output of `<tier> publication-policy`.
+#[derive(Debug)]
+pub enum PublicationPolicyOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        publication_policy: String,
+        publication_policy_version: i64,
+        publication_draft: bool,
+        publication_branch_prefix: Option<String>,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for PublicationPolicyOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            PublicationPolicyOutput::DryRun(plan) => plan.to_json(),
+            PublicationPolicyOutput::Done {
+                agent,
+                publication_policy,
+                publication_policy_version,
+                publication_draft,
+                publication_branch_prefix,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                "publication_policy": publication_policy,
+                "publication_policy_version": publication_policy_version,
+                "publication_draft": publication_draft,
+                "publication_branch_prefix": publication_branch_prefix,
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            PublicationPolicyOutput::DryRun(plan) => plan.render(ui),
+            PublicationPolicyOutput::Done {
+                agent,
+                publication_policy,
+                publication_policy_version,
+                publication_draft,
+                publication_branch_prefix,
+                changed,
+            } => {
+                let prefix = publication_branch_prefix
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string());
+                let verb = if *changed { " now" } else { "" };
+                ui.payload(&format!(
+                    "publication policy for {agent}{verb}: {publication_policy} version {publication_policy_version}, draft {publication_draft}, branch prefix {prefix}"
+                ));
+            }
+        }
+    }
+}
+
+/// The PATCH body for publication policy, or None when this invocation only inspects.
+pub fn publication_policy_patch_body(
+    policy: &Option<String>,
+    draft: bool,
+    no_draft: bool,
+    branch_prefix: &Option<String>,
+    clear_branch_prefix: bool,
+) -> Option<serde_json::Value> {
+    let mut body = serde_json::Map::new();
+    if let Some(policy) = policy {
+        body.insert(
+            "publication_policy".to_string(),
+            serde_json::Value::String(policy.clone()),
+        );
+    }
+    if draft {
+        body.insert(
+            "publication_draft".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    } else if no_draft {
+        body.insert(
+            "publication_draft".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    if clear_branch_prefix {
+        body.insert(
+            "publication_branch_prefix".to_string(),
+            serde_json::Value::Null,
+        );
+    } else if let Some(prefix) = branch_prefix {
+        body.insert(
+            "publication_branch_prefix".to_string(),
+            serde_json::Value::String(prefix.clone()),
+        );
+    }
+    if body.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(body))
+    }
+}
+
+pub async fn publication_policy(
+    opts: AgentActionOpts,
+    policy: Option<String>,
+    draft: bool,
+    no_draft: bool,
+    branch_prefix: Option<String>,
+    clear_branch_prefix: bool,
+) -> Result<PublicationPolicyOutput> {
+    let ui = crate::ui::ui();
+    let body = publication_policy_patch_body(
+        &policy,
+        draft,
+        no_draft,
+        &branch_prefix,
+        clear_branch_prefix,
+    );
+    if opts.dry_run {
+        let plan = match &body {
+            Some(b) => format!(
+                "PATCH {}/agents/<id>  {b}  (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            ),
+            None => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print its publication policy)",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(PublicationPolicyOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let Some(body) = body else {
+        return Ok(done_policy(&agent, false));
+    };
+    let cl = ui.checklist();
+    let step = cl.step(&format!("updating publication policy for {}", agent.name));
+    let saved = match client.update_agent(&agent.id, &body).await {
+        Ok(saved) => {
+            step.done("updated");
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    Ok(done_policy(&saved, true))
+}
+
+#[cfg(test)]
+mod publication_policy_tests {
+    use super::publication_policy_patch_body;
+
+    #[test]
+    fn an_inspect_sends_no_patch_body() {
+        assert!(publication_policy_patch_body(&None, false, false, &None, false).is_none());
+    }
+
+    #[test]
+    fn auto_draft_and_a_cleared_prefix_are_one_patch() {
+        let body =
+            publication_policy_patch_body(&Some("auto".to_string()), true, false, &None, true)
+                .expect("a write");
+        assert_eq!(body["publication_policy"], "auto");
+        assert_eq!(body["publication_draft"], true);
+        assert!(body["publication_branch_prefix"].is_null());
+        assert!(body.get("model").is_none());
+    }
+}
+
+fn done_policy(agent: &crate::api::Agent, changed: bool) -> PublicationPolicyOutput {
+    PublicationPolicyOutput::Done {
+        agent: agent.name.clone(),
+        publication_policy: agent.publication_policy.clone(),
+        publication_policy_version: agent.publication_policy_version,
+        publication_draft: agent.publication_draft,
+        publication_branch_prefix: agent.publication_branch_prefix.clone(),
+        changed,
+    }
 }
 
 #[cfg(test)]
@@ -11720,8 +12282,12 @@ mod overrides_tests {
     // alone" silently becomes "reset this to the platform default".
     #[test]
     fn an_unchanged_field_is_absent_and_a_cleared_field_is_present_and_null() {
-        let body = overrides_patch_body(&OverrideChange::Unchanged, &OverrideChange::Clear)
-            .expect("a clear is a write");
+        let body = overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Clear,
+            &OverrideChange::Unchanged,
+        )
+        .expect("a clear is a write");
         let obj = body.as_object().expect("an object");
         assert!(
             !obj.contains_key("model"),
@@ -11732,9 +12298,12 @@ mod overrides_tests {
 
     #[test]
     fn both_unchanged_is_no_body_at_all_which_is_the_inspect_path() {
-        assert!(
-            overrides_patch_body(&OverrideChange::Unchanged, &OverrideChange::Unchanged).is_none()
-        );
+        assert!(overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged
+        )
+        .is_none());
     }
 
     #[test]
@@ -11742,6 +12311,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
         assert_eq!(body["model"], "kimi-k2");
@@ -11778,10 +12348,10 @@ mod overrides_tests {
     // verb was interpolated as an empty string before the colon.
     #[test]
     fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
-        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, false);
+        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, false);
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default"
+            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -11789,8 +12359,8 @@ mod overrides_tests {
     #[test]
     fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
         assert_eq!(
-            super::overrides_summary("a", &None, &Some("adaptive".into()), true),
-            "overrides for a now: model platform default, thinking adaptive"
+            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), true),
+            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s"
         );
     }
 
@@ -11817,6 +12387,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
         assert_eq!(body["model"], "kimi-k2");
@@ -11836,6 +12407,100 @@ mod overrides_tests {
             OverrideChange::resolve("model", Some("m".into()), false).unwrap(),
             OverrideChange::Set("m".into())
         );
+    }
+
+    // --- `--execution-deadline`/`--clear-execution-deadline` (issue #3071) --
+    //
+    // Same three-way PATCH semantics as `model`/`thinking`, plus one thing
+    // neither of those has: the wire field, `execution_deadline_seconds`, is a
+    // JSON NUMBER, not a string, so a `Set` value has to be parsed and range
+    // checked (60..10800) client-side rather than forwarded as typed text.
+
+    #[test]
+    fn a_set_execution_deadline_carries_a_json_number_not_a_string() {
+        let body = overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::resolve_execution_deadline(Some("120".into()), false).unwrap(),
+        )
+        .expect("a set is a write");
+        assert_eq!(body["execution_deadline_seconds"], 120);
+        assert!(body.get("model").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn a_cleared_execution_deadline_is_present_and_null() {
+        let body = overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::Clear,
+        )
+        .expect("a clear is a write");
+        assert!(body["execution_deadline_seconds"].is_null());
+    }
+
+    #[test]
+    fn an_unchanged_execution_deadline_is_absent_when_model_and_thinking_are_set() {
+        let body = overrides_patch_body(
+            &OverrideChange::Set("kimi-k2".into()),
+            &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
+        )
+        .expect("a set is a write");
+        assert!(
+            !body
+                .as_object()
+                .unwrap()
+                .contains_key("execution_deadline_seconds"),
+            "unchanged must be absent: {body}"
+        );
+    }
+
+    #[test]
+    fn an_execution_deadline_below_the_minimum_is_refused_client_side() {
+        let err = OverrideChange::resolve_execution_deadline(Some("59".into()), false)
+            .expect_err("below the 60s floor must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("60"), "{msg}");
+        assert!(msg.contains("10800"), "{msg}");
+    }
+
+    #[test]
+    fn an_execution_deadline_above_the_maximum_is_refused_client_side() {
+        let err = OverrideChange::resolve_execution_deadline(Some("10801".into()), false)
+            .expect_err("above the 10800s ceiling must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("60"), "{msg}");
+        assert!(msg.contains("10800"), "{msg}");
+    }
+
+    #[test]
+    fn execution_deadline_boundaries_are_accepted() {
+        assert_eq!(
+            OverrideChange::resolve_execution_deadline(Some("60".into()), false).unwrap(),
+            OverrideChange::Set("60".into())
+        );
+        assert_eq!(
+            OverrideChange::resolve_execution_deadline(Some("10800".into()), false).unwrap(),
+            OverrideChange::Set("10800".into())
+        );
+    }
+
+    #[test]
+    fn a_non_integer_execution_deadline_is_refused_client_side() {
+        let err = OverrideChange::resolve_execution_deadline(Some("soon".into()), false)
+            .expect_err("a non-integer value must be refused");
+        assert!(err.to_string().contains("--execution-deadline"), "{err}");
+    }
+
+    #[test]
+    fn setting_and_clearing_execution_deadline_together_is_a_usage_error() {
+        let err = OverrideChange::resolve_execution_deadline(Some("120".into()), true)
+            .expect_err("contradictory flags must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("--execution-deadline"), "{msg}");
+        assert!(msg.contains("--clear-execution-deadline"), "{msg}");
     }
 }
 

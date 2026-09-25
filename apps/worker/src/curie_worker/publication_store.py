@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import timedelta
 
 from channel_protocol.reply import ReplyTarget
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .publication_loop import PublicationIdentity, PublicationWork
+from .publication_loop import PublicationWork
 from .reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute
 
 _SAFE_SCHEMA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -20,22 +20,6 @@ _SAFE_SCHEMA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 class PublicationStoreError(RuntimeError):
     """A durable publication transition lost its compare-and-swap."""
-
-
-# The SET half of the identity capture in _terminal_cas, spliced into the
-# lineage advance only when the worker holds a verified identity. It lives here,
-# already indented for its splice site, so that method reads as "update the
-# parameters, assign the two fragments" instead of carrying the SQL and its
-# rationale five levels deep.
-#
-# Plain assignment, never COALESCE: COALESCE would silently keep a stored value
-# that diverged from provider truth, which is the class of defect #2903 is. The
-# equality guards in _identity_where make a divergence lose the CAS instead.
-_IDENTITY_SET = """
-                                   github_repository_id = :github_repository_id,
-                                   github_installation_id = :github_installation_id,
-                                   github_pr_node_id = :github_pr_node_id,
-                                   base_ref = :base_ref,"""
 
 
 @dataclass(frozen=True)
@@ -102,57 +86,9 @@ class PostgresPublicationStore:
             raise ValueError("publication attempt limits must be positive")
         self._engine = engine
         self._table = f'"{schema}".publications'
+        self._requests = f'"{schema}".execution_requests'
         self._approvals = f'"{schema}".approvals'
         self._lineages = f'"{schema}".thread_publication_lineages'
-        # Only the identity-capture CAS reads these two: it re-asserts the
-        # deployment and workspace authority the API checked one round trip
-        # earlier, so a deactivation inside that window cannot capture.
-        self._deployments = f'"{schema}".deployments'
-        self._workspaces = f'"{schema}".thread_workspaces'
-        # The WHERE half of the identity capture, the counterpart to
-        # _IDENTITY_SET. Composed once here, where the two table names it needs
-        # are already resolved.
-        #
-        # "Identity is never backfilled onto a PR that was published before the
-        # App existed" is a user constraint and a security property, and the
-        # leading predicate is what makes it an assertion of the statement
-        # instead of an assertion about its caller: a row that already carries
-        # pr_number must already carry identity, so a pre-App lineage produces
-        # zero rows here whatever the worker asks for. Without it the property
-        # rests entirely on the gate in _verified_identity and the version CAS
-        # happening to read the same row snapshot, and one mechanism is not
-        # enough for it. Do not delete it as redundant: a first capture has
-        # pr_number NULL, so it can never refuse one.
-        #
-        # The API verified deployment and workspace authority one HTTP round
-        # trip ago and deactivation does not bump the lineage version, so the
-        # version CAS cannot close that window. The two EXISTS predicates
-        # re-assert both facts here. They are deliberately absent from the
-        # identity-free statement: they protect the capture that makes a lineage
-        # reviewable, and a token-mode install has no identity to protect.
-        self._identity_where = f"""
-                               AND (pr_number IS NULL
-                                    OR github_repository_id IS NOT NULL)
-                               AND (github_repository_id IS NULL
-                                    OR github_repository_id = :github_repository_id)
-                               AND (github_installation_id IS NULL
-                                    OR github_installation_id = :github_installation_id)
-                               AND (github_pr_node_id IS NULL
-                                    OR github_pr_node_id = :github_pr_node_id)
-                               AND (base_ref IS NULL OR base_ref = :base_ref)
-                               AND EXISTS (
-                                    SELECT 1 FROM {self._deployments} d
-                                     WHERE d.id = l.deployment_id
-                                       AND d.agent_id = l.agent_id
-                                       AND d.status = 'active'
-                               )
-                               AND EXISTS (
-                                    SELECT 1 FROM {self._workspaces} w
-                                     WHERE w.agent_id = l.agent_id
-                                       AND w.conversation_id = l.conversation_id
-                                       AND lower(w.repo_full_name)
-                                           = lower(l.repo_full_name)
-                               )"""
         self._lease_owner = lease_owner
         self._lease_seconds = lease_seconds
         self._result_max_attempts = result_max_attempts
@@ -394,7 +330,9 @@ class PostgresPublicationStore:
                     {"approval_id": row["approval_id"]},
                 )
 
-    async def claim_next(self) -> PublicationWork | None:
+    async def claim_next(
+        self, *, exclude: Collection[uuid.UUID] = ()
+    ) -> PublicationWork | None:
         statement = text(
             f"""
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
@@ -403,8 +341,17 @@ class PostgresPublicationStore:
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
-                   l.pr_url, l.head_sha, l.github_repository_id,
-                   a.conversation_id
+                   l.pr_url, l.head_sha,
+                   a.conversation_id,
+                   (
+                     p.execution_request_id IS NULL
+                     OR EXISTS (
+                        SELECT 1 FROM {self._requests} e
+                         WHERE e.id = p.execution_request_id
+                           AND e.status = 'running'
+                     )
+                   ) AS owner_running,
+                   p.open_as_draft, p.branch_prefix
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
               JOIN {self._lineages} l ON l.id = p.lineage_id
@@ -414,6 +361,16 @@ class PostgresPublicationStore:
                AND p.reconcile_attempts < :max_attempts
                AND p.reconcile_dead_lettered_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
+               AND NOT (p.id = ANY(CAST(:exclude AS uuid[])))
+               AND (
+                    p.execution_request_id IS NULL
+                    OR EXISTS (
+                        SELECT 1 FROM {self._requests} e
+                         WHERE e.id = p.execution_request_id
+                           AND e.status = 'running'
+                    )
+                    OR p.status IN ('launching', 'running')
+               )
              ORDER BY p.created_at, p.id
              FOR UPDATE OF p SKIP LOCKED
              LIMIT 1
@@ -422,7 +379,11 @@ class PostgresPublicationStore:
         async with self._engine.begin() as connection:
             row = (
                 await connection.execute(
-                    statement, {"max_attempts": self._reconcile_max_attempts}
+                    statement,
+                    {
+                        "max_attempts": self._reconcile_max_attempts,
+                        "exclude": [str(item) for item in exclude],
+                    },
                 )
             ).mappings().first()
             if row is None:
@@ -475,11 +436,6 @@ class PostgresPublicationStore:
             branch=str(row["branch"]),
             pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
             pr_url=str(row["pr_url"]) if row["pr_url"] is not None else None,
-            github_repository_id=(
-                int(row["github_repository_id"])
-                if row["github_repository_id"] is not None
-                else None
-            ),
             expected_prior_head=str(row["expected_prior_head"]),
             expected_remote_head=(
                 str(row["head_sha"])
@@ -502,6 +458,12 @@ class PostgresPublicationStore:
                 adapter=row["reply_adapter"],
             ),
             version=version,
+            lease_owner=self._lease_owner,
+            owner_running=bool(row["owner_running"]),
+            open_as_draft=bool(row["open_as_draft"]),
+            branch_prefix=(
+                str(row["branch_prefix"]) if row["branch_prefix"] is not None else None
+            ),
         )
 
     async def is_terminal(self, publication_id: uuid.UUID) -> bool:
@@ -641,10 +603,13 @@ class PostgresPublicationStore:
         outcome: str,
         pr_url: str | None,
         error: str | None,
-        identity: PublicationIdentity | None = None,
-        **lineage: object,
     ) -> None:
-        """Persist the outcome and clear private work before any reply attempt."""
+        """Persist the outcome and clear private work before any reply attempt.
+
+        A published lineage head is never written here: the API advances it
+        with verified GitHub identity first, so this CAS finds that outcome
+        already terminal.
+        """
 
         status = {
             "published": "succeeded",
@@ -655,36 +620,11 @@ class PostgresPublicationStore:
         }.get(outcome)
         if status is None:
             raise ValueError(f"unsupported publication outcome {outcome!r}")
-        lineage_id_value = lineage.get("lineage_id")
-        lineage_version_value = lineage.get("lineage_version")
-        pr_number_value = lineage.get("pr_number")
         await self._terminal_cas(
             publication_id,
             status=status,
             result_url=pr_url,
             error=error[:2000] if error else None,
-            lineage_id=lineage_id_value if isinstance(lineage_id_value, uuid.UUID) else None,
-            lineage_version=(
-                lineage_version_value
-                if isinstance(lineage_version_value, int)
-                else None
-            ),
-            pr_number=(
-                pr_number_value
-                if isinstance(pr_number_value, int)
-                else None
-            ),
-            new_head=(
-                str(lineage["new_head"])
-                if lineage.get("new_head") is not None
-                else None
-            ),
-            expected_prior_head=(
-                str(lineage["expected_prior_head"])
-                if lineage.get("expected_prior_head") is not None
-                else None
-            ),
-            identity=identity,
         )
 
     async def pending_result(
@@ -1076,6 +1016,41 @@ class PostgresPublicationStore:
             raise PublicationStoreError("publication retry CAS was lost")
         self._versions.pop(publication_id, None)
 
+    async def release(self, publication_id: uuid.UUID) -> None:
+        """Release an owned reconcile lease without charging an attempt.
+
+        Used while the deterministic Job is still in flight, so the next pass
+        observes it promptly instead of waiting out the lease.
+        """
+
+        version = self._versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication has no owned lease version")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET lease_owner = NULL,
+                               lease_expires_at = NULL,
+                               version = version + 1,
+                               updated_at = now()
+                         WHERE id = :id AND version = :version AND lease_owner = :owner
+                     RETURNING version
+                        """
+                    ),
+                    {
+                        "id": publication_id,
+                        "version": version,
+                        "owner": self._lease_owner,
+                    },
+                )
+            ).scalar_one_or_none()
+        if updated is None:
+            raise PublicationStoreError("publication release CAS was lost")
+        self._versions.pop(publication_id, None)
+
     async def _terminal_cas(
         self,
         publication_id: uuid.UUID,
@@ -1083,93 +1058,11 @@ class PostgresPublicationStore:
         status: str,
         result_url: str | None,
         error: str | None,
-        lineage_id: uuid.UUID | None = None,
-        lineage_version: int | None = None,
-        pr_number: int | None = None,
-        new_head: str | None = None,
-        expected_prior_head: str | None = None,
-        identity: PublicationIdentity | None = None,
     ) -> None:
         version = self._versions.get(publication_id)
         if version is None:
             raise PublicationStoreError("publication has no owned lease version")
         async with self._engine.begin() as connection:
-            if new_head is not None:
-                if (
-                    lineage_id is None
-                    or lineage_version is None
-                    or pr_number is None
-                    or result_url is None
-                    or expected_prior_head is None
-                ):
-                    raise PublicationStoreError(
-                        "publication success omitted lineage CAS identity"
-                    )
-                parameters: dict[str, object] = {
-                    "lineage_id": lineage_id,
-                    "lineage_version": lineage_version,
-                    "pr_number": pr_number,
-                    "pr_url": result_url,
-                    "new_head": new_head,
-                    "expected_prior": expected_prior_head,
-                }
-                identity_set = ""
-                identity_where = ""
-                if identity is not None:
-                    parameters.update(
-                        github_repository_id=identity.repository_id,
-                        github_installation_id=identity.installation_id,
-                        github_pr_node_id=identity.pr_node_id,
-                        base_ref=identity.base_ref,
-                    )
-                    identity_set = _IDENTITY_SET
-                    identity_where = self._identity_where
-                try:
-                    lineage_updated = (
-                        await connection.execute(
-                            text(
-                                f"""
-                            UPDATE {self._lineages} AS l
-                               SET pr_number = COALESCE(pr_number, :pr_number),
-                                   pr_url = COALESCE(pr_url, :pr_url),
-                                   head_sha = :new_head,{identity_set}
-                                   version = version + 1,
-                                   updated_at = now()
-                             WHERE id = :lineage_id
-                               AND status = 'open'
-                               AND version = :lineage_version
-                               AND (pr_number IS NULL OR pr_number = :pr_number)
-                               AND (pr_url IS NULL OR pr_url = :pr_url)
-                               AND (
-                                    (head_sha IS NULL AND base_sha = :expected_prior)
-                                    OR head_sha = :expected_prior
-                               ){identity_where}
-                         RETURNING version
-                            """
-                            ),
-                            parameters,
-                        )
-                    ).scalar_one_or_none()
-                except IntegrityError as exc:
-                    # Only the identity-bearing variant can land here:
-                    # uq_publication_github_pr_owner, the identity check
-                    # constraint and the per-conversation unique index all
-                    # become reachable the moment identity is written, while the
-                    # identity-free statement writes no identity column and its
-                    # COALESCEd pr_number and pr_url cannot violate any of them.
-                    # Do not name one of them: several can reject this statement
-                    # and blaming a specific index sends an operator hunting the
-                    # wrong lineage. PostgreSQL's own name stays on the chained
-                    # driver error for whoever reads the traceback. Without the
-                    # catch at all the violation escapes as a raw driver error
-                    # and loops on lease expiry instead of failing visibly under
-                    # the bounded retry.
-                    raise PublicationStoreError(
-                        "a database constraint rejected the identity capture "
-                        f"for pull request {pr_number} on lineage {lineage_id}"
-                    ) from exc
-                if lineage_updated is None:
-                    raise PublicationStoreError("publication lineage advance CAS was lost")
             updated = (
                 await connection.execute(
                     text(
@@ -1200,12 +1093,6 @@ class PostgresPublicationStore:
                     },
                 )
             ).scalar_one_or_none()
-            # A successful lineage advance and a lost publication lease must
-            # roll back together. Otherwise a stale worker could move the
-            # shared PR head while leaving its revision nonterminal and make
-            # the retry appear to be a foreign concurrent commit.
-            if updated is None and new_head is not None:
-                raise PublicationStoreError("publication terminal CAS was lost")
         if updated is None:
             if await self.is_terminal(publication_id):
                 self._versions.pop(publication_id, None)

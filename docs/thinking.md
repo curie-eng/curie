@@ -31,6 +31,9 @@ Reasoning-on is simply the default for that class of model, while
 Two layers, both operator-owned. Nothing in a bundle can set or influence
 either one, at any tier — the same rule that governs which model an agent runs.
 
+Provisioned evals inherit both stored model and thinking settings. An explicit
+model selected by an eval sweep takes precedence over the stored model.
+
 **The platform default** is `CURIE_THINKING` on the worker, set wherever you set
 the worker's other env (compose, or `worker.extraEnv` in the chart):
 

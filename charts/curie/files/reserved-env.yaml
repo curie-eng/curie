@@ -60,6 +60,7 @@ worker:
   CURIE_UPGRADE_LEGACY_QUIESCE: the Helm-managed mixed-version upgrade mode (remove this override)
   CURIE_UPGRADE_REVISION: the Helm release revision (remove this override)
   CURIE_WARM_POOL: worker.warmPool
+  CURIE_WORK_ITEM_MAX_TURNS: worker.workItemMaxTurns
   CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS: worker.workspace.archiveTimeoutSeconds
   CURIE_WORKSPACE_BUCKET: worker.workspace.bucket
   CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS: worker.workspace.cloneTimeoutSeconds
@@ -105,6 +106,10 @@ api:
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret
   GITHUB_CLONE_BASE: api.githubCloneBase
+  GITHUB_FACTORY_CARD_BASE_URL: api.githubFactoryCardBaseUrl
+  GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
+  GITHUB_FACTORY_LABEL: api.githubFactoryLabel
+  GITHUB_FACTORY_MENTION: api.githubFactoryMention
   GITHUB_REPO_ALLOWLIST: api.githubRepoAllowlist
   GITHUB_REVIEW_INGRESS_ENABLED: api.githubReviewIngressEnabled
   GITHUB_REVIEW_RECONCILER_INTERVAL_S: api.githubReviewReconcilerIntervalSeconds
@@ -120,6 +125,7 @@ api:
   RESUME_RECONCILER_ENABLED: api.resumeReconciler.enabled
   RESUME_RECONCILER_GRACE_SECONDS: api.resumeReconciler.graceSeconds
   RESUME_RECONCILER_INTERVAL_SECONDS: api.resumeReconciler.intervalSeconds
+  RUNNER_NAMESPACE: the release namespace (Helm --namespace)
   S3_ACCESS_KEY: rustfs.auth.accessKey
   S3_ENDPOINT_URL: rustfs.host / rustfs.port
   S3_SECRET_KEY: rustfs.existingSecret

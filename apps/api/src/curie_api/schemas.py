@@ -33,7 +33,13 @@ from pydantic import (
 from . import adapter_principal
 from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
-from .models import GIT_FLOW_CREATED_BY, Environment
+from .models import (
+    GIT_FLOW_CREATED_BY,
+    MAX_EXECUTION_DEADLINE_SECONDS,
+    MIN_EXECUTION_DEADLINE_SECONDS,
+    Environment,
+)
+from .publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from .repo_full_name import RepoFullName
 from .source_binding import (
     validate_revision,
@@ -775,6 +781,32 @@ def _reject_retired_update_binding_key(data: Any) -> Any:
     return data
 
 
+def _reject_null_publication_switches(data: Any) -> Any:
+    """Policy and draft are not nullable. Prefix null clears the prefix."""
+
+    if not isinstance(data, dict):
+        return data
+    if "publication_policy" in data and data["publication_policy"] is None:
+        raise ValueError("publication_policy must be approve or auto")
+    if "publication_draft" in data and data["publication_draft"] is None:
+        raise ValueError("publication_draft must be true or false")
+    return data
+
+
+def _validate_publication_policy_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in (POLICY_APPROVE, POLICY_AUTO):
+        raise ValueError("publication_policy must be approve or auto")
+    return value
+
+
+def _validate_publication_branch_prefix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return validate_branch_prefix(value)
+
+
 class ChannelBinding(BaseModel):
     """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
 
@@ -1092,6 +1124,10 @@ class AgentCreate(BaseModel):
     # follow-up). False (the default) matches a single-binding agent's existing
     # behavior exactly, since there is nothing yet to share with.
     memory: bool = False
+    # ADR 0147. Omitted means human approval. A bundle cannot set this.
+    publication_policy: Literal["approve", "auto"] = "approve"
+    publication_draft: bool = False
+    publication_branch_prefix: str | None = None
 
     _check_name = field_validator("name")(_validate_agent_name)
     _check_model = field_validator("model")(_validate_model_override)
@@ -1101,6 +1137,9 @@ class AgentCreate(BaseModel):
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
+    _check_publication_prefix = field_validator("publication_branch_prefix")(
+        _validate_publication_branch_prefix
+    )
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -1130,6 +1169,16 @@ class AgentUpdate(BaseModel):
     # `model` above: omitted is unchanged, explicit null clears to the platform
     # default.
     thinking: str | None = None
+    # New per-agent work-item execution deadline in seconds (#3071). Same
+    # three-way semantics as `model`: omitted is unchanged, explicit null clears
+    # to the platform default of 1800 s.
+    execution_deadline_seconds: (
+        Annotated[
+            int,
+            Field(ge=MIN_EXECUTION_DEADLINE_SECONDS, le=MAX_EXECUTION_DEADLINE_SECONDS),
+        ]
+        | None
+    ) = None
     # New permission gates (#245). Omitted (None) leaves the current gates
     # unchanged; an explicit empty list clears them.
     approval_required_tools: list[str] | None = None
@@ -1157,6 +1206,11 @@ class AgentUpdate(BaseModel):
     repo_full_name: RepoFullName | None = None
     # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
+    # Omitted leaves the current publication policy. Explicit null is refused.
+    # ``publication_branch_prefix`` null clears the prefix.
+    publication_policy: Literal["approve", "auto"] | None = None
+    publication_draft: bool | None = None
+    publication_branch_prefix: str | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
@@ -1165,10 +1219,17 @@ class AgentUpdate(BaseModel):
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
+    _check_publication_policy = field_validator("publication_policy")(
+        _validate_publication_policy_value
+    )
+    _check_publication_prefix = field_validator("publication_branch_prefix")(
+        _validate_publication_branch_prefix
+    )
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
     _reject_retired_channel_key = model_validator(mode="before")(_reject_retired_update_binding_key)
+    _reject_null_publication = model_validator(mode="before")(_reject_null_publication_switches)
 
 
 class AgentOut(BaseModel):
@@ -1187,6 +1248,8 @@ class AgentOut(BaseModel):
     behavior_packs: dict[str, Any] | None
     model: str | None
     thinking: str | None
+    # Null means the platform default execution deadline (1800 s) (#3071).
+    execution_deadline_seconds: int | None = None
     approval_required_tools: list[str] | None
     approval_routes: dict[str, ApprovalRouteBindingOut] | None
     # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
@@ -1200,6 +1263,10 @@ class AgentOut(BaseModel):
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up).
     memory: bool
+    publication_policy: Literal["approve", "auto"] = "approve"
+    publication_policy_version: int = 1
+    publication_draft: bool = False
+    publication_branch_prefix: str | None = None
     created_at: datetime
 
     @field_validator("secrets", mode="before")
@@ -1398,6 +1465,12 @@ class ConnectorManifests(BaseModel):
     # Service in `manifests`, so an author never hand-writes a URL that
     # resolves in one tier and not another.
     mcp_entries: dict[str, Any] = Field(default_factory=dict)
+    # The version whose bundle was read. Required: the route always names the
+    # version it was given and does not look up a second deployment.
+    version_id: uuid.UUID
+    # plugin.json triggers as stored. Missing, null, and non-list values are
+    # an empty list. Entries are not validated or rewritten.
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DeploymentCreate(BaseModel):
@@ -1478,6 +1551,8 @@ class PublicationCreate(BaseModel):
     review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
     route: str | None = None
     base_sha: str
+    work_item_request_id: uuid.UUID | None = None
+    work_item_runtime_epoch: int | None = Field(default=None, ge=1)
     patch_b64: str = Field(min_length=1)
     changed_paths: list[str] = Field(min_length=1, max_length=4096)
     expires_in_seconds: int | None = Field(default=None, ge=1)
@@ -1580,6 +1655,10 @@ class PublicationLineageAdvance(BaseModel):
 
     expected_version: int = Field(ge=1)
     expected_head_sha: str | None
+    # The worker's claimed publication version and lease owner fence a stale
+    # worker out after another worker reclaims the publication.
+    expected_publication_version: int = Field(ge=1)
+    lease_owner: str = Field(min_length=1, max_length=255)
     state: Literal["open", "merged", "closed"] = "open"
     pr_number: int = Field(gt=0)
     pr_url: str = Field(min_length=1, max_length=2048)
@@ -1593,20 +1672,6 @@ class PublicationLineageAdvance(BaseModel):
         if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
             raise ValueError("lineage head must be one full 40-character commit id")
         return value.lower()
-
-
-class PublicationLineageIdentityOut(BaseModel):
-    """One verified immutable GitHub identity, or an explicit refusal to capture."""
-
-    # `lineage_id` is echoed on both answers. The worker asserts it equals the
-    # lineage it is about to write, so no reordered, retried or proxied answer
-    # can ever be persisted onto a different lineage.
-    lineage_id: uuid.UUID
-    eligible: bool
-    repository_id: int | None = None
-    installation_id: int | None = None
-    pr_node_id: str | None = None
-    base_ref: str | None = None
 
 
 class PublicationLineageOut(BaseModel):
@@ -1660,6 +1725,8 @@ class PublicationOut(BaseModel):
     pr_url: str | None
     repo_full_name: str
     status: str
+    open_as_draft: bool = False
+    branch_prefix: str | None = None
     version: int
     base_sha: str
     changed_paths: list[str]
@@ -1675,6 +1742,96 @@ class PublicationOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     terminal_at: datetime | None
+
+
+WorkItemOutcomeState = Literal[
+    "waiting",
+    "running",
+    "cancellation_requested",
+    "cancelled",
+    "expired",
+    "failed",
+    "awaiting_approval",
+    "publishing",
+    "published",
+    "completed_unpublished",
+]
+WorkItemCiState = Literal[
+    "passing", "failing", "pending", "none", "unavailable", "not_applicable"
+]
+
+
+class WorkItemRequestOut(BaseModel):
+    """Operator view of one ExecutionRequest (#2577). Built from an explicit
+    allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
+
+    sequence: int
+    status: str
+    created_at: datetime
+    wait_deadline: datetime
+    started_at: datetime | None
+    execution_deadline: datetime | None
+    terminal_at: datetime | None
+    terminal_cause: str | None
+    termination_observation: str | None
+    capacity_deferrals: int
+    last_deferral_reason: str | None
+
+
+class WorkItemPrOut(BaseModel):
+    number: int
+    url: str
+    status: str
+
+
+class WorkItemPublicationOut(BaseModel):
+    status: str
+    revision_number: int | None
+    approval_status: str | None
+
+
+class WorkItemCorrectnessOut(BaseModel):
+    """The platform never asserts correctness; the bundle owns it (ADR 0162)."""
+
+    asserted: Literal[False] = False
+    owner: Literal["bundle"] = "bundle"
+
+
+class WorkItemCiOut(BaseModel):
+    """A live, unpersisted CI observation of the published head."""
+
+    state: WorkItemCiState
+    reason: str | None = None
+    head_sha: str | None = None
+    observed_at: datetime | None = None
+
+
+class WorkItemOutcomeOut(BaseModel):
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    repo_full_name: str
+    github_issue_number: int
+    issue_url: str
+    cancelled_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    state: WorkItemOutcomeState
+    actionable_cause: str
+    objective: str | None
+    objective_truncated: bool
+    requester: str | None
+    pr: WorkItemPrOut | None
+    publication: WorkItemPublicationOut | None
+    correctness: WorkItemCorrectnessOut
+    # Null on the list route: CI is observed live on the detail route only.
+    ci: WorkItemCiOut | None
+    requests: list[WorkItemRequestOut]
+
+
+class WorkItemOutcomeList(BaseModel):
+    items: list[WorkItemOutcomeOut]
+    limit: int
+    truncated: bool
 
 
 class ApprovalResolve(BaseModel):
@@ -2018,7 +2175,7 @@ class ApprovalAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
-    principal_kind: Literal["chat", "console", "operator", "adapter"] | None
+    principal_kind: Literal["chat", "console", "operator", "adapter", "platform"] | None
     authenticated: bool
     # The adapter that transported an `adapter` principal's decision
     # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.

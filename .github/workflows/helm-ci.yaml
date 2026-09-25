@@ -135,6 +135,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/api-service-nodeport-assertions.sh
 
+      # Prove the api reads runner pods for the Logs tab from the release
+      # namespace, the same namespace the worker claims sandboxes in.
+      - name: helm render assertions (api runner namespace)
+        run: bash charts/curie/ci/api-runner-namespace-assertions.sh
+
       # Prove the retired BYO-model LiteLLM sidecar (issue #253) is absent by
       # default and that enabling its values flag is refused by the chart
       # guard. Runs the chart-owned assertion script.

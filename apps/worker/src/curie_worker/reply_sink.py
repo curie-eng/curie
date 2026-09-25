@@ -2,9 +2,9 @@
 
 The kernel holds ONE ``ReplySink`` and never asks what a channel can do (ADR-0096
 D3). Adapter selection lives here, below the seam: ``ReplySinkRouter`` picks
-``SlackReplyAdapter`` for ``kind == "slack"`` and ``HttpReplyAdapter`` for
-everything else. A ``kind`` branch reappearing in ``kernel.py`` is the seam
-leaking back upward.
+``SlackReplyAdapter`` for ``kind == "slack"``, ``GitHubReplySink`` for
+``kind == "github"``, and ``HttpReplyAdapter`` for everything else. A ``kind``
+branch reappearing in ``kernel.py`` is the seam leaking back upward.
 
 ``TargetRoute`` is a worker-local kwarg, never a wire field: a published event
 body must not tell an adapter where the platform is sending it, and must never
@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 
 SLACK_KIND = "slack"
+GITHUB_KIND = "github"
 
 # This platform-owned adapter is selected by the disconnected ``cluster
 # message`` reply handle. It is deliberately not configurable: allowing an
@@ -385,6 +386,28 @@ class HttpReplyAdapter:
         return ReplyAck(ref=_ref_from(payload))
 
 
+class GitHubReplySink:
+    """Acks every GitHub-bound event locally and makes no network call.
+
+    A factory turn bound to a GitHub repository answers on GitHub only through
+    the platform's one GitHub writer -- the api factory notice / publication
+    path (#2924/#2798). Streamed model text is therefore acknowledged and not
+    posted. That keeps exactly one GitHub response per request and never
+    fabricates an endpoint. It also keeps the fail-closed rule for every other
+    kind: only ``kind == "github"`` is routed here.
+    """
+
+    async def emit(
+        self,
+        event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        del event, route, best_effort_unreachable
+        return ReplyAck(ref=None)
+
+
 class _ClusterMessageReplyAdapter:
     """Delivers disconnected cluster replies to the platform API relay.
 
@@ -618,7 +641,8 @@ def build_reply_sink(config: WorkerConfig) -> ReplySinkRouter:
                 config.slack_bot_token,
                 base_url=config.slack_api_base_url or None,
                 trusted_origins=config.slack_trusted_origins,
-            )
+            ),
+            GITHUB_KIND: GitHubReplySink(),
         },
         default=HttpReplyAdapter(config.adapter_credentials),
         cluster_message=_ClusterMessageReplyAdapter(

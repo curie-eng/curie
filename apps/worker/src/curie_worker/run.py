@@ -40,17 +40,19 @@ from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
 from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
+from .cron_loop import BundleTriggerSource, CronSchedulerLoop
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
+from .hook_runs import HookRunRecorder
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
 from .publication_clients import (
     GitHubPublicationLookup,
     PublicationCredentialClient,
-    PublicationIdentityClient,
+    PublicationLineageClient,
     PublicationTranscriptClient,
 )
 from .publication_k8s import KubernetesPublicationCluster, PublicationJobSettings
@@ -73,6 +75,8 @@ from .sandbox import (
 )
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
+from .workitem_dispatch import WorkItemDispatchClient
+from .workitem_orphans import WorkItemOrphanSweeper
 from .workspace import (
     SubprocessCommands,
     WorkspaceClaimCoordinator,
@@ -111,7 +115,12 @@ class Runtime:
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
     connector_loop: ConnectorReconcileLoop | None = None
+    # The cron scheduler (#268). Always built by ``build``; optional only so a
+    # Runtime constructed elsewhere need not name it.
+    cron_loop: CronSchedulerLoop | None = None
     publication_loop: PublicationReconcileLoop | None = None
+    # None when the worker has no internal token and so no WorkItem client.
+    orphan_sweeper: WorkItemOrphanSweeper | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -140,6 +149,10 @@ _MAX_TUNABLE_SECONDS = 31_536_000
 # reaches the consumers. Cutting it short only leaves some legacy refs behind,
 # and those lapse with their own TTL.
 _CARD_MIGRATION_BUDGET_S = 30.0
+
+# The boot orphan sweep (#3076) runs before the heartbeat too, so it is bounded
+# the same way. A cut short sweep is finished by the supervised loop.
+_ORPHAN_SWEEP_BUDGET_S = 30.0
 
 
 def _bounded_seconds(
@@ -437,6 +450,15 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     )
     sink = build_reply_sink(config)
     card_store = ApprovalCardStore(async_redis, config)
+    work_items = (
+        WorkItemDispatchClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        if config.internal_worker_token
+        else None
+    )
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
@@ -482,8 +504,10 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         approval_reader=approval_client,
         actions=action_client,
         card_store=card_store,
+        hook_runs=HookRunRecorder(engine),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
+        work_items=work_items,
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
@@ -555,7 +579,40 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         eval_http=eval_http,
         engine=engine,
         card_store=card_store,
+        orphan_sweeper=(
+            WorkItemOrphanSweeper(
+                work_items,
+                ThreadLockOwnerLiveness(
+                    ConsumerLivenessStore(async_redis),
+                    stream=config.stream,
+                    group=config.consumer_group,
+                ).is_alive,
+                self_name=config.consumer_name,
+                locally_owned=kernel.owns_work_item,
+                absence_proof_s=config.consumer_heartbeat_ttl_ms / 1000,
+                interval_s=config.work_item_orphan_sweep_interval_s,
+            )
+            if work_items is not None
+            else None
+        ),
         connector_loop=_build_connector_loop(config, engine),
+        cron_loop=CronSchedulerLoop(
+            engine=engine,
+            redis=async_redis,
+            source=BundleTriggerSource(
+                BundleStore(config),
+                max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+                max_compression_ratio=config.bundle_max_compression_ratio,
+                max_members=config.bundle_max_members,
+            ),
+            is_killed=killswitch.is_killed,
+            db_schema=config.db_schema,
+            stream=config.stream,
+            interval_seconds=config.cron_tick_interval_s,
+            delivery_budget_s=config.delivery_budget_s,
+            default_max_usd_per_day=config.default_max_usd_per_day,
+            default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
+        ),
         publication_loop=publication_loop,
     )
 
@@ -567,6 +624,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "evals",
         "heartbeat",
         "connectors",
+        "cron",
         "publications",
     }
 )
@@ -765,14 +823,13 @@ def _build_publication_loop(
             worker_token=config.internal_worker_token,
             client=http,
         ),
-        identity=PublicationIdentityClient(
+        cluster=cluster,
+        github=GitHubPublicationLookup(http),
+        lineage=PublicationLineageClient(
             api_base_url=config.api_base_url,
             worker_token=config.internal_worker_token,
             client=http,
-            lease_seconds=config.publication_lease_seconds,
         ),
-        cluster=cluster,
-        github=GitHubPublicationLookup(http),
         # Publication delivery runs outside the kernel, so it must decorate the
         # shared router independently. The reply observation depth suppresses
         # the HTTP adapter's nested instrumentation and keeps one logical
@@ -860,6 +917,16 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
         )
     except Exception:
         logger.exception("legacy approval card migration failed; continuing boot")
+    # One boot sweep before any consumer reads: a run this process's previous
+    # incarnation owned is an orphan now (#3076). Swallowed like the migration.
+    sweeper = rt.orphan_sweeper
+    if sweeper is not None:
+        try:
+            await asyncio.wait_for(sweeper.sweep(), timeout=_ORPHAN_SWEEP_BUDGET_S)
+        except TimeoutError:
+            logger.warning("work-item orphan boot sweep exceeded its budget; the loop resumes it")
+        except Exception:
+            logger.exception("work-item orphan boot sweep failed; continuing boot")
     policy = _supervise_policy(config)
     try:
         # return_exceptions=True + per-task restart: a crash in one consumer must
@@ -889,6 +956,18 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             *(
                 [
                     _supervise(
+                        "cron",
+                        lambda: rt.cron_loop.run_forever(shutdown),  # type: ignore[union-attr]
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if rt.cron_loop is not None
+                else []
+            ),
+            *(
+                [
+                    _supervise(
                         "publications",
                         lambda: rt.publication_loop.run_forever(shutdown),  # type: ignore[union-attr]
                         shutdown,
@@ -896,6 +975,18 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                     )
                 ]
                     if getattr(rt, "publication_loop", None) is not None
+                else []
+            ),
+            *(
+                [
+                    _supervise(
+                        "work-item-orphans",
+                        lambda: sweeper.run_forever(shutdown),
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if sweeper is not None
                 else []
             ),
             return_exceptions=True,

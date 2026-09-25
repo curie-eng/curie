@@ -34,6 +34,22 @@
           "exclusiveMinimum": 0,
           "description": "Positive cadence in seconds for reconciling accepted GitHub review feedback."
         },
+        "githubFactoryIngressEnabled": {
+          "type": "boolean",
+          "description": "Opt-in gate for signed GitHub issue admission. The API validates the App credentials, label, mention login, allowlist, and non-default webhook secret at boot."
+        },
+        "githubFactoryLabel": {
+          "type": "string",
+          "description": "Issue label that requests initial factory admission. Empty while intake is off."
+        },
+        "githubFactoryCardBaseUrl": {
+          "type": "string",
+          "description": "Public https origin GitHub's image proxy fetches the live factory status card from. Empty omits the card image."
+        },
+        "githubFactoryMention": {
+          "type": "string",
+          "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."
+        },
         "githubRepoAllowlist": {
           "type": "array",
           "uniqueItems": true,
@@ -68,14 +84,14 @@
         "deliveryBudgetSeconds": {
           "type": "integer",
           "minimum": 60,
-          "maximum": 1800,
-          "description": "Overall wall-clock deadline for one delivery (ADR-0131). Below 60s a budget cannot cover claim + one runner request + settle; above 1800s (the ADR's stated maximum) silently requires a termination grace the schema will not accept."
+          "maximum": 10800,
+          "description": "Overall wall-clock deadline for one delivery (ADR-0131). Below 60s a budget cannot cover claim + one runner request + settle; at most 10800s (three hours, #3071). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds)."
         },
         "runnerTotalTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "maximum": 1800,
-          "description": "Positive per-request ceiling for runner work, at most 1800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
+          "maximum": 10800,
+          "description": "Positive per-request ceiling for runner work, at most 10800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
         },
         "deliveryLeaseTtlSeconds": {
           "type": "integer",
@@ -89,17 +105,22 @@
           "maximum": 3600,
           "description": "How often the delivery lease owner renews its lease and resets its PEL idle (ADR-0131). Too large relative to deliveryLeaseTtlSeconds drops a healthy owner's lease on a single missed heartbeat; the worker's own validator enforces that relationship."
         },
+        "workItemMaxTurns": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Turn budget for a work-item (factory) delivery (#3071), rendered as CURIE_WORK_ITEM_MAX_TURNS and written into that delivery's sandbox as CURIE_MAX_TURNS. Other deliveries keep the runner default. A run that exhausts it fails as max-turns."
+        },
         "deliveryShutdownReserveSeconds": {
           "type": "integer",
           "minimum": 0,
           "maximum": 3600,
-          "description": "Budget reserved for fenced terminal settlement after runner work completes (ADR-0131). terminationGracePeriodSeconds must be at least deliveryBudgetSeconds plus this value, or a draining worker is SIGKILLed before it can settle."
+          "description": "Budget reserved for fenced terminal settlement after runner work completes (ADR-0131). The rendered termination grace is at least deliveryBudgetSeconds plus this value, so a draining worker can settle before SIGKILL."
         },
         "terminationGracePeriodSeconds": {
           "type": "integer",
           "minimum": 60,
           "maximum": 86400,
-          "description": "Voluntary Pod termination grace before SIGKILL. Must be at least deliveryBudgetSeconds + deliveryShutdownReserveSeconds (ADR-0131, #1971), or a worker draining a maximum-budget turn is killed at the exact moment it would settle; below 60s not even a fast drain reliably completes."
+          "description": "Floor for the voluntary Pod termination grace before SIGKILL. The chart renders max(this, deliveryBudgetSeconds + deliveryShutdownReserveSeconds) (ADR-0131, #1971, #3071), so a worker draining a maximum-budget turn is never killed at the moment it would settle; below 60s not even a fast drain reliably completes."
         },
         "upgradeDrain": {
           "type": "object",

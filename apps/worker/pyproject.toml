@@ -5,6 +5,7 @@ description = "Curie worker: concurrency kernel (routing, finish-race CAS, steer
 requires-python = ">=3.13"
 dependencies = [
     "redis>=5.2",
+    "cronsim==2.7",
     "pydantic-settings>=2.15.0",
     "kubernetes>=36.0.3",
     "aci-protocol",

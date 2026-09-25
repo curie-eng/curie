@@ -1,4 +1,4 @@
 {
-  "protocol_version": "0.4.6",
-  "wire_sha256": "f428630bbb0a6ec57eb180311b4b847bb72cd4c2234437af5b3993342b110672"
+  "protocol_version": "0.5.1",
+  "wire_sha256": "ec95fbcd2ad81eb32b4c068ea91a78434385e3ac21bfb85775b89a1ded62f520"
 }

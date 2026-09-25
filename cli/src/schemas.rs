@@ -66,6 +66,10 @@ mod tests {
     fn a_known_schema_and_an_unknown_one() {
         assert!(schema("kill").is_some(), "kill schema is embedded");
         assert!(schema("kill.schema.json").is_some());
+        assert!(
+            schema("curie-yaml").is_some(),
+            "installation input schema is embedded"
+        );
         assert!(schema("no-such-result").is_none());
     }
 }

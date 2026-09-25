@@ -1,6 +1,26 @@
 {
   "components": {
     "schemas": {
+      "AcquireBody": {
+        "properties": {
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "generation"
+        ],
+        "title": "AcquireBody",
+        "type": "object"
+      },
       "ActionAuditOut": {
         "description": "One entry in an action's audit trail: an authorized undo, or a refused one.",
         "properties": {
@@ -498,6 +518,63 @@
         "title": "ActionUndoOut",
         "type": "object"
       },
+      "Activity": {
+        "additionalProperties": false,
+        "properties": {
+          "last_tool": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Tool"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "tool_calls": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Calls"
+          },
+          "turns": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turns"
+          }
+        },
+        "title": "Activity",
+        "type": "object"
+      },
       "AdapterPrincipalMint": {
         "description": "Administrative request to issue one channel adapter credential (ADR-0154).",
         "properties": {
@@ -592,6 +669,81 @@
         "title": "AdapterPrincipalRotate",
         "type": "object"
       },
+      "AdmissionFacts": {
+        "properties": {
+          "address": {
+            "minLength": 1,
+            "title": "Address",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "github_installation_id": {
+            "exclusiveMinimum": 0.0,
+            "title": "Github Installation Id",
+            "type": "integer"
+          },
+          "github_issue_number": {
+            "exclusiveMinimum": 0.0,
+            "title": "Github Issue Number",
+            "type": "integer"
+          },
+          "github_repository_id": {
+            "exclusiveMinimum": 0.0,
+            "title": "Github Repository Id",
+            "type": "integer"
+          },
+          "kind": {
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          },
+          "objective": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          },
+          "reply_conversation_id": {
+            "minLength": 1,
+            "title": "Reply Conversation Id",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "minLength": 1,
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requester": {
+            "minLength": 1,
+            "title": "Requester",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "kind",
+          "address",
+          "reply_conversation_id",
+          "repo_full_name",
+          "github_repository_id",
+          "github_issue_number",
+          "github_installation_id",
+          "objective",
+          "requester",
+          "request_id"
+        ],
+        "title": "AdmissionFacts",
+        "type": "object"
+      },
       "AgentCreate": {
         "properties": {
           "approval_required_tools": {
@@ -667,6 +819,31 @@
           },
           "name": {
             "title": "Name",
+            "type": "string"
+          },
+          "publication_branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Branch Prefix"
+          },
+          "publication_draft": {
+            "default": false,
+            "title": "Publication Draft",
+            "type": "boolean"
+          },
+          "publication_policy": {
+            "default": "approve",
+            "enum": [
+              "approve",
+              "auto"
+            ],
+            "title": "Publication Policy",
             "type": "string"
           },
           "repo_full_name": {
@@ -784,6 +961,17 @@
             "title": "Created At",
             "type": "string"
           },
+          "execution_deadline_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Deadline Seconds"
+          },
           "hook_partitions": {
             "anyOf": [
               {
@@ -821,6 +1009,36 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "publication_branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Branch Prefix"
+          },
+          "publication_draft": {
+            "default": false,
+            "title": "Publication Draft",
+            "type": "boolean"
+          },
+          "publication_policy": {
+            "default": "approve",
+            "enum": [
+              "approve",
+              "auto"
+            ],
+            "title": "Publication Policy",
+            "type": "string"
+          },
+          "publication_policy_version": {
+            "default": 1,
+            "title": "Publication Policy Version",
+            "type": "integer"
           },
           "repo_full_name": {
             "anyOf": [
@@ -923,6 +1141,19 @@
             ],
             "title": "Approval Routes"
           },
+          "execution_deadline_seconds": {
+            "anyOf": [
+              {
+                "maximum": 10800.0,
+                "minimum": 60.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Deadline Seconds"
+          },
           "hook_partitions": {
             "anyOf": [
               {
@@ -958,6 +1189,43 @@
               }
             ],
             "title": "Model"
+          },
+          "publication_branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Branch Prefix"
+          },
+          "publication_draft": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Draft"
+          },
+          "publication_policy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "approve",
+                  "auto"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Policy"
           },
           "repo_full_name": {
             "anyOf": [
@@ -1167,7 +1435,8 @@
                   "chat",
                   "console",
                   "operator",
-                  "adapter"
+                  "adapter",
+                  "platform"
                 ],
                 "type": "string"
               },
@@ -2257,6 +2526,20 @@
         "title": "BundleOut",
         "type": "object"
       },
+      "CancelBody": {
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "CancelBody",
+        "type": "object"
+      },
       "ChannelBindingOut": {
         "additionalProperties": false,
         "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe shape stays `{kind, address}`, identical to what `ChannelBinding`\nserialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring\nalready describes that as the read contract.",
@@ -2472,8 +2755,24 @@
             "default": "",
             "title": "Owned Secret Name",
             "type": "string"
+          },
+          "triggers": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Triggers",
+            "type": "array"
+          },
+          "version_id": {
+            "format": "uuid",
+            "title": "Version Id",
+            "type": "string"
           }
         },
+        "required": [
+          "version_id"
+        ],
         "title": "ConnectorManifests",
         "type": "object"
       },
@@ -2594,6 +2893,64 @@
           "points"
         ],
         "title": "CostReport",
+        "type": "object"
+      },
+      "Declaration": {
+        "additionalProperties": false,
+        "properties": {
+          "loops": {
+            "items": {
+              "$ref": "#/components/schemas/LoopDeclaration"
+            },
+            "maxItems": 4,
+            "title": "Loops",
+            "type": "array"
+          },
+          "phases": {
+            "items": {
+              "$ref": "#/components/schemas/PhaseDeclaration"
+            },
+            "maxItems": 12,
+            "minItems": 1,
+            "title": "Phases",
+            "type": "array"
+          }
+        },
+        "required": [
+          "phases"
+        ],
+        "title": "Declaration",
+        "type": "object"
+      },
+      "DeferBody": {
+        "properties": {
+          "capacity": {
+            "title": "Capacity",
+            "type": "boolean"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "reason": {
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "generation",
+          "reason",
+          "capacity"
+        ],
+        "title": "DeferBody",
         "type": "object"
       },
       "DeploymentCreate": {
@@ -3199,6 +3556,47 @@
         "title": "EvalTriggerResult",
         "type": "object"
       },
+      "FinishBody": {
+        "properties": {
+          "cause": {
+            "minLength": 1,
+            "title": "Cause",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "outcome": {
+            "enum": [
+              "completed",
+              "failed"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch",
+          "outcome",
+          "cause"
+        ],
+        "title": "FinishBody",
+        "type": "object"
+      },
       "GateKind": {
         "description": "Which gate raised an approval: a permission gate or a policy gate.\n\nA ``StrEnum`` rather than a ``Literal`` for two reasons. It is what the Rust\ngenerator can express (a multi-valued ``Literal`` raises; the ``Enum`` branch\nis the sanctioned path, exactly as ``SessionStatus`` uses). And the field is\nauthority-bearing per #544/ADR-0046, so the value domain is a named, exported\npart of the contract rather than an inline annotation.",
         "enum": [
@@ -3274,6 +3672,20 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HeartbeatBody": {
+        "properties": {
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch"
+        ],
+        "title": "HeartbeatBody",
         "type": "object"
       },
       "HelpPackConfig": {
@@ -3359,6 +3771,30 @@
         "title": "HookPartitionConfig",
         "type": "object"
       },
+      "HookRunRef": {
+        "description": "Identity of the scheduled hook run that produced a queued turn.\n\n``slot_utc`` is an ISO 8601 timestamp with an explicit UTC offset.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slot_utc": {
+            "title": "Slot Utc",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "name",
+          "slot_utc"
+        ],
+        "title": "HookRunRef",
+        "type": "object"
+      },
       "KillState": {
         "description": "Whether an agent is currently killed (kill switch, L1).",
         "properties": {
@@ -3406,6 +3842,34 @@
           }
         },
         "title": "LoadPackConfig",
+        "type": "object"
+      },
+      "LoopDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "cap": {
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Cap",
+            "type": "integer"
+          },
+          "review": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Review",
+            "type": "string"
+          },
+          "start": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "review",
+          "cap"
+        ],
+        "title": "LoopDeclaration",
         "type": "object"
       },
       "MemoryEntryCreate": {
@@ -3802,6 +4266,48 @@
         "title": "ObservationNode",
         "type": "object"
       },
+      "OwnerLostBody": {
+        "properties": {
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "owner",
+          "runtime_epoch"
+        ],
+        "title": "OwnerLostBody",
+        "type": "object"
+      },
+      "PhaseDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "PhaseDeclaration",
+        "type": "object"
+      },
       "PodLogs": {
         "description": "Runner-pod logs for the per-run runner-logs affordance.",
         "properties": {
@@ -3836,6 +4342,57 @@
           "logs"
         ],
         "title": "PodLogs",
+        "type": "object"
+      },
+      "ProgressReport": {
+        "additionalProperties": false,
+        "properties": {
+          "activity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Activity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "declaration": {
+            "$ref": "#/components/schemas/Declaration"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "phase": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Phase",
+            "type": "string"
+          },
+          "round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round"
+          }
+        },
+        "required": [
+          "phase",
+          "declaration"
+        ],
+        "title": "ProgressReport",
         "type": "object"
       },
       "PublicationCreate": {
@@ -4003,6 +4560,30 @@
               }
             ],
             "title": "Title"
+          },
+          "work_item_request_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Item Request Id"
+          },
+          "work_item_runtime_epoch": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Item Runtime Epoch"
           }
         },
         "required": [
@@ -4035,6 +4616,11 @@
             ],
             "title": "Expected Head Sha"
           },
+          "expected_publication_version": {
+            "minimum": 1.0,
+            "title": "Expected Publication Version",
+            "type": "integer"
+          },
           "expected_version": {
             "minimum": 1.0,
             "title": "Expected Version",
@@ -4042,6 +4628,12 @@
           },
           "head_sha": {
             "title": "Head Sha",
+            "type": "string"
+          },
+          "lease_owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Lease Owner",
             "type": "string"
           },
           "pr_number": {
@@ -4069,75 +4661,13 @@
         "required": [
           "expected_version",
           "expected_head_sha",
+          "expected_publication_version",
+          "lease_owner",
           "pr_number",
           "pr_url",
           "head_sha"
         ],
         "title": "PublicationLineageAdvance",
-        "type": "object"
-      },
-      "PublicationLineageIdentityOut": {
-        "description": "One verified immutable GitHub identity, or an explicit refusal to capture.",
-        "properties": {
-          "base_ref": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Base Ref"
-          },
-          "eligible": {
-            "title": "Eligible",
-            "type": "boolean"
-          },
-          "installation_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Installation Id"
-          },
-          "lineage_id": {
-            "format": "uuid",
-            "title": "Lineage Id",
-            "type": "string"
-          },
-          "pr_node_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr Node Id"
-          },
-          "repository_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Repository Id"
-          }
-        },
-        "required": [
-          "lineage_id",
-          "eligible"
-        ],
-        "title": "PublicationLineageIdentityOut",
         "type": "object"
       },
       "PublicationLineageOut": {
@@ -4280,6 +4810,17 @@
             ],
             "title": "Branch"
           },
+          "branch_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch Prefix"
+          },
           "changed_paths": {
             "items": {
               "type": "string"
@@ -4384,6 +4925,11 @@
               }
             ],
             "title": "Lineage Version"
+          },
+          "open_as_draft": {
+            "default": false,
+            "title": "Open As Draft",
+            "type": "boolean"
           },
           "pr_number": {
             "anyOf": [
@@ -4540,7 +5086,7 @@
         "type": "object"
       },
       "QueuedTurn": {
-        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.",
+        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.",
         "properties": {
           "attachments": {
             "default": [],
@@ -4562,12 +5108,29 @@
             "title": "Event Id",
             "type": "string"
           },
+          "hook_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HookRunRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "received_at": {
             "title": "Received At",
             "type": "string"
           },
           "reply_handle": {
-            "$ref": "#/components/schemas/ReplyHandle"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReplyHandle"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "source": {
             "$ref": "#/components/schemas/TurnSource",
@@ -4583,7 +5146,6 @@
           "conversation_id",
           "author",
           "text",
-          "reply_handle",
           "received_at"
         ],
         "title": "QueuedTurn",
@@ -5260,6 +5822,38 @@
         "title": "SourceTraceOut",
         "type": "object"
       },
+      "StartBody": {
+        "properties": {
+          "claim_name": {
+            "minLength": 1,
+            "title": "Claim Name",
+            "type": "string"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "sandbox_name": {
+            "minLength": 1,
+            "title": "Sandbox Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "generation",
+          "claim_name",
+          "sandbox_name"
+        ],
+        "title": "StartBody",
+        "type": "object"
+      },
       "StateAppendIn": {
         "description": "Append ``item`` to a log-shaped (JSON array) state entry (#248). If the\nentry does not exist it is created as a single-element array; if it exists\nits value must already be an array, else the append is rejected.\n\n``reserve_bytes`` (#2927) refuses the append with 413 when the new value\nwould leave fewer than that many bytes free under the per-value cap. The\nrunner sets it on transcript appends to keep headroom for the worker's\npublication outcome append; omitting it keeps the plain cap.",
         "properties": {
@@ -5366,6 +5960,40 @@
           "last_updated"
         ],
         "title": "StateNamespaceOut",
+        "type": "object"
+      },
+      "TerminationBody": {
+        "properties": {
+          "observation": {
+            "minLength": 1,
+            "title": "Observation",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch",
+          "observation"
+        ],
+        "title": "TerminationBody",
+        "type": "object"
+      },
+      "TerminationClaimBody": {
+        "properties": {
+          "owner": {
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner"
+        ],
+        "title": "TerminationClaimBody",
         "type": "object"
       },
       "ThreadResetState": {
@@ -5726,6 +6354,434 @@
           "status"
         ],
         "title": "WebhookResult",
+        "type": "object"
+      },
+      "WorkItemCiOut": {
+        "description": "A live, unpersisted CI observation of the published head.",
+        "properties": {
+          "head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Head Sha"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "passing",
+              "failing",
+              "pending",
+              "none",
+              "unavailable",
+              "not_applicable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "WorkItemCiOut",
+        "type": "object"
+      },
+      "WorkItemCorrectnessOut": {
+        "description": "The platform never asserts correctness; the bundle owns it (ADR 0162).",
+        "properties": {
+          "asserted": {
+            "const": false,
+            "default": false,
+            "title": "Asserted",
+            "type": "boolean"
+          },
+          "owner": {
+            "const": "bundle",
+            "default": "bundle",
+            "title": "Owner",
+            "type": "string"
+          }
+        },
+        "title": "WorkItemCorrectnessOut",
+        "type": "object"
+      },
+      "WorkItemOutcomeList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemOutcomeOut"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "items",
+          "limit",
+          "truncated"
+        ],
+        "title": "WorkItemOutcomeList",
+        "type": "object"
+      },
+      "WorkItemOutcomeOut": {
+        "properties": {
+          "actionable_cause": {
+            "title": "Actionable Cause",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "cancelled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancelled At"
+          },
+          "ci": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemCiOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "correctness": {
+            "$ref": "#/components/schemas/WorkItemCorrectnessOut"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "github_issue_number": {
+            "title": "Github Issue Number",
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "issue_url": {
+            "title": "Issue Url",
+            "type": "string"
+          },
+          "objective": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Objective"
+          },
+          "objective_truncated": {
+            "title": "Objective Truncated",
+            "type": "boolean"
+          },
+          "pr": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemPrOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "publication": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemPublicationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "requester": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requester"
+          },
+          "requests": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemRequestOut"
+            },
+            "title": "Requests",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "waiting",
+              "running",
+              "cancellation_requested",
+              "cancelled",
+              "expired",
+              "failed",
+              "awaiting_approval",
+              "publishing",
+              "published",
+              "completed_unpublished"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "repo_full_name",
+          "github_issue_number",
+          "issue_url",
+          "cancelled_at",
+          "created_at",
+          "updated_at",
+          "state",
+          "actionable_cause",
+          "objective",
+          "objective_truncated",
+          "requester",
+          "pr",
+          "publication",
+          "correctness",
+          "ci",
+          "requests"
+        ],
+        "title": "WorkItemOutcomeOut",
+        "type": "object"
+      },
+      "WorkItemPrOut": {
+        "properties": {
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "number",
+          "url",
+          "status"
+        ],
+        "title": "WorkItemPrOut",
+        "type": "object"
+      },
+      "WorkItemPublicationOut": {
+        "properties": {
+          "approval_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Status"
+          },
+          "revision_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision Number"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "revision_number",
+          "approval_status"
+        ],
+        "title": "WorkItemPublicationOut",
+        "type": "object"
+      },
+      "WorkItemRequestOut": {
+        "description": "Operator view of one ExecutionRequest (#2577). Built from an explicit\nallowlist dict, never from an ORM row, so no runtime-owner field leaks.",
+        "properties": {
+          "capacity_deferrals": {
+            "title": "Capacity Deferrals",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "execution_deadline": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Deadline"
+          },
+          "last_deferral_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Deferral Reason"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terminal_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal At"
+          },
+          "terminal_cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Cause"
+          },
+          "termination_observation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Termination Observation"
+          },
+          "wait_deadline": {
+            "format": "date-time",
+            "title": "Wait Deadline",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sequence",
+          "status",
+          "created_at",
+          "wait_deadline",
+          "started_at",
+          "execution_deadline",
+          "terminal_at",
+          "terminal_cause",
+          "termination_observation",
+          "capacity_deferrals",
+          "last_deferral_reason"
+        ],
+        "title": "WorkItemRequestOut",
         "type": "object"
       },
       "WorkspaceCredentialRequest": {
@@ -12022,6 +13078,44 @@
         ]
       }
     },
+    "/v1/factory/cards/{token}.svg": {
+      "get": {
+        "operationId": "factory_status_card_v1_factory_cards__token__svg_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "title": "Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/svg+xml": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Factory Status Card",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
     "/v1/internal/cluster-message-replies/{reply_ref}": {
       "post": {
         "operationId": "append_cluster_message_reply_v1_internal_cluster_message_replies__reply_ref__post",
@@ -12620,18 +13714,139 @@
         ]
       }
     },
-    "/v1/internal/publications/{publication_id}/lineage/identity": {
+    "/v1/internal/work-items/admissions": {
       "post": {
-        "description": "Hand the worker one verified identity and write nothing (#2903).\n\nThe worker persists these four values inside the same compare-and-set that\nfirst sets `pr_number`, so the two facts can never be observed apart. The\nApp credentials stay here; the worker receives values, never authority.",
-        "operationId": "verify_publication_lineage_identity_v1_internal_publications__publication_id__lineage_identity_post",
+        "operationId": "admit_work_item_v1_internal_work_items_admissions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdmissionFacts"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admit Work Item V1 Internal Work Items Admissions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admit Work Item",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}": {
+      "get": {
+        "operationId": "get_work_item_request_v1_internal_work_items_requests__request_id__get",
         "parameters": [
           {
             "in": "path",
-            "name": "publication_id",
+            "name": "request_id",
             "required": true,
             "schema": {
               "format": "uuid",
-              "title": "Publication Id",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Work Item Request V1 Internal Work Items Requests  Request Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/acquire": {
+      "post": {
+        "operationId": "acquire_work_item_request_v1_internal_work_items_requests__request_id__acquire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
               "type": "string"
             }
           },
@@ -12656,7 +13871,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PublicationLineageAdvance"
+                "$ref": "#/components/schemas/AcquireBody"
               }
             }
           },
@@ -12667,7 +13882,9 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PublicationLineageIdentityOut"
+                  "additionalProperties": true,
+                  "title": "Response Acquire Work Item Request V1 Internal Work Items Requests  Request Id  Acquire Post",
+                  "type": "object"
                 }
               }
             },
@@ -12684,9 +13901,776 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Verify Publication Lineage Identity",
+        "summary": "Acquire Work Item Request",
         "tags": [
-          "internal-publications"
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/defer": {
+      "post": {
+        "operationId": "defer_work_item_request_v1_internal_work_items_requests__request_id__defer_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeferBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Defer Work Item Request V1 Internal Work Items Requests  Request Id  Defer Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Defer Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/finish": {
+      "post": {
+        "operationId": "finish_work_item_request_v1_internal_work_items_requests__request_id__finish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinishBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Finish Work Item Request V1 Internal Work Items Requests  Request Id  Finish Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finish Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/heartbeat": {
+      "post": {
+        "operationId": "heartbeat_work_item_request_v1_internal_work_items_requests__request_id__heartbeat_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeartbeatBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Heartbeat Work Item Request V1 Internal Work Items Requests  Request Id  Heartbeat Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Heartbeat Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/hold-approval": {
+      "post": {
+        "operationId": "hold_work_item_for_approval_v1_internal_work_items_requests__request_id__hold_approval_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeartbeatBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Hold Work Item For Approval V1 Internal Work Items Requests  Request Id  Hold Approval Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Hold Work Item For Approval",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/owner-lost": {
+      "post": {
+        "operationId": "declare_work_item_owner_lost_v1_internal_work_items_requests__request_id__owner_lost_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnerLostBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Declare Work Item Owner Lost V1 Internal Work Items Requests  Request Id  Owner Lost Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Declare Work Item Owner Lost",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/start": {
+      "post": {
+        "operationId": "start_work_item_request_v1_internal_work_items_requests__request_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Work Item Request V1 Internal Work Items Requests  Request Id  Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/termination": {
+      "post": {
+        "operationId": "record_work_item_termination_v1_internal_work_items_requests__request_id__termination_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Record Work Item Termination V1 Internal Work Items Requests  Request Id  Termination Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Work Item Termination",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/termination/claim": {
+      "post": {
+        "operationId": "claim_work_item_termination_v1_internal_work_items_requests__request_id__termination_claim_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminationClaimBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Claim Work Item Termination V1 Internal Work Items Requests  Request Id  Termination Claim Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Work Item Termination",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/running": {
+      "get": {
+        "operationId": "running_work_item_request_v1_internal_work_items_running_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Running Work Item Request V1 Internal Work Items Running Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Running Work Item Request",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/runtime-owners": {
+      "get": {
+        "operationId": "list_work_item_runtime_owners_v1_internal_work_items_runtime_owners_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Work Item Runtime Owners V1 Internal Work Items Runtime Owners Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Work Item Runtime Owners",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/{work_item_id}/cancel": {
+      "post": {
+        "operationId": "cancel_work_item_v1_internal_work_items__work_item_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Work Item V1 Internal Work Items  Work Item Id  Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Work Item",
+        "tags": [
+          "internal-work-items"
         ]
       }
     },
@@ -12826,6 +14810,229 @@
         "summary": "Select Workspace Repository",
         "tags": [
           "internal-workspaces"
+        ]
+      }
+    },
+    "/v1/work-item-progress/{request_id}": {
+      "post": {
+        "operationId": "report_work_item_progress_v1_work_item_progress__request_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProgressReport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Report Work Item Progress V1 Work Item Progress  Request Id  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Work Item Progress",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
+    "/work-items": {
+      "get": {
+        "operationId": "list_work_items_work_items_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkItemOutcomeList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Work Items",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}": {
+      "get": {
+        "operationId": "get_work_item_work_items__work_item_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkItemOutcomeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Work Item",
+        "tags": [
+          "work-items"
         ]
       }
     }

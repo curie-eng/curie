@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/publication-policy/v1.json",
+  "title": "curie <tier> publication-policy --json",
+  "description": "The agent-facing payload of `curie <tier> publication-policy <agent>`: the dry-run plan, or the agent's publication policy as the API stored it. `approve` keeps the human gate. `auto` lets the platform resolve the same approval. `changed` is false for an inspect and true when this invocation wrote.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "publication_policy": {
+          "type": "string",
+          "enum": ["approve", "auto"]
+        },
+        "publication_policy_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "publication_draft": {
+          "type": "boolean"
+        },
+        "publication_branch_prefix": {
+          "type": ["string", "null"]
+        },
+        "changed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agent",
+        "publication_policy",
+        "publication_policy_version",
+        "publication_draft",
+        "publication_branch_prefix",
+        "changed"
+      ]
+    }
+  ]
+}

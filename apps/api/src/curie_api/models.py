@@ -8,6 +8,7 @@ agent_versions.commit_sha, deployments.bot_identity/commit_sha).
 from __future__ import annotations
 
 import enum
+import secrets
 import uuid
 from datetime import datetime
 from typing import Any
@@ -15,9 +16,13 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
+    Identity,
     Index,
+    Integer,
     LargeBinary,
     String,
     Text,
@@ -30,6 +35,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
+
+# Work-item execution deadline bounds (#3071). An agent's
+# `execution_deadline_seconds` NULL means the default; a set value is bounded
+# by the minimum and maximum, and the ExecutionRequest CHECK caps every row at
+# the maximum.
+DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
+MIN_EXECUTION_DEADLINE_SECONDS = 60
+MAX_EXECUTION_DEADLINE_SECONDS = 10800
 
 GIT_FLOW_CREATED_BY = "git-flow"
 
@@ -66,6 +79,30 @@ class ActionStatus(enum.StrEnum):
 
 class Agent(Base):
     __tablename__ = "agents"
+    __table_args__ = (
+        CheckConstraint(
+            "publication_policy IN ('approve', 'auto')",
+            name="agents_publication_policy_ck",
+        ),
+        CheckConstraint(
+            "publication_policy_version >= 1",
+            name="agents_publication_policy_version_ck",
+        ),
+        CheckConstraint(
+            "publication_branch_prefix IS NULL OR ("
+            "char_length(publication_branch_prefix) BETWEEN 2 AND 64 "
+            "AND publication_branch_prefix ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}/$' "
+            "AND publication_branch_prefix NOT LIKE '%..%' "
+            "AND publication_branch_prefix NOT LIKE '%.lock/' "
+            "AND publication_branch_prefix NOT LIKE '%./')",
+            name="agents_publication_branch_prefix_ck",
+        ),
+        CheckConstraint(
+            "execution_deadline_seconds IS NULL OR execution_deadline_seconds "
+            f"BETWEEN {MIN_EXECUTION_DEADLINE_SECONDS} AND {MAX_EXECUTION_DEADLINE_SECONDS}",
+            name="agents_execution_deadline_seconds_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(unique=True)
@@ -106,6 +143,9 @@ class Agent(Base):
     # (`curie_runner.thinking`), not this column's -- stored as a plain string so
     # the persistence layer does not have to track the harness.
     thinking: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent work-item execution deadline in seconds (#3071). Operator-owned
+    # like `model`/`thinking`; NULL means DEFAULT_EXECUTION_DEADLINE_SECONDS.
+    execution_deadline_seconds: Mapped[int | None] = mapped_column(default=None)
     # Per-agent behavior packs: declarative, opt-in UX touches the worker applies
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;
@@ -166,6 +206,17 @@ class Agent(Base):
     # revision}}}``. NULL means no hook on this agent selects a coding target
     # from a delivery: investigation may still run, coding does not guess a repo.
     source_bindings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Who resolves a publication approval (ADR 0147). ``approve`` is today's
+    # human gate and the value every pre-existing row receives. ``auto`` makes
+    # the platform resolve the same approval row under the recorded policy.
+    # The version increments when the operator changes the policy or its bounds,
+    # so an in-flight auto approval cannot redeem after that change.
+    publication_policy: Mapped[str] = mapped_column(
+        default="approve", server_default="approve"
+    )
+    publication_policy_version: Mapped[int] = mapped_column(default=1, server_default="1")
+    publication_draft: Mapped[bool] = mapped_column(default=False, server_default="false")
+    publication_branch_prefix: Mapped[str | None] = mapped_column(default=None)
     # Whether this agent's bindings share one workflow-state namespace or each
     # get their own (#1525 follow-up). Cardinality alone (ADR-0118 decision 2)
     # governs routing and agent-scoped controls (budget, kill state, bundle
@@ -347,7 +398,7 @@ class ThreadWorkspace(Base):
 
 
 class Approval(Base):
-    """A durable human-approval request (#244, ADR-0010).
+    """A durable approval request (#244, ADR-0010).
 
     Created by the worker when a run ends ``awaiting-approval``; the session is
     suspended while this row is pending, so the record must carry everything a
@@ -361,6 +412,13 @@ class Approval(Base):
     """
 
     __tablename__ = "approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "(policy_identity IS NULL AND policy_version IS NULL) OR "
+            "(policy_identity = 'publication:auto' AND policy_version >= 1)",
+            name="approvals_policy_identity_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Nullable: a run without a deployment binding (the generic/dev path) can
@@ -436,6 +494,10 @@ class Approval(Base):
     # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
     # requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
+    # Set only when the platform resolved this row under ADR 0147. Human
+    # resolutions leave both NULL so they stay distinguishable in the audit.
+    policy_identity: Mapped[str | None] = mapped_column(default=None)
+    policy_version: Mapped[int | None] = mapped_column(default=None)
 
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
 
@@ -529,6 +591,465 @@ class ThreadPublicationLineage(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     publications: Mapped[list[Publication]] = relationship(back_populates="lineage")
+
+
+class WorkItem(Base):
+    """Durable execution identity for one canonical GitHub issue."""
+
+    __tablename__ = "work_items"
+    __table_args__ = (
+        CheckConstraint(
+            "github_repository_id > 0",
+            name="work_items_github_repository_id_ck",
+        ),
+        CheckConstraint(
+            "github_issue_number > 0",
+            name="work_items_github_issue_number_ck",
+        ),
+        CheckConstraint(
+            "github_installation_id > 0",
+            name="work_items_github_installation_id_ck",
+        ),
+        CheckConstraint("version >= 1", name="work_items_version_ck"),
+        CheckConstraint("next_sequence >= 1", name="work_items_next_sequence_ck"),
+        UniqueConstraint(
+            "github_repository_id",
+            "github_issue_number",
+            name="work_items_github_issue_key",
+        ),
+        UniqueConstraint(
+            "publication_lineage_id",
+            name="work_items_publication_lineage_key",
+        ),
+        CheckConstraint(
+            "(readmit_request_id IS NULL AND readmit_requester IS NULL "
+            "AND readmit_objective IS NULL) OR "
+            "(readmit_request_id IS NOT NULL AND readmit_requester IS NOT NULL "
+            "AND readmit_objective IS NOT NULL)",
+            name="work_items_readmit_ck",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    github_repository_id: Mapped[int] = mapped_column(BigInteger)
+    github_issue_number: Mapped[int]
+    github_installation_id: Mapped[int] = mapped_column(BigInteger)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    repo_full_name: Mapped[str]
+    conversation_id: Mapped[str]
+    publication_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            f"{SCHEMA}.thread_publication_lineages.id",
+            ondelete="RESTRICT",
+        ),
+        default=None,
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # A relabel that arrived while a request was still running. The
+    # reconciler admits it once that request reaches a terminus.
+    readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    publication_lineage: Mapped[ThreadPublicationLineage | None] = relationship()
+    execution_requests: Mapped[list[ExecutionRequest]] = relationship(
+        back_populates="work_item",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ExecutionRequest(Base):
+    """One bounded execution attempt owned by a WorkItem."""
+
+    __tablename__ = "execution_requests"
+    __table_args__ = (
+        CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
+        CheckConstraint("version >= 1", name="execution_requests_version_ck"),
+        CheckConstraint(
+            "status IS NOT NULL AND status IN "
+            "('waiting', 'running', 'cancellation_requested', 'completed', "
+            "'failed', 'expired', 'cancelled')",
+            name="execution_requests_status_ck",
+        ),
+        CheckConstraint(
+            "terminal_cause IS NULL OR length(btrim(terminal_cause)) > 0",
+            name="execution_requests_terminal_cause_ck",
+        ),
+        CheckConstraint(
+            "termination_observation IS NULL "
+            "OR length(btrim(termination_observation)) > 0",
+            name="execution_requests_termination_observation_ck",
+        ),
+        CheckConstraint(
+            "(started_at IS NULL AND execution_deadline IS NULL) OR "
+            "(started_at IS NOT NULL AND execution_deadline IS NOT NULL AND "
+            "execution_deadline > started_at AND "
+            "execution_deadline <= started_at + "
+            f"interval '{MAX_EXECUTION_DEADLINE_SECONDS} seconds')",
+            name="execution_requests_deadline_ck",
+        ),
+        CheckConstraint(
+            "((status = 'waiting' AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'running' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'cancellation_requested' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause IN ('issue_cancelled', 'execution_deadline', 'owner_lost') "
+            "AND termination_observation IS NULL) "
+            "OR (status = 'completed' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause IS NOT NULL AND terminal_cause = 'completed' "
+            "AND termination_observation IS NULL) "
+            "OR (status = 'failed' AND started_at IS NOT NULL "
+            "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause IS NOT NULL AND "
+            "((terminal_cause = 'owner_lost' AND termination_observation IS NOT NULL) "
+            "OR (terminal_cause <> 'owner_lost' AND termination_observation IS NULL))) "
+            "OR (status = 'expired' AND terminal_at IS NOT NULL AND "
+            "((started_at IS NULL AND execution_deadline IS NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause = 'capacity_wait_expired' "
+            "AND termination_observation IS NULL) OR "
+            "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause = 'execution_deadline' "
+            "AND termination_observation IS NOT NULL))) "
+            "OR (status = 'cancelled' AND terminal_at IS NOT NULL "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause = 'issue_cancelled' AND "
+            "((started_at IS NULL AND execution_deadline IS NULL "
+            "AND termination_observation IS NULL) OR "
+            "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
+            "AND termination_observation IS NOT NULL)))) IS TRUE",
+            name="execution_requests_state_shape_ck",
+        ),
+        CheckConstraint(
+            "teardown_unconfirmed_at IS NULL OR status = 'cancelled'",
+            name="execution_requests_teardown_unconfirmed_ck",
+        ),
+        CheckConstraint(
+            "dispatch_generation >= 1",
+            name="execution_requests_dispatch_generation_ck",
+        ),
+        CheckConstraint(
+            "published_generation IS NULL OR "
+            "published_generation BETWEEN 1 AND dispatch_generation",
+            name="execution_requests_published_generation_ck",
+        ),
+        CheckConstraint(
+            "acquired_generation IS NULL OR "
+            "acquired_generation BETWEEN 1 AND dispatch_generation",
+            name="execution_requests_acquired_generation_ck",
+        ),
+        CheckConstraint(
+            "capacity_deferrals >= 0",
+            name="execution_requests_capacity_deferrals_ck",
+        ),
+        CheckConstraint(
+            "dispatch_epoch >= 0",
+            name="execution_requests_dispatch_epoch_ck",
+        ),
+        CheckConstraint(
+            "runtime_epoch >= 0",
+            name="execution_requests_runtime_epoch_ck",
+        ),
+        CheckConstraint(
+            "execution_attempts IN (0, 1) AND "
+            "(execution_attempts = 1) = (started_at IS NOT NULL)",
+            name="execution_requests_execution_attempts_ck",
+        ),
+        CheckConstraint(
+            "(objective IS NULL AND requester IS NULL AND reply_kind IS NULL "
+            "AND reply_address IS NULL AND reply_conversation_id IS NULL) OR "
+            "(objective IS NOT NULL AND requester IS NOT NULL AND "
+            "reply_kind IS NOT NULL AND reply_address IS NOT NULL AND "
+            "reply_conversation_id IS NOT NULL AND length(btrim(objective)) > 0 "
+            "AND length(objective) <= 65536 AND length(btrim(requester)) > 0 "
+            "AND length(btrim(reply_kind)) > 0 AND length(btrim(reply_address)) > 0 "
+            "AND length(btrim(reply_conversation_id)) > 0)",
+            name="execution_requests_snapshot_ck",
+        ),
+        UniqueConstraint(
+            "work_item_id",
+            "sequence",
+            name="execution_requests_work_item_sequence_key",
+        ),
+        Index(
+            "uq_execution_requests_active_work_item",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('waiting', 'running', 'cancellation_requested')"
+            ),
+        ),
+        Index(
+            "ix_execution_requests_dispatch_due",
+            "dispatch_not_before",
+            postgresql_where=text("status = 'waiting'"),
+        ),
+        Index(
+            "ix_execution_requests_runtime_liveness",
+            "runtime_heartbeat_expires_at",
+            postgresql_where=text(
+                "status IN ('running','cancellation_requested')"
+            ),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    sequence: Mapped[int]
+    status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
+    wait_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    execution_deadline: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    terminal_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    terminal_cause: Mapped[str | None] = mapped_column(default=None)
+    termination_observation: Mapped[str | None] = mapped_column(
+        Text, default=None
+    )
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    dispatch_generation: Mapped[int] = mapped_column(default=1, server_default="1")
+    published_generation: Mapped[int | None] = mapped_column(default=None)
+    dispatch_not_before: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    dispatch_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    dispatch_epoch: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0"
+    )
+    dispatch_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    acquired_generation: Mapped[int | None] = mapped_column(default=None)
+    acquire_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    acquire_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    capacity_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
+    last_deferral_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    execution_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    runtime_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    runtime_epoch: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0"
+    )
+    runtime_heartbeat_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    terminate_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Settle anchor: updated_at moves on heartbeats and terminate publishes.
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # A forced settle with no worker teardown receipt. Terminate wakes keep
+    # going out until a worker records the teardown and clears this.
+    teardown_unconfirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    runtime_claim_name: Mapped[str | None] = mapped_column(Text, default=None)
+    runtime_sandbox_name: Mapped[str | None] = mapped_column(Text, default=None)
+    objective: Mapped[str | None] = mapped_column(Text, default=None)
+    requester: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_address: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_conversation_id: Mapped[str | None] = mapped_column(Text, default=None)
+
+    work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
+
+
+def new_card_token() -> str:
+    """A fresh unguessable card capability: 32 random bytes as lowercase hex."""
+
+    return secrets.token_hex(32)
+
+
+class FactoryStatusComment(Base):
+    """One bot-authored GitHub status comment per factory execution request.
+
+    Inserted at admission and edited in place by the reconciler as the request
+    progresses (#3077). The terminus fills ``terminal_cause`` and ``detail``. A
+    refusal is recorded here and does not rewrite the request. ``posted_at``
+    means the comment was created; ``finalized_at`` means it will not be edited
+    again.
+    """
+
+    # Keeps its pre-#3077 table name so 0055 stays an expand revision.
+    __tablename__ = "factory_terminal_notices"
+    __table_args__ = (
+        CheckConstraint(
+            "terminal_cause IS NULL OR length(btrim(terminal_cause)) > 0",
+            name="factory_terminal_notices_cause_ck",
+        ),
+        CheckConstraint("attempts >= 0", name="factory_terminal_notices_attempts_ck"),
+        CheckConstraint("scan_page >= 1", name="factory_terminal_notices_scan_page_ck"),
+        CheckConstraint(
+            "posted_at IS NULL OR refused_at IS NULL",
+            name="factory_terminal_notices_one_outcome_ck",
+        ),
+        CheckConstraint(
+            "(comment_id IS NULL) = (posted_at IS NULL)",
+            name="factory_terminal_notices_comment_ck",
+        ),
+        CheckConstraint(
+            "(refusal IS NULL) = (refused_at IS NULL)",
+            name="factory_terminal_notices_refusal_ck",
+        ),
+        CheckConstraint(
+            "comment_list IS NULL OR comment_list IN ('issue', 'review')",
+            name="factory_terminal_notices_comment_list_ck",
+        ),
+        CheckConstraint(
+            "comment_list IS NULL OR comment_id IS NOT NULL",
+            name="factory_terminal_notices_comment_list_pair_ck",
+        ),
+        CheckConstraint(
+            "finalized_at IS NULL OR posted_at IS NOT NULL",
+            name="factory_terminal_notices_finalized_ck",
+        ),
+        CheckConstraint(
+            "subject_title IS NULL OR length(subject_title) <= 256",
+            name="factory_terminal_notices_subject_title_ck",
+        ),
+        CheckConstraint(
+            "applied_label IS NULL OR applied_label IN "
+            "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human')",
+            name="factory_terminal_notices_applied_label_ck",
+        ),
+        # Application N-1's delivery scan still reads this one.
+        Index(
+            "ix_factory_terminal_notices_pending",
+            "created_at",
+            postgresql_where=text("posted_at IS NULL AND refused_at IS NULL"),
+        ),
+        Index(
+            "ix_factory_terminal_notices_unfinalized",
+            "created_at",
+            postgresql_where=text("finalized_at IS NULL AND refused_at IS NULL"),
+        ),
+    )
+
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    # The capability in the card URL camo fetches: 64 lowercase hex characters.
+    card_token: Mapped[str] = mapped_column(
+        Text,
+        unique=True,
+        default=new_card_token,
+        server_default=text(
+            "replace(gen_random_uuid()::text, '-', '') "
+            "|| replace(gen_random_uuid()::text, '-', '')"
+        ),
+    )
+    terminal_cause: Mapped[str | None] = mapped_column(Text, default=None)
+    # The provider's own failure message, redacted before it is stored (#3073).
+    detail: Mapped[str | None] = mapped_column(Text, default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
+    posted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    comment_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # Which GitHub comment list ``comment_id`` lives in: issue or PR review.
+    comment_list: Mapped[str | None] = mapped_column(Text, default=None)
+    rendered_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    subject_title: Mapped[str | None] = mapped_column(Text, default=None)
+    # NULL: never applied. '': backfilled by 0055, never touch.
+    applied_label: Mapped[str | None] = mapped_column(Text, default=None)
+    declaration: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    activity: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    refused_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    refusal: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ExecutionRequestPhaseReport(Base):
+    """One ``report_progress`` call from the sandbox, on its active request (#3077)."""
+
+    __tablename__ = "execution_request_phase_reports"
+    __table_args__ = (
+        CheckConstraint(
+            "phase ~ '^[a-z][a-z0-9_]{0,63}$'",
+            name="execution_request_phase_reports_phase_ck",
+        ),
+        CheckConstraint(
+            "note IS NULL OR length(note) BETWEEN 1 AND 280",
+            name="execution_request_phase_reports_note_ck",
+        ),
+        CheckConstraint(
+            "loop_round IS NULL OR loop_round BETWEEN 1 AND 5",
+            name="execution_request_phase_reports_round_ck",
+        ),
+        Index(
+            "ix_execution_request_phase_reports_request",
+            "execution_request_id",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+    )
+    phase: Mapped[str] = mapped_column(Text)
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+    loop_round: Mapped[int | None] = mapped_column(default=None)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
 
 
 class PublicationReviewReservation(Base):
@@ -711,6 +1232,15 @@ class Publication(Base):
             "result_delivery_dead_lettered_at",
             "lease_expires_at",
         ),
+        CheckConstraint(
+            "branch_prefix IS NULL OR ("
+            "char_length(branch_prefix) BETWEEN 2 AND 64 "
+            "AND branch_prefix ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}/$' "
+            "AND branch_prefix NOT LIKE '%..%' "
+            "AND branch_prefix NOT LIKE '%.lock/' "
+            "AND branch_prefix NOT LIKE '%./')",
+            name="publications_branch_prefix_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -729,10 +1259,18 @@ class Publication(Base):
         ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="SET NULL"),
         default=None,
     )
+    execution_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="SET NULL"),
+        default=None,
+    )
     revision_number: Mapped[int | None] = mapped_column(default=None)
     expected_prior_head: Mapped[str | None] = mapped_column(default=None)
     repo_full_name: Mapped[str]
     status: Mapped[str] = mapped_column(server_default="pending")
+    # Snapshotted from the agent policy at creation. Human policy stores false
+    # and NULL. The worker enforces these bounds and does not reread the agent.
+    open_as_draft: Mapped[bool] = mapped_column(default=False, server_default="false")
+    branch_prefix: Mapped[str | None] = mapped_column(default=None)
     version: Mapped[int] = mapped_column(server_default="1", default=1)
     base_sha: Mapped[str]
     # Deliberately excluded from every public DTO. Terminal retention clears
@@ -854,7 +1392,7 @@ class ApprovalAuditEntry(Base):
     __table_args__ = (
         CheckConstraint(
             "principal_kind IS NULL OR principal_kind IN "
-            "('chat', 'console', 'operator', 'adapter')",
+            "('chat', 'console', 'operator', 'adapter', 'platform')",
             name="approval_audit_principal_kind_ck",
         ),
     )
@@ -1061,6 +1599,49 @@ class WorkflowStateEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+
+class ThreadTranscript(Base):
+    """One thread's conversation transcript (ADR-0170, #3070).
+
+    Moved out of ``workflow_state_entries``: that store caps a whole (agent,
+    namespace), so every thread an agent ever ran shared one transcript budget
+    and a busy factory agent stopped for good once it filled. A transcript is
+    capped per thread here (``transcript_max_thread_bytes``) with no agent-wide
+    cap, and it is deleted when its WorkItem reaches a terminal state or, for a
+    thread with no WorkItem, once ``expires_at`` passes. The state API keeps
+    serving it under ``/state/transcript/<thread_key>``.
+    """
+
+    __tablename__ = "thread_transcripts"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            name="uq_thread_transcripts_agent_scope_thread",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_thread_transcripts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    # Same partition key as ``WorkflowStateEntry.binding_scope``; NULL is the
+    # agent-wide identity every runner transcript uses today.
+    binding_scope: Mapped[str | None] = mapped_column(default=None)
+    # The worker's scoped thread key, which is also ``WorkItem.conversation_id``.
+    thread_key: Mapped[str]
+    value: Mapped[Any] = mapped_column(JSONB)
+    version: Mapped[int] = mapped_column(default=1)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
 class ConsoleSession(Base):
     """One console login: the code that establishes it and the session it becomes.
 
@@ -1093,3 +1674,175 @@ class ConsoleSession(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class HookRun(Base):
+    """One claimed trigger slot for an agent version."""
+
+    __tablename__ = "hook_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "name",
+            "slot_utc",
+            name="hook_runs_agent_name_slot_key",
+        ),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('ran', 'skipped', 'blocked', 'failed')",
+            name="hook_runs_outcome_ck",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String)
+    slot_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE")
+    )
+    outcome: Mapped[str | None] = mapped_column(String, default=None)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+
+class Tenant(Base):
+    """A self-host appliance's tenant record (#2906).
+
+    First, no-behavior-change slice: a single row is auto-provisioned by
+    migration 0048 at a fixed, well-known id so later migrations can
+    reference it without a runtime lookup. ``deployment_id`` is an opaque
+    identifier for the physical appliance -- NOT a foreign key to
+    ``Deployment``/``deployments``, which is the unrelated dev/prod binding
+    of an AgentVersion.
+    """
+
+    __tablename__ = "tenants"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    deployment_id: Mapped[str] = mapped_column(String)
+    idp_config_ref: Mapped[str | None] = mapped_column(default=None)
+    retention_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    default_provider_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(String, default="active")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Principal(Base):
+    """A tenant scoped human or service identity (#2907, ADR 0155 step 2).
+
+    Keyed on the IdP subject within a tenant; ``email`` and ``display_name``
+    are attributes and never the identity key. A rebuildable projection of the
+    customer IdP, with no callers yet.
+    """
+
+    __tablename__ = "principals"
+    __table_args__ = (
+        CheckConstraint("type IN ('human', 'service')", name="principals_type_ck"),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'revoked')",
+            name="principals_status_ck",
+        ),
+        CheckConstraint(
+            "authorization_version >= 1",
+            name="principals_authorization_version_ck",
+        ),
+        UniqueConstraint(
+            "tenant_id", "idp_subject", name="principals_tenant_idp_subject_key"
+        ),
+        # Target of principal_teams' tenant-scoped foreign key.
+        UniqueConstraint("tenant_id", "id", name="principals_tenant_id_id_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    idp_subject: Mapped[str] = mapped_column(String)
+    type: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="active", server_default="active")
+    display_name: Mapped[str | None] = mapped_column(default=None)
+    email: Mapped[str | None] = mapped_column(default=None)
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    authorization_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1"
+    )
+
+
+class Team(Base):
+    """A tenant scoped team: an IdP group projection or a Curie-managed team (#2907).
+
+    An ``idp_group`` team carries the IdP's group id in ``external_id``; the
+    IdP stays the system of record for its membership.
+    """
+
+    __tablename__ = "teams"
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('idp_group', 'curie_managed')", name="teams_source_ck"
+        ),
+        CheckConstraint(
+            "source <> 'idp_group' OR external_id IS NOT NULL",
+            name="teams_idp_group_external_id_ck",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "source",
+            "external_id",
+            name="teams_tenant_source_external_id_key",
+        ),
+        # Target of principal_teams' tenant-scoped foreign key.
+        UniqueConstraint("tenant_id", "id", name="teams_tenant_id_id_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    source: Mapped[str] = mapped_column(String)
+    external_id: Mapped[str | None] = mapped_column(default=None)
+    name: Mapped[str] = mapped_column(String)
+
+
+class PrincipalTeam(Base):
+    """One principal's membership of one team, as last synced (#2907).
+
+    A projection of the IdP's group membership, not a system of record;
+    ``version`` and ``synced_at`` record which sync produced the row. Both
+    foreign keys include ``tenant_id``, so a principal and a team from
+    different tenants cannot be linked.
+    """
+
+    __tablename__ = "principal_teams"
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('idp_group', 'curie_managed')",
+            name="principal_teams_source_ck",
+        ),
+        CheckConstraint("version >= 1", name="principal_teams_version_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            ondelete="CASCADE",
+            name="principal_teams_principal_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            ondelete="CASCADE",
+            name="principal_teams_team_fkey",
+        ),
+        Index("ix_principal_teams_team_id", "team_id"),
+    )
+
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    team_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    source: Mapped[str] = mapped_column(String)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

@@ -43,8 +43,10 @@ from aci_protocol import (
     Event,
     Final,
     GateKind,
+    HookRunRef,
     OutboundEvent,
     QueuedTurn,
+    ReplyHandle,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
@@ -75,6 +77,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from pydantic import ValidationError
 
+from . import sandbox_token
 from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import (
@@ -102,9 +105,19 @@ from .behaviorpacks import (
     sample_load,
     sample_tip,
 )
-from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingResolver
+from .binding import (
+    DECISION_ENV,
+    GRANT_TOOL_ENV,
+    MAX_TURNS_ENV,
+    PROGRESS_TOKEN_ENV,
+    PROGRESS_URL_ENV,
+    RESUMED_KIND_ENV,
+    SANDBOX_TOKEN_TTL_SECONDS,
+    BindingResolver,
+)
 from .config import WorkerConfig
 from .delivery_lease import DeliveryLease, LeaseLostError
+from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
@@ -131,6 +144,16 @@ from .sandbox.types import (
     SuspendedThreadError,
 )
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
+from .workitem_dispatch import (
+    TerminationObservation,
+    WorkItemAcquireGrant,
+    WorkItemConflict,
+    WorkItemDispatchClient,
+    WorkItemRun,
+    WorkItemStartRefused,
+    WorkItemTransportError,
+    parse_work_item_event_id,
+)
 from .workspace import (
     WORKSPACES_DISABLED_REFUSAL,
     WorkspaceClaimCoordinator,
@@ -269,7 +292,7 @@ def _target_for(qevent: QueuedTurn) -> ReplyTarget:
     card, both addressed to a channel the turn may never have come from -- build
     their own ``ReplyTarget`` inline and deliberately do not come through here.
     """
-    handle = qevent.reply_handle
+    handle = _reply_handle_for(qevent)
     return ReplyTarget(
         kind=handle.kind,
         address=handle.channel,
@@ -304,7 +327,14 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
     no (kind, address, conversation) combination can collide with another by
     moving a separator. The key is only ever compared, never parsed back.
     """
-    handle = qevent.reply_handle
+    if qevent.reply_handle is None and qevent.hook_run is not None:
+        # A targetless cron turn (#2963) has no channel pair; its thread belongs
+        # to the hook agent. ``@`` is not a legal channel kind, so this key can
+        # never collide with a bound (kind, address).
+        return scoped_conversation_id(
+            "@cron", qevent.hook_run.agent_id, qevent.conversation_id
+        )
+    handle = _reply_handle_for(qevent)
     return scoped_conversation_id(
         handle.kind,
         handle.channel,
@@ -320,8 +350,55 @@ def _route_from_handle(qevent: QueuedTurn) -> TargetRoute:
     writes to the stream at all after ADR-0096 phase 2: the ingress API mints the
     handle from the binding row, and the dispatcher and CLI are first-party.
     """
-    handle = qevent.reply_handle
+    handle = _reply_handle_for(qevent)
     return TargetRoute(endpoint=handle.endpoint, adapter=handle.adapter)
+
+
+def _reply_handle_for(qevent: QueuedTurn) -> ReplyHandle:
+    """Return the reply handle of a targeted turn.
+
+    Raises for a targetless turn, so any egress path left unguarded fails closed
+    instead of inventing somewhere to send.
+    """
+
+    handle = qevent.reply_handle
+    if handle is None:
+        raise ValueError("targetless turn has no reply target")
+    return handle
+
+
+def _is_targetless(qevent: QueuedTurn) -> bool:
+    """A turn with no reply target: a hook run nobody is waiting on (#2963)."""
+
+    return qevent.reply_handle is None
+
+
+def _check_targetless_shape(qevent: QueuedTurn) -> None:
+    """Re-check the wire rule here: direct callers can skip model validation.
+
+    Only a CRON turn carrying its hook run key may omit the reply handle.
+    """
+
+    if _is_targetless(qevent) and (
+        qevent.source is not TurnSource.CRON or qevent.hook_run is None
+    ):
+        raise ValueError("only a cron turn with a hook run may omit its reply target")
+    # A targetless turn carries no resume authority (#2963): an id shaped like a
+    # work-item wake or an approval resume is an identity violation. It is refused
+    # here, before any effect, because settling it through the normal completion
+    # path would look up runs and write the done marker keyed by that id, which
+    # could finish or defer the UNRELATED run that legitimately owns it.
+    if _is_targetless(qevent) and (
+        parse_work_item_event_id(qevent.event_id) is not None
+        or Kernel._is_approval_resume(qevent.event_id)
+    ):
+        raise ValueError("a targetless turn may not carry a work-item or resume id")
+
+
+# The route a targetless turn threads through signatures that require one. No
+# delivery path uses it: every sink call is skipped for a targetless turn, and
+# ``_target_for`` still raises for one, so nothing can be addressed with it.
+_NO_EGRESS_ROUTE = TargetRoute()
 
 
 def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
@@ -385,10 +462,14 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "server-error",
     "ledger-error",
     "model-credential-rejected",
+    "model-credit-exhausted",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
     "history-persistence-error",
+    # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
+    # a retry would spend the same budget and stop at the same place.
+    "max-turns",
 })
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset({"runner-timeout-unconfirmed"})
@@ -400,6 +481,27 @@ def map_error_classification(raw: str | None) -> str:
     if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
         return raw
     return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+# The factory terminus cause for a classified escalation (#3073). Each cause has
+# its own operator sentence on the issue; anything unnamed stays the generic
+# ``runner_escalated``.
+_ESCALATION_CAUSES = {
+    "model-credit-exhausted": "model_credit_exhausted",
+    "model-credential-rejected": "model_credential_rejected",
+    "rate-limit": "model_rate_limited",
+    "server-error": "model_error",
+    "budget-exceeded": "budget_exceeded",
+    "runner-timeout": "runner_timeout",
+    "runner-timeout-unconfirmed": "runner_timeout",
+    "workspace-error": "workspace_error",
+}
+
+
+def _escalation_cause(failure: TurnOutcome | None) -> str:
+    if failure is None or failure.classification is None:
+        return "runner_escalated"
+    return _ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
 
 
 def _display_error_classification(raw: str | None) -> str:
@@ -443,6 +545,21 @@ def _join_reply_blocks(*parts: str | None) -> str:
     """
 
     return "\n\n".join(part for part in parts if part)
+
+
+# Operator guidance appended to an escalation lead for classifications whose
+# fix is a known knob (#3071). Keyed by the displayed classification token.
+_CLASSIFICATION_GUIDANCE = {
+    "max-turns": (
+        "The run used its whole turn budget; raise worker.workItemMaxTurns "
+        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns."
+    ),
+}
+
+
+def _with_guidance(lead: str, token: str) -> str:
+    guidance = _CLASSIFICATION_GUIDANCE.get(token)
+    return f"{lead} {guidance}" if guidance else lead
 
 
 def _escalation_text(
@@ -789,6 +906,14 @@ class TurnOutcome:
     workspace_inferred_repo: str | None = None
 
 
+class _FactoryExecutionEnded(Exception):
+    """The factory run already ended, so this approval must not resume it."""
+
+
+class _WorkItemDeferred(Exception):
+    """The execute wake was deferred in SQL; ACK it and start nothing."""
+
+
 class ThreadBusyError(RuntimeError):
     """A non-steering turn found a live thread, so it was not started.
 
@@ -847,6 +972,44 @@ class _WorkspaceInferenceCarry:
     """
 
     repo: str | None = None
+
+
+@dataclass
+class _HookRunCarry:
+    """One delivery's validated hook run and actual start state."""
+
+    recorder: HookRunRecorder | None = None
+    ref: HookRunRef | None = None
+    agent_id: uuid.UUID | None = None
+    this_attempt_started: bool = False
+    any_attempt_started: bool = False
+
+
+_HOOK_RUN_CARRY: ContextVar[_HookRunCarry | None] = ContextVar(
+    "curie_worker_hook_run_carry", default=None
+)
+
+# The WorkItem request this delivery acquired or adopted. Per delivery, never
+# kernel-global: concurrent executions each start their own request (#3069).
+_OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
+    "curie_worker_owned_work_item", default=None
+)
+
+
+def _hook_success_outcome() -> HookRunOutcome | None:
+    carry = _HOOK_RUN_CARRY.get()
+    if carry is None:
+        return None
+    if carry.this_attempt_started:
+        return "ran"
+    if carry.any_attempt_started:
+        return "failed"
+    return None
+
+
+def _hook_failure_outcome() -> HookRunOutcome | None:
+    carry = _HOOK_RUN_CARRY.get()
+    return "failed" if carry is not None and carry.any_attempt_started else None
 
 
 @dataclass
@@ -919,7 +1082,7 @@ class _ThrottledReply:
         self,
         sink: ReplySink,
         *,
-        target: ReplyTarget,
+        target: ReplyTarget | None,
         route: TargetRoute,
         min_interval_s: float,
         nav: NavAffordance | None = None,
@@ -990,7 +1153,7 @@ class _ThrottledReply:
         self._last = now
         # A message creating emit must stay fail loud so ref minting and turn
         # retry semantics remain intact. Only an existing message edit is soft.
-        if self._target.reply_ref is None:
+        if self._target is None or self._target.reply_ref is None:
             await self._emit(text)
             self._last_text = text
             return
@@ -1014,6 +1177,10 @@ class _ThrottledReply:
         await self._emit(text or "(no response)")
 
     async def _emit(self, text: str) -> None:
+        if self._target is None:
+            # A targetless turn (#2963) or factory execution (#2991): the stream
+            # is consumed, never sent to the requesting chat.
+            return
         ack = await self._sink.emit(
             ReplyUpdate(
                 version=REPLY_WIRE_VERSION,
@@ -1060,8 +1227,10 @@ class Kernel:
         approval_reader: ApprovalReader | None = None,
         actions: ActionRecorder | None = None,
         card_store: ApprovalCardStore | None = None,
+        hook_runs: HookRunRecorder | None = None,
         route_ttl_seconds: int = 3600,
         suspended_route_ttl_seconds: int = 86400,
+        work_items: WorkItemDispatchClient | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -1106,8 +1275,20 @@ class Kernel:
         # EXPIRY can disable it (#419); absent (unwired tests) simply skips the
         # card teardown -- the resolve-click path still heals a card on click.
         self._card_store = card_store
+        self._hook_runs = hook_runs
         self._route_ttl_seconds = route_ttl_seconds
         self._suspended_route_ttl_seconds = suspended_route_ttl_seconds
+        self._work_items = work_items
+        # Keyed by request id, never thread key: a steered follow-up shares the
+        # thread and must not see or remove this run.
+        self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
+        self._held_work_items: dict[str, WorkItemRun] = {}
+        # Approval resume ids that were mapped to a factory execution.
+        # The live run can be removed before a later delivery failure reaches
+        # ``notify_turn_not_started``, so the exact event identity survives to
+        # that boundary. Successful and cancelled turns clear it in
+        # ``process_event``. A failed turn is cleared by the notice path.
+        self._factory_work_item_events: set[str] = set()
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
@@ -1145,6 +1326,18 @@ class Kernel:
         # a FAILED one is cleared by the notice that reads it.
         self._terminal_reply_attempted: set[str] = set()
 
+    def owns_work_item(self, request_id: uuid.UUID) -> bool:
+        """Whether this process still holds the WorkItem run (#3076).
+
+        A live run that has not finished, or one parked for approval, is ours;
+        the orphan sweeper must never declare either lost.
+        """
+
+        run = self._work_item_runs.get(request_id)
+        if run is not None and not run.finished:
+            return True
+        return any(held.request_id == request_id for held in self._held_work_items.values())
+
     def _target_for(self, qevent: QueuedTurn) -> ReplyTarget:
         """This turn's reply target, including any ref minted during the turn.
 
@@ -1172,7 +1365,8 @@ class Kernel:
             qevent: The queued turn the delivery belonged to.
             ack: The adapter's acknowledgement.
         """
-        if ack.ref and qevent.reply_handle.placeholder is None:
+        handle = qevent.reply_handle
+        if handle is not None and ack.ref and handle.placeholder is None:
             self._minted_refs.setdefault(qevent.event_id, ack.ref)
 
     async def _reply_for(
@@ -1202,6 +1396,15 @@ class Kernel:
         Returns:
             The adapter's acknowledgement.
         """
+        if _is_targetless(qevent) or self._is_factory_work_item_turn(
+            qevent.event_id
+        ):
+            # No requesting chat egress for a targetless turn (#2963) or a
+            # factory execution (#2991). A hook run records its outcome on its
+            # row. A factory run is reported by the API's notice writer after
+            # the WorkItem settles, so the kernel must not create a competing
+            # boot, approval, refusal, escalation, or final message here.
+            return ReplyAck()
         if terminal:
             # Marked BEFORE the send, never after, so an exception from ``_reply``
             # cannot skip the mark for text that may already be on the screen.
@@ -1251,8 +1454,25 @@ class Kernel:
         # notice must not overwrite it with an invitation to resend.
         attempted = event_id in self._terminal_reply_attempted
         self._terminal_reply_attempted.discard(event_id)
+        factory_work_item_turn = self._is_factory_work_item_turn(event_id)
+        self._factory_work_item_events.discard(event_id)
 
-        if qevent.reply_handle.placeholder is None:
+        if factory_work_item_turn:
+            logger.debug(
+                "event %s belongs to a factory execution; no not started notice",
+                event_id,
+            )
+            return
+
+        handle = qevent.reply_handle
+        if handle is None:
+            logger.debug(
+                "event %s has no reply target; no not started notice",
+                event_id,
+            )
+            return
+
+        if handle.placeholder is None:
             logger.debug(
                 "event %s has no placeholder to edit; no not-started notice",
                 event_id,
@@ -1348,7 +1568,9 @@ class Kernel:
         for -- the leaseless path is a supported caller, not a degraded one.
         """
 
+        _check_targetless_shape(qevent)
         error: BaseException | None = None
+        hook_token = _HOOK_RUN_CARRY.set(_HookRunCarry())
         # A redelivery must never inherit an earlier delivery's terminal-send mark
         # from this process (#2433).
         self._terminal_reply_attempted.discard(qevent.event_id)
@@ -1370,6 +1592,12 @@ class Kernel:
                     await self._process_event(qevent, lease=lease)
             except asyncio.CancelledError as exc:
                 error = exc
+                await self._close_hook_run_after_error(
+                    qevent,
+                    lease=lease,
+                    original=exc,
+                    shield=True,
+                )
                 _LIFECYCLE_OUTCOME.set("interrupted")
                 span.add_event(
                     "turn.processing.interrupted",
@@ -1377,6 +1605,13 @@ class Kernel:
                 )
             except Exception as exc:
                 error = exc
+                if not isinstance(exc, HookRunRecorderError):
+                    await self._close_hook_run_after_error(
+                        qevent,
+                        lease=lease,
+                        original=exc,
+                        shield=False,
+                    )
                 span.add_event(
                     "turn.processing.failed",
                     {"outcome": "classified_failure", "error.class": type(exc).__name__},
@@ -1389,6 +1624,7 @@ class Kernel:
                     # ``CancelledError`` is a ``BaseException``, so it clears here
                     # too: a cancelled turn is a shutdown, not a lost answer.
                     self._terminal_reply_attempted.discard(qevent.event_id)
+                    self._factory_work_item_events.discard(qevent.event_id)
                 outcome = _LIFECYCLE_OUTCOME.get()
                 if outcome is None:
                     # A normal early return is the already-terminal skip. An
@@ -1406,8 +1642,97 @@ class Kernel:
                 span.add_event("turn.processing.completed", {"outcome": outcome})
                 _LIFECYCLE_OUTCOME.reset(outcome_token)
                 _LIFECYCLE_SPAN.reset(token)
+                _HOOK_RUN_CARRY.reset(hook_token)
         if error is not None:
             raise error
+
+    def _run_for_event(self, event_id: str) -> WorkItemRun | None:
+        """The execution bound to this turn, not whichever run started last."""
+
+        for candidate in self._work_item_runs.values():
+            if (
+                candidate.event_id == event_id
+                and candidate.started
+                and not candidate.finished
+            ):
+                return candidate
+        return None
+
+    def _is_factory_work_item_turn(self, event_id: str) -> bool:
+        """Whether this turn's requesting chat belongs to a factory execution.
+
+        Execute wake ids are platform minted and fully parsed. Approval resumes
+        have their own id namespace, so they count only after WorkItem ownership
+        ties the exact event to a factory conversation. Message text and channel
+        kind confer no factory identity.
+        """
+
+        parsed = parse_work_item_event_id(event_id)
+        if parsed is not None:
+            return parsed.kind in {"execute", "ci"}
+        return (
+            event_id in self._factory_work_item_events
+            or self._run_for_event(event_id) is not None
+        )
+
+    def _work_item_repository(self, event_id: str) -> str | None:
+        """The WorkItem repository for an acquired execute wake, else None."""
+
+        parsed = parse_work_item_event_id(event_id)
+        if parsed is None or parsed.kind != "execute":
+            return None
+        run = self._work_item_runs.get(parsed.request_id)
+        return run.repo_full_name if run is not None else None
+
+    async def _adopt_resumed_work_item(
+        self, event_id: str, thread_key: str
+    ) -> uuid.UUID | None:
+        """Reattach the execution an approval continuation still owns.
+
+        The execute wake already returned. The same process keeps the run.
+        A restarted worker reads the still-running request by conversation.
+        Either way the continuation finishes that request and bounds the
+        runner by the original execution deadline.
+        """
+
+        held = self._held_work_items.pop(thread_key, None)
+        if held is None and self._work_items is not None:
+            try:
+                found = await self._work_items.running_for_conversation(thread_key)
+            except WorkItemTransportError:
+                raise
+            except WorkItemConflict as exc:
+                if exc.code == "execution_ended":
+                    raise _FactoryExecutionEnded from exc
+                found = None
+            if found is not None:
+                held = WorkItemRun(
+                    client=self._work_items,
+                    request_id=found.request_id,
+                    owner=self._config.consumer_name,
+                    grant=WorkItemAcquireGrant(
+                        generation=0,
+                        work_item_id=found.request_id,
+                        conversation_id=thread_key,
+                        wait_deadline="",
+                        repo_full_name=None,
+                    ),
+                    event_id=event_id,
+                    thread_key=thread_key,
+                    on_stop=self._stop_owned_work_item,
+                    on_stale=self._abandon_stale_work_item,
+                )
+                held.started = True
+                held.runtime_epoch = found.runtime_epoch
+                held.execution_deadline = found.execution_deadline
+        if held is None:
+            return None
+        held.held = False
+        held.finished = False
+        held.event_id = event_id
+        self._work_item_runs[held.request_id] = held
+        self._factory_work_item_events.add(event_id)
+        return held.request_id
 
     async def _process_event(
         self, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
@@ -1424,6 +1749,9 @@ class Kernel:
         the wire permitted died on the first line of the kernel. The reply path
         now posts a message when there is none to edit and edits it thereafter.
         """
+        _check_targetless_shape(qevent)
+        targetless = _is_targetless(qevent)
+        handle = qevent.reply_handle
         event_id = qevent.event_id
         thread_key = _thread_key_for(qevent)
         # The turn's route starts as the one the server minted onto the wire. A
@@ -1431,7 +1759,7 @@ class Kernel:
         # bound-but-undeployed status reply, when the diagnostic binding lookup
         # supplies the server-controlled endpoint. Other pre-resolution paths
         # can only reach the handle's route, which is why it travels on the wire.
-        route = _route_from_handle(qevent)
+        route = _NO_EGRESS_ROUTE if targetless else _route_from_handle(qevent)
 
         # Acquire the per-thread order lock BEFORE any await, so concurrent
         # same-thread events queue in task-arrival order (asyncio.Lock is FIFO and
@@ -1449,6 +1777,8 @@ class Kernel:
                 entry.lock.release()
                 self._release_order_entry(thread_key, entry)
 
+        owned_work_item_id: uuid.UUID | None = None
+        owned_token = _OWNED_WORK_ITEM.set(None)
         try:
             if await self._markers.is_terminal(event_id):
                 # ``is_terminal``, not ``is_done``: a DONE outbox record proves
@@ -1466,6 +1796,145 @@ class Kernel:
                 # confirmed, which it re-emits from the STORED record.
                 await self._reemit_pending_completion(event_id)
                 return
+
+            if qevent.source is TurnSource.CRON:
+                if self._hook_runs is None or qevent.hook_run is None:
+                    logger.error(
+                        "cron event %s has no hook run recorder or key; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                try:
+                    hook_state = await self._hook_runs.get(qevent.hook_run)
+                except HookRunRecorderError as exc:
+                    if exc.code != "invalid_ref":
+                        raise
+                    logger.error(
+                        "cron event %s has an invalid hook run key; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                if hook_state is None:
+                    logger.error(
+                        "cron event %s has no matching hook run row; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                if hook_state.outcome is not None:
+                    logger.info(
+                        "cron event %s belongs to an already terminal hook run; "
+                        "dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                hook_carry = _HOOK_RUN_CARRY.get()
+                assert hook_carry is not None
+                hook_carry.recorder = self._hook_runs
+                hook_carry.ref = qevent.hook_run
+                hook_carry.agent_id = hook_state.agent_id
+
+            parsed_work_item = parse_work_item_event_id(event_id)
+            if parsed_work_item is not None and parsed_work_item.kind in {"terminate"}:
+                await self._terminate_work_item(qevent, parsed_work_item.request_id)
+                return
+            if parsed_work_item is not None and parsed_work_item.kind in {"execute"}:
+                if self._work_items is None:
+                    logger.error(
+                        "work-item execute %s has no dispatch client; dropping the wake",
+                        event_id,
+                    )
+                    return
+                if qevent.attachments:
+                    logger.error(
+                        "work-item execute %s carried attachments; refusing",
+                        event_id,
+                    )
+                    return
+                assert parsed_work_item.generation is not None
+                try:
+                    grant = await self._work_items.acquire(
+                        parsed_work_item.request_id,
+                        owner=self._config.consumer_name,
+                        generation=parsed_work_item.generation,
+                    )
+                except WorkItemConflict as exc:
+                    logger.info(
+                        "work-item acquire refused for %s: %s",
+                        event_id,
+                        exc.code,
+                    )
+                    return
+                self._work_item_runs[parsed_work_item.request_id] = WorkItemRun(
+                    client=self._work_items,
+                    request_id=parsed_work_item.request_id,
+                    owner=self._config.consumer_name,
+                    grant=grant,
+                    event_id=event_id,
+                    thread_key=thread_key,
+                    on_stop=self._stop_owned_work_item,
+                    on_stale=self._abandon_stale_work_item,
+                )
+                owned_work_item_id = parsed_work_item.request_id
+            elif parsed_work_item is not None and parsed_work_item.is_ci_fix:
+                # A CI fix round continues the SAME running request (#3097): adopt
+                # it by conversation the way an approval continuation does, and
+                # refuse the turn when the running request is not the one the
+                # event names (a relabel replaced it) or the execution ended.
+                try:
+                    adopted = await self._adopt_resumed_work_item(event_id, thread_key)
+                except _FactoryExecutionEnded:
+                    self._factory_work_item_events.add(event_id)
+                    await self._markers.mark_done(event_id)
+                    return
+                if adopted != parsed_work_item.request_id:
+                    if adopted is not None:
+                        self._work_item_runs.pop(adopted, None)
+                    logger.info(
+                        "work-item CI continuation %s is stale: running request is %s",
+                        event_id,
+                        adopted,
+                    )
+                    await self._markers.mark_done(event_id)
+                    return
+                owned_work_item_id = adopted
+            elif self._is_approval_resume(event_id):
+                try:
+                    owned_work_item_id = await self._adopt_resumed_work_item(
+                        event_id, thread_key
+                    )
+                except _FactoryExecutionEnded:
+                    self._factory_work_item_events.add(event_id)
+                    await self._markers.mark_done(event_id)
+                    return
+            _OWNED_WORK_ITEM.set(owned_work_item_id)
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
@@ -1490,7 +1959,8 @@ class Kernel:
                         "outcome": "resumed",
                     },
                 )
-            else:
+            elif not targetless:
+                # A targetless turn owns no card: it never paused for approval.
                 await self._finalize_settled_card(qevent, route)
 
             # Crash-safety: a prior attempt executed a side effect but never
@@ -1525,6 +1995,7 @@ class Kernel:
                     "escalated",
                     telemetry_outcome="classified_failure",
                     lease=lease,
+                    hook_outcome="failed",
                 )
                 return
 
@@ -1538,14 +2009,65 @@ class Kernel:
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
-            if self._binding is not None:
+            if targetless:
+                # Routed by the hook run's agent, never a channel binding (#2963).
+                # The id is the one the hook row lookup parsed and matched, not
+                # the raw wire string. Each refusal of a valid open run closes
+                # its row, since no reply exists to carry the reason.
+                hook_carry = _HOOK_RUN_CARRY.get()
+                assert hook_carry is not None and hook_carry.agent_id is not None
+                binding = self._binding
+                resolved = (
+                    await binding.resolve_agent(hook_carry.agent_id)
+                    if binding is not None
+                    else None
+                )
+                if binding is None or resolved is None:
+                    logger.error(
+                        "targetless cron event %s: agent %s has no active "
+                        "deployment; dropping",
+                        event_id,
+                        hook_carry.agent_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="failed",
+                    )
+                    return
+                if self._killswitch is not None and await self._killswitch.is_killed(
+                    resolved.agent_id
+                ):
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="blocked",
+                    )
+                    return
+                agent_id = resolved.agent_id
+                agent_name = resolved.agent_name
+                # No kind/address: there is no binding to scope the state
+                # namespace to. No approval grant, resumed kind or decision
+                # either: a targetless turn is never a resume.
+                boot_env = binding.boot_env(resolved, thread_key)
+                workspace_deployment_id = resolved.deployment_id
+                packs = binding.packs_for(resolved)
+                approval_routes = resolved.approval_routes
+            elif self._binding is not None:
+                assert handle is not None
                 # The routing key is the PAIR (ADR-0096 phase 2): the queue wire
                 # carries a required `kind`, and both halves bind into the
                 # resolver's predicate. Never the address alone -- one address
                 # can be bound under two kinds, and dropping the kind here would
                 # answer an unbound kind with the other agent.
                 resolved = await self._binding.resolve(
-                    qevent.reply_handle.kind, qevent.reply_handle.channel
+                    handle.kind, handle.channel
                 )
                 if resolved is None:
                     # Binding doubles predate the diagnostic lookup; keep a miss
@@ -1555,7 +2077,7 @@ class Kernel:
                     )
                     undeployed = (
                         await undeployed_lookup(
-                            qevent.reply_handle.kind, qevent.reply_handle.channel
+                            handle.kind, handle.channel
                         )
                         if undeployed_lookup is not None
                         else None
@@ -1564,14 +2086,14 @@ class Kernel:
                         # A bound non-Slack route may carry the only endpoint the
                         # platform can use to deliver this status reply.
                         route = TargetRoute(
-                            endpoint=undeployed.endpoint or qevent.reply_handle.endpoint,
-                            adapter=undeployed.adapter or qevent.reply_handle.adapter,
+                            endpoint=undeployed.endpoint or handle.endpoint,
+                            adapter=undeployed.adapter or handle.adapter,
                         )
                         logger.warning(
                             "undeployed agent turn dropped for agent=%s route=%s:%s",
                             undeployed.agent_name,
-                            qevent.reply_handle.kind,
-                            qevent.reply_handle.channel,
+                            handle.kind,
+                            handle.channel,
                         )
                         await self._drop_with_message(
                             qevent,
@@ -1588,8 +2110,8 @@ class Kernel:
                         qevent,
                         route,
                         "No agent is configured for this "
-                        f"{qevent.reply_handle.kind} address "
-                        f"{qevent.reply_handle.channel} yet.",
+                        f"{handle.kind} address "
+                        f"{handle.channel} yet.",
                         lease=lease,
                     )
                     return
@@ -1599,9 +2121,28 @@ class Kernel:
                 # names none leaves the server-minted handle standing -- the
                 # dispatcher and CLI bind no endpoint of their own.
                 route = TargetRoute(
-                    endpoint=resolved.endpoint or qevent.reply_handle.endpoint,
-                    adapter=resolved.adapter or qevent.reply_handle.adapter,
+                    endpoint=resolved.endpoint or handle.endpoint,
+                    adapter=resolved.adapter or handle.adapter,
                 )
+                hook_carry = _HOOK_RUN_CARRY.get()
+                if (
+                    qevent.source is TurnSource.CRON
+                    and hook_carry is not None
+                    and hook_carry.agent_id != resolved.agent_id
+                ):
+                    logger.error(
+                        "cron event %s resolved to a different agent than its "
+                        "hook run key; dropping",
+                        event_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
                 if self._killswitch is not None and await self._killswitch.is_killed(
                     resolved.agent_id
                 ):
@@ -1618,8 +2159,8 @@ class Kernel:
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
                 boot_env_kwargs: dict[str, Any] = {
-                    "kind": qevent.reply_handle.kind,
-                    "address": qevent.reply_handle.channel,
+                    "kind": handle.kind,
+                    "address": handle.channel,
                 }
                 # The internal thread key is channel-scoped, so it no longer
                 # starts with the eval marker carried by conversation_id.
@@ -1653,6 +2194,20 @@ class Kernel:
                 )
                 if grant_tool:
                     boot_env[GRANT_TOOL_ENV] = grant_tool
+                # A factory execution may report its phases for the live status
+                # card (#3077). The token is bound to this request and to the
+                # work_item.progress scope only; no other turn carries it.
+                if owned_work_item_id is not None and self._config.api_key:
+                    base = self._config.runner_facing_api_base_url.rstrip("/")
+                    boot_env[PROGRESS_URL_ENV] = (
+                        f"{base}/v1/work-item-progress/{owned_work_item_id}"
+                    )
+                    boot_env[PROGRESS_TOKEN_ENV] = sandbox_token.mint(
+                        self._config.api_key,
+                        agent=str(owned_work_item_id),
+                        scope="work_item.progress",
+                        exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
+                    )
                 # Decision A2 marker (#544): an authority-free FACT carrying the
                 # resumed approval's gate kind (the actual gate_kind column value,
                 # e.g. 'policy' or 'permission'). After the approved-only gate in
@@ -1707,6 +2262,15 @@ class Kernel:
                 if self._config.shimmer:
                     await self._set_shimmer(qevent, route, packs)
 
+            # Work-item turn budget (#3071). A factory execution runs far more
+            # tool turns than a chat reply, so ONLY a work-item delivery raises
+            # the runner's turn cap; every other delivery carries no
+            # CURIE_MAX_TURNS and keeps the runner default. Placed after every
+            # boot-env build site so both the targetless and the bound paths
+            # carry it.
+            if owned_work_item_id is not None and boot_env is not None:
+                boot_env[MAX_TURNS_ENV] = str(self._config.work_item_max_turns)
+
             # ADR-0131 reclaim preflight. A delivery that has CHANGED HANDS --
             # generation > 1, a distributed-state fact and never a sniff of the
             # message text, so kernel rule 3 stands -- may not simply route: the
@@ -1727,6 +2291,9 @@ class Kernel:
             attempt = 0
             while True:
                 attempt += 1
+                hook_carry = _HOOK_RUN_CARRY.get()
+                if hook_carry is not None:
+                    hook_carry.this_attempt_started = False
                 # The delivery's overall deadline gates every attempt, and the
                 # attempts CONSUME it: a retry never restarts it.
                 if lease is not None:
@@ -1762,22 +2329,64 @@ class Kernel:
                             "escalated",
                             telemetry_outcome="deadline_halted",
                             lease=lease,
+                            hook_outcome=_hook_failure_outcome(),
                         )
                         return
-                outcome = await self._attempt(
-                    qevent,
-                    route,
-                    release_order,
-                    boot_env,
-                    agent_id,
-                    nav,
-                    packs,
-                    workspace_deployment_id,
-                    agent_name,
-                    remaining_s=_remaining_budget(lease),
-                    pressure_retried=False,
-                    workspace_inference=workspace_inference,
-                )
+                try:
+                    outcome = await self._attempt(
+                        qevent,
+                        route,
+                        release_order,
+                        boot_env,
+                        agent_id,
+                        nav,
+                        packs,
+                        workspace_deployment_id,
+                        agent_name,
+                        remaining_s=_remaining_budget(lease),
+                        pressure_retried=False,
+                        workspace_inference=workspace_inference,
+                    )
+                except _WorkItemDeferred:
+                    return
+                except WorkItemStartRefused as exc:
+                    logger.info(
+                        "work-item start refused for %s: %s",
+                        event_id,
+                        exc.code,
+                    )
+                    return
+                except ThreadBusyError:
+                    run = (
+                        self._work_item_runs.get(owned_work_item_id)
+                        if owned_work_item_id is not None
+                        else None
+                    )
+                    if run is not None and not run.started:
+                        try:
+                            await run.defer("thread_busy", capacity=False)
+                        except WorkItemConflict as exc:
+                            logger.info(
+                                "work-item thread_busy defer refused for %s: %s",
+                                event_id,
+                                exc.code,
+                            )
+                        return
+                    raise
+
+                if outcome.status is SessionStatus.AWAITING_APPROVAL and targetless:
+                    # A resume needs a reply route this turn does not carry
+                    # (#2963), so a gate on a targetless turn is a failed run,
+                    # never a pause and never a grant. The gated tool never ran.
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="classified_failure",
+                        lease=lease,
+                        hook_outcome="failed",
+                    )
+                    return
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
                     # A gate fired (ADR-0010): persist the durable record, then
@@ -1797,6 +2406,7 @@ class Kernel:
                         "awaiting-approval",
                         telemetry_outcome="awaiting_approval",
                         lease=lease,
+                        hook_outcome=_hook_success_outcome(),
                     )
                     return
 
@@ -1811,6 +2421,7 @@ class Kernel:
                             else "done"
                         ),
                         lease=lease,
+                        hook_outcome=_hook_success_outcome(),
                     )
                     return
 
@@ -1821,9 +2432,10 @@ class Kernel:
                         route,
                         _escalation_text(
                             qevent,
-                            lead=(
+                            lead=_with_guidance(
                                 f"The run hit an error ({token}) after starting an action; "
-                                "not retrying automatically."
+                                "not retrying automatically.",
+                                token,
                             ),
                             detail=outcome.error_message,
                         ),
@@ -1834,10 +2446,35 @@ class Kernel:
                         "escalated",
                         telemetry_outcome="side_effect_halted",
                         lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
+                        failure=outcome,
                     )
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
+                if (
+                    qevent.source is TurnSource.CRON
+                    and retryable
+                    and lease is not None
+                    and lease.remaining_s() <= _MIN_ATTEMPT_BUDGET_S
+                ):
+                    await self._escalate(
+                        qevent,
+                        route,
+                        "The run exceeded its delivery deadline after "
+                        f"{attempt} attempt(s) and was not restarted. "
+                        "Flagging for a human.",
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="deadline_halted",
+                        lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
+                    )
+                    return
+                retryable = retryable and qevent.source is not TurnSource.CRON
                 if not retryable or attempt >= self._config.max_attempts:
                     token = _display_error_classification(outcome.classification)
                     await self._escalate(
@@ -1845,8 +2482,9 @@ class Kernel:
                         route,
                         _escalation_text(
                             qevent,
-                            lead=(
-                                f"The run failed ({token}) after {attempt} attempt(s)."
+                            lead=_with_guidance(
+                                f"The run failed ({token}) after {attempt} attempt(s).",
+                                token,
                             ),
                             detail=outcome.error_message,
                         ),
@@ -1861,6 +2499,8 @@ class Kernel:
                             else "classified_failure"
                         ),
                         lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
+                        failure=outcome,
                     )
                     return
 
@@ -1881,6 +2521,20 @@ class Kernel:
                     backoff_s = min(backoff_s, max(0.0, lease.remaining_s()))
                 await asyncio.sleep(backoff_s)
         finally:
+            if owned_work_item_id is not None:
+                owned_run = self._work_item_runs.get(owned_work_item_id)
+                if owned_run is not None and owned_run.held:
+                    self._held_work_items[owned_run.thread_key] = owned_run
+                    self._work_item_runs.pop(owned_work_item_id, None)
+                else:
+                    owned_run = self._work_item_runs.pop(owned_work_item_id, None)
+                    if owned_run is not None:
+                        await owned_run.close()
+                        if owned_run.finished:
+                            # The turn has ended and the request is settled, so
+                            # nothing on this thread needs the sandbox (#3075).
+                            await self._release_work_item_sandbox(owned_run.thread_key)
+            _OWNED_WORK_ITEM.reset(owned_token)
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
             # path (success, escalate, drop, or error). Best-effort and
@@ -1898,7 +2552,7 @@ class Kernel:
             # while a failed entry stays PENDING for reclaim -- so completing
             # here would tell the adapter to deliver a turn that is about to run
             # again. An EMPTY status IS the clear on the neutral wire.
-            if self._config.shimmer:
+            if self._config.shimmer and not targetless:
                 # Rebuilt rather than reusing the ``target`` captured at entry, so
                 # a placeholder-less turn clears the status against the message it
                 # actually posted. Slack's status call does not read the ref, but a
@@ -2183,6 +2837,172 @@ class Kernel:
         finally:
             await self._lock.release(lock_key, token)
 
+    async def _release_work_item_sandbox(self, thread_key: str) -> None:
+        """Delete a settled WorkItem thread's claim, live or suspended (#3075).
+
+        Best-effort: a failure is logged and never changes the WorkItem outcome.
+        The orphan reaper skips any claim a route references, so without this a
+        suspended route kept its claim until someone deleted it by hand.
+        """
+
+        try:
+            token = await asyncio.wait_for(
+                self._lock.acquire(self._config.lock_key(thread_key)),
+                _RESET_LOCK_ACQUIRE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "work-item sandbox release could not lock thread %s; leaving the claim",
+                thread_key,
+                exc_info=True,
+            )
+            return
+        try:
+            released = await asyncio.wait_for(
+                asyncio.to_thread(self._substrate.release, thread_key),
+                _RESET_RELEASE_TIMEOUT_S,
+            )
+            if released and self._workspace is not None:
+                await asyncio.to_thread(self._workspace.release, thread_key)
+        except Exception:
+            logger.warning(
+                "work-item sandbox release failed for thread %s",
+                thread_key,
+                exc_info=True,
+            )
+        finally:
+            await self._lock.release(self._config.lock_key(thread_key), token)
+
+    async def _terminate_work_item(
+        self, qevent: QueuedTurn, request_id: uuid.UUID
+    ) -> None:
+        """Claim termination ownership, observe sandbox absence, and record it."""
+
+        if self._work_items is None:
+            logger.error(
+                "work-item terminate %s has no dispatch client; dropping the wake",
+                qevent.event_id,
+            )
+            return
+        thread_key = _thread_key_for(qevent)
+        try:
+            epoch = await self._work_items.claim_termination(
+                request_id,
+                owner=self._config.consumer_name,
+            )
+        except WorkItemConflict as exc:
+            logger.info(
+                "work-item terminate claim refused for %s: %s",
+                request_id,
+                exc.code,
+            )
+            return
+        claim_name: str | None = None
+        sandbox_name: str | None = None
+        try:
+            view = await self._work_items.get_request(request_id)
+        except WorkItemConflict as exc:
+            logger.info(
+                "work-item terminate could not read request %s: %s",
+                request_id,
+                exc.code,
+            )
+        else:
+            claim_name = view.runtime_claim_name
+            sandbox_name = view.runtime_sandbox_name
+        observation = await self._halt_work_item_runtime(
+            thread_key,
+            claim_name=claim_name,
+            sandbox_name=sandbox_name,
+        )
+        if observation is None:
+            logger.warning(
+                "work-item terminate for %s did not observe absence; reconciler retries",
+                request_id,
+            )
+            return
+        try:
+            await self._work_items.record_termination(
+                request_id,
+                runtime_epoch=epoch,
+                observation=observation.render(),
+            )
+        except WorkItemConflict as exc:
+            logger.warning(
+                "work-item record_termination refused for %s: %s",
+                request_id,
+                exc.code,
+            )
+
+    async def _stop_owned_work_item(self, thread_key: str, run: WorkItemRun) -> None:
+        """Heartbeat saw cancellation_requested: interrupt, observe, record."""
+
+        if self._work_items is None or run.runtime_epoch is None:
+            return
+        observation = await self._halt_work_item_runtime(
+            thread_key,
+            claim_name=run.claim_name,
+            sandbox_name=run.sandbox_name,
+        )
+        if observation is None:
+            logger.warning(
+                "work-item owner stop for %s did not observe absence",
+                run.request_id,
+            )
+            return
+        try:
+            await self._work_items.record_termination(
+                run.request_id,
+                runtime_epoch=run.runtime_epoch,
+                observation=observation.render(),
+            )
+            run.finished = True
+        except WorkItemConflict as exc:
+            logger.warning(
+                "work-item owner record_termination refused for %s: %s",
+                run.request_id,
+                exc.code,
+            )
+
+    async def _abandon_stale_work_item(self, thread_key: str, run: WorkItemRun) -> None:
+        """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
+
+        run.finished = True
+        logger.warning(
+            "stale work-item owner abandoning request %s on thread %s without releasing the route",
+            run.request_id,
+            thread_key,
+        )
+
+    async def _halt_work_item_runtime(
+        self,
+        thread_key: str,
+        *,
+        claim_name: str | None,
+        sandbox_name: str | None,
+    ) -> TerminationObservation | None:
+        """Interrupt, then poll until stored claim and sandbox names are gone."""
+
+        try:
+            await asyncio.wait_for(
+                self.interrupt_thread(thread_key, "work-item termination"),
+                _RESET_INTERRUPT_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "work-item interrupt did not land for thread %s; terminating anyway",
+                thread_key,
+                exc_info=True,
+            )
+        async with self._lock.hold(self._config.lock_key(thread_key)):
+            return await asyncio.to_thread(
+                self._substrate.terminate_thread,
+                thread_key,
+                claim_name=claim_name,
+                sandbox_name=sandbox_name,
+                observer=self._config.consumer_name,
+            )
+
     def attach_killswitch(self, killswitch: KillSwitch) -> None:
         """Wire the kill switch after construction (it needs interrupt_agent)."""
         self._killswitch = killswitch
@@ -2272,6 +3092,56 @@ class Kernel:
             best_effort_unreachable=best_effort_unreachable,
         )
 
+    async def _close_hook_run_after_error(
+        self,
+        qevent: QueuedTurn,
+        *,
+        lease: DeliveryLease | None,
+        original: BaseException,
+        shield: bool,
+    ) -> None:
+        carry = _HOOK_RUN_CARRY.get()
+        if (
+            carry is None
+            or not carry.any_attempt_started
+            or carry.recorder is None
+            or carry.ref is None
+            or (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.lost.is_set()
+            )
+        ):
+            return
+        try:
+            if shield:
+                close_task = asyncio.create_task(
+                    asyncio.wait_for(
+                        carry.recorder.close(carry.ref, "failed"),
+                        timeout=5.0,
+                    )
+                )
+                while not close_task.done():
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        logger.error(
+                            "hook run failure close was cancelled again for event %s; "
+                            "waiting for its bounded cleanup",
+                            qevent.event_id,
+                        )
+                        continue
+                close_task.result()
+            else:
+                await carry.recorder.close(carry.ref, "failed")
+        except BaseException:
+            logger.error(
+                "hook run failure close failed for event %s while preserving %s",
+                qevent.event_id,
+                type(original).__name__,
+                exc_info=True,
+            )
+
     async def _complete(
         self,
         qevent: QueuedTurn,
@@ -2280,8 +3150,15 @@ class Kernel:
         *,
         telemetry_outcome: str,
         lease: DeliveryLease | None = None,
+        hook_outcome: HookRunOutcome | None = None,
+        failure: TurnOutcome | None = None,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
+
+        ``failure`` is the classified turn behind an escalation. A factory run
+        finishes with the cause and provider message it carries (#3073).
+
+        For a valid cron run, close its Postgres row before these Valkey steps.
 
         1. write the outbox record       -- durable, BEFORE the done marker
         2. mark done + flag the record   -- ONE MULTI, so they cannot diverge
@@ -2299,6 +3176,9 @@ class Kernel:
         second sanctioned source -- no adapter can write to the stream, so the
         handle is trustworthy). A terminal path that marked done without a record
         would be a completion nothing could ever recover.
+        A targetless cron turn (#2963) is the one exception: no adapter is
+        waiting, so no completion is owed, and ``_settle_targetless`` marks it
+        done with no record.
 
         Since ADR-0131 this is also the FENCE. When the caller holds a delivery
         lease, steps 1 and 2 fuse into ``Markers.settle_fenced``, one script that
@@ -2315,7 +3195,102 @@ class Kernel:
         entry stays pending for whoever now holds the fence. Without that, a turn
         whose settle was refused would be acked with no completion written at all.
         """
+        parsed = parse_work_item_event_id(qevent.event_id)
+        run = (
+            self._work_item_runs.get(parsed.request_id)
+            if parsed is not None and parsed.kind in {"execute"}
+            else None
+        )
+        if run is not None and run.event_id != qevent.event_id:
+            run = None
+        if run is None and (
+            (parsed is not None and parsed.is_ci_fix)
+            or self._is_approval_resume(qevent.event_id)
+        ):
+            run = self._run_for_event(qevent.event_id)
+        if run is not None and run.started and not run.finished:
+            try:
+                if outcome == "awaiting-approval":
+                    # Approval is not a terminus. Stop the short lease refresh
+                    # and hold the request until its execution deadline. The
+                    # run stays attached so the resume turn can finish it.
+                    await run.close()
+                    try:
+                        await run.hold_for_approval()
+                    except (WorkItemConflict, WorkItemTransportError):
+                        logger.warning(
+                            "work-item approval hold failed for %s",
+                            qevent.event_id,
+                            exc_info=True,
+                        )
+                    else:
+                        run.held = True
+                elif outcome == "delivered":
+                    try:
+                        await run.finish(
+                            outcome="failed",
+                            cause=(
+                                "ci_fix_unpublished"
+                                if parsed is not None and parsed.is_ci_fix
+                                else "no_pull_request"
+                            ),
+                            detail=None,
+                        )
+                    except WorkItemConflict as exc:
+                        if exc.code != "publication_pending":
+                            raise
+                        # The publication loop owns the terminus from here; the
+                        # execution itself is over, and publication works from
+                        # the stored patch, not the sandbox.
+                        run.finished = True
+                elif outcome == "escalated":
+                    await run.finish(
+                        outcome="failed",
+                        cause=_escalation_cause(failure),
+                        detail=failure.error_message if failure is not None else None,
+                    )
+                else:
+                    await run.finish(outcome="failed", cause="runner_failed", detail=None)
+            except WorkItemConflict as exc:
+                logger.warning(
+                    "work-item finish refused for %s: %s; writing no marker",
+                    qevent.event_id,
+                    exc.code,
+                )
+                return
+        elif run is not None and not run.started:
+            try:
+                await run.defer(f"not_started:{telemetry_outcome}", capacity=False)
+            except WorkItemConflict as exc:
+                logger.info(
+                    "work-item unstarted defer refused for %s: %s",
+                    qevent.event_id,
+                    exc.code,
+                )
+        if hook_outcome is None and _is_targetless(qevent):
+            # A targeted terminal that started nothing (an escalation, a refused
+            # admission or workspace) leaves the row open for a human reading the
+            # reply. A targetless one has no reader and redelivery skips a done
+            # event, so every targetless terminal closes the row: "ran" only when
+            # an attempt started and ended ok, otherwise "failed" (#2963).
+            hook_outcome = "failed"
+        hook_carry = _HOOK_RUN_CARRY.get()
+        if (
+            hook_outcome is not None
+            and hook_carry is not None
+            and hook_carry.recorder is not None
+            and hook_carry.ref is not None
+            and not (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.lost.is_set()
+            )
+        ):
+            await hook_carry.recorder.close(hook_carry.ref, hook_outcome)
         event_id = qevent.event_id
+        if _is_targetless(qevent):
+            await self._settle_targetless(qevent, outcome, telemetry_outcome, lease)
+            return
         record = CompletionRecord(
             event_id=event_id,
             event=TurnCompleted(
@@ -2389,6 +3364,55 @@ class Kernel:
         except ValueError:
             duration = 0.0
         record_metric("curie.turn.duration", duration, attributes=attributes)
+
+    async def _settle_targetless(
+        self,
+        qevent: QueuedTurn,
+        outcome: str,
+        telemetry_outcome: str,
+        lease: DeliveryLease | None,
+    ) -> None:
+        """``_complete``'s terminal write for a targetless turn (#2963).
+
+        Marker only: no adapter is waiting, so no ``turn.completed`` is owed and
+        no outbox record is written. The fenced form refuses exactly as
+        ``settle_fenced`` does, with the same lease-lost handling.
+        """
+        event_id = qevent.event_id
+        if _is_fenced(lease):
+            assert lease is not None  # narrowed by _is_fenced
+            settled = await self._markers.settle_fenced_without_completion(
+                event_id,
+                stream=lease.stream,
+                group=lease.group,
+                entry_id=lease.entry_id,
+                owner=lease.owner,
+                generation=lease.generation,
+            )
+            if not settled:
+                logger.warning(
+                    "fenced out of terminal settlement for event %s "
+                    "(owner=%s generation=%d outcome=%s): another owner holds "
+                    "this delivery; writing no marker",
+                    event_id,
+                    lease.owner,
+                    lease.generation,
+                    outcome,
+                )
+                _LIFECYCLE_OUTCOME.set("fenced_out")
+                lease.lost.set()
+                return
+        else:
+            await self._markers.mark_done_without_completion(event_id)
+        _LIFECYCLE_OUTCOME.set(telemetry_outcome)
+        record_metric(
+            "curie.turn.completed",
+            attributes={
+                "service.name": "curie-worker",
+                "source": "worker",
+                "outcome": telemetry_outcome,
+            },
+        )
 
     async def _deliver_completion(self, record: CompletionRecord, *, generation: str) -> bool:
         """Emit a stored completion and clear it, or leave it owed. True on send.
@@ -2566,6 +3590,8 @@ class Kernel:
         Best-effort: the sink swallows errors, so a workspace without the
         assistant feature costs one debug line and nothing else.
         """
+        if _is_targetless(qevent):
+            return
         load = sample_load(packs, qevent.conversation_id)
         tip = sample_tip(packs, qevent.conversation_id)
         if load and tip:
@@ -2680,6 +3706,7 @@ class Kernel:
         pressure_retried: bool,
         workspace_inference: _WorkspaceInferenceCarry,
     ) -> TurnOutcome:
+        handle = qevent.reply_handle
         thread_key = _thread_key_for(qevent)
         attempt_started = time.monotonic()
 
@@ -2694,12 +3721,17 @@ class Kernel:
         # A placeholderless job or review candidate must route first. Otherwise
         # every busy redelivery or authority outage posts a notice for a turn
         # that never started. Reviews publish their receipt after reservation;
-        # jobs publish the deferred booting state below after routing succeeds.
+        # webhook jobs publish that deferred booting state below after routing
+        # succeeds, and a cron turn does not. A cron turn posts once, when the
+        # final reply is delivered.
         review_candidate = _REVIEW_EVENT_ID_RE.fullmatch(qevent.event_id) is not None
-        defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
-        defer_review_booting = qevent.reply_handle.placeholder is None and review_candidate
-        if not self._config.slack_no_edit_streaming and not (
-            defer_job_booting or defer_review_booting
+        placeholder = None if handle is None else handle.placeholder
+        defer_job_booting = placeholder is None and qevent.source.is_job
+        defer_review_booting = placeholder is None and review_candidate
+        if (
+            handle is not None
+            and not self._config.slack_no_edit_streaming
+            and not (defer_job_booting or defer_review_booting)
         ):
             try:
                 await self._reply_for(
@@ -2803,6 +3835,7 @@ class Kernel:
                             review_turn=qevent if verified_review is not None else None,
                             workspace_inference=workspace_inference,
                             approval_resume=self._is_approval_resume(qevent.event_id),
+                            work_item_repo=self._work_item_repository(qevent.event_id),
                         )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -2822,6 +3855,20 @@ class Kernel:
                 rejection.used,
                 rejection.hard,
             )
+            parsed_execute = parse_work_item_event_id(qevent.event_id)
+            if parsed_execute is not None and parsed_execute.kind in {"execute"}:
+                run = self._work_item_runs.get(parsed_execute.request_id)
+                if run is not None and not run.started:
+                    release_order()
+                    try:
+                        await run.defer("capacity", capacity=True)
+                    except WorkItemConflict as exc:
+                        logger.info(
+                            "work-item capacity defer refused for %s: %s",
+                            qevent.event_id,
+                            exc.code,
+                        )
+                    raise _WorkItemDeferred() from None
             if self._is_approval_resume(qevent.event_id):
                 release_order()
                 return TurnOutcome(terminal_ok=False, classification="runner-error")
@@ -3000,7 +4047,11 @@ class Kernel:
                 # second time.
                 logger.warning("GitHub feedback receipt delivery unavailable")
 
-        if not self._config.slack_no_edit_streaming and defer_job_booting:
+        if (
+            not self._config.slack_no_edit_streaming
+            and defer_job_booting
+            and qevent.source is not TurnSource.CRON
+        ):
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
@@ -3036,6 +4087,10 @@ class Kernel:
             return TurnOutcome(terminal_ok=True, steered=True)
 
         assert routed.handle is not None and routed.turn is not None
+        hook_carry = _HOOK_RUN_CARRY.get()
+        if hook_carry is not None:
+            hook_carry.this_attempt_started = True
+            hook_carry.any_attempt_started = True
         turn = routed.turn
         # Register this owner turn so a kill for its agent interrupts it, then
         # stream; unregister when the turn ends.
@@ -3479,6 +4534,7 @@ class Kernel:
         workspace_inference: _WorkspaceInferenceCarry,
         attachment_fresh_only: bool = False,
         approval_resume: bool = False,
+        work_item_repo: str | None = None,
     ) -> _RouteResult:
         # A thread that requires a repository must establish (or confirm) it
         # before any platform response path. This deliberately precedes the
@@ -3500,14 +4556,22 @@ class Kernel:
             # quotes the gated tool's arguments, so ``apiVersion: batch/v1`` would
             # read as a repository; its repository is the thread's existing
             # selection, which a null request returns.
-            repo_fact = trusted_repository_fact(
-                event.text,
-                ignore_message=(
-                    verified_review is not None
-                    or source is TurnSource.WEBHOOK
-                    or approval_resume
-                ),
-            )
+            #
+            # A factory work-item execution (#2992) already knows its
+            # repository: the API bound it to the WorkItem from the signed
+            # delivery. The issue URL in its objective is the assignment, not a
+            # repository choice, so the turn text is never parsed for it.
+            if work_item_repo is not None:
+                repo_fact = work_item_repo
+            else:
+                repo_fact = trusted_repository_fact(
+                    event.text,
+                    ignore_message=(
+                        verified_review is not None
+                        or source is TurnSource.WEBHOOK
+                        or approval_resume
+                    ),
+                )
             if self._workspace is None:
                 # The coordinator is available across the worker, not a condition
                 # on generic agent turns. Refuse only an event that requires a
@@ -3667,6 +4731,34 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable workspace handoff boundary"
             )
+        # Turn budget fence (#3071). CURIE_MAX_TURNS binds only at boot, so a
+        # live route booted with a different budget is replaced (not adopted)
+        # once it reaches the same durable handoff boundary a late workspace
+        # acquisition waits for. A steerable message arriving while a turn is
+        # live keeps the one-live-session rule instead: it adopts and steers,
+        # and the budget applies from the next new turn.
+        turn_budget_replacement = (
+            existing_handle is not None
+            and existing_handle.max_turns != (boot_env or {}).get(MAX_TURNS_ENV)
+        )
+        if (
+            turn_budget_replacement
+            and existing_handle is not None
+            and not source.is_job
+            and verified_review is None
+            and await self._turn_active(existing_handle, remaining_s=remaining_s)
+        ):
+            turn_budget_replacement = False
+        if (
+            turn_budget_replacement
+            and existing_handle is not None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            raise ThreadBusyError(
+                f"thread {thread_key} has not reached a durable turn budget handoff boundary"
+            )
         if packs is not None and verified_review is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
@@ -3695,8 +4787,16 @@ class Kernel:
             workspace_repo=workspace_repo,
             replace_handle=(
                 existing_handle
-                if workspace_repo is not None and existing_handle is not None and (
-                    force_lineage_replacement or existing_handle.workspace_repo is None
+                if existing_handle is not None
+                and (
+                    turn_budget_replacement
+                    or (
+                        workspace_repo is not None
+                        and (
+                            force_lineage_replacement
+                            or existing_handle.workspace_repo is None
+                        )
+                    )
                 )
                 else None
             ),
@@ -3800,6 +4900,16 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
+            # Turn budget fence (#3071), finish-race side. The route was kept
+            # only to steer a live turn; that turn ended (or its liveness was
+            # unreadable), and CURIE_MAX_TURNS binds at boot, so a new turn must
+            # not open on this runner. Retry: the redelivery finds the turn
+            # idle and takes the replacement path above.
+            if handle.max_turns != (boot_env or {}).get(MAX_TURNS_ENV):
+                raise ThreadBusyError(
+                    f"thread {thread_key} turn ended before its steer; "
+                    "retrying to replace the runner's turn budget"
+                )
         if verified_review is not None:
             reserver = getattr(
                 self._publication_creator, "reserve_review_feedback", None
@@ -3841,6 +4951,32 @@ class Kernel:
         # Register before start_turn so a kill during the POST can find this
         # thread. Canned and steered returns above never register. A failed
         # start unregisters so a turn that never opened cannot leak an entry.
+        runs = getattr(self, "_work_item_runs", {})
+        owned_id = _OWNED_WORK_ITEM.get()
+        run = runs.get(owned_id) if owned_id is not None else None
+        if run is None:
+            for candidate in runs.values():
+                if (
+                    candidate.thread_key == thread_key
+                    and candidate.started
+                    and not candidate.finished
+                ):
+                    run = candidate
+                    break
+        if run is not None and run.finished:
+            raise WorkItemStartRefused("work item authority is finished")
+        if run is not None and not run.started:
+            started = await run.start(
+                claim_name=handle.claim_name,
+                sandbox_name=handle.sandbox_name,
+            )
+            remaining_s = (
+                started.remaining_s
+                if remaining_s is None
+                else min(remaining_s, started.remaining_s)
+            )
+        elif run is not None:
+            remaining_s = run.bound_remaining_s(remaining_s)
         if agent_id is not None:
             self._register_run(agent_id, thread_key)
         try:
@@ -4274,7 +5410,13 @@ class Kernel:
                 # A runner appeared after the attachment lookup; it never saw
                 # the staged files, so refuse rather than adopt it (#2739).
                 raise RouteChangedError(thread_key)
-            if existing is not None and existing.workspace_repo == workspace_repo:
+            if (
+                existing is not None
+                and existing.workspace_repo == workspace_repo
+                # A route the caller fenced for replacement (#3071 turn
+                # budget) is never adopted.
+                and existing != replace_handle
+            ):
                 await asyncio.to_thread(
                     self._workspace.touch,
                     thread_key,
@@ -4390,6 +5532,18 @@ class Kernel:
                     "claim", "workspace substrate returned an invalid sandbox handle"
                 )
             return workspace_claim.handle
+        if replace_handle is not None:
+            # Turn budget fence (#3071): the caller proved the old runner idle
+            # with durable history; hand the route to a runner booted with this
+            # delivery's env, keeping the session and history identity.
+            return await asyncio.to_thread(
+                self._substrate.handoff,
+                thread_key,
+                expected=replace_handle,
+                env=boot_env or {},
+                workspace_repo=None,
+                agent_name=agent_name,
+            )
         try:
             return await asyncio.to_thread(
                 self._substrate.claim,
@@ -4457,6 +5611,7 @@ class Kernel:
         # thread key like the sandbox and the lock: two channels sharing a
         # conversation id must not pop each other's card. Outside the try because
         # the failure log below names it.
+        handle = _reply_handle_for(qevent)
         thread_key = _thread_key_for(qevent)
         try:
             # Expiry states only that nobody decided, so it needs no record read.
@@ -4506,7 +5661,7 @@ class Kernel:
                         # either from the turn addresses the wrong place; ``kind``
                         # empty is the pre-upgrade entry, which falls back to the
                         # turn exactly as it did before.
-                        kind=ref.kind or qevent.reply_handle.kind,
+                        kind=ref.kind or handle.kind,
                         address=ref.channel,
                         conversation_id=qevent.conversation_id,
                         reply_ref=ref.ts,
@@ -4619,6 +5774,7 @@ class Kernel:
         that case.
         """
 
+        handle = _reply_handle_for(qevent)
         # Both identities are live in this function and they are not
         # interchangeable: ``thread`` is the BARE adapter conversation id used
         # only for replies; ``thread_key`` is the canonical server identity that
@@ -4642,8 +5798,8 @@ class Kernel:
         # its own: the schema permits the same address string under two kinds,
         # so an address-only comparison misreads an email turn whose address
         # happens to equal a Slack policy channel as "the requesting channel".
-        card_kind = qevent.reply_handle.kind
-        card_channel = qevent.reply_handle.channel
+        card_kind = handle.kind
+        card_channel = handle.channel
         notification_target: tuple[str, str, TargetRoute] | None = None
         if route_name:
             binding = (approval_routes or {}).get(route_name)
@@ -4690,6 +5846,13 @@ class Kernel:
         # so the durable record, the card and the publication request stay free
         # of it.
         inference = _workspace_inference_notice(outcome.workspace_inferred_repo)
+        parsed_publication = parse_work_item_event_id(qevent.event_id)
+        publication_run = (
+            self._work_item_runs.get(parsed_publication.request_id)
+            if parsed_publication is not None
+            and parsed_publication.kind in {"execute", "ci"}
+            else None
+        )
         try:
             if is_publication:
                 publication_creator = self._publication_creator
@@ -4713,11 +5876,11 @@ class Kernel:
                         repo_full_name=snapshot.repo_full_name,
                         author=qevent.author,
                         summary=summary,
-                        reply_kind=qevent.reply_handle.kind,
-                        reply_channel=qevent.reply_handle.channel,
+                        reply_kind=handle.kind,
+                        reply_channel=handle.channel,
                         reply_placeholder=self._target_for(qevent).reply_ref,
-                        reply_endpoint=qevent.reply_handle.endpoint,
-                        reply_adapter=qevent.reply_handle.adapter,
+                        reply_endpoint=handle.endpoint,
+                        reply_adapter=handle.adapter,
                         dedupe_key=qevent.event_id,
                         base_sha=snapshot.base_sha,
                         patch=snapshot.patch,
@@ -4728,6 +5891,19 @@ class Kernel:
                         max_patch_bytes=self._config.publication_patch_max_bytes,
                         review_origin_key=outcome.review_origin_key,
                         route=route_name,
+                        work_item_request_id=(
+                            parsed_publication.request_id
+                            if parsed_publication is not None
+                            and parsed_publication.kind in {"execute", "ci"}
+                            and publication_run is not None
+                            and publication_run.started
+                            else None
+                        ),
+                        work_item_runtime_epoch=(
+                            publication_run.runtime_epoch
+                            if publication_run is not None and publication_run.started
+                            else None
+                        ),
                     )
                 )
                 created = CreatedApproval(
@@ -4751,8 +5927,8 @@ class Kernel:
                         # creation time, never looked up at resume: an operator may
                         # re-bind the address between suspension and resume, and the
                         # persisted values are facts about the original turn.
-                        reply_kind=qevent.reply_handle.kind,
-                        reply_channel=qevent.reply_handle.channel,
+                        reply_kind=handle.kind,
+                        reply_channel=handle.channel,
                         # The ref this turn actually DELIVERED on, not the one the wire
                         # carried. On a placeholder-less turn (ADR-0079) the two differ:
                         # the wire says null and the turn has since posted its own
@@ -4760,8 +5936,8 @@ class Kernel:
                         # nothing to edit, so the approval's outcome would land on a
                         # second message beside the request it answers.
                         reply_placeholder=self._target_for(qevent).reply_ref,
-                        reply_endpoint=qevent.reply_handle.endpoint,
-                        reply_adapter=qevent.reply_handle.adapter,
+                        reply_endpoint=handle.endpoint,
+                        reply_adapter=handle.adapter,
                         dedupe_key=qevent.event_id,
                         route=route_name,
                         card_channel=card_channel,
@@ -4956,10 +6132,10 @@ class Kernel:
         # different kinds, and comparing addresses alone would hand a non-Slack
         # turn's transport to a Slack policy card that merely shares its address.
         in_requesting_channel = (card_kind, card_channel) == (
-            qevent.reply_handle.kind,
-            qevent.reply_handle.channel,
+            handle.kind,
+            handle.channel,
         )
-        card_endpoint = qevent.reply_handle.endpoint if in_requesting_channel else None
+        card_endpoint = handle.endpoint if in_requesting_channel else None
         card_adapter = route.adapter if in_requesting_channel else None
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
@@ -5108,13 +6284,22 @@ class Kernel:
         workspace_inferred_repo: str | None,
     ) -> TurnOutcome:
         acc = _StreamAccumulator(workspace_inferred_repo=workspace_inferred_repo)
+        silent_requesting_chat = self._is_factory_work_item_turn(qevent.event_id)
         reply = _ThrottledReply(
             self._sink,
-            target=self._target_for(qevent),
+            target=(
+                None
+                if _is_targetless(qevent) or silent_requesting_chat
+                else self._target_for(qevent)
+            ),
             route=route,
             min_interval_s=self._config.slack_edit_min_interval_s,
             nav=nav,
-            no_edit=self._config.slack_no_edit_streaming,
+            no_edit=(
+                self._config.slack_no_edit_streaming
+                or qevent.source is TurnSource.CRON
+                or silent_requesting_chat
+            ),
             # Reply delivery is best-effort ONLY on an approval-resume turn (the
             # granted tool has already executed in the runner): a dead reply
             # endpoint with no default transport completes the turn instead of
@@ -5128,7 +6313,11 @@ class Kernel:
             # plan-ratified, not an oversight.
             best_effort=self._is_approval_resume(qevent.event_id),
             on_ref=lambda ref: self._adopt_ref(qevent, ReplyAck(ref=ref)),
-            on_final=lambda: self._terminal_reply_attempted.add(qevent.event_id),
+            on_final=(
+                None
+                if silent_requesting_chat
+                else lambda: self._terminal_reply_attempted.add(qevent.event_id)
+            ),
         )
         try:
             # ``async with`` releases the aiohttp response on every exit path

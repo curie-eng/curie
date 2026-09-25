@@ -48,7 +48,12 @@ from plugin_format.connector_render import (
     mcp_entry,
     unhosted_mcp_entry,
 )
-from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
+from plugin_format.connectors import (
+    CONNECTORS_FILE,
+    ConnectorsFile,
+    ConnectorSpec,
+    validate_connectors,
+)
 from plugin_format.yaml_loader import safe_load_unique
 
 logger = logging.getLogger(__name__)
@@ -127,7 +132,9 @@ def derive_mcp_servers(
 
     try:
         return {
-            name: mcp_entry(release, agent, namespace, name, spec)
+            name: _without_unreachable_bearer(
+                mcp_entry(release, agent, namespace, name, spec), spec
+            )
             for name, spec in sorted(declared.connectors.items())
         }
     except AmbiguousObjectName as exc:
@@ -153,6 +160,41 @@ def derive_mcp_servers(
             exc,
         )
         return {}
+
+
+def _without_unreachable_bearer(entry: dict[str, Any], spec: ConnectorSpec) -> dict[str, Any]:
+    """Drop a client Bearer implied only by a lone ``from_secret`` credential (#2825).
+
+    ``mcp_entry`` derives ``Authorization: Bearer ${NAME}`` from a hosted
+    connector's single secret, which fits github-mcp-server's client PAT. When
+    that secret is a ``SecretRef`` it is the server's own upstream credential,
+    delivered to the connector pod by ``secretKeyRef`` and, under ADR-0090,
+    never to the sandbox. The placeholder could never expand, so every boot
+    diagnosed ``missing_credential`` and every turn denied the connector's tools
+    (mcp-grafana and the SRE bot's tempo server). Without the header the boot
+    probe dials the server for real: one that does authenticate the client
+    still fails, as ``probe_failed``. An explicit ``bearer_secret`` is the
+    author asking for the header, so it is kept, as is a remote connector's
+    authored header, which authenticates the client.
+    """
+
+    if (
+        not spec.is_hosted
+        or spec.bearer_secret
+        or len(spec.secrets) != 1
+        or isinstance(spec.secrets[0], str)
+    ):
+        return entry
+    headers = entry.get("headers")
+    if not isinstance(headers, dict) or headers.get("Authorization") != (
+        f"Bearer ${{{spec.secrets[0].name}}}"
+    ):
+        return entry
+    remaining = {key: value for key, value in headers.items() if key != "Authorization"}
+    trimmed = {key: value for key, value in entry.items() if key != "headers"}
+    if remaining:
+        trimmed["headers"] = remaining
+    return trimmed
 
 
 def build_mcp_servers(platform: dict[str, Any], derived: dict[str, Any]) -> dict[str, Any]:

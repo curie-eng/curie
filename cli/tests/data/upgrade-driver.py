@@ -593,6 +593,9 @@ if program == "helm":
     # Helm v3.20 removes rel.Chart before serializing status and keeps the
     # numeric release revision at version:
     # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
+    if args[0] == "history":
+        print("Error: release: not found", file=sys.stderr)
+        sys.exit(1)
     if args[0] == "status":
         if "json" in args:
             emit(

@@ -127,6 +127,11 @@ def _parse_trusted_origins(value: object) -> object:
 TrustedOrigins = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 
+# Upper bound for CURIE_DELIVERY_BUDGET_S and CURIE_RUNNER_TOTAL_TIMEOUT_S:
+# three hours, so a long factory run fits one delivery (#3071, ADR-0171). The
+# chart schema carries the same maximum.
+MAX_DELIVERY_BUDGET_S = 10800.0
+
 
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
@@ -737,9 +742,13 @@ class WorkerConfig(BaseSettings):
     # the delivery. The lease is the renewable proof of ownership that makes a
     # healthy long turn un-reclaimable and a dead owner's turn recoverable
     # after a bounded expiry, replacing the old dead pair of a flat HTTP
-    # timeout and a 900s idle-based steal window.
+    # timeout and a 900s idle-based steal window. Both this budget and the
+    # per-request ceiling reach MAX_DELIVERY_BUDGET_S (three hours, #3071).
     delivery_budget_s: float = Field(
-        default=600.0, ge=60.0, le=1800.0, validation_alias="CURIE_DELIVERY_BUDGET_S"
+        default=600.0,
+        ge=60.0,
+        le=MAX_DELIVERY_BUDGET_S,
+        validation_alias="CURIE_DELIVERY_BUDGET_S",
     )
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
@@ -808,12 +817,19 @@ class WorkerConfig(BaseSettings):
         default=None, validation_alias="CURIE_TERMINATION_GRACE_PERIOD_S"
     )
 
+    # Turn budget for a work-item (factory) delivery (#3071). A work-item
+    # execution writes this into the sandbox boot env as CURIE_MAX_TURNS; every
+    # other delivery carries none and keeps the runner's short chat default.
+    work_item_max_turns: int = Field(
+        default=1000, gt=0, validation_alias="CURIE_WORK_ITEM_MAX_TURNS"
+    )
+
     # Runner HTTP timeouts
     runner_connect_timeout_s: float = 10.0
     runner_total_timeout_s: float = Field(
         default=600.0,
         gt=0.0,
-        le=1800.0,
+        le=MAX_DELIVERY_BUDGET_S,
         validation_alias=AliasChoices(
             "CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"
         ),
@@ -1090,6 +1106,15 @@ class WorkerConfig(BaseSettings):
     )
     connector_reconcile_interval_s: float = Field(
         default=60.0, gt=0, validation_alias="CURIE_CONNECTOR_RECONCILE_INTERVAL_S"
+    )
+    # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
+    # A slot fires on the first tick at or after it, so the tick bounds lateness.
+    cron_tick_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_CRON_TICK_INTERVAL_S"
+    )
+    # How often the worker looks for WorkItem runs whose owner died (#3076).
+    work_item_orphan_sweep_interval_s: float = Field(
+        default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
     )
     # The reconciler reuses `connector_release` / `connector_namespace` above --
     # deliberately the same two values the runner's connector scope is built

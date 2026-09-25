@@ -112,6 +112,99 @@ def _lineage_resources(module: Any) -> Any:
     )
 
 
+def test_branch_prefix_mismatch_exits_before_any_git_or_github_call(
+    publication_k8s: Any,
+    tmp_path: Path,
+) -> None:
+    payload = replace(
+        _payload(publication_k8s),
+        branch="factory/publication-abc",
+        branch_prefix="factory/",
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload,
+        credential=WRITE_CREDENTIAL,
+        settings=_settings(publication_k8s),
+    )
+    script = tmp_path / "publish.sh"
+    script.write_text(resources.config_map["data"]["publish.sh"])
+    completed = subprocess.run(
+        ["bash", str(script)],
+        env={**os.environ, **_job_env(resources), "BRANCH": "curie/publication-abc"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 1
+    assert "required prefix" in completed.stderr
+
+
+def test_a_cleared_prefix_still_accepts_the_stored_platform_branch(
+    publication_k8s: Any,
+) -> None:
+    payload = replace(
+        _payload(publication_k8s),
+        branch="factory/publication-abc",
+        branch_prefix=None,
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload,
+        credential=WRITE_CREDENTIAL,
+        settings=_settings(publication_k8s),
+    )
+    assert _job_env(resources)["BRANCH"] == "factory/publication-abc"
+    assert _job_env(resources)["PUBLICATION_BRANCH_PREFIX"] == ""
+
+    unsafe = replace(_payload(publication_k8s), branch="release/v1", branch_prefix=None)
+    with pytest.raises(publication_k8s.PublicationResourceError, match="lineage branch"):
+        publication_k8s.build_publication_resources(
+            unsafe,
+            credential=WRITE_CREDENTIAL,
+            settings=_settings(publication_k8s),
+        )
+
+
+def test_draft_publication_refuses_a_non_draft_pull_request(
+    publication_k8s: Any,
+    tmp_path: Path,
+) -> None:
+    payload = replace(_payload(publication_k8s), open_as_draft=True)
+    resources = publication_k8s.build_publication_resources(
+        payload,
+        credential=WRITE_CREDENTIAL,
+        settings=_settings(publication_k8s),
+    )
+    created = _pull_response()
+    created["draft"] = False
+    refused, _ = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="post-push",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, []),
+            (201, {}, created),
+        ],
+    )
+    assert refused.returncode != 0
+    assert "required draft" in refused.stderr
+
+    accepted = _pull_response()
+    accepted["draft"] = True
+    opened, requests = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="post-push",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, []),
+            (201, {}, accepted),
+        ],
+    )
+    assert opened.returncode == 0, opened.stderr
+    assert any(path.endswith("/pulls") for path, _auth in requests)
+
+
 def test_900000_raw_patch_bytes_fit_binary_data_and_900001_is_refused(
     publication_k8s: Any,
 ) -> None:

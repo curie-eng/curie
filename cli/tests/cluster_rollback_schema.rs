@@ -16,7 +16,7 @@ use curie::ops::{
     HelmRevision, RollbackOpts,
 };
 use curie::schema_compat::{pending_revisions, plan_upgrade, TargetMetadata};
-use curie::schema_window::{live_in_window, window_for};
+use curie::schema_window::{live_in_window, newest_fail_forward, window_for};
 
 fn catalog_marks_artifact_identity_ambiguous(version: &str) -> bool {
     let catalog: serde_json::Value =
@@ -80,7 +80,9 @@ fn v090_and_v091_accept_0044_and_refuse_0045() {
     }
 }
 
-/// The 0.9.2 chart establishes the new 0045 serving floor and head.
+/// Released v0.9.2 is a single revision window at 0045. The feature train
+/// chart continues past that window, so this pin is the catalog, not the
+/// packaged 0.10.0 graph.
 #[test]
 fn v092_accepts_0045_and_refuses_outside_its_single_revision_window() {
     let window = window_for("0.9.2").expect("0.9.2 is catalogued");
@@ -95,10 +97,50 @@ fn v092_accepts_0045_and_refuses_outside_its_single_revision_window() {
     );
 }
 
-/// The installed 0.9.1 source reports catalog head 0044 while the target chart
-/// provides its own graph and makes 0045 the only pending live migration.
 #[test]
-fn v091_catalog_source_head_and_chart_target_graph_pin_the_0045_boundary() {
+fn v0100_release_candidates_have_exact_catalog_windows() {
+    let catalog: serde_json::Value =
+        serde_json::from_str(include_str!("../src/application_schema_windows.json"))
+            .expect("application schema catalog parses");
+    for version in ["0.10.0-rc.1", "0.10.0-rc.2"] {
+        assert!(catalog["windows"].get(version).is_some());
+        let window = window_for(version).expect("release candidate is catalogued");
+        assert_eq!(window.schema_min, "0045");
+        assert_eq!(window.schema_head, "0057");
+        assert!(live_in_window("0045", &window));
+        assert!(live_in_window("0056", &window));
+        assert!(live_in_window("0057", &window));
+        assert!(!live_in_window("0044", &window));
+        assert_eq!(
+            window_for(&format!("v{version}"))
+                .expect("prefixed release candidate is catalogued")
+                .schema_head,
+            window.schema_head
+        );
+    }
+}
+
+#[test]
+fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
+    assert_eq!(
+        newest_fail_forward(["0.10.0-rc.1"], "0057").as_deref(),
+        Some("0.10.0-rc.1")
+    );
+    assert_eq!(
+        newest_fail_forward(["0.10.0-rc.1", "0.10.0"], "0057").as_deref(),
+        Some("0.10.0")
+    );
+    assert_eq!(
+        newest_fail_forward(["0.10.0-rc.1", "0.10.0-rc.2"], "0057").as_deref(),
+        Some("0.10.0-rc.2")
+    );
+}
+
+/// Released 0.9.1 reports catalog head 0044. This tree's packaged chart keeps
+/// the 0045 floor and continues through feature train head 0057, so the
+/// pending live migrations are 0045 through 0057 and the upgrade applies.
+#[test]
+fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
     let target: TargetMetadata =
         serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
@@ -106,13 +148,19 @@ fn v091_catalog_source_head_and_chart_target_graph_pin_the_0045_boundary() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0045");
-    assert_eq!(target.schema_head, "0045");
+    assert_eq!(target.schema_head, "0057");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
-    assert_eq!(pending.len(), 1, "{pending:?}");
-    assert_eq!(pending[0].revision, "0045");
-    assert_eq!(pending[0].kind, "expand");
+    let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
+    assert_eq!(
+        revisions,
+        [
+            "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
+            "0056", "0057"
+        ]
+    );
+    assert!(pending.iter().all(|step| step.kind == "expand"));
 
     let decision = plan_upgrade(
         Some("0044"),

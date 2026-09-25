@@ -16,6 +16,7 @@ from apps.api.tests.test_github_review_events import (
     HEAD,
     REPO,
     post_review,
+    publish_through_worker,
     review_rows,
 )
 from apps.api.tests.test_github_review_events import review_app_key as review_app_key
@@ -59,13 +60,7 @@ def _other_verified_lineage(client, truth, auth_headers):
         headers={**auth_headers, "X-Curie-Approval-Principal": principal},
     )
     assert resolved.status_code == 200, resolved.text
-    advanced = client.patch(
-        f"/v1/internal/publications/{publication['id']}/lineage",
-        headers=worker_headers,
-        json={"expected_version": 1, "expected_head_sha": None, "state": "open",
-              "pr_number": 18, "pr_url": f"https://github.com/{REPO}/pull/18", "head_sha": HEAD},
-    )
-    assert advanced.status_code == 200, advanced.text
+    publish_through_worker(client, pr_number=18)
     review_rows("UPDATE curie.publications SET outcome_history_ready_at=now(), "
                 "result_reported_at=now() WHERE id=:id", {"id": publication["id"]})
     return conversation

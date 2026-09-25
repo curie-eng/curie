@@ -49,10 +49,18 @@ Pydantic models mirroring the Claude Code shapes:
   other events validate but are not yet wired.
 - `TriggerDeclaration` (the manifest `triggers` field, a Curie extension for
   triggers beyond chat, #273/#270): a list of `{type, ...}`. `type` is `cron`
-  (requires a non-empty `schedule` cron expression) or `webhook` (requires a
-  non-empty `path`). Declaring triggers in the bundle keeps an agent's full
+  or `webhook`. `name`, `timezone`, `target`, and `prompt` are optional.
+  `validate_bundle` enforces the ADR-0099 cron shape (non-empty name and prompt,
+  five-field schedule). Timezone, when present, is an IANA zone name matching an
+  exact key in packaged tzdata, so host only aliases such as `localtime` are rejected. It defaults to UTC
+  only when omitted and is legal only with a schedule. Target, when present, is a
+  non-empty channel address string. Schedule is forbidden on other types. A webhook stays `{type, path}`.
+  Declaring triggers in the bundle keeps an agent's full
   wake-up behavior in one reviewable artifact. **Deploy-time validation** rejects
-  an unknown type, a cron trigger without a schedule, or a webhook trigger
+  an unknown type, a cron missing a non-empty name or prompt, a cron whose
+  schedule is missing or not five fields, a schedule on a non-cron type, an
+  invalid timezone, a timezone without a schedule, a duplicate name, a blank
+  target, or a webhook trigger
   without a path. Runtime consumption (kernel cron scheduling / webhook ingress)
   is a separate not-yet-built seam (see `docs/interfaces/triggers/INTERFACE.md`),
   so this is validation only today.
@@ -167,6 +175,10 @@ Error codes include `bundle.missing`, `manifest.missing`,
 `mcp.declared_pointer`, `hooks.declared_missing`, `hooks.invalid_json`,
 `hooks.invalid`, `hooks.command_missing`, `triggers.invalid`,
 `triggers.unknown_type`, `triggers.cron_missing_schedule`,
+`triggers.cron_missing_name`, `triggers.cron_missing_prompt`,
+`triggers.cron_invalid_schedule`, `triggers.schedule_forbidden`,
+`triggers.timezone_invalid`, `triggers.timezone_without_schedule`,
+`triggers.duplicate_name`, `triggers.target_invalid`,
 `triggers.webhook_missing_path`, `approval_policy.invalid`,
 `approval_policy.incomplete`, `approval_policy.gate_not_namespaced`,
 `tool_policy.unenforced`, `tool_policy.invalid`,

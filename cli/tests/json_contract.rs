@@ -1369,6 +1369,26 @@ fn deploy_all_targets_failure_outputs_validate() {
 }
 
 #[test]
+fn starter_curie_yaml_validates_against_the_input_schema() {
+    let yaml = include_str!("../../examples/curie.yaml");
+    let value: serde_json::Value =
+        serde_norway::from_str(yaml).expect("starter YAML deserializes to JSON");
+    assert_valid("curie-yaml.schema.json", &value);
+}
+
+#[test]
+fn apply_init_output_validates() {
+    use curie::ui::CliOutput;
+    let json = curie::installation::ApplyOutput::WroteStarter {
+        path: "curie.yaml".to_string(),
+    }
+    .to_json();
+    assert_valid("apply.schema.json", &json);
+    assert_eq!(json["wrote"], serde_json::json!(true));
+    assert_eq!(json["path"], serde_json::json!("curie.yaml"));
+}
+
+#[test]
 fn diff_output_validates() {
     let mut entries = curie::installation::diff_plan(
         &std::collections::BTreeMap::from([
@@ -1396,6 +1416,7 @@ fn diff_output_validates() {
         unresolved_credentials: vec!["CURIE_1426_GITHUB_CREDENTIAL".to_string()],
         namespace: "acme-bot".to_string(),
         release: "acme-bot".to_string(),
+        cluster: None,
         release_exists: true,
         // Mismatched on purpose: the real cluster ran 0.5.1 against a 0.6.0
         // CLI, and that is the state the warning exists for.
@@ -1427,6 +1448,15 @@ fn diff_output_validates() {
     assert!(
         json.get("migration").is_some(),
         "the migration key must be PRESENT, not merely absent-and-read-as-null: {json}"
+    );
+    assert_eq!(
+        json["cluster"],
+        serde_json::Value::Null,
+        "an unresolved cluster must still be emitted as null: {json}"
+    );
+    assert!(
+        json.get("cluster").is_some(),
+        "the cluster key must be PRESENT, not merely absent-and-read-as-null: {json}"
     );
 
     // Every classification the schema enumerates must be reachable from a real
@@ -1485,6 +1515,7 @@ fn diff_output_with_stateful_removals_validates() {
         unresolved_credentials: Vec::new(),
         namespace: "acme-bot".to_string(),
         release: "acme-bot".to_string(),
+        cluster: None,
         release_exists: true,
         chart_deployed: Some("curie-0.6.0".to_string()),
         chart_target: "0.6.0".to_string(),

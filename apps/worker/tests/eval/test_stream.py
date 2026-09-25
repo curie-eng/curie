@@ -16,6 +16,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import tarfile
 import time
 import uuid
@@ -45,7 +46,13 @@ from curie_test_support.valkey import (
     VALKEY_PW as _VPW,
 )
 from curie_worker import stream_consumer as stream_consumer_module
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV, THINKING_ENV
+from curie_worker.binding import (
+    BUDGET_ENV,
+    BUNDLE_REF_ENV,
+    MODEL_ENV,
+    THINKING_ENV,
+    BindingResolver,
+)
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer_liveness import (
@@ -74,8 +81,15 @@ from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 CONTAINS = GraderKind.CONTAINS
+_DB_URL = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
+)
+_DB_SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
 
 
 async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -90,9 +104,12 @@ async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
 class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
-    def __init__(self, *, thinking: str | None = None) -> None:
+    def __init__(
+        self, *, model: str | None = None, thinking: str | None = None
+    ) -> None:
+        self._model = model
         self._thinking = thinking
-        self.thinking_agent_id: uuid.UUID | None = None
+        self.model_settings_agent_ids: list[uuid.UUID] = []
 
     async def repo_full_name(self, _agent_id: uuid.UUID) -> str:
         return "owner/repo"
@@ -105,9 +122,25 @@ class _StubRepo:
     async def name_for(self, _agent_id: uuid.UUID) -> str | None:
         return None
 
-    async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
-        self.thinking_agent_id = agent_id
-        return self._thinking
+    async def model_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str | None, str | None]:
+        self.model_settings_agent_ids.append(agent_id)
+        return self._model, self._thinking
+
+
+class _ObservedBindingResolver(BindingResolver):
+    """A real resolver that records the paired settings lookup."""
+
+    def __init__(self, engine: AsyncEngine, config: WorkerConfig) -> None:
+        super().__init__(engine, config)
+        self.model_settings_agent_ids: list[uuid.UUID] = []
+
+    async def model_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str | None, str | None]:
+        self.model_settings_agent_ids.append(agent_id)
+        return await super().model_settings_for(agent_id)
 
 
 class _UnusedSubstrate:
@@ -264,7 +297,7 @@ def _build_consumer(
     reports: list[dict[str, Any]],
     lf_client: httpx.AsyncClient,
     report_status: int = 200,
-    repo_lookup: _StubRepo | None = None,
+    repo_lookup: Any | None = None,
 ) -> EvalStreamConsumer:
     def handler(request: httpx.Request) -> httpx.Response:
         reports.append(json.loads(request.content))
@@ -470,6 +503,7 @@ def test_seam_full_consume_eval_report_cycle(make_eval_harness, bundles) -> None
             client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
             reports: list[dict[str, Any]] = []
             async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                repo_lookup = _StubRepo(model="must_not_be_resolved")
                 consumer = _build_consumer(
                     redis_client=client,
                     cfg=cfg,
@@ -477,6 +511,7 @@ def test_seam_full_consume_eval_report_cycle(make_eval_harness, bundles) -> None
                     substrate=_UnusedSubstrate(),
                     reports=reports,
                     lf_client=lf_client,
+                    repo_lookup=repo_lookup,
                 )
                 await consumer.ensure_group()
                 sha = f"sha-{token}"
@@ -492,6 +527,7 @@ def test_seam_full_consume_eval_report_cycle(make_eval_harness, bundles) -> None
                 assert reports[0]["passed_count"] == 1
                 assert reports[0]["total"] == 2
                 assert reports[0]["target_url"] == base_url
+                assert repo_lookup.model_settings_agent_ids == []
                 summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
                 assert summary["pending"] == 0
 
@@ -787,141 +823,249 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
 
 
 @pytest.mark.parametrize(
-    ("platform_thinking", "agent_thinking", "item_model", "expected_thinking"),
+    (
+        "platform_model",
+        "stored_model",
+        "item_model",
+        "expected_model",
+        "platform_thinking",
+        "agent_thinking",
+        "expected_thinking",
+    ),
     [
-        pytest.param("adaptive", "disabled", "requested_model", "disabled"),
-        pytest.param("adaptive", None, None, "adaptive"),
-        pytest.param(None, "high", None, "high"),
-        pytest.param(None, None, None, None),
+        pytest.param(
+            "worker_model",
+            "stored_model",
+            None,
+            "stored_model",
+            None,
+            "high",
+            "high",
+            id="stored_settings",
+        ),
+        pytest.param(
+            "worker_model",
+            None,
+            None,
+            "worker_model",
+            "adaptive",
+            None,
+            "adaptive",
+            id="null_stored_settings",
+        ),
+        pytest.param(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            id="fully_unset",
+        ),
+        pytest.param(
+            "worker_model",
+            "stored_model",
+            "sweep_model",
+            "sweep_model",
+            "adaptive",
+            "disabled",
+            "disabled",
+            id="sweep_model_wins",
+        ),
     ],
 )
 def test_provisioned_runner_end_to_end(
     make_eval_harness,
     bundles,
+    platform_model: str | None,
+    stored_model: str | None,
+    item_model: str | None,
+    expected_model: str | None,
     platform_thinking: str | None,
     agent_thinking: str | None,
-    item_model: str | None,
     expected_thinking: str | None,
 ) -> None:
-    """No target_url: the consumer provisions a runner via the G1 substrate (boot
-    env carrying the bundle_ref + budget), evals against it, reports, and tears the
-    sandbox down in a finally. The fake runner is the model boundary, so no real
-    model is ever called."""
+    """A provisioned eval resolves stored settings through Postgres once.
+
+    The claim makes the external fake runner answer with its claimed model. The
+    real eval consumer must therefore boot the expected model to pass the case,
+    and the actual Langfuse recorder must label that same model.
+    """
     store, upload = bundles
 
     async def go() -> None:
-        async with make_eval_harness() as (base_url, fake, _client):
-            fake.responses = {"ping": "pong"}
-            port = int(base_url.rsplit(":", 1)[1])
-            bundle_ref = upload(
-                EvalSuite(
-                    name="prov",
-                    cases=[
-                        EvalCase(
-                            id="1", input="ping", grader=Grader(kind=CONTAINS, expected="pong")
-                        )
-                    ],
-                )
-            )
+        engine = create_async_engine(_DB_URL)
+        agent_id: uuid.UUID | None = None
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
             token = uuid.uuid4().hex[:8]
-            if platform_thinking is None:
-                cfg = _cfg(f"test:evals:{token}", f"g-{token}")
-            else:
+            agent_id = uuid.uuid4()
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        f"INSERT INTO {_DB_SCHEMA}.agents "
+                        "(id, name, model, thinking, repo_full_name) "
+                        "VALUES (:id, :name, :model, :thinking, :repo)"
+                    ),
+                    {
+                        "id": agent_id,
+                        "name": f"eval_agent_{token}",
+                        "model": stored_model,
+                        "thinking": agent_thinking,
+                        "repo": "acme-corp/acme-bot",
+                    },
+                )
+
+            async with make_eval_harness() as (base_url, fake, _client):
+                port = int(base_url.rsplit(":", 1)[1])
+                expected_output = expected_model or "unset"
+                bundle_ref = upload(
+                    EvalSuite(
+                        name="prov",
+                        cases=[
+                            EvalCase(
+                                id="1",
+                                input="report model",
+                                grader=Grader(kind=CONTAINS, expected=expected_output),
+                            )
+                        ],
+                    )
+                )
                 cfg = _cfg(
                     f"test:evals:{token}",
-                    f"g-{token}",
-                    thinking=platform_thinking,
+                    f"g:{token}",
+                    fake_model=False,
+                    model=platform_model or "",
+                    thinking=platform_thinking or "",
+                    db_schema=_DB_SCHEMA,
                 )
-            sandbox_prefix = f"test:curie:sandbox:{token}"
-            sync_client = redis.Redis(
-                host=_VH, port=_VP, password=_VPW or None, decode_responses=False
-            )
-            pressure_client = AsyncRedis(
-                host=_VH,
-                port=_VP,
-                password=_VPW or None,
-                decode_responses=False,
-                socket_timeout=1.0,
-                socket_connect_timeout=1.0,
-                retry=AsyncRetry(NoBackoff(), 0),
-                driver_info=None,
-                maint_notifications_config=MaintNotificationsConfig(enabled=False),
-            )
-            fake_k8s = _FakeK8s()
-            substrate = SandboxSubstrate(
-                fake_k8s,  # type: ignore[arg-type]
-                AffinityStore(
-                    sync_client,
-                    pressure_client=pressure_client,
-                    key_prefix=sandbox_prefix,
-                ),
-                SubstrateConfig(
-                    namespace="test-ns",
-                    warm_pool="test-pool",
-                    runner_port=port,
-                    route_ttl_seconds=60,
-                    claim_timeout_seconds=3.0,
-                    poll_interval_seconds=0.005,
-                    key_prefix=sandbox_prefix,
-                ),
-            )
-            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
-            reports: list[dict[str, Any]] = []
-            async with httpx.AsyncClient(timeout=30.0) as lf_client:
-                repo_lookup = _StubRepo(thinking=agent_thinking)
-                consumer = _build_consumer(
-                    redis_client=client,
-                    cfg=cfg,
-                    bundle_store=store,
-                    substrate=substrate,
-                    reports=reports,
-                    lf_client=lf_client,
-                    repo_lookup=repo_lookup,
+                sandbox_prefix = f"test:curie:sandbox:{token}"
+                sync_client = redis.Redis(
+                    host=_VH, port=_VP, password=_VPW or None, decode_responses=False
                 )
-                await consumer.ensure_group()
-                sha = f"sha-{token}"
-                item = _item(
-                    suite="prov",
-                    sha=sha,
-                    bundle_ref=bundle_ref,
-                    target_url=None,
-                    model=item_model,
+                pressure_client = AsyncRedis(
+                    host=_VH,
+                    port=_VP,
+                    password=_VPW or None,
+                    decode_responses=False,
+                    socket_timeout=1.0,
+                    socket_connect_timeout=1.0,
+                    retry=AsyncRetry(NoBackoff(), 0),
+                    driver_info=None,
+                    maint_notifications_config=MaintNotificationsConfig(enabled=False),
                 )
-                await client.xadd(cfg.eval_stream, {"payload": item.model_dump_json()})
 
-                await _drain_one(consumer, reports)
+                @dataclass
+                class _ModelEchoK8s(_FakeK8s):
+                    def create_claim(
+                        self,
+                        name: str,
+                        *,
+                        pool: str,
+                        env: dict[str, str] | None = None,
+                        labels: dict[str, str] | None = None,
+                    ) -> None:
+                        fake.responses["report model"] = (env or {}).get(MODEL_ENV, "unset")
+                        super().create_claim(name, pool=pool, env=env, labels=labels)
 
-                # The provisioned runner answered and the suite passed 1/1.
-                assert reports[0]["passed_count"] == 1
-                assert reports[0]["total"] == 1
-                assert reports[0]["target_url"] is None  # provisioned, not a shortcut
-                # The boot env carried the bundle ref and a budget (the F2 seam),
-                assert fake_k8s.claim_envs, "substrate.claim was never called"
-                assert fake_k8s.claim_envs[0][BUNDLE_REF_ENV] == bundle_ref
-                assert BUDGET_ENV in fake_k8s.claim_envs[0]
-                if expected_thinking is None:
-                    assert THINKING_ENV not in fake_k8s.claim_envs[0]
-                else:
-                    assert fake_k8s.claim_envs[0][THINKING_ENV] == expected_thinking
-                if item_model is not None:
-                    assert fake_k8s.claim_envs[0][MODEL_ENV] == item_model
-                if agent_thinking is not None:
-                    assert repo_lookup.thinking_agent_id == item.agent_id
-                # and the sandbox was torn down after the eval (finally: release).
-                assert fake_k8s.deleted, "provisioned sandbox was never released"
-                assert not fake_k8s.claims
+                fake_k8s = _ModelEchoK8s()
+                substrate = SandboxSubstrate(
+                    fake_k8s,  # type: ignore[arg-type]
+                    AffinityStore(
+                        sync_client,
+                        pressure_client=pressure_client,
+                        key_prefix=sandbox_prefix,
+                    ),
+                    SubstrateConfig(
+                        namespace="test-ns",
+                        warm_pool="test-pool",
+                        runner_port=port,
+                        route_ttl_seconds=60,
+                        claim_timeout_seconds=3.0,
+                        poll_interval_seconds=0.005,
+                        key_prefix=sandbox_prefix,
+                    ),
+                )
+                client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+                reports: list[dict[str, Any]] = []
+                async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                    repo_lookup = _ObservedBindingResolver(engine, cfg)
+                    consumer = _build_consumer(
+                        redis_client=client,
+                        cfg=cfg,
+                        bundle_store=store,
+                        substrate=substrate,
+                        reports=reports,
+                        lf_client=lf_client,
+                        repo_lookup=repo_lookup,
+                    )
+                    await consumer.ensure_group()
+                    sha = f"sha_{token}"
+                    item = _item(
+                        suite="prov",
+                        sha=sha,
+                        bundle_ref=bundle_ref,
+                        target_url=None,
+                        model=item_model,
+                    ).model_copy(update={"agent_id": agent_id})
+                    await client.xadd(cfg.eval_stream, {"payload": item.model_dump_json()})
 
-                summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
-                assert summary["pending"] == 0
-                await _assert_langfuse_traces(lf_client, cfg, sha, expected=1)
+                    await _drain_one(consumer, reports)
 
-            await client.delete(cfg.eval_stream)
-            keys = list(sync_client.scan_iter(match=f"{sandbox_prefix}:*"))
-            if keys:
-                sync_client.delete(*keys)
-            sync_client.close()
-            await pressure_client.aclose()
-            await client.aclose()
+                    assert reports[0]["passed_count"] == 1
+                    assert reports[0]["total"] == 1
+                    assert reports[0]["target_url"] is None
+                    assert fake_k8s.claim_envs, "substrate.claim was never called"
+                    claim_env = fake_k8s.claim_envs[0]
+                    assert claim_env[BUNDLE_REF_ENV] == bundle_ref
+                    assert BUDGET_ENV in claim_env
+                    if expected_model is None:
+                        assert MODEL_ENV not in claim_env
+                    else:
+                        assert claim_env[MODEL_ENV] == expected_model
+                    if expected_thinking is None:
+                        assert THINKING_ENV not in claim_env
+                    else:
+                        assert claim_env[THINKING_ENV] == expected_thinking
+                    assert repo_lookup.model_settings_agent_ids == [agent_id]
+                    assert fake_k8s.deleted, "provisioned sandbox was never released"
+                    assert not fake_k8s.claims
+
+                    summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
+                    assert summary["pending"] == 0
+                    traces = await _assert_langfuse_traces(
+                        lf_client, cfg, sha, expected=1
+                    )
+                    trace_row = traces[0]
+                    assert trace_row["metadata"]["model"] == expected_model
+                    model_tags = [
+                        tag for tag in trace_row["tags"] if tag.startswith("model:")
+                    ]
+                    assert model_tags == (
+                        [] if expected_model is None else [f"model:{expected_model}"]
+                    )
+
+                await client.delete(cfg.eval_stream)
+                keys = list(sync_client.scan_iter(match=f"{sandbox_prefix}:*"))
+                if keys:
+                    sync_client.delete(*keys)
+                sync_client.close()
+                await pressure_client.aclose()
+                await client.aclose()
+        finally:
+            if agent_id is not None:
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(f"DELETE FROM {_DB_SCHEMA}.agents WHERE id = :id"),
+                        {"id": agent_id},
+                    )
+            await engine.dispose()
 
     asyncio.run(go())
 
@@ -1234,7 +1378,7 @@ def test_eval_boot_env_mints_runner_token() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item)
+    env = consumer._boot_env(item, None, None, model=None)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
 
 
@@ -1255,7 +1399,7 @@ def test_eval_lane_boot_env_omits_memory_ref() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item)
+    env = consumer._boot_env(item, None, None, model=None)
     assert "CURIE_MEMORY_REF" not in env
     assert "CURIE_MEMORY_TOKEN" not in env
     assert "CURIE_HISTORY_REF" not in env
@@ -1279,7 +1423,7 @@ def test_eval_boot_env_forwards_sha_as_bundle_version() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item)
+    env = consumer._boot_env(item, None, None, model=None)
     assert env["CURIE_BUNDLE_VERSION"] == "deadbeef"
     assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
 
@@ -1301,14 +1445,17 @@ def test_eval_requested_model_boots_and_tags_that_model() -> None:
     item = _item(
         suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None, model="claude-x"
     )
-    env = consumer._boot_env(item)
+    env = consumer._boot_env(item, None, None, model="claude-x")
     assert env[MODEL_ENV] == "claude-x"  # requested model wins over worker default
-    assert consumer._eval_model(item) == "claude-x"  # ...and is the matrix label
+    assert consumer._eval_model(item, "claude-x") == "claude-x"
 
     # No requested model: the worker default is booted and tagged, as before.
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    assert consumer._boot_env(default_item)[MODEL_ENV] == "worker-default"
-    assert consumer._eval_model(default_item) == "worker-default"
+    assert (
+        consumer._boot_env(default_item, None, None, model="worker-default")[MODEL_ENV]
+        == "worker-default"
+    )
+    assert consumer._eval_model(default_item, "worker-default") == "worker-default"
 
 
 def test_eval_requested_model_labels_even_a_target_url_run() -> None:
@@ -1327,9 +1474,9 @@ def test_eval_requested_model_labels_even_a_target_url_run() -> None:
     labelled = _item(
         suite="s", sha="d", bundle_ref=None, target_url="http://runner", model="claude-y"
     )
-    assert consumer._eval_model(labelled) == "claude-y"
+    assert consumer._eval_model(labelled, "claude-y") == "claude-y"
     unlabelled = _item(suite="s", sha="d", bundle_ref=None, target_url="http://runner")
-    assert consumer._eval_model(unlabelled) is None
+    assert consumer._eval_model(unlabelled, None) is None
 
 
 def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
@@ -1358,7 +1505,7 @@ def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
         model="claude-opus-4-8",
     )
     with caplog.at_level(logging.WARNING):
-        assert consumer._eval_model(booted) is None  # NOT "claude-opus-4-8"
+        assert consumer._eval_model(booted, "claude-opus-4-8") is None
     assert any("claude-opus-4-8" in r.getMessage() for r in caplog.records), (
         "the discarded requested model must be logged, not silently dropped"
     )
@@ -1366,14 +1513,16 @@ def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
     # A fake run with no requested model is unlabelled too (not the worker default,
     # which the fake session never calls either).
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    assert consumer._eval_model(default_item) is None
+    default_env = consumer._boot_env(default_item, None, None, model="stored_model")
+    assert default_env[MODEL_ENV] == "stored_model"
+    assert consumer._eval_model(default_item, "stored_model") is None
 
     # The target_url runner we did not boot is exempt: our fake flag says nothing
     # about what that runner ran, so a caller-asserted label still stands.
     remote = _item(
         suite="s", sha="d", bundle_ref=None, target_url="http://runner", model="claude-y"
     )
-    assert consumer._eval_model(remote) == "claude-y"
+    assert consumer._eval_model(remote, "claude-y") == "claude-y"
 
 
 class _ConcurrencyProbeSubstrate:
@@ -1424,7 +1573,9 @@ def test_eval_claim_creation_is_bounded_to_one_by_default() -> None:
     ]
 
     async def go() -> None:
-        await asyncio.gather(*(consumer._acquire_target(item) for item in items))
+        await asyncio.gather(
+            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+        )
 
     asyncio.run(go())
 
@@ -1451,7 +1602,9 @@ def test_eval_claim_creation_bound_admits_configured_parallelism() -> None:
     ]
 
     async def go() -> None:
-        await asyncio.gather(*(consumer._acquire_target(item) for item in items))
+        await asyncio.gather(
+            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+        )
 
     asyncio.run(go())
 
@@ -1715,6 +1868,8 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
             "ANTHROPIC_BASE_URL": "http://evil",
             "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_ok",
         },
+        None,
+        model=None,
     )
     # The reserved model-credential key never carries the injected value.
     assert env.get("ANTHROPIC_BASE_URL") != "http://evil"
@@ -2078,21 +2233,22 @@ def test_eval_threads_the_workers_fake_state_into_run_eval_suite(
 
 async def _assert_langfuse_traces(
     lf_client: httpx.AsyncClient, cfg: WorkerConfig, sha: str, *, expected: int
-) -> None:
+) -> list[dict[str, Any]]:
     """Poll the real Langfuse until ``expected`` traces are visible for the version
     tag (v3 ingestion is async: queued, then materialized in ClickHouse)."""
-    found = 0
+    traces: list[dict[str, Any]] = []
     for _ in range(40):
         resp = await lf_client.get(
             f"{cfg.langfuse_host}/api/public/traces",
             params={"tags": f"version:{sha}"},
             auth=(cfg.langfuse_public_key, cfg.langfuse_secret_key),
         )
-        found = len(resp.json().get("data", [])) if resp.status_code == 200 else 0
-        if found >= expected:
+        traces = resp.json().get("data", []) if resp.status_code == 200 else []
+        if len(traces) >= expected:
             break
         await asyncio.sleep(1)
-    assert found == expected
+    assert len(traces) == expected
+    return traces
 
 
 def test_worker_boot_after_an_outage_skips_stale_backlog_but_runs_recent() -> None:

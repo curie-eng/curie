@@ -1,10 +1,17 @@
 """A hosted connector whose only secret is a SecretRef is not a failed capability (#2825).
 
-A connector with one ``from_secret`` credential lets its pod read the upstream
-token through a ``secretKeyRef``. Under ADR 0090, that value never reaches the
-sandbox. A derived client ``Authorization: Bearer ${NAME}`` header could not
-expand, so boot reported ``missing_credential`` on every session and the
-exclusion hook denied each connector tool while the turn still finished.
+The soak install's SRE bot declares ``grafana`` and ``tempo`` with one
+``from_secret`` credential each. That credential is the hosted server's own
+upstream token: the connector pod reads it through a ``secretKeyRef`` and, under
+ADR-0090, its value never reaches the sandbox. The derived client
+``Authorization: Bearer ${NAME}`` header therefore could never expand, so the
+boot diagnosis reported ``missing_credential`` on every session, logged
+``declared connector capability failed`` at ERROR on every turn, and the
+exclusion hook denied every ``mcp__grafana__*`` / ``mcp__tempo__*`` call while
+the turn still finished.
+
+Kept in its own module so the fix-pin revert still collects it: every
+module-level import here already exists on the pre-fix runner.
 """
 
 from __future__ import annotations
@@ -23,15 +30,16 @@ from curie_runner.mcp_tool_capability import (
     probe_mcp_tool_capability,
 )
 
-SCOPE = {"release": "acme", "agent": "acme-bot", "namespace": "acme-dev"}
+SCOPE = {"release": "curie", "agent": "sre-bot", "namespace": "curie"}
 
+# The soak bundle's shape, reduced to the fields that decide the header.
 SECRETREF_ONLY = (
     "connectors:\n"
     "  grafana:\n"
     "    image: docker.io/grafana/mcp-grafana:latest\n"
     "    secrets:\n"
     "      - name: GRAFANA_SERVICE_ACCOUNT_TOKEN\n"
-    "        from_secret: grafana-connector\n"
+    "        from_secret: curie-grafana-connector\n"
     "        key: GRAFANA_SERVICE_ACCOUNT_TOKEN\n"
 )
 
@@ -63,16 +71,13 @@ def _bundle(root: Path, connectors: str) -> Path:
     return root
 
 
-def _answering_probe(
-    dialed: list[dict[str, Any]],
-):
+def _answering_probe(dialed: list[dict[str, Any]]):
     async def probe(
-        config: Any,
-        **_kwargs: object,
+        config: Any, **_kwargs: object
     ) -> tuple[int, bool, frozenset[str], frozenset[str]]:
         dialed.append(dict(config))
-        tool = "mcp__grafana__search_dashboards"
-        return 1, False, frozenset({tool}), frozenset({tool})
+        tools = frozenset({"mcp__grafana__search_dashboards"})
+        return 1, False, tools, tools
 
     return probe
 
@@ -98,8 +103,8 @@ def test_secretref_only_connector_is_not_a_failed_capability(
     monkeypatch.delenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", raising=False)
 
     derived = derive_mcp_servers(_bundle(tmp_path, SECRETREF_ONLY), **SCOPE)
-    # The sandbox never holds a SecretRef value, so no client header can be
-    # derived from it. The hosted server authenticates upstream itself.
+    # The sandbox never holds a SecretRef value (ADR-0090), so no client header
+    # can be derived from it; the hosted server authenticates upstream itself.
     assert "Authorization" not in derived["grafana"].get("headers", {})
 
     with caplog.at_level(logging.WARNING):
@@ -116,8 +121,8 @@ def test_secretref_only_connector_is_not_a_failed_capability(
 def test_named_secret_still_derives_the_bearer_and_reports_it_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A Curie resolved secret is delivered to the sandbox, so the derived header
-    # stays and a missing value is still a real failure.
+    # Negative control: a Curie-resolved secret IS delivered to the sandbox, so
+    # the derived header stays and a missing value is still a real failure.
     dialed: list[dict[str, Any]] = []
     monkeypatch.setattr("curie_runner.mcp_tool_capability._probe_server", _answering_probe(dialed))
     monkeypatch.delenv("GITHUB_PERSONAL_ACCESS_TOKEN", raising=False)
@@ -136,8 +141,8 @@ def test_named_secret_still_derives_the_bearer_and_reports_it_missing(
 
 
 def test_explicit_bearer_secret_naming_a_secretref_keeps_the_header(tmp_path: Path) -> None:
-    # An author who explicitly asks for a client Bearer keeps it, so a
-    # credential that cannot reach the sandbox is still surfaced.
+    # Negative control: an author who explicitly asks for a client Bearer keeps
+    # it, so a credential that cannot reach the sandbox is still surfaced.
     derived = derive_mcp_servers(_bundle(tmp_path, EXPLICIT_SECRETREF_BEARER), **SCOPE)
     assert derived["github"]["headers"] == {
         "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
@@ -147,11 +152,11 @@ def test_explicit_bearer_secret_naming_a_secretref_keeps_the_header(tmp_path: Pa
 def test_secretref_server_that_refuses_the_client_is_still_a_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A hosted server that does authenticate the client fails on the real dial
-    # and remains visible as a failed connector.
+    # Secondary path: a hosted server that DOES authenticate the client now
+    # fails on the real dial (probe_failed, re-dialed each turn) instead of the
+    # network-free diagnosis, so the failure stays visible.
     async def refuses(
-        *_args: object,
-        **_kwargs: object,
+        *_args: object, **_kwargs: object
     ) -> tuple[int, bool, frozenset[str], frozenset[str]]:
         raise RuntimeError("401 Unauthorized")
 
@@ -177,8 +182,9 @@ REMOTE_SECRETREF_AUTHORED_BEARER = (
 
 @pytest.mark.parametrize("scoped", [True, False])
 def test_remote_connector_keeps_its_authored_bearer(tmp_path: Path, scoped: bool) -> None:
-    # Only the hosted derived header is an upstream credential. A remote
-    # connector's authored header authenticates the client and must survive.
+    # Negative control, both scope paths: only the HOSTED derived header is an
+    # upstream credential; a remote connector's authored header authenticates
+    # the client and must survive.
     scope = SCOPE if scoped else {"release": None, "agent": None, "namespace": None}
     derived = derive_mcp_servers(_bundle(tmp_path, REMOTE_SECRETREF_AUTHORED_BEARER), **scope)
     assert derived["vendor"]["headers"] == {"Authorization": "Bearer ${VENDOR_TOKEN}"}

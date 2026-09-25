@@ -8,7 +8,7 @@
 # command`. That exception is not classified by the kernel, so the turn hangs,
 # the entry is re-delivered to dead-letter, and every attempt leaks a sandbox.
 # `values.schema.json` makes helm refuse the value at install/template time so it
-# never reaches worker env at all. Thirteen assertions:
+# never reaches worker env at all. Fifteen assertions:
 #
 #   (a) POSITIVE, defaults: the render SUCCEEDS and the worker Deployment
 #       carries the three env vars at their shipped defaults.
@@ -50,27 +50,21 @@
 #       test_substrate_config_refuses_an_unparseable_ttl_naming_the_env_var. (i)
 #       and that case are one seam read from two ends; deleting either removes
 #       half of the only gate on the null path.
-#   (j) ADR-0131 RELATIONSHIP, positive and negative: the rendered
+#   (j) ADR-0131 RELATIONSHIP, derived grace: the rendered
 #       terminationGracePeriodSeconds must cover the rendered
 #       CURIE_DELIVERY_BUDGET_S + CURIE_DELIVERY_SHUTDOWN_RESERVE_S. The
-#       positive raises budget and grace together and must still render+pass;
-#       the negative raises the budget while leaving grace at its pre-ADR-0131
-#       value of 1800 and must be REFUSED BY THE RENDER ITSELF, by the
-#       `curie.worker.validateDrainBudget` guard in _helpers.tpl.
-#       That guard is the only fence an operator actually hits: JSON Schema
-#       cannot express cross-field arithmetic, so values.schema.json accepts
-#       grace=1800, `helm upgrade` used to succeed, and the worker then
-#       CrashLoopBackOffed because its `WorkerConfig` check raises before
-#       `asyncio.run` and no supervisor can catch it -- a silent breaking
-#       upgrade for any install that overrides grace. The fixed-value
-#       assertion in (a) only ever sees 1860 at the default; this is the half
-#       that actually exercises the inequality the ADR mandates, and the only
-#       assertion that demonstrates the guard REJECTING something.
+#       positive raises budget and grace together and must still render+pass.
+#       The second case raises the budget while leaving grace at its
+#       pre-ADR-0131 value of 1800: since #3071 the chart derives grace as
+#       max(configured, budget + reserve) in `curie.worker.terminationGrace`,
+#       so this renders and the pod grace is 1860, not the configured 1800.
+#       That combination used to reach the worker and CrashLoopBackOff it on
+#       the `WorkerConfig` boot check; the derived grace makes it impossible.
 #   (k) RUNNER CEILING, positive and negative: the shipped worker env contains
 #       CURIE_RUNNER_TOTAL_TIMEOUT_S=600 exactly once; 1700 under an 1800-second
 #       delivery budget renders and reaches the worker; equality at 600, a
-#       fractional 0.5-second ceiling, and the inclusive 1800 maximum render
-#       with coherent delivery budgets. The schema refuses 0 and 1800.1,
+#       fractional 0.5-second ceiling, and the inclusive 1800 case render
+#       with coherent delivery budgets. The schema refuses 0 and 10800.1,
 #       proving the exclusive lower bound and inclusive upper bound. Finally,
 #       the relationship guard refuses the individually schema-valid combination
 #       runnerTotalTimeoutSeconds=1700 / deliveryBudgetSeconds=600 and names
@@ -80,8 +74,8 @@
 #       reply-timeout helper reads the rendered worker Deployment through an
 #       external kubectl stub. Defaults yield 600 + 60 = 660 seconds and a
 #       900-second chart override yields 960. Missing, duplicate, nonliteral,
-#       or out-of-range delivery-budget entries are refused with the helper's
-#       diagnostic. This is chart and CLI consumer coverage only. A separate
+#       or out-of-range delivery-budget entries (outside 60 through 10800) are
+#       refused with the helper's diagnostic. This is chart and CLI consumer coverage only. A separate
 #       disposable cluster proof drives a real installed release and proves
 #       replies at the cluster tier.
 #   (m) RETAINED extraEnv TIMEOUT, positive: a v0.8.4-era worker.extraEnv
@@ -90,8 +84,12 @@
 #       first-class default (600) and still emits a non-colliding extraEnv
 #       entry. This is the 2026-09-04 soak: retained extraEnv plus first-class
 #       timeout made Kubernetes reject the worker patch (#2097).
+#   (n) THREE-HOUR CEILING (#3071): budget and runner ceiling at 10800 render
+#       with the default grace, which derives to 10860; 10801 is refused.
+#   (o) FACTORY TURN BUDGET (#3071): worker.workItemMaxTurns reaches the
+#       worker env as CURIE_WORK_ITEM_MAX_TURNS.
 # SCHEMA WORDING IS NOT ASSERTED, AND MUST NOT BECOME ASSERTED. Every negative
-# below EXCEPT the relationship negatives in (j) and (k) checks only (1)
+# below EXCEPT the relationship negative in (k) checks only (1)
 # that helm exited non-zero and (2) that the captured output contains the bare
 # knob name. The schema-bound negatives in (k) follow this generic rule too.
 # The failure text comes from helm's own bundled JSON-Schema validator, whose
@@ -111,8 +109,8 @@
 # passes on the author's machine and fails in CI, or the reverse, for a reason
 # that has nothing to do with the chart.
 #
-# The relationship negatives in (j) and (k) are the deliberate
-# exceptions: their messages are CHART-OWNED text from `fail` in _helpers.tpl,
+# The relationship negative in (k) is the deliberate
+# exception: its message is CHART-OWNED text from `fail` in _helpers.tpl,
 # not helm's validator, so they cannot drift with the helm version and
 # asserting them is what proves each guard -- rather than some unrelated
 # template error -- is what refused the render. They check stable
@@ -518,16 +516,14 @@ done
 # (i)
 assert_env i --set worker.routeTtlSeconds=null -- CURIE_ROUTE_TTL_SECONDS=
 
-# (j) ADR-0131 grace/budget relationship, POSITIVE and NEGATIVE. This is the
-# important half of the assertion, not a formality -- a render assertion that
-# only ever sees the default values is vacuous. The negative reproduces the
-# actual ADR-0131 misconfiguration: an operator raises the delivery budget to
-# 1800 but leaves an old terminationGracePeriodSeconds override (1800, the
-# pre-ADR-0131 value) in place, so grace no longer covers budget + reserve
-# (1800 + 60 = 1860 > 1800). That combination used to render clean and kill the
-# worker at boot; it is now refused at render time by
-# `curie.worker.validateDrainBudget`, so the negative asserts the REFUSAL and
-# its message rather than inspecting a rendered manifest.
+# (j) ADR-0131 grace/budget relationship. A render assertion that only ever
+# sees the default values is vacuous, so both cases raise the budget. The
+# second reproduces the actual ADR-0131 misconfiguration: an operator raises
+# the delivery budget to 1800 but leaves an old terminationGracePeriodSeconds
+# override (1800, the pre-ADR-0131 value) in place. Since #3071 the chart
+# derives grace = max(configured, budget + reserve) via
+# `curie.worker.terminationGrace`, so that render succeeds and the pod grace
+# (and CURIE_TERMINATION_GRACE_PERIOD_S) is 1860.
 J_POSITIVE="$TMP/j-positive.yaml"
 if ! helm template curie "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
@@ -540,29 +536,35 @@ if ! msg="$(python3 -c "$WORKER_GRACE_COVERS_BUDGET_PY" "$J_POSITIVE" 2>&1)"; th
   fail j "$msg"
 fi
 
-# The NEGATIVE control. Captured, not piped: helm exits non-zero by design here
-# and `set -o pipefail` would abort the script on the very outcome being
-# asserted.
-J_NEGATIVE_OUT=""
-if J_NEGATIVE_OUT="$(helm template curie "$CHART" \
+J_DERIVED="$TMP/j-derived.yaml"
+if ! helm template curie "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
-  --set worker.terminationGracePeriodSeconds=1800 2>&1)"; then
-  fail j "helm ACCEPTED deliveryBudgetSeconds=1800 with terminationGracePeriodSeconds=1800 (grace 1800 < required 1860). That render must be refused: it upgrades clean and then CrashLoopBackOffs the worker on the boot validator"
+  --set worker.terminationGracePeriodSeconds=1800 \
+  >"$J_DERIVED" 2>&1; then
+  fail j "the render FAILED on deliveryBudgetSeconds=1800 with terminationGracePeriodSeconds=1800; grace must be derived as max(configured, budget + reserve)
+  $(head -5 "$J_DERIVED")"
 fi
-# The three key names and the arithmetic, checked one token at a time so the
-# assertion says WHICH part of the message went missing. Chart-owned wording,
-# not helm's -- see the header note above.
-for token in \
-  "worker.terminationGracePeriodSeconds" \
-  "worker.deliveryBudgetSeconds" \
-  "worker.deliveryShutdownReserveSeconds" \
-  "(1800) + " \
-  "(60) = 1860" \
-  "ADR-0131"; do
-  grep -qF "$token" <<<"$J_NEGATIVE_OUT" \
-    || fail j "the refusal does not mention $token; an operator reading it during an upgrade cannot tell which value to raise
-  $(head -3 <<<"$J_NEGATIVE_OUT")"
-done
+if ! msg="$(python3 -c "$WORKER_GRACE_COVERS_BUDGET_PY" "$J_DERIVED" 2>&1)"; then
+  fail j "$msg"
+fi
+J_GRACE="$(python3 - "$J_DERIVED" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+deploys = [
+    d for d in docs
+    if d.get("kind") == "Deployment"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "worker"
+]
+print(deploys[0]["spec"]["template"]["spec"].get("terminationGracePeriodSeconds"))
+PY
+)"
+[[ "$J_GRACE" == "1860" ]] \
+  || fail j "worker terminationGracePeriodSeconds rendered $J_GRACE for budget 1800 + reserve 60 with configured grace 1800, expected 1860"
+assert_env j \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1800 \
+  -- \
+  CURIE_TERMINATION_GRACE_PERIOD_S=1860
 
 # (k) Runner per-request ceiling. The default is asserted in (a), including
 # exactly-once env placement. Exercise an operational override, equality, a
@@ -597,7 +599,7 @@ assert_env k \
   CURIE_DELIVERY_BUDGET_S=1800
 
 # Disable both resource templates so these failures isolate JSON Schema rather
-# than either cross-field guard. Use --set-json for 1800.1 so the schema sees a
+# than either cross-field guard. Use --set-json for 10800.1 so the schema sees a
 # genuine number and the refusal proves the inclusive maximum.
 assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
@@ -608,7 +610,7 @@ assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
   --set api.deploy=false \
   --set ui.deploy=false \
-  --set-json worker.runnerTotalTimeoutSeconds=1800.1
+  --set-json worker.runnerTotalTimeoutSeconds=10800.1
 
 # Individually valid scalar values, relationally invalid together. Capture the
 # result directly so Helm's required non-zero status is the asserted outcome.
@@ -645,8 +647,8 @@ render_worker_deployment_json "$L_CUSTOM_JSON" --set worker.deliveryBudgetSecond
 assert_ladder_reply_timeout "$L_CUSTOM_JSON" 960
 
 for mutation_and_fragment in \
-  "nonliteral:must be a literal integer from 60 through 1800" \
-  "below-minimum:must be from 60 through 1800" \
+  "nonliteral:must be a literal integer from 60 through 10800" \
+  "below-minimum:must be from 60 through 10800" \
   "duplicate:must appear exactly once in the worker container env" \
   "missing:is absent from the worker container env"; do
   mutation="${mutation_and_fragment%%:*}"
@@ -661,4 +663,53 @@ done
 assert_refused m "CURIE_RUNNER_TOTAL_TIMEOUT_S" \
   --set-json 'worker.extraEnv=[{"name":"CURIE_RUNNER_TOTAL_TIMEOUT_S","value":"1700"},{"name":"CURIE_UPGRADE_FIXTURE","value":"kept"}]'
 
-echo "worker-ttl-bounds-assertions: all thirteen assertions passed"
+# (n) #3071 three-hour ceiling and factory turn budget. The delivery budget and
+#     runner ceiling reach 10800 inclusive; 10801 is refused by the schema. A
+#     10800 budget with the DEFAULT terminationGracePeriodSeconds must render,
+#     because the chart derives grace as max(configured, budget + reserve):
+#     10800 + 60 = 10860 on both the pod spec and the worker env.
+N_MAX="$TMP/n-max.yaml"
+if ! helm template curie "$CHART" \
+  --set worker.deliveryBudgetSeconds=10800 \
+  --set worker.runnerTotalTimeoutSeconds=10800 \
+  >"$N_MAX" 2>&1; then
+  fail n "the render FAILED at deliveryBudgetSeconds=10800 with the default grace; grace must follow the budget
+  $(head -5 "$N_MAX")"
+fi
+if ! msg="$(python3 -c "$WORKER_GRACE_COVERS_BUDGET_PY" "$N_MAX" 2>&1)"; then
+  fail n "$msg"
+fi
+N_GRACE="$(python3 - "$N_MAX" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+deploys = [
+    d for d in docs
+    if d.get("kind") == "Deployment"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "worker"
+]
+print(deploys[0]["spec"]["template"]["spec"].get("terminationGracePeriodSeconds"))
+PY
+)"
+[[ "$N_GRACE" == "10860" ]] \
+  || fail n "worker terminationGracePeriodSeconds rendered $N_GRACE at a 10800 budget, expected 10860"
+assert_env n \
+  --set worker.deliveryBudgetSeconds=10800 \
+  --set worker.runnerTotalTimeoutSeconds=10800 \
+  -- \
+  CURIE_DELIVERY_BUDGET_S=10800 \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=10800 \
+  CURIE_TERMINATION_GRACE_PERIOD_S=10860
+for knob in deliveryBudgetSeconds runnerTotalTimeoutSeconds; do
+  assert_refused n "$knob" \
+    --set worker.deploy=false \
+    --set api.deploy=false \
+    --set ui.deploy=false \
+    --set "worker.$knob=10801"
+done
+
+# (o) Factory turn budget: worker.workItemMaxTurns defaults to 1000 and an
+#     override reaches the worker env as CURIE_WORK_ITEM_MAX_TURNS.
+assert_env o -- CURIE_WORK_ITEM_MAX_TURNS=1000
+assert_env o --set worker.workItemMaxTurns=5 -- CURIE_WORK_ITEM_MAX_TURNS=5
+
+echo "worker-ttl-bounds-assertions: all fifteen assertions passed"

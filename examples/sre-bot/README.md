@@ -97,7 +97,8 @@ is empty and denies every selection, including after `curie cluster deploy
 the real control). Pass `--workspace-repo owner/repo` to the installer and the
 matching `api.githubRepoAllowlist` value to the following `cluster up`, as the
 fresh install sequence above does. Both inputs are repeatable, and `owner/*` is
-also accepted.
+also accepted. The fresh installer also requires a nonempty `--approvers` list
+for its approval route.
 
 `curie cluster deploy --workspace` warns when the allowlist is empty.
 
@@ -169,6 +170,10 @@ The `self-upgrade` connector continues to publish `upgrade_self()` and
 `upgrade_platform()` as separate zero-argument actions behind explicit legacy
 approval gates. It starts pinned Job templates; it is not part of the general
 Kubernetes connector, and its kubeconfig is never shared with it.
+
+A leaked connector token can still select the platform-upgrader ServiceAccount
+on Job create (PR #2163). Draft ADR-0141 proposes the admission pin; the
+installer does not apply it.
 
 ## Live demo
 

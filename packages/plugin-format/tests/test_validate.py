@@ -1,5 +1,8 @@
 import json
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -94,6 +97,11 @@ def _bundle(tmp_path: Path, manifest: str) -> Path:
     return tmp_path
 
 
+def _trigger_bundle(tmp_path: Path, triggers: list[object]) -> Path:
+    """Demo bundle. json.dumps so a None field is JSON null, not the string "null"."""
+    return _bundle(tmp_path, json.dumps({"name": "demo", "triggers": triggers}))
+
+
 def test_inline_valid_pretooluse_hook_passes(tmp_path: Path) -> None:
     bundle = _bundle(
         tmp_path,
@@ -135,18 +143,280 @@ def test_declared_hooks_file_is_validated(tmp_path: Path) -> None:
 
 
 def test_valid_cron_and_webhook_triggers_pass(tmp_path: Path) -> None:
-    bundle = _bundle(
+    bundle = _trigger_bundle(
         tmp_path,
-        '{"name": "demo", "triggers": ['
-        '{"type": "cron", "schedule": "0 9 * * 1-5"}, '
-        '{"type": "webhook", "path": "/hooks/deploy"}]}',
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "timezone": "America/New_York",
+                "prompt": "Post the daily plan.",
+                "target": "C0EXAMPLE1",
+            },
+            {"type": "webhook", "path": "/hooks/deploy"},
+        ],
     )
-    assert validate_bundle(bundle).valid
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
 
 
 def test_cron_trigger_without_schedule_is_rejected(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, '{"name": "demo", "triggers": [{"type": "cron"}]}')
     assert "triggers.cron_missing_schedule" in _codes(bundle)
+
+
+def test_cron_with_timezone_omitted_is_valid(tmp_path: Path) -> None:
+    # An omitted timezone means UTC, because validate_bundle does not rewrite the manifest.
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "target": "C0EXAMPLE1",
+            },
+            {"type": "webhook", "path": "/hooks/deploy"},
+        ],
+    )
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+def test_cron_with_target_omitted_is_valid(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "timezone": "America/New_York",
+                "prompt": "Post the daily plan.",
+            },
+            {"type": "webhook", "path": "/hooks/deploy"},
+        ],
+    )
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+def test_webhook_with_path_alone_is_valid(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(tmp_path, [{"type": "webhook", "path": "/hooks/deploy"}])
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+def test_legacy_cron_without_name_and_prompt_is_rejected(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(tmp_path, [{"type": "cron", "schedule": "0 9 * * 1-5"}])
+    assert not validate_bundle(bundle).valid
+    codes = _codes(bundle)
+    assert "triggers.cron_missing_name" in codes
+    assert "triggers.cron_missing_prompt" in codes
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        {"type": "cron", "schedule": "0 9 * * 1-5", "prompt": "Post the daily plan."},
+        {
+            "type": "cron",
+            "name": "   ",
+            "schedule": "0 9 * * 1-5",
+            "prompt": "Post the daily plan.",
+        },
+    ],
+    ids=["missing", "whitespace"],
+)
+def test_cron_without_a_name_is_rejected(tmp_path: Path, trigger: dict[str, str]) -> None:
+    bundle = _trigger_bundle(tmp_path, [trigger])
+    assert "triggers.cron_missing_name" in _codes(bundle)
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        {"type": "cron", "name": "weekday-digest", "schedule": "0 9 * * 1-5"},
+        {
+            "type": "cron",
+            "name": "weekday-digest",
+            "schedule": "0 9 * * 1-5",
+            "prompt": "   ",
+        },
+    ],
+    ids=["missing", "whitespace"],
+)
+def test_cron_without_a_prompt_is_rejected(tmp_path: Path, trigger: dict[str, str]) -> None:
+    bundle = _trigger_bundle(tmp_path, [trigger])
+    assert "triggers.cron_missing_prompt" in _codes(bundle)
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    ["0 0 9 * * 1-5", "every weekday at 9", "60 9 * * 1", "@daily"],
+    ids=["six-field", "free-text", "minute-out-of-range", "daily-alias"],
+)
+def test_unparsed_cron_schedule_is_rejected(tmp_path: Path, schedule: str) -> None:
+    # Name and prompt are set so the failure is the schedule, not a missing field.
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": schedule,
+                "prompt": "Post the daily plan.",
+            }
+        ],
+    )
+    assert "triggers.cron_invalid_schedule" in _codes(bundle)
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    ["Not/AZone", "", None, "localtime", "posixrules", " America/New_York "],
+    ids=["unknown", "blank", "null", "localtime", "posixrules", "padded_iana"],
+)
+def test_unresolved_cron_timezone_is_rejected(tmp_path: Path, timezone: str | None) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "timezone": timezone,
+            }
+        ],
+    )
+    assert "triggers.timezone_invalid" in _codes(bundle)
+
+
+def test_packaged_tzdata_accepts_an_iana_zone_without_a_host_database(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "timezone": "America/New_York",
+            }
+        ],
+    )
+    program = "\n".join(
+        [
+            "import sys",
+            "from pathlib import Path",
+            "from plugin_format import validate_bundle",
+            "result = validate_bundle(Path(sys.argv[1]))",
+            "assert result.valid, result.errors",
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(bundle)],
+        env=os.environ | {"PYTHONTZPATH": ""},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    ["0 9 * * 1-5", "", None],
+    ids=["expression", "blank", "null"],
+)
+def test_webhook_with_schedule_is_rejected(tmp_path: Path, schedule: str | None) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [{"type": "webhook", "path": "/hooks/deploy", "schedule": schedule}],
+    )
+    assert "triggers.schedule_forbidden" in _codes(bundle)
+
+
+def test_webhook_timezone_without_schedule_is_rejected(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [{"type": "webhook", "path": "/hooks/deploy", "timezone": "UTC"}],
+    )
+    assert "triggers.timezone_without_schedule" in _codes(bundle)
+
+
+def test_duplicate_trigger_name_after_strip_is_rejected(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+            },
+            {"type": "webhook", "name": " weekday-digest ", "path": "/hooks/deploy"},
+        ],
+    )
+    assert "triggers.duplicate_name" in _codes(bundle)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [{"channel": "C0EXAMPLE1"}, {"channel": "   "}],
+    ids=["nonblank_channel", "blank_channel"],
+)
+def test_channel_object_target_is_structurally_invalid(
+    tmp_path: Path, target: dict[str, str]
+) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "target": target,
+            }
+        ],
+    )
+    assert "triggers.invalid" in _codes(bundle)
+
+
+def test_oversized_cron_number_is_rejected(tmp_path: Path) -> None:
+    # Longer than the interpreter digit cap. Must be a named error, not a raise.
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": ("1" * 4301) + " 9 * * 1",
+                "prompt": "Post the daily plan.",
+            }
+        ],
+    )
+    assert "triggers.cron_invalid_schedule" in _codes(bundle)
+
+
+def test_whitespace_cron_target_is_rejected(tmp_path: Path) -> None:
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": "0 9 * * 1-5",
+                "prompt": "Post the daily plan.",
+                "target": "   ",
+            }
+        ],
+    )
+    assert "triggers.target_invalid" in _codes(bundle)
 
 
 def test_webhook_trigger_without_path_is_rejected(tmp_path: Path) -> None:

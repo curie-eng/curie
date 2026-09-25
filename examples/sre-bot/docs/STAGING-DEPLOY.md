@@ -72,8 +72,11 @@ After the ordinary deploy, the installer:
 Read both Role manifests before accepting this flag. Kubernetes lets a holder
 of the connector token create a Job selecting the wider platform-upgrader
 ServiceAccount; RBAC does not restrict `spec.serviceAccountName` on Job create.
-The connector cannot form that request, but a leaked token can bypass it. The
-permission map names mitigation choices and the residual risk.
+The connector cannot form that request, but a leaked token can bypass it.
+Draft ADR-0141 proposes admission that pins those Jobs to the live CronJob
+templates. The installer does not apply `manifests/upgrade-job-admission.yaml`;
+the residual risk is unchanged until that ADR is Accepted and the policy is
+installed with both identities.
 
 The same connector publishes the separate zero-argument `upgrade_self` tool,
 which targets `self-upgrade/cronjob.yaml`. The installer does not apply `self-upgrade/cronjob.yaml`;

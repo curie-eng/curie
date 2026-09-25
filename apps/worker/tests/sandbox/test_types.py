@@ -34,6 +34,7 @@ def test_route_record_round_trips_token() -> None:
             token="tok-20",
             workspace_materialized_head="a" * 40,
             publication_visible_outcome_revision=2,
+            max_turns="1000",
         )
     )
     restored = RouteRecord.from_json(record.to_json())
@@ -41,6 +42,7 @@ def test_route_record_round_trips_token() -> None:
     assert restored.handle.token == "tok-20"
     assert restored.handle.workspace_materialized_head == "a" * 40
     assert restored.handle.publication_visible_outcome_revision == 2
+    assert restored.handle.max_turns == "1000"
     assert restored.handle == record.handle
 
 
@@ -62,3 +64,4 @@ def test_route_record_legacy_payload_without_token_defaults_empty() -> None:
     assert record.handle.token == ""
     assert record.handle.workspace_materialized_head is None
     assert record.handle.publication_visible_outcome_revision == 0
+    assert record.handle.max_turns is None

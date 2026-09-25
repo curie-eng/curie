@@ -174,6 +174,8 @@ def _full_boot_env() -> BootEnv:
         memory_token="st-memory-token",
         state_url="http://api:8000/agents/agent-abc/state",
         state_token="st-state-token",
+        progress_url="http://api:8000/v1/work-item-progress/wi-full",
+        progress_token="sbx-progress-token",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
         approval_resumed_kind="policy",
@@ -556,18 +558,21 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
 # --- Golden 3: the kernel resume overlay. ------------------------------------
 
 
-def test_the_kernel_owns_exactly_the_three_approval_resume_keys() -> None:
+def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     """kernel.py layers these onto binding.boot_env's dict after the fact.
 
     They are a distinct producer: same process, different code path, rendered
     independently. The kernel sets them via the exported constants, so the
     producer map is what pins the overlay's exact extent. ADR-0076/#889 added
-    ``CURIE_APPROVAL_DECISION`` alongside the original two.
+    ``CURIE_APPROVAL_DECISION`` alongside the original two, and #3077 added the
+    request-bound progress URL/token the resume overlay mints per work item.
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
+        "CURIE_PROGRESS_URL",
+        "CURIE_PROGRESS_TOKEN",
     }
 
 
@@ -776,6 +781,8 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_MEMORY_TOKEN",
         "CURIE_STATE_URL",
         "CURIE_STATE_TOKEN",
+        "CURIE_PROGRESS_URL",
+        "CURIE_PROGRESS_TOKEN",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
         "CURIE_APPROVAL_RESUMED_KIND",

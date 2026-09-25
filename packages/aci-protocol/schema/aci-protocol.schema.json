@@ -562,6 +562,38 @@
           ],
           "title": "Port"
         },
+        "progress_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_PROGRESS_TOKEN",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Progress Token"
+        },
+        "progress_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_PROGRESS_URL",
+          "producer": [
+            "kernel"
+          ],
+          "title": "Progress Url"
+        },
         "runner_token": {
           "anyOf": [
             {
@@ -1005,6 +1037,30 @@
       "title": "GateKind",
       "type": "string"
     },
+    "HookRunRef": {
+      "description": "Identity of the scheduled hook run that produced a queued turn.\n\n``slot_utc`` is an ISO 8601 timestamp with an explicit UTC offset.",
+      "properties": {
+        "agent_id": {
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "slot_utc": {
+          "title": "Slot Utc",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id",
+        "name",
+        "slot_utc"
+      ],
+      "title": "HookRunRef",
+      "type": "object"
+    },
     "InboundMessage": {
       "discriminator": {
         "mapping": {
@@ -1117,7 +1173,7 @@
       "title": "OutboundEvent"
     },
     "QueuedTurn": {
-      "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.",
+      "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.",
       "properties": {
         "attachments": {
           "default": [],
@@ -1139,12 +1195,31 @@
           "title": "Event Id",
           "type": "string"
         },
+        "hook_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HookRunRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "received_at": {
           "title": "Received At",
           "type": "string"
         },
         "reply_handle": {
-          "$ref": "#/$defs/ReplyHandle"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplyHandle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "source": {
           "$ref": "#/$defs/TurnSource",
@@ -1160,7 +1235,6 @@
         "conversation_id",
         "event_id",
         "received_at",
-        "reply_handle",
         "text"
       ],
       "title": "QueuedTurn",
@@ -1459,6 +1533,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.6",
-  "title": "ACI Protocol v0.4.6"
+  "protocolVersion": "0.5.1",
+  "title": "ACI Protocol v0.5.1"
 }

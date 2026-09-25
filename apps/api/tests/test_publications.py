@@ -316,6 +316,28 @@ def _get_lineage(
     )
 
 
+def _claim_publication_lease(publication_id: str, owner: str) -> int:
+    """Stand in for the worker's claim_next lease on one publication."""
+
+    async def run() -> int:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        "UPDATE curie.publications SET lease_owner = :owner, "
+                        "lease_expires_at = now() + interval '1 minute', "
+                        "version = version + 1 WHERE id = :id RETURNING version"
+                    ),
+                    {"id": uuid.UUID(publication_id), "owner": owner},
+                )
+                return int(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
 def _advance_lineage(
     client: TestClient,
     publication_id: str,
@@ -326,12 +348,18 @@ def _advance_lineage(
     state: str = "open",
     pr_number: int = PR_NUMBER,
     pr_url: str = PR_URL,
+    lease: tuple[int, str] | None = None,
 ) -> Any:
+    if lease is None:
+        owner = "api-test-worker"
+        lease = (_claim_publication_lease(publication_id, owner), owner)
     return client.patch(
         f"/v1/internal/publications/{publication_id}/lineage",
         json={
             "expected_version": expected_version,
             "expected_head_sha": expected_head_sha,
+            "expected_publication_version": lease[0],
+            "lease_owner": lease[1],
             "state": state,
             "pr_number": pr_number,
             "pr_url": pr_url,
@@ -345,8 +373,7 @@ def _mark_outcome_history_ready(publication_id: str) -> None:
     """Stand in for the worker transcript outbox in API-only lineage tests."""
 
     _execute(
-        "UPDATE curie.publications SET outcome_history_ready_at = now() "
-        "WHERE id = :id",
+        "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
         {"id": uuid.UUID(publication_id)},
     )
 
@@ -450,8 +477,7 @@ def _make_publication_legacy(
     """Model an exact pre-scoping row without inventing a canonical identity."""
 
     _execute(
-        "UPDATE curie.publications SET workspace_conversation_id = NULL "
-        "WHERE id = :publication_id",
+        "UPDATE curie.publications SET workspace_conversation_id = NULL WHERE id = :publication_id",
         {"publication_id": publication_id},
     )
     _execute(
@@ -483,9 +509,7 @@ def test_publication_approval_privately_preserves_the_first_inbound_carrier(
 
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
-    payload = _publication_payload(
-        deployment["id"], dedupe_key="publication-traceparent-example"
-    )
+    payload = _publication_payload(deployment["id"], dedupe_key="publication-traceparent-example")
     payload["traceparent"] = _REPLAY_TRACEPARENT
 
     first_status, first = _create_publication(
@@ -718,9 +742,7 @@ def test_null_workspace_publication_replay_refuses_bare_authorization_fallback(
     _, publication = _create_publication(client, payload)
     _make_publication_legacy(publication["id"], deployment["id"], payload)
 
-    exact = client.post(
-        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-    )
+    exact = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
     assert exact.status_code == 409
     assert _rows(
         "SELECT workspace_conversation_id FROM curie.publications WHERE id = :id",
@@ -751,9 +773,7 @@ def test_legacy_publication_replay_rechecks_the_current_allowlist(
     monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", "[]")
     get_settings.cache_clear()
 
-    replay = client.post(
-        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-    )
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
     assert replay.status_code == 409
     assert _counts() == (1, 1)
 
@@ -797,14 +817,10 @@ def test_publication_splits_scoped_thread_identity_from_slack_reply_identity(
     assert _thread_ts(reply_thread) == reply_thread
     assert _thread_ts(scoped_thread) is None
 
-    replay = client.post(
-        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-    )
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
     assert replay.status_code == 200, replay.text
     changed_reply = dict(payload, reply_conversation_id="1700000000.000200")
-    conflict = client.post(
-        "/v1/internal/publications", json=changed_reply, headers=WORKER_HEADERS
-    )
+    conflict = client.post("/v1/internal/publications", json=changed_reply, headers=WORKER_HEADERS)
     assert conflict.status_code == 409
 
     async def claim_outboxes() -> tuple[Any, Any]:
@@ -1050,9 +1066,7 @@ def test_publication_without_a_selected_workspace_is_inert(
     deployment = _create_deployment(client, auth_headers)
     payload = _publication_payload(deployment["id"], dedupe_key="generic-no-selection")
 
-    refused = client.post(
-        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-    )
+    refused = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
 
     assert refused.status_code == 409
     assert _counts() == (0, 0)
@@ -1226,9 +1240,7 @@ def test_cluster_message_publication_card_claim_carries_the_session_reply_ref(
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
     reply_ref = str(uuid.uuid4())
-    relay_payload = _publication_payload(
-        deployment["id"], dedupe_key="event-card-cluster-message"
-    )
+    relay_payload = _publication_payload(deployment["id"], dedupe_key="event-card-cluster-message")
     relay_payload.update(
         reply_placeholder=reply_ref,
         reply_endpoint=None,
@@ -1244,9 +1256,7 @@ def test_cluster_message_publication_card_claim_carries_the_session_reply_ref(
 
     async def claim_both() -> dict[str, Any]:
         engine = create_async_engine(get_settings().database_url)
-        store = PostgresPublicationStore(
-            engine, schema="curie", lease_owner="card-reply-ref-test"
-        )
+        store = PostgresPublicationStore(engine, schema="curie", lease_owner="card-reply-ref-test")
         try:
             claimed = {}
             for _ in range(2):
@@ -1356,9 +1366,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
 
     async def consume() -> list[str | None]:
         app = web.Application()
-        app.add_routes(
-            [web.post("/v1/internal/cluster-message-replies/{reply_ref}", relay)]
-        )
+        app.add_routes([web.post("/v1/internal/cluster-message-replies/{reply_ref}", relay)])
         server = TestServer(app)
         await server.start_server()
         config = WorkerConfig(
@@ -1376,9 +1384,9 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
                 result_max_attempts=2,
             ),
             credentials=None,
-            identity=None,
             cluster=None,
             github=None,
+            lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
             card_store=ApprovalCardStore(valkey, config),
@@ -2040,9 +2048,7 @@ class _RecordingWorkspaceCoordinator:
 
             kwargs = {**kwargs, "validate_candidate": observe_candidate}
         result = self._coordinator.claim_or_resume_with_handle(**kwargs)
-        self.claims.append(
-            (str(kwargs["thread_key"]), kwargs.get("replace_handle"), result.handle)
-        )
+        self.claims.append((str(kwargs["thread_key"]), kwargs.get("replace_handle"), result.handle))
         return result
 
     def current(self, thread_key: str) -> Any:
@@ -2079,9 +2085,7 @@ def _testclient_transport(client: TestClient) -> Any:
     return transport
 
 
-def _local_publication_repository(
-    root: Path, repo_full_name: str
-) -> tuple[Path, str, bytes]:
+def _local_publication_repository(root: Path, repo_full_name: str) -> tuple[Path, str, bytes]:
     repo = root / repo_full_name.replace("/", "-")
     repo.mkdir()
     subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
@@ -2518,9 +2522,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
     repository_assets: dict[str, tuple[str, bytes]] = {}
     snapshots: dict[str, RunnerWorkspaceSnapshot] = {}
     for channel, repo_full_name in repos.items():
-        _repo, base_sha, base_archive = _local_publication_repository(
-            tmp_path, repo_full_name
-        )
+        _repo, base_sha, base_archive = _local_publication_repository(tmp_path, repo_full_name)
         repository_assets[repo_full_name] = (base_sha, base_archive)
         snapshots[channel] = RunnerWorkspaceSnapshot(
             repo_full_name=repo_full_name,
@@ -2578,9 +2580,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                 kind=kind,
                 address=address,
             )
-            history_segment = unquote(
-                urlsplit(env[HISTORY_REF_ENV]).path.rsplit("/", 1)[-1]
-            )
+            history_segment = unquote(urlsplit(env[HISTORY_REF_ENV]).path.rsplit("/", 1)[-1])
             self.history_keys.append((address or "", thread_key, history_segment))
             return env
 
@@ -2731,13 +2731,9 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                 sync_redis.delete(*keys)
             sync_redis.close()
 
-    statuses, requests, release_keys, claims, history_keys, routed_events = asyncio.run(
-        exercise()
-    )
+    statuses, requests, release_keys, claims, history_keys, routed_events = asyncio.run(exercise())
     scoped_by_channel = {
-        channel: channel_protocol.scoped_conversation_id(
-            "slack", channel, shared_timestamp
-        )
+        channel: channel_protocol.scoped_conversation_id("slack", channel, shared_timestamp)
         for channel in repos
     }
     workspace_rows = _rows(
@@ -2766,12 +2762,8 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
     assert set(release_keys) == scoped_identities
     assert len(history_keys) == 2
     assert {
-        (address, thread_key, history_key)
-        for address, thread_key, history_key in history_keys
-    } == {
-        (channel, scoped, scoped)
-        for channel, scoped in scoped_by_channel.items()
-    }
+        (address, thread_key, history_key) for address, thread_key, history_key in history_keys
+    } == {(channel, scoped, scoped) for channel, scoped in scoped_by_channel.items()}
 
     durable_rows = _rows(
         "SELECT p.workspace_conversation_id, p.repo_full_name, "
@@ -2796,20 +2788,14 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
         assert all(target.kind == "slack" for target in channel_targets)
         assert all(target.conversation_id == shared_timestamp for target in channel_targets)
         assert all(target.reply_ref == placeholders[channel] for target in channel_targets)
-    assert len(reply_targets) == sum(
-        1 for target in reply_targets if target.address in repos
-    )
+    assert len(reply_targets) == sum(1 for target in reply_targets if target.address in repos)
     completion_targets = [
         target for event_name, target in routed_events if event_name == "turn.completed"
     ]
     assert len(completion_targets) == 2
     assert {
-        (target.address, target.conversation_id, target.reply_ref)
-        for target in completion_targets
-    } == {
-        (channel, shared_timestamp, placeholder)
-        for channel, placeholder in placeholders.items()
-    }
+        (target.address, target.conversation_id, target.reply_ref) for target in completion_targets
+    } == {(channel, shared_timestamp, placeholder) for channel, placeholder in placeholders.items()}
 
     request_by_channel = {request["reply_channel"]: request for request in requests}
     before_crossed = _counts()
@@ -3521,9 +3507,7 @@ def test_two_publication_revisions_advance_one_durable_thread_lineage(
         "latest_revision": 1,
     }
     assert (
-        client.get(f"/publications/{first['id']}", headers=auth_headers).json()[
-            "status"
-        ]
+        client.get(f"/publications/{first['id']}", headers=auth_headers).json()["status"]
         == "succeeded"
     )
     assert advanced.json()["has_pending_outcome"] is True
@@ -3611,9 +3595,7 @@ def test_concurrent_first_revisions_create_one_lineage_and_one_approval(
     ]
 
     def attempt(payload: dict[str, Any]) -> Any:
-        return client.post(
-            "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-        )
+        return client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(attempt, payloads))
@@ -3944,6 +3926,103 @@ def test_publication_revision_refuses_a_checkout_not_at_the_lineage_head(
     assert current["version"] == 2
 
 
+def test_lineage_advance_success_clears_an_earlier_attempt_error(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id="thread-lineage-error",
+            dedupe_key="lineage-error-cleared",
+        ),
+    )
+    assert _resolve(client, auth_headers, publication["approval_id"]).status_code == 200
+    # The worker's bounded retry records the failed attempt's error, as store.retry does.
+    _execute(
+        "UPDATE curie.publications SET error = 'publication lineage endpoint is unreachable', "
+        "reconcile_attempts = reconcile_attempts + 1 WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert _rows(
+        "SELECT status, error FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    ) == [{"status": "succeeded", "error": None}]
+
+
+def test_lineage_advance_refuses_a_worker_whose_publication_lease_was_reclaimed(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id="thread-lineage-lease",
+            dedupe_key="lineage-lease-stale",
+        ),
+    )
+    assert _resolve(client, auth_headers, publication["approval_id"]).status_code == 200
+    stale = (_claim_publication_lease(publication["id"], "worker-a"), "worker-a")
+    current = (_claim_publication_lease(publication["id"], "worker-b"), "worker-b")
+    snapshot = (
+        "SELECT p.status, p.version, p.lease_owner, p.patch_bytes IS NULL AS cleared, "
+        "l.pr_number, l.head_sha, l.version AS lineage_version "
+        "FROM curie.publications p JOIN curie.thread_publication_lineages l "
+        "ON l.id = p.lineage_id WHERE p.id = :id"
+    )
+    before = _rows(snapshot, {"id": uuid.UUID(publication["id"])})
+
+    for lease in (stale, (current[0], "worker-a"), (stale[0], "worker-b")):
+        refused = _advance_lineage(
+            client,
+            publication["id"],
+            expected_version=1,
+            expected_head_sha=None,
+            head_sha=FIRST_REVISION_SHA,
+            lease=lease,
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "publication.lease_lost"
+        assert _rows(snapshot, {"id": uuid.UUID(publication["id"])}) == before
+
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+        lease=current,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert _rows(snapshot, {"id": uuid.UUID(publication["id"])}) == [
+        {
+            "status": "succeeded",
+            "version": current[0] + 1,
+            "lease_owner": None,
+            "cleared": True,
+            "pr_number": PR_NUMBER,
+            "head_sha": FIRST_REVISION_SHA,
+            "lineage_version": 2,
+        }
+    ]
+
+
 def test_lineage_advance_cas_refuses_stale_version_and_expected_head(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -4013,9 +4092,7 @@ def test_lineage_advance_cas_refuses_stale_version_and_expected_head(
     assert current["head_sha"] == FIRST_REVISION_SHA
     assert current["version"] == 2
     assert (
-        client.get(f"/publications/{second['id']}", headers=auth_headers).json()[
-            "status"
-        ]
+        client.get(f"/publications/{second['id']}", headers=auth_headers).json()["status"]
         == "approved"
     )
 
@@ -4059,6 +4136,9 @@ def test_concurrent_lineage_advances_have_one_exact_cas_winner(
     )
     assert _resolve(client, auth_headers, second["approval_id"]).status_code == 200
 
+    # Both racers present the same held lease, so only the lineage CAS decides.
+    lease = (_claim_publication_lease(second["id"], "api-test-worker"), "api-test-worker")
+
     def attempt(head_sha: str) -> Any:
         return _advance_lineage(
             client,
@@ -4066,6 +4146,7 @@ def test_concurrent_lineage_advances_have_one_exact_cas_winner(
             expected_version=2,
             expected_head_sha=FIRST_REVISION_SHA,
             head_sha=head_sha,
+            lease=lease,
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -4229,8 +4310,7 @@ def test_lineage_get_refuses_redirect_without_forwarding_authorization(
     assert calls[0].url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"
     assert "Authorization" in calls[0].headers
     assert _rows(
-        "SELECT status, head_sha, version FROM curie.thread_publication_lineages "
-        "WHERE id = :id",
+        "SELECT status, head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": uuid.UUID(publication["lineage_id"])},
     ) == [{"status": "open", "head_sha": FIRST_REVISION_SHA, "version": 2}]
 
@@ -4262,8 +4342,7 @@ def test_lineage_get_refuses_non_200_github_truth_without_mutating_lineage(
     assert detail["code"] == "publication.github_unavailable"
     assert "Try again later" in detail["message"]
     assert _rows(
-        "SELECT status, head_sha, version FROM curie.thread_publication_lineages "
-        "WHERE id = :id",
+        "SELECT status, head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": uuid.UUID(publication["lineage_id"])},
     ) == [{"status": "open", "head_sha": FIRST_REVISION_SHA, "version": 2}]
     assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
@@ -4295,8 +4374,7 @@ def test_lineage_get_refuses_github_transport_failure_without_mutating_lineage(
     assert refused.status_code == 503
     assert refused.json()["detail"]["code"] == "publication.github_unavailable"
     assert _rows(
-        "SELECT status, head_sha, version FROM curie.thread_publication_lineages "
-        "WHERE id = :id",
+        "SELECT status, head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": uuid.UUID(publication["lineage_id"])},
     ) == [{"status": "open", "head_sha": FIRST_REVISION_SHA, "version": 2}]
     assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
@@ -4326,10 +4404,7 @@ def test_lineage_get_adopts_head_for_migrated_succeeded_publication(
             async with sessionmaker() as session:
                 await session.execute(
                     update(ThreadPublicationLineage)
-                    .where(
-                        ThreadPublicationLineage.id
-                        == uuid.UUID(publication["lineage_id"])
-                    )
+                    .where(ThreadPublicationLineage.id == uuid.UUID(publication["lineage_id"]))
                     .values(head_sha=None, version=1)
                 )
                 await session.commit()
@@ -4365,8 +4440,7 @@ def test_lineage_get_adopts_head_for_migrated_succeeded_publication(
     assert refreshed.json()["head_sha"] == FIRST_REVISION_SHA
     assert refreshed.json()["version"] == 2
     assert _rows(
-        "SELECT head_sha, version FROM curie.thread_publication_lineages "
-        "WHERE id = :id",
+        "SELECT head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": uuid.UUID(publication["lineage_id"])},
     ) == [{"head_sha": FIRST_REVISION_SHA, "version": 2}]
 
@@ -4421,9 +4495,7 @@ def test_lineage_get_persists_terminal_github_truth_without_credential_redemptio
     assert refreshed.json()["has_pending_revision"] is False
     assert refreshed.json()["version"] == 3
     assert len(calls) == 1
-    stored = client.get(
-        f"/publications/{publication['id']}", headers=auth_headers
-    )
+    stored = client.get(f"/publications/{publication['id']}", headers=auth_headers)
     assert stored.status_code == 200, stored.text
     assert stored.json()["lineage_state"] == expected_state
     assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
@@ -4495,6 +4567,433 @@ def test_lineage_get_reports_pending_revision_while_its_push_is_in_flight(
     ) == [{"head_sha": FIRST_REVISION_SHA, "version": 2}]
 
 
+def _set_publication_policy(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    agent_id: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    response = client.patch(f"/agents/{agent_id}", json=body, headers=auth_headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_publication_policy_defaults_to_human_approval(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    agent = client.get(f"/agents/{deployment['agent_id']}", headers=auth_headers)
+    assert agent.status_code == 200, agent.text
+    body = agent.json()
+    assert body["publication_policy"] == "approve"
+    assert body["publication_policy_version"] == 1
+    assert body["publication_draft"] is False
+    assert body["publication_branch_prefix"] is None
+
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
+    assert publication["status"] == "pending"
+    assert publication["open_as_draft"] is False
+    approval = _rows(
+        "SELECT status, resolved_by, policy_identity FROM curie.approvals WHERE id = :id",
+        {"id": uuid.UUID(publication["approval_id"])},
+    )[0]
+    assert approval == {
+        "status": "pending",
+        "resolved_by": None,
+        "policy_identity": None,
+    }
+
+
+def test_supervised_publication_still_approves_and_denies(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, approved_row = _create_publication(
+        client, _publication_payload(deployment["id"], dedupe_key="supervised-approve")
+    )
+    approved = _resolve(client, auth_headers, approved_row["approval_id"])
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "approved"
+    issued = client.post(
+        f"/v1/internal/publications/{approved_row['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+    assert issued.status_code == 200, issued.text
+
+    _, denied_row = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            dedupe_key="supervised-deny",
+            conversation_id="thread-supervised-deny",
+        ),
+    )
+    denied = _resolve(client, auth_headers, denied_row["approval_id"], decision="rejected")
+    assert denied.status_code == 200, denied.text
+    refused = client.post(
+        f"/v1/internal/publications/{denied_row['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+    assert refused.status_code == 409
+
+
+def test_auto_policy_resolves_without_a_human_and_records_the_platform(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    agent = _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {
+            "publication_policy": "auto",
+            "publication_draft": True,
+            "publication_branch_prefix": "factory/",
+        },
+    )
+    assert agent["publication_policy"] == "auto"
+    assert agent["publication_policy_version"] == 2
+    payload = _publication_payload(deployment["id"], dedupe_key="auto-once")
+    created, publication = _create_publication(client, payload)
+    assert created == 201
+    assert publication["status"] == "approved"
+    assert publication["open_as_draft"] is True
+    assert publication["branch_prefix"] == "factory/"
+    assert publication["branch"].startswith("factory/publication-")
+    approval = _rows(
+        "SELECT status, resolved_by, policy_identity, policy_version, resumed_at "
+        "FROM curie.approvals WHERE id = :id",
+        {"id": uuid.UUID(publication["approval_id"])},
+    )[0]
+    assert approval["status"] == "approved"
+    assert approval["resolved_by"] == "platform:publication-policy"
+    assert approval["policy_identity"] == "publication:auto"
+    assert approval["policy_version"] == 2
+    assert approval["resumed_at"] is not None
+    audit = _rows(
+        "SELECT actor, principal_kind, authorizer, authorized, decision "
+        "FROM curie.approval_audit_entries WHERE approval_id = :id",
+        {"id": uuid.UUID(publication["approval_id"])},
+    )
+    assert audit == [
+        {
+            "actor": "platform:publication-policy",
+            "principal_kind": "platform",
+            "authorizer": "publication-policy",
+            "authorized": True,
+            "decision": "approved",
+        }
+    ]
+    visible_audit = client.get(
+        f"/approvals/{publication['approval_id']}/audit",
+        headers=auth_headers,
+    )
+    assert visible_audit.status_code == 200, visible_audit.text
+    assert visible_audit.json()[0]["principal_kind"] == "platform"
+    card = _rows(
+        "SELECT approval_card_reported_at IS NOT NULL AS reported, "
+        "patch_bytes IS NOT NULL AS has_patch, lease_expires_at "
+        "FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )[0]
+    assert card == {"reported": True, "has_patch": True, "lease_expires_at": None}
+
+    replay_status, replay = _create_publication(client, payload)
+    assert replay_status == 200
+    assert replay["id"] == publication["id"]
+    audit_after = _rows(
+        "SELECT actor FROM curie.approval_audit_entries WHERE approval_id = :id",
+        {"id": uuid.UUID(publication["approval_id"])},
+    )
+    assert audit_after == [{"actor": "platform:publication-policy"}]
+
+    other = _publication_payload(deployment["id"], dedupe_key="auto-second")
+    conflict = client.post(
+        "/v1/internal/publications",
+        json={
+            **other,
+            "conversation_id": payload["conversation_id"],
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert conflict.status_code == 409, conflict.text
+
+    issued = client.post(
+        f"/v1/internal/publications/{publication['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+    assert issued.status_code == 200, issued.text
+    redemption = _rows(
+        "SELECT outcome, detail FROM curie.credential_redemption_audit_entries "
+        "WHERE publication_id = :id ORDER BY created_at, id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    assert redemption[-1]["outcome"] == "issued"
+    assert "publication:auto version 2" in redemption[-1]["detail"]
+    assert "platform:publication-policy" in redemption[-1]["detail"]
+    assert "ghp_publication_operator" not in json.dumps(redemption)
+
+
+def test_policy_revocation_and_cancellation_block_credential_redemption(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {"publication_policy": "auto"},
+    )
+    _, publication = _create_publication(
+        client, _publication_payload(deployment["id"], dedupe_key="auto-revoke")
+    )
+    revoked = _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {"publication_policy": "approve"},
+    )
+    assert revoked["publication_policy_version"] == 3
+    refused = client.post(
+        f"/v1/internal/publications/{publication['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.policy_revoked"
+
+    deployment = _create_deployment(
+        client, auth_headers, name="publisher-cancel", channel="C0EXAMPLE2"
+    )
+    _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {"publication_policy": "auto"},
+    )
+    payload = _publication_payload(deployment["id"], dedupe_key="auto-cancel")
+    _, cancelled = _create_publication(client, payload)
+    _execute(
+        "INSERT INTO curie.work_items "
+        "(id, github_repository_id, github_issue_number, github_installation_id, "
+        "agent_id, repo_full_name, conversation_id, cancelled_at) "
+        "VALUES (:id, 1, 2575, 1, :agent_id, :repo, :conversation_id, now())",
+        {
+            "id": uuid.uuid4(),
+            "agent_id": uuid.UUID(deployment["agent_id"]),
+            "repo": REPO,
+            "conversation_id": _workspace_identity(payload),
+        },
+    )
+    blocked = client.post(
+        f"/v1/internal/publications/{cancelled['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "publication.work_item_cancelled"
+
+
+def test_auto_policy_refuses_a_branch_outside_the_recorded_prefix(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    first_payload = _publication_payload(deployment["id"], dedupe_key="prefix-first")
+    _, first = _create_publication(client, first_payload)
+    approved = _resolve(client, auth_headers, first["approval_id"])
+    assert approved.status_code == 200, approved.text
+    _execute(
+        "UPDATE curie.publications SET status = 'succeeded', terminal_at = now(), "
+        "patch_bytes = NULL, outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+    _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {"publication_policy": "auto", "publication_branch_prefix": "factory/"},
+    )
+    second = _publication_payload(
+        deployment["id"],
+        dedupe_key="prefix-second",
+        conversation_id=first_payload["conversation_id"],
+    )
+    # The stored lineage branch still uses the historical prefix. A later auto
+    # revision must not publish onto a branch outside the operator prefix.
+    response = client.post(
+        "/v1/internal/publications",
+        json=second,
+        headers=WORKER_HEADERS,
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "publication.branch_prefix"
+
+
+def test_publication_policy_rejects_a_bad_prefix(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    response = client.patch(
+        f"/agents/{deployment['agent_id']}",
+        json={"publication_branch_prefix": "../factory/"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 422, response.text
+    # git check-ref-format rejects a component ending in .lock. The policy
+    # boundary must refuse that prefix before a publication branch is named.
+    locked = client.patch(
+        f"/agents/{deployment['agent_id']}",
+        json={"publication_branch_prefix": "factory.lock/"},
+        headers=auth_headers,
+    )
+    assert locked.status_code == 422, locked.text
+    dotted = client.patch(
+        f"/agents/{deployment['agent_id']}",
+        json={"publication_branch_prefix": "factory./"},
+        headers=auth_headers,
+    )
+    assert dotted.status_code == 422, dotted.text
+    git_lock = subprocess.run(
+        ["git", "check-ref-format", "--branch", "factory.lock/publication-abc"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert git_lock.returncode != 0
+
+
+def test_clearing_the_prefix_keeps_the_existing_publication_branch(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {"publication_policy": "auto", "publication_branch_prefix": "factory/"},
+    )
+    first_payload = _publication_payload(deployment["id"], dedupe_key="keep-branch-first")
+    _, first = _create_publication(client, first_payload)
+    assert first["branch"].startswith("factory/publication-")
+    assert first["branch_prefix"] == "factory/"
+    _execute(
+        "UPDATE curie.publications SET status = 'succeeded', terminal_at = now(), "
+        "patch_bytes = NULL, outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+    cleared = _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {"publication_policy": "approve", "publication_branch_prefix": None},
+    )
+    assert cleared["publication_policy"] == "approve"
+    assert cleared["publication_branch_prefix"] is None
+    second = _publication_payload(
+        deployment["id"],
+        dedupe_key="keep-branch-second",
+        conversation_id=first_payload["conversation_id"],
+    )
+    response = client.post(
+        "/v1/internal/publications",
+        json=second,
+        headers=WORKER_HEADERS,
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["status"] == "pending"
+    assert body["branch"] == first["branch"]
+    assert body["branch_prefix"] == "factory/"
+
+
+def test_stale_publication_policy_version_conflicts(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    agent_id = uuid.UUID(deployment["agent_id"])
+    waiting = threading.Event()
+
+    async def hold_then_bump() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(text("BEGIN"))
+                await connection.execute(
+                    text("SELECT id FROM curie.agents WHERE id = :id FOR UPDATE"),
+                    {"id": agent_id},
+                )
+                waiting.set()
+                for _ in range(100):
+                    blocked = await connection.execute(
+                        text("SELECT count(*) FROM pg_locks WHERE NOT granted")
+                    )
+                    if int(blocked.scalar_one()) > 0:
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError("publication policy update did not wait")
+                await connection.execute(
+                    text(
+                        "UPDATE curie.agents "
+                        "SET publication_policy_version = publication_policy_version + 1, "
+                        "publication_draft = true "
+                        "WHERE id = :id"
+                    ),
+                    {"id": agent_id},
+                )
+                await connection.commit()
+        finally:
+            await engine.dispose()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        holder = pool.submit(lambda: asyncio.run(hold_then_bump()))
+        assert waiting.wait(5)
+        stale = client.patch(
+            f"/agents/{deployment['agent_id']}",
+            json={"publication_policy": "auto"},
+            headers=auth_headers,
+        )
+        holder.result(timeout=15)
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "publication.policy_version_conflict"
+    current = client.get(f"/agents/{deployment['agent_id']}", headers=auth_headers)
+    assert current.status_code == 200, current.text
+    assert current.json()["publication_policy"] == "approve"
+    assert current.json()["publication_policy_version"] == 2
+    assert current.json()["publication_draft"] is True
+    retried = _set_publication_policy(
+        client,
+        auth_headers,
+        deployment["agent_id"],
+        {"publication_policy": "auto"},
+    )
+    assert retried["publication_policy"] == "auto"
+    assert retried["publication_policy_version"] == 3
+    assert retried["publication_draft"] is True
+
+
 def test_lineage_get_reports_external_head_without_pending_revision_or_overwrite(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -4537,9 +5036,7 @@ def test_lineage_get_reports_external_head_without_pending_revision_or_overwrite
     assert detail["expected_head_sha"] == FIRST_REVISION_SHA
     assert detail["actual_head_sha"] == EXTERNAL_REVISION_SHA
     assert "credential" not in json.dumps(detail, sort_keys=True).casefold()
-    stored = client.get(
-        f"/publications/{publication['id']}", headers=auth_headers
-    )
+    stored = client.get(f"/publications/{publication['id']}", headers=auth_headers)
     assert stored.status_code == 200, stored.text
     assert stored.json()["lineage_head_sha"] == FIRST_REVISION_SHA
     assert stored.json()["lineage_state"] == "open"
@@ -4661,6 +5158,8 @@ def review_lineage_app(
         "branch": "pending",
         "head_sha": FIRST_REVISION_SHA,
         "status": 200,
+        "state": "open",
+        "merged": False,
         "calls": [],
     }
     real_client = httpx.Client
@@ -4689,8 +5188,8 @@ def review_lineage_app(
                 "number": PR_NUMBER,
                 "html_url": PR_URL,
                 "node_id": truth["node_id"],
-                "state": "open",
-                "merged": False,
+                "state": truth["state"],
+                "merged": truth["merged"],
                 "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
                 "base": {"repo": repo, "ref": "main"},
             },
@@ -5259,7 +5758,8 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
                         ),
                     )
                 assert conflict.value.code == (
-                    "publication.review_ineligible" if mutation != "head"
+                    "publication.review_ineligible"
+                    if mutation != "head"
                     else "publication.lineage_stale"
                 )
         finally:
@@ -5269,27 +5769,10 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
     assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
 
 
-# --- T5/T6: the worker's real terminal write captures GitHub identity (#2903) ---
+# --- Canonical worker lineage PATCH integration -------------------------------
 
 
-def _worker_identity(
-    *,
-    repository_id: int = 9001,
-    installation_id: int = 41,
-    pr_node_id: str = "PR_example_123",
-    base_ref: str = "main",
-) -> Any:
-    from curie_worker.publication_loop import PublicationIdentity
-
-    return PublicationIdentity(
-        repository_id=repository_id,
-        installation_id=installation_id,
-        pr_node_id=pr_node_id,
-        base_ref=base_ref,
-    )
-
-
-def _identity_columns(lineage_id: str) -> dict[str, Any]:
+def _lineage_identity(lineage_id: str) -> dict[str, Any]:
     return _rows(
         "SELECT status, pr_number, pr_url, head_sha, version, "
         "github_repository_id, github_installation_id, github_pr_node_id, base_ref "
@@ -5299,67 +5782,10 @@ def _identity_columns(lineage_id: str) -> dict[str, Any]:
 
 
 def _reportable(publication_id: str) -> None:
-    """Satisfy claim_next's card-reported precondition without the card outbox."""
-
     _execute(
-        "UPDATE curie.publications SET approval_card_reported_at = now() "
-        "WHERE id = :id",
+        "UPDATE curie.publications SET approval_card_reported_at = now() WHERE id = :id",
         {"id": uuid.UUID(publication_id)},
     )
-
-
-def _terminalize(
-    publication_id: str,
-    *,
-    identity: Any,
-    lease_owner: str,
-    head_sha: str = FIRST_REVISION_SHA,
-    pr_number: int = PR_NUMBER,
-    pr_url: str = PR_URL,
-    version_offset: int = 0,
-    deactivate_deployment: str | None = None,
-) -> None:
-    """Drive the real worker store's terminal CAS for one claimed publication."""
-
-    from curie_worker.publication_store import PostgresPublicationStore
-
-    _reportable(publication_id)
-
-    async def run() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        store = PostgresPublicationStore(
-            engine, schema="curie", lease_owner=lease_owner
-        )
-        try:
-            work = await store.claim_next()
-            assert work is not None, "the publication was not claimable"
-            assert str(work.publication_id) == publication_id
-            if deactivate_deployment is not None:
-                async with engine.begin() as connection:
-                    await connection.execute(
-                        text(
-                            "UPDATE curie.deployments SET status = 'inactive' "
-                            "WHERE id = :id"
-                        ),
-                        {"id": uuid.UUID(deactivate_deployment)},
-                    )
-            await store.persist_result(
-                work.publication_id,
-                outcome="published",
-                pr_url=pr_url,
-                error=None,
-                lineage_id=work.lineage_id,
-                lineage_version=work.lineage_version + version_offset,
-                revision_id=work.revision_id,
-                expected_prior_head=work.expected_prior_head,
-                pr_number=pr_number,
-                new_head=head_sha,
-                identity=identity,
-            )
-        finally:
-            await engine.dispose()
-
-    asyncio.run(run())
 
 
 def _approved_revision(
@@ -5368,17 +5794,14 @@ def _approved_revision(
     *,
     conversation_id: str,
     dedupe_key: str,
-    base_sha: str = BASE_SHA,
-    deployment: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deployment = deployment or _create_deployment(client, auth_headers)
+    deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
         client,
         _publication_payload(
             deployment["id"],
             conversation_id=conversation_id,
             dedupe_key=dedupe_key,
-            base_sha=base_sha,
         ),
     )
     approved = _resolve(client, auth_headers, publication["approval_id"])
@@ -5386,213 +5809,249 @@ def _approved_revision(
     return deployment, publication
 
 
-def test_worker_success_path_captures_identity_so_review_feedback_resolves(
+class _TerminalObservationCluster:
+    def __init__(self) -> None:
+        self.validations = 0
+        self.terminal_cleanups = 0
+
+    def observe(self, _job_name: str) -> Any:
+        from curie_worker.publication_loop import PublicationJobObservation
+
+        return PublicationJobObservation(
+            phase="succeeded",
+            pr_url=PR_URL,
+            pr_number=PR_NUMBER,
+            commit_sha=FIRST_REVISION_SHA,
+            logs="",
+        )
+
+    def validate_existing(self, _resources: Any) -> None:
+        self.validations += 1
+
+    def apply(self, _resources: Any) -> None:
+        raise AssertionError("the terminal Job observation must not apply a new Job")
+
+    def cleanup_credentials(self, _names: Any) -> None:
+        return None
+
+    def cleanup_terminal(self, _names: Any) -> None:
+        self.terminal_cleanups += 1
+
+
+class _UnexpectedPublicationCredentials:
+    def redeem(self, _publication_id: uuid.UUID) -> Any:
+        raise AssertionError("a terminal Job observation must not redeem credentials")
+
+
+class _PublicationTranscript:
+    def __init__(self) -> None:
+        self.records: list[tuple[uuid.UUID, str]] = []
+
+    def record_result(
+        self,
+        _agent_id: uuid.UUID,
+        _workspace_conversation_id: str,
+        publication_id: uuid.UUID,
+        text: str,
+    ) -> None:
+        self.records.append((publication_id, text))
+
+
+class _PublicationReplies:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def emit(self, event: Any, **_kwargs: Any) -> None:
+        assert event.event == "reply.update"
+        assert event.message is None
+        assert event.settled is None
+        assert event.text is not None
+        self.messages.append(event.text)
+
+
+async def _reconcile_through_lineage_patch(
+    client: TestClient,
+    *,
+    lease_owner: str,
+) -> tuple[Any, _TerminalObservationCluster, _PublicationTranscript, _PublicationReplies]:
+    from curie_worker.publication_clients import PublicationLineageClient
+    from curie_worker.publication_k8s import PublicationJobSettings
+    from curie_worker.publication_loop import PublicationReconciler
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    settings = PublicationJobSettings(
+        namespace="curie",
+        runner_image="ghcr.io/curie-eng/curie-runner:test",
+        image_pull_policy="IfNotPresent",
+        image_pull_secrets=(),
+        priority_class_name="curie-publication",
+        service_account_name="curie-publication",
+        owner_name="curie-publication",
+        git_user_name="Curie Publisher",
+        git_user_email="publisher@example.test",
+        cpu_request="100m",
+        cpu_limit="1",
+        memory_request="256Mi",
+        memory_limit="1Gi",
+        ephemeral_request="1Gi",
+        ephemeral_limit="4Gi",
+    )
+    engine = create_async_engine(get_settings().database_url)
+    store = PostgresPublicationStore(engine, schema="curie", lease_owner=lease_owner)
+    cluster = _TerminalObservationCluster()
+    transcript = _PublicationTranscript()
+    replies = _PublicationReplies()
+    try:
+        work = await store.claim_next()
+        assert work is not None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=client.app),
+            base_url="http://api.example.test",
+        ) as http:
+            reconciler = PublicationReconciler(
+                store=store,
+                credentials=_UnexpectedPublicationCredentials(),
+                cluster=cluster,
+                github=SimpleNamespace(),
+                lineage=PublicationLineageClient(
+                    api_base_url="http://api.example.test",
+                    worker_token=WORKER_TOKEN,
+                    client=http,
+                ),
+                replies=replies,
+                transcript=transcript,
+                job_settings=settings,
+            )
+            await reconciler.reconcile(work)
+        return work, cluster, transcript, replies
+    finally:
+        await engine.dispose()
+
+
+def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
 ) -> None:
-    """T5, the ticket's outcome. Every link real except GitHub itself.
-
-    The real worker identity client speaks to the real internal endpoint over an
-    ASGI transport; that endpoint runs the real ``verify_publication_identity``
-    against the fixture's App, mint and provider transport; and the identity it
-    returns is written by the real ``PostgresPublicationStore.persist_result``.
-    Afterwards ``review_context`` must resolve exactly one lineage, which is the
-    thing #2903 reports as permanently broken.
-    """
-
-    from curie_api import github_review_store
-    from curie_api.github_review_events import UnverifiedFeedback
-    from curie_worker.config import WorkerConfig
-    from curie_worker.publication_clients import PublicationIdentityClient
-    from curie_worker.publication_store import PostgresPublicationStore
-
-    # The same publication_lease_seconds the production worker reads in run.py,
-    # so the client's derived request timeout cannot drift from the real config.
-    lease_seconds = WorkerConfig(
-        api_base_url="http://api.example.test",
-        internal_worker_token=WORKER_TOKEN,
-    ).publication_lease_seconds
+    """The reconciler, API PATCH and PostgreSQL settlement execute as one path."""
 
     client, truth, _ = review_lineage_app
-    conversation_id = "thread-worker-identity-capture"
-    deployment, publication = _approved_revision(
+    _, publication = _approved_revision(
         client,
         auth_headers,
-        conversation_id=conversation_id,
-        dedupe_key="worker-identity-capture",
+        conversation_id="thread-worker-lineage-patch",
+        dedupe_key="worker-lineage-patch",
     )
     truth["branch"] = publication["branch"]
     _reportable(publication["id"])
 
-    async def publish() -> Any:
+    async def reconcile() -> Any:
+        return await _reconcile_through_lineage_patch(
+            client,
+            lease_owner="lineage-patch-worker",
+        )
+
+    work, cluster, transcript, replies = client.portal.call(reconcile)
+
+    assert truth["calls"]
+    assert cluster.validations == 1
+    assert cluster.terminal_cleanups == 1
+    assert transcript.records == [
+        (work.publication_id, f"Published the approved changes: {PR_URL}")
+    ]
+    assert replies.messages == [f"Published the approved changes: {PR_URL}"]
+    assert _lineage_identity(publication["lineage_id"]) == {
+        "status": "open",
+        "pr_number": PR_NUMBER,
+        "pr_url": PR_URL,
+        "head_sha": FIRST_REVISION_SHA,
+        "version": work.lineage_version + 1,
+        "github_repository_id": 9001,
+        "github_installation_id": 41,
+        "github_pr_node_id": "PR_example_123",
+        "base_ref": "main",
+    }
+    assert _rows(
+        "SELECT status, lease_owner, patch_bytes IS NULL AS cleared FROM curie.publications "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    ) == [{"status": "succeeded", "lease_owner": None, "cleared": True}]
+
+
+def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unchanged(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    """A stale worker must not convert provider terminal truth into a lineage write."""
+
+    from curie_worker.publication_clients import PublicationLineageClient
+    from curie_worker.publication_loop import PublicationLineageRefused
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id="thread-stale-before-provider",
+        dedupe_key="stale-before-provider",
+    )
+    truth["branch"] = publication["branch"]
+    truth["state"] = "closed"
+    truth["merged"] = True
+    _reportable(publication["id"])
+
+    async def claim() -> Any:
         engine = create_async_engine(get_settings().database_url)
         store = PostgresPublicationStore(
-            engine, schema="curie", lease_owner="identity-capture-outcome"
+            engine, schema="curie", lease_owner="stale-lineage-worker"
         )
         try:
             work = await store.claim_next()
             assert work is not None
-            assert str(work.publication_id) == publication["id"]
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=client.app),
-                base_url="http://api.example.test",
-            ) as http:
-                verified = await PublicationIdentityClient(
+            return work
+        finally:
+            await engine.dispose()
+
+    work = client.portal.call(claim)
+    _claim_publication_lease(publication["id"], "replacement-lineage-worker")
+    snapshot = (
+        "SELECT p.status, p.version, p.lease_owner, l.status AS lineage_status, "
+        "l.pr_number, l.head_sha, l.version AS lineage_version "
+        "FROM curie.publications p JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+        "WHERE p.id = :id"
+    )
+    before = _rows(snapshot, {"id": uuid.UUID(publication["id"])})
+
+    async def stale_advance() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=client.app),
+            base_url="http://api.example.test",
+        ) as http:
+            with pytest.raises(PublicationLineageRefused):
+                await PublicationLineageClient(
                     api_base_url="http://api.example.test",
                     worker_token=WORKER_TOKEN,
                     client=http,
-                    lease_seconds=lease_seconds,
-                ).verify(
+                ).advance(
                     work.publication_id,
-                    lineage_id=work.lineage_id,
                     expected_version=work.lineage_version,
                     expected_head_sha=work.expected_remote_head,
+                    expected_publication_version=work.version,
+                    lease_owner=work.lease_owner,
                     pr_number=PR_NUMBER,
                     pr_url=PR_URL,
                     head_sha=FIRST_REVISION_SHA,
                 )
-            assert verified is not None, (
-                "the real endpoint refused identity for a verifiable lineage"
-            )
-            await store.persist_result(
-                work.publication_id,
-                outcome="published",
-                pr_url=PR_URL,
-                error=None,
-                lineage_id=work.lineage_id,
-                lineage_version=work.lineage_version,
-                revision_id=work.revision_id,
-                expected_prior_head=work.expected_prior_head,
-                pr_number=PR_NUMBER,
-                new_head=FIRST_REVISION_SHA,
-                identity=verified,
-            )
-            return verified
-        finally:
-            await engine.dispose()
 
-    verified = client.portal.call(publish)
+    client.portal.call(stale_advance)
 
-    assert (
-        verified.repository_id,
-        verified.installation_id,
-        verified.pr_node_id,
-        verified.base_ref,
-    ) == (9001, 41, "PR_example_123", "main")
-    assert truth["calls"], "no provider read happened, so nothing was verified"
-    # One version increment carries pr_number and identity together, so the two
-    # facts can never be observed apart. That split is the whole defect.
-    assert _identity_columns(publication["lineage_id"]) == {
+    assert truth["calls"] == []
+    assert _rows(snapshot, {"id": uuid.UUID(publication["id"])}) == before
+    assert _lineage_identity(publication["lineage_id"]) == {
         "status": "open",
-        "pr_number": PR_NUMBER,
-        "pr_url": PR_URL,
-        "head_sha": FIRST_REVISION_SHA,
-        "version": 2,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
-        "base_ref": "main",
-    }
-
-    feedback = UnverifiedFeedback(
-        delivery_id=uuid.uuid4(),
-        event="pull_request_review_comment",
-        installation_id=41,
-        repository_id=9001,
-        repo_full_name=REPO,
-        pr_number=PR_NUMBER,
-        feedback_id=7001,
-        sender_id=2121,
-        sender_login="example-reviewer",
-        body="Please rename the helper.",
-        url=f"{PR_URL}#discussion_r7001",
-        created_at=datetime.now(UTC),
-        head_sha=FIRST_REVISION_SHA,
-        commit_sha=FIRST_REVISION_SHA,
-        author_association="MEMBER",
-    )
-
-    async def resolve_feedback() -> Any:
-        engine = create_async_engine(get_settings().database_url)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-        try:
-            async with maker() as session:
-                return await github_review_store.review_context(
-                    session, feedback, get_settings()
-                )
-        finally:
-            await engine.dispose()
-
-    # Before this fix this call raised FeedbackIgnored("lineage_absent_or_ambiguous")
-    # for every PR the platform itself published.
-    context = asyncio.run(resolve_feedback())
-
-    assert str(context.lineage.id) == publication["lineage_id"]
-    truth_row = context.truth
-    assert (
-        truth_row.repository_id,
-        truth_row.installation_id,
-        truth_row.pr_node_id,
-        truth_row.base_ref,
-    ) == (9001, 41, "PR_example_123", "main")
-    assert context.conversation_id == conversation_id
-
-
-def test_terminal_cas_writes_identity_in_the_same_update_that_sets_pr_number(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-) -> None:
-    client, _ = publication_stack
-    _, publication = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id="thread-cas-first-capture",
-        dedupe_key="cas-first-capture",
-    )
-
-    _terminalize(
-        publication["id"],
-        identity=_worker_identity(),
-        lease_owner="cas-first-capture",
-    )
-
-    assert _identity_columns(publication["lineage_id"]) == {
-        "status": "open",
-        "pr_number": PR_NUMBER,
-        "pr_url": PR_URL,
-        "head_sha": FIRST_REVISION_SHA,
-        "version": 2,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
-        "base_ref": "main",
-    }
-
-
-def test_terminal_cas_without_identity_still_publishes_a_token_mode_lineage(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-) -> None:
-    """E2 regression guard: an install with no App must not start failing."""
-
-    client, _ = publication_stack
-    _, publication = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id="thread-cas-token-mode",
-        dedupe_key="cas-token-mode",
-    )
-
-    _terminalize(publication["id"], identity=None, lease_owner="cas-token-mode")
-
-    assert _identity_columns(publication["lineage_id"]) == {
-        "status": "open",
-        "pr_number": PR_NUMBER,
-        "pr_url": PR_URL,
-        "head_sha": FIRST_REVISION_SHA,
-        "version": 2,
+        "pr_number": None,
+        "pr_url": None,
+        "head_sha": None,
+        "version": 1,
         "github_repository_id": None,
         "github_installation_id": None,
         "github_pr_node_id": None,
@@ -5600,278 +6059,45 @@ def test_terminal_cas_without_identity_still_publishes_a_token_mode_lineage(
     }
 
 
-@pytest.mark.parametrize(
-    "second_identity",
-    [None, "same"],
-    ids=["later_revision_without_identity", "identical_identity_replay"],
-)
-def test_terminal_cas_leaves_an_already_identified_lineage_alone(
-    publication_stack: tuple[TestClient, str],
+def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
-    clean_db: None,
-    second_identity: str | None,
 ) -> None:
-    """The production shape of every revision after the first must not raise."""
+    """The reconciler maps API terminal truth onto the store's terminal CAS."""
 
-    client, _ = publication_stack
-    conversation_id = "thread-cas-second-revision"
-    deployment, first = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id=conversation_id,
-        dedupe_key="cas-second-revision-one",
-    )
-    _terminalize(
-        first["id"], identity=_worker_identity(), lease_owner="cas-second-one"
-    )
-    _mark_outcome_history_ready(first["id"])
-    _, second = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id=conversation_id,
-        dedupe_key="cas-second-revision-two",
-        base_sha=FIRST_REVISION_SHA,
-        deployment=deployment,
-    )
-
-    _terminalize(
-        second["id"],
-        identity=None if second_identity is None else _worker_identity(),
-        lease_owner="cas-second-two",
-        head_sha=SECOND_REVISION_SHA,
-    )
-
-    assert _identity_columns(first["lineage_id"]) == {
-        "status": "open",
-        "pr_number": PR_NUMBER,
-        "pr_url": PR_URL,
-        "head_sha": SECOND_REVISION_SHA,
-        "version": 3,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
-        "base_ref": "main",
-    }
-
-
-@pytest.mark.parametrize(
-    "divergent",
-    [
-        {"repository_id": 9002},
-        {"installation_id": 42},
-        {"pr_node_id": "PR_example_999"},
-        {"base_ref": "develop"},
-    ],
-    ids=["repository_id", "installation_id", "pr_node_id", "base_ref"],
-)
-def test_terminal_cas_refuses_a_divergent_identity_and_writes_nothing(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-    divergent: dict[str, Any],
-) -> None:
-    """A COALESCE here would silently keep the stored value. It must not."""
-
-    from curie_worker.publication_store import PublicationStoreError
-
-    client, _ = publication_stack
-    conversation_id = "thread-cas-divergent-identity"
-    deployment, first = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id=conversation_id,
-        dedupe_key="cas-divergent-one",
-    )
-    _terminalize(
-        first["id"], identity=_worker_identity(), lease_owner="cas-divergent-one"
-    )
-    _mark_outcome_history_ready(first["id"])
-    before = _identity_columns(first["lineage_id"])
-    _, second = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id=conversation_id,
-        dedupe_key="cas-divergent-two",
-        base_sha=FIRST_REVISION_SHA,
-        deployment=deployment,
-    )
-
-    with pytest.raises(PublicationStoreError, match="lineage advance CAS was lost"):
-        _terminalize(
-            second["id"],
-            identity=_worker_identity(**divergent),
-            lease_owner="cas-divergent-two",
-            head_sha=SECOND_REVISION_SHA,
-        )
-
-    assert _identity_columns(first["lineage_id"]) == before
-
-
-def test_terminal_cas_refuses_a_stale_lineage_version_carrying_identity(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-) -> None:
-    """Capture-once safety rests entirely on this version guard (B5)."""
-
-    from curie_worker.publication_store import PublicationStoreError
-
-    client, _ = publication_stack
+    client, truth, _ = review_lineage_app
     _, publication = _approved_revision(
         client,
         auth_headers,
-        conversation_id="thread-cas-stale-version",
-        dedupe_key="cas-stale-version",
+        conversation_id="thread-terminal-lineage-patch",
+        dedupe_key="terminal-lineage-patch",
     )
-    before = _identity_columns(publication["lineage_id"])
+    truth["branch"] = publication["branch"]
+    truth["state"] = "closed"
+    truth["merged"] = True
+    _reportable(publication["id"])
 
-    with pytest.raises(PublicationStoreError, match="lineage advance CAS was lost"):
-        _terminalize(
-            publication["id"],
-            identity=_worker_identity(),
-            lease_owner="cas-stale-version",
-            version_offset=1,
+    async def reconcile() -> Any:
+        return await _reconcile_through_lineage_patch(
+            client,
+            lease_owner="terminal-lineage-worker",
         )
 
-    assert _identity_columns(publication["lineage_id"]) == before
+    work, cluster, transcript, replies = client.portal.call(reconcile)
 
-
-@pytest.mark.parametrize("capturing", [True, False], ids=["identity", "no_identity"])
-def test_deactivated_deployment_blocks_identity_capture_but_not_a_null_capture(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-    capturing: bool,
-) -> None:
-    """R12. The asymmetry is deliberate: the predicates protect the capture.
-
-    A deactivated deployment must stop the write that makes a lineage
-    reviewable, and must not start failing a token-mode terminalization that has
-    no identity to protect and that succeeds on the base today.
-    """
-
-    from curie_worker.publication_store import PublicationStoreError
-
-    client, _ = publication_stack
-    deployment, publication = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id=f"thread-cas-deactivated-{capturing}",
-        dedupe_key=f"cas-deactivated-{capturing}",
-    )
-    before = _identity_columns(publication["lineage_id"])
-
-    if capturing:
-        with pytest.raises(PublicationStoreError, match="lineage advance CAS was lost"):
-            _terminalize(
-                publication["id"],
-                identity=_worker_identity(),
-                lease_owner="cas-deactivated-identity",
-                deactivate_deployment=deployment["id"],
-            )
-        assert _identity_columns(publication["lineage_id"]) == before
-        return
-
-    _terminalize(
-        publication["id"],
-        identity=None,
-        lease_owner="cas-deactivated-null",
-        deactivate_deployment=deployment["id"],
-    )
-    assert _identity_columns(publication["lineage_id"]) == {
-        **before,
+    assert truth["calls"]
+    assert cluster.validations == 1
+    assert cluster.terminal_cleanups == 0
+    assert transcript.records == []
+    assert replies.messages == []
+    assert _lineage_identity(publication["lineage_id"]) == {
+        "status": "merged",
         "pr_number": PR_NUMBER,
         "pr_url": PR_URL,
         "head_sha": FIRST_REVISION_SHA,
-        "version": 2,
+        "version": work.lineage_version + 1,
+        "github_repository_id": None,
+        "github_installation_id": None,
+        "github_pr_node_id": None,
+        "base_ref": None,
     }
-
-
-def test_duplicate_pr_owner_identity_capture_is_a_store_error_not_integrity_error(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-) -> None:
-    """E11: uq_publication_github_pr_owner is newly reachable once identity lands."""
-
-    from curie_worker.publication_store import PublicationStoreError
-
-    client, _ = publication_stack
-    deployment, first = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id="thread-cas-pr-owner-one",
-        dedupe_key="cas-pr-owner-one",
-    )
-    _terminalize(
-        first["id"], identity=_worker_identity(), lease_owner="cas-pr-owner-one"
-    )
-    # One deployment, two conversations: two distinct open lineages both
-    # claiming (repository_id 9001, pr_number 123). A second deployment would
-    # take a 409 on the shared Slack address during setup, and distinct
-    # conversations keep uq_active_publication_github_conversation from being
-    # what fires instead of uq_publication_github_pr_owner.
-    _, second = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id="thread-cas-pr-owner-two",
-        dedupe_key="cas-pr-owner-two",
-        deployment=deployment,
-    )
-    assert second["lineage_id"] != first["lineage_id"]
-
-    with pytest.raises(PublicationStoreError) as raised:
-        _terminalize(
-            second["id"],
-            identity=_worker_identity(),
-            lease_owner="cas-pr-owner-two",
-        )
-
-    # The unique index fired, not the version CAS. Without this the test would
-    # also pass on a merely lost compare-and-set, which is a different defect
-    # and would leave the raw sqlalchemy IntegrityError escaping unhandled.
-    assert "CAS was lost" not in str(raised.value)
-
-    assert _identity_columns(second["lineage_id"])["github_repository_id"] is None
-
-
-def test_first_capture_lineage_can_still_be_terminalized_by_provider_truth(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-) -> None:
-    """The SQL claim B3f rests on: NULL head_sha and NULL pr_number terminalize."""
-
-    from curie_worker.publication_store import PostgresPublicationStore
-
-    client, _ = publication_stack
-    _, publication = _approved_revision(
-        client,
-        auth_headers,
-        conversation_id="thread-first-capture-terminal",
-        dedupe_key="first-capture-terminal",
-    )
-    before = _identity_columns(publication["lineage_id"])
-    assert before["pr_number"] is None and before["head_sha"] is None
-
-    async def terminalize() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        store = PostgresPublicationStore(
-            engine, schema="curie", lease_owner="first-capture-terminal"
-        )
-        try:
-            await store.mark_lineage_terminal(
-                uuid.UUID(publication["lineage_id"]),
-                expected_version=before["version"],
-                expected_stored_head=None,
-                state="merged",
-                pr_number=PR_NUMBER,
-                pr_url=PR_URL,
-                head_sha=FIRST_REVISION_SHA,
-            )
-        finally:
-            await engine.dispose()
-
-    asyncio.run(terminalize())
-
-    assert _identity_columns(publication["lineage_id"])["status"] == "merged"
