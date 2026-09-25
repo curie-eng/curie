@@ -1973,6 +1973,27 @@ class Kernel:
                     return
             _OWNED_WORK_ITEM.set(owned_work_item_id)
 
+            # ADR-0168 decision 5: a turn addressed to an identity this worker
+            # cannot speak as ends here, before a card, a claim or a model call.
+            # Nothing can answer it: only the addressed bot may edit its own
+            # placeholder, and a reply from any other bot is the defect.
+            if not targetless and not self._is_factory_work_item_turn(event_id):
+                assert handle is not None
+                refusal = self._sink.undeliverable_reason(handle.kind, route)
+                if refusal is not None:
+                    logger.error(
+                        "dropping event %s without a reply: %s", event_id, refusal
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="failed",
+                    )
+                    return
+
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
             # and gated on the resume event id so an ordinary turn pays nothing.
