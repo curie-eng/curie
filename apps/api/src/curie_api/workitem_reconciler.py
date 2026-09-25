@@ -20,7 +20,7 @@ from redis.exceptions import ResponseError
 from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_ci, factory_notices, workitems
+from . import factory_ci, factory_label_reconcile, factory_notices, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, WorkItem
 from .workitem_dispatch import (
@@ -62,6 +62,8 @@ class WorkItemReconciler:
         # budget goes to the least recently observed due requests first.
         self._ci_observed: dict[uuid.UUID, int] = {}
         self._ci_pass = 0
+        # Monotonic time of the next missed-label listing (#3081).
+        self._labels_due = 0.0
 
     def _stream(self) -> str:
         return self._settings.runs_stream
@@ -120,6 +122,7 @@ class WorkItemReconciler:
         await self._publish_terminate_wakes()
         await self._settle_overdue_cancellations()
         await self._readmit_pending()
+        await self._reconcile_missed_labels()
         await self._sync_status_comments()
         async with self._sessionmaker() as session:
             await redispatch_lapsed_acquisitions(session)
@@ -427,6 +430,22 @@ class WorkItemReconciler:
         )
         # Already-enqueued counts as published: the round has its turn.
         return True
+
+    async def _reconcile_missed_labels(self) -> None:
+        """Admit labeled issues whose delivery GitHub never retried (#3081)."""
+
+        settings = self._settings
+        interval = settings.github_factory_reconcile_interval_s
+        if not settings.github_factory_ingress_enabled or interval <= 0:
+            return
+        clock = asyncio.get_running_loop().time()
+        if clock < self._labels_due:
+            return
+        self._labels_due = clock + interval
+        async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
+            await factory_label_reconcile.reconcile_missed_labels(
+                self._sessionmaker, settings, client, now=datetime.now(UTC)
+            )
 
     async def _sync_status_comments(self) -> None:
         async with self._sessionmaker() as session:
