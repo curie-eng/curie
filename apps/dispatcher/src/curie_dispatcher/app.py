@@ -19,6 +19,7 @@ from slack_sdk.web import WebClient
 
 from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers
+from .identities import SlackIdentityCredentials, default_identity_credentials
 from .supervisor import Connection
 
 # In Socket Mode the signing secret is never used to verify requests (they arrive
@@ -56,9 +57,15 @@ def build_redis(config: DispatcherConfig) -> redis.Redis:
     )
 
 
-def build_web_client(config: DispatcherConfig) -> WebClient:
-    """The dispatcher's own Web API client, authenticated with the bot token."""
-    return WebClient(token=config.slack_bot_token, timeout=_SLACK_API_TIMEOUT_SECONDS)
+def build_web_client(
+    config: DispatcherConfig, identity: SlackIdentityCredentials | None = None
+) -> WebClient:
+    """One identity's own Web API client, authenticated with its bot token.
+
+    ``default``, from the ``SLACK_*`` settings, when no identity is given.
+    """
+    credentials = identity if identity is not None else default_identity_credentials(config)
+    return WebClient(token=credentials.bot_token, timeout=_SLACK_API_TIMEOUT_SECONDS)
 
 
 def build_app(
@@ -66,19 +73,26 @@ def build_app(
     *,
     web_client: WebClient,
     redis_client: redis.Redis,
+    identity: SlackIdentityCredentials | None = None,
     clock: Clock | None = None,
     authorize: Callable[..., Any] | None = None,
     logger: logging.Logger | None = None,
     resolver: Any | None = None,
 ) -> App:
-    """Build a Bolt App with the dispatcher's handlers registered."""
-    signing = config.slack_signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
+    """Build one identity's Bolt App with the dispatcher's handlers registered.
+
+    ``identity`` is ``default`` when omitted, built from the ``SLACK_*``
+    settings exactly as a stock install always built it. Its name is what every
+    turn this app mints carries (ADR-0168 decision 2).
+    """
+    credentials = identity if identity is not None else default_identity_credentials(config)
+    signing = credentials.signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
     app_kwargs: dict[str, Any] = {}
     app_kwargs["signing_secret"] = signing
     if authorize is not None:
         app_kwargs["authorize"] = authorize
     else:
-        app_kwargs["token"] = config.slack_bot_token
+        app_kwargs["token"] = credentials.bot_token
         # Defer token validation to connect time: a bare token otherwise makes
         # Bolt call auth.test eagerly at construction, which would require network
         # to build the app and fail startup on a transient Slack blip. Socket Mode
@@ -92,6 +106,7 @@ def build_app(
         "redis_client": redis_client,
         "config": config,
         "logger": logger,
+        "slack_identity": credentials.name,
     }
     if clock is not None:
         register_kwargs["clock"] = clock

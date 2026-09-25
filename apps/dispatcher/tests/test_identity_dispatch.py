@@ -339,7 +339,9 @@ def test_bolt_and_the_web_client_are_built_from_the_identity_given(
     monkeypatch.setattr(app_module, "App", RecordingApp)
     monkeypatch.setattr(app_module, "WebClient", recording_web_client)
 
-    build_app(config, identity=OPS, web_client=build_web_client(config, OPS), redis_client=redis_client)
+    build_app(
+        config, identity=OPS, web_client=build_web_client(config, OPS), redis_client=redis_client
+    )
 
     assert client_calls == [{"token": "xoxb-ops", "timeout": 2}]
     assert app_calls == [
