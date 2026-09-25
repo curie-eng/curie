@@ -4,6 +4,10 @@ The runner POSTs one report per phase transition with a request-bound
 ``work_item.progress`` sandbox token. This module validates the wire body,
 records the report onto the WorkItem's currently active request, and derives
 the pure phase view the status comment and the SVG card render from.
+
+The platform also records the phases it owns itself
+(``record_platform_report``, #3179): the CI wait, whose report the agent can
+never send because its turn ends at the ``publish_changes`` call.
 """
 
 from __future__ import annotations
@@ -182,6 +186,71 @@ async def record_report(
         row.activity = body.activity.model_dump(exclude_none=True)
     await session.commit()
     return RecordResult("recorded", active.id)
+
+
+async def record_platform_report(
+    session: AsyncSession, *, request_id: uuid.UUID, phase: str, note: str
+) -> bool:
+    """Record one phase report the platform itself owns (#3179).
+
+    The agent's turn ends at the publish call, so it can never report the CI
+    wait; the reconciler's CI gate records that phase here. The locks follow
+    ``record_report``'s order (the request row, then the status row), and the
+    status row is taken with ``skip_locked`` because the comment sync holds it
+    across its GitHub calls: a skipped write is simply retried on the next
+    reconciler pass. ``False`` means not recorded, never an error: not when
+    the request is not running, the status row is missing or locked, the
+    pinned declaration does not declare the phase, the latest report is
+    already that phase (one report per CI wait), or the report cap is hit.
+    """
+
+    stripped = note.strip()
+    request = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.id == request_id).with_for_update()
+    )
+    if request is None or request.status != "running":
+        await session.rollback()
+        return False
+    row = await session.scalar(
+        select(FactoryStatusComment)
+        .where(FactoryStatusComment.execution_request_id == request.id)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    declaration = row.declaration if row is not None else None
+    if (
+        not isinstance(declaration, dict)
+        or phase not in {str(p["id"]) for p in declaration.get("phases", [])}
+        or not 1 <= len(stripped) <= 280
+    ):
+        await session.rollback()
+        return False
+    latest = await session.scalar(
+        select(ExecutionRequestPhaseReport.phase)
+        .where(ExecutionRequestPhaseReport.execution_request_id == request.id)
+        .order_by(ExecutionRequestPhaseReport.id.desc())
+        .limit(1)
+    )
+    if latest == phase:
+        await session.rollback()
+        return False
+    count = await session.scalar(
+        select(func.count())
+        .select_from(ExecutionRequestPhaseReport)
+        .where(ExecutionRequestPhaseReport.execution_request_id == request.id)
+    )
+    if (count or 0) >= REPORT_LIMIT:
+        await session.rollback()
+        return False
+    session.add(
+        ExecutionRequestPhaseReport(
+            execution_request_id=request.id,
+            phase=phase,
+            note=stripped,
+        )
+    )
+    await session.commit()
+    return True
 
 
 # --- the phase view (pure) ------------------------------------------------------

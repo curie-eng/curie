@@ -922,7 +922,11 @@ The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
 comment shows a checklist of the phases the agent reports through
 `report_progress` and a `Status:` line (`QUEUED`, `RUNNING`, `PUBLISHING`,
-`STOPPING`). Its last edit adds the result, marks the comment final, and it is
+`STOPPING`). The platform itself records the `wait_ci` phase once a
+publication has succeeded and the CI gate owns the request, because the
+agent's turn ends at the publish call, so the checklist still moves to Wait
+for CI during that wait. Its last edit adds the result, marks the comment
+final, and it is
 not edited again. A comment a person deletes is re-created once on the next
 pass; unlabel the issue to stop the run instead.
 

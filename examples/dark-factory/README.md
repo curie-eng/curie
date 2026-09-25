@@ -129,7 +129,9 @@ factory against a disposable install.
 `progress/phases.json` declares the nine phases and the two review loops. At
 the start of each phase the skill calls `mcp__curie__report_progress`, and the
 platform edits one status comment on the issue with a live card showing the
-current phase, the loop rounds and the run's activity. A failed report never
+current phase, the loop rounds and the run's activity. The one exception is
+`wait_ci`: the turn ends at the publish call, so the platform records that
+phase itself while the pull request's checks run. A failed report never
 stops the run.
 
 ## Evals

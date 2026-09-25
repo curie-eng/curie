@@ -35,11 +35,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
+from curie_api.factory_ci import WAIT_CI_NOTE
 from curie_api.factory_notices import FINAL_MARKER, marker_for
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_factory_progress import report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     HEAD_A,
     HEAD_B,
@@ -1263,3 +1265,132 @@ def test_a_request_with_no_publication_is_still_an_orphan_candidate(
     declared = _owner_lost(client, row["id"], epoch)
     assert declared.status_code == 200, declared.text
     assert _terminal(number) == ("cancellation_requested", "owner_lost")
+
+
+# --- #3179: the platform records the CI wait itself --------------------------------
+
+
+def _report_all_phases(client: Any, request_id: uuid.UUID) -> None:
+    """The agent's reports through the publish call; its turn ends there."""
+
+    for phase in ("read_issue", "pin_criteria", "failing_test"):
+        assert report(client, request_id, phase).status_code == 201
+    for phase in ("plan", "plan_review", "implement", "review_diff"):
+        assert report(client, request_id, phase, round=1).status_code == 201
+    assert report(client, request_id, "publish").status_code == 201
+
+
+def _phase_reports(request_id: uuid.UUID) -> list[dict[str, Any]]:
+    return _rows(
+        "SELECT phase, note, loop_round FROM curie.execution_request_phase_reports "
+        "WHERE execution_request_id = :id ORDER BY id",
+        {"id": request_id},
+    )
+
+
+def test_the_platform_records_the_wait_ci_phase_once_the_gate_owns_the_request(
+    admitted: Any,
+) -> None:
+    """A publication that succeeded and a CI that is pending (#3179).
+
+    The agent's turn ends at the publish call, so it can never report the CI
+    wait itself; the comment must still show Publish PR done and Wait for CI
+    in progress.
+    """
+
+    client, github, sink = admitted
+    number = 9760
+    sink.ci_script = [ci_pending(), ci_green()]
+    published = _published(client, github, sink, number)
+    _report_all_phases(client, published["id"])
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    body = _body(sink, published["id"])
+    assert "- [x] Publish PR\n" in body
+    assert "- [ ] **Wait for CI** (in progress)\n" in body
+    assert _phase_reports(published["id"])[-1] == {
+        "phase": "wait_ci",
+        "note": WAIT_CI_NOTE,
+        "loop_round": None,
+    }
+
+    # Repeated passes write no second report.
+    _reconcile()
+
+    assert [row["phase"] for row in _phase_reports(published["id"])].count("wait_ci") == 1
+    assert _terminal(number) == ("completed", "completed")
+
+
+def test_a_fix_round_reports_its_own_implement_and_the_platform_the_second_wait(
+    admitted: Any,
+) -> None:
+    """A CI failure loops back to implement through the agent's own reports."""
+
+    client, github, sink = admitted
+    number = 9761
+    sink.ci_scripts = {HEAD_A: [ci_failing()], HEAD_B: [ci_pending(), ci_green()]}
+    published = _published(client, github, sink, number)
+    _report_all_phases(client, published["id"])
+
+    _reconcile()
+
+    assert [t["event_id"] for t in _ci_turns(published["id"])] == [
+        f"work-item-{published['id']}-ci-2"
+    ]
+    # The fix turn runs: the agent reports its own implement round, publishes,
+    # and the turn ends at the publish call again.
+    assert (
+        report(client, published["id"], "implement", round=2, note="Fixing the checks")
+        .status_code
+        == 201
+    )
+    assert report(client, published["id"], "publish").status_code == 201
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the checks",
+        paths=["src/widget.py"],
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    body = _body(sink, published["id"])
+    assert "- [x] Implement\n" in body
+    assert "- [x] Publish PR\n" in body
+    assert "- [ ] **Wait for CI** (in progress)\n" in body
+    phases = [row["phase"] for row in _phase_reports(published["id"])]
+    assert phases[-1] == "wait_ci"
+    assert phases.count("wait_ci") == 2
+
+
+def test_a_declaration_without_wait_ci_records_nothing(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9762
+    sink.ci_script = [ci_failing()]
+    published = _published(client, github, sink, number)
+    shorter = {
+        "phases": [
+            {"id": "read_issue", "label": "Read issue"},
+            {"id": "implement", "label": "Implement"},
+            {"id": "publish", "label": "Publish PR"},
+        ],
+        "loops": [],
+    }
+    assert report(client, published["id"], "read_issue", declaration=shorter).status_code == 201
+    assert report(client, published["id"], "publish", declaration=shorter).status_code == 201
+
+    _reconcile()
+
+    assert [row["phase"] for row in _phase_reports(published["id"])] == [
+        "read_issue",
+        "publish",
+    ]
+    assert [t["event_id"] for t in _ci_turns(published["id"])] == [
+        f"work-item-{published['id']}-ci-2"
+    ]
+    assert _terminal(number) == ("running", None)

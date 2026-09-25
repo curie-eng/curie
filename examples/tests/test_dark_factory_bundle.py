@@ -207,6 +207,9 @@ def test_skill_defines_the_nine_phases_in_order() -> None:
 
 
 LOOPED_PHASES = {"plan", "plan_review", "implement", "review_diff"}
+# The turn ends at the publish call, so the platform records these phases
+# itself (#3179); the step never asks the agent to make the call.
+PLATFORM_REPORTED_PHASES = {"wait_ci"}
 
 
 def _phase_declaration() -> dict:
@@ -244,7 +247,12 @@ def test_every_step_reports_its_own_phase_through_report_progress() -> None:
     for phase, text in sections.items():
         assert "report_progress" in text, phase
         assert re.search(rf"report_progress[^\n]*\b{phase}\b", text), phase
-        if phase in LOOPED_PHASES:
+        if phase in PLATFORM_REPORTED_PHASES:
+            assert re.search(
+                r"platform\b.{0,120}report_progress", text, re.IGNORECASE | re.DOTALL
+            ), phase
+            assert not re.search(r"(?m)^\s*Call report_progress", text), phase
+        elif phase in LOOPED_PHASES:
             assert re.search(r"report_progress[^\n]*\bround\b", text), phase
 
 
@@ -348,6 +356,17 @@ def test_wait_ci_section_loops_a_failed_check_back_to_implement() -> None:
     assert "Could not complete:" in section
     assert "1800" in section
     assert "does not act on them yet" not in section
+
+
+def test_wait_ci_step_is_recorded_by_the_platform_not_the_agent() -> None:
+    """The turn ends at the publish call, so the platform records wait_ci (#3179)."""
+
+    _, body = _skill_parts()
+    section = _section(body, 9)
+    assert re.search(r"platform[^\n]*records the `wait_ci` phase itself", section)
+    assert re.search(r"report_progress[^\n]*`wait_ci`", section)
+    assert not re.search(r"(?m)^\s*Call report_progress", section)
+    assert "report `wait_ci`" not in _section(body, 8)
 
 
 def test_skill_names_three_review_loops_including_wait_ci() -> None:

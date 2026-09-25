@@ -11,14 +11,18 @@ decides with the pure ``decide``:
 - a failure on the last round, a timed-out wait, or unreadable CI ends the
   request with a ``Could not complete:`` notice. Unreadable CI is never success.
 
-No network call runs under a row lock. Every write is fenced to the observed
-publication and head (``workitems.settle_ci_verdict`` / ``hold_for_ci_fix``),
-and a Valkey claim keeps each round to at most one continuation.
+While the gate owns the request it also records the ``wait_ci`` phase report
+itself (#3179): the agent's turn ends at the publish call, so it can never
+report that phase. No network call runs under a row lock. Every write is
+fenced to the observed publication and head (``workitems.settle_ci_verdict`` /
+``hold_for_ci_fix``), and a Valkey claim keeps each round to at most one
+continuation.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -32,10 +36,12 @@ from curie_telemetry.redact import redact_text
 from sqlalchemy import TIMESTAMP, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import workitem_outcomes, workitems
+from . import factory_progress, workitem_outcomes, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
 from .workitem_outcomes import CiDetail
+
+logger = logging.getLogger(__name__)
 
 CI_GRACE_SECONDS = 120
 CI_WAIT_SECONDS = 1200
@@ -43,6 +49,9 @@ CI_POLL_SECONDS = 20
 CI_MAX_ROUNDS = 3
 CI_OBSERVATIONS_PER_PASS = 4
 CI_CLAIM_SECONDS = 60
+# The phase the platform records itself while it owns the request (#3179).
+WAIT_CI_PHASE = "wait_ci"
+WAIT_CI_NOTE = "waiting on the pull request's checks"
 # Causes the reconciler writes for a request whose pull request already opened;
 # they may land after the execution deadline. ``ci_fix_unpublished`` is written
 # by the worker and stays bounded by the deadline. ``workitems`` keeps an equal
@@ -412,6 +421,10 @@ async def gate(
     round_ = len(facts.publications)
     if await valkey.exists(ci_key(request.id, round_ + 1)):
         return "fixing"
+    # The agent's turn ended at the publish call, so it can never report the
+    # CI wait itself (#3179). The platform records the phase while the gate
+    # owns the request; best-effort, it never gates the verdict.
+    await _record_wait_ci(sessionmaker, request.id)
     due = next_poll.get(request.id)
     if due is not None and now < due:
         return "waiting"
@@ -483,6 +496,21 @@ async def gate(
 def _issue_url(settings: Settings, work_item: WorkItem) -> str:
     base = settings.github_clone_base.rstrip("/")
     return f"{base}/{work_item.repo_full_name}/issues/{work_item.github_issue_number}"
+
+
+async def _record_wait_ci(
+    sessionmaker: async_sessionmaker[AsyncSession], request_id: uuid.UUID
+) -> bool:
+    """Record the wait_ci phase report; a skipped or failed write retries next pass."""
+
+    try:
+        async with sessionmaker() as session:
+            return await factory_progress.record_platform_report(
+                session, request_id=request_id, phase=WAIT_CI_PHASE, note=WAIT_CI_NOTE
+            )
+    except Exception:
+        logger.warning("wait_ci phase report for request %s failed", request_id, exc_info=True)
+        return False
 
 
 async def _continue(

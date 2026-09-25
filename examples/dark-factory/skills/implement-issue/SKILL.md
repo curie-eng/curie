@@ -20,7 +20,10 @@ set to that phase's id, `round` for `plan`, `plan_review`, `implement` and
 `review_diff`, and an optional one-line `note` saying what you are about to
 do. The note is public on the issue, so it must contain no secrets and no raw
 tool output. Report the phase before its first tool call. If the tool returns
-an error, continue the work; progress never blocks the run.
+an error, continue the work; progress never blocks the run. The one exception
+is `wait_ci`: your turn ends at the `publish_changes` call, so the platform
+records that phase itself once the publication request is pending; never call
+report_progress for it.
 
 The bundle's review gate hook enforces the loops. It reports each review phase
 and its round, numbers the rounds, sends the call to the right reviewer in the
@@ -233,9 +236,10 @@ reviewer's latest verdict is `VERDICT: APPROVE`. Call
   checks you ran with their results, then the plan and diff review rounds it
   took, then anything you did not verify or deliberately declined.
 
-After calling it, report `wait_ci` (step 9), end your turn and say that the publication request is
-pending. Do not call it twice. Never push with git; the platform publishes
-from outside the sandbox.
+After calling it, end your turn and say that the publication request is
+pending; the platform records the `wait_ci` phase (step 9) itself. Do not
+call it twice. Never push with git; the platform publishes from outside the
+sandbox.
 
 **Stop with a stated reason** in every other case. Your final reply begins
 with `Could not complete:` and then gives the reason in one sentence, what you
@@ -244,9 +248,10 @@ tried, and what a maintainer must provide or decide. Do not call
 
 ## 9. Wait for CI (phase `wait_ci`)
 
-Call report_progress with phase `wait_ci` right after the publication
-request, then end the turn. When a `wait_ci` round message sends you back to
-`implement`, report `implement` again before fixing.
+The platform records the `wait_ci` phase itself once the publication request
+is pending, so never call report_progress for `wait_ci` yourself. When a
+`wait_ci` round message sends you back to `implement`, report `implement`
+again before fixing.
 
 This phase follows a publication. The platform opens the pull request after
 the approval, and its checks run there.
