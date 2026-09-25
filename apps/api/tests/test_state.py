@@ -33,6 +33,38 @@ from sqlalchemy.exc import IntegrityError
 _FAR_FUTURE = 4102444800  # 2100-01-01, valid at test time
 _PAST = 1000000000  # 2001, expired at test time
 
+# A second declared Slack identity (ADR-0168 decision 1), in the shape
+# test_declared_identities.py's TWO_IDENTITIES uses, so a binding may name
+# adapter="second" without a 422.
+_SECOND_SLACK_IDENTITY = json.dumps(
+    [
+        {
+            "name": "default",
+            "app_token_env": "SLACK_APP_TOKEN",
+            "bot_token_env": "SLACK_BOT_TOKEN",
+            "signing_secret_env": "SLACK_SIGNING_SECRET",
+        },
+        {
+            "name": "second",
+            "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+            "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+            "signing_secret_env": None,
+        },
+    ]
+)
+
+
+@pytest.fixture
+def declare_second_slack_identity(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Declares `_SECOND_SLACK_IDENTITY`, the way test_declared_identities.py's
+    `declare` fixture does: `get_settings` is cached, so the cache is cleared
+    both after setting the environment and again on the way out."""
+
+    monkeypatch.setenv("CURIE_SLACK_IDENTITIES", _SECOND_SLACK_IDENTITY)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
 
 def _agent(
     client: Any,
@@ -1438,6 +1470,107 @@ def test_binding_scoped_route_404s_for_a_pair_that_is_not_this_agents(
     aid = _agent(client, auth_headers)
     resp = client.get(
         f"/agents/{aid}/state/bindings/slack/C000000S03/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
+_ROUTE_PAIR_CHECK = "agent_channels_route_pair_ck"
+
+
+async def _seed_identity_only_slack_binding(agent_id: str, address: str, adapter: str) -> None:
+    """Directly persist a Slack binding under a NAMED identity with no
+    endpoint -- the exact shape `_binding_scope` 404'd on before A3
+    (ADR-0168 decision 4).
+
+    `agent_channels_route_pair_ck` (migration 0024) still refuses this shape
+    -- adapter set, endpoint NULL -- from the ordinary write path: it predates
+    ADR-0168, and ADR-0168 decision 3's own contract migration (#3100, not
+    landed) is what makes `adapter` NOT NULL for Slack and gives the CHECK a
+    Slack exception. Until then this seeds the row directly, dropping and
+    restoring the CHECK around one INSERT, on the disposable per-run test
+    database only -- never a migration or any committed schema -- the same
+    way test_migration_0037_multibinding_state_identity.py seeds rows the
+    ORM/API layer cannot write. The restore always runs, even if the insert
+    fails, and re-adds NOT VALID (this one seeded row is the only one that
+    would fail revalidation) so the CHECK still enforces every later write.
+    """
+
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        await connection.execute(
+            f"ALTER TABLE curie.agent_channels DROP CONSTRAINT {_ROUTE_PAIR_CHECK}"
+        )
+        try:
+            await connection.execute(
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                "VALUES ($1, $2, 'slack', $3, $4)",
+                uuid.uuid4(),
+                uuid.UUID(agent_id),
+                address,
+                adapter,
+            )
+        finally:
+            await connection.execute(
+                f"ALTER TABLE curie.agent_channels ADD CONSTRAINT {_ROUTE_PAIR_CHECK} "
+                "CHECK ((endpoint IS NULL) = (adapter IS NULL)) NOT VALID"
+            )
+    finally:
+        await connection.close()
+
+
+def test_binding_scoped_state_reaches_a_binding_held_only_under_a_named_identity(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    declare_second_slack_identity: None,
+) -> None:
+    """A3's first behaviour (ADR-0168 decision 4): an agent's bindings on one
+    pair share one binding-state scope regardless of which Slack identity
+    holds it. Before this, `_binding_scope` resolved the pair through the
+    default identity alone (#3147), so an agent bound on a pair ONLY under a
+    named identity got a 404 from every one of its own
+    `/state/bindings/...` routes."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE10")
+    asyncio.run(_seed_identity_only_slack_binding(aid, "C0EXAMPLE11", "second"))
+
+    url = f"/agents/{aid}/state/bindings/slack/C0EXAMPLE11/ns/k"
+    put = client.put(url, json={"value": "named-identity"}, headers=auth_headers)
+    assert put.status_code == 200, put.text
+    got = client.get(url, headers=auth_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["value"] == "named-identity"
+
+
+def test_binding_scoped_route_404s_when_this_agent_holds_no_binding_on_the_pair(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A3's second behaviour: widening the identity the check accepts must
+    not widen whether a binding has to exist at all -- an agent with no row
+    on `(kind, address)` still 404s."""
+    aid = _agent(client, auth_headers, address="C0EXAMPLE12")
+    resp = client.get(
+        f"/agents/{aid}/state/bindings/slack/C0EXAMPLE13/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
+def test_binding_scoped_route_404s_when_only_another_agent_holds_the_pair(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    declare_second_slack_identity: None,
+) -> None:
+    """A3's third behaviour: widening the check across identities must not
+    widen it across agents -- another agent's binding on this pair, held
+    under a named identity, still does not admit a different agent."""
+    owner = _agent(client, auth_headers, address="C0EXAMPLE14", name="pair-owner")
+    asyncio.run(_seed_identity_only_slack_binding(owner, "C0EXAMPLE15", "second"))
+
+    other = _agent(client, auth_headers, address="C0EXAMPLE16", name="not-the-owner")
+    resp = client.get(
+        f"/agents/{other}/state/bindings/slack/C0EXAMPLE15/ns/k", headers=auth_headers
     )
     assert resp.status_code == 404
     assert "binding" in resp.text.lower()
