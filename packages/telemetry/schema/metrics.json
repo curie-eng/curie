@@ -1102,6 +1102,8 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
@@ -1156,7 +1158,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3960
+      "cardinality_bound": 4040
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1235,6 +1237,8 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
@@ -1289,7 +1293,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 3960
+      "cardinality_bound": 4040
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1368,6 +1372,8 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
@@ -1415,7 +1421,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 792
+      "cardinality_bound": 808
     },
     "curie.background.loop": {
       "type": "counter",

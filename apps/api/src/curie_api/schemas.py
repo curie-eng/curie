@@ -2778,3 +2778,75 @@ class ConsoleSessionOut(BaseModel):
 
     subject: str | None
     expires_at: datetime
+
+
+# --- provider installations (#2909, ADR 0155 step 4) -----------------------
+
+ProviderName = Literal[
+    "slack", "m365", "github", "jira", "linear", "confluence", "quickbooks", "other"
+]
+ProviderInstallationStatus = Literal["connected", "disconnected", "degraded"]
+
+
+def _reject_explicit_null(value: Any) -> Any:
+    if value is None:
+        raise ValueError("may be omitted but not null")
+    return value
+
+
+class ProviderInstallationCreate(BaseModel):
+    """A connected external account, created by an administrator.
+
+    ``credential_ref`` and ``webhook_verification_ref`` are plain strings
+    here, with no Field constraints, on purpose: FastAPI's 422 echoes the
+    rejected input, and a value pasted where a reference belongs is exactly
+    the credential that must not come back. The router checks both against
+    the reference grammar and answers with a message that omits the value.
+    """
+
+    provider: ProviderName
+    external_account_id: str = Field(min_length=1)
+    # Omitted means the default tenant; nothing branches on how many exist.
+    tenant_id: uuid.UUID | None = None
+    display_name: str | None = None
+    credential_ref: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    webhook_verification_ref: str | None = None
+    status: ProviderInstallationStatus = "connected"
+    installed_by_principal_id: uuid.UUID | None = None
+
+
+class ProviderInstallationUpdate(BaseModel):
+    """Partial update: an omitted field is unchanged, and null clears a nullable one.
+
+    The reference fields follow ``ProviderInstallationCreate``'s rule.
+    """
+
+    display_name: str | None = None
+    external_account_id: str | None = Field(default=None, min_length=1)
+    credential_ref: str | None = None
+    scopes: list[str] | None = None
+    webhook_verification_ref: str | None = None
+    status: ProviderInstallationStatus | None = None
+
+    _not_null = field_validator("external_account_id", "scopes", "status")(
+        _reject_explicit_null
+    )
+
+
+class ProviderInstallationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    provider: str
+    external_account_id: str
+    display_name: str | None
+    # A pointer into the secret store, held to the reference grammar.
+    credential_ref: str | None
+    scopes: list[str]
+    webhook_verification_ref: str | None
+    status: str
+    installed_by_principal_id: uuid.UUID | None
+    installed_at: datetime
+    disconnected_at: datetime | None
