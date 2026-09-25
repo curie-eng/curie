@@ -713,7 +713,8 @@ if prewarm_got is not None:
 platform_value = priority_classes.get(platform_name)
 sandbox_value = priority_classes.get(sandbox_name)
 if platform_value is not None and sandbox_value is not None:
-    if not int(platform_value) > int(sandbox_value) > 0:
+    # Helm renders a large integer value as 1e+06, so parse through float.
+    if not int(float(platform_value)) > int(float(sandbox_value)) > 0:
         sys.stderr.write(
             "rendered PriorityClass values do not order platform > sandbox > 0 "
             f"(platform={platform_value!r}, sandbox={sandbox_value!r}); the "
