@@ -33,12 +33,6 @@ on:
       # skipped, and the gate that exists to catch exactly that revert
       # never runs.
       - "apps/dispatcher/src/curie_dispatcher/config.py"
-      # Fourth obligation, same shape: the Slack identities gate (ADR-0168
-      # decision 1) feeds the rendered declaration through this parser, which
-      # all three config files above import, and the worker's env through the
-      # sandbox filter. A PR that loosens either must still run it.
-      - "packages/aci-protocol/src/aci_protocol/slack_identities.py"
-      - "apps/worker/src/curie_worker/sandbox/types.py"
       - "uv.lock"
       - "pyproject.toml"
       # The unpinned-image gate (#2319) and the Langfuse image-pin gate
@@ -54,6 +48,15 @@ on:
       # and the gate that exists to catch exactly that revert never runs.
       - "cli/src/ops/upgrade.rs"
       - "cli/tests/data/upgrade-driver.py"
+      # Fourth obligation, the first gate's shape: the Slack identities gate
+      # (ADR-0168 decision 1) feeds the rendered declaration through this
+      # parser, which the API, worker and dispatcher config all import, and
+      # the worker's env through the sandbox filter. The parser reads the
+      # default identity's name and the reserved delivery selector from
+      # turn.py. A PR that loosens any of them must still run it.
+      - "packages/aci-protocol/src/aci_protocol/slack_identities.py"
+      - "packages/aci-protocol/src/aci_protocol/turn.py"
+      - "apps/worker/src/curie_worker/sandbox/types.py"
 
 permissions:
   contents: read

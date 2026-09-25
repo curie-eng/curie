@@ -129,6 +129,10 @@ def test_the_chart_rendering_parses_as_rendered(monkeypatch: pytest.MonkeyPatch)
         ([DEFAULT, {**SECOND, "name": "Second"}], "should match pattern"),
         ([DEFAULT, {**SECOND, "name": "a" * 41}], "at most 40 characters"),
         ([DEFAULT, {**SECOND, "note": "x"}], "Extra inputs are not permitted"),
+        (
+            [DEFAULT, {**SECOND, "name": "curie-cluster-message"}],
+            "'curie-cluster-message' is a reserved delivery selector",
+        ),
         ([{**DEFAULT, "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0"}], "'default' must read"),
         ([{**DEFAULT, "app_token_env": "CURIE_SLACK_APP_TOKEN__0"}], "'default' must read"),
         (

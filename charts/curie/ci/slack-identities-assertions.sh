@@ -291,9 +291,29 @@ for workload in ("worker", "api"):
     assert named(only_env[workload], *LEGACY_NAMES) == [
         entry("SLACK_BOT_TOKEN", "slack-main", "slackBotToken")
     ], f"T2: {workload} default bot token must follow the listed default"
-t2 = json.loads(named(only_env["worker"], DECLARATION)[0]["value"])
-assert [item["name"] for item in t2] == ["default", "second"], f"T2: default first: {t2!r}"
-assert t2[0]["signing_secret_env"] is None and t2[1]["app_token_env"] == "CURIE_SLACK_APP_TOKEN__0"
+# The one shape where `default` takes the legacy names from a list entry and
+# has no signing secret; the real parser reads it below, beside T1's.
+t2_expected = [
+    {"name": "default", "app_token_env": "SLACK_APP_TOKEN", "bot_token_env": "SLACK_BOT_TOKEN",
+     "signing_secret_env": None},
+    {"name": "second", "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+     "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+     "signing_secret_env": "CURIE_SLACK_SIGNING_SECRET__0"},
+]
+t2_declarations = {
+    workload: [e["value"] for e in entries if e["name"] == DECLARATION]
+    for workload, entries in only_env.items()
+}
+assert all(len(values) == 1 for values in t2_declarations.values()), (
+    f"T2: every workload must carry exactly one {DECLARATION}; got {t2_declarations!r}"
+)
+assert len({values[0] for values in t2_declarations.values()}) == 1, (
+    f"T2: the three workloads disagree: {t2_declarations!r}"
+)
+t2_rendered = t2_declarations["worker"][0]
+assert json.loads(t2_rendered) == t2_expected, f"T2: default first, no signing secret: {t2_rendered}"
+(work / "t2-rendered-declaration.txt").write_text(t2_rendered)
+(work / "t2-expected-declaration.json").write_text(json.dumps(t2_expected))
 
 # --- T3: no dispatcher here; the API and worker still read the list ---------
 headless_values = with_block(SECOND)
@@ -336,6 +356,18 @@ refuse("N16 malformed second entry", with_block(SECOND, {**THIRD, "name": "Third
        "dispatcher.slack.identities[1].name")
 refuse("N17 refused on upgrade too", with_block({**SECOND, "name": "Second"}), f"{W0}.name",
        args=("--is-upgrade",))
+refuse("N18 non-string signing ref", with_block({**SECOND, "signingSecretExistingSecret": True}),
+       f"{W0}.signingSecretExistingSecret must name the Secret holding this identity's signing secret")
+refuse("N19 empty signing ref", with_block({**SECOND, "signingSecretExistingSecret": ""}),
+       f"{W0}.signingSecretExistingSecret must name the Secret holding this identity's signing secret")
+refuse("N20 signing key without its Secret",
+       with_block({**THIRD, "signingSecretExistingSecretKey": "signing"}),
+       f"{W0}.signingSecretExistingSecretKey is set without {W0}.signingSecretExistingSecret")
+refuse("N21 an empty map, not a list", slack(appToken="xapp-example", botToken="xoxb-example",
+                                            identities={}),
+       "dispatcher.slack.identities must be a list")
+refuse("N22 the reserved delivery selector", with_block({**SECOND, "name": "curie-cluster-message"}),
+       f"{W0}.name", "curie-cluster-message", "reserved")
 
 # --- X: extraEnv cannot shadow a name this chart owns -----------------------
 def with_extra_env(values, workload, name):
@@ -351,7 +383,8 @@ for workload in ("worker", "api", "dispatcher"):
            f"{workload}.extraEnv", DECLARATION, "dispatcher.slack.identities")
 # X2: an indexed name is reserved wherever the list renders it.
 for workload, name in (("worker", "CURIE_SLACK_BOT_TOKEN__0"), ("api", "CURIE_SLACK_BOT_TOKEN__0"),
-                       ("dispatcher", "CURIE_SLACK_APP_TOKEN__0")):
+                       ("dispatcher", "CURIE_SLACK_APP_TOKEN__0"),
+                       ("dispatcher", "CURIE_SLACK_SIGNING_SECRET__0")):
     refuse(f"X2 {workload} {name}", with_extra_env(with_block(SECOND), workload, name),
            f"{workload}.extraEnv", name, W0)
 
@@ -381,7 +414,8 @@ PY
 # starts from the repo root: the apps are workspace members.
 (
   cd "$REPO_ROOT"
-  uv run --python 3.13 python - "$WORK/rendered-declaration.txt" "$WORK/expected-declaration.json" "$WORK/worker-env-names.json" <<'PY'
+  uv run --python 3.13 python - "$WORK/rendered-declaration.txt" "$WORK/expected-declaration.json" "$WORK/worker-env-names.json" \
+    "$WORK/t2-rendered-declaration.txt" "$WORK/t2-expected-declaration.json" <<'PY'
 import json
 import os
 import sys
@@ -393,10 +427,11 @@ for key in [key for key in os.environ if key.startswith(("CURIE_", "SLACK_"))]:
 rendered = open(sys.argv[1]).read()
 expected = json.load(open(sys.argv[2]))
 worker_env_names = json.load(open(sys.argv[3]))
+t2_rendered = open(sys.argv[4]).read()
+t2_expected = json.load(open(sys.argv[5]))
 
 os.environ["CURIE_API_KEY"] = "example-api-key"
 os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"] = "example-attester-secret"
-os.environ["CURIE_SLACK_IDENTITIES"] = rendered
 
 from curie_api.config import Settings
 from curie_dispatcher.config import DispatcherConfig
@@ -404,13 +439,22 @@ from curie_worker.config import WorkerConfig
 from curie_worker.sandbox.types import filter_agent_child_env
 from pydantic import ValidationError
 
-parsed = {
-    "api": Settings().slack_identities,
-    "worker": WorkerConfig().slack_identities,
-    "dispatcher": DispatcherConfig().slack_identities,
-}
-assert len(set(parsed.values())) == 1, f"the three services disagree: {parsed!r}"
-assert [identity.model_dump() for identity in parsed["api"]] == expected, parsed["api"]
+
+def parse_everywhere(label, declaration, want):
+    """The declaration as all three services read it, and read alike."""
+    os.environ["CURIE_SLACK_IDENTITIES"] = declaration
+    parsed = {
+        "api": Settings().slack_identities,
+        "worker": WorkerConfig().slack_identities,
+        "dispatcher": DispatcherConfig().slack_identities,
+    }
+    assert len(set(parsed.values())) == 1, f"{label}: the three services disagree: {parsed!r}"
+    assert [identity.model_dump() for identity in parsed["api"]] == want, (label, parsed["api"])
+    return parsed
+
+
+t2_parsed = parse_everywhere("T2", t2_rendered, t2_expected)
+parsed = parse_everywhere("T1", rendered, expected)
 
 token_names = {
     name for name in worker_env_names
@@ -432,8 +476,9 @@ except ValidationError:
 else:
     raise AssertionError("the real parser ACCEPTED a bot token env name the sandbox filter misses")
 
-print(f"OK: the rendered declaration parsed identically in the API, worker and dispatcher "
-      f"({[identity.name for identity in parsed['api']]}); the sandbox filter dropped "
+print(f"OK: the rendered declarations parsed identically in the API, worker and dispatcher "
+      f"({[identity.name for identity in parsed['api']]} and, list-only, "
+      f"{[identity.name for identity in t2_parsed['api']]}); the sandbox filter dropped "
       f"{sorted(token_names)}; an unfiltered env name was refused")
 PY
 )
