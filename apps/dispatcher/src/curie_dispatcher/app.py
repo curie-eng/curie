@@ -118,6 +118,43 @@ def build_app(
     return app
 
 
+# How long closing a connection waits for the builtin client's session runner
+# to finish its current pass. A pass is bounded by the socket's receive timeout
+# (slack_sdk's builtin ``Connection`` defaults it to 3 seconds) or a 0.2 second
+# idle sleep; past this, the daemon thread is left rather than hanging shutdown.
+_SESSION_RUNNER_JOIN_S = 5.0
+
+
+def _stop_session_runner(client: Any) -> None:
+    """Stop the session runner thread the builtin Socket Mode client leaves up.
+
+    Observed on slack_sdk 3.44.1, probing a ``SocketModeHandler`` built over a
+    token-verification-free Bolt ``App``:
+
+    - ``close()`` stops the app monitor, the message processor and the worker
+      pool, but ``client.current_session_runner.is_alive()`` is still True
+      afterwards, so each connection built leaves one thread behind.
+    - With a session installed (a socketpair standing in for the websocket),
+      ``close()`` then setting the runner's event and joining it for 3 s
+      leaves it alive: the pass in ``run_until_completion`` loops while its
+      session state is not terminated, sleeping while the socket is gone.
+      Marking ``current_session_state.terminated`` first let the join finish
+      in under a second.
+
+    Every attribute is slack_sdk internals, so each is looked up guardedly.
+    """
+    state = getattr(client, "current_session_state", None)
+    if state is not None:
+        state.terminated = True
+    runner = getattr(client, "current_session_runner", None)
+    event = getattr(runner, "event", None)
+    if isinstance(event, threading.Event):
+        event.set()
+    thread = getattr(runner, "thread", None)
+    if isinstance(thread, threading.Thread) and thread.is_alive():
+        thread.join(_SESSION_RUNNER_JOIN_S)
+
+
 class SocketModeConnection(Connection):
     """Adapts Bolt's SocketModeHandler to the supervisor's Connection protocol.
 
@@ -181,8 +218,23 @@ class SocketModeConnection(Connection):
             )
 
     def run(self) -> None:
-        self._closed.clear()
-        self._handler.connect()  # type: ignore[no-untyped-call]
+        # The supervisor never reuses a connection, so a close that landed
+        # before run is final: honour it rather than clearing it.
+        if self._closed.is_set():
+            return
+        try:
+            self._handler.connect()  # type: ignore[no-untyped-call]
+        except BaseException:
+            # The handler started its client's threads at construction; a
+            # connect that fails would otherwise leave them running, one set
+            # per reconnect attempt.
+            self.close()
+            raise
+        if self._closed.is_set():
+            # A close landed while connect was in flight and tore down a
+            # handler connect then brought back up; close what it opened.
+            self.close()
+            return
         if self._slack_identity is None:
             self._logger.info("socket mode connected identity=%s", release_identity())
         else:
@@ -199,3 +251,7 @@ class SocketModeConnection(Connection):
             self._handler.close()  # type: ignore[no-untyped-call]
         except Exception:  # pragma: no cover - best-effort teardown
             self._logger.exception("error closing socket mode handler")
+        try:
+            _stop_session_runner(self._handler.client)
+        except Exception:  # pragma: no cover - best-effort teardown
+            self._logger.exception("error stopping the socket mode session runner")

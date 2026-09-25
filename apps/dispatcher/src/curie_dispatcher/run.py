@@ -10,6 +10,7 @@ graceful shutdown, and runs the supervisors together. Run it with
 import logging
 import os
 import signal
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -210,10 +211,21 @@ def main() -> None:
         )
         hb_stop = start_heartbeat(config.heartbeat_file, config.heartbeat_interval_s)
 
-        def _handle_signal(signum: int, _frame: object) -> None:
+        def _shut_down(signum: int) -> None:
             logger.info("received signal %s, shutting down", signum)
             hb_stop.set()
             supervisor.request_stop()
+
+        def _handle_signal(signum: int, _frame: object) -> None:
+            # A handler runs on the main thread between two of its bytecodes,
+            # and a group of one runs its supervisor there, so the stop's locks
+            # (the supervisor's, and each event's condition) may already be
+            # held by the very thread it interrupted. Starting a thread takes
+            # only the thread registry's lock, which is reentrant
+            # (an RLock on CPython 3.13, `threading._active_limbo_lock`).
+            threading.Thread(
+                target=_shut_down, args=(signum,), name="dispatcher-shutdown", daemon=True
+            ).start()
 
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
