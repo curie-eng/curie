@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .models import ThreadTranscript, WorkflowStateEntry, WorkItem
+from .threadkeys import pre_identity_thread_key_for
 
 TRANSCRIPT_NAMESPACE = "transcript"
 
@@ -181,10 +182,54 @@ async def _adopt_legacy(
     return copied
 
 
+async def _adopt_pre_identity(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
+) -> bool:
+    """Copy the transcript a named non-Slack route kept under its pre-identity key.
+
+    ADR-0168 decision 4 gave that route's key an identity segment. Same rules
+    as ``_adopt_legacy``: copy when this key has no row or the old row is
+    newer, and never lock or delete the old row, which a worker that has not
+    rolled still writes. Does not commit. Returns whether anything was copied.
+    """
+    old_key = await pre_identity_thread_key_for(session, agent_id, key)
+    if old_key is None:
+        return False
+    copied = await _adopt_legacy(session, agent_id, scope, old_key)
+    old: ThreadTranscript | None = await session.scalar(
+        select(ThreadTranscript).where(*_where(agent_id, scope, old_key), _live())
+    )
+    if old is None:
+        return copied
+    current: ThreadTranscript | None = await session.scalar(
+        select(ThreadTranscript).where(*_where(agent_id, scope, key)).with_for_update()
+    )
+    if current is None:
+        session.add(
+            ThreadTranscript(
+                agent_id=agent_id,
+                binding_scope=scope,
+                thread_key=key,
+                value=old.value,
+                version=old.version,
+                expires_at=_expiry(),
+            )
+        )
+    elif old.updated_at > current.updated_at:
+        current.value = old.value
+        current.version = max(current.version, old.version) + 1
+        current.expires_at = _expiry()
+    else:
+        return copied
+    await session.flush()
+    return True
+
+
 async def get(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
 ) -> ThreadTranscript | None:
-    if await _adopt_legacy(session, agent_id, scope, key):
+    adopted = await _adopt_legacy(session, agent_id, scope, key)
+    if await _adopt_pre_identity(session, agent_id, scope, key) or adopted:
         await session.commit()
     row: ThreadTranscript | None = await session.scalar(
         select(ThreadTranscript).where(*_where(agent_id, scope, key), _live())
@@ -196,6 +241,7 @@ async def _get_locked(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
 ) -> ThreadTranscript | None:
     await _adopt_legacy(session, agent_id, scope, key)
+    await _adopt_pre_identity(session, agent_id, scope, key)
     await _sweep_expired(session, agent_id)
     row: ThreadTranscript | None = await session.scalar(
         select(ThreadTranscript).where(*_where(agent_id, scope, key)).with_for_update()
