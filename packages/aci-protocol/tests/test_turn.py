@@ -30,7 +30,14 @@ from aci_protocol import (
     parse_queued_turn,
 )
 from aci_protocol.events import _READER_CONTEXT_KEY
-from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, matching_routes, route_identity
+from aci_protocol.turn import (
+    CLUSTER_MESSAGE_ADAPTER,
+    DEFAULT_IDENTITY,
+    SLACK_KIND,
+    matching_routes,
+    route_identity,
+    slack_speaking_identity,
+)
 from pydantic import ValidationError
 
 # The committed cross-language golden the Rust CLI re-serializes byte-identically
@@ -587,6 +594,39 @@ def test_another_kind_keeps_its_adapter_or_its_absence() -> None:
     assert route_identity("email", "agentmail-sandbox") == "agentmail-sandbox"
     # A route-less non-Slack binding stays route-less: NULL is not an identity.
     assert route_identity("email", None) is None
+
+
+@pytest.mark.parametrize(
+    ("adapter", "endpoint", "expected"),
+    [
+        (None, None, DEFAULT_IDENTITY),
+        ("default", None, DEFAULT_IDENTITY),
+        ("support-bot", None, "support-bot"),
+        # An empty endpoint is no endpoint: the route is the configured Slack.
+        ("support-bot", "", "support-bot"),
+        (CLUSTER_MESSAGE_ADAPTER, None, DEFAULT_IDENTITY),
+        # The pre-ADR custom-transport form stores a credential slug in
+        # `adapter`, not an identity, so its calls keep the default app's token.
+        ("proof-offline", "http://127.0.0.1:1", DEFAULT_IDENTITY),
+        (None, "http://127.0.0.1:1", DEFAULT_IDENTITY),
+    ],
+)
+def test_a_slack_route_speaks_as_its_resolved_identity(
+    adapter: str | None, endpoint: str | None, expected: str
+) -> None:
+    assert slack_speaking_identity(SLACK_KIND, adapter, endpoint) == expected
+
+
+@pytest.mark.parametrize(
+    ("adapter", "endpoint"),
+    [("agentmail-sandbox", "https://mail.example.test/"), (None, None)],
+)
+def test_another_kinds_slack_calls_speak_as_the_default_identity(
+    adapter: str | None, endpoint: str | None
+) -> None:
+    # A mail route's `adapter` names a mail adapter, never a Slack identity, so
+    # a Slack call made for it (an approver group lookup) keeps the default app.
+    assert slack_speaking_identity("email", adapter, endpoint) == DEFAULT_IDENTITY
 
 
 @dataclass(frozen=True)
