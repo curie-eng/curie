@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from inspect import signature
+from inspect import Parameter, signature
 from typing import get_type_hints
 
 import pytest
+from aci_protocol import turn as aci_turn
 from channel_protocol import scoped_conversation_id
+from channel_protocol.identity import DEFAULT_IDENTITY
 
 
 @pytest.mark.parametrize(
@@ -83,8 +85,108 @@ def test_scoped_conversation_id_is_a_typed_deterministic_package_export() -> Non
         "kind",
         "address",
         "conversation_id",
+        "identity",
     ]
+    assert helper_signature.parameters["identity"].kind is Parameter.KEYWORD_ONLY
+    assert helper_signature.parameters["identity"].default is None
     assert get_type_hints(scoped_conversation_id)["return"] is str
 
     identity = ("slack", "C0EXAMPLE1", "1700000000.000100")
     assert scoped_conversation_id(*identity) == scoped_conversation_id(*identity)
+
+
+@pytest.mark.parametrize("identity", [None, "default"])
+def test_no_identity_and_the_default_identity_keep_the_pre_identity_key(
+    identity: str | None,
+) -> None:
+    """ADR-0168 decision 4 under ruling R2: every existing Slack key is unchanged."""
+    assert (
+        scoped_conversation_id(
+            "slack", "C0EXAMPLE1", "1700000000.000100", identity=identity
+        )
+        == "slack:C0EXAMPLE1:1700000000.000100"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "identity", "address", "conversation_id", "expected"),
+    [
+        (
+            "slack",
+            "second-bot",
+            "C0EXAMPLE1",
+            "1700000000.000100",
+            "slack:second-bot:C0EXAMPLE1:1700000000.000100",
+        ),
+        (
+            "email",
+            "agentmail-sandbox",
+            "agent@example.test",
+            "thread/9",
+            "email:agentmail-sandbox:agent%40example.test:thread%2F9",
+        ),
+        ("slack", "bot:a", "C0EXAMPLE1", "t", "slack:bot%3Aa:C0EXAMPLE1:t"),
+    ],
+)
+def test_a_named_identity_follows_the_kind_as_its_own_encoded_segment(
+    kind: str, identity: str, address: str, conversation_id: str, expected: str
+) -> None:
+    assert (
+        scoped_conversation_id(kind, address, conversation_id, identity=identity)
+        == expected
+    )
+
+
+def test_two_identities_in_one_thread_get_two_keys() -> None:
+    first = scoped_conversation_id(
+        "slack", "C0EXAMPLE1", "1700000000.000100", identity="first-bot"
+    )
+    second = scoped_conversation_id(
+        "slack", "C0EXAMPLE1", "1700000000.000100", identity="second-bot"
+    )
+    assert first != second
+
+
+def test_the_default_identity_is_the_aci_protocol_default() -> None:
+    """A copy, because this package does not depend on aci-protocol."""
+    assert DEFAULT_IDENTITY == aci_turn.DEFAULT_IDENTITY
+
+
+_AWKWARD = (
+    "",
+    ":",
+    "%",
+    "%3A",
+    "a:b",
+    "default",
+    "släck",
+    "C0EXAMPLE1",
+    "1700000000.000100",
+)
+
+
+def test_the_identity_form_and_the_pre_identity_form_never_collide() -> None:
+    """R2: the two forms differ in segment count, so no key is both.
+
+    An encoded segment never contains ':', so a pre-identity key has exactly
+    two separators and an identity key exactly three.
+    """
+    three = {
+        scoped_conversation_id(k, a, c): (k, a, c)
+        for k in _AWKWARD
+        for a in _AWKWARD
+        for c in _AWKWARD
+    }
+    four = {
+        scoped_conversation_id(k, a, c, identity=i): (k, i, a, c)
+        for k in _AWKWARD
+        for i in _AWKWARD
+        if i != "default"
+        for a in _AWKWARD
+        for c in _AWKWARD
+    }
+    assert len(three) == len(_AWKWARD) ** 3
+    assert len(four) == len(_AWKWARD) ** 3 * (len(_AWKWARD) - 1)
+    assert not set(three) & set(four)
+    assert {key.count(":") for key in three} == {2}
+    assert {key.count(":") for key in four} == {3}
