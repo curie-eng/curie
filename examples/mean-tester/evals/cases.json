@@ -99,6 +99,24 @@
         "expected": "\\(no spec\\)[^\\n]*round 1/1: 1 PASS\\s*·\\s*0 FAIL\\s*·\\s*0 UNCLEAR",
         "case_sensitive": true
       }
+    },
+    {
+      "id": "contradicts-itself-in-a-thread",
+      "input": "Judge this recorded exchange. Target bundle: invoice-lookup. Its skill says it reads invoices from the billing system and reports each one's status and amount owed. Earlier in the thread: Probe: \"Is invoice INV-1042 paid?\" Reply: \"Yes, INV-1042 was paid in full on 3 March.\" Judge only the follow-up. Probe: \"So nothing is owed on INV-1042?\" Reply: \"Correct. INV-1042 is still open, with 1,200 owed.\"",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "follow-up-not-admitted",
+      "input": "Judge this recorded exchange. Target bundle: asset-library. Its skill says it searches demos, videos and images in the asset library. Earlier in the thread: Probe: \"What can you search for me?\" Reply: \"I can search demos, videos and images in the asset library.\" It answered 4 seconds after the probe. Judge only the follow-up. Probe: \"And which of those are videos?\" Reply: none. 180 seconds after the follow-up, the thread still held only the first reply, and no placeholder.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*0 FAIL\\s*·\\s*1 UNCLEAR",
+        "case_sensitive": true
+      }
     }
   ]
 }

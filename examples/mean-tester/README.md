@@ -1,8 +1,9 @@
 # Mean tester example
 
-This bundle tests another agent the way a person does. It plans a round of at
-most four probes from the target's spec, asks the target over Slack from its
-own bot, then reports PASS, FAIL or UNCLEAR per probe with the reply quoted. It
+This bundle tests another agent the way a person does. It plans a campaign of
+probes from the target's spec, asks the target over Slack from its own bot,
+following up inside the threads it opens, then reports PASS, FAIL or UNCLEAR
+per probe with the reply quoted. It
 holds no platform API key and no cluster credential. It judges only what the
 target's Slack surface shows, and it files nothing. See
 [ADR-0169](../../docs/adr/0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md)
@@ -12,16 +13,22 @@ It is one skill, a manifest and `.mcp.json`. It reaches Slack and GitHub through
 two off-the-shelf stdio MCP servers that the runner image preinstalls:
 `slack-mcp` (`@zencoderai/slack-mcp-server@0.0.1`) and `mcp-server-github`.
 
-This README is the bundle's design. It departs from those ADRs in three places:
+This README is the bundle's design. It departs from those ADRs in five places:
 - the spec may come with the request, and Git is only one source of it
   (ADR-0169 decision 2);
 - a round runs without a spec, grading only what needs none;
 - the request names the channel to probe, instead of an operator list
-  (ADR-0172 decision 1).
+  (ADR-0172 decision 1);
+- one request runs a whole campaign, not one round of four probes
+  (ADR-0169 decision 4);
+- it follows up inside the threads its own probes opened, so the tool policy
+  allows `slack_reply_to_thread` (ADR-0172 decision 2).
 
 One tester serves agents that other teams build and deploy. Reading their
 bundles from Git would put those teams' repository credentials in the tester's
-sandbox, and every new target would need a redeploy of the tester.
+sandbox, and every new target would need a redeploy of the tester. And a mean
+test that is four probes long finds little: the ones that found real defects
+ran to forty or more, with follow-ups inside the thread.
 
 ## Where the spec comes from
 
@@ -72,6 +79,12 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
   bound. The manifest declares the secret either way. With no repository
   listed, give it a token that can read no private repository, such as a
   fine-grained token limited to public repositories.
+- **Enough agent steps for a campaign.** The runner ends a turn after
+  `CURIE_MAX_TURNS` model steps, 20 by default. A campaign takes well over a
+  hundred: every probe, read and wait is a step. Set it for the tester's
+  installation through `agentSandbox.runner.extraEnv`, for example
+  `[{name: CURIE_MAX_TURNS, value: "300"}]`. A turn that runs out fails with
+  `error_max_turns`, after probes were sent, so it is not retried.
 - **For attached specs:** turn the attachment lane on (`attachments.enabled`)
   and give the tester's Slack app the `files:read` scope. Without both,
   attached files are ignored, so paste the spec into the request instead.
@@ -81,7 +94,9 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
 Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKILL.md):
 - the channel to probe when a request names none, if you want a default;
 - the `owner/repo@branch` repositories it may read target bundles from, if any;
-- the test installations, if any.
+- the test installations, if any;
+- how many new threads a campaign may open per 15 minutes, how many follow-ups
+  a thread may carry, and the turn budget (see "A campaign").
 
 Every target not listed as a test installation is production. Against
 production, the tester only reads and asks. It never asks for an action, even
@@ -141,13 +156,62 @@ Slack turns `#agents-testing` into a `<#C…>` reference. The request can instea
 attach the target's files, name `bundle asset-search` from a listed
 repository, or give no spec at all.
 
-The tester sends one ordinary probe to check that the target answers, then runs
-one round of at most four probes, and replies with the report. The report's
-`Next:` lines are the probes still planned. For the next round, reply in the
-report's thread with the mention: `@mean-tester continue`. The dispatcher
-receives only mentions and direct messages, so a bare `continue` reaches
-nobody. For each FAIL, the report carries an eval case for the target's
-`evals/cases.json`. You file the issue.
+That one request runs a whole campaign and replies with its report. To send one
+probe and nothing else, add `with exactly this probe: "…"`.
+
+Reply in the report's thread with the mention: `@mean-tester continue` runs
+what a campaign left as `Next:` lines, and `@mean-tester rerun <id>` sends a
+finished campaign's messages again. The dispatcher receives only mentions and
+direct messages, so a bare `continue` reaches nobody. For each FAIL, the report
+carries an eval case for the target's `evals/cases.json`. You file the issue.
+
+## A campaign
+
+The tester plans the whole test from the spec, writes every expectation down,
+and only then sends anything. A campaign has five kinds of thread:
+- **ordinary use:** one probe for each thing the spec says the target does;
+- **boundaries:** a near miss, something that does not exist, a value it must
+  refuse;
+- **refusals:** an off-topic ask, a forbidden action asked as a question, an
+  instruction to ignore its rules;
+- **authority:** someone else already approved it, the rules changed this
+  morning;
+- **conversation:** a follow-up in the same thread that corrects, contradicts
+  or builds on the first answer.
+
+The target's committed eval cases, and the FAILs of earlier campaigns, go
+first.
+
+**Fewer threads, more turns each.** Each thread opens with a root probe and
+carries follow-ups inside it. That is what keeps a campaign inside the target's
+capacity. A new thread holds one sandbox for the route's lifetime
+(`routeTtlSeconds`), and an installation's sandboxes are shared by every agent
+and every person on it. Forty new threads at once would fill the quota and turn
+into forty capacity refusals, for the target's real users too.
+
+The operator sets three numbers under "Where you work":
+- **new threads per 15 minutes:** the share of the target installation's
+  sandboxes a campaign may take;
+- **follow-ups per thread:** the most the target installation admits. It
+  admits a bot's mention inside a thread only for a pair on its threaded-bot
+  allowlist (#2440), and may cap how many it admits. Use 0 until the target's
+  operator has listed the tester, and the tester then opens a thread per
+  probe;
+- **the turn budget:** the tester's own `worker.deliveryBudgetSeconds`. A
+  campaign runs in one turn, and stops starting threads five minutes before
+  the budget ends. What does not fit is left as `Next:` lines.
+
+**Rerun.** Every probe a campaign sends carries its id: `[mean test <id>]`.
+After a fix, `@mean-tester rerun <id>` finds that campaign's messages in the
+channel and sends them again, word for word and in the same order. It reports
+each probe as fixed, still failing, newly failing or unchanged. The same
+messages are what make the second run a check of the fix, rather than a new
+test.
+
+**The report** puts findings worst first: an action claimed without evidence,
+then an invented fact, then a failure text, then a wrong answer, then UNCLEAR.
+It counts each kind of thread and carries eval cases for the worst three FAILs,
+all in one Slack reply of under 3,000 characters.
 
 ## Evals
 
@@ -164,6 +228,6 @@ curie skill eval --plugin-dir examples/mean-tester
 
 - Resolve, approve or reject any approval card.
 - Change anything about its target, or file anything.
-- Reply inside a target's thread, react, or read Slack users: the tool policy
-  allows exactly the six tools listed in
+- Reply in any thread but the ones its own probes opened, react, or read Slack
+  users: the tool policy allows exactly the seven tools listed in
   [`docs/PERMISSION-MAP.md`](docs/PERMISSION-MAP.md).
