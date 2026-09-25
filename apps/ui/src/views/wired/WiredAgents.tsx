@@ -13,7 +13,7 @@ const METRICS_WINDOW_LABEL = "last 7d";
 
 // One card's metrics fetch, isolated so each card owns its own hook call and
 // its own loading/error state.
-function AgentMetricsLine({ agent }: { agent: AgentOut }) {
+export function AgentMetricsLine({ agent }: { agent: AgentOut }) {
   // No `environment` filter: runner traces carry no deployment environment
   // today, so an environment filter matches nothing; the agent trace-name
   // filter already scopes the query to this agent (mirrors agent_trace_filter
@@ -27,9 +27,9 @@ function AgentMetricsLine({ agent }: { agent: AgentOut }) {
   const tokens = s ? s.tokens.toLocaleString() : "—";
   const cost = s ? `$${s.cost_usd.toFixed(2)}` : "—";
   return (
-    <div style={{ fontSize: 12, color: C.muted, fontFamily: C.mono, marginBottom: 10 }}>
+    <span style={{ fontSize: 12, color: C.muted, fontFamily: C.mono }}>
       {`${runs} runs · ${tokens} tokens · ${cost} (${METRICS_WINDOW_LABEL})`}
-    </div>
+    </span>
   );
 }
 
@@ -142,7 +142,9 @@ export function WiredAgents() {
                 <div style={{ fontFamily: C.mono, fontSize: 13 }}>{new Date(a.created_at).toLocaleDateString()}</div>
               </div>
             </div>
-            <AgentMetricsLine agent={a} />
+            <div style={{ marginBottom: 10 }}>
+              <AgentMetricsLine agent={a} />
+            </div>
             <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
               {/* No status chip: GET /agents carries no bundle/deploy state, so we
                   cannot honestly claim an agent is "live" from the list alone. */}

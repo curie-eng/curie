@@ -141,9 +141,10 @@ OPENROUTER_KEY_URL = f"https://{OPENROUTER_HOST}/api/v1/key"
 # The factory agent's per-agent execution deadline (#3071, ADR 0171; the
 # maximum), which the ExecutionRequest deadline follows, and the chart's
 # maximum worker delivery budget.
-# Context window declared for a gateway model Claude Code's catalog does not
-# know. Conservative, so compaction starts before any supported model's limit.
-GATEWAY_CONTEXT_TOKENS = 128_000
+# Context window declared for DEFAULT_MODEL, which Claude Code's catalog does
+# not know. Another model declares its own through
+# CURIE_FACTORY_MODEL_CONTEXT_TOKENS; a guessed window could compact too late.
+DEFAULT_MODEL_CONTEXT_TOKENS = 128_000
 EXECUTION_BOUND_SECONDS = 10800
 # Wait allowance after the execution deadline for publication and the notice.
 PUBLICATION_ALLOWANCE_SECONDS = 600
@@ -301,6 +302,7 @@ class FactoryConfig:
     actor_token: str = dataclasses.field(repr=False)
     model_api_key: str | None = dataclasses.field(default=None, repr=False)
     model: str = DEFAULT_MODEL
+    model_context_tokens: int | None = DEFAULT_MODEL_CONTEXT_TOKENS
     bundle_dir: Path = DEFAULT_BUNDLE
     curie_bin: str = "curie"
     # The operator's own GitHub login; None means ask gh at check time.
@@ -564,6 +566,21 @@ def load_config(
             "CURIE_FACTORY_BUNDLE_DIR (a plugin bundle directory; default examples/dark-factory)"
         )
 
+    model = env.get("CURIE_FACTORY_MODEL") or DEFAULT_MODEL
+    # Only DEFAULT_MODEL has a known window; another model declares its own or
+    # keeps Claude Code's unknown-model notice rather than a guessed window.
+    model_context_tokens: int | None = (
+        DEFAULT_MODEL_CONTEXT_TOKENS if model == DEFAULT_MODEL else None
+    )
+    if env.get("CURIE_FACTORY_MODEL_CONTEXT_TOKENS"):
+        raw = env["CURIE_FACTORY_MODEL_CONTEXT_TOKENS"]
+        if raw.isdigit() and int(raw) > 0:
+            model_context_tokens = int(raw)
+        else:
+            missing.append(
+                "CURIE_FACTORY_MODEL_CONTEXT_TOKENS (a positive integer, the context window)"
+            )
+
     if missing:
         raise ConfigError(
             "missing required factory credential or setting: "
@@ -586,7 +603,8 @@ def load_config(
         webhook_secret=webhook_secret,
         actor_token=actor_token,
         model_api_key=env.get("CURIE_FACTORY_MODEL_API_KEY") or None,
-        model=env.get("CURIE_FACTORY_MODEL") or DEFAULT_MODEL,
+        model=model,
+        model_context_tokens=model_context_tokens,
         bundle_dir=bundle_dir,
         curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
         operator_login=env.get("CURIE_FACTORY_OPERATOR_LOGIN") or None,
@@ -773,10 +791,15 @@ def install_values(
         # session-title side request keeps one needless call per turn off the
         # gateway, and naming the context window silences the unknown-model
         # notice instead of letting Claude Code guess a window.
-        values["agentSandbox"]["runner"]["extraEnv"] = [
-            {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"},
-            {"name": "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "value": str(GATEWAY_CONTEXT_TOKENS)},
-        ]
+        extra_env = [{"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"}]
+        if config.model_context_tokens is not None:
+            extra_env.append(
+                {
+                    "name": "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                    "value": str(config.model_context_tokens),
+                }
+            )
+        values["agentSandbox"]["runner"]["extraEnv"] = extra_env
         # The chart maximum, so the agent's 10800 s execution deadline and not
         # the default 600 s worker budget bounds the run. The runner ceiling
         # must not exceed the delivery budget.
