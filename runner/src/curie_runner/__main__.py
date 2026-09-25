@@ -421,7 +421,8 @@ def build_runner(
         approval_gate.state_server_mounted = state_mounted
         approval_gate.publication_precheck = PublicationPrecheck(
             mounted_workspace,
-            os.environ.get("CURIE_STATE_URL") or os.environ.get("CURIE_PROGRESS_URL"),
+            os.environ.get(BootEnv.env_key("state_url"))
+            or os.environ.get(BootEnv.env_key("progress_url")),
             network_enabled=not fake_model,
         )
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
