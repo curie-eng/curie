@@ -40,6 +40,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
+from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_dispatcher.app import build_app
 from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.handlers import process_action
@@ -1003,6 +1004,7 @@ def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
             web_client=harness.web_client,
             redis_client=redis_client,
             config=config,
+            slack_identity=DEFAULT_IDENTITY,
             logger=harness.logger,
         )
         _drain(harness.app)

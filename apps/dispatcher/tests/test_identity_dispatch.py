@@ -6,13 +6,16 @@ is. Two apps built for two identities feed one stream. The identity is fixed
 when an app is built, so nothing in a delivery can move it.
 """
 
+import inspect
 import json
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import redis
 from curie_dispatcher import app as app_module
+from curie_dispatcher import handlers as handlers_module
 from curie_dispatcher.app import build_app, build_web_client
 from curie_dispatcher.approval_actions import (
     APPROVE_ACTION_ID,
@@ -20,6 +23,7 @@ from curie_dispatcher.approval_actions import (
     ResolveOutcome,
 )
 from curie_dispatcher.config import DispatcherConfig
+from curie_dispatcher.handlers import process_action, process_event
 from curie_dispatcher.identities import SlackIdentityCredentials
 from curie_dispatcher.queue import from_stream_fields
 from slack_bolt import App
@@ -141,7 +145,7 @@ def _mention(
     return SocketModeRequest(type="events_api", envelope_id=envelope_id, payload=payload)
 
 
-def _button(envelope_id: str) -> SocketModeRequest:
+def _button(envelope_id: str, *, extra: dict[str, Any] | None = None) -> SocketModeRequest:
     return SocketModeRequest(
         type="interactive",
         envelope_id=envelope_id,
@@ -156,6 +160,7 @@ def _button(envelope_id: str) -> SocketModeRequest:
             "channel": {"id": CHANNEL},
             "message": {"ts": "1700.0001", "thread_ts": "1700.0001"},
             "actions": [{"type": "button", "action_id": "reports", "action_ts": "1.5"}],
+            **(extra or {}),
         },
     )
 
@@ -252,6 +257,94 @@ def test_the_delivery_cannot_choose_the_identity(
     assert payloads["Ev0EXAMPLE4:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
 
 
+def test_a_button_click_cannot_choose_the_identity(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    default = _default(config, redis_client)
+    ops = _ops(config, redis_client)
+
+    default.handle(
+        _button(
+            "env-f3", extra={"adapter": "ops-bot", "identity": "ops-bot", "api_app_id": "A0OPS"}
+        )
+    )
+    ops.handle(_button("env-f4", extra={"adapter": "default", "identity": "default"}))
+    default.drain()
+    ops.drain()
+
+    payloads = _payloads(redis_client, config)
+    assert set(payloads) == {"action-trig-env-f3", "action-trig-env-f4:ops-bot"}
+    assert payloads["action-trig-env-f3"]["reply_handle"]["adapter"] is None
+    assert payloads["action-trig-env-f4:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
+
+
+def test_a_direct_message_to_an_identity_mints_that_identity(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    ops = _ops(config, redis_client)
+    dm = {
+        "type": "message",
+        "channel_type": "im",
+        "channel": CHANNEL,
+        "user": "U123",
+        "text": "status",
+        "ts": "1700.0002",
+    }
+
+    ops.handle(
+        SocketModeRequest(
+            type="events_api",
+            envelope_id="env-m1",
+            payload={
+                "type": "event_callback",
+                "event_id": "Ev0EXAMPLE7",
+                "team_id": "T1",
+                "event": dm,
+            },
+        )
+    )
+    ops.drain()
+
+    payloads = _payloads(redis_client, config)
+    assert set(payloads) == {"Ev0EXAMPLE7:ops-bot"}
+    assert payloads["Ev0EXAMPLE7:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
+    ops.web_client.chat_postMessage.assert_called_once()
+
+
+@pytest.mark.parametrize("identity", ["default", "ops-bot"])
+def test_the_enqueue_line_names_the_release_and_the_slack_identity(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    identity: str,
+) -> None:
+    monkeypatch.setenv("CURIE_RELEASE_IDENTITY", "curie-release-7")
+    connection = _default if identity == "default" else _ops
+    bot_user_id = "U0DEFAULT" if identity == "default" else "U0OPS"
+    conn = connection(config, redis_client)
+
+    with caplog.at_level(logging.INFO, logger=handlers_module.__name__):
+        conn.handle(_mention("env-l1", "Ev0EXAMPLE8", bot_user_id=bot_user_id))
+        conn.drain()
+
+    enqueued = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == handlers_module.__name__ and r.getMessage().startswith("enqueued ")
+    ]
+    assert len(enqueued) == 1
+    assert enqueued[0].endswith(f" identity=curie-release-7 slack_identity={identity}")
+
+
+@pytest.mark.parametrize("lane", [process_event, process_action])
+def test_a_lane_must_be_told_which_identity_it_serves(lane: Any) -> None:
+    """No fallback: a caller that forgets the identity fails, not mints `default`."""
+
+    parameter = inspect.signature(lane).parameters["slack_identity"]
+    assert parameter.default is inspect.Parameter.empty
+
+
 def test_the_default_identity_mints_exactly_the_handle_it_always_did(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
@@ -339,14 +432,18 @@ def test_bolt_and_the_web_client_are_built_from_the_identity_given(
     monkeypatch.setattr(app_module, "App", RecordingApp)
     monkeypatch.setattr(app_module, "WebClient", recording_web_client)
 
+    ops = SlackIdentityCredentials(
+        name="ops-bot", app_token="xapp-ops", bot_token="xoxb-ops", signing_secret="signing-ops"
+    )
+
     build_app(
-        config, identity=OPS, web_client=build_web_client(config, OPS), redis_client=redis_client
+        config, identity=ops, web_client=build_web_client(config, ops), redis_client=redis_client
     )
 
     assert client_calls == [{"token": "xoxb-ops", "timeout": 2}]
     assert app_calls == [
         {
-            "signing_secret": "unused-in-socket-mode",
+            "signing_secret": "signing-ops",
             "token": "xoxb-ops",
             "token_verification_enabled": False,
         }

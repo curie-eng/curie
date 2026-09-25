@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import QueuedTurn, ReplyHandle
+from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_dispatcher import handlers as handlers_module
 from curie_dispatcher import queue as queue_module
 from curie_dispatcher.config import DispatcherConfig
@@ -271,6 +272,7 @@ def test_accepted_slack_ingress_owns_claim_placeholder_and_enqueue_trace(
                 web_client=web_client,  # type: ignore[arg-type]
                 redis_client=redis_client,
                 config=config,
+                slack_identity=DEFAULT_IDENTITY,
             )
         else:
             result = process_action(
@@ -284,6 +286,7 @@ def test_accepted_slack_ingress_owns_claim_placeholder_and_enqueue_trace(
                 web_client=web_client,  # type: ignore[arg-type]
                 redis_client=redis_client,
                 config=config,
+                slack_identity=DEFAULT_IDENTITY,
             )
 
     assert result is not None
@@ -339,6 +342,7 @@ def test_slack_ingress_keeps_claim_placeholder_enqueue_order(
         web_client=_WebClient(order),  # type: ignore[arg-type]
         redis_client=redis_client,
         config=config,
+        slack_identity=DEFAULT_IDENTITY,
     )
 
     assert result is not None
@@ -370,6 +374,7 @@ def test_duplicate_and_refused_slack_inputs_emit_no_enqueue_span(
             web_client=web_client,  # type: ignore[arg-type]
             redis_client=redis_client,
             config=config,
+            slack_identity=DEFAULT_IDENTITY,
         )
         refused = process_event(
             body={"event_id": "Ev-refused"},
@@ -378,6 +383,7 @@ def test_duplicate_and_refused_slack_inputs_emit_no_enqueue_span(
             web_client=web_client,  # type: ignore[arg-type]
             redis_client=redis_client,
             config=config,
+            slack_identity=DEFAULT_IDENTITY,
         )
 
     assert duplicate is None
