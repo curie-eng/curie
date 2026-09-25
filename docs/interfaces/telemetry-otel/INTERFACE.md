@@ -121,7 +121,8 @@ keys:
   `curie.generation.round`, `curie.tool.call.index`, and `curie.tool.outcome`.
   Generation content adds `langfuse.observation.input` and `langfuse.observation.output`
   (#3128), on `llm.generation` spans only, redacted and then clipped to 8000 characters.
-  Input is the turn prompt or the names of the tool results that opened the round
+  Input is a `[user prompt: N chars]` placeholder (never the prompt text) or the names
+  of the tool results that opened the round
   (`[tool_result NAME]`, `[tool_result NAME error]`); output is assistant text and
   `[tool_use NAME]` markers. Tool arguments and tool results are never recorded.
   `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
