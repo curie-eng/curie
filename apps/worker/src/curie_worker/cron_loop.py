@@ -498,7 +498,11 @@ class CronSchedulerLoop:
                         target.agent_name,
                     )
 
-        log = logger.info if summary.did_work else logger.debug
+        # A pass that only lost a slot race to another replica did no work,
+        # but it is the one signal that replicas are contending for slots, so
+        # it must stay visible at INFO (#3013). A pass where nothing happened
+        # stays at DEBUG.
+        log = logger.info if (summary.did_work or summary.lost) else logger.debug
         log(
             "cron pass: %d admitted, %d blocked, %d skipped, %d failed, %d lost",
             summary.admitted,
