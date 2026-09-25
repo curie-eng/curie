@@ -475,6 +475,33 @@ fn the_mirror_structs_carry_exactly_the_frozen_field_names() {
     );
 }
 
+#[test]
+fn the_mirror_keeps_an_empty_admits_list_apart_from_a_missing_one() {
+    // `admits: []` admits no agent and a missing list admits the deploying
+    // agent alone (ADR-0168 decision 7), so a reader that folded one into the
+    // other would change who may call the connector.
+    let file = connector_build::parse_connectors(
+        "connectors:\n  closed:\n    image: x:1\n    admits: []\n  alone:\n    image: x:1\n",
+    )
+    .expect("both declarations parse");
+    assert_eq!(file.connectors["closed"].admits, Some(Vec::new()));
+    assert_eq!(file.connectors["alone"].admits, None);
+}
+
+#[test]
+fn the_mirror_carries_self_as_written() {
+    // `self` names the agent the bundle is deployed as. The CLI never knows
+    // that agent, so it must hand the entry on unresolved.
+    let file = connector_build::parse_connectors(
+        "connectors:\n  grafana:\n    image: x:1\n    admits: [self, acme-ops]\n",
+    )
+    .expect("the declaration parses");
+    assert_eq!(
+        file.connectors["grafana"].admits,
+        Some(vec!["self".to_string(), "acme-ops".to_string()])
+    );
+}
+
 // ─── object_name / service_dns: the Docker network alias ─────────────────────
 
 #[test]

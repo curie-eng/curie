@@ -902,3 +902,99 @@ def test_bundle_surfaces_an_ambiguous_connector_name(tmp_path: Path) -> None:
     offending = [e for e in result.errors if e.code == "connectors.ambiguous_name"]
     assert offending, [e.code for e in result.errors]
     assert "mcp-grafana" in offending[0].message
+
+
+# --------------------------------------------------------------------------- #
+# `admits`: the agents whose sandboxes a hosted connector lets in
+# (ADR-0168 decision 7)
+# --------------------------------------------------------------------------- #
+def test_a_hosted_connector_carries_the_agents_it_admits() -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x:1", "admits": ["acme-dev", "acme-ops"]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].admits == ["acme-dev", "acme-ops"]
+
+
+def test_a_missing_admits_list_stays_distinct_from_an_empty_one() -> None:
+    # Absent admits the deploying agent alone and `[]` admits no agent, so the
+    # parsed model must keep the two apart for the renderer to tell them apart.
+    parsed, errors = validate_connectors(
+        {"connectors": {"alone": {"image": "x:1"}, "closed": {"image": "x:1", "admits": []}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["alone"].admits is None
+    assert parsed.connectors["closed"].admits == []
+
+
+def test_admits_accepts_self_for_the_agent_the_bundle_is_deployed_as() -> None:
+    # `self` keeps a bundle portable across deploy targets: the same file admits
+    # whichever agent it is deployed as. Validation carries it as written;
+    # nothing resolves it to a name yet.
+    parsed, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x:1", "admits": ["self", "acme-ops"]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].admits == ["self", "acme-ops"]
+
+
+def test_self_admitted_twice_is_a_duplicate() -> None:
+    assert _codes({"connectors": {"grafana": {"image": "x:1", "admits": ["self", "self"]}}}) == [
+        "connectors.duplicate_admits"
+    ]
+
+
+def test_a_build_form_connector_carries_admits_too() -> None:
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "k8s-write": {
+                        "build": {"context": "connectors/k8s-write", "platforms": ["linux/amd64"]},
+                        "admits": ["acme-dev"],
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+def test_admits_on_a_remote_connector_is_refused() -> None:
+    assert _codes(
+        {"connectors": {"internal": {"url": "https://mcp.example.com/mcp", "admits": ["acme-dev"]}}}
+    ) == ["connectors.remote_has_admits"]
+
+
+@pytest.mark.parametrize(
+    "name", ["Acme-Dev", "acme_dev", "acme dev", "-acme", "acme-", "", "a" * 41, "Self", "SELF"]
+)
+def test_an_admitted_name_must_have_the_agent_name_shape(name: str) -> None:
+    assert _codes({"connectors": {"grafana": {"image": "x:1", "admits": [name]}}}) == [
+        "connectors.bad_admits_agent"
+    ]
+
+
+def test_an_agent_admitted_twice_is_reported_once() -> None:
+    assert _codes({"connectors": {"grafana": {"image": "x:1", "admits": ["acme-dev"] * 3}}}) == [
+        "connectors.duplicate_admits"
+    ]
+
+
+def test_the_admitted_name_rule_is_the_deploy_target_agent_rule() -> None:
+    # deploy_targets imports connectors, so connectors cannot import the agent
+    # rule back. The two copies are pinned equal here instead.
+    from plugin_format import connectors, deploy_targets
+
+    assert connectors._NAME_RE.pattern == deploy_targets._NAME_RE.pattern
+    assert connectors._NAME_MAX == deploy_targets._NAME_MAX
+
+
+def test_bundle_surfaces_a_refused_admits_entry(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, "connectors:\n  grafana:\n    image: x:1\n    admits: [Acme]\n")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert "connectors.bad_admits_agent" in [e.code for e in result.errors]

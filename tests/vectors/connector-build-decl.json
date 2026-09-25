@@ -307,6 +307,48 @@
       },
       "expect": "accept",
       "codes": []
+    },
+    {
+      "name": "a_hosted_connector_lists_the_agents_it_admits",
+      "why": "ADR-0168 decision 7. `curie build` reads connectors.yaml before the platform does, so a mirror that refused `admits` would stop a bundle carrying it from building at all.",
+      "document": {
+        "connectors": {
+          "grafana": {
+            "image": "ghcr.io/acme-corp/mcp-grafana:0.17.2",
+            "admits": ["acme-dev", "acme-ops"]
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
+    },
+    {
+      "name": "a_hosted_connector_admits_the_agent_it_is_deployed_as_by_self",
+      "why": "`self` names whichever agent the bundle is deployed as, so one file stays portable across deploy targets. The mirror carries the entry as written; neither language resolves it at read time.",
+      "document": {
+        "connectors": {
+          "grafana": {
+            "image": "ghcr.io/acme-corp/mcp-grafana:0.17.2",
+            "admits": ["self", "acme-ops"]
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
+    },
+    {
+      "name": "an_empty_admits_list_is_accepted_on_the_build_form",
+      "why": "`[]` admits no agent, which is a declaration and not a typo, and the build form is as hosted as the image form.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": { "context": "connectors/k8s-write", "platforms": ["linux/amd64"] },
+            "admits": []
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
     }
   ]
 }
