@@ -384,3 +384,27 @@ def test_a_long_wait_is_a_bounded_foreground_until_loop_not_a_long_sleep():
     run = _section("Running a campaign")
     assert "sleep 110" not in run
     assert "until [ $(date +%s) -ge" in run
+
+
+def test_the_report_asks_for_the_next_request_as_a_new_message():
+    # MEASURED 2026-09-25: after a 31-probe campaign and one "continue", "rerun"
+    # in the campaign's thread was refused with history-persistence-error. One
+    # campaign turn can fill most of a thread's history, so the report must not
+    # send the person back into that thread.
+    report = _section("Reporting")
+    assert "in a new message" in report
+    assert '"continue <id>"' in report and '"rerun <id>"' in report
+    assert "in this thread" not in report
+
+
+def test_continue_and_rerun_find_the_campaign_by_its_id():
+    # A new message opens a new thread and a new sandbox, so neither the plan
+    # file nor "this thread's" report is there to read.
+    description = _skill().split("\n---", 1)[0]
+    assert '"continue <id>"' in description and '"rerun <id>"' in description
+    cont = _section('"continue"')
+    assert "`continue <id>`" in cont
+    assert "find the campaign's report by its id" in cont
+    rerun = _section('"rerun"')
+    assert "find the campaign's report by its id" in rerun
+    assert "When the report cannot be found" in rerun
