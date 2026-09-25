@@ -182,12 +182,19 @@ pub struct ConnectorManifests {
 /// a Slack binding stored with none reads back `"default"`, a non-Slack binding
 /// reads its adapter slug or `null` when no route is configured. `#[serde(default)]`
 /// keeps a platform that predates the field parsing to `None`.
+///
+/// `allowed_callers` is who may talk to the bot through this binding (ADR 0175):
+/// `None` means everyone, which is also what a platform that predates the field
+/// reads as. Skipped when serializing a `None`, so no request built from this
+/// struct can send a key the binding write models refuse.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub kind: String,
     pub address: String,
     #[serde(default)]
     pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 /// The identity every Slack binding had before ADR-0168: the installation's one
@@ -2090,6 +2097,46 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Set or clear one binding's caller list:
+    /// `PUT /agents/{id}/channels/callers?kind=&address=[&adapter=]` (ADR 0175).
+    ///
+    /// `callers` of `None` sends an explicit JSON `null`, which clears the list
+    /// so everyone may talk to the bot again; a list replaces the stored one
+    /// whole. The API checks the entries against the binding's kind and answers
+    /// the agent as stored, so the caller reports what took rather than what it
+    /// sent. This write does not bump the binding generation, so it never
+    /// revokes an adapter's channel token.
+    pub async fn set_channel_callers(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        address: &str,
+        adapter: Option<&str>,
+        callers: Option<&[String]>,
+    ) -> Result<Agent> {
+        let mut query = vec![("kind", kind), ("address", address)];
+        if let Some(adapter) = adapter {
+            query.push(("adapter", adapter));
+        }
+        let resp = self
+            .http
+            .put(format!(
+                "{}/agents/{agent_id}/channels/callers",
+                self.base_url
+            ))
+            .query(&query)
+            .header("X-API-Key", &self.api_key)
+            .json(&serde_json::json!({ "allowed_callers": callers }))
+            .send()
+            .await
+            .context("PUT /agents/{id}/channels/callers")?;
+        Self::expect_ok(resp, "setting the surface's caller list")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent after the caller list write")
+    }
+
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).
     ///
     /// `adapter`, when known, is the identity the resolved binding speaks
@@ -3676,6 +3723,7 @@ mod tests {
             kind: kind.into(),
             address: "C0EXAMPLE1".into(),
             adapter: adapter.map(str::to_string),
+            allowed_callers: None,
         };
         assert_eq!(binding("slack", Some("default")).named_adapter(), None);
         assert_eq!(
