@@ -372,3 +372,12 @@ def test_a_campaign_waits_in_the_foreground_because_nothing_wakes_it():
     run = _section("Running a campaign")
     assert "never in the background" in run
     assert "Nothing will wake you" in run
+
+
+def test_a_long_wait_is_a_bounded_foreground_until_loop_not_a_long_sleep():
+    # MEASURED in the runner's session log: the harness refused "sleep 110"
+    # ("Blocked: standalone sleep 110 ... use ... an until-loop"), accepted
+    # "sleep 20", and the campaign then waited in the background and ended.
+    run = _section("Running a campaign")
+    assert "sleep 110" not in run
+    assert "until [ $(date +%s) -ge" in run
