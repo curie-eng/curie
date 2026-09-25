@@ -106,6 +106,7 @@ async fn run_command_deploy(server: &MockServer, plugin_dir: &Path) -> commands:
         tier: commands::DeployTier::Local,
         agent: None,
         target: None,
+        identity: None,
         plugin_dir: plugin_dir.to_path_buf(),
         api_url: server.base_url.clone(),
         api_key: "test-key".to_string(),

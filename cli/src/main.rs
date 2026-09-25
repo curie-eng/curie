@@ -1942,6 +1942,12 @@ enum LocalAction {
         /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Identity (bot) the Slack binding this deploy writes speaks through
+        /// (ADR-0168 decision 8). Overrides the target's `identity`; omitted,
+        /// the target's is used, else the installation's own. Needs a channel:
+        /// --slack-channel, or the target's slack_channel.
+        #[arg(long, value_name = "NAME")]
+        identity: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
@@ -2832,7 +2838,7 @@ enum ClusterAction {
         /// and forgetting one leaves an agent that exists and never updates.
         /// Ordered dev-first so a run that fails part-way leaves prod on its
         /// previous version rather than ahead of a dev that never landed.
-        #[arg(long, conflicts_with_all = ["target", "agent", "env", "slack_channel"])]
+        #[arg(long, conflicts_with_all = ["target", "agent", "env", "slack_channel", "identity"])]
         all_targets: bool,
         /// Deploy under this agent name instead of the manifest's `name`.
         ///
@@ -2872,6 +2878,12 @@ enum ClusterAction {
         /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Identity (bot) the Slack binding this deploy writes speaks through
+        /// (ADR-0168 decision 8). Overrides the target's `identity`; omitted,
+        /// the target's is used, else the installation's own. Needs a channel:
+        /// --slack-channel, or the target's slack_channel.
+        #[arg(long, value_name = "NAME")]
+        identity: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
@@ -4444,6 +4456,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 plugin_dir,
                 agent,
                 target,
+                identity,
                 api_url,
                 api_key,
                 slack_channel,
@@ -4463,6 +4476,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     plugin_dir,
                     agent,
                     target,
+                    identity,
                     api_url,
                     api_key,
                     slack_channel,
@@ -5215,6 +5229,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 plugin_dir,
                 agent,
                 target,
+                identity,
                 all_targets,
                 api_url,
                 namespace,
@@ -5482,6 +5497,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             plugin_dir: plugin_dir.clone(),
                             agent: agent.clone(),
                             target: Some(target.clone()),
+                            identity: None,
                             api_url: api_url.clone(),
                             api_key: api_key.clone(),
                             slack_channel: slack_channel.clone(),
@@ -5595,6 +5611,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
+                        identity: identity.clone(),
                         api_url: api_url.clone(),
                         api_key: api_key.clone(),
                         slack_channel: slack_channel.clone(),

@@ -1608,6 +1608,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Bind this agent to a GitHub repository (`owner/name`) so pushes to its dev/prod branches deploy it (ADR-0014)",
               "id": "repo",
               "long": "repo",
@@ -4339,6 +4347,14 @@ export const commandManifest = {
               "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
               "id": "slack_channel",
               "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
               "positional": false,
               "required": false
             },

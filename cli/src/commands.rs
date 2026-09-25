@@ -1326,6 +1326,7 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         // identity there, so there is nothing to override.
         agent: None,
         target: None,
+        identity: None,
         api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
@@ -4678,6 +4679,10 @@ pub struct DeployOpts {
     pub agent: Option<String>,
     /// Resolve agent/env/channel from a `deploy.yaml` target (ADR-0089).
     pub target: Option<String>,
+    /// The identity the Slack binding this deploy writes speaks through
+    /// (ADR-0168 decision 8). `None` takes the target's, else `default`, which
+    /// is written exactly as before.
+    pub identity: Option<String>,
     pub plugin_dir: PathBuf,
     pub api_url: String,
     pub api_key: String,
@@ -4903,6 +4908,26 @@ fn is_documentation_placeholder_channel(channel: &str) -> bool {
     })
 }
 
+/// Refuse an `--identity` that is not a deploy.yaml identity name, before any
+/// request. @spec ADR-0168 d8. The rule is `plugin_format.deploy_targets`'
+/// target-name rule; which names exist is the platform's to say.
+pub fn validate_identity_name(name: &str) -> Result<()> {
+    let bytes = name.as_bytes();
+    let alnum = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let valid = matches!((bytes.first(), bytes.last()), (Some(first), Some(last)) if alnum(first) && alnum(last))
+        && bytes.len() <= 40
+        && bytes.iter().all(|byte| alnum(byte) || *byte == b'-');
+    if valid {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "--identity `{name}` is not an identity name: lowercase letters, digits and dashes, \
+         starting and ending with a letter or digit, at most 40 characters"
+    ))
+    .with_fix("pass the identity name the installation declares, for example --identity ops-bot")
+    .into())
+}
+
 fn reject_documentation_placeholder_target(
     target_name: &str,
     target: &crate::api::ResolvedTarget,
@@ -5043,6 +5068,9 @@ async fn prepare_deploy_with_commit_sha(
     let ui = crate::ui::ui();
     if let Some(channel) = opts.slack_channel.as_deref() {
         validate_channel_binding("slack", channel)?;
+    }
+    if let Some(identity) = opts.identity.as_deref() {
+        validate_identity_name(identity)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
     let packed_manifest = read_packed_bundle_manifest(&archive);
@@ -5205,6 +5233,20 @@ async fn prepare_deploy_with_commit_sha(
         .slack_channel
         .as_deref()
         .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref()));
+    // @spec ADR-0168 d8. An explicit flag beats the target, as every field does.
+    let identity = opts
+        .identity
+        .as_deref()
+        .or_else(|| resolved.as_ref().map(|r| r.identity.as_str()))
+        .filter(|name| *name != crate::api::DEFAULT_SLACK_IDENTITY);
+    if let (Some(identity), None) = (identity, slack_channel) {
+        return Err(crate::exit::CliError::usage(format!(
+            "identity `{identity}` names the Slack binding this deploy writes, and this deploy \
+             writes none: no --slack-channel was passed and no target slack_channel applies"
+        ))
+        .with_fix("pass --slack-channel <id>, or add slack_channel to the deploy.yaml target")
+        .into());
+    }
     let record_secrets = match opts.tier {
         DeployTier::Local => secrets.clone(),
         // Names-only placeholders over the EFFECTIVE set, not just
@@ -5227,7 +5269,7 @@ async fn prepare_deploy_with_commit_sha(
     // error arm below.
     let prepared = async {
         let (agent, channel, repo_note) = client
-            .resolve_agent(&agent_name, slack_channel, opts.repo.as_deref())
+            .resolve_agent_as(&agent_name, slack_channel, opts.repo.as_deref(), identity)
             .await?;
         check_deploy_routes_bound(
             declared_routes.as_ref(),
@@ -10178,6 +10220,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
@@ -10300,6 +10343,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10346,6 +10390,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10389,6 +10434,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10424,6 +10470,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
