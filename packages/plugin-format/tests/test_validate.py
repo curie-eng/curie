@@ -2595,3 +2595,114 @@ def test_other_platform_namespace_gates_are_refused(tmp_path: Path, gate: str) -
     _write_mcp(bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}')
 
     assert len(_gate_errors(bundle)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# ADR 0173: a bundle that layers its own runner image
+# --------------------------------------------------------------------------- #
+_RUNNER_CONNECTORS = (
+    "connectors: {}\n"
+    "runner:\n"
+    "  build:\n"
+    "    context: runner\n"
+    "    platforms: [linux/amd64, linux/arm64]\n"
+)
+_ARG_DOCKERFILE = "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\nRUN pip install acme-tools\n"
+
+
+def _runner_bundle(tmp_path: Path, dockerfile: str = _ARG_DOCKERFILE) -> Path:
+    root = _built_bundle(tmp_path, _RUNNER_CONNECTORS)
+    (root / "runner").mkdir(parents=True, exist_ok=True)
+    (root / "runner" / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+    return root
+
+
+def _write_runner_lock(root: Path, *, source_digest: str | None = None) -> None:
+    from plugin_format import connector_lock
+    from plugin_format.connectors import ConnectorBuild
+
+    build = ConnectorBuild.model_validate(
+        {"context": "runner", "platforms": ["linux/amd64", "linux/arm64"]}
+    )
+    digest = source_digest or connector_lock.source_digest_of(root / "runner", build)
+    (root / connector_lock.CONNECTOR_LOCK_FILE).write_text(
+        "version: 1\n"
+        "connectors: {}\n"
+        "runner:\n"
+        f"  image: registry.example/acme/acme-bot-runner@sha256:{'a' * 64}\n"
+        f"  base: ghcr.io/curie-eng/curie-runner@sha256:{'b' * 64}\n"
+        "  delivery: registry\n"
+        "  platforms: [linux/amd64, linux/arm64]\n"
+        f"  source_digest: {digest}\n",
+        encoding="utf-8",
+    )
+
+
+def test_a_locked_runner_layer_bundle_validates(tmp_path: Path) -> None:
+    # The control for every negative below.
+    root = _runner_bundle(tmp_path)
+    _write_runner_lock(root)
+    result = validate_bundle(root)
+    assert result.valid, [(e.code, e.message) for e in result.errors]
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "ARG CURIE_RUNNER_IMAGE\nFROM $CURIE_RUNNER_IMAGE\n",
+        "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE} AS runtime\nRUN true\n",
+    ],
+    ids=["unbraced", "named-stage"],
+)
+def test_the_base_argument_spellings_docker_accepts_validate(
+    tmp_path: Path, dockerfile: str
+) -> None:
+    root = _runner_bundle(tmp_path, dockerfile)
+    _write_runner_lock(root)
+    result = validate_bundle(root)
+    assert "connectors.runner_base_not_arg" not in {e.code for e in result.errors}
+    assert result.valid, [(e.code, e.message) for e in result.errors]
+
+
+def test_a_runner_dockerfile_naming_a_literal_base_is_refused(tmp_path: Path) -> None:
+    # A literal FROM builds on whatever the tag names today, so the base the
+    # lock records would describe an image the layer was not built from.
+    root = _runner_bundle(
+        tmp_path, "FROM ghcr.io/curie-eng/curie-runner:0.10.0\nRUN pip install acme-tools\n"
+    )
+    _write_runner_lock(root)
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.runner_base_not_arg")
+    assert "CURIE_RUNNER_IMAGE" in issue.message
+
+
+def test_a_declared_runner_with_no_lock_is_refused(tmp_path: Path) -> None:
+    root = _runner_bundle(tmp_path)
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.lock_missing")
+    assert "runner" in issue.message
+
+
+def test_a_lock_without_a_runner_entry_is_refused(tmp_path: Path) -> None:
+    root = _runner_bundle(tmp_path)
+    (root / "connectors.lock.yaml").write_text("version: 1\nconnectors: {}\n", encoding="utf-8")
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.lock_missing")
+    assert "runner" in issue.message
+
+
+def test_a_runner_lock_is_stale_once_the_runner_source_changes(tmp_path: Path) -> None:
+    root = _runner_bundle(tmp_path)
+    _write_runner_lock(root)
+    assert validate_bundle(root).valid, "the control: unchanged source validates"
+
+    (root / "runner" / "Dockerfile").write_text(
+        _ARG_DOCKERFILE + "RUN pip install acme-extra\n", encoding="utf-8"
+    )
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.lock_stale")
+    assert "runner" in issue.message

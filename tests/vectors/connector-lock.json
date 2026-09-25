@@ -1,5 +1,5 @@
 {
-  "comment": "Single source of truth for connectors.lock.yaml, the per install record of what a bundle's declared connector source resolved to (ADR 0113). Python owns ConnectorLockFile / ConnectorLockEntry, validate_connector_lock and apply_lock in packages/plugin-format/src/plugin_format/connector_lock.py; the Rust CLI owns hand mirrors in cli/src/connector_build.rs because `curie build` writes the file and `curie cluster deploy` preflights it, both before the platform ever sees the bundle. plugin-format.schema.json carries no Connector* $defs, so the schema driven field-parity gate compares nothing here and this file is the seam instead. Read by packages/plugin-format/tests/test_connector_lock.py and by cli/tests/connector_build_decl_vectors.rs.\n\napply_lock is the SINGLE enforcement point for \"the resolved digest is the only identity rendered into a Deployment or used to start the local connector\" (ADR 0113). It returns a derived ConnectorsFile in which each build: connector's image is the locked digest and its build is cleared, so every downstream reader (render, mcp_entry, is_hosted, the worker reconciler's plan) works unchanged against an ordinary image: spec.\n\nAn image reference is well formed in exactly two shapes and nothing else: `<repo>@sha256:<64 lowercase hex>` for delivery `registry`, which is the OCI content-addressable manifest digest form documented at https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests, and a bare `sha256:<64 lowercase hex>` for delivery `local-daemon`, which is the image ID `docker image inspect --format {{.Id}}` reports for a locally built image. Anything else, a tag included, is refused: a tag can be repointed after review, which is the mutable-tag failure this platform has already hit.\n\nEach vector carries: `name`, `why`, `connectors` (the connectors.yaml content), `lock` (the connectors.lock.yaml content), `portable` (the apply_lock keyword; only the cluster deploy preflight passes true), `expect` (\"apply\", \"raise\" or \"invalid\"), and on \"apply\" a `resolved` map of connector name to the image every downstream reader must then see. \"raise\" means validate_connector_lock accepts the document but apply_lock refuses it. \"invalid\" means the document does not survive validate_connector_lock at all, so it is rejected at bundle intake rather than at render time; `codes` names the reported error codes, all of which are namespaced under `connectors.lock`. Both lanes reject unknown keys inside a vector.",
+  "comment": "Single source of truth for connectors.lock.yaml, the per install record of what a bundle's declared connector source resolved to (ADR 0113). Python owns ConnectorLockFile / ConnectorLockEntry, validate_connector_lock and apply_lock in packages/plugin-format/src/plugin_format/connector_lock.py; the Rust CLI owns hand mirrors in cli/src/connector_build.rs because `curie build` writes the file and `curie cluster deploy` preflights it, both before the platform ever sees the bundle. plugin-format.schema.json carries no Connector* $defs, so the schema driven field-parity gate compares nothing here and this file is the seam instead. Read by packages/plugin-format/tests/test_connector_lock.py and by cli/tests/connector_build_decl_vectors.rs.\n\napply_lock is the SINGLE enforcement point for \"the resolved digest is the only identity rendered into a Deployment or used to start the local connector\" (ADR 0113). It returns a derived ConnectorsFile in which each build: connector's image is the locked digest and its build is cleared, so every downstream reader (render, mcp_entry, is_hosted, the worker reconciler's plan) works unchanged against an ordinary image: spec.\n\nAn image reference is well formed in exactly two shapes and nothing else: `<repo>@sha256:<64 lowercase hex>` for delivery `registry`, which is the OCI content-addressable manifest digest form documented at https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests, and a bare `sha256:<64 lowercase hex>` for delivery `local-daemon`, which is the image ID `docker image inspect --format {{.Id}}` reports for a locally built image. Anything else, a tag included, is refused: a tag can be repointed after review, which is the mutable-tag failure this platform has already hit.\n\nEach vector carries: `name`, `why`, `connectors` (the connectors.yaml content), `lock` (the connectors.lock.yaml content), `portable` (the apply_lock keyword; only the cluster deploy preflight passes true), `expect` (\"apply\", \"raise\" or \"invalid\"), and on \"apply\" a `resolved` map of connector name to the image every downstream reader must then see. \"raise\" means validate_connector_lock accepts the document but apply_lock refuses it. \"invalid\" means the document does not survive validate_connector_lock at all, so it is rejected at bundle intake rather than at render time; `codes` names the reported error codes, all of which are namespaced under `connectors.lock`. Both lanes reject unknown keys inside a vector.\n\nADR 0173 adds an optional top-level `runner:` to both files. connector_lock.resolve_runner_image(connectors, lock, portable=...) is the single resolver for it: a vector may carry `resolved_runner` (the image it must return, or null when no runner is declared). On \"raise\" the Python lane runs apply_lock then resolve_runner_image and requires a ValueError from that sequence. The runner entry's `image` AND `base` must both be digest shaped for its delivery; the Rust reader refuses a tag in either at the read (SHAPE_REFUSALS in cli/tests/connector_build_decl_vectors.rs).",
   "vectors": [
     {
       "name": "a_registry_entry_resolves_the_declaration_to_its_digest",
@@ -9,9 +9,14 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64", "linux/arm64"]
+              "platforms": [
+                "linux/amd64",
+                "linux/arm64"
+              ]
             },
-            "env": { "K8S_WRITE_ALLOWLIST": "acme-ns/acme-api" }
+            "env": {
+              "K8S_WRITE_ALLOWLIST": "acme-ns/acme-api"
+            }
           }
         }
       },
@@ -21,7 +26,10 @@
           "k8s-write": {
             "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "delivery": "registry",
-            "platforms": ["linux/amd64", "linux/arm64"],
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -38,7 +46,12 @@
       "connectors": {
         "connectors": {
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
@@ -48,7 +61,9 @@
           "tempo": {
             "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "delivery": "local-daemon",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -65,7 +80,12 @@
       "connectors": {
         "connectors": {
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
@@ -75,7 +95,9 @@
           "tempo": {
             "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "delivery": "local-daemon",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -91,7 +113,9 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
@@ -102,7 +126,9 @@
           "k8s-write": {
             "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -118,7 +144,9 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
@@ -129,7 +157,9 @@
           "k8s-write": {
             "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:0000",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -145,7 +175,9 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
@@ -156,7 +188,9 @@
           "k8s-write": {
             "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -172,7 +206,9 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
@@ -183,7 +219,9 @@
           "k8s-write": {
             "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -199,11 +237,18 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           },
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
@@ -213,7 +258,9 @@
           "k8s-write": {
             "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -228,23 +275,36 @@
         "connectors": {
           "grafana": {
             "image": "ghcr.io/acme-corp/mcp-grafana:0.17.2",
-            "args": ["-t", "streamable-http", "-disable-write"]
+            "args": [
+              "-t",
+              "streamable-http",
+              "-disable-write"
+            ]
           }
         }
       },
       "lock": null,
       "portable": true,
       "expect": "apply",
-      "resolved": { "grafana": "ghcr.io/acme-corp/mcp-grafana:0.17.2" }
+      "resolved": {
+        "grafana": "ghcr.io/acme-corp/mcp-grafana:0.17.2"
+      }
     },
     {
       "name": "a_url_connector_survives_a_lock_that_does_not_mention_it",
       "why": "REGRESSION for the remote form. A bundle mixing a built connector and a provider owned endpoint must keep the endpoint exactly as declared; only the built one is rewritten.",
       "connectors": {
         "connectors": {
-          "internal": { "url": "https://mcp.acme.example.com/mcp" },
+          "internal": {
+            "url": "https://mcp.acme.example.com/mcp"
+          },
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
@@ -254,7 +314,9 @@
           "tempo": {
             "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
@@ -271,7 +333,12 @@
       "connectors": {
         "connectors": {
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
@@ -281,7 +348,9 @@
           "tempo": {
             "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
             "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
           }
@@ -289,7 +358,9 @@
       },
       "portable": true,
       "expect": "invalid",
-      "codes": ["connectors.lock_invalid"]
+      "codes": [
+        "connectors.lock_invalid"
+      ]
     },
     {
       "name": "an_unknown_delivery_is_rejected_at_intake",
@@ -297,7 +368,12 @@
       "connectors": {
         "connectors": {
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
@@ -307,14 +383,18 @@
           "tempo": {
             "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "delivery": "node-import",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
       },
       "portable": true,
       "expect": "invalid",
-      "codes": ["connectors.lock_invalid"]
+      "codes": [
+        "connectors.lock_invalid"
+      ]
     },
     {
       "name": "an_unknown_lock_version_is_rejected_at_intake",
@@ -322,7 +402,12 @@
       "connectors": {
         "connectors": {
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
@@ -332,14 +417,275 @@
           "tempo": {
             "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "delivery": "registry",
-            "platforms": ["linux/amd64"],
+            "platforms": [
+              "linux/amd64"
+            ],
             "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
           }
         }
       },
       "portable": true,
       "expect": "invalid",
-      "codes": ["connectors.lock_unsupported_version"]
+      "codes": [
+        "connectors.lock_unsupported_version"
+      ]
+    },
+    {
+      "name": "a_registry_runner_entry_resolves_to_its_digest",
+      "why": "ADR 0173 decision 2: the renderer uses exactly the recorded runner digest and nothing derived from a tag.",
+      "connectors": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {},
+        "runner": {
+          "image": "ghcr.io/acme-corp/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "ghcr.io/curie-eng/curie-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "delivery": "registry",
+          "platforms": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "portable": true,
+      "expect": "apply",
+      "resolved": {},
+      "resolved_runner": "ghcr.io/acme-corp/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "a_bundle_declaring_no_runner_resolves_no_runner_image",
+      "why": "REGRESSION. Every bundle in the wild declares no runner and must keep the platform runner, so the resolver answers None rather than raising for a lock without a runner entry.",
+      "connectors": {
+        "connectors": {
+          "tempo": {
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "tempo": {
+            "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "delivery": "registry",
+            "platforms": [
+              "linux/amd64"
+            ],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "apply",
+      "resolved": {
+        "tempo": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "resolved_runner": null
+    },
+    {
+      "name": "a_local_daemon_runner_entry_applies_when_portability_is_not_required",
+      "why": "The dev fast path, same as for connectors: a local image id is a legitimate identity where nothing pulls it.",
+      "connectors": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {},
+        "runner": {
+          "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "base": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "delivery": "local-daemon",
+          "platforms": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "portable": false,
+      "expect": "apply",
+      "resolved": {},
+      "resolved_runner": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "a_local_daemon_runner_entry_is_refused_where_portability_is_required",
+      "why": "No cluster node can pull an image that lives only in the operator's Docker daemon; sandboxes would sit in ImagePullBackOff.",
+      "connectors": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {},
+        "runner": {
+          "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "base": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "delivery": "local-daemon",
+          "platforms": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "a_tag_shaped_runner_image_is_refused",
+      "why": "The mutable-tag failure ADR 0173 inherits from ADR 0113: a tag can be repointed after review.",
+      "connectors": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {},
+        "runner": {
+          "image": "ghcr.io/acme-corp/acme-bot-runner:v1",
+          "base": "ghcr.io/curie-eng/curie-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "delivery": "registry",
+          "platforms": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "a_tag_shaped_runner_base_is_refused",
+      "why": "The base is recorded so an upgrade can tell which platform runner a layer was built on. A tag there answers that question with whatever the tag points at today.",
+      "connectors": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {},
+        "runner": {
+          "image": "ghcr.io/acme-corp/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "ghcr.io/curie-eng/curie-runner:0.10.0",
+          "delivery": "registry",
+          "platforms": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "a_declared_runner_with_no_lock_entry_is_refused",
+      "why": "Falling back to the platform runner would silently drop every tool the bundle's layer installs; the agent then fails mid-turn on a missing binary.",
+      "connectors": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {}
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "an_unknown_key_in_the_runner_entry_is_rejected_at_intake",
+      "why": "The deny_unknown_fields proof for RunnerLockEntry.",
+      "connectors": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {},
+        "runner": {
+          "image": "ghcr.io/acme-corp/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": "ghcr.io/curie-eng/curie-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "delivery": "registry",
+          "platforms": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "tag": "v1"
+        }
+      },
+      "portable": true,
+      "expect": "invalid",
+      "codes": [
+        "connectors.lock_invalid"
+      ]
     }
   ]
 }
