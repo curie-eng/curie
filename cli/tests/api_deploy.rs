@@ -1658,6 +1658,41 @@ async fn a_named_identity_with_no_channel_is_refused_before_any_write() {
     assert!(server.recorded().is_empty());
 }
 
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_targets_identity_with_no_channel_is_refused_before_any_write() {
+    // No --identity flag: the name comes only from the resolved target. A
+    // check that reads `opts.identity` alone (ignoring `resolved.identity`)
+    // would see `None` here and let this deploy through to a write.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"ops-bot","connectors":null}"#,
+        ),
+        (m, p) => panic!("no write expected before the no-channel refusal: {m} {p}"),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let err = commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        None,
+        Some("dev"),
+        None,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2, "{err:#}");
+    assert!(err.to_string().contains(IDENTITY), "{err}");
+    let recorded = server.recorded();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "only the target resolve, no write: {recorded:?}"
+    );
+    assert_eq!(recorded[0].path, "/deploy-targets/resolve");
+}
+
 fn named_identity_route(req: &support::Request) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         // The target names the identity; its channel comes from the flag,
