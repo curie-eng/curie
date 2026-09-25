@@ -15,7 +15,7 @@ credentials. Their own scope is the real bound.
 |---|---|---|
 | `MEAN_TESTER_SLACK_BOT_TOKEN` | `slack-mcp` | The tester's own app. It posts only where the app is invited. |
 | `MEAN_TESTER_SLACK_TEAM_ID` | `slack-mcp` | Not a credential; the server refuses to start without it. |
-| `GITHUB_PERSONAL_ACCESS_TOKEN` | `mcp-server-github` | Fine-grained, **Contents: Read**, the listed repositories only. |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | `mcp-server-github` | Fine-grained, **Contents: Read**, the listed repositories only. With none listed, a token that can read no private repository. |
 
 ## Writes
 
@@ -35,6 +35,10 @@ thread it was asked in.
 | `github/search_code` | The target's `plugin.json` or `deploy.yaml` in a listed repository. |
 | `github/get_file_contents` | The target bundle's files and an optional specification. |
 | `github/list_commits` | The branch's latest commit, which the report names. |
+
+The GitHub reads happen only for a bundle in a listed repository. Files
+attached to a request arrive under `/attachments`, and the tester reads them
+with the runner's own file tools, which this MCP tool policy does not govern.
 
 ## Denied
 
