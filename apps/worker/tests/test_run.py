@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import socket
 import logging
+import socket
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
