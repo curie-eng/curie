@@ -840,7 +840,10 @@ so Curie can re-read the issue, keep its one status comment, and set the
 `curie-factory:*` state labels. **Metadata: Read** is already implied by repository
 installation discovery.
 
-Give the App **Checks: Read** and **Commit statuses: Read**. After a factory
+Give the App **Checks: Read**, **Commit statuses: Read**, and **Actions: Read**.
+The Actions permission lets repair rounds include the failing job's log tail.
+Without it, CI verdicts still use checks and commit statuses; the repair prompt
+keeps the check summary and says `Job log unavailable.` After a factory
 run publishes, it waits on the pull request's checks inside its execution
 deadline; the request completes only when CI is green. A failure resumes the
 same run to fix the code and push to the same pull request, for at most 3
@@ -851,8 +854,8 @@ execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
 `api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
 1200, 1 to 10800, checked at boot) when the repository's required checks take
 longer than 20 minutes; the wait still ends at the execution deadline if that
-comes first. Unreadable CI,
-such as a missing permission, ends as `ci_unverified`, which is never success;
+comes first. Unreadable CI, such as missing Checks or Commit statuses permission,
+ends as `ci_unverified`, which is never success;
 the pull request stays open either way. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.
 
