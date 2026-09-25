@@ -17,6 +17,7 @@ import pytest
 from curie_runner.history import (
     HISTORY_APPEND_RESERVE_BYTES,
     HISTORY_VALUE_MAX_BYTES,
+    ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
     HistoryCapacityError,
@@ -180,6 +181,80 @@ def test_turn_still_refuses_when_even_the_final_answer_cannot_fit() -> None:
 
     with pytest.raises(HistoryError):
         bound_turn_record(record, max_value_bytes=100)
+
+
+def test_structural_compaction_keeps_pending_approval_call_without_orphan_results() -> None:
+    messages = [ConversationMessage(role="user", content="Run the requested checks")]
+    for index in range(80):
+        tool_id = f"completed{index}"
+        tool_blocks: list[dict[str, Any]] = (
+            [{"type": "thinking", "thinking": "old private reasoning"}] if index == 0 else []
+        )
+        tool_blocks.append(
+            {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": "ls"}}
+        )
+        messages.extend(
+            [
+                ConversationMessage(role="assistant", content=tool_blocks),
+                ConversationMessage(
+                    role="user",
+                    content=[
+                        {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}
+                    ],
+                ),
+            ]
+        )
+    pending_id = "pendingApproval"
+    messages.append(
+        ConversationMessage(
+            role="assistant",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": pending_id,
+                    "name": "Bash",
+                    "input": {"command": "publish"},
+                }
+            ],
+        )
+    )
+    record = TurnRecord(
+        user="Run the requested checks",
+        assistant="Approval required before publishing",
+        messages=tuple(messages),
+        status="awaiting_approval",
+        approval=ApprovalContext(summary="Publish requires approval", gate_kind="permission"),
+    )
+    cap = 8_000
+    assert _size([record.to_dict()]) > cap
+
+    bounded = bound_turn_record(record, max_value_bytes=cap)
+
+    assert _size([bounded.to_dict()]) <= cap
+    assert bounded.assistant == record.assistant
+    assert bounded.approval == record.approval
+    uses = {
+        block["id"]
+        for message in bounded.messages
+        if isinstance(message.content, list)
+        for block in message.content
+        if block.get("type") == "tool_use"
+    }
+    results = {
+        block["tool_use_id"]
+        for message in bounded.messages
+        if isinstance(message.content, list)
+        for block in message.content
+        if block.get("type") == "tool_result"
+    }
+    assert pending_id in uses
+    assert pending_id not in results
+    assert "completed0" not in uses
+    assert results <= uses
+    assert "old private reasoning" not in json.dumps(bounded.to_dict())
+    replay, summary = build_conversation_replay([bounded])
+    assert summary is None
+    assert replay.messages == bounded.messages
 
 
 def test_explicit_cap_and_reserve_are_honored() -> None:

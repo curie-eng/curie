@@ -806,7 +806,7 @@ def test_runner_uses_the_cap_advertised_by_the_state_api() -> None:
     assert f'"id": "u{_FACTORY_CALLS - 1}"' in stored_text
 
 
-@pytest.mark.parametrize("cap_header", [None, "invalid", "0"])
+@pytest.mark.parametrize("cap_header", [None, "invalid", "0", "8000", "8192"])
 def test_store_refuses_missing_or_invalid_api_capacity(cap_header: str | None) -> None:
     state = _CappedCasState()
     state.cap_header = cap_header
