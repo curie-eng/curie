@@ -926,6 +926,11 @@ const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 /// secret classifier below all read the one key.
 const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
 
+/// The declared Slack identities beyond `default` (ADR-0168 decision 1). `up`
+/// carries them with the release's other recorded values; named here so
+/// `diff`'s reset reporting and the secret classifier read the one key.
+const SLACK_IDENTITIES_KEY: &str = "dispatcher.slack.identities";
+
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
@@ -1292,7 +1297,8 @@ fn is_retained_mail_key(key: &str) -> bool {
 /// [`resolve_preserved_runner_identity_values`], and
 /// [`resolve_preserved_runner_egress_values`],
 /// [`resolve_preserved_gvisor_mode_value`], and
-/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, which survive
+/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, plus the
+/// [`SLACK_IDENTITIES_KEY`] list the live-value overlay carries, which survive
 /// untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
@@ -1318,6 +1324,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
+        || key_is_or_descends_from(key, SLACK_IDENTITIES_KEY)
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1364,8 +1371,13 @@ pub fn is_secret_value_key(key: &str) -> bool {
     // A Slack trusted-origin list (issue #1897) is the same shape: it is
     // operator-visible dev configuration -- hostnames, not a token -- and
     // masking it would hide the very value the operator opens `curie diff` to
-    // confirm survived the upgrade.
-    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY && key != SLACK_TRUSTED_ORIGINS_KEY)
+    // confirm survived the upgrade. The Slack identity list is the same: its
+    // names are configuration, and its Secret references are masked below by
+    // their key names, exactly as before the family was preserved.
+    if (is_preserved_by_up(key)
+        && key != GVISOR_MODE_KEY
+        && key != SLACK_TRUSTED_ORIGINS_KEY
+        && !key_is_or_descends_from(key, SLACK_IDENTITIES_KEY))
         || key == GITHUB_TOKEN_KEY
         || key == MODEL_CREDENTIAL_KEY
     {
