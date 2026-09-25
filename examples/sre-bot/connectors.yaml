@@ -21,7 +21,8 @@
 #                           available to upgrade to.
 #                           Needs SELF_UPGRADE_KUBECONFIG and the CronJob it
 #                           starts. Read manifests/upgrade-role.yaml first: its
-#                           grant is the widest in this bundle.
+#                           grant is the widest in this bundle by default; only
+#                           the opt-in operator grant is wider.
 #   grafana       ON.       Logs, metrics, alerts and profiles from the bundled
 #                           observability stack.
 #   tempo         ON.       Distributed traces from the bundled stack.
@@ -139,9 +140,11 @@ connectors:
 # property for a convenience. So the key stays in the Job, and the bot only ever
 # presses the button.
 #
-# THE GRANT IS THE WIDEST IN THIS BUNDLE and manifests/upgrade-role.yaml says so
-# plainly: `create` on `jobs` cannot be narrowed with `resourceNames`, because a
-# create has no name to match. Read that file before installing this.
+# THE GRANT IS THE WIDEST IN THIS BUNDLE BY DEFAULT (only the opt-in operator
+# grant, manifests/kubernetes-operator-access.yaml, is wider) and
+# manifests/upgrade-role.yaml says so plainly: `create` on `jobs` cannot be
+# narrowed with `resourceNames`, because a create has no name to match. Read
+# that file before installing this.
 #
 # Before bring-up: apply `manifests/upgrade-role.yaml`, store the resulting
 # kubeconfig as SELF_UPGRADE_KUBECONFIG, and install the CronJob (suspended --
