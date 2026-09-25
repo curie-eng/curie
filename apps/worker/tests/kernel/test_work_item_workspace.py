@@ -45,7 +45,7 @@ ISSUE_URL = f"https://github.com/{WORK_ITEM_REPO}/issues/123"
 
 
 class _Binding:
-    async def resolve(self, kind: str, channel: str) -> object:
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,
             agent_name="acme-bot",

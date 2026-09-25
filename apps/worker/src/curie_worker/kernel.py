@@ -53,6 +53,7 @@ from aci_protocol import (
     ToolNote,
     TurnSource,
 )
+from aci_protocol.turn import DEFAULT_IDENTITY, route_identity
 from channel_protocol import (
     MESSAGE_VERSION,
     Action,
@@ -753,6 +754,25 @@ def _parse_approval_targets(
     non-Slack resolver, an unknown target field, a half-configured transport,
     or duplicate targets must not produce a durable approval with ambiguous
     authority.
+
+    ADR-0168 decision 3 splits the notification target's both-or-neither rule
+    by kind. A Slack notification WITH an endpoint is the pre-ADR
+    custom-transport form and keeps both-or-neither: ``adapter`` there is a
+    credential slug, not an identity, and a stray endpoint with no adapter (or
+    the reverse) is a half-configured transport. A Slack notification with NO
+    endpoint may name an identity in ``adapter``, or none (the default) --
+    ``adapter`` alone is a complete, resolvable Slack route (D4.4), not a
+    half-configured one. Any other kind still requires both, unconditionally
+    (enforced below by ``kind != POLICY_CARD_KIND`` on its own).
+
+    Duplicate detection against the resolution target follows the same split:
+    a Slack notification with no endpoint duplicates the resolution when they
+    name the SAME IDENTITY (``route_identity``), because that is the same
+    Slack route by decision 3; a Slack notification WITH an endpoint (custom
+    transport) and any other kind duplicate the resolution on the raw
+    ``(kind, address)`` pair, as they always have -- ``adapter`` there is a
+    credential slug, not an identity, so comparing it would let two different
+    credentials on the SAME pair pass as distinct targets.
     """
 
     if not isinstance(binding, dict) or set(binding) - {
@@ -791,6 +811,13 @@ def _parse_approval_targets(
     address_shape = (
         _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
     )
+    # True for every shape EXCEPT a Slack notification with no endpoint: a
+    # non-Slack kind (always) or a Slack custom-transport notification (an
+    # endpoint present). That one exception is where `adapter` names an
+    # ADR-0168 decision 3 IDENTITY rather than a credential slug, so both the
+    # both-or-neither gate and the duplicate check below treat it apart from
+    # every other shape, which still goes by the raw `(kind, address)` pair.
+    not_slack_identity_form = kind != POLICY_CARD_KIND or endpoint is not None
     if (
         not isinstance(kind, str)
         or _CHANNEL_SLUG.fullmatch(kind) is None
@@ -801,10 +828,15 @@ def _parse_approval_targets(
         or (adapter is not None and (
             not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None
         ))
-        or (endpoint is None) != (adapter is None)
+        or (not_slack_identity_form and (endpoint is None) != (adapter is None))
         or (endpoint is not None and not _valid_notification_endpoint(endpoint))
         or (kind != POLICY_CARD_KIND and endpoint is None)
-        or (kind, address) == resolution_pair
+        or (
+            (kind, address) == resolution_pair
+            if not_slack_identity_form
+            else (kind, route_identity(kind, adapter), address)
+            == (POLICY_CARD_KIND, DEFAULT_IDENTITY, resolution_pair[1])
+        )
     ):
         return None
     return resolution_pair, (kind, address, TargetRoute(endpoint=endpoint, adapter=adapter))
@@ -2061,13 +2093,15 @@ class Kernel:
                 approval_routes = resolved.approval_routes
             elif self._binding is not None:
                 assert handle is not None
-                # The routing key is the PAIR (ADR-0096 phase 2): the queue wire
-                # carries a required `kind`, and both halves bind into the
-                # resolver's predicate. Never the address alone -- one address
-                # can be bound under two kinds, and dropping the kind here would
-                # answer an unbound kind with the other agent.
+                # The routing key is the TRIPLE (ADR-0168 decision 3): the queue
+                # wire carries a required `kind` and, for Slack, `adapter` names
+                # the bot identity the turn was addressed to. Never the address
+                # alone, and never the pair alone -- one address can be bound
+                # under two kinds, and one pair can answer to only one identity
+                # at a time, so dropping either would answer with somebody
+                # else's route.
                 resolved = await self._binding.resolve(
-                    handle.kind, handle.channel
+                    handle.kind, handle.adapter, handle.channel
                 )
                 if resolved is None:
                     # Binding doubles predate the diagnostic lookup; keep a miss
@@ -2077,7 +2111,7 @@ class Kernel:
                     )
                     undeployed = (
                         await undeployed_lookup(
-                            handle.kind, handle.channel
+                            handle.kind, handle.adapter, handle.channel
                         )
                         if undeployed_lookup is not None
                         else None

@@ -950,7 +950,7 @@ def test_pending_first_revision_is_a_terminal_reply_before_dirty_route_adoption(
     )
 
     class Binding(GrantBinding):
-        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+        async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
             from curie_worker.binding import ResolvedDeployment
 
             return ResolvedDeployment(
@@ -1148,7 +1148,7 @@ def test_lineage_api_refusal_is_a_user_visible_terminal_process_event(
     deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
 
     class Binding(GrantBinding):
-        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+        async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
             from curie_worker.binding import ResolvedDeployment
 
             return ResolvedDeployment(
@@ -1238,7 +1238,7 @@ def test_slack_publication_ownership_uses_scoped_key_but_replies_use_bare_thread
     thread_key = f"slack:C0EXAMPLE1:{thread}"
 
     class Binding(GrantBinding):
-        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+        async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
             from curie_worker.binding import ResolvedDeployment
 
             return ResolvedDeployment(
@@ -1368,7 +1368,7 @@ def test_ordinary_approval_notice_keeps_the_announcement_above_it(make_harness) 
     deployment_id = uuid.UUID("22222222-2222-4222-8222-222222222659")
 
     class Binding(GrantBinding):
-        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+        async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
             from curie_worker.binding import ResolvedDeployment
 
             return ResolvedDeployment(
@@ -1455,7 +1455,7 @@ def test_publication_notice_keeps_the_announcement_above_it(
     thread = "1700000000.002659"
 
     class Binding(GrantBinding):
-        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+        async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
             from curie_worker.binding import ResolvedDeployment
 
             return ResolvedDeployment(
@@ -2578,7 +2578,7 @@ class GrantBinding:
         self.decision = decision
         self.agent_id = uuid.uuid4()
 
-    async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+    async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
         from curie_worker.binding import ResolvedDeployment
 
         return ResolvedDeployment(
@@ -2896,7 +2896,7 @@ class RoutedBinding:
         self.routes = routes
         self.agent_id = uuid.uuid4()
 
-    async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+    async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
         from curie_worker.binding import ResolvedDeployment
 
         return ResolvedDeployment(
@@ -2966,6 +2966,32 @@ _MALFORMED_NOTIFICATION_OVERRIDES = [
     ("endpoint-http-only", {"endpoint": "ftp://adapter.example.com/replies"}),
     ("endpoint-needs-host", {"endpoint": "https:///replies"}),
     ("endpoint-no-userinfo", {"endpoint": "https://user@adapter.example.com/replies"}),
+    (
+        # ADR-0168 decision 3 keeps both-or-neither for a Slack notification
+        # WITH an endpoint (the pre-ADR custom-transport form): an endpoint
+        # with no adapter is still half-configured, exactly as any other
+        # kind's would be.
+        "slack-custom-transport-half-configured",
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE2",
+            "endpoint": "https://adapter.example.com/replies",
+            "adapter": None,
+        },
+    ),
+    (
+        # A Slack notification WITH an endpoint (custom transport) still
+        # duplicates the resolution on the raw `(kind, address)` pair: its
+        # `adapter` is a credential slug, not an identity, so a different
+        # slug here must not let it past as a distinct target.
+        "slack-custom-transport-same-as-resolution",
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE1",
+            "endpoint": "https://adapter.example.com/replies",
+            "adapter": "some-slug",
+        },
+    ),
 ]
 
 
@@ -3048,6 +3074,82 @@ def test_routed_approval_posts_one_interactive_resolution_card_and_one_text_only
                 key async for key in h.async_redis.scan_iter(match=h.config.approval_card_key("*"))
             ]
             assert card_keys == [h.config.approval_card_key("appr-1")]
+
+    asyncio.run(go())
+
+
+def test_a_slack_notification_naming_an_identity_with_no_endpoint_parses(make_harness) -> None:
+    """ADR-0168 decision 3: a Slack notification target may carry an identity
+    in ``adapter`` with NO ``endpoint`` -- a complete, resolvable route on the
+    worker's own Slack transport (D4.4), not the half-configured shape the
+    both-or-neither rule refuses.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        routes = {
+            "managers": {
+                **_resolution_route(),
+                "notification": {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "second"},
+            }
+        }
+        async with make_harness(approvals=approvals, binding=RoutedBinding(routes)) as h:
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
+            await h.kernel.process_event(_qevent("discount?", thread="th-slack-identity"))
+
+            assert len(approvals.requests) == 1
+
+            posts = [
+                (event, route)
+                for event, route, _best_effort in h.sink.events
+                if isinstance(event, ReplyPost)
+            ]
+            assert len(posts) == 2
+            (_card, _card_route), (notification, notification_route) = posts
+
+            assert notification.target.kind == "slack"
+            assert notification.target.address == "C0EXAMPLE2"
+            assert notification_route.endpoint is None
+            assert notification_route.adapter == "second"
+
+    asyncio.run(go())
+
+
+def test_a_notification_on_the_resolutions_own_pair_under_another_identity_is_not_a_duplicate(
+    make_harness,
+) -> None:
+    """Duplicate detection keys on IDENTITY (ADR-0168 decision 3), not merely
+    the ``(kind, address)`` pair: a notification aimed at the resolution's own
+    Slack channel but under a DIFFERENT bot identity is a distinct route, not
+    the resolution card posted again, so it must parse rather than be refused
+    as a same-as-resolution duplicate.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        routes = {
+            "managers": {
+                **_resolution_route(),
+                "notification": {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "second"},
+            }
+        }
+        async with make_harness(approvals=approvals, binding=RoutedBinding(routes)) as h:
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
+            await h.kernel.process_event(_qevent("discount?", thread="th-same-pair-identity"))
+
+            assert len(approvals.requests) == 1
+
+            posts = [
+                (event, route)
+                for event, route, _best_effort in h.sink.events
+                if isinstance(event, ReplyPost)
+            ]
+            assert len(posts) == 2
+            (_card, _card_route), (notification, notification_route) = posts
+
+            assert notification.target.kind == "slack"
+            assert notification.target.address == "C0EXAMPLE1"
+            assert notification_route.adapter == "second"
 
     asyncio.run(go())
 
@@ -4174,7 +4276,7 @@ def test_publication_with_bound_route_is_created_and_does_not_escalate_unexpecte
     thread = "1700000000.002705"
 
     class Binding(GrantBinding):
-        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+        async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
             from curie_worker.binding import ResolvedDeployment
 
             return ResolvedDeployment(
@@ -4307,7 +4409,7 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
     thread = "1700000000.002706"
 
     class Binding(GrantBinding):
-        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+        async def resolve(self, kind: str, adapter: str | None, channel: str):  # noqa: ANN201
             from curie_worker.binding import ResolvedDeployment
 
             return ResolvedDeployment(
@@ -4438,7 +4540,7 @@ class _WorkspacelessBinding:
             return _GATED_TOOL
         return None
 
-    async def resolve(self, _kind: str, _channel: str) -> object:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> object:
         return SimpleNamespace(
             agent_id=uuid.UUID("22222222-2222-4222-8222-222222222828"),
             agent_name="sre-bot",
