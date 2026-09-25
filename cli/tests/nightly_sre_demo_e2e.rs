@@ -152,9 +152,7 @@ fn workflow_job_containing(text: &str, needle: &str) -> String {
     blocks
         .into_iter()
         .find(|block| block.contains(needle))
-        .unwrap_or_else(|| {
-            panic!("no workflow job name contains {needle}; jobs section:\n{jobs}")
-        })
+        .unwrap_or_else(|| panic!("no workflow job name contains {needle}; jobs section:\n{jobs}"))
 }
 
 fn connector_block<'a>(text: &'a str, name: &str) -> &'a str {

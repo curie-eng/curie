@@ -179,6 +179,20 @@ pub fn last_log_args(namespace: &str, pod: &str, previous: bool) -> Vec<String> 
     args
 }
 
+pub fn pod_events_args(namespace: &str, pod: &str) -> Vec<String> {
+    vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "get".into(),
+        "events".into(),
+        "-o".into(),
+        "json".into(),
+        "--field-selector".into(),
+        format!("involvedObject.name={pod}"),
+    ]
+}
+
 /// Time left on the command deadline. `None` means the wait must fail closed.
 pub fn remaining_timeout(deadline: Instant, now: Instant) -> Option<Duration> {
     deadline
@@ -449,6 +463,49 @@ fn excerpt_or_omit(text: &str, secret_values: &BTreeMap<String, String>) -> Opti
     }
 }
 
+fn event_text<'a>(event: &'a Value, field: &str) -> Option<&'a str> {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+pub fn project_pod_events(document: &Value, pod: &str) -> String {
+    let Some(items) = document.get("items").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for event in items {
+        if event
+            .get("involvedObject")
+            .and_then(|object| object.get("name"))
+            .and_then(Value::as_str)
+            != Some(pod)
+        {
+            continue;
+        }
+        let Some(event_type) = event_text(event, "type") else {
+            continue;
+        };
+        let Some(reason) = event_text(event, "reason") else {
+            continue;
+        };
+        let Some(message) = event_text(event, "message") else {
+            continue;
+        };
+        lines.push(format!("{event_type} {reason}: {message}"));
+    }
+    lines.join("\n")
+}
+
+pub fn sanitized_pod_events(
+    document: &Value,
+    pod: &str,
+    secret_values: &BTreeMap<String, String>,
+) -> Option<String> {
+    excerpt_or_omit(&project_pod_events(document, pod), secret_values)
+}
+
 /// Nonzero connector rollout failure. Names the connector and the recovery command.
 pub fn rollout_failure(
     connector: &str,
@@ -456,8 +513,13 @@ pub fn rollout_failure(
     deployment: &str,
     reason: &str,
     excerpt: Option<&str>,
+    events: Option<&str>,
 ) -> anyhow::Error {
     let mut message = format!("connector {connector} did not become ready ({reason})");
+    if let Some(events) = events.map(str::trim).filter(|events| !events.is_empty()) {
+        message.push_str("\npod events:\n");
+        message.push_str(events);
+    }
     if let Some(excerpt) = excerpt.map(str::trim).filter(|excerpt| !excerpt.is_empty()) {
         message.push_str("\nlast log:\n");
         message.push_str(excerpt);
@@ -498,6 +560,7 @@ async fn kubectl_list(
             &workload.deployment,
             "timeout",
             None,
+            None,
         ));
     };
     match run_bounded(
@@ -515,6 +578,7 @@ async fn kubectl_list(
             &workload.deployment,
             "observe",
             None,
+            None,
         )),
         Err(err) if timed_out(&err) => Err(rollout_failure(
             &workload.connector,
@@ -522,12 +586,14 @@ async fn kubectl_list(
             &workload.deployment,
             "timeout",
             None,
+            None,
         )),
         Err(_) => Err(rollout_failure(
             &workload.connector,
             namespace,
             &workload.deployment,
             "observe",
+            None,
             None,
         )),
     }
@@ -615,6 +681,28 @@ async fn last_log_excerpt(
     excerpt_or_omit(&raw, secret_values)
 }
 
+async fn pod_events_excerpt(
+    target: &ClusterTarget,
+    namespace: &str,
+    pod: &str,
+    secret_values: &BTreeMap<String, String>,
+    deadline: Instant,
+) -> Option<String> {
+    let budget = remaining_timeout(deadline, Instant::now())?;
+    let (ok, out, _) = run_bounded(
+        &target.args(&pod_events_args(namespace, pod)),
+        None,
+        budget.min(Duration::from_secs(10)),
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let document = serde_json::from_str::<Value>(&out).ok()?;
+    sanitized_pod_events(&document, pod, secret_values)
+}
+
 /// Wait until every hosted connector Deployment is Ready, or fail named.
 pub async fn wait_for_connector_rollouts(
     target: &ClusterTarget,
@@ -644,6 +732,7 @@ pub async fn wait_for_connector_rollouts(
                 &first.deployment,
                 "timeout",
                 None,
+                None,
             ));
         }
         let mut still = Vec::new();
@@ -654,11 +743,13 @@ pub async fn wait_for_connector_rollouts(
                 }
                 RolloutObservation::Pending => still.push(workload),
                 RolloutObservation::Failed { reason, pod } => {
-                    let excerpt = match pod {
-                        Some(pod) => {
-                            last_log_excerpt(target, namespace, &pod, secret_values, deadline).await
-                        }
-                        None => None,
+                    let (excerpt, events) = match pod.as_deref() {
+                        Some(pod) => (
+                            last_log_excerpt(target, namespace, pod, secret_values, deadline).await,
+                            pod_events_excerpt(target, namespace, pod, secret_values, deadline)
+                                .await,
+                        ),
+                        None => (None, None),
                     };
                     return Err(rollout_failure(
                         &workload.connector,
@@ -666,6 +757,7 @@ pub async fn wait_for_connector_rollouts(
                         &workload.deployment,
                         reason,
                         excerpt.as_deref(),
+                        events.as_deref(),
                     ));
                 }
             }

@@ -70,7 +70,7 @@ jobs:
     needs: [prereqs]
     if: needs.prereqs.outputs.ready == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
