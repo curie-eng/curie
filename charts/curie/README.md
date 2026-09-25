@@ -1743,6 +1743,15 @@ answered with a 422 that says so, on create, add and move alike. Declaring an
 identity readies the chart and the services for it; no binding can route to
 it.
 
+Each identity's bot token is also the one its turns are answered with. The
+worker sets the assistant status, edits the reply, posts and settles approval
+cards and downloads attached files with the token of the identity a turn
+arrived on, and the API resolves an approval's Slack user-group approvers with
+it, so each Slack app needs its own `files:read` and `usergroups:read` scopes.
+A worker holding no token for the identity a turn names drops the turn before
+it runs, logs the identity, and leaves the placeholder as the dispatcher posted
+it: it never answers as another bot.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement
