@@ -97,6 +97,25 @@ async def thread_key_forms(
     return (thread_key,) if old is None else (thread_key, old)
 
 
+def fence_key_forms(thread_key: str) -> tuple[str, ...]:
+    """``thread_key``, then its pre-identity form -- unguarded.
+
+    Only safe for a REFUSAL already scoped to one agent: `pre_identity_key_of`
+    can only be this key's own kind/address pair, so a false match would have
+    to also land inside that one agent's rows, and over-matching there is the
+    safe direction for a refusal (`publication_cancellation_conflict`,
+    `_refuse_fenced_work_item`). `thread_key_forms`'s single-binding guard
+    exists for a WRITE (`_bind_running_work_item_lineage`) or an agent-blind
+    reader (`running_for_conversation`), where over-matching would not be
+    safe, and it fails open exactly where this must not: once the binding
+    that proved the old key is gone, a cancelled legacy work item would stop
+    fencing credential redemption.
+    """
+
+    old = pre_identity_key_of(thread_key)
+    return (thread_key,) if old is None else (thread_key, old)
+
+
 def route_adapter_of(thread_key: str) -> str | None:
     """The ``adapter`` a wake's ``ReplyHandle`` needs to reproduce this key's route.
 
@@ -105,7 +124,63 @@ def route_adapter_of(thread_key: str) -> str | None:
     default Slack route's key carries no identity segment, so this returns
     None for it -- the same value an unnamed route already used, and
     ``route_identity`` maps both back to the same default app.
+
+    None also comes back for a pre-identity key: one minted before decision 4
+    never carries a segment at all, so this cannot tell "default" from "no
+    segment was ever added". A legacy non-Slack work item's CURRENT execute
+    wake still resolves its live binding at dispatch time (`_admission_refusal`,
+    `load_execute_wake`), so a caller keying that same thread for a legacy
+    row -- the terminate wake -- cannot stop here; see
+    `legacy_route_adapter_of`.
     """
 
     parsed = parse_scoped_conversation_id(thread_key)
     return None if parsed is None else parsed.identity
+
+
+async def legacy_route_adapter_of(
+    session: AsyncSession, agent_id: uuid.UUID, thread_key: str
+) -> str | None:
+    """``route_adapter_of``, falling back to the agent's one binding for a
+    pre-identity non-Slack key.
+
+    `WorkItem.conversation_id` is immutable once written (migration 0046), so
+    a work item admitted before decision 4 is stuck under its old, unnamed
+    key forever, even once its route gains a named adapter under decision 3
+    and every wake keyed from a LIVE binding lookup starts carrying it
+    (`_admission_refusal`'s resolved binding, threaded through admission and
+    replay). The single-binding condition is `pre_identity_thread_key_for`'s
+    own guard: before the route triple a pair held one binding, so this is
+    the only adapter the pair's binding could be.
+    """
+
+    decoded = route_adapter_of(thread_key)
+    if decoded is not None:
+        return decoded
+    parsed = parse_scoped_conversation_id(thread_key)
+    if parsed is None or parsed.kind == SLACK_KIND:
+        return decoded
+    adapters = list(
+        await session.scalars(
+            select(AgentChannel.adapter).where(
+                AgentChannel.agent_id == agent_id,
+                AgentChannel.kind == parsed.kind,
+                AgentChannel.address == parsed.address,
+            )
+        )
+    )
+    return adapters[0] if len(adapters) == 1 else None
+
+
+def legacy_producer_thread_key(kind: str, address: str, conversation_id: str) -> str:
+    """The workspace key a pre-#2274 producer always wrote.
+
+    A publication request that omits ``reply_conversation_id`` predates that
+    field (added 2026-09-04): its ``conversation_id`` is the bare, unscoped id
+    the worker minted before decision 4 gave the worker's own key an identity
+    segment, so every route -- named or not -- wrote this same unidentified
+    form. Building the CURRENT identity key here instead would hand such a
+    request's publication a key it never wrote, and the lookup would miss.
+    """
+
+    return scoped_conversation_id(kind, address, conversation_id)

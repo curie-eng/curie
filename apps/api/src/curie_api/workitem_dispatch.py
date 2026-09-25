@@ -16,9 +16,9 @@ from . import crud, workitems
 from .config import get_settings
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .threadkeys import (
+    legacy_route_adapter_of,
     pre_identity_key_of,
     pre_identity_thread_key_for,
-    route_adapter_of,
     route_thread_key,
     route_thread_key_matches,
 )
@@ -150,15 +150,6 @@ async def _refuse(
     return result
 
 
-async def _facts_route_adapter(session: AsyncSession, facts: Any) -> str | None:
-    """The adapter of the binding ``_admission_refusal`` resolved for these facts."""
-
-    binding = await crud.binding_for_route(session, facts.kind, None, facts.address)
-    if binding is None or binding.agent_id != facts.agent_id:
-        return None
-    return binding.adapter
-
-
 def _facts_conversation(facts: Any, adapter: str | None) -> str:
     return route_thread_key(
         facts.kind, adapter, facts.address, facts.reply_conversation_id
@@ -225,7 +216,7 @@ async def _write_snapshot(
 
 
 async def _replay_existing(
-    session: AsyncSession, request: ExecutionRequest, facts: Any
+    session: AsyncSession, request: ExecutionRequest, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | DispatchConflict:
     work_item = await _lock_work_item(session, request.work_item_id)
     if work_item is None:
@@ -237,7 +228,7 @@ async def _replay_existing(
         return await _refuse(
             session, "not_found", work_item_id=work_item.id, request_id=request.id
         )
-    if not _work_item_matches(work_item, facts, await _facts_route_adapter(session, facts)):
+    if not _work_item_matches(work_item, facts, adapter):
         return await _refuse(
             session,
             "identity_mismatch",
@@ -261,7 +252,16 @@ async def _replay_existing(
 
 async def _admission_refusal(
     session: AsyncSession, facts: Any
-) -> DispatchConflict | None:
+) -> DispatchConflict | AgentChannel:
+    """The binding that authorizes this admission, or the refusal.
+
+    Every caller below reuses THIS binding for the rest of its own
+    transaction rather than re-resolving `crud.binding_for_route`: a second
+    read in the same transaction cannot see anything this one did not, and a
+    rebind racing between the two would key the work item by a binding other
+    than the one that just authorized it.
+    """
+
     agent = await session.get(Agent, facts.agent_id)
     if agent is None:
         return await _refuse(session, "not_found")
@@ -288,21 +288,21 @@ async def _admission_refusal(
         or not requester.strip()
     ):
         return await _refuse(session, "identity_mismatch")
-    return None
+    return binding
 
 
 async def admit(
     session: AsyncSession, facts: Any
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
-    refused = await _admission_refusal(session, facts)
-    if refused is not None:
-        return refused
+    resolved = await _admission_refusal(session, facts)
+    if isinstance(resolved, DispatchConflict):
+        return resolved
     existing = await session.scalar(
         select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
     )
     if existing is not None:
-        return await _replay_existing(session, existing, facts)
-    return await _admit_new(session, facts)
+        return await _replay_existing(session, existing, facts, resolved.adapter)
+    return await _admit_new(session, facts, resolved.adapter)
 
 
 async def readmit(
@@ -314,14 +314,14 @@ async def readmit(
     request, not ``facts.request_id``: the new run starts once it has stopped.
     """
 
-    refused = await _admission_refusal(session, facts)
-    if refused is not None:
-        return refused
+    resolved = await _admission_refusal(session, facts)
+    if isinstance(resolved, DispatchConflict):
+        return resolved
     existing = await session.scalar(
         select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
     )
     if existing is not None:
-        return await _replay_existing(session, existing, facts)
+        return await _replay_existing(session, existing, facts, resolved.adapter)
     work_item = await session.scalar(
         select(WorkItem).where(
             WorkItem.github_repository_id == facts.github_repository_id,
@@ -329,8 +329,8 @@ async def readmit(
         )
     )
     if work_item is None:
-        return await _admit_new(session, facts)
-    if not _work_item_matches(work_item, facts, await _facts_route_adapter(session, facts)):
+        return await _admit_new(session, facts, resolved.adapter)
+    if not _work_item_matches(work_item, facts, resolved.adapter):
         return await _refuse(
             session, "identity_mismatch", work_item_id=work_item.id
         )
@@ -357,7 +357,7 @@ async def readmit(
 
 
 async def _admit_new(
-    session: AsyncSession, facts: Any
+    session: AsyncSession, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
     created = await workitems.create_or_get_work_item(
         session,
@@ -366,7 +366,7 @@ async def _admit_new(
         github_installation_id=facts.github_installation_id,
         agent_id=facts.agent_id,
         repo_full_name=facts.repo_full_name,
-        conversation_id=_facts_conversation(facts, await _facts_route_adapter(session, facts)),
+        conversation_id=_facts_conversation(facts, adapter),
     )
     if isinstance(created, WorkItemConflict):
         return created
@@ -389,7 +389,7 @@ async def _admit_new(
                 )
             )
             if existing is not None:
-                return await _replay_existing(session, existing, facts)
+                return await _replay_existing(session, existing, facts, adapter)
         return requested
     assert requested.request is not None
     written = await _write_snapshot(session, requested.request.id, facts)
@@ -1381,11 +1381,14 @@ async def claim_terminate_publishes(
     # This endpoint names no live channel to copy `adapter` from -- the owning
     # binding may already be gone by the time termination fires -- so it is
     # decoded back out of the work item's OWN stored route instead, the same
-    # key `_facts_conversation` minted at admission (ADR-0168 decision 4).
-    thread_keys: dict[uuid.UUID, str] = {}
+    # key `_facts_conversation` minted at admission (ADR-0168 decision 4). A
+    # work item admitted before decision 4 has no identity to decode there,
+    # so `legacy_route_adapter_of` falls back to its agent's one binding --
+    # the same live lookup its CURRENT execute wake already resolves.
+    work_items: dict[uuid.UUID, WorkItem] = {}
     if rows:
-        thread_keys = {
-            found.id: found.conversation_id
+        work_items = {
+            found.id: found
             for found in await session.scalars(
                 select(WorkItem).where(
                     WorkItem.id.in_({row.work_item_id for row in rows})
@@ -1398,7 +1401,7 @@ async def claim_terminate_publishes(
             continue
         if row.reply_conversation_id is None:
             continue
-        thread_key = thread_keys.get(row.work_item_id)
+        work_item = work_items.get(row.work_item_id)
         published.append(
             TerminatePublish(
                 request_id=row.id,
@@ -1406,7 +1409,13 @@ async def claim_terminate_publishes(
                 reply_address=row.reply_address,
                 reply_conversation_id=row.reply_conversation_id,
                 requester=row.requester,
-                reply_adapter=None if thread_key is None else route_adapter_of(thread_key),
+                reply_adapter=(
+                    None
+                    if work_item is None
+                    else await legacy_route_adapter_of(
+                        session, work_item.agent_id, work_item.conversation_id
+                    )
+                ),
             )
         )
     return published

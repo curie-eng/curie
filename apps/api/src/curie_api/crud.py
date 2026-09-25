@@ -46,7 +46,6 @@ from .publication_policy import (
     publication_row_prefix,
 )
 from .schemas import (
-    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     ActionComplete,
     ActionRecord,
     AgentCreate,
@@ -61,24 +60,15 @@ from .schemas import (
     SourceBindingConfig,
     VersionCreate,
 )
-from .threadkeys import route_thread_key, route_thread_key_matches, thread_key_forms
+from .threadkeys import (
+    fence_key_forms,
+    legacy_producer_thread_key,
+    route_thread_key_matches,
+    thread_key_forms,
+)
 from .workspace_policy import repository_is_allowed
 
 _WORKSPACE_UNSET = object()
-
-
-def _workspace_route_adapter(reply_adapter: str | None) -> str | None:
-    """``reply_adapter``, unless it is the built-in disconnected-message relay.
-
-    That sentinel is never a declared identity or an egress credential (see
-    ``PublicationCreate._valid_reply_route``) -- it names a later delivery
-    substitution, not the thread's own route -- so it must not turn into an
-    identity segment when a legacy request forces this module to rebuild the
-    workspace key from ``reply_adapter`` instead of a stored, already-scoped
-    ``conversation_id``.
-    """
-
-    return None if reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER else reply_adapter
 
 
 class AmbiguousRoute(RuntimeError):
@@ -140,9 +130,8 @@ async def _adopt_publication_replay(
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else route_thread_key(
+        else legacy_producer_thread_key(
             data.reply_kind,
-            _workspace_route_adapter(data.reply_adapter),
             data.reply_channel,
             data.conversation_id,
         )
@@ -1079,9 +1068,17 @@ _ACTIVE_WORK_ITEM_STATUSES = ("waiting", "running", "cancellation_requested")
 async def _work_item_for_thread(
     session: AsyncSession, *, agent_id: uuid.UUID, conversation_id: str
 ) -> WorkItem | None:
-    """This thread's work item, under its key or its pre-identity key (ADR-0168 decision 4)."""
+    """This agent's work item on this thread, under its key or its pre-identity
+    key (ADR-0168 decision 4).
 
-    for form in await thread_key_forms(session, agent_id, conversation_id):
+    Unguarded (`fence_key_forms`, not `thread_key_forms`): both callers are a
+    REFUSAL already scoped to `agent_id`, where over-matching is the safe
+    direction, and the guard would fail open the moment the binding that
+    proved the old key is gone -- exactly when a cancelled legacy work item
+    still has to fence credential redemption.
+    """
+
+    for form in fence_key_forms(conversation_id):
         work_item: WorkItem | None = await session.scalar(
             select(WorkItem)
             .where(WorkItem.agent_id == agent_id, WorkItem.conversation_id == form)
@@ -1202,9 +1199,8 @@ async def create_publication(
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else route_thread_key(
+        else legacy_producer_thread_key(
             data.reply_kind,
-            _workspace_route_adapter(data.reply_adapter),
             data.reply_channel,
             data.conversation_id,
         )

@@ -78,18 +78,26 @@ fn percent_encode_unreserved(s: &str) -> String {
 /// Frozen with the Python `_thread_key_for` helper in
 /// `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member that is only
 /// the conversation_id cannot release the sandbox (#2259).
+/// The worker's built-in reply adapter for a disconnected `curie cluster
+/// message` turn (`message.rs::CLUSTER_MESSAGE_RELAY_ADAPTER`). It selects
+/// where the reply is delivered, not which binding answers: the turn is the
+/// channel's own Slack turn, so it resolves as the default identity, same as
+/// `aci_protocol.turn.route_identity`.
+const CLUSTER_MESSAGE_ADAPTER: &str = "curie-cluster-message";
+
 pub fn thread_key_for(
     kind: &str,
     adapter: Option<&str>,
     channel: &str,
     conversation_id: &str,
 ) -> String {
-    // `aci_protocol.turn.route_identity`: a Slack route with no adapter is the
-    // default app; any other kind's adapter is its identity as stored.
+    // `aci_protocol.turn.route_identity`: a Slack route with no adapter, or
+    // with the built-in disconnected-message relay adapter, is the default
+    // app; any other kind's adapter is its identity as stored.
     let identity = if kind == "slack" {
         Some(
             adapter
-                .filter(|name| !name.is_empty())
+                .filter(|name| !name.is_empty() && *name != CLUSTER_MESSAGE_ADAPTER)
                 .unwrap_or(DEFAULT_SLACK_IDENTITY),
         )
     } else {
