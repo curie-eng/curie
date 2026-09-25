@@ -1984,4 +1984,19 @@ connectors:
         );
         assert_eq!(hosted_env_secret_names(&decl), vec!["PAT".to_string()]);
     }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn restrict_to_keeps_only_the_allowlist() {
+        let decl = parse_connectors(
+            "connectors:\n  grafana:\n    image: g:1\n    secrets: [GRAFANA_TOKEN]\n  \
+             loki:\n    image: g:1\n    secrets: [LOKI_TOKEN]\n",
+        )
+        .unwrap();
+        let only = restrict_to(&decl, Some(&["grafana".to_string()]));
+        assert_eq!(only.connectors.keys().collect::<Vec<_>>(), ["grafana"]);
+        assert_eq!(hosted_env_secret_names(&only), ["GRAFANA_TOKEN"]);
+        assert!(restrict_to(&decl, Some(&[])).connectors.is_empty());
+        assert_eq!(restrict_to(&decl, None).connectors.len(), 2);
+    }
 }

@@ -1710,3 +1710,37 @@ async fn the_flag_beats_the_targets_identity() {
     .unwrap();
     assert!(create_body(&server)["channel"].get("adapter").is_none());
 }
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_targeted_cluster_deploy_binds_only_its_connectors_secret_names() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"default","connectors":["grafana"]}"#,
+        ),
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(201, &agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    std::fs::write(
+        dir.path().join("connectors.yaml"),
+        "connectors:\n  grafana:\n    image: ghcr.io/example/g:1\n    secrets: [GRAFANA_TOKEN]\n  \
+         loki:\n    image: ghcr.io/example/g:1\n    secrets: [LOKI_TOKEN]\n",
+    )
+    .unwrap();
+    let mut opts = identity_deploy_opts(&server, dir.path(), None, Some("dev"), Some(BOUND));
+    opts.tier = commands::DeployTier::Cluster;
+    opts.secret_binding_supported = false;
+    commands::deploy(opts).await.unwrap();
+
+    let secrets: Vec<String> = patch_bodies(&server)
+        .iter()
+        .filter_map(|body| body["secrets"].as_object())
+        .flat_map(|map| map.keys().cloned())
+        .collect();
+    assert_eq!(secrets, ["GRAFANA_TOKEN"], "loki is not this target's connector");
+}
