@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
+from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TurnSource
 from aci_protocol.turn import route_identity
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -20,6 +21,7 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, PLUGIN_DIR_ENV, ResolvedDeployment
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import ReplySinkRouter, build_reply_sink
+from curie_worker.workitem_dispatch import WorkItemRunning
 
 DONE = SessionStatus.DONE
 _CHANNEL = "C0EXAMPLE1"
@@ -171,6 +173,85 @@ def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_
             text = "\n".join(caplog.messages)
             assert ev.event_id in text and "'ghost'" in text
             assert _DEFAULT_TOKEN not in text and _OPS_TOKEN not in text
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+class _CiWorkItems:
+    """Names one already-running request, like a CI continuation's dispatch."""
+
+    def __init__(self, running: uuid.UUID) -> None:
+        self.running = running
+        self.finishes: list[tuple[uuid.UUID, dict[str, object]]] = []
+
+    async def running_for_conversation(self, _conversation_id: str) -> WorkItemRunning:
+        return WorkItemRunning(
+            request_id=self.running,
+            runtime_epoch=1,
+            execution_deadline=datetime.now(UTC) + timedelta(minutes=20),
+        )
+
+    async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
+        self.finishes.append((request_id, kwargs))
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        async def record(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        return record
+
+
+def test_a_factory_work_item_turn_runs_on_an_untokened_identity(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gate's factory-work-item exemption, pinned directly rather than only
+    documented in its inline comment: a CI-fix-round continuation whose route
+    names an identity this worker holds NO token for must still run.
+
+    Its requesting-chat reply is already suppressed end to end (``_reply_for``,
+    ``_ThrottledReply``'s ``target=None``), so there is no wrong-bot reply for
+    the gate to prevent here, and dropping it would lose a legitimate factory
+    continuation instead. The sink is REAL (``build_reply_sink``); its
+    ``undeliverable_reason`` WOULD refuse this exact route if the gate did not
+    skip factory turns (see the sibling test above, on the same 'ghost'
+    identity), so deleting or inverting
+    ``not self._is_factory_work_item_turn(event_id)`` fails this test.
+    """
+
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            request_id = uuid.uuid4()
+            binding = _TripleBinding({("slack", "ghost", _CHANNEL): _resolved("ghost")})
+            async with make_harness(binding=binding, sink=_sink(port)) as h:
+                h.kernel._work_items = _CiWorkItems(request_id)
+                h.runner.default_script = [Final(text="fixed it", status=DONE)]
+                ev = QueuedTurn(
+                    event_id=f"work-item-{request_id}-ci-2",
+                    conversation_id=f"work-item-{request_id}",
+                    author="github:1:bot",
+                    text="fix it",
+                    reply_handle=ReplyHandle(
+                        kind="slack",
+                        channel=_CHANNEL,
+                        placeholder="1720000000.000100",
+                        adapter="ghost",
+                    ),
+                    received_at="2026-07-05T00:00:00+00:00",
+                    source=TurnSource.WEBHOOK,
+                )
+                with caplog.at_level(logging.ERROR, logger="curie_worker.kernel"):
+                    await h.kernel.process_event(ev)
+
+                assert h.runner.opened == ["fix it"]
+                assert not any("dropping event" in message for message in caplog.messages)
+            assert capture.requests == []
         finally:
             await server.close()
 
