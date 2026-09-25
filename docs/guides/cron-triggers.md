@@ -74,5 +74,20 @@ channel to post an approval card to or resume in, so a gated tool call ends the
 run as `failed` and the tool never runs. Give a trigger a `target` if its work
 needs approval.
 
+## Reading the record
+
+`curie local schedules` and `curie cluster schedules` list every cron hook on
+the in force deployment of each agent. Pass `--agent` to limit the list to one
+agent. Each hook shows its trigger, schedule, zone, newest slot, and how that
+slot ended. A missing `timezone` is reported as `UTC`. `GET /schedules` is the
+same list. `curie skill schedules` is refused, because that tier has no
+platform API and no run record.
+
+A hook that failed on its newest slot is visible in that one response,
+including when the three newest slots all failed. A slot that has not ended
+yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, and
+`skipped`. `deferred` and `reclaimed` are part of the run record vocabulary
+and are not written by the current scheduler.
+
 Webhook triggers validate at deploy but are not yet wired to a live wake-up;
 see the [triggers seam](../interfaces/triggers/INTERFACE.md).

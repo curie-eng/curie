@@ -1509,6 +1509,16 @@ enum SkillAction {
     },
     #[command(about = format!(
         "Not available at this tier: {}; {}",
+        commands::SCHEDULES_REASON, commands::SCHEDULES_ALT,
+    ))]
+    Schedules {
+        /// Accepts any arguments so every form reaches the exit-4 capability
+        /// refusal instead of a clap usage error.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _rest: Vec<String>,
+    },
+    #[command(about = format!(
+        "Not available at this tier: {}; {}",
         commands::OBSERVABILITY_REASON, commands::OBSERVABILITY_ALT,
     ))]
     Observability {
@@ -2218,6 +2228,23 @@ enum LocalAction {
         #[arg(value_name = "ID")]
         id: Option<String>,
         /// Scope to one agent (name or id).
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List each cron hook on the in-force deployment (`GET /schedules`).
+    Schedules {
+        /// Scope to one agent (name or id). Omit to list every deployed agent.
         #[arg(long, value_name = "NAME_OR_ID")]
         agent: Option<String>,
         #[arg(
@@ -3090,6 +3117,17 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List each cron hook on the in-force deployment (`GET /schedules`).
+    Schedules {
+        /// Scope to one agent (name or id). Omit to list every deployed agent.
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
         #[command(flatten)]
@@ -3245,6 +3283,7 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
         | ClusterAction::WorkItems { conn, .. }
+        | ClusterAction::Schedules { conn, .. }
         | ClusterAction::Delete { conn, .. } => {
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
@@ -3343,6 +3382,7 @@ fn retarget_cluster_action(
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
         | ClusterAction::WorkItems { conn, .. }
+        | ClusterAction::Schedules { conn, .. }
         | ClusterAction::Delete { conn, .. } => {
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);
@@ -4113,6 +4153,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
             SkillAction::WorkItems { .. } => Err(commands::skill_work_items_unavailable()),
+            SkillAction::Schedules { .. } => Err(commands::skill_schedules_unavailable()),
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
@@ -4444,6 +4485,20 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?
             }),
+            LocalAction::Schedules {
+                agent,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit(
+                commands::schedules(commands::SchedulesOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    dry_run,
+                })
+                .await?,
+            ),
             LocalAction::Memory { target, add } => match add {
                 None => emit(commands::memory(target.into()).await?),
                 Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
@@ -5796,6 +5851,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                         agent,
                         dry_run,
                         tier: "cluster",
+                    })
+                    .await?,
+                )
+            }
+            ClusterAction::Schedules {
+                agent,
+                conn,
+                dry_run,
+            } => {
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::schedules(commands::SchedulesOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
                     })
                     .await?,
                 )

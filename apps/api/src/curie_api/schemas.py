@@ -2778,3 +2778,32 @@ class ConsoleSessionOut(BaseModel):
 
     subject: str | None
     expires_at: datetime
+
+
+ScheduleOutcome = Literal["ran", "deferred", "skipped", "blocked", "reclaimed", "failed"]
+
+
+class ScheduleHookOut(BaseModel):
+    """One cron hook on the in-force bundle, with its newest slot."""
+
+    name: str
+    trigger: str
+    schedule: str
+    zone: str
+    last_fire_at: datetime | None
+    last_outcome: ScheduleOutcome | None
+
+
+class AgentSchedulesOut(BaseModel):
+    """The scheduled hooks of one agent's in-force deployment."""
+
+    agent: str
+    agent_id: uuid.UUID
+    bundle_error: str | None
+    hooks: list[ScheduleHookOut]
+
+
+class ScheduleListOut(BaseModel):
+    """Every in-force cron hook the platform can see."""
+
+    schedules: list[AgentSchedulesOut]
