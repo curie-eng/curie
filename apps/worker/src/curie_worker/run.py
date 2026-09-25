@@ -229,6 +229,11 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     return SubstrateConfig(
         namespace=env.get("CURIE_NAMESPACE", "default"),
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),
+        agent_pools=frozenset(
+            name.strip()
+            for name in env.get("CURIE_AGENT_SANDBOX_POOLS", "").split(",")
+            if name.strip()
+        ),
         runner_port=int(env.get("CURIE_RUNNER_PORT", "8080")),
         **overrides,
     )

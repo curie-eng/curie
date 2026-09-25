@@ -2084,3 +2084,12 @@ carve-outs for ANY CIDR that contains a metadata address -- not just an exact /0
 {{- define "curie.sandbox.claimEnvNoOpNotice" -}}
 no {{ .key }} in this container's env: nothing to stage. This is expected for a warm or unbound pod. If you set {{ .key }} on a SandboxClaim and expected staging, note that a spec.env entry with no containerName reaches the RUNNER container only -- repeat it with containerName: {{ .container }}.
 {{- end -}}
+
+{{/*
+Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
+array: every connectorSecrets agent plus every registryEgress agent (#3083).
+*/}}
+{{- define "curie.agentSandboxPoolAgents" -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) -}}
+{{- $agents | uniq | sortAlpha | toJson -}}
+{{- end -}}
