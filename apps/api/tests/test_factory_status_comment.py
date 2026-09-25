@@ -147,6 +147,35 @@ def test_the_card_image_is_linked_when_a_base_url_is_set(
     body = _posts(sink)[0][1] or ""
     assert f"![Curie status]({CARD_BASE}/v1/factory/cards/{token}.svg)" in body
     assert "width" not in body
+    # The card carries the phases, so the comment adds no placeholder (#3125).
+    assert WAITING not in body
+    assert "Status: QUEUED" in body
+
+
+def test_a_card_url_replaces_the_checklist_as_phases_advance(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    monkeypatch.setenv("GITHUB_FACTORY_CARD_BASE_URL", CARD_BASE)
+    get_settings.cache_clear()
+    number = 9912
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    token = _notices(request_id)[0]["card_token"]
+    sink.requests.clear()
+
+    _start_running(request_id)
+    for phase, loop_round in (("read_issue", None), ("plan", 1)):
+        assert report(client, request_id, phase, round=loop_round).status_code == 201
+    _reconcile()
+
+    body = _patches(sink)[-1][1] or ""
+    assert f"![Curie status]({CARD_BASE}/v1/factory/cards/{token}.svg)" in body
+    assert "Status: RUNNING" in body
+    assert "- [" not in body
+    assert "Read issue" not in body
+    assert WAITING not in body
+    assert body.rstrip().endswith(marker_for(request_id))
 
 
 # --- 2: edited in place as phases advance --------------------------------------------
