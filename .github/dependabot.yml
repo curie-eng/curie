@@ -7,6 +7,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    labels: ["dependencies"]
     groups:
       github-actions:
         patterns: ["*"]
@@ -18,6 +19,7 @@ updates:
       - /packages/aci-protocol/generated/rust
     schedule:
       interval: weekly
+    labels: ["dependencies"]
     groups:
       cargo:
         patterns: ["*"]
@@ -29,6 +31,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    labels: ["dependencies"]
     groups:
       python:
         patterns: ["*"]
@@ -38,6 +41,7 @@ updates:
     directory: /apps/ui
     schedule:
       interval: weekly
+    labels: ["dependencies"]
     groups:
       pnpm:
         patterns: ["*"]
@@ -64,6 +68,7 @@ updates:
       - /runner
     schedule:
       interval: weekly
+    labels: ["dependencies"]
     groups:
       docker:
         patterns: ["*"]
