@@ -79,6 +79,12 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
   bound. The manifest declares the secret either way. With no repository
   listed, give it a token that can read no private repository, such as a
   fine-grained token limited to public repositories.
+- **Enough agent steps for a campaign.** The runner ends a turn after
+  `CURIE_MAX_TURNS` model steps, 20 by default. A campaign takes well over a
+  hundred: every probe, read and wait is a step. Set it for the tester's
+  installation through `agentSandbox.runner.extraEnv`, for example
+  `[{name: CURIE_MAX_TURNS, value: "300"}]`. A turn that runs out fails with
+  `error_max_turns`, after probes were sent, so it is not retried.
 - **For attached specs:** turn the attachment lane on (`attachments.enabled`)
   and give the tester's Slack app the `files:read` scope. Without both,
   attached files are ignored, so paste the spec into the request instead.
