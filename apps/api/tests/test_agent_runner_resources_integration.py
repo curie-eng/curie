@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
+from curie_api.runner_resources import validate_runner_resources
 
 # The chart block the operator sends. Every key is required when the field is set.
 _VALID: dict[str, Any] = {
@@ -120,6 +121,15 @@ def _shape_body(slug: str) -> dict[str, Any]:
     if slug == "json-string":
         return {"runner_resources": json.dumps(_resources())}
     raise AssertionError(slug)
+
+
+def test_validate_runner_resources_stores_stripped_quantities() -> None:
+    raw = _resources()
+    raw["requests"]["cpu"] = " 500m "
+    stored = validate_runner_resources(raw)
+    assert stored is not None
+    assert stored["requests"]["cpu"] == "500m"
+    assert stored["limits"]["memory"] == "2Gi"
 
 
 def test_created_agent_runner_resources_is_null(

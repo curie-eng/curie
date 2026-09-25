@@ -49,18 +49,22 @@ def validate_runner_resources(value: Any) -> dict[str, Any] | None:
         raise RunnerResourcesError(
             "runner resources must set cpu, memory, and ephemeral-storage on requests and limits"
         ) from exc
+    normalized = {
+        side: {dimension: str(value[side][dimension]).strip() for dimension in _DIMENSIONS}
+        for side in ("requests", "limits")
+    }
     for side in ("requests", "limits"):
         for dimension in _DIMENSIONS:
-            _parse(dimension, str(value[side][dimension]))
+            _parse(dimension, normalized[side][dimension])
     for dimension in _DIMENSIONS:
-        request = _parse(dimension, str(value["requests"][dimension]))
-        limit = _parse(dimension, str(value["limits"][dimension]))
+        request = _parse(dimension, normalized["requests"][dimension])
+        limit = _parse(dimension, normalized["limits"][dimension])
         if request > limit:
             raise RunnerResourcesError(
-                f"{dimension} request {value['requests'][dimension]} is above "
-                f"limit {value['limits'][dimension]}"
+                f"{dimension} request {normalized['requests'][dimension]} is above "
+                f"limit {normalized['limits'][dimension]}"
             )
-    return value
+    return normalized
 
 
 def quota_refusal(
