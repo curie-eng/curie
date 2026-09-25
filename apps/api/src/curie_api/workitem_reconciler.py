@@ -507,7 +507,7 @@ class WorkItemReconciler:
                     channel=item.reply_address,
                     placeholder=None,
                     endpoint=None,
-                    adapter=None,
+                    adapter=item.reply_adapter,
                 ),
                 received_at=datetime.now(UTC).isoformat(),
             )

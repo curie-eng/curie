@@ -86,3 +86,26 @@ def route_thread_key_matches(
         route_thread_key(kind, adapter, address, conversation_id),
         pre_identity_thread_key(kind, adapter, address, conversation_id),
     )
+
+
+async def thread_key_forms(
+    session: AsyncSession, agent_id: uuid.UUID, thread_key: str
+) -> tuple[str, ...]:
+    """``thread_key``, then its pre-identity form when that can only be this agent's route's."""
+
+    old = await pre_identity_thread_key_for(session, agent_id, thread_key)
+    return (thread_key,) if old is None else (thread_key, old)
+
+
+def route_adapter_of(thread_key: str) -> str | None:
+    """The ``adapter`` a wake's ``ReplyHandle`` needs to reproduce this key's route.
+
+    ``route_thread_key`` folds ``adapter`` into the key through
+    ``route_identity``; this is its inverse for a key already minted. A
+    default Slack route's key carries no identity segment, so this returns
+    None for it -- the same value an unnamed route already used, and
+    ``route_identity`` maps both back to the same default app.
+    """
+
+    parsed = parse_scoped_conversation_id(thread_key)
+    return None if parsed is None else parsed.identity

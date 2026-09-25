@@ -15,7 +15,13 @@ from sqlalchemy.sql.elements import ColumnElement
 from . import crud, workitems
 from .config import get_settings
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
-from .threadkeys import route_thread_key, route_thread_key_matches
+from .threadkeys import (
+    pre_identity_key_of,
+    pre_identity_thread_key_for,
+    route_adapter_of,
+    route_thread_key,
+    route_thread_key_matches,
+)
 from .workitems import (
     ExecutionRequestSnapshot,
     WorkItemConflict,
@@ -123,6 +129,7 @@ class TerminatePublish:
     reply_address: str
     reply_conversation_id: str
     requester: str | None
+    reply_adapter: str | None
 
 
 async def _refuse(
@@ -1249,6 +1256,18 @@ async def running_for_conversation(
     work_item = await session.scalar(
         select(WorkItem).where(WorkItem.conversation_id == conversation_id)
     )
+    old = pre_identity_key_of(conversation_id) if work_item is None else None
+    if old is not None:
+        # This endpoint names no agent, so the owner of the old-key row must
+        # prove the old key is its route's (ADR-0168 decision 4).
+        candidate = await session.scalar(
+            select(WorkItem).where(WorkItem.conversation_id == old)
+        )
+        if candidate is not None and (
+            await pre_identity_thread_key_for(session, candidate.agent_id, conversation_id)
+            == old
+        ):
+            work_item = candidate
     if work_item is None:
         return "absent", None
     running = cast(
@@ -1350,6 +1369,7 @@ async def claim_terminate_publishes(
             )
             .returning(
                 ExecutionRequest.id,
+                ExecutionRequest.work_item_id,
                 ExecutionRequest.reply_kind,
                 ExecutionRequest.reply_address,
                 ExecutionRequest.reply_conversation_id,
@@ -1358,12 +1378,27 @@ async def claim_terminate_publishes(
         )
     ).all()
     await session.commit()
+    # This endpoint names no live channel to copy `adapter` from -- the owning
+    # binding may already be gone by the time termination fires -- so it is
+    # decoded back out of the work item's OWN stored route instead, the same
+    # key `_facts_conversation` minted at admission (ADR-0168 decision 4).
+    thread_keys: dict[uuid.UUID, str] = {}
+    if rows:
+        thread_keys = {
+            found.id: found.conversation_id
+            for found in await session.scalars(
+                select(WorkItem).where(
+                    WorkItem.id.in_({row.work_item_id for row in rows})
+                )
+            )
+        }
     published: list[TerminatePublish] = []
     for row in rows:
         if row.reply_kind is None or row.reply_address is None:
             continue
         if row.reply_conversation_id is None:
             continue
+        thread_key = thread_keys.get(row.work_item_id)
         published.append(
             TerminatePublish(
                 request_id=row.id,
@@ -1371,6 +1406,7 @@ async def claim_terminate_publishes(
                 reply_address=row.reply_address,
                 reply_conversation_id=row.reply_conversation_id,
                 requester=row.requester,
+                reply_adapter=None if thread_key is None else route_adapter_of(thread_key),
             )
         )
     return published

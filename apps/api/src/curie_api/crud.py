@@ -61,7 +61,7 @@ from .schemas import (
     SourceBindingConfig,
     VersionCreate,
 )
-from .threadkeys import route_thread_key, route_thread_key_matches
+from .threadkeys import route_thread_key, route_thread_key_matches, thread_key_forms
 from .workspace_policy import repository_is_allowed
 
 _WORKSPACE_UNSET = object()
@@ -1076,6 +1076,23 @@ async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
 _ACTIVE_WORK_ITEM_STATUSES = ("waiting", "running", "cancellation_requested")
 
 
+async def _work_item_for_thread(
+    session: AsyncSession, *, agent_id: uuid.UUID, conversation_id: str
+) -> WorkItem | None:
+    """This thread's work item, under its key or its pre-identity key (ADR-0168 decision 4)."""
+
+    for form in await thread_key_forms(session, agent_id, conversation_id):
+        work_item: WorkItem | None = await session.scalar(
+            select(WorkItem)
+            .where(WorkItem.agent_id == agent_id, WorkItem.conversation_id == form)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+        if work_item is not None:
+            return work_item
+    return None
+
+
 async def publication_cancellation_conflict(
     session: AsyncSession,
     *,
@@ -1088,14 +1105,8 @@ async def publication_cancellation_conflict(
     active request already in ``cancellation_requested``, may not.
     """
 
-    work_item = await session.scalar(
-        select(WorkItem)
-        .where(
-            WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id == conversation_id,
-        )
-        .with_for_update(read=True)
-        .execution_options(populate_existing=True)
+    work_item = await _work_item_for_thread(
+        session, agent_id=agent_id, conversation_id=conversation_id
     )
     if work_item is None:
         return None
@@ -1129,14 +1140,8 @@ async def _refuse_fenced_work_item(
     request_id: uuid.UUID | None,
     runtime_epoch: int | None,
 ) -> ExecutionRequest | None:
-    work_item = await session.scalar(
-        select(WorkItem)
-        .where(
-            WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id == conversation_id,
-        )
-        .with_for_update(read=True)
-        .execution_options(populate_existing=True)
+    work_item = await _work_item_for_thread(
+        session, agent_id=agent_id, conversation_id=conversation_id
     )
     if work_item is None:
         return None
@@ -1525,7 +1530,9 @@ async def _bind_running_work_item_lineage(
         update(WorkItem)
         .where(
             WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id == conversation_id,
+            WorkItem.conversation_id.in_(
+                await thread_key_forms(session, agent_id, conversation_id)
+            ),
             WorkItem.cancelled_at.is_(None),
             WorkItem.publication_lineage_id.is_(None),
             select(ExecutionRequest.id)
