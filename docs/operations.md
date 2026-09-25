@@ -829,7 +829,7 @@ reconciler admitted the issue counts as a relabel and starts a second run.
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
 the review subscriptions when both gates are on. Give the App **Issues: Read and write**
 so Curie can re-read the issue, keep its one status comment, and set the
-`curie:*` state labels. **Metadata: Read** is already implied by repository
+`curie-factory:*` state labels. **Metadata: Read** is already implied by repository
 installation discovery.
 
 Give the App **Checks: Read** and **Commit statuses: Read**. After a factory
@@ -974,11 +974,15 @@ publication lineage commit. A refused create or edit is recorded on the status
 row, stops further edits, and does not change the execution row.
 
 The same pass keeps one state label on the originating issue, for revisions
-too: `curie:queued` while waiting, `curie:running` while running or stopping,
-`curie:pr-open` after a completed run, and `curie:needs-human` after a failed
-or expired one. A cancelled run removes all four. Curie adds the desired label
-and removes the other three, and never touches any other label, including
-the factory admission label.
+too: `curie-factory:queued` while waiting, `curie-factory:running` while running
+or stopping, `curie-factory:pr-open` after a completed run, and
+`curie-factory:needs-human` after a failed or expired one. A cancelled run
+removes all four. The same pass removes a legacy `curie:queued`,
+`curie:running`, `curie:pr-open`, or `curie:needs-human` label by exact name
+whenever it sets or clears the state label, including after an upgrade.
+Curie still never touches any other label, including the factory admission
+label. An older release rolled back onto this schema does not know the new
+names, so it will not remove a `curie-factory:*` label it finds.
 
 Set `api.githubFactoryCardBaseUrl` (`GITHUB_FACTORY_CARD_BASE_URL`) to the
 API's public `https://` origin to embed a live SVG card in the status comment.

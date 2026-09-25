@@ -52,7 +52,12 @@ from test_github_factory_ingress import LABEL, _issue_event, _post
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
-STATE_LABELS = {"curie:queued", "curie:running", "curie:pr-open", "curie:needs-human"}
+STATE_LABELS = {
+    "curie-factory:queued",
+    "curie-factory:running",
+    "curie-factory:pr-open",
+    "curie-factory:needs-human",
+}
 WAITING = "_Waiting for the agent to report progress._"
 CARD_BASE = "https://curie.example.com"
 
@@ -125,7 +130,7 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
     assert body.rstrip().endswith(marker_for(request_id))
-    assert _curie_labels(sink, number) == {"curie:queued"}
+    assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
     row = _notices(request_id)[0]
@@ -210,9 +215,17 @@ def test_progress_edits_the_same_comment_and_moves_the_label_to_running(
     assert FINAL_MARKER not in body
     # Model notes never reach the Markdown, only the card.
     assert marker_for(request_id) in body
-    assert ("POST", f"/repos/{REPO}/issues/{number}/labels", '["curie:running"]') in sink.requests
-    assert ("DELETE", f"/repos/{REPO}/issues/{number}/labels/curie:queued", None) in sink.requests
-    assert _curie_labels(sink, number) == {"curie:running"}
+    assert (
+        "POST",
+        f"/repos/{REPO}/issues/{number}/labels",
+        '["curie-factory:running"]',
+    ) in sink.requests
+    assert (
+        "DELETE",
+        f"/repos/{REPO}/issues/{number}/labels/curie-factory:queued",
+        None,
+    ) in sink.requests
+    assert _curie_labels(sink, number) == {"curie-factory:running"}
     assert {LABEL, "bug"} <= sink.issue_labels[number]
 
     sink.requests.clear()
@@ -285,7 +298,7 @@ def test_completion_patches_the_pr_link_and_finalizes(admitted: Any) -> None:  #
         < body.index(marker_for(request_id))
     )
     assert _notices(request_id)[0]["finalized_at"] is not None
-    assert _curie_labels(sink, number) == {"curie:pr-open"}
+    assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
     assert sink.posts == 1
     assert len(_marked(sink, request_id)) == 1
 
@@ -328,7 +341,7 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     assert "Cause: runner_escalated" in body
     assert "Status: FAILED" in body
     assert FINAL_MARKER in body
-    assert _curie_labels(sink, number) == {"curie:needs-human"}
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     assert sink.posts == 1
 
 
@@ -379,7 +392,7 @@ def test_unlabel_while_waiting_stops_and_clears_every_state_label(
     number = 9909
     request_id = _admit(client, github, sink, number)
     _reconcile()
-    assert _curie_labels(sink, number) == {"curie:queued"}
+    assert _curie_labels(sink, number) == {"curie-factory:queued"}
     github.labels = []
     removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert removed.json()["status"] == "factory_cancelled"
@@ -391,7 +404,11 @@ def test_unlabel_while_waiting_stops_and_clears_every_state_label(
     assert "Status: CANCELLED" in comment["body"]
     assert FINAL_MARKER in comment["body"]
     assert _curie_labels(sink, number) == set()
-    assert ("DELETE", f"/repos/{REPO}/issues/{number}/labels/curie:queued", None) in sink.requests
+    assert (
+        "DELETE",
+        f"/repos/{REPO}/issues/{number}/labels/curie-factory:queued",
+        None,
+    ) in sink.requests
     assert "bug" in sink.issue_labels[number]
     assert sink.posts == 1
 
@@ -407,7 +424,7 @@ def test_a_running_cancellation_shows_stopping(admitted: Any) -> None:  # noqa: 
     (comment,) = _marked(sink, request_id)
     assert "Status: STOPPING" in comment["body"]
     assert FINAL_MARKER not in comment["body"]
-    assert _curie_labels(sink, number) == {"curie:running"}
+    assert _curie_labels(sink, number) == {"curie-factory:running"}
 
 
 # --- 6: relabel supersedes ------------------------------------------------------------------
@@ -439,13 +456,79 @@ def test_relabel_while_waiting_finalizes_the_old_comment_and_opens_a_new_one(
     assert "Status: QUEUED" in new["body"]
     assert FINAL_MARKER not in new["body"]
     assert sink.posts == 2
-    assert _curie_labels(sink, number) == {"curie:queued"}
+    assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # The superseded row never cleared the successor's label.
     assert (
         "DELETE",
-        f"/repos/{REPO}/issues/{number}/labels/curie:queued",
+        f"/repos/{REPO}/issues/{number}/labels/curie-factory:queued",
         None,
     ) not in sink.requests
+
+
+# --- legacy labels are rewritten on the next pass ---------------------------------------------
+
+
+def test_legacy_state_label_is_replaced_on_the_next_pass(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9916
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+
+    # _rows does not commit. This update has to, or the next pass still sees the new name.
+    _execute(
+        "UPDATE curie.factory_terminal_notices SET applied_label = :label "
+        "WHERE execution_request_id = :id",
+        {"label": "curie:queued", "id": request_id},
+    )
+    assert _notices(request_id)[0]["applied_label"] == "curie:queued"
+    labels = sink.issue_labels[number]
+    labels.discard("curie-factory:queued")
+    # LABEL is "factory" in this fixture. "curie-factory" is the admission name a
+    # prefix delete would also remove, so it has to stay beside LABEL.
+    labels.update({LABEL, "curie-factory", "bug", "curie:queued", "curie:custom"})
+    sink.requests.clear()
+    _reconcile()
+
+    assert (
+        "POST",
+        f"/repos/{REPO}/issues/{number}/labels",
+        '["curie-factory:queued"]',
+    ) in sink.requests
+    assert "curie:queued" not in sink.issue_labels[number]
+    assert {LABEL, "curie-factory", "curie:custom", "bug"} <= sink.issue_labels[number]
+
+
+def test_legacy_pr_open_label_is_replaced_after_finalize(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9917
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    _start_running(request_id)
+    assert report(client, request_id, "publish").status_code == 201
+    work_item_id = _request(number)["work_item_id"]
+    _attach_publication(work_item_id, status="succeeded", pr=77)
+    _reconcile()
+    assert _request(number)["status"] == "completed"
+    assert _notices(request_id)[0]["finalized_at"] is not None
+
+    _execute(
+        "UPDATE curie.factory_terminal_notices SET applied_label = :label "
+        "WHERE execution_request_id = :id",
+        {"label": "curie:pr-open", "id": request_id},
+    )
+    assert _notices(request_id)[0]["applied_label"] == "curie:pr-open"
+    labels = sink.issue_labels[number]
+    labels.discard("curie-factory:pr-open")
+    labels.add("curie:pr-open")
+    sink.requests.clear()
+    _reconcile()
+
+    assert (
+        "POST",
+        f"/repos/{REPO}/issues/{number}/labels",
+        '["curie-factory:pr-open"]',
+    ) in sink.requests
+    assert "curie:pr-open" not in sink.issue_labels[number]
 
 
 # --- 7 and 8: lost edit responses and deleted comments ----------------------------------------
@@ -538,7 +621,7 @@ def test_a_review_thread_revision_replies_then_edits_the_review_comment(
     assert FINAL_MARKER in comment["body"]
     assert "The requested revision is pushed to this pull request." in comment["body"]
     assert _curie_labels(sink, pr) == set()
-    assert _curie_labels(sink, number) == {"curie:pr-open"}
+    assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
 
 
 def test_a_refused_thread_reply_lives_on_and_is_edited_on_the_conversation(
