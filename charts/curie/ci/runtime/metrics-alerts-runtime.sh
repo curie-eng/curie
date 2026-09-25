@@ -23,8 +23,8 @@ usage() {
 Usage: charts/curie/ci/runtime/metrics-alerts-runtime.sh [--keep]
 
 Installs a task-owned Prometheus and a trimmed Curie Collector overlay,
-emits Curie run/queue/RPC/delivery metric points over OTLP, queries the
-retained series, then breaks export to prove absent-data detection and
+emits Curie run/queue/RPC/delivery metric points and the worker and api
+gauges over OTLP, queries the retained series, then breaks export to prove absent-data detection and
 restores it. Refuses namespaces/releases used by the permanent soak.
 EOF
 }
@@ -200,10 +200,10 @@ def sum_metric(name, value, attrs):
         },
     }
 
-def gauge_metric(name, value, attrs):
+def gauge_metric(name, value, attrs, unit="s"):
     return {
         "name": name,
-        "unit": "s",
+        "unit": unit,
         "gauge": {
             "dataPoints": [{
                 "asDouble": float(value),
@@ -257,6 +257,28 @@ payload = {
                     "role": "client",
                     "outcome": "success",
                 }),
+                # CurieApplicationMetricsAbsent reads this gauge and the api's
+                # below, with the attributes and units the services record.
+                gauge_metric("curie.queue.depth", 0, {
+                    "service.name": "curie-worker",
+                    "source": "worker",
+                    "outcome": "pending",
+                }, unit="{message}"),
+            ]
+        }],
+    }, {
+        "resource": {
+            "attributes": [
+                {"key": "service.name", "value": {"stringValue": "curie-api"}},
+            ]
+        },
+        "scopeMetrics": [{
+            "metrics": [
+                gauge_metric("curie.approval.pending", 0, {
+                    "service.name": "curie-api",
+                    "operation": "observe",
+                    "outcome": "pending",
+                }, unit="{approval}"),
             ]
         }],
     }]
@@ -298,7 +320,9 @@ for expr in \
   'curie_turn_accepted_total' \
   'curie_queue_enqueue_total or curie_queue_enqueue' \
   'curie_runner_rpc_result_total or curie_runner_rpc_result' \
-  'curie_reply_delivery_total or curie_reply_delivery'
+  'curie_reply_delivery_total or curie_reply_delivery' \
+  'curie_queue_depth{service_name="curie-worker"}' \
+  'curie_approval_pending{service_name="curie-api"}'
 do
   wait_query "$expr" >/dev/null
   echo "PASS retained: $expr"
