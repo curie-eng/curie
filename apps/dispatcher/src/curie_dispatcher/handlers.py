@@ -294,11 +294,12 @@ def _mint_turn(
     )
     stream_id = enqueue(redis_client, config, queued)
     log.info(
-        "enqueued %s %s as stream entry %s identity=%s",
+        "enqueued %s %s as stream entry %s identity=%s slack_identity=%s",
         delivery_kind,
         slack_event_id,
         stream_id,
         release_identity(),
+        slack_identity,
     )
     return stream_id
 
@@ -311,7 +312,7 @@ def process_event(
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
-    slack_identity: str = DEFAULT_IDENTITY,
+    slack_identity: str,
     bot_user_id: str | None = None,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
@@ -324,7 +325,8 @@ def process_event(
 
     ``slack_identity`` is the identity whose app this delivery arrived on. It
     is fixed when the listener is registered, and nothing in ``body`` or
-    ``event`` can change it.
+    ``event`` can change it. It has no default, so a lane that forgets to pass
+    it fails instead of minting ``default``'s turn.
 
     Returns the Valkey Stream id when a job was enqueued, or None when the event
     was refused. Every refusal is logged with its enumerated ``DropReason``.
@@ -427,7 +429,7 @@ def process_action(
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
-    slack_identity: str = DEFAULT_IDENTITY,
+    slack_identity: str,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
 ) -> str | None:
@@ -437,6 +439,7 @@ def process_action(
 
     Same four steps as ``process_event`` (ack is Bolt's, before this runs); no
     decision about *how* the turn is answered lives here -- that is the worker's.
+    ``slack_identity`` is required for the same reason as on ``process_event``.
     """
     log = logger or logging.getLogger(__name__)
 
