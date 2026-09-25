@@ -163,6 +163,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: internalWorkerToken
+            # Mirrors the worker's CURIE_INSTALLATION_ID (#3127): the API scopes
+            # the same per-installation upgrade quiesce key the worker writes.
+            - name: CURIE_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: installationId
+                  optional: false
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS

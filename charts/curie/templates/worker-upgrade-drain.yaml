@@ -40,8 +40,8 @@ clears it on the next attempt.
 */}}
 {{- include "curie.worker.validateUpgradeDrain" . }}
 {{/* The EFFECTIVE clocks, not the raw values: `timeoutSeconds` is a floor and
-     the gate is raised to cover the delivery budget, with the quiesce TTL
-     derived above that. See `curie.worker.upgradeDrain.timeout` for why this is
+     the gate is raised to cover the delivery budget, and the quiesce TTL (the
+     roll hold after a clean drain) is capped at that wait (#3127). See `curie.worker.upgradeDrain.timeout` for why this is
      derived rather than refused. */}}
 {{- $drainTimeout := include "curie.worker.upgradeDrain.timeout" . }}
 {{- $quiesceTtl := include "curie.worker.upgradeDrain.quiesceTtl" . }}
@@ -141,7 +141,7 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   # Unlike the gate, this one SHOULD retry: clearing the flag is idempotent, and
-  # a release that never lands leaves the fleet waiting out `quiesceTtlSeconds`
+  # a release that never lands leaves the fleet waiting out the roll hold
   # before it claims again. The TTL is the fail-safe behind these attempts, not
   # a substitute for them.
   backoffLimit: 3
@@ -181,9 +181,7 @@ spec:
           env:
             {{- include "curie.env.valkey" . | nindent 12 }}
             # Present so the release Job builds the SAME WorkerConfig the gate
-            # does; the config's own validator refuses a quiesce TTL that does
-            # not outlast the drain wait, and a Job that omitted these would
-            # construct a config the gate could not.
+            # does, from the same effective clocks.
             - name: CURIE_UPGRADE_DRAIN_TIMEOUT_S
               value: {{ $drainTimeout | quote }}
             - name: CURIE_UPGRADE_QUIESCE_TTL_S

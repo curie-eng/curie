@@ -152,6 +152,11 @@ _DESIRED_LABEL = {
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
 _WAITING_FOR_PROGRESS = "_Waiting for the agent to report progress._"
 _MARKDOWN_SPECIAL = set("\\`*_[]()#<>!|")
+# #3127 AC2: queued work isn't stuck, it's waiting out an upgrade.
+_PAUSED_FOR_UPGRADE_LINE = (
+    "Paused: this Curie installation is paused for an upgrade. "
+    "Queued work starts when the upgrade finishes."
+)
 
 
 def desired_label(status: str) -> str:
@@ -233,6 +238,7 @@ def status_body(
     pill_label: str,
     phase_view: PhaseView | None,
     result: str | None,
+    paused_for_upgrade: bool = False,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
@@ -252,6 +258,8 @@ def status_body(
     elif result is None:
         parts.append(_WAITING_FOR_PROGRESS)
     parts.append(f"Status: {pill_label}")
+    if paused_for_upgrade and pill_label == "QUEUED":
+        parts.append(_PAUSED_FOR_UPGRADE_LINE)
     if result is not None:
         parts.append(FINAL_MARKER)
     parts.append(marker_for(request_id))
@@ -273,7 +281,11 @@ def _desired_label_sql() -> Any:
 
 
 async def sync_status_comments(
-    session: AsyncSession, settings: Settings, *, limit: int = 20
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    limit: int = 20,
+    paused_for_upgrade: bool = False,
 ) -> int:
     """Create, edit, finalize and label every due status comment this pass can lock.
 
@@ -339,6 +351,7 @@ async def sync_status_comments(
                 request,
                 pr_url=pr_url,
                 latest=bool(latest),
+                paused_for_upgrade=paused_for_upgrade,
             )
             row.attempts += 1
     await session.commit()
@@ -363,6 +376,7 @@ async def _sync_one(
     *,
     pr_url: str | None,
     latest: bool,
+    paused_for_upgrade: bool = False,
 ) -> int:
     assert request.objective is not None
     target = parse_reply_target(
@@ -391,7 +405,15 @@ async def _sync_one(
     writes = 0
     if row.finalized_at is None:
         writes += await _sync_comment(
-            session, github, settings, row, work_item, request, target, pr_url=pr_url
+            session,
+            github,
+            settings,
+            row,
+            work_item,
+            request,
+            target,
+            pr_url=pr_url,
+            paused_for_upgrade=paused_for_upgrade,
         )
     if latest and row.refused_at is None:
         writes += await _sync_labels(github, row, work_item, request.status)
@@ -408,10 +430,20 @@ async def _sync_comment(
     target: ReplyTarget,
     *,
     pr_url: str | None,
+    paused_for_upgrade: bool = False,
 ) -> int:
     if row.subject_title is None:
         row.subject_title = await _subject_title(github, work_item, target)
-    body = await _render(session, settings, row, work_item, request, target, pr_url=pr_url)
+    body = await _render(
+        session,
+        settings,
+        row,
+        work_item,
+        request,
+        target,
+        pr_url=pr_url,
+        paused_for_upgrade=paused_for_upgrade,
+    )
     terminal = FINAL_MARKER in body
     writes = 0
     if row.comment_id is None:
@@ -468,6 +500,7 @@ async def _render(
     target: ReplyTarget,
     *,
     pr_url: str | None,
+    paused_for_upgrade: bool = False,
 ) -> str:
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
@@ -515,6 +548,7 @@ async def _render(
         pill_label=pill_label,
         phase_view=view,
         result=result,
+        paused_for_upgrade=paused_for_upgrade,
     )
 
 
