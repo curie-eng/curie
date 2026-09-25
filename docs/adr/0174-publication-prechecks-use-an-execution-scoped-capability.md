@@ -99,7 +99,7 @@ Use one new sibling signed credential. Do not widen `sandbox_token`.
 | Minter | API, only after authenticating the worker and validating its running execution request and existing open lineage |
 | Signing key and format | Existing platform API key as the HMAC signing key through the existing signature primitive; distinct `ppc` token prefix and dedicated verifier |
 | Scope | Exactly `publication.precheck`; no state, channel, progress, approval, publication, or credential redemption authority |
-| Mint route | Worker authenticated `POST /publications/precheck/context` in `routers/publications.py` |
+| Mint route | Worker authenticated `POST /v1/internal/publications/precheck/context` in `routers/publications.py` |
 | Comparison route | Scoped credential authenticated `POST /publications/precheck` |
 | Comparison router | `apps/api/src/curie_api/routers/publication_precheck.py` |
 | Signed identity | Agent, deployment, canonical storage conversation, WorkItem identifier, execution request UUID, runtime epoch, lineage UUID and version, and accepted head |
