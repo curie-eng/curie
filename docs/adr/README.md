@@ -197,4 +197,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0171 | [A factory run may take three hours and is bounded by time, not turns](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md) | Accepted |
 | 0172 | [The mean tester is one bundle on off-the-shelf MCP servers, and it only reports](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md) | Accepted |
 | 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Accepted |
+| 0175 | [A binding may name the callers it admits](0175-a-binding-may-name-the-callers-it-admits.md) | Draft |
 <!-- END GENERATED: adr-index -->
