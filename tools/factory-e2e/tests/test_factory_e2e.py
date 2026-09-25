@@ -189,8 +189,8 @@ def test_app_jwt_is_rs256_and_verifies(tmp_path: Path) -> None:
 
 
 def test_request_id_matches_api_derivation() -> None:
-    expected = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/factory/label/123/9")
-    assert fe.request_id_for(123, 9) == expected
+    expected = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/factory/label/123/9/d-1")
+    assert fe.request_id_for(123, 9, "d-1") == expected
 
 
 def _delivery(guid: str, number: int, repo: str, *, action: str = "labeled") -> dict[str, Any]:
@@ -453,7 +453,10 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
         "fakeModel": False,
         "model": config.model,
         "credentials": "model-key-value",
-        "extraEnv": [{"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"}],
+        "extraEnv": [
+            {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"},
+            {"name": "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "value": "128000"},
+        ],
     }
     assert not {"fakeModel", "model", "credentials"} & set(values["agentSandbox"])
     worker = values["worker"]
@@ -1005,7 +1008,7 @@ def test_revision_request_id_matches_the_api_derivation() -> None:
     inner = uuid.uuid5(uuid.NAMESPACE_URL, f"{rid}:issue_comment:{cid}")
     expected = uuid.uuid5(uuid.NAMESPACE_URL, f"github-feedback-{inner}")
     assert fe.revision_request_id(rid, cid) == expected
-    assert fe.revision_request_id(rid, cid) != fe.request_id_for(rid, 9)
+    assert fe.revision_request_id(rid, cid) != fe.request_id_for(rid, 9, "d-1")
 
 
 def test_match_delivery_action_kwarg_picks_unlabeled_and_ignores_labeled() -> None:
@@ -1336,7 +1339,7 @@ def test_quota_hard_pods_reads_the_sandbox_quota() -> None:
     assert fe.quota_hard_pods({}) is None
 
 
-def test_real_model_install_skips_session_title_generation(tmp_path: Path) -> None:
+def test_real_model_install_declares_the_gateway_context_window(tmp_path: Path) -> None:
     config = fe.FactoryConfig(
         kube_context="k8",
         app_id="1",
@@ -1360,6 +1363,7 @@ def test_real_model_install_skips_session_title_generation(tmp_path: Path) -> No
     )
     env = values["agentSandbox"]["runner"]["extraEnv"]
     assert {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"} in env
+    assert {"name": "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "value": "128000"} in env
 
 
 def test_fast_model_crash_is_retried_and_a_real_ending_is_not() -> None:
@@ -2313,3 +2317,57 @@ def test_check_app_refuses_when_the_actor_is_the_operator(
     login["value"] = "factory-tester"
     preflight.check_app()
     assert preflight.evidence["actor_login"] == "factory-tester"
+
+
+
+
+def test_only_the_default_model_gets_a_context_window_by_default(tmp_path: Path) -> None:
+    config = fe.FactoryConfig(
+        kube_context="k8",
+        app_id="1",
+        installation_id=1,
+        private_key_file=tmp_path / "app.pem",
+        repo="acme/fixture",
+        label="curie-factory",
+        mention="acme-bot",
+        cloudflared="cloudflared",
+        priority_classes=None,
+        restore_webhook_url=None,
+        webhook_secret="secret",
+        actor_token="token",
+        model_api_key="test-key",
+        model="acme/small-model",
+        model_context_tokens=None,
+    )
+    values = fe.install_values(
+        config, candidate="a" * 40, app_key_secret="ref", consumer_controller=False
+    )
+    names = {e["name"] for e in values["agentSandbox"]["runner"]["extraEnv"]}
+    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in names
+    assert "CLAUDE_CODE_DISABLE_TERMINAL_TITLE" in names
+
+
+def test_model_context_window_follows_the_selected_model(tmp_path: Path) -> None:
+    app_dir = _app_dir(tmp_path)
+    default = fe.load_config(_env(app_dir), context=None, gh_token=_no_gh)
+    assert default.model_context_tokens == fe.DEFAULT_MODEL_CONTEXT_TOKENS
+    other = fe.load_config(
+        {**_env(app_dir), "CURIE_FACTORY_MODEL": "acme/small-model"}, context=None, gh_token=_no_gh
+    )
+    assert other.model_context_tokens is None
+    declared = fe.load_config(
+        {
+            **_env(app_dir),
+            "CURIE_FACTORY_MODEL": "acme/small-model",
+            "CURIE_FACTORY_MODEL_CONTEXT_TOKENS": "32000",
+        },
+        context=None,
+        gh_token=_no_gh,
+    )
+    assert declared.model_context_tokens == 32000
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_MODEL_CONTEXT_TOKENS"):
+        fe.load_config(
+            {**_env(app_dir), "CURIE_FACTORY_MODEL_CONTEXT_TOKENS": "lots"},
+            context=None,
+            gh_token=_no_gh,
+        )

@@ -314,6 +314,9 @@ export interface MetricsSummary {
   tokens: number;
   cost_usd: number;
   error_rate: number;
+  // False when a run used a model with no Langfuse price row: cost_usd is then
+  // 0 because the cost is unknown, not because the run was free.
+  cost_known?: boolean;
 }
 
 export interface MetricPoint {

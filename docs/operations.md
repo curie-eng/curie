@@ -1069,6 +1069,16 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
 | `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
+| `CURIE_FACTORY_MODEL_CONTEXT_TOKENS` | The model's context window, passed to the sandbox as `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 128000 for the default model, unset for any other) |
+
+The App must already be installed on the fixture repository. Adding a
+repository to an App installation is a manual step: in GitHub, open the App's
+installation settings (**Settings > Applications > Installed GitHub Apps >
+Configure** for a user, or the organization's equivalent), then pick the
+repository under **Repository access**, or choose **All repositories**. The API
+refuses this with 403 for a user token, so the tool cannot do it for you.
+Installing the App on all repositories of the fixture owner makes new fixture
+forks work with no further step.
 
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
@@ -1081,8 +1091,12 @@ malicious instruction) on the configured model and again on
 credential), then one authorized same-PR revision and label removal of one
 waiting request and one running request. After the waiting cancellation it
 raises the sandbox pod quota to the chart default with `helm upgrade
---reuse-values`, so the per-agent sandbox warm pool survives. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` so the model session
-does not die while titling itself. A request that
+--reuse-values`, so the per-agent sandbox warm pool survives. A gateway model
+is not in Claude Code's model catalog, so the runner logs a
+`[claude-code:unrecognized_model]` warning. It is only a warning: the turn still
+reaches the gateway. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` to skip
+the session-title side request and `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to declare the
+model's context window (`CURIE_FACTORY_MODEL_CONTEXT_TOKENS`), which silences the notice. A request that
 has not started, a delivery the tunnel rejected, or a run that escalates in
 the first few seconds is cancelled and opened again. A refusal still has to
 end as `no_pull_request`, and the budget case still has to end as

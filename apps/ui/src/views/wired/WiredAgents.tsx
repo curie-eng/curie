@@ -6,6 +6,7 @@ import { useWired } from "../../state/wired";
 import { useAllDeployments } from "../../api/hooks";
 import { hiddenAgentIdsForEnv } from "../../state/env";
 import { deleteAgent } from "../../api/client";
+import { AgentMetricsLine } from "./AgentMetricsLine";
 
 export function WiredAgents() {
   const { state, dispatch } = useStore();
@@ -115,6 +116,9 @@ export function WiredAgents() {
                 <div style={{ fontSize: 11, color: C.muted, marginBottom: 3 }}>created</div>
                 <div style={{ fontFamily: C.mono, fontSize: 13 }}>{new Date(a.created_at).toLocaleDateString()}</div>
               </div>
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <AgentMetricsLine agent={a} />
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
               {/* No status chip: GET /agents carries no bundle/deploy state, so we

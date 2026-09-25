@@ -141,6 +141,10 @@ OPENROUTER_KEY_URL = f"https://{OPENROUTER_HOST}/api/v1/key"
 # The factory agent's per-agent execution deadline (#3071, ADR 0171; the
 # maximum), which the ExecutionRequest deadline follows, and the chart's
 # maximum worker delivery budget.
+# Context window declared for DEFAULT_MODEL, which Claude Code's catalog does
+# not know. Another model declares its own through
+# CURIE_FACTORY_MODEL_CONTEXT_TOKENS; a guessed window could compact too late.
+DEFAULT_MODEL_CONTEXT_TOKENS = 128_000
 EXECUTION_BOUND_SECONDS = 10800
 # Wait allowance after the execution deadline for publication and the notice.
 PUBLICATION_ALLOWANCE_SECONDS = 600
@@ -298,6 +302,7 @@ class FactoryConfig:
     actor_token: str = dataclasses.field(repr=False)
     model_api_key: str | None = dataclasses.field(default=None, repr=False)
     model: str = DEFAULT_MODEL
+    model_context_tokens: int | None = DEFAULT_MODEL_CONTEXT_TOKENS
     bundle_dir: Path = DEFAULT_BUNDLE
     curie_bin: str = "curie"
     # The operator's own GitHub login; None means ask gh at check time.
@@ -561,6 +566,21 @@ def load_config(
             "CURIE_FACTORY_BUNDLE_DIR (a plugin bundle directory; default examples/dark-factory)"
         )
 
+    model = env.get("CURIE_FACTORY_MODEL") or DEFAULT_MODEL
+    # Only DEFAULT_MODEL has a known window; another model declares its own or
+    # keeps Claude Code's unknown-model notice rather than a guessed window.
+    model_context_tokens: int | None = (
+        DEFAULT_MODEL_CONTEXT_TOKENS if model == DEFAULT_MODEL else None
+    )
+    if env.get("CURIE_FACTORY_MODEL_CONTEXT_TOKENS"):
+        raw = env["CURIE_FACTORY_MODEL_CONTEXT_TOKENS"]
+        if raw.isdigit() and int(raw) > 0:
+            model_context_tokens = int(raw)
+        else:
+            missing.append(
+                "CURIE_FACTORY_MODEL_CONTEXT_TOKENS (a positive integer, the context window)"
+            )
+
     if missing:
         raise ConfigError(
             "missing required factory credential or setting: "
@@ -583,7 +603,8 @@ def load_config(
         webhook_secret=webhook_secret,
         actor_token=actor_token,
         model_api_key=env.get("CURIE_FACTORY_MODEL_API_KEY") or None,
-        model=env.get("CURIE_FACTORY_MODEL") or DEFAULT_MODEL,
+        model=model,
+        model_context_tokens=model_context_tokens,
         bundle_dir=bundle_dir,
         curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
         operator_login=env.get("CURIE_FACTORY_OPERATOR_LOGIN") or None,
@@ -647,10 +668,13 @@ def app_jwt(app_id: str, key_file: Path, *, now: int | None = None) -> str:
     return f"{header}.{payload}.{_b64url(signed.stdout)}"
 
 
-def request_id_for(repository_id: int, issue_number: int) -> uuid.UUID:
-    """The execution request id the api derives for a label admission."""
+def request_id_for(repository_id: int, issue_number: int, delivery_id: str) -> uuid.UUID:
+    """The execution request id the api derives for a label admission.
 
-    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}"
+    Each labeled delivery is its own request, so the delivery id is part of it.
+    """
+
+    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{delivery_id}"
     return uuid.uuid5(uuid.NAMESPACE_URL, identity)
 
 
@@ -761,12 +785,21 @@ def install_values(
         values["agentSandbox"]["runner"].update(
             {"fakeModel": False, "model": config.model, "credentials": config.model_api_key}
         )
-        # Claude Code's session-title request does not recognize a gateway model
-        # id. That side request fails the turn as "model error: unknown".
-        # CLAUDE_CODE_DISABLE_TERMINAL_TITLE skips it for Agent SDK sessions.
-        values["agentSandbox"]["runner"]["extraEnv"] = [
-            {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"},
-        ]
+        # A gateway model id is missing from Claude Code's model catalog, so it
+        # logs a "[claude-code:unrecognized_model]" warning. That is a warning,
+        # not the failure: the turn still reaches the gateway. Skipping the
+        # session-title side request keeps one needless call per turn off the
+        # gateway, and naming the context window silences the unknown-model
+        # notice instead of letting Claude Code guess a window.
+        extra_env = [{"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"}]
+        if config.model_context_tokens is not None:
+            extra_env.append(
+                {
+                    "name": "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                    "value": str(config.model_context_tokens),
+                }
+            )
+        values["agentSandbox"]["runner"]["extraEnv"] = extra_env
         # The chart maximum, so the agent's 10800 s execution deadline and not
         # the default 600 s worker budget bounds the run. The runner ceiling
         # must not exceed the delivery budget.
@@ -2336,7 +2369,7 @@ class Preflight:
                 f"{delivery.get('status_code')}, api status {api_status!r}"
             )
         self.step("delivery accepted", delivery_id=delivery.get("guid"))
-        request_id = request_id_for(self.repository_id, issue_number)
+        request_id = request_id_for(self.repository_id, issue_number, str(delivery.get("guid")))
         status, body = self.api(
             "GET",
             f"/v1/internal/work-items/requests/{request_id}",
