@@ -840,7 +840,10 @@ spec:
 {{- end }}
 {{- end }}
 {{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}
-{{- range $agent := keys $connectorSecrets | sortAlpha }}
-{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent)) | nindent 0 }}
+{{- /* A registryEgress agent needs pods labeled curietech.ai/agent=<agent> for its
+       registry NetworkPolicy to select, so it gets a per-agent template even
+       with no connector secrets (#3083). */}}
+{{- range $agent := include "curie.agentSandboxPoolAgents" $root | fromJsonArray }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent | default dict)) | nindent 0 }}
 {{- end }}
 {{- end }}
