@@ -7,7 +7,7 @@ import { useWired } from "../../state/wired";
 import { useMetricsSummary, useTraces, useAllDeployments } from "../../api/hooks";
 import { hiddenAgentIdsForEnv } from "../../state/env";
 import { ConnectSlackPanel } from "../../components/ConnectSlackPanel";
-import { AgentMetricsLine } from "./WiredAgents";
+import { AgentMetricsLine } from "./AgentMetricsLine";
 import type { AgentOut, RawTrace } from "../../api/client";
 
 // Honest post-deploy panel: the real next step, not a fictional "replied in 42ms".
