@@ -93,8 +93,9 @@ def quota_refusal(
         assert ceiling is not None
         got = str(value[side][dimension])
         if _parse(dimension, got) > _parse(dimension, ceiling):
+            kind = "request" if side == "requests" else "limit"
             return (
-                f"{dimension} request {got} cannot fit sandbox quota hard {ceiling}; "
+                f"{dimension} {kind} {got} cannot fit sandbox quota hard {ceiling}; "
                 "lower the override or raise resourceQuota.hard"
             )
     return None

@@ -420,3 +420,23 @@ def test_docker_limit_args_converts_kubernetes_limits() -> None:
     }
     assert docker_limit_args(mebi, "768m", "1") == ["--memory", "768m", "--cpus", "0.5"]
     assert docker_limit_args(gibi, "768m", "1") == ["--memory", "1g", "--cpus", "2"]
+    kibi = {
+        "requests": {"cpu": "50m", "memory": "128Ki", "ephemeral-storage": "1Ki"},
+        "limits": {"cpu": "1", "memory": "512Ki", "ephemeral-storage": "2Ki"},
+    }
+    bare = {
+        "requests": {"cpu": "50m", "memory": "1024", "ephemeral-storage": "2048"},
+        "limits": {"cpu": "1", "memory": "4096", "ephemeral-storage": "8192"},
+    }
+    tebi = {
+        "requests": {"cpu": "50m", "memory": "1Ti", "ephemeral-storage": "1Ti"},
+        "limits": {"cpu": "1", "memory": "1Ti", "ephemeral-storage": "1Ti"},
+    }
+    assert docker_limit_args(kibi, "768m", "1") == ["--memory", "512k", "--cpus", "1"]
+    assert docker_limit_args(bare, "768m", "1") == ["--memory", "4096", "--cpus", "1"]
+    assert docker_limit_args(tebi, "768m", "1") == [
+        "--memory",
+        str(1024**4),
+        "--cpus",
+        "1",
+    ]

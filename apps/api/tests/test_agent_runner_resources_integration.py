@@ -224,6 +224,32 @@ def test_quota_refuses_over_cpu_and_stores_within_quota(
         get_settings.cache_clear()
 
 
+def test_quota_refusal_does_not_save_other_fields_in_the_same_request(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        _set_quota(monkeypatch, dict(_FULL_QUOTA))
+        agent = _create_agent(client, auth_headers, "rr-quota-sibling")
+        over = _resources()
+        over["requests"]["cpu"] = "1500m"
+        over["limits"]["cpu"] = "2"
+        refused = _patch(
+            client,
+            auth_headers,
+            agent["id"],
+            {"model": "claude-sonnet-5", "runner_resources": over},
+        )
+        assert refused.status_code == 422, refused.text
+        stored = _read(client, auth_headers, agent["id"])
+        assert stored["model"] is None
+        assert stored["runner_resources"] is None
+    finally:
+        get_settings.cache_clear()
+
+
 def test_unset_quota_accepts_over_cpu_when_shape_is_valid(
     client: Any,
     auth_headers: dict[str, str],

@@ -22,7 +22,7 @@ from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..models import Agent, AgentChannel
 from ..publication_policy import PublicationPolicyConflict
-from ..runner_resources import quota_refusal
+from ..runner_resources import RunnerResourcesError, quota_refusal
 from ..schemas import (
     AgentCreate,
     AgentOut,
@@ -231,6 +231,23 @@ async def update_agent(
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
             except deploy.ApprovalRoutesUnbound as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    # Same preflight shape (#3209). The helpers below each commit on their own,
+    # so a quota refusal after `model` or `thinking` would persist those fields
+    # on a request this handler answered 422.
+    if "runner_resources" in data.model_fields_set and data.runner_resources is not None:
+        settings = get_settings()
+        try:
+            refusal = quota_refusal(
+                data.runner_resources,
+                requests_cpu=settings.sandbox_quota_requests_cpu,
+                requests_memory=settings.sandbox_quota_requests_memory,
+                limits_cpu=settings.sandbox_quota_limits_cpu,
+                limits_memory=settings.sandbox_quota_limits_memory,
+            )
+        except RunnerResourcesError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        if refusal is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
     # Presence, not truthiness (#1310). `is not None` conflates "the client did
     # not mention this field" with "the client explicitly sent null", so setting
     # either override used to be a one-way door: nothing could put it back to the
@@ -248,19 +265,7 @@ async def update_agent(
             session, agent, data.execution_deadline_seconds
         )
     if "runner_resources" in sent:
-        # Shape already ran in AgentUpdate. Quota is the persistence boundary:
-        # a refusal leaves the stored block untouched, including an explicit clear.
-        if data.runner_resources is not None:
-            settings = get_settings()
-            refusal = quota_refusal(
-                data.runner_resources,
-                requests_cpu=settings.sandbox_quota_requests_cpu,
-                requests_memory=settings.sandbox_quota_requests_memory,
-                limits_cpu=settings.sandbox_quota_limits_cpu,
-                limits_memory=settings.sandbox_quota_limits_memory,
-            )
-            if refusal is not None:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
+        # Quota was judged above, before any field committed. Null clears.
         agent = await crud.update_agent_runner_resources(session, agent, data.runner_resources)
     if data.memory is not None:
         # Omitted leaves it unchanged; unlike `model`/`thinking` there is no

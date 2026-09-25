@@ -120,10 +120,19 @@ def _replace_resources(spec: dict[str, Any], resources: dict[str, Any]) -> None:
 
 
 def _docker_memory(quantity: str) -> str:
+    # docker's RAMInBytes parser treats k, m, and g as binary kibibytes,
+    # mebibytes, and gibibytes. That matches Kubernetes Ki, Mi, and Gi.
+    # A bare number is bytes. Ti has no docker suffix, so it becomes bytes.
+    if quantity.endswith("Ki"):
+        return f"{quantity[:-2]}k"
     if quantity.endswith("Mi"):
         return f"{quantity[:-2]}m"
     if quantity.endswith("Gi"):
         return f"{quantity[:-2]}g"
+    if quantity.endswith("Ti"):
+        return str(int(quantity[:-2]) * 1024**4)
+    if quantity.isdigit():
+        return quantity
     raise ValueError(f"unsupported memory quantity {quantity!r}")
 
 
