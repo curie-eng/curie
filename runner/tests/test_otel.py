@@ -117,6 +117,7 @@ def _export_turn(
     *,
     model: str | None = "configured-model",
     collector_endpoint: str | None = None,
+    prompt: str = "go",
 ) -> tuple[list[object], list[ReadableSpan]]:
     exporter = InMemorySpanExporter()
     resource = (
@@ -147,7 +148,7 @@ def _export_turn(
             lines = [
                 line
                 async for line in runner.run_turn(
-                    Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+                    Event(type="message", text=prompt, user="U0EXAMPLE1", ts="1")
                 )
             ]
             return parse_ndjson("".join(lines))
@@ -431,6 +432,9 @@ def test_two_true_provider_wait_rounds_accumulate_assistant_usage_only() -> None
         if key.startswith("gen_ai.usage.")
     }
     assert emitted_values.isdisjoint({101, 103, 107, 109})
+    # Per-message usage is per-generation by default: no scope key (#3128).
+    for span in finished:
+        assert "curie.usage.scope" not in (span.attributes or {})
 
     for generation in generations:
         ttft = generation.attributes["curie.generation.ttft_ms"]
@@ -1954,3 +1958,155 @@ def test_validator_leaves_clean_allowed_attributes_untouched() -> None:
     (finished,) = exporter.get_finished_spans()
     assert finished.attributes["langfuse.trace.name"] == "curie-run:test"
     assert finished.attributes["gen_ai.usage.input_tokens"] == 12
+
+
+# --- #3128: generation input, output, and result-only usage ------------------------
+
+_INPUT = "langfuse.observation.input"
+_OUTPUT = "langfuse.observation.output"
+_SCOPE = "curie.usage.scope"
+
+
+def test_result_only_usage_lands_on_the_single_generation_scoped_to_the_turn() -> None:
+    script: list[object] = [
+        AssistantMessage(content=[TextBlock(text="hi")], model="observed-model", usage=None),
+        _result(text="hi", usage={"input_tokens": 12, "output_tokens": 3}),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    [generation] = _spans_by_name(finished)["llm.generation"]
+
+    assert generation.attributes["gen_ai.usage.input_tokens"] == 12
+    assert generation.attributes["gen_ai.usage.output_tokens"] == 3
+    assert generation.attributes[_SCOPE] == "turn"
+
+
+def _three_round_result_only_script() -> list[object]:
+    return [
+        AssistantMessage(
+            content=[
+                TextBlock(text="round one"),
+                ToolUseBlock(id="call-one", name="Bash", input={"command": _TOOL_ARGUMENT}),
+            ],
+            model="observed-model",
+            usage=None,
+        ),
+        _tool_result("call-one"),
+        AssistantMessage(
+            content=[
+                TextBlock(text="round two"),
+                ToolUseBlock(id="call-two", name="Read", input={"path": _TOOL_ARGUMENT}),
+            ],
+            model="observed-model",
+            usage=None,
+        ),
+        _tool_result("call-two"),
+        AssistantMessage(
+            content=[TextBlock(text="round three")], model="observed-model", usage=None
+        ),
+        _result(text="round three", usage={"input_tokens": 40, "output_tokens": 9}),
+    ]
+
+
+def test_result_only_usage_is_never_fabricated_on_earlier_generations() -> None:
+    _, finished = _export_turn(_adapter_session_factory(_three_round_result_only_script()))
+    generations = _spans_by_name(finished)["llm.generation"]
+
+    assert len(generations) == 3
+    for earlier in generations[:2]:
+        keys = set(earlier.attributes or {})
+        assert not any(key.startswith("gen_ai.usage.") for key in keys)
+        assert _SCOPE not in keys
+    final = generations[2]
+    assert final.attributes["gen_ai.usage.input_tokens"] == 40
+    assert final.attributes["gen_ai.usage.output_tokens"] == 9
+    assert final.attributes[_SCOPE] == "turn"
+
+
+def test_generations_record_the_prompt_output_and_tool_names_only() -> None:
+    prompt = "Resolve https://github.com/acme-corp/widgets/issues/123"
+    script: list[object] = [
+        AssistantMessage(
+            content=[
+                TextBlock(text="Looking at the file."),
+                ToolUseBlock(id=_TOOL_CALL_ID, name="Bash", input={"command": _TOOL_ARGUMENT}),
+            ],
+            model="observed-model",
+            usage={"input_tokens": 3, "output_tokens": 2},
+        ),
+        _tool_result(_TOOL_CALL_ID),
+        AssistantMessage(
+            content=[TextBlock(text="All done here.")],
+            model="observed-model",
+            usage={"input_tokens": 5, "output_tokens": 4},
+        ),
+        _result(text="All done here."),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script), prompt=prompt)
+    first, second = _spans_by_name(finished)["llm.generation"]
+
+    assert first.attributes[_INPUT] == prompt
+    assert "Looking at the file." in first.attributes[_OUTPUT]
+    assert "[tool_use Bash]" in first.attributes[_OUTPUT]
+    assert second.attributes[_INPUT] == "[tool_result Bash]"
+    assert "All done here." in second.attributes[_OUTPUT]
+    material = _span_wire_material(finished)
+    assert _TOOL_ARGUMENT not in material
+    assert _TOOL_RESULT not in material
+    assert _TOOL_CALL_ID not in material
+
+
+def test_a_failed_tool_result_is_named_as_an_error_in_the_next_input() -> None:
+    script: list[object] = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="call-err", name="Bash", input={})],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _tool_result("call-err", is_error=True),
+        AssistantMessage(
+            content=[TextBlock(text="It failed.")],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _result(text="It failed."),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    _, second = _spans_by_name(finished)["llm.generation"]
+
+    assert second.attributes[_INPUT] == "[tool_result Bash error]"
+
+
+def test_generation_content_is_redacted_before_it_is_clipped() -> None:
+    """A credential straddling the 8000-char clip never reaches the span raw."""
+
+    token = "gh" + "p_" + "A1b2C3d4" * 5
+    prompt = "p " * 3995 + token + " tail " + "z" * 2000
+    reply = "r " * 3995 + token + " tail"
+    script: list[object] = [
+        AssistantMessage(
+            content=[TextBlock(text=reply)],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _result(text="done"),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script), prompt=prompt)
+    [generation] = _spans_by_name(finished)["llm.generation"]
+
+    for key in (_INPUT, _OUTPUT):
+        value = generation.attributes[key]
+        assert isinstance(value, str)
+        assert len(value) <= 8000 + 3
+        assert "gh" + "p_" not in value
+        assert token[:10] not in value
+    assert "[REDACTED" in generation.attributes[_INPUT]
+
+
+def test_generation_content_keys_are_never_on_the_root_or_tool_spans() -> None:
+    _, finished = _export_turn(_adapter_session_factory(_two_round_script()))
+    for span in finished:
+        if span.name == "llm.generation":
+            continue
+        keys = set(span.attributes or {})
+        assert _INPUT not in keys
+        assert _OUTPUT not in keys

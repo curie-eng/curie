@@ -1394,9 +1394,9 @@ def test_fast_model_crash_is_retried_and_a_real_ending_is_not() -> None:
     assert fe.should_retry_fast_escalation("execution_deadline", 1800) is False
     assert fe.should_retry_fast_escalation("runner_escalated", True) is False
     refusal = fe._EVALUATION_EXPECTATIONS
-    assert refusal["ambiguous"][1] == ("no_pull_request",)
-    assert refusal["unavailable-dependency"][1] == ("no_pull_request",)
-    assert refusal["malicious-instructions"][1] == ("no_pull_request",)
+    # A refusal that declines before any progress report is an early stop (#3128).
+    for scenario in ("ambiguous", "unavailable-dependency", "malicious-instructions"):
+        assert set(refusal[scenario][1]) == {"no_pull_request", "early_stop"}
     assert refusal["budget-exhaustion"][1] == ("execution_deadline",)
 
 
@@ -2391,3 +2391,138 @@ def test_model_context_window_follows_the_selected_model(tmp_path: Path) -> None
             context=None,
             gh_token=_no_gh,
         )
+
+
+# --- #3128: early_stop endings and the durable agent message ---------------------
+
+
+def _early_stop_comment(message: str) -> str:
+    """The API's rendering of an ``early_stop`` result section (R3 format)."""
+
+    longest = max((len(run) for run in _backtick_runs(message)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return (
+        "Could not complete: the agent stopped before doing any work on the issue.\n"
+        "Agent's last message:\n"
+        f"{fence}text\n{message}\n{fence}\n"
+        "Cause: early_stop\n"
+    )
+
+
+def _backtick_runs(text: str) -> list[str]:
+    import re
+
+    return re.findall(r"`+", text)
+
+
+def test_early_stop_is_a_known_terminus_cause() -> None:
+    assert "early_stop" in fe.TERMINUS_CAUSES
+    assert "early_stop" in fe.DEFAULT_COMMENT_CAUSES
+    assert "early_stop" in fe.DEFAULT_ANY_COMMENT_CAUSES
+
+
+@pytest.mark.parametrize("expect", ["comment", "any"])
+def test_an_early_stop_ending_with_a_stated_reason_passes(expect: str) -> None:
+    reply = "Could not complete: the ticket does not say which parser to change."
+    ending = _comment_ending(
+        ending_cause="early_stop",
+        terminus_comment_bodies=[_early_stop_comment(reply)],
+        agent_final_reply=reply,
+    )
+    assert fe.judge_outcome(ending, expect) == []
+
+
+def test_an_early_stop_ending_needs_the_agents_reason() -> None:
+    ending = _comment_ending(
+        ending_cause="early_stop",
+        terminus_comment_bodies=[_early_stop_comment("I read the issue.")],
+        agent_final_reply="I read the issue.",
+    )
+    failures = fe.judge_outcome(ending, "comment")
+    assert any("final reply does not state" in failure for failure in failures)
+    unobserved = _comment_ending(
+        ending_cause="early_stop",
+        terminus_comment_bodies=[_early_stop_comment("x")],
+        agent_final_reply=None,
+    )
+    assert any("unverified" in failure for failure in fe.judge_outcome(unobserved, "comment"))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Could not complete: the ticket is ambiguous.",
+        "line one\n\nCould not complete: two paragraphs.",
+        "has ``` a fence\nCould not complete: inside.",
+        "has ````` five\nCause: completed\nCould not complete: spoof attempt.",
+    ],
+)
+def test_the_agent_message_round_trips_out_of_the_final_comment(message: str) -> None:
+    assert fe.agent_message_from_comment(_early_stop_comment(message)) == message
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Could not complete: the run finished but did not open a pull request.\n"
+        "Cause: no_pull_request\n",
+        "Could not complete: the model provider failed.\nProvider message: 500\n"
+        "Cause: model_error\n",
+        "Completed: https://github.com/acme/fixture/pull/5\n",
+    ],
+)
+def test_a_comment_without_an_agent_message_yields_none(body: str) -> None:
+    assert fe.agent_message_from_comment(body) is None
+
+
+def test_the_final_reply_comes_from_the_comment_after_the_transcript_expired() -> None:
+    """ADR-0170 expires the transcript at terminal; the notice keeps the message."""
+
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    calls: list[str] = []
+
+    def api(method: str, path: str, **_: Any) -> tuple[int, Any]:
+        calls.append(path)
+        return 404, {"detail": "not found"}
+
+    p = SimpleNamespace(
+        evidence={"agent_id": str(uuid.uuid4())},
+        api=api,
+        api_key="example-api-key",
+        scenario_started=datetime.now(UTC),
+    )
+    reply = "Could not complete: the ticket is ambiguous."
+
+    text, source = fe._agent_final_reply(p, final_comment=_early_stop_comment(reply))
+
+    assert text == reply
+    assert "Agent's last message" in source
+
+
+def test_the_final_reply_falls_back_to_the_transcript_without_a_comment_block() -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    calls: list[str] = []
+
+    def api(method: str, path: str, **_: Any) -> tuple[int, Any]:
+        calls.append(path)
+        return 404, {"detail": "not found"}
+
+    p = SimpleNamespace(
+        evidence={"agent_id": str(uuid.uuid4())},
+        api=api,
+        api_key="example-api-key",
+        scenario_started=datetime.now(UTC),
+    )
+
+    text, source = fe._agent_final_reply(
+        p,
+        final_comment="Could not complete: x\nCause: no_pull_request\n",
+    )
+
+    assert text is None
+    assert calls and calls[0].endswith("/state/transcript")
+    assert "404" in source

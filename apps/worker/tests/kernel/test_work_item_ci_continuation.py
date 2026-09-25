@@ -258,6 +258,9 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             assert finish["runtime_epoch"] == EPOCH
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "ci_fix_unpublished"
+            assert finish["detail"] is None
+            # A CI fix turn has its own bounded loop: no #3128 continuation.
+            assert len(h.runner.opened) == 1
 
     asyncio.run(exercise())
 

@@ -779,6 +779,71 @@ def test_credit_exhausted_finish_comments_the_redacted_provider_message(
     assert key not in body
 
 
+@pytest.mark.parametrize(("number", "cause"), [(9291, "early_stop"), (9292, "no_pull_request")])
+def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
+    admitted: Any, number: int, cause: str
+) -> None:
+    """#3128: the agent's final message survives on the notice row and the comment."""
+
+    client, github, sink = admitted
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    key = "sk-or-v1-" + "0123456789abcdef" * 4
+    detail = f"I read the issue and stopped. <!-- curie-status:final --> @octocat {key}"
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause, "detail": detail},
+    )
+    assert finished.status_code == 200, finished.text
+    terminal = _request(number)
+    assert (terminal["status"], terminal["terminal_cause"]) == ("failed", cause)
+    notice = _notices(row["id"])[0]
+    assert notice["detail"] is not None
+    assert "I read the issue and stopped." in notice["detail"]
+    assert key not in notice["detail"]
+    assert "[REDACTED" in notice["detail"]
+    _reconcile()
+    assert sink.posts == 1
+    body = sink.comments[0]["body"]
+    assert body.startswith("Could not complete:")
+    assert "Agent's last message:" in body
+    assert "I read the issue and stopped." in body
+    assert key not in body
+    assert f"Cause: {cause}" in body
+    # The model's copy of the final marker is broken; the platform's own is the
+    # only one, so the comment is still recognised as exactly one final notice.
+    assert body.count(FINAL_MARKER) == 1
+    _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
+
+
+def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any) -> None:
+    """#3128: like ``no_pull_request``, publication owns the terminus."""
+
+    client, github, sink = admitted
+    number = 9293
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    _attach_publication(row["work_item_id"], status="pending", pr=None)
+
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "early_stop",
+            "detail": "stopping",
+        },
+    )
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _request(number)["status"] == "running"
+
+
 def test_a_refused_post_leaves_the_terminal_row_unchanged(admitted: Any) -> None:
     client, github, sink = admitted
     number = 9204
