@@ -4206,7 +4206,6 @@ class Kernel:
                 outcome = await self._consume(
                     qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
                 )
-                outcome.workspace_inferred_repo = inferred
                 outcome = await self._continue_unpublished(
                     qevent,
                     route,
