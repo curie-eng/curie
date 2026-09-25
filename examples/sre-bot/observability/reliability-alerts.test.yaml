@@ -2513,6 +2513,242 @@ tests:
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
 
+  # CurieTurnAcceptedStale is about a label set, not a process. A restart ends
+  # the old instance's series and starts the new one's at its first turn, so a
+  # count per series pages on the old instance's flat series and cannot see the
+  # new one's first turn. The rule counts each window over every instance of a
+  # label set. The 90m count reads a new series from zero, and a label set with
+  # turns in 7 days but no series left in the 90m range counts 0 there. The 7d
+  # count is increase() alone: with under seven days of history every live
+  # series would look new over 7d. The alert names no instance.
+
+  # A worker restart with the canary healthy throughout, on a 30-minute
+  # cadence. Worker a's last turn is first exported at 121m and its last export
+  # is at 145m; worker b's first turn is exported at 147m and another follows
+  # every 30 minutes. Counted per series, a's range holds only flat samples from
+  # 210m to 233m, so it fires from 225m. An old series pages that way only with
+  # at least 16 minutes of flat exports after its last turn, so a cadence of 15
+  # minutes or less cannot show it. a's series leaves the 90m range at 234m,
+  # b's first sample counts until 236m, and b's own increase from 237m. At 240m
+  # and 250m a's last sample is 95 and 105 minutes old: a per-series count that
+  # reads a series missing from the range as 0 is firing there.
+  - name: a worker restart with the canary healthy stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted",instance="curie-worker-a"}'
+        values: '_ 1x29 2x29 3x29 4x29 5x24'
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted",instance="curie-worker-b"}'
+        values: '_x147 1x29 2x29 3x29 4x29 5x29 6x3'
+    alert_rule_test:
+      - eval_time: 225m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 233m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 237m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 240m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 250m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 300m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+
+  # Worker a's last turn is exported at 121m and its last export is at 122m, a
+  # restart; worker b accepts one turn, exported at 124m, and none after.
+  # Counted per series the rule never pages: b's 7d increase is 0 at its first
+  # value, and a's series leaves the range. Counted per label set, b's first
+  # sample holds the 90m count at 1 until 213m. From 214m the count is 0 while
+  # a's increases keep the 7d count above 0: pending, and firing at 229m, 105
+  # minutes after b's turn, and still at 300m. A 90m count without the
+  # new-series term is 0 from 210m and fires from 225m.
+  - name: a canary that stops one turn after a worker restart fires
+    interval: 1m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted",instance="curie-worker-a"}'
+        values: '_ 1x29 2x29 3x29 4x29 5x1'
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted",instance="curie-worker-b"}'
+        values: '_x124 1x176'
+    alert_rule_test:
+      - eval_time: 228m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 229m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              outcome: accepted
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+      - eval_time: 300m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              outcome: accepted
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+
+  # Worker a's last turn is exported at 121m and its last export is at 122m;
+  # worker b never accepts a turn, so it has no series. a's last two samples
+  # give a 90m increase of 0 at 210m, and from 211m the label set has no series
+  # in the 90m range at all while its 7d count stays above 0. Read as 0, that
+  # is pending from 210m and firing at 225m, 104 minutes after a's last turn,
+  # and still at 300m. Read as absent, or per series, the rule never pages.
+  - name: a canary that never accepts a turn after a worker restart fires
+    interval: 1m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted",instance="curie-worker-a"}'
+        values: '_ 1x29 2x29 3x29 4x29 5x1'
+    alert_rule_test:
+      - eval_time: 224m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 225m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              outcome: accepted
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+      - eval_time: 300m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              outcome: accepted
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+
+  # A live worker whose counter has stood at 5 since 25m, with no turn after.
+  # Its turns at 10m to 25m are in the 7d range until 7d20m, so the rule pages
+  # until then; from there, with no turn in 7 days, it is quiet. A 7d range at
+  # 1m holds 10080 samples, over promtool's 10000-sample query limit, so this
+  # case samples every 5m; the 5m instant look-back still finds a sample at
+  # every evaluation.
+  - name: a label set with no turn in 7 days stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted",instance="curie-worker-a"}'
+        values: '_ 1+1x4 5x2034'
+    alert_rule_test:
+      - eval_time: 10140m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+
+  # A fresh Prometheus beside a worker that has run for weeks. Its series is
+  # first seen at 5m already at 4000 and accepts no turn. Promtool has no
+  # history before 0m, so over the 7d window the series looks new until 7d4m;
+  # a 7d count that read a new series from zero would count all 4000 and page
+  # from 110m, 15 minutes after the 90m count reaches 0, to the end of the run.
+  # increase() over 7d is 0 throughout. Sampled every 5m for the same limit as
+  # above.
+  - name: a series first seen at its lifetime count on a fresh Prometheus stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted",instance="curie-worker-a"}'
+        values: '_ 4000x2016'
+    alert_rule_test:
+      - eval_time: 110m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 12h
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 3d
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 7d
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+
+  # Two sources, each under its own job. The worker's last turn is exported at
+  # 60m and the dispatcher's at 120m. The worker's 90m count is 0 from 149m and
+  # fires alone at 164m while the dispatcher still accepts turns; the
+  # dispatcher's is 0 from 209m and fires beside it at 224m. One alert per
+  # label set, each keeping `job` and naming no instance.
+  - name: two sources that stop accepting turns page separately without an instance
+    interval: 1m
+    input_series:
+      - series: 'curie_turn_accepted_total{job="curie-worker",instance="curie-worker-a",service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '_ 1+1x59 60x239'
+      - series: 'curie_turn_accepted_total{job="curie-dispatcher",instance="curie-dispatcher-a",service_name="curie-dispatcher",source="dispatcher",outcome="accepted"}'
+        values: '_ 1+1x119 120x179'
+    alert_rule_test:
+      - eval_time: 164m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              job: curie-worker
+              outcome: accepted
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+      - eval_time: 224m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              job: curie-dispatcher
+              outcome: accepted
+              service_name: curie-dispatcher
+              severity: page
+              source: dispatcher
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+          - exp_labels:
+              component: curie-canary
+              job: curie-worker
+              outcome: accepted
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+
   # CurieApplicationMetricsAbsent reads the two gauges, which the worker
   # records on every maintenance tick and the api on every sweep whether or
   # not anything happens, so a quiet system still has both. A counter is no
