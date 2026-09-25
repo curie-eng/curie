@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
-from channel_protocol import scoped_conversation_id
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
@@ -47,6 +46,7 @@ from .publication_policy import (
     publication_row_prefix,
 )
 from .schemas import (
+    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     ActionComplete,
     ActionRecord,
     AgentCreate,
@@ -61,9 +61,24 @@ from .schemas import (
     SourceBindingConfig,
     VersionCreate,
 )
+from .threadkeys import route_thread_key, route_thread_key_matches
 from .workspace_policy import repository_is_allowed
 
 _WORKSPACE_UNSET = object()
+
+
+def _workspace_route_adapter(reply_adapter: str | None) -> str | None:
+    """``reply_adapter``, unless it is the built-in disconnected-message relay.
+
+    That sentinel is never a declared identity or an egress credential (see
+    ``PublicationCreate._valid_reply_route``) -- it names a later delivery
+    substitution, not the thread's own route -- so it must not turn into an
+    identity segment when a legacy request forces this module to rebuild the
+    workspace key from ``reply_adapter`` instead of a stored, already-scoped
+    ``conversation_id``.
+    """
+
+    return None if reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER else reply_adapter
 
 
 class AmbiguousRoute(RuntimeError):
@@ -125,8 +140,9 @@ async def _adopt_publication_replay(
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else scoped_conversation_id(
+        else route_thread_key(
             data.reply_kind,
+            _workspace_route_adapter(data.reply_adapter),
             data.reply_channel,
             data.conversation_id,
         )
@@ -1181,8 +1197,9 @@ async def create_publication(
     workspace_conversation_id = (
         data.conversation_id
         if data.reply_conversation_id is not None
-        else scoped_conversation_id(
+        else route_thread_key(
             data.reply_kind,
+            _workspace_route_adapter(data.reply_adapter),
             data.reply_channel,
             data.conversation_id,
         )
@@ -3154,8 +3171,13 @@ async def _require_review_binding(
         or binding.agent_id != lineage.agent_id
         or binding.generation != lineage.binding_generation
         or not lineage.reply_conversation_id
-        or scoped_conversation_id(binding.kind, binding.address, lineage.reply_conversation_id)
-        != lineage.conversation_id
+        or not route_thread_key_matches(
+            binding.kind,
+            binding.adapter,
+            binding.address,
+            lineage.reply_conversation_id,
+            lineage.conversation_id,
+        )
     ):
         raise PublicationLineageConflict(
             "publication.review_ineligible",

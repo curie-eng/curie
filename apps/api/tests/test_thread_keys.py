@@ -21,7 +21,7 @@ from curie_api.threadkeys import (
 )
 from curie_api.workitem_dispatch import admit, readmit
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 ADDRESS = "agent@example.test"
 ADAPTER = "agentmail-sandbox"
@@ -33,8 +33,13 @@ SLACK_TS = "1700000000.000100"
 
 
 def test_route_thread_key_resolves_the_route_identity() -> None:
-    assert route_thread_key("slack", None, "C0EXAMPLE1", SLACK_TS) == f"slack:C0EXAMPLE1:{SLACK_TS}"
-    assert route_thread_key("slack", "default", "C0EXAMPLE1", SLACK_TS) == f"slack:C0EXAMPLE1:{SLACK_TS}"
+    assert (
+        route_thread_key("slack", None, "C0EXAMPLE1", SLACK_TS) == f"slack:C0EXAMPLE1:{SLACK_TS}"
+    )
+    assert (
+        route_thread_key("slack", "default", "C0EXAMPLE1", SLACK_TS)
+        == f"slack:C0EXAMPLE1:{SLACK_TS}"
+    )
     assert (
         route_thread_key("slack", "second-bot", "C0EXAMPLE1", SLACK_TS)
         == f"slack:second-bot:C0EXAMPLE1:{SLACK_TS}"
@@ -79,8 +84,13 @@ def test_only_threadkeys_builds_a_thread_key_in_the_api() -> None:
 def _with_session[T](body: Callable[[AsyncSession], Awaitable[T]]) -> T:
     async def go() -> T:
         engine = create_async_engine(get_settings().database_url)
+        # `expire_on_commit=False`, matching `db.py`'s own session factory: a
+        # bare `AsyncSession(engine)` expires every attribute on commit, and
+        # `readmit`'s own internal commit then makes its later `work_item.id`
+        # read (`workitem_dispatch.py::readmit`) refuse outside a greenlet.
+        maker = async_sessionmaker(engine, expire_on_commit=False)
         try:
-            async with AsyncSession(engine) as session:
+            async with maker() as session:
                 return await body(session)
         finally:
             await engine.dispose()
@@ -152,17 +162,51 @@ def test_admission_keys_a_mail_work_item_by_its_identity(
     _with_session(body)
 
 
+# --- readmission accepts the pre-identity key ------------------------------------
+#
+# `WorkItem.conversation_id` is immutable once written -- migration 0046's
+# `enforce_work_items_update_invariants` trigger refuses any UPDATE that
+# touches it (pinned by `test_migration_0046_work_items.py`), so a work item
+# "admitted before the identity" cannot be built by admitting one under the
+# current code and then rewriting its key. It is seeded directly under the
+# old key instead: the row shape a pre-decision-4 admission actually left
+# behind, since admission itself can no longer produce one.
+
+
+async def _legacy_mail_work_item(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID, int]:
+    agent_id = await _mail_agent(session)
+    facts = _facts(agent_id)
+    work_item_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO curie.work_items "
+            "(id, github_repository_id, github_issue_number, github_installation_id, "
+            "agent_id, repo_full_name, conversation_id) "
+            "VALUES (:id, :repo_id, :issue, :install, :agent_id, :repo, :conversation_id)"
+        ),
+        {
+            "id": work_item_id,
+            "repo_id": facts.github_repository_id,
+            "issue": facts.github_issue_number,
+            "install": facts.github_installation_id,
+            "agent_id": agent_id,
+            "repo": facts.repo_full_name,
+            "conversation_id": OLD_KEY,
+        },
+    )
+    await session.commit()
+    version = await session.scalar(
+        text("SELECT version FROM curie.work_items WHERE id = :id"), {"id": work_item_id}
+    )
+    assert version is not None
+    return agent_id, work_item_id, version
+
+
 def test_readmit_accepts_a_work_item_admitted_before_the_identity(
     clean_db: None, allowlisted: None
 ) -> None:
     async def body(session: AsyncSession) -> None:
-        agent_id = await _mail_agent(session)
-        admitted = await admit(session, _facts(agent_id))
-        await session.execute(
-            text("UPDATE curie.work_items SET conversation_id = :old WHERE id = :id"),
-            {"old": OLD_KEY, "id": admitted.work_item.id},
-        )
-        await session.commit()
+        agent_id, _work_item_id, _version = await _legacy_mail_work_item(session)
         again = await readmit(session, _facts(agent_id))
         assert getattr(again, "code", None) != "identity_mismatch", again
 

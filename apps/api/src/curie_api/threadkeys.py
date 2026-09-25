@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import uuid
 
-from aci_protocol.turn import SLACK_KIND
+from aci_protocol.turn import SLACK_KIND, route_identity
 from channel_protocol import parse_scoped_conversation_id, scoped_conversation_id
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,3 +54,35 @@ async def pre_identity_thread_key_for(
         )
     )
     return old if adapters == [parsed.identity] else None
+
+
+def route_thread_key(
+    kind: str, adapter: str | None, address: str, conversation_id: str
+) -> str:
+    """The worker's thread key for this route and conversation (``kernel._thread_key_for``)."""
+
+    return scoped_conversation_id(
+        kind, address, conversation_id, identity=route_identity(kind, adapter)
+    )
+
+
+def pre_identity_thread_key(
+    kind: str, adapter: str | None, address: str, conversation_id: str
+) -> str | None:
+    """The key this route had before decision 4, or None when it did not change."""
+
+    if kind == SLACK_KIND:
+        return None
+    old = scoped_conversation_id(kind, address, conversation_id)
+    return None if old == route_thread_key(kind, adapter, address, conversation_id) else old
+
+
+def route_thread_key_matches(
+    kind: str, adapter: str | None, address: str, conversation_id: str, stored: str
+) -> bool:
+    """Whether ``stored`` is this route's thread key, in its current or pre-identity form."""
+
+    return stored in (
+        route_thread_key(kind, adapter, address, conversation_id),
+        pre_identity_thread_key(kind, adapter, address, conversation_id),
+    )

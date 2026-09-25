@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
-from channel_protocol import scoped_conversation_id
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -16,6 +15,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from . import crud, workitems
 from .config import get_settings
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
+from .threadkeys import route_thread_key, route_thread_key_matches
 from .workitems import (
     ExecutionRequestSnapshot,
     WorkItemConflict,
@@ -143,9 +143,18 @@ async def _refuse(
     return result
 
 
-def _facts_conversation(facts: Any) -> str:
-    return scoped_conversation_id(
-        facts.kind, facts.address, facts.reply_conversation_id
+async def _facts_route_adapter(session: AsyncSession, facts: Any) -> str | None:
+    """The adapter of the binding ``_admission_refusal`` resolved for these facts."""
+
+    binding = await crud.binding_for_route(session, facts.kind, None, facts.address)
+    if binding is None or binding.agent_id != facts.agent_id:
+        return None
+    return binding.adapter
+
+
+def _facts_conversation(facts: Any, adapter: str | None) -> str:
+    return route_thread_key(
+        facts.kind, adapter, facts.address, facts.reply_conversation_id
     )
 
 
@@ -169,14 +178,20 @@ def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
     )
 
 
-def _work_item_matches(item: WorkItem, facts: Any) -> bool:
+def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
     return (
         item.agent_id == facts.agent_id
         and item.repo_full_name == facts.repo_full_name
         and item.github_repository_id == facts.github_repository_id
         and item.github_issue_number == facts.github_issue_number
         and item.github_installation_id == facts.github_installation_id
-        and item.conversation_id == _facts_conversation(facts)
+        and route_thread_key_matches(
+            facts.kind,
+            adapter,
+            facts.address,
+            facts.reply_conversation_id,
+            item.conversation_id,
+        )
     )
 
 
@@ -215,7 +230,7 @@ async def _replay_existing(
         return await _refuse(
             session, "not_found", work_item_id=work_item.id, request_id=request.id
         )
-    if not _work_item_matches(work_item, facts):
+    if not _work_item_matches(work_item, facts, await _facts_route_adapter(session, facts)):
         return await _refuse(
             session,
             "identity_mismatch",
@@ -308,7 +323,7 @@ async def readmit(
     )
     if work_item is None:
         return await _admit_new(session, facts)
-    if not _work_item_matches(work_item, facts):
+    if not _work_item_matches(work_item, facts, await _facts_route_adapter(session, facts)):
         return await _refuse(
             session, "identity_mismatch", work_item_id=work_item.id
         )
@@ -344,7 +359,7 @@ async def _admit_new(
         github_installation_id=facts.github_installation_id,
         agent_id=facts.agent_id,
         repo_full_name=facts.repo_full_name,
-        conversation_id=_facts_conversation(facts),
+        conversation_id=_facts_conversation(facts, await _facts_route_adapter(session, facts)),
     )
     if isinstance(created, WorkItemConflict):
         return created
