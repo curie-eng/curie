@@ -463,3 +463,42 @@ def test_bind_running_work_item_lineage_finds_a_legacy_work_items_running_reques
         assert bound == lineage_id
 
     _with_session(body)
+
+
+def test_bind_running_work_item_lineage_does_not_adopt_a_legacy_key_under_another_adapter(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id, work_item_id, _version = await _legacy_mail_work_item(session)
+        readmitted = await readmit(session, _facts(agent_id))
+        assert getattr(readmitted, "code", None) != "identity_mismatch", readmitted
+        assert readmitted.request is not None
+        request_id = readmitted.request.id
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "status = 'running', started_at = clock_timestamp(), "
+                "execution_deadline = clock_timestamp() + interval '1800 seconds', "
+                "execution_attempts = 1, "
+                "version = version + 1 "
+                "WHERE id = :id"
+            ),
+            {"id": request_id},
+        )
+        await session.commit()
+        lineage_id = await _bare_lineage(session, agent_id)
+        # The pair's binding is bound under ADAPTER, not this one: the old
+        # key can only be ITS route's, so a write implying another route's
+        # identity must not adopt it.
+        other = scoped_conversation_id("email", ADDRESS, THREAD, identity="other-inbox")
+        await crud._bind_running_work_item_lineage(
+            session, agent_id=agent_id, conversation_id=other, lineage_id=lineage_id
+        )
+        await session.commit()
+        bound = await session.scalar(
+            text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
+            {"id": work_item_id},
+        )
+        assert bound is None
+
+    _with_session(body)
