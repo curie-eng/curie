@@ -1015,7 +1015,7 @@ class SessionRunner:
         assert self._session is not None
         gen.query_observed()
         # The prompt text never reaches OTel (e2e ladder gate); record its size only.
-        gen.observe_input(f"[user prompt: {len(event.text)} chars]")
+        gen.observe_prompt(event.text)
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
             if isinstance(message, StreamedToolUseBoundary):

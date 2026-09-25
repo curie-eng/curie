@@ -128,14 +128,23 @@ _USAGE_ATTRIBUTE_KEYS: Mapping[str, SpanAttributeKey] = {
 _MAX_OBSERVATION_CHARS = 8000
 
 
-def _observation_text(parts: list[str]) -> str | None:
+def _prompt_placeholder(prompt: str) -> str:
+    return f"[user prompt: {len(prompt)} chars]"
+
+
+def _observation_text(parts: list[str], prompts: list[str]) -> str | None:
     """Join, redact, THEN clip generation content; None when there is nothing.
 
     Redacting first means a credential straddling the clip boundary is replaced
     whole instead of leaving a raw prefix the pattern can no longer match.
     """
 
-    text = redact_text("\n".join(part for part in parts if part))
+    text = "\n".join(part for part in parts if part)
+    # The user prompt never reaches OTel (e2e ladder gate), even echoed back by
+    # the model; longest first so a prompt containing another is replaced whole.
+    for prompt in sorted(prompts, key=len, reverse=True):
+        text = text.replace(prompt, _prompt_placeholder(prompt))
+    text = redact_text(text)
     if not text:
         return None
     if len(text) > _MAX_OBSERVATION_CHARS:
@@ -455,6 +464,7 @@ class _GenerationSpan:
         self._pending_input: list[str] = []
         self._tool_names: dict[str, str] = {}
         self._turn_usage_observed = False
+        self._prompts: list[str] = []
 
     @property
     def result_observed(self) -> bool:
@@ -510,6 +520,19 @@ class _GenerationSpan:
             self._generation_input.append(text)
         else:
             self._pending_input.append(text)
+
+    def observe_prompt(self, text: str) -> None:
+        """Record a turn prompt as a size placeholder, never its text.
+
+        The prompt is remembered so any exact echo of it in generation input or
+        output is replaced by the same placeholder before redaction and clip.
+        """
+
+        if not text:
+            return
+        if text not in self._prompts:
+            self._prompts.append(text)
+        self.observe_input(_prompt_placeholder(text))
 
     def observe_output(self, text: str) -> None:
         """Buffer assistant text or a ``[tool_use NAME]`` marker as output."""
@@ -821,7 +844,7 @@ class _GenerationSpan:
             (SpanAttributeKey.OBSERVATION_INPUT, self._generation_input),
             (SpanAttributeKey.OBSERVATION_OUTPUT, self._generation_output),
         ):
-            text = _observation_text(parts)
+            text = _observation_text(parts, self._prompts)
             if text is not None:
                 _set(span, key, text)
         self._generation_input = []
