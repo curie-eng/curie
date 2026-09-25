@@ -1433,11 +1433,11 @@ dispatcher:
     # CURIE_SLACK_BOT_TOKEN__<n> (worker, API, dispatcher) and
     # CURIE_SLACK_APP_TOKEN__<n> / CURIE_SLACK_SIGNING_SECRET__<n> (dispatcher),
     # where <n> is the entry's position, and CURIE_SLACK_IDENTITIES tells all
-    # three which name reads which variable. A listed identity is declared to
-    # the API, which then accepts bindings naming it; the dispatcher still
-    # connects only `default` until each identity gets its own connection. A
-    # plain `curie cluster up` carries a recorded list forward with the
-    # release's other recorded values.
+    # three which name reads which variable. That declaration is what the API
+    # validates a Slack binding's identity against. A plain `curie cluster up`
+    # carries a recorded non-empty list forward instead of resetting it to this
+    # default; a recorded empty list makes `up` refuse until it is removed from
+    # the release's values.
     identities: []
   resources:
     requests: { cpu: 50m, memory: 128Mi }

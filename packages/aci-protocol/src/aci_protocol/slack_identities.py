@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field
 from pydantic_settings import NoDecode
 
-from .turn import DEFAULT_IDENTITY
+from .turn import CLUSTER_MESSAGE_ADAPTER, DEFAULT_IDENTITY
 
 SLACK_IDENTITIES_ENV = "CURIE_SLACK_IDENTITIES"
 
@@ -96,6 +96,11 @@ def _check_declarations(identities: tuple[SlackIdentity, ...]) -> tuple[SlackIde
     repeated = sorted({name for name in names if names.count(name) > 1})
     if repeated:
         raise ValueError(f"{SLACK_IDENTITIES_ENV} repeats identity names {repeated}")
+    if CLUSTER_MESSAGE_ADAPTER in names:
+        raise ValueError(
+            f"{SLACK_IDENTITIES_ENV} declares an identity named {CLUSTER_MESSAGE_ADAPTER!r}; "
+            f"{CLUSTER_MESSAGE_ADAPTER!r} is a reserved delivery selector, not an identity"
+        )
     if DEFAULT_IDENTITY not in names:
         raise ValueError(
             f"{SLACK_IDENTITIES_ENV} declares no {DEFAULT_IDENTITY!r} identity; a Slack "

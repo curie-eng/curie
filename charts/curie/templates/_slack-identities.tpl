@@ -18,10 +18,11 @@
      helm's include returns a string. */}}
 {{- define "curie.slack.identities" -}}
 {{- $s := .Values.dispatcher.slack -}}
-{{- $list := $s.identities | default list -}}
-{{- if not (kindIs "slice" $list) -}}
+{{- $list := $s.identities -}}
+{{- if not (or (kindIs "invalid" $list) (kindIs "slice" $list)) -}}
 {{- fail (printf "dispatcher.slack.identities must be a list of identities; got %s." (kindOf $list)) -}}
 {{- end -}}
+{{- $list = $list | default list -}}
 {{- $allowed := list "name" "appTokenExistingSecret" "appTokenExistingSecretKey" "botTokenExistingSecret" "botTokenExistingSecretKey" "signingSecretExistingSecret" "signingSecretExistingSecretKey" -}}
 {{- $block := include "curie.slack.blockConfigured" . -}}
 {{- $items := list -}}
@@ -47,6 +48,9 @@
 {{- if or (gt (len $name) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $name)) -}}
 {{- fail (printf "%s.name %q must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ and be at most 40 characters, the deploy target name shape." $where $name) -}}
 {{- end -}}
+{{- if eq $name "curie-cluster-message" -}}
+{{- fail (printf "%s.name %q is reserved: it is the built-in cluster-message reply adapter, a delivery selector every binding already refuses, not an identity. Choose another name." $where $name) -}}
+{{- end -}}
 {{- if hasKey $seen $name -}}
 {{- fail (printf "%s.name %q repeats %s; identity names are unique." $where $name (get $seen $name)) -}}
 {{- end -}}
@@ -59,6 +63,14 @@
 {{- if not (and (kindIs "string" $ref) $ref) -}}
 {{- fail (printf "%s.%sExistingSecret must name the Secret holding this identity's %s." $where $token $token) -}}
 {{- end -}}
+{{- end -}}
+{{- if hasKey $entry "signingSecretExistingSecret" -}}
+{{- $ref := get $entry "signingSecretExistingSecret" -}}
+{{- if not (and (kindIs "string" $ref) $ref) -}}
+{{- fail (printf "%s.signingSecretExistingSecret must name the Secret holding this identity's signing secret; leave the key out when this identity has none." $where) -}}
+{{- end -}}
+{{- else if hasKey $entry "signingSecretExistingSecretKey" -}}
+{{- fail (printf "%s.signingSecretExistingSecretKey is set without %s.signingSecretExistingSecret, so this identity would render no signing secret. Set the Secret too, or remove the key." $where $where) -}}
 {{- end -}}
 {{- $isDefault := eq $name "default" -}}
 {{- $signing := get $entry "signingSecretExistingSecret" | default "" -}}

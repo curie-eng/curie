@@ -1665,12 +1665,14 @@ key: {{ .defaultKey }}
 {{- end -}}
 
 {{/* ---- Dispatcher gating ----
-     The Slack dispatcher only deploys when it has both tokens; without them it
-     would crash-loop the reconnect supervisor forever, so a token-less default
-     install skips the Deployment entirely (NOTES prints the connect command).
-     A token counts as present whether it arrives as the plain value or via its
-     *ExistingSecret (issue #1759) -- a dispatcher configured entirely through
-     BYO Secrets must still deploy. */}}
+     The Slack dispatcher only deploys when the identity `default` has both
+     tokens: from dispatcher.slack, where a token counts as present whether it
+     arrives as the plain value or via its *ExistingSecret (issue #1759), or
+     from a dispatcher.slack.identities entry named `default`. A non-empty list
+     is enough here because curie.slack.identities fails the render unless the
+     list leaves `default` with both. Without them the dispatcher would
+     crash-loop the reconnect supervisor forever, so a token-less default
+     install skips the Deployment entirely (NOTES prints the connect command). */}}
 {{- define "curie.dispatcher.enabled" -}}
 {{- $appTokenSet := or .Values.dispatcher.slack.appToken .Values.dispatcher.slack.appTokenExistingSecret -}}
 {{- $botTokenSet := or .Values.dispatcher.slack.botToken .Values.dispatcher.slack.botTokenExistingSecret -}}
