@@ -256,10 +256,11 @@ async def _admission_refusal(
     """The binding that authorizes this admission, or the refusal.
 
     Every caller below reuses THIS binding for the rest of its own
-    transaction rather than re-resolving `crud.binding_for_route`: a second
-    read in the same transaction cannot see anything this one did not, and a
-    rebind racing between the two would key the work item by a binding other
-    than the one that just authorized it.
+    transaction rather than re-resolving `crud.binding_for_route`: under
+    Postgres's default READ COMMITTED isolation, a second read in the same
+    transaction sees any rebind already committed since the first, so
+    re-resolving could key the work item by a binding other than the one
+    that just authorized it.
     """
 
     agent = await session.get(Agent, facts.agent_id)

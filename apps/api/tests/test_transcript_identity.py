@@ -119,10 +119,10 @@ def test_a_later_write_under_the_old_key_is_adopted_again(
     read = client.get(_url(aid, NEW_KEY), headers=auth_headers)
     assert read.status_code == 200, read.text
     assert read.json()["value"] == later
-    # review-4-5 finding 2: the re-adoption is itself a write. A runner still
-    # holding the version from before it must not be able to compare-and-set
-    # over the history the old worker just wrote, so the version must move,
-    # and then hold still until the next real change.
+    # The re-adoption is itself a write. A runner still holding the version
+    # from before it must not be able to compare-and-set over the history the
+    # old worker just wrote, so the version must move, and then hold still
+    # until the next real change.
     assert read.json()["version"] > first.json()["version"]
     again = client.get(_url(aid, NEW_KEY), headers=auth_headers)
     assert again.json()["version"] == read.json()["version"]
@@ -131,9 +131,9 @@ def test_a_later_write_under_the_old_key_is_adopted_again(
 def test_a_stale_expected_version_after_readoption_is_refused(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """review-4-5 finding 2 (P2): without the version bump on re-adoption, a
-    compare-and-set holding the pre-readoption version would overwrite the
-    history the old worker just wrote back in, instead of conflicting."""
+    """Without the version bump on re-adoption, a compare-and-set holding the
+    pre-readoption version would overwrite the history the old worker just
+    wrote back in, instead of conflicting."""
     aid = _mail_agent(client, auth_headers)
     _seed(client, auth_headers, aid, OLD_KEY, HISTORY)
     first = client.get(_url(aid, NEW_KEY), headers=auth_headers).json()
@@ -154,10 +154,10 @@ def test_a_stale_expected_version_after_readoption_is_refused(
 def test_an_unbound_identity_on_the_pair_never_adopts_it(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """review-4-5 finding 3: this covers an identity with NO binding on the
-    pair. A second BOUND identity on the pair cannot exist until #3100
-    (migration 0023 holds the pair to one row); that path is pinned instead
-    by the stub unit test on ``pre_identity_thread_key_for`` below."""
+    """This covers an identity with NO binding on the pair. A second BOUND
+    identity on the pair cannot exist until #3100 (migration 0023 holds the
+    pair to one row); that path is pinned instead by the stub unit test on
+    ``pre_identity_thread_key_for`` below."""
     aid = _mail_agent(client, auth_headers)
     _seed(client, auth_headers, aid, OLD_KEY, HISTORY)
     other = scoped_conversation_id("email", ADDRESS, THREAD, identity="other-inbox")
@@ -168,11 +168,11 @@ def test_an_unbound_identity_on_the_pair_never_adopts_it(
 def test_another_agents_route_never_adopts_it(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """review-4-5 finding 3: OLD_KEY is seeded under the STRANGER itself, not
-    the owner. Seeding it under the owner leaves the stranger with nothing to
-    adopt from either way, so dropping the agent-id filter in
-    ``pre_identity_thread_key_for`` would go unnoticed; seeding it here means
-    only that filter stands between the stranger and its neighbor's binding."""
+    """OLD_KEY is seeded under the STRANGER itself, not the owner. Seeding it
+    under the owner leaves the stranger with nothing to adopt from either
+    way, so dropping the agent-id filter in ``pre_identity_thread_key_for``
+    would go unnoticed; seeding it here means only that filter stands
+    between the stranger and its neighbor's binding."""
     _mail_agent(client, auth_headers)
     stranger = _agent(client, auth_headers, "stranger", {"kind": "slack", "address": "C0EXAMPLE2"})
     _seed(client, auth_headers, stranger, OLD_KEY, HISTORY)
@@ -197,10 +197,9 @@ def test_a_named_slack_identity_never_adopts_the_default_apps_history(
 def test_a_deleted_transcript_is_not_readopted(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """review-4-5 finding 1: a delete under the new key must end the thread,
-    not merely hide it behind the pre-identity row adoption keeps copying
-    back from. Before the fix, the old row outlived the delete and the next
-    read resurrected it."""
+    """A delete under the new key must end the thread, not merely hide it
+    behind the pre-identity row adoption keeps copying back from. Before the
+    fix, the old row outlived the delete and the next read resurrected it."""
     aid = _mail_agent(client, auth_headers)
     _seed(client, auth_headers, aid, OLD_KEY, HISTORY)
     assert client.get(_url(aid, NEW_KEY), headers=auth_headers).status_code == 200
@@ -215,9 +214,9 @@ def test_a_deleted_transcript_is_not_readopted(
 def test_an_expired_old_row_is_not_adopted(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """review-4-5 finding 4 (P5): the old row's own TTL has to be honored the
-    same way ``_adopt_legacy`` honors it, or a thread whose history the TTL
-    already ended comes back from a row nothing else is reading anymore."""
+    """The old row's own TTL has to be honored the same way ``_adopt_legacy``
+    honors it, or a thread whose history the TTL already ended comes back
+    from a row nothing else is reading anymore."""
     aid = _mail_agent(client, auth_headers)
     _seed(client, auth_headers, aid, OLD_KEY, HISTORY)
     _sql(
@@ -232,10 +231,10 @@ def test_an_expired_old_row_is_not_adopted(
 def test_a_pre_0053_row_under_the_old_key_is_adopted(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """review-4-5 finding 4 (P6): only a pre-0053 ``workflow_state_entries``
-    row sits under OLD_KEY here -- no ``thread_transcripts`` counterpart yet
-    -- so reading NEW_KEY must chain through ``_adopt_legacy`` on the old key
-    before there is anything to adopt from it."""
+    """Only a pre-0053 ``workflow_state_entries`` row sits under OLD_KEY here
+    -- no ``thread_transcripts`` counterpart yet -- so reading NEW_KEY must
+    chain through ``_adopt_legacy`` on the old key before there is anything
+    to adopt from it."""
     aid = _mail_agent(client, auth_headers)
     _sql(
         "INSERT INTO curie.workflow_state_entries "
@@ -253,12 +252,11 @@ def test_a_pre_0053_row_under_the_old_key_is_adopted(
 
 
 def test_pre_identity_thread_key_for_refuses_a_second_binding_on_the_pair() -> None:
-    """review-4-5 finding 3: pins the ``==`` (not ``in``) in
-    ``pre_identity_thread_key_for``. Migration 0023 holds
-    ``(kind, address)`` to one row per agent until #3100, so a second BOUND
-    identity on the pair cannot be seeded through the HTTP API today -- a
-    stub session is enough here, because only the list comparison is under
-    test."""
+    """Pins the ``==`` (not ``in``) in ``pre_identity_thread_key_for``.
+    Migration 0023 holds ``(kind, address)`` to one row per agent until
+    #3100, so a second BOUND identity on the pair cannot be seeded through
+    the HTTP API today -- a stub session is enough here, because only the
+    list comparison is under test."""
 
     class _StubAdapters:
         async def scalars(self, query: Any) -> list[str | None]:

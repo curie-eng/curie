@@ -4,9 +4,10 @@
 `crud._require_review_binding` (the review-revision path) and
 `github_review_store.review_context` (the webhook path) both rebuild the
 lineage's original binding's thread key through `route_thread_key_matches`,
-which already tries both the current and the pre-identity form. Mutating
-either check back to the exact key alone survives the existing suite because
-nothing seeds a pre-identity lineage; the cases here close that gap.
+which already tries both the current and the pre-identity form. The cases
+here seed a lineage under its pre-identity key and assert that both checks
+still accept it, and that each refuses a lineage whose route has since been
+rebound to a different identity.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import pytest
 from channel_protocol import scoped_conversation_id
 from curie_api import crud
 from curie_api.config import get_settings
-from curie_api.github_review_events import UnverifiedFeedback
+from curie_api.github_review_events import FeedbackIgnored, UnverifiedFeedback
 from curie_api.github_review_store import review_context
 from curie_api.models import (
     Agent,
@@ -255,7 +256,7 @@ def test_review_context_refuses_a_bare_slack_lineage_after_a_named_rebind(
             reply_conversation_id=SLACK_TS,
             github=True,
         )
-        with pytest.raises(Exception) as caught:
+        with pytest.raises(FeedbackIgnored) as caught:
             await review_context(session, _feedback(), get_settings())
         assert getattr(caught.value, "code", None) == "binding_no_longer_authorized"
 

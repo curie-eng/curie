@@ -105,7 +105,8 @@ def test_scoped_conversation_id_is_a_typed_deterministic_package_export() -> Non
 def test_no_identity_and_the_default_identity_keep_the_pre_identity_key(
     identity: str | None,
 ) -> None:
-    """ADR-0168 decision 4 under ruling R2: every existing Slack key is unchanged."""
+    """ADR-0168 decision 4: every existing Slack key is unchanged, whether the
+    caller passes no identity or the default app's own name."""
     assert (
         scoped_conversation_id(
             "slack", "C0EXAMPLE1", "1700000000.000100", identity=identity
@@ -172,7 +173,7 @@ _AWKWARD = (
 
 
 def test_the_identity_form_and_the_pre_identity_form_never_collide() -> None:
-    """R2: the two forms differ in segment count, so no key is both.
+    """The two forms differ in segment count, so no key is both.
 
     An encoded segment never contains ':', so a pre-identity key has exactly
     two separators and an identity key exactly three.
@@ -260,10 +261,10 @@ _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-re
 
 
 def test_parse_round_trips_every_frozen_vector_example() -> None:
-    """review-4-5 finding 5: the earlier parse tests only cover hand-written
-    keys and the ``_AWKWARD`` product, never the one corpus the API, the
-    worker, and the CLI all freeze together (``tests/vectors/thread-reset-set.json``).
-    A parser and a builder that agree on invented keys but disagree on the
+    """The earlier parse tests only cover hand-written keys and the
+    ``_AWKWARD`` product, never the one corpus the API, the worker, and the
+    CLI all freeze together (``tests/vectors/thread-reset-set.json``). A
+    parser and a builder that agree on invented keys but disagree on the
     shared vector would still pass every other test in this file."""
     examples = json.loads(_VECTOR.read_text())["thread_key_examples"]
     assert examples

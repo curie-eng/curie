@@ -28,6 +28,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::api::DEFAULT_SLACK_IDENTITY;
+use crate::message::CLUSTER_MESSAGE_RELAY_ADAPTER;
 
 pub const DEFAULT_STREAM: &str = RUNS_STREAM_DEFAULT;
 pub const DEFAULT_VALKEY_URL: &str = "redis://:valkeypass@localhost:26379";
@@ -77,14 +78,12 @@ fn percent_encode_unreserved(s: &str) -> String {
 /// `kind` unless it is none or the default Slack app (ADR-0168 decision 4).
 /// Frozen with the Python `_thread_key_for` helper in
 /// `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member that is only
-/// the conversation_id cannot release the sandbox (#2259).
-/// The worker's built-in reply adapter for a disconnected `curie cluster
-/// message` turn (`message.rs::CLUSTER_MESSAGE_RELAY_ADAPTER`). It selects
-/// where the reply is delivered, not which binding answers: the turn is the
-/// channel's own Slack turn, so it resolves as the default identity, same as
+/// the conversation_id cannot release the sandbox (#2259). A disconnected
+/// `curie cluster message` turn's built-in reply adapter
+/// (`message::CLUSTER_MESSAGE_RELAY_ADAPTER`) selects where the reply is
+/// delivered, not which binding answers: the turn is the channel's own Slack
+/// turn, so it resolves as the default identity, same as
 /// `aci_protocol.turn.route_identity`.
-const CLUSTER_MESSAGE_ADAPTER: &str = "curie-cluster-message";
-
 pub fn thread_key_for(
     kind: &str,
     adapter: Option<&str>,
@@ -97,7 +96,7 @@ pub fn thread_key_for(
     let identity = if kind == "slack" {
         Some(
             adapter
-                .filter(|name| !name.is_empty() && *name != CLUSTER_MESSAGE_ADAPTER)
+                .filter(|name| !name.is_empty() && *name != CLUSTER_MESSAGE_RELAY_ADAPTER)
                 .unwrap_or(DEFAULT_SLACK_IDENTITY),
         )
     } else {
