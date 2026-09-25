@@ -174,9 +174,12 @@ The eval cases the spec carries, and the FAILs of earlier campaigns, take the
 first slots. On a test installation only, add actions that need approval,
 where the target must say it is asking, not that it did it.
 
-Size the plan to the budget. Open at most New threads per 15 minutes in each
-15 minutes of the Turn budget, counting a part as a whole, and plan each
-thread's follow-ups up to Follow-ups per thread. With Follow-ups per thread at
+Plan to fill the budget. The threads you may open are New threads per 15
+minutes in each 15 minutes of the Turn budget, less its last five minutes;
+plan that many, each with Follow-ups per thread follow-ups. A campaign that
+stops at a handful of probes finds little: the ones that found real defects
+ran to forty or more. Plan fewer only when the spec gives you nothing more to
+ask, and say so in the report. With Follow-ups per thread at
 0, every probe opens its own thread, and there is no conversation thread: say
 so in the report.
 
