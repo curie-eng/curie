@@ -622,10 +622,10 @@ def test_host_credentials_are_never_written_to_the_claim(
 
 
 def test_no_slack_identity_token_reaches_the_claim() -> None:
-    """The k8s counterpart of the docker filter test (#3147 finding 8): the
-    same `filter_agent_child_env` backs both substrates (`k8s.py:254`,
-    `docker.py:367`), but only the docker call site had a test naming the
-    indexed Slack token prefixes."""
+    """The k8s counterpart of
+    `test_create_claim_excludes_every_slack_identity_token_from_child_env`:
+    the same `filter_agent_child_env` backs both substrates, and this pins
+    the k8s claim's call site against the indexed Slack token prefixes."""
     api = _FakeApi()
     _client(api).create_claim(
         "claim-slack-identities",

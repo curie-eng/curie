@@ -1437,10 +1437,13 @@ dispatcher:
     # CURIE_SLACK_APP_TOKEN__<n> / CURIE_SLACK_SIGNING_SECRET__<n> (dispatcher),
     # where <n> is the entry's position, and CURIE_SLACK_IDENTITIES tells all
     # three which name reads which variable. That declaration is what the API
-    # validates a Slack binding's identity against. A plain `curie cluster up`
-    # carries a recorded non-empty list forward instead of resetting it to this
-    # default; a recorded empty list makes `up` refuse until it is removed from
-    # the release's values.
+    # validates a Slack binding's identity against. A binding naming a listed
+    # identity is refused with a 422 until the database admits it
+    # (https://github.com/curie-eng/curie/issues/3146): declaring one readies
+    # the chart and services only. A plain `curie cluster up` carries a
+    # recorded non-empty list forward instead of resetting it to this default;
+    # a recorded empty list makes `up` refuse until it is removed from the
+    # release's values.
     identities: []
   resources:
     requests: { cpu: 50m, memory: 128Mi }

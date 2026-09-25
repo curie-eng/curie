@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 _FAR_FUTURE = 4102444800  # 2100-01-01, valid at test time
 _PAST = 1000000000  # 2001, expired at test time
 
+
 def _agent(
     client: Any,
     headers: dict[str, str],
@@ -1450,7 +1451,8 @@ async def _constraint_definition(connection: Any, name: str) -> str:
     """`pg_get_constraintdef` for one `curie.agent_channels` constraint, so a
     caller can restore the EXACT installed definition rather than a
     hand-copied guess that would silently drift from whatever a later
-    migration (the phase 2 contract migration, #3146) installs."""
+    migration (the contract migration for ADR-0168 decision 3, #3146)
+    installs."""
 
     definition = await connection.fetchval(
         """
@@ -1475,8 +1477,8 @@ async def _seed_named_identity_binding(
     try:
         if not state["dropped"]:
             # Attempt the plain shape first, in its own transaction: if this
-            # already inserts cleanly, the phase 2 contract migration (#3146)
-            # has landed and this whole fixture is due for deletion.
+            # already inserts cleanly, the database admits a named Slack
+            # binding (#3146) and this whole fixture is due for deletion.
             probe_id = uuid.uuid4()
             try:
                 async with connection.transaction():
@@ -1494,8 +1496,8 @@ async def _seed_named_identity_binding(
             else:
                 state["seeded_ids"].append(probe_id)
                 pytest.fail(
-                    "the phase 2 contract migration landed (#3146): a named "
-                    "Slack binding now inserts through the plain shape -- "
+                    "a named Slack binding now inserts through the plain "
+                    "shape (#3146) -- "
                     "seed it through the API instead and delete "
                     "_seed_named_identity_binding, seed_named_identity_binding "
                     "and _constraint_definition."
@@ -1564,24 +1566,25 @@ async def _restore_route_pair_constraints(state: dict[str, Any]) -> None:
 @pytest.fixture
 def seed_named_identity_binding() -> Iterator[Callable[[str, str, str], None]]:
     """A callable that directly persists a Slack `agent_channels` row under a
-    NAMED identity with no endpoint -- the shape `_binding_scope` 404'd on
-    before this fix (#3147).
+    NAMED identity with no endpoint, the shape `_binding_scope` must resolve
+    to this agent's own binding state (#3147).
 
     `agent_channels_route_pair_ck` (migration 0024, `(endpoint IS NULL) =
     (adapter IS NULL)`) and `agent_channels_kind_address_key` (migration
     0023, UNIQUE `kind, address`) both still refuse this shape from the
     ordinary write path -- a named identity with no endpoint, and a second
-    row sharing a pair another agent already holds. Only the phase 2 contract
-    migration (#3146, not landed) admits a named Slack binding through the
-    ordinary API; until then the callable drops both constraints, inside one
-    transaction with the insert, on the disposable per-run test database
-    only -- never a migration or any committed schema. It first attempts the
-    plain insert on its own, so once #3146 lands the very next run fails
-    loudly here instead of quietly passing on retired plumbing, naming what
-    to delete. Teardown removes the seeded rows and restores each
-    constraint's EXACT saved definition (`pg_get_constraintdef`), VALID, so
-    the schema commutes back to what it was regardless of how the test
-    exits.
+    row sharing a pair another agent already holds. The database refuses a
+    named Slack binding from the ordinary API until
+    [#3146](https://github.com/curie-eng/curie/issues/3146), the contract
+    migration for ADR-0168 decision 3, widens both, so the callable drops both
+    constraints, inside one transaction with the insert, on the disposable
+    per-run test database only -- never a migration or any committed schema.
+    It first attempts the plain insert on its own, so the first run on a
+    database that admits the shape fails loudly here instead of quietly
+    passing on retired plumbing, naming what to delete. Teardown removes the
+    seeded rows and restores each constraint's EXACT saved definition
+    (`pg_get_constraintdef`), VALID, so the schema commutes back to what it
+    was regardless of how the test exits.
     """
 
     state: dict[str, Any] = {

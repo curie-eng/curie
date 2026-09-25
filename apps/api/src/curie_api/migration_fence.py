@@ -407,8 +407,8 @@ def load_declarations() -> dict[str, Declaration]:
         # refused: this module cannot import `identities.declared_identities`
         # (the ORM-import contract above) to check a name against the chart's
         # list, and a declaration vouches for a row written before a second
-        # Slack identity could exist. Widening this is the phase 2 contract
-        # migration's (#3146).
+        # Slack identity could exist. The contract migration for ADR-0168
+        # decision 3 (#3146) is what widens this.
         kind = str(entry["reply_kind"]).strip()
         if kind == SLACK_KIND and adapter not in (None, DEFAULT_IDENTITY):
             raise _declaration_refusal(

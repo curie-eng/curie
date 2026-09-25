@@ -456,7 +456,7 @@ async def agent_holds_channel_pair(
     pair with one arbitrary row when several could match, which only holds
     today because `agent_channels_kind_address_key` (migration 0023) still
     caps the pair to one row; once the contract migration for ADR-0168
-    decision 3 (#3100) widens it to the triple, two agents can hold the same
+    decision 3 (#3146) widens it to the triple, two agents can hold the same
     pair under two identities, and picking an arbitrary row would answer the
     wrong agent's question. This asks the narrower thing every caller here
     actually needs -- filtered on `agent_id` in the query itself, so it stays

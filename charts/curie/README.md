@@ -1735,11 +1735,13 @@ on a later `up`. The one shape `up` refuses outright is a list explicitly
 recorded as empty (`[]`, as opposed to the key being absent); leave the key out
 rather than clearing it to an empty list.
 
-The API accepts a Slack binding naming one of these identities and validates it
-against the chart's declared list, but storing it still fails: the database
-still refuses a named Slack binding until the phase 2 contract migration
-(#3146) lands. Until then, declaring an identity here readies the chart and the
-services for it, but no binding can route to it yet.
+The API validates a Slack binding's identity against this declared list, but
+the database refuses to store a Slack binding naming any identity other than
+`default` until
+[#3146](https://github.com/curie-eng/curie/issues/3146). Such a binding is
+answered with a 422 that says so, on create, add and move alike. Declaring an
+identity readies the chart and the services for it; no binding can route to
+it.
 
 ### Reserved environment variables
 

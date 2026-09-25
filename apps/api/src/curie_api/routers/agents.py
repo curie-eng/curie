@@ -97,8 +97,8 @@ _CHECK_CONSTRAINT_MESSAGES = {
     "agent_channels_route_pair_ck": (
         "a Slack binding naming an identity other than 'default' cannot be "
         "stored until the database admits it "
-        "(https://github.com/curie-eng/curie/issues/3146); the identity is "
-        "declared, but bind this channel under 'default' for now"
+        "(https://github.com/curie-eng/curie/issues/3146). The identity is "
+        "declared; bind the channel under 'default' instead"
     ),
 }
 

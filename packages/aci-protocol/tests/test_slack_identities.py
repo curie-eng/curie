@@ -65,7 +65,8 @@ def test_a_declaration_parses_in_order_and_names_every_identity(
 
     assert parsed == (SlackIdentity(**DEFAULT), SlackIdentity(**SECOND))
     assert declared_slack_identity_names(parsed) == frozenset({"default", "second"})
-    # Task 5's chart gate builds a set of parsed identities, so each one must
+    # `charts/curie/ci/slack-identities-assertions.sh` builds a set of parsed
+    # identities, so each one must
     # be hashable; `model_config = ConfigDict(frozen=True, ...)` is what makes
     # a pydantic model hashable, and this is the property that would break if
     # that were ever dropped.
@@ -76,9 +77,9 @@ def test_a_declaration_parses_in_order_and_names_every_identity(
 def test_a_listed_default_with_no_signing_secret_is_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Task 5's T2: a list-only install where `default` comes from a listed
-    entry with no signing ref renders `signing_secret_env: null`. `default`
-    still takes the legacy app and bot names."""
+    """The list-only shape the chart gate renders: `default` comes from a
+    listed entry with no signing ref, so it renders `signing_secret_env:
+    null`. `default` still takes the legacy app and bot names."""
 
     no_signing_default = {**DEFAULT, "signing_secret_env": None}
 
