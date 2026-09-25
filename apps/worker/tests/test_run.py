@@ -932,6 +932,7 @@ def test_supervise_policy_reads_worker_config() -> None:
         "max_restart_backoff_s": 30.0,
         "max_consecutive_failures": 5,
         "failure_reset_s": 120.0,
+        "boot_grace_s": run._BOOT_GRACE_S,
     }
 
 
@@ -1438,4 +1439,39 @@ def test_supervise_keeps_tracebacks_for_connection_failures_after_boot(
 
     records = [r for r in caplog.records if r.name == "curie_worker.run"]
     assert len(records) == 2
+    assert all(r.levelno == logging.ERROR and r.exc_info for r in records)
+
+
+def test_run_warns_in_one_line_when_valkey_is_not_ready_for_the_boot_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Valkey still coming up on a fresh install is expected at boot (#3079): the
+    migration is skipped with a one-line warning, not a traceback."""
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        events = _boot(
+            monkeypatch,
+            raises=redis.exceptions.ConnectionError("Error connecting to valkey:6379"),
+        )
+
+    assert "runs" in events
+    records = [
+        r for r in caplog.records if r.name == "curie_worker.run" and "migration" in r.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is None
+    assert "not ready" in records[0].getMessage()
+
+
+def test_supervise_keeps_tracebacks_for_local_os_errors_during_boot(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PermissionError is a local fault, not a dependency warming up."""
+    _capture_metrics(monkeypatch)
+    factory, _ = _crash_twice_then_return(PermissionError(13, "Permission denied"))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
     assert all(r.levelno == logging.ERROR and r.exc_info for r in records)

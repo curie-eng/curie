@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import signal
+import socket
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -673,10 +674,13 @@ def _is_dependency_not_ready(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        # OSError covers socket.gaierror, ConnectionRefusedError and TimeoutError.
+        # Network failures only: a PermissionError or FileNotFoundError is a
+        # local fault, not a dependency warming up.
         if isinstance(
             current,
-            OSError
+            socket.gaierror
+            | ConnectionError
+            | TimeoutError
             | redis.exceptions.ConnectionError
             | redis.exceptions.TimeoutError
             | sqlalchemy.exc.OperationalError
@@ -980,8 +984,16 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             "cut short; any legacy ref it did not reach simply lapses with its TTL",
             _CARD_MIGRATION_BUDGET_S,
         )
-    except Exception:
-        logger.exception("legacy approval card migration failed; continuing boot")
+    except Exception as exc:
+        if _is_dependency_not_ready(exc):
+            logger.warning(
+                "legacy approval card migration skipped: a dependency is not ready "
+                "yet (expected during startup) cause=%s: %s",
+                type(exc).__name__,
+                " ".join(str(exc).split()),
+            )
+        else:
+            logger.exception("legacy approval card migration failed; continuing boot")
     # One boot sweep before any consumer reads: a run this process's previous
     # incarnation owned is an orphan now (#3076). Swallowed like the migration.
     sweeper = rt.orphan_sweeper
@@ -990,8 +1002,16 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             await asyncio.wait_for(sweeper.sweep(), timeout=_ORPHAN_SWEEP_BUDGET_S)
         except TimeoutError:
             logger.warning("work-item orphan boot sweep exceeded its budget; the loop resumes it")
-        except Exception:
-            logger.exception("work-item orphan boot sweep failed; continuing boot")
+        except Exception as exc:
+            if _is_dependency_not_ready(exc):
+                logger.warning(
+                    "work-item orphan boot sweep deferred to its loop: a dependency "
+                    "is not ready yet (expected during startup) cause=%s: %s",
+                    type(exc).__name__,
+                    " ".join(str(exc).split()),
+                )
+            else:
+                logger.exception("work-item orphan boot sweep failed; continuing boot")
     policy = _supervise_policy(config)
     try:
         # return_exceptions=True + per-task restart: a crash in one consumer must
