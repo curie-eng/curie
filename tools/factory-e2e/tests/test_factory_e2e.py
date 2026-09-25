@@ -1855,3 +1855,461 @@ def test_sql_sets_the_chart_schema_on_the_install_postgres(monkeypatch: pytest.M
     assert "statefulset/curie-postgres" in seen["argv"]
     assert "-csearch_path=curie" in seen["argv"][-1]
     assert seen["input"] == "SELECT 1"
+
+
+# --- #3078: --hold, crash leftovers, candidate search, dedicated actor --------
+
+
+def _preflight(tmp_path: Path, env: dict[str, str] | None = None) -> fe.Preflight:
+    config = fe.load_config(env or _env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
+    return fe.Preflight(
+        config,
+        repo_root=REPO_ROOT,
+        candidate="c" * 40,
+        namespace="test-factory-unit",
+        evidence_path=tmp_path / "evidence" / "e.json",
+        admission_timeout=1,
+    )
+
+
+class _StopAfter:
+    """A stop event that sets itself after ``ticks`` waits."""
+
+    def __init__(self, ticks: int) -> None:
+        self.ticks = ticks
+        self.waits = 0
+
+    def wait(self, _timeout: float) -> bool:
+        self.waits += 1
+        return self.waits > self.ticks
+
+
+def test_hold_reports_connection_details_without_secrets_and_returns_on_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    preflight.api_url = "http://127.0.0.1:4321"
+    preflight.api_key = "super-secret-api-key"
+    preflight.tunnel_url = "https://quick-brown-fox.trycloudflare.com"
+    ticks: list[str] = []
+    monkeypatch.setattr(preflight, "ensure_api", lambda: ticks.append("api"))
+    monkeypatch.setattr(preflight, "ensure_tunnel", lambda: ticks.append("tunnel"))
+
+    def failing_refresh() -> None:
+        ticks.append("token")
+        raise fe.PreflightFailed("refresh failed once")
+
+    monkeypatch.setattr(preflight, "ensure_issue_token", failing_refresh)
+    stop = _StopAfter(2)
+    preflight.hold(stop)  # type: ignore[arg-type]
+    assert stop.waits == 3
+    assert ticks == ["api", "tunnel", "token"] * 2
+    written = preflight.evidence_path.read_text()
+    assert "super-secret-api-key" not in written
+    hold = json.loads(written)["hold"]
+    assert hold["namespace"] == "test-factory-unit"
+    assert hold["api_url"] == "http://127.0.0.1:4321"
+    assert hold["webhook_url"] == "https://quick-brown-fox.trycloudflare.com/github/webhook"
+    assert hold["factory_agent"] == fe.FACTORY_AGENT
+    key_file = Path(hold["api_key_file"])
+    assert key_file.read_text() == "super-secret-api-key"
+    assert key_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_hold_rewrites_evidence_when_the_port_forward_moves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    preflight.api_url = "http://127.0.0.1:1"
+
+    def reopen() -> None:
+        preflight.api_url = "http://127.0.0.1:2"
+
+    monkeypatch.setattr(preflight, "ensure_api", reopen)
+    monkeypatch.setattr(preflight, "ensure_tunnel", lambda: None)
+    monkeypatch.setattr(preflight, "ensure_issue_token", lambda: None)
+    preflight.hold(_StopAfter(1))  # type: ignore[arg-type]
+    assert json.loads(preflight.evidence_path.read_text())["hold"]["api_url"] == (
+        "http://127.0.0.1:2"
+    )
+
+
+def test_hold_flag_parses_on_preflight_and_run() -> None:
+    assert fe.parse_args(["preflight", "--hold"]).hold is True
+    assert fe.parse_args(["preflight"]).hold is False
+    assert fe.parse_args(["run", "--scenario", "cancel-waiting", "--hold"]).hold is True
+
+
+def test_main_holds_only_after_a_passing_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key, value in _env(_app_dir(tmp_path)).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(fe, "_resolve_candidate", lambda *a, **k: "c" * 40)
+    monkeypatch.setattr(fe.Teardown, "run", lambda self: [])
+    held: list[str] = []
+    monkeypatch.setattr(fe.Preflight, "hold", lambda self, stop: held.append(self.namespace))
+    monkeypatch.setattr(fe.signal, "signal", lambda *a: None)
+    evidence = tmp_path / "e.json"
+
+    monkeypatch.setattr(fe.Preflight, "run", lambda self, driver: None)
+    assert fe.main(["preflight", "--hold", "--evidence", str(evidence)]) == 0
+    assert held == [fe.default_namespace("c" * 40)]
+    assert json.loads(evidence.read_text())["result"] == "passed"
+
+    def fail(self: Any, driver: Any) -> None:
+        raise fe.PreflightFailed("admission never arrived")
+
+    held.clear()
+    monkeypatch.setattr(fe.Preflight, "run", fail)
+    assert fe.main(["preflight", "--hold", "--evidence", str(evidence)]) == fe.EXIT_FAILED
+    assert held == []
+
+
+def test_tunnel_alive_survives_one_transient_failure() -> None:
+    statuses = iter([599, 200])
+    slept: list[float] = []
+
+    def probe(_url: str) -> int:
+        return next(statuses)
+
+    assert fe.tunnel_alive("https://x.example", probe=probe, sleep=slept.append) is True
+    assert slept == [fe.TUNNEL_DEAD_PROBE_INTERVAL]
+
+
+def test_tunnel_alive_is_dead_only_after_every_probe_fails() -> None:
+    calls: list[str] = []
+    slept: list[float] = []
+
+    def probe(url: str) -> int:
+        calls.append(url)
+        return 599
+
+    assert fe.tunnel_alive("https://x.example", probe=probe, sleep=slept.append) is False
+    assert len(calls) == fe.TUNNEL_DEAD_PROBES
+    assert slept == [fe.TUNNEL_DEAD_PROBE_INTERVAL] * (fe.TUNNEL_DEAD_PROBES - 1)
+
+
+def test_webhook_restore_target_refuses_a_live_tunnel_and_parks_a_dead_one() -> None:
+    tunnel = "https://quick-brown-fox.trycloudflare.com/github/webhook"
+    probed: list[str] = []
+
+    def alive(base: str) -> bool:
+        probed.append(base)
+        return True
+
+    with pytest.raises(fe.PreflightFailed, match="another"):
+        fe.webhook_restore_target(tunnel, "https://real.example/hook", alive)
+    assert probed == ["https://quick-brown-fox.trycloudflare.com"]
+    assert fe.webhook_restore_target(tunnel, None, lambda _b: False) == fe.PARKED_WEBHOOK_URL
+    assert (
+        fe.webhook_restore_target(tunnel, "https://real.example/hook", lambda _b: False)
+        == "https://real.example/hook"
+    )
+
+
+def test_webhook_restore_target_keeps_a_non_tunnel_url_without_probing() -> None:
+    def never(_base: str) -> bool:
+        raise AssertionError("a non-tunnel URL is not probed")
+
+    assert fe.webhook_restore_target("https://real.example/hook", None, never) == (
+        "https://real.example/hook"
+    )
+    assert fe.webhook_restore_target("https://real.example/hook", "https://x.example", never) == (
+        "https://x.example"
+    )
+
+
+def _ns(name: str, *, creation_timestamp: str | None = None, **annotations: str) -> dict[str, Any]:
+    meta: dict[str, Any] = {"name": name, "annotations": annotations}
+    if creation_timestamp is not None:
+        meta["creationTimestamp"] = creation_timestamp
+    return {"metadata": meta}
+
+
+def test_classify_harness_namespaces() -> None:
+    items = [
+        _ns("test-factory-mine", **{fe.RUN_ANNOTATION: "me", fe.HOLDER_ANNOTATION: "box:1"}),
+        _ns(
+            "test-factory-legacy-old",
+            creation_timestamp="2020-01-01T00:00:00Z",
+            **{fe.RUN_ANNOTATION: "old"},
+        ),
+        _ns("test-factory-dead", **{fe.RUN_ANNOTATION: "r2", fe.HOLDER_ANNOTATION: "box:222"}),
+        _ns("test-factory-live", **{fe.RUN_ANNOTATION: "r3", fe.HOLDER_ANNOTATION: "box:333"}),
+        _ns("test-factory-far", **{fe.RUN_ANNOTATION: "r4", fe.HOLDER_ANNOTATION: "other:222"}),
+        _ns("test-factory-bad", **{fe.RUN_ANNOTATION: "r5", fe.HOLDER_ANNOTATION: "box:x"}),
+        _ns("unmarked"),
+    ]
+    stale, foreign = fe.classify_harness_namespaces(
+        items, run_id="me", hostname="box", pid_alive=lambda pid: pid == 333
+    )
+    assert stale == ["test-factory-dead"]
+    assert foreign == [
+        "test-factory-legacy-old",
+        "test-factory-far",
+        "test-factory-bad",
+    ]
+
+
+def test_create_namespace_records_the_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    manifests: list[dict[str, Any]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        if "create" in argv:
+            manifests.append(json.loads(input_text or "{}"))
+        return ""
+
+    monkeypatch.setattr(fe, "run", fake_run)
+    monkeypatch.setattr(fe.socket, "gethostname", lambda: "box")
+    preflight.create_namespace()
+    annotations = manifests[0]["metadata"]["annotations"]
+    assert annotations[fe.HOLDER_ANNOTATION] == f"box:{fe.os.getpid()}"
+
+
+def test_sweep_removes_only_stale_namespaces_and_their_release_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    monkeypatch.setattr(fe.socket, "gethostname", lambda: "box")
+    listing = {
+        "items": [
+            _ns("test-factory-dead", **{fe.RUN_ANNOTATION: "r", fe.HOLDER_ANNOTATION: "box:1"}),
+            _ns("test-factory-far", **{fe.RUN_ANNOTATION: "r", fe.HOLDER_ANNOTATION: "far:1"}),
+        ]
+    }
+    monkeypatch.setattr(fe, "pid_alive", lambda pid: False)
+    deleted: list[tuple[str, str]] = []
+    helm: list[list[str]] = []
+
+    def kubectl(*args: str, check: bool = True) -> str:
+        if args[:2] == ("get", "namespaces"):
+            return json.dumps(listing)
+        if args[:2] == ("get", "namespace") and ("namespace", args[2]) in deleted:
+            return ""
+        if args[:3] == ("get", "namespace", "test-factory-dead-curie-publication"):
+            return json.dumps(
+                {
+                    "metadata": {
+                        "annotations": {"meta.helm.sh/release-namespace": "test-factory-dead"}
+                    }
+                }
+            )
+        if args[0] == "get" and args[1] == "namespace":
+            return ""
+        if args[0] == "get":
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "kind": "ClusterRole",
+                            "metadata": {
+                                "name": "dead-role",
+                                "annotations": {
+                                    "meta.helm.sh/release-namespace": "test-factory-dead"
+                                },
+                            },
+                        },
+                        {
+                            "kind": "ClusterRole",
+                            "metadata": {
+                                "name": "live-role",
+                                "annotations": {"meta.helm.sh/release-namespace": "other"},
+                            },
+                        },
+                    ]
+                }
+            )
+        if args[0] == "delete":
+            deleted.append((args[1], args[2]))
+        return ""
+
+    def fake_subprocess(argv: list[str], **_kwargs: Any) -> Any:
+        helm.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "Error: release: not found")
+
+    monkeypatch.setattr(preflight, "kubectl", kubectl)
+    monkeypatch.setattr(fe.subprocess, "run", fake_subprocess)
+    preflight.sweep_stale_namespaces()
+    assert [argv[argv.index("-n") + 1] for argv in helm] == ["test-factory-dead"]
+    assert deleted == [
+        ("namespace", "test-factory-dead"),
+        ("namespace", "test-factory-dead-curie-publication"),
+        ("clusterrole", "dead-role"),
+    ]
+    step = preflight.evidence["steps"][-1]
+    assert step["swept"] == ["test-factory-dead"]
+    assert step["foreign"] == ["test-factory-far"]
+
+
+@pytest.mark.parametrize("foreign_present", [False, True])
+def test_sweep_removes_owned_crds_after_every_stale_release_unless_another_install_remains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign_present: bool
+) -> None:
+    preflight = _preflight(tmp_path)
+    monkeypatch.setattr(fe.socket, "gethostname", lambda: "box")
+    monkeypatch.setattr(fe, "pid_alive", lambda pid: False)
+    items = [
+        _ns("test-factory-dead-a", **{fe.RUN_ANNOTATION: "a", fe.HOLDER_ANNOTATION: "box:1"}),
+        _ns("test-factory-dead-b", **{fe.RUN_ANNOTATION: "b", fe.HOLDER_ANNOTATION: "box:2"}),
+    ]
+    if foreign_present:
+        far = {fe.RUN_ANNOTATION: "r", fe.HOLDER_ANNOTATION: "far:1"}
+        items.append(_ns("test-factory-far", **far))
+    order: list[str] = []
+    deleted: set[str] = set()
+
+    def kubectl(*args: str, check: bool = True) -> str:
+        if args[:2] == ("get", "namespaces"):
+            return json.dumps({"items": items})
+        if args[:2] == ("get", "crd"):
+            assert list(args[2:4]) == ["-l", fe.OWNER_LABEL]
+            return "customresourcedefinition.apiextensions.k8s.io/sandboxes.agents.x-k8s.io\n"
+        if args[:2] == ("get", "namespace"):
+            return ""
+        if args[0] == "get":
+            return json.dumps({"items": []})
+        if args[0] == "delete":
+            deleted.add(args[2])
+            order.append(f"{args[1]}/{args[2]}")
+        return ""
+
+    def fake_subprocess(argv: list[str], **_kwargs: Any) -> Any:
+        order.append(f"uninstall/{argv[argv.index('-n') + 1]}")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(preflight, "kubectl", kubectl)
+    monkeypatch.setattr(fe.subprocess, "run", fake_subprocess)
+    preflight.sweep_stale_namespaces()
+    crds = [entry for entry in order if entry.startswith("crd/")]
+    if foreign_present:
+        assert crds == []
+    else:
+        assert crds == ["crd/sandboxes.agents.x-k8s.io"]
+        # Every stale release is uninstalled before any shared CRD goes.
+        assert order.index("uninstall/test-factory-dead-b") < order.index(crds[0])
+    assert preflight.evidence["steps"][-1]["crds_deleted"] == [c[4:] for c in crds]
+
+
+def test_install_creates_the_crds_it_adds_already_labelled_before_helm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    chart = tmp_path / "chart"
+    (chart / "crds").mkdir(parents=True)
+    manifest = chart / "crds" / "sandbox.yaml"
+    manifest.write_text("metadata:\n  name: sandboxes.agents.x-k8s.io\n")
+    order: list[str] = []
+
+    def kubectl(*args: str, check: bool = True) -> str:
+        if args[0] == "label":
+            assert args[1:] == ("--local", "-f", str(manifest), fe.OWNER_LABEL, "-o", "yaml")
+            return "labelled-crd-yaml"
+        if args[0] == "wait":
+            order.append(f"wait {args[2]}")
+        return ""
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        if "create" in argv:
+            assert input_text == "labelled-crd-yaml"
+            order.append("create crd")
+        if "install" in argv:
+            order.append("helm install")
+            raise fe.PreflightFailed("helm install timed out")
+        return ""
+
+    monkeypatch.setattr(preflight, "extract_chart", lambda: chart)
+    monkeypatch.setattr(preflight, "egress_cidrs", lambda: [])
+    monkeypatch.setattr(preflight, "kubectl", kubectl)
+    monkeypatch.setattr(fe, "run", fake_run)
+    with pytest.raises(fe.PreflightFailed):
+        preflight.install()
+    assert order == [
+        "create crd",
+        "wait crd/sandboxes.agents.x-k8s.io",
+        "helm install",
+    ]
+    assert preflight.created_crds == ["sandboxes.agents.x-k8s.io"]
+
+
+def test_newest_published_skips_unpublished_commits() -> None:
+    commits = ["a" * 40, "b" * 40, "c" * 40]
+    assert fe.newest_published(commits, lambda c: c != "a" * 40) == "b" * 40
+    assert fe.newest_published(commits, lambda c: False) is None
+    assert fe.newest_published([], lambda c: True) is None
+
+
+def test_unpublished_images_names_each_missing_image() -> None:
+    missing = fe.unpublished_images("sha-x", head=lambda image, tag: image != fe.RUNNER_IMAGE)
+    assert missing == [fe.RUNNER_IMAGE]
+
+
+def test_default_candidate_is_the_newest_published_commit_of_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    newest, older = "1" * 40, "2" * 40
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        calls.append(argv)
+        return f"{newest}\n{older}\n" if "rev-list" in argv else ""
+
+    monkeypatch.setattr(fe, "run", fake_run)
+    got = fe._resolve_candidate(REPO_ROOT, None, published=lambda c: c == older)
+    assert got == older
+    assert "refs/heads/next" in calls[0]
+    assert f"--max-count={fe.CANDIDATE_SEARCH_DEPTH}" in calls[1]
+    with pytest.raises(fe.ConfigError, match=str(fe.CANDIDATE_SEARCH_DEPTH)):
+        fe._resolve_candidate(REPO_ROOT, None, published=lambda c: False)
+
+
+def test_explicit_candidate_skips_the_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("an explicit full commit needs no git call")
+
+    monkeypatch.setattr(fe, "run", refuse)
+    assert fe._resolve_candidate(REPO_ROOT, "d" * 40, published=refuse) == "d" * 40
+
+
+def test_require_dedicated_actor() -> None:
+    with pytest.raises(fe.ConfigError, match="dedicated test GitHub account"):
+        fe.require_dedicated_actor("Operator", "operator")
+    fe.require_dedicated_actor("factory-tester", "operator")
+
+
+def test_require_dedicated_actor_refuses_an_unknown_operator_login() -> None:
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_OPERATOR_LOGIN"):
+        fe.require_dedicated_actor("factory-tester", "")
+
+
+def test_load_config_reads_the_operator_login(tmp_path: Path) -> None:
+    env = _env(_app_dir(tmp_path))
+    assert fe.load_config(env, context=None, gh_token=_no_gh).operator_login is None
+    env["CURIE_FACTORY_OPERATOR_LOGIN"] = "operator"
+    assert fe.load_config(env, context=None, gh_token=_no_gh).operator_login == "operator"
+
+
+def test_check_app_refuses_when_the_actor_is_the_operator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(_app_dir(tmp_path))
+    env["CURIE_FACTORY_OPERATOR_LOGIN"] = "operator"
+    preflight = _preflight(tmp_path, env)
+    monkeypatch.setattr(preflight, "as_app", lambda method, path, body=None: (200, {}))
+    login = {"value": "Operator"}
+
+    def as_actor(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if path == "/user":
+            return 200, {"login": login["value"]}
+        return 200, {"id": 9, "default_branch": "main", "permissions": {"push": True}}
+
+    monkeypatch.setattr(preflight, "as_actor", as_actor)
+    monkeypatch.setattr(fe, "gh_operator_login", lambda: _no_gh("operator"))
+    with pytest.raises(fe.ConfigError):
+        preflight.check_app()
+    login["value"] = "factory-tester"
+    preflight.check_app()
+    assert preflight.evidence["actor_login"] == "factory-tester"
