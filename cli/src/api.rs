@@ -3381,7 +3381,7 @@ mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
         mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
-        MAX_OBSERVABILITY_METRIC_POINTS,
+        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY, MAX_OBSERVABILITY_METRIC_POINTS,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -3698,6 +3698,46 @@ mod tests {
             mint_channel_token_body("email", "ops@example.com", None, 3600),
             serde_json::json!({"kind": "email", "address": "ops@example.com", "ttl_s": 3600})
         );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_resolved_target_from_an_older_api_means_default_and_every_connector() {
+        let target: ResolvedTarget =
+            serde_json::from_str(r#"{"agent":"acme-bot","env":"prod","slack_channel":null}"#)
+                .expect("an API without the fields still decodes");
+        assert_eq!(target.identity, DEFAULT_SLACK_IDENTITY);
+        assert_eq!(target.connectors, None);
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_resolved_target_carries_the_identity_and_the_allowlist() {
+        let target: ResolvedTarget = serde_json::from_str(
+            r#"{"agent":"acme-bot","env":"prod","slack_channel":null,
+                "identity":"ops-bot","connectors":["grafana"]}"#,
+        )
+        .unwrap();
+        assert_eq!(target.identity, "ops-bot");
+        assert_eq!(target.connectors, Some(vec!["grafana".to_string()]));
+        let empty: ResolvedTarget =
+            serde_json::from_str(r#"{"env":"dev","identity":"default","connectors":[]}"#).unwrap();
+        assert_eq!(empty.connectors, Some(Vec::new()));
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_listed_target_decodes_the_same_two_fields() {
+        let listed: ListedTargets = serde_json::from_str(
+            r#"{"targets":[{"name":"dev","agent":"a","env":"dev","slack_channel":null},
+                           {"name":"prod","agent":"b","env":"prod","slack_channel":null,
+                            "identity":"ops-bot","connectors":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.targets[0].identity, DEFAULT_SLACK_IDENTITY);
+        assert_eq!(listed.targets[0].connectors, None);
+        assert_eq!(listed.targets[1].identity, "ops-bot");
+        assert_eq!(listed.targets[1].connectors, Some(Vec::new()));
     }
 
     #[test]
