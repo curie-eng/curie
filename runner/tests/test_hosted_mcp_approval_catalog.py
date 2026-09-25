@@ -24,7 +24,7 @@ import pytest
 import uvicorn
 from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
 from claude_agent_sdk import SystemMessage
-from claude_agent_sdk.types import PermissionResultDeny
+from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
 from curie_runner import RunnerConfig
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
@@ -275,7 +275,12 @@ def test_hosted_connector_denied_tools_are_refused_without_an_approval(
         assert hook_gate.pending_summary is None
 
         callback_gate = _gate_for(bundle)
-        callback_result = anyio.run(build_can_use_tool(callback_gate), tool_name, {}, None)
+        callback_result = anyio.run(
+            build_can_use_tool(callback_gate),
+            tool_name,
+            {},
+            ToolPermissionContext(tool_use_id="toolu_hosted_test"),
+        )
         assert isinstance(callback_result, PermissionResultDeny)
         assert callback_gate.pending_summary is None
 
