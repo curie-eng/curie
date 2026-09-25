@@ -265,6 +265,18 @@ class SandboxSubstrate:
             return None
         return record.handle
 
+    def touch_live(self, thread_key: str, claim_name: str) -> bool:
+        """Refresh the route TTL while a turn streams on ``claim_name`` (#3188).
+
+        Only a LIVE route that still names ``claim_name`` is refreshed: a
+        suspended route keeps its own longer TTL, and a route a handoff replaced
+        belongs to someone else. Returns whether the TTL was refreshed.
+        """
+
+        return self._affinity.touch_if_live_claim(
+            thread_key, claim_name, self._config.route_ttl_seconds
+        )
+
     @property
     def claim_timeout_seconds(self) -> float:
         """The fresh claim budget the pressure path must reserve for its retry."""
