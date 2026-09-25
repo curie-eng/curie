@@ -2097,6 +2097,13 @@ enum LocalAction {
         /// Clear the execution-deadline override back to the platform default.
         #[arg(long)]
         clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -2961,6 +2968,13 @@ enum ClusterAction {
         /// Clear the execution-deadline override back to the platform default.
         #[arg(long)]
         clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -4565,6 +4579,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_thinking,
                 execution_deadline,
                 clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
                 api_url,
                 api_key,
                 dry_run,
@@ -4581,6 +4597,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     commands::OverrideChange::resolve_execution_deadline(
                         execution_deadline,
                         clear_execution_deadline,
+                    )?,
+                    commands::OverrideChange::resolve_runner_resources(
+                        runner_resources,
+                        clear_runner_resources,
                     )?,
                 )
                 .await?,
@@ -5669,6 +5689,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_thinking,
                 execution_deadline,
                 clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
                 conn,
                 dry_run,
             } => {
@@ -5683,6 +5705,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     execution_deadline,
                     clear_execution_deadline,
                 )?;
+                let runner_resources = commands::OverrideChange::resolve_runner_resources(
+                    runner_resources,
+                    clear_runner_resources,
+                )?;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
@@ -5696,6 +5722,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model,
                         thinking,
                         execution_deadline,
+                        runner_resources,
                     )
                     .await?,
                 )

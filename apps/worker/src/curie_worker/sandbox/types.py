@@ -345,6 +345,8 @@ class SandboxClient(Protocol):
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         """Create a claim after excluding host credentials from the child environment.
 

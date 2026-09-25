@@ -55,6 +55,17 @@ rules:
   - apiGroups: [""]
     resources: ["resourcequotas"]
     verbs: ["get"]
+  {{- if .Values.agentSandbox.deploy }}
+  # Per-agent runner resources (#3209). get reads the chart template. create
+  # and patch write only the worker-owned copy. list and delete stay absent.
+  # The ValidatingAdmissionPolicy in runner-resources-admission.yaml is rendered
+  # on the same condition and refuses any name that is not that copy, so this
+  # grant cannot rewrite the shared template. Kubernetes older than 1.30 fails
+  # that template, which fails this render before the grant is installed.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get", "create", "patch"]
+  {{- end }}
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects

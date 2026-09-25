@@ -146,6 +146,10 @@ class Agent(Base):
     # Per-agent work-item execution deadline in seconds (#3071). Operator-owned
     # like `model`/`thinking`; NULL means DEFAULT_EXECUTION_DEADLINE_SECONDS.
     execution_deadline_seconds: Mapped[int | None] = mapped_column(default=None)
+    # Per-agent runner cpu, memory, and ephemeral-storage (#3209). NULL means
+    # the chart agentSandbox.runner.resources block. A set value is applied on
+    # the next sandbox claim, not by resizing a sandbox that is already running.
+    runner_resources: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent behavior packs: declarative, opt-in UX touches the worker applies
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;

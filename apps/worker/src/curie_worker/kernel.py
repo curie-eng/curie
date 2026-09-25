@@ -242,9 +242,8 @@ def _publication_approval_summary(snapshot: RunnerWorkspaceSnapshot) -> str:
         f"Requester-provided description: {requester_body}"
     )
 
-_LIFECYCLE_SPAN: ContextVar[Any | None] = ContextVar(
-    "curie_worker_lifecycle_span", default=None
-)
+
+_LIFECYCLE_SPAN: ContextVar[Any | None] = ContextVar("curie_worker_lifecycle_span", default=None)
 _LIFECYCLE_OUTCOME: ContextVar[str | None] = ContextVar(
     "curie_worker_lifecycle_outcome", default=None
 )
@@ -336,9 +335,7 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
         # A targetless cron turn (#2963) has no channel pair; its thread belongs
         # to the hook agent. ``@`` is not a legal channel kind, so this key can
         # never collide with a bound (kind, address).
-        return scoped_conversation_id(
-            "@cron", qevent.hook_run.agent_id, qevent.conversation_id
-        )
+        return scoped_conversation_id("@cron", qevent.hook_run.agent_id, qevent.conversation_id)
     handle = _reply_handle_for(qevent)
     return scoped_conversation_id(
         handle.kind,
@@ -385,9 +382,7 @@ def _check_targetless_shape(qevent: QueuedTurn) -> None:
     Only a CRON turn carrying its hook run key may omit the reply handle.
     """
 
-    if _is_targetless(qevent) and (
-        qevent.source is not TurnSource.CRON or qevent.hook_run is None
-    ):
+    if _is_targetless(qevent) and (qevent.source is not TurnSource.CRON or qevent.hook_run is None):
         raise ValueError("only a cron turn with a hook run may omit its reply target")
     # A targetless turn carries no resume authority (#2963): an id shaped like a
     # work-item wake or an approval resume is an identity violation. It is refused
@@ -459,24 +454,26 @@ RETRYABLE_CLASSIFICATIONS = frozenset(
 # Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
 # not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
 # make a currently non-retryable token retryable.
-PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
-    "rate-limit",
-    "runner-error",
-    "runner-timeout",
-    "workspace-error",
-    "budget-exceeded",
-    "server-error",
-    "ledger-error",
-    "model-credential-rejected",
-    "model-credit-exhausted",
-    "approval-not-acted",
-    "false-completion",
-    "publication-unrecorded",
-    "history-persistence-error",
-    # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
-    # a retry would spend the same budget and stop at the same place.
-    "max-turns",
-})
+PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
+    {
+        "rate-limit",
+        "runner-error",
+        "runner-timeout",
+        "workspace-error",
+        "budget-exceeded",
+        "server-error",
+        "ledger-error",
+        "model-credential-rejected",
+        "model-credit-exhausted",
+        "approval-not-acted",
+        "false-completion",
+        "publication-unrecorded",
+        "history-persistence-error",
+        # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
+        # a retry would spend the same budget and stop at the same place.
+        "max-turns",
+    }
+)
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset({"runner-timeout-unconfirmed"})
 
@@ -578,11 +575,7 @@ def _escalation_text(
     clipped = redact_text((detail or "").strip())
     if len(clipped) > _ESCALATION_DETAIL_MAX:
         clipped = clipped[:_ESCALATION_DETAIL_MAX]
-    extra = (
-        f"{clipped} event_id={qevent.event_id}."
-        if clipped
-        else f"event_id={qevent.event_id}."
-    )
+    extra = f"{clipped} event_id={qevent.event_id}." if clipped else f"event_id={qevent.event_id}."
     return f"{lead} {extra} Flagging for a human."
 
 
@@ -616,9 +609,7 @@ _HANDOFF_REVALIDATION_BRIDGE_GRACE_S = 1.0
 # optional AUTH, optional SELECT, and the command response.
 _PRESSURE_REDIS_CONNECT_S = 1.0
 _PRESSURE_REDIS_READ_S = 1.0
-_PRESSURE_REDIS_COLD_OPERATION_S = (
-    _PRESSURE_REDIS_CONNECT_S + 3 * _PRESSURE_REDIS_READ_S
-)
+_PRESSURE_REDIS_COLD_OPERATION_S = _PRESSURE_REDIS_CONNECT_S + 3 * _PRESSURE_REDIS_READ_S
 _PRESSURE_SCAN_DEADLINE_S = 2.0
 # Affinity uses an approximate SCAN COUNT hint of 8192. Eight pages cover about
 # 65,000 database keys. This separate cap counts matching route keys before
@@ -639,9 +630,7 @@ _PRESSURE_INVENTORY_CEILING_S = _PRESSURE_SCAN_DEADLINE_S
 # victim lock with one finite operation that can cost one cold Redis bound, four
 # seconds. That tail consumes unused claim reserve and never authorizes retry.
 _PRESSURE_CANDIDATE_CEILING_S = (
-    2 * _PRESSURE_REDIS_COLD_OPERATION_S
-    + _PRESSURE_RUNNER_STATUS_S
-    + 3 * _PRESSURE_REDIS_READ_S
+    2 * _PRESSURE_REDIS_COLD_OPERATION_S + _PRESSURE_RUNNER_STATUS_S + 3 * _PRESSURE_REDIS_READ_S
 )
 _PRESSURE_CLEANUP_CEILING_S = _PRESSURE_DELETE_S + _PRESSURE_GONE_WAIT_S
 _PRESSURE_CEILING_S = (
@@ -705,6 +694,7 @@ def _remaining_budget(lease: DeliveryLease | None) -> float | None:
     applies exactly as it did before ADR-0131.
     """
     return None if lease is None else lease.remaining_s()
+
 
 # The platform-authored prefix that marks an approval resume turn as an EXPIRY
 # (vs a resolve). Set by ``resumequeue.build_expiry_resume_turn`` on both expiry
@@ -813,9 +803,7 @@ def _parse_approval_targets(
     address = notification.get("address")
     endpoint = notification.get("endpoint")
     adapter = notification.get("adapter")
-    address_shape = (
-        _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
-    )
+    address_shape = _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
     # True for every shape EXCEPT a Slack notification with no endpoint: a
     # non-Slack kind (always) or a Slack custom-transport notification (an
     # endpoint present). That one exception is where `adapter` names an
@@ -830,9 +818,10 @@ def _parse_approval_targets(
         or not address
         or _ROUTE_WHITESPACE.search(address) is not None
         or (address_shape is not None and address_shape.fullmatch(address) is None)
-        or (adapter is not None and (
-            not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None
-        ))
+        or (
+            adapter is not None
+            and (not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None)
+        )
         or (not_slack_identity_form and (endpoint is None) != (adapter is None))
         or (endpoint is not None and not _valid_notification_endpoint(endpoint))
         or (kind != POLICY_CARD_KIND and endpoint is None)
@@ -1433,9 +1422,7 @@ class Kernel:
         Returns:
             The adapter's acknowledgement.
         """
-        if _is_targetless(qevent) or self._is_factory_work_item_turn(
-            qevent.event_id
-        ):
+        if _is_targetless(qevent) or self._is_factory_work_item_turn(qevent.event_id):
             # No requesting chat egress for a targetless turn (#2963) or a
             # factory execution (#2991). A hook run records its outcome on its
             # row. A factory run is reported by the API's notice writer after
@@ -1672,9 +1659,7 @@ class Kernel:
                     span.set_attribute("outcome", outcome)
                 if hasattr(span, "set_status"):
                     span.set_status(
-                        StatusCode.ERROR
-                        if outcome in _ERROR_LIFECYCLE_OUTCOMES
-                        else StatusCode.OK
+                        StatusCode.ERROR if outcome in _ERROR_LIFECYCLE_OUTCOMES else StatusCode.OK
                     )
                 span.add_event("turn.processing.completed", {"outcome": outcome})
                 _LIFECYCLE_OUTCOME.reset(outcome_token)
@@ -1687,11 +1672,7 @@ class Kernel:
         """The execution bound to this turn, not whichever run started last."""
 
         for candidate in self._work_item_runs.values():
-            if (
-                candidate.event_id == event_id
-                and candidate.started
-                and not candidate.finished
-            ):
+            if candidate.event_id == event_id and candidate.started and not candidate.finished:
                 return candidate
         return None
 
@@ -1708,8 +1689,7 @@ class Kernel:
         if parsed is not None:
             return parsed.kind in {"execute", "ci"}
         return (
-            event_id in self._factory_work_item_events
-            or self._run_for_event(event_id) is not None
+            event_id in self._factory_work_item_events or self._run_for_event(event_id) is not None
         )
 
     def _work_item_repository(self, event_id: str) -> str | None:
@@ -1721,9 +1701,7 @@ class Kernel:
         run = self._work_item_runs.get(parsed.request_id)
         return run.repo_full_name if run is not None else None
 
-    async def _adopt_resumed_work_item(
-        self, event_id: str, thread_key: str
-    ) -> uuid.UUID | None:
+    async def _adopt_resumed_work_item(self, event_id: str, thread_key: str) -> uuid.UUID | None:
         """Reattach the execution an approval continuation still owns.
 
         The execute wake already returned. The same process keeps the run.
@@ -1880,8 +1858,7 @@ class Kernel:
                     return
                 if hook_state.outcome is not None:
                     logger.info(
-                        "cron event %s belongs to an already terminal hook run; "
-                        "dropping",
+                        "cron event %s belongs to an already terminal hook run; dropping",
                         event_id,
                     )
                     await self._complete(
@@ -1964,9 +1941,7 @@ class Kernel:
                 owned_work_item_id = adopted
             elif self._is_approval_resume(event_id):
                 try:
-                    owned_work_item_id = await self._adopt_resumed_work_item(
-                        event_id, thread_key
-                    )
+                    owned_work_item_id = await self._adopt_resumed_work_item(event_id, thread_key)
                 except _FactoryExecutionEnded:
                     self._factory_work_item_events.add(event_id)
                     await self._markers.mark_done(event_id)
@@ -2042,6 +2017,7 @@ class Kernel:
             boot_env: dict[str, str] | None = None
             agent_id: uuid.UUID | None = None
             agent_name: str | None = None
+            runner_resources: dict[str, Any] | None = None
             workspace_deployment_id: uuid.UUID | None = None
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
@@ -2061,8 +2037,7 @@ class Kernel:
                 )
                 if binding is None or resolved is None:
                     logger.error(
-                        "targetless cron event %s: agent %s has no active "
-                        "deployment; dropping",
+                        "targetless cron event %s: agent %s has no active deployment; dropping",
                         event_id,
                         hook_carry.agent_id,
                     )
@@ -2089,6 +2064,8 @@ class Kernel:
                     return
                 agent_id = resolved.agent_id
                 agent_name = resolved.agent_name
+                reader = getattr(self._binding, "runner_resources_for", None)
+                runner_resources = await reader(agent_id) if reader is not None else None
                 # No kind/address: there is no binding to scope the state
                 # namespace to. No approval grant, resumed kind or decision
                 # either: a targetless turn is never a resume.
@@ -2105,19 +2082,13 @@ class Kernel:
                 # under two kinds, and one pair can answer to only one identity
                 # at a time, so dropping either would answer with somebody
                 # else's route.
-                resolved = await self._binding.resolve(
-                    handle.kind, handle.adapter, handle.channel
-                )
+                resolved = await self._binding.resolve(handle.kind, handle.adapter, handle.channel)
                 if resolved is None:
                     # Binding doubles predate the diagnostic lookup; keep a miss
                     # on those doubles on the established polite-drop path.
-                    undeployed_lookup = getattr(
-                        self._binding, "undeployed_binding", None
-                    )
+                    undeployed_lookup = getattr(self._binding, "undeployed_binding", None)
                     undeployed = (
-                        await undeployed_lookup(
-                            handle.kind, handle.adapter, handle.channel
-                        )
+                        await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
                         if undeployed_lookup is not None
                         else None
                     )
@@ -2194,6 +2165,8 @@ class Kernel:
                     return
                 agent_id = resolved.agent_id
                 agent_name = getattr(resolved, "agent_name", None)
+                reader = getattr(self._binding, "runner_resources_for", None)
+                runner_resources = await reader(agent_id) if reader is not None else None
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
@@ -2382,6 +2355,7 @@ class Kernel:
                         packs,
                         workspace_deployment_id,
                         agent_name,
+                        runner_resources=runner_resources,
                         remaining_s=_remaining_budget(lease),
                         pressure_retried=False,
                         workspace_inference=workspace_inference,
@@ -2664,9 +2638,7 @@ class Kernel:
                         )
         return reaped
 
-    async def _preflight_reclaimed_delivery(
-        self, thread_key: str, lease: DeliveryLease
-    ) -> None:
+    async def _preflight_reclaimed_delivery(self, thread_key: str, lease: DeliveryLease) -> None:
         """Prove a TRANSFERRED delivery is safe to re-execute, or refuse it.
 
         ADR-0131's reclaim rules 2, 3 and 4, in that order. Rule 1 -- "a
@@ -2912,9 +2884,7 @@ class Kernel:
         finally:
             await self._lock.release(self._config.lock_key(thread_key), token)
 
-    async def _terminate_work_item(
-        self, qevent: QueuedTurn, request_id: uuid.UUID
-    ) -> None:
+    async def _terminate_work_item(self, qevent: QueuedTurn, request_id: uuid.UUID) -> None:
         """Claim termination ownership, observe sandbox absence, and record it."""
 
         if self._work_items is None:
@@ -3107,9 +3077,7 @@ class Kernel:
         """Edit the placeholder with a reason and complete the turn (a polite
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
-        await self._complete(
-            qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease
-        )
+        await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease)
 
     async def _reply(
         self,
@@ -3145,11 +3113,7 @@ class Kernel:
             or not carry.any_attempt_started
             or carry.recorder is None
             or carry.ref is None
-            or (
-                _is_fenced(lease)
-                and lease is not None
-                and lease.lost.is_set()
-            )
+            or (_is_fenced(lease) and lease is not None and lease.lost.is_set())
         ):
             return
         try:
@@ -3243,8 +3207,7 @@ class Kernel:
         if run is not None and run.event_id != qevent.event_id:
             run = None
         if run is None and (
-            (parsed is not None and parsed.is_ci_fix)
-            or self._is_approval_resume(qevent.event_id)
+            (parsed is not None and parsed.is_ci_fix) or self._is_approval_resume(qevent.event_id)
         ):
             run = self._run_for_event(qevent.event_id)
         if run is not None and run.started and not run.finished:
@@ -3319,11 +3282,7 @@ class Kernel:
             and hook_carry is not None
             and hook_carry.recorder is not None
             and hook_carry.ref is not None
-            and not (
-                _is_fenced(lease)
-                and lease is not None
-                and lease.lost.is_set()
-            )
+            and not (_is_fenced(lease) and lease is not None and lease.lost.is_set())
         ):
             await hook_carry.recorder.close(hook_carry.ref, hook_outcome)
         event_id = qevent.event_id
@@ -3741,6 +3700,7 @@ class Kernel:
         workspace_deployment_id: uuid.UUID | None = None,
         agent_name: str | None = None,
         *,
+        runner_resources: dict[str, Any] | None = None,
         remaining_s: float | None = None,
         pressure_retried: bool,
         workspace_inference: _WorkspaceInferenceCarry,
@@ -3773,9 +3733,7 @@ class Kernel:
             and not (defer_job_booting or defer_review_booting)
         ):
             try:
-                await self._reply_for(
-                    qevent, route, self._config.booting_text, terminal=False
-                )
+                await self._reply_for(qevent, route, self._config.booting_text, terminal=False)
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
@@ -3809,9 +3767,7 @@ class Kernel:
         try:
             try:
                 if review_candidate:
-                    verifier = getattr(
-                        self._publication_creator, "verify_review_feedback", None
-                    )
+                    verifier = getattr(self._publication_creator, "verify_review_feedback", None)
                     if verifier is None or workspace_deployment_id is None:
                         raise WorkspaceSelectionRefused(
                             "GitHub feedback requires a configured trusted workspace "
@@ -3847,6 +3803,7 @@ class Kernel:
                         packs,
                         workspace_deployment_id=workspace_deployment_id,
                         agent_name=agent_name,
+                        runner_resources=runner_resources,
                         source=qevent.source,
                         remaining_s=remaining_s,
                         verified_review=verified_review,
@@ -3854,11 +3811,7 @@ class Kernel:
                         workspace_inference=workspace_inference,
                     )
                 else:
-                    claim_env = (
-                        dict(boot_env or {})
-                        if self._attachments is not None
-                        else boot_env
-                    )
+                    claim_env = dict(boot_env or {}) if self._attachments is not None else boot_env
                     async with self._lock.hold(self._config.lock_key(thread_key)):
                         routed = await self._route_and_start(
                             thread_key,
@@ -3867,6 +3820,7 @@ class Kernel:
                             packs,
                             workspace_deployment_id=workspace_deployment_id,
                             agent_name=agent_name,
+                            runner_resources=runner_resources,
                             source=qevent.source,
                             remaining_s=remaining_s,
                             agent_id=agent_id,
@@ -3886,8 +3840,7 @@ class Kernel:
         except CapacityExhaustedError as exc:
             rejection = exc.rejection
             logger.warning(
-                "sandbox capacity exhausted for event %s: quota=%s "
-                "requested=%s used=%s hard=%s",
+                "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
                 qevent.event_id,
                 rejection.quota_name,
                 rejection.requested,
@@ -3925,9 +3878,7 @@ class Kernel:
 
             pressure_started = time.monotonic()
             current_remaining = (
-                None
-                if remaining_s is None
-                else remaining_s - (pressure_started - attempt_started)
+                None if remaining_s is None else remaining_s - (pressure_started - attempt_started)
             )
             required = _PRESSURE_CEILING_S + self._substrate.claim_timeout_seconds
             if current_remaining is None or current_remaining < required:
@@ -3947,9 +3898,7 @@ class Kernel:
                 await self._reply_for(qevent, route, _CAPACITY_REPLY)
                 return TurnOutcome(terminal_ok=True)
 
-            retry_remaining = current_remaining - (
-                time.monotonic() - pressure_started
-            )
+            retry_remaining = current_remaining - (time.monotonic() - pressure_started)
             if retry_remaining <= 0:
                 self._record_pressure_outcome("timeout")
                 release_order()
@@ -3969,6 +3918,7 @@ class Kernel:
                 packs,
                 workspace_deployment_id,
                 agent_name,
+                runner_resources=runner_resources,
                 remaining_s=retry_remaining,
                 pressure_retried=True,
                 workspace_inference=workspace_inference,
@@ -3977,8 +3927,7 @@ class Kernel:
             record_reclaimed_retry()
             release_order()
             logger.info(
-                "pending publication refused a new turn for agent=%s deployment=%s "
-                "thread=%s",
+                "pending publication refused a new turn for agent=%s deployment=%s thread=%s",
                 agent_name,
                 workspace_deployment_id,
                 thread_key,
@@ -4074,9 +4023,7 @@ class Kernel:
 
         if review_receipt is not None:
             try:
-                await self._reply_for(
-                    qevent, route, review_receipt, terminal=False
-                )
+                await self._reply_for(qevent, route, review_receipt, terminal=False)
             except asyncio.CancelledError:
                 close_routed_turn()
                 raise
@@ -4094,9 +4041,7 @@ class Kernel:
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
-                await self._reply_for(
-                    qevent, route, self._config.booting_text, terminal=False
-                )
+                await self._reply_for(qevent, route, self._config.booting_text, terminal=False)
             except asyncio.CancelledError:
                 close_routed_turn()
                 raise
@@ -4156,12 +4101,9 @@ class Kernel:
             outcome.workspace_inferred_repo = inferred
             if verified_review is not None:
                 outcome.review_origin_key = verified_review.origin_key
-            if (
-                outcome.status is SessionStatus.AWAITING_APPROVAL
-                and _is_publish_provenance(
-                    outcome.approval_gate_kind,
-                    outcome.approval_granted_tool,
-                )
+            if outcome.status is SessionStatus.AWAITING_APPROVAL and _is_publish_provenance(
+                outcome.approval_gate_kind,
+                outcome.approval_granted_tool,
             ):
                 try:
                     snapshot = await self._runner.snapshot(
@@ -4181,9 +4123,7 @@ class Kernel:
                         snapshot=snapshot,
                         max_patch_bytes=self._config.publication_patch_max_bytes,
                         scratch_root=Path(self._config.workspace_scratch_root),
-                        git_timeout_seconds=(
-                            self._config.publication_git_command_timeout_seconds
-                        ),
+                        git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
                     )
                     outcome.publication_snapshot = snapshot
                 except (
@@ -4216,6 +4156,7 @@ class Kernel:
         *,
         workspace_deployment_id: uuid.UUID | None = None,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         source: TurnSource = TurnSource.SLACK,
         remaining_s: float | None = None,
         verified_review: VerifiedReviewFeedback | None = None,
@@ -4282,9 +4223,7 @@ class Kernel:
                         author=event.user,
                         repo_full_name=None,
                     )
-                repository_requested = (
-                    repository_requested or selected_repository is not None
-                )
+                repository_requested = repository_requested or selected_repository is not None
                 if repository_requested and self._workspace is None:
                     raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
                 if repository_requested:
@@ -4367,6 +4306,7 @@ class Kernel:
                                 ),
                             )
                         claim_started = time.monotonic()
+
                         async def capture_handoff() -> tuple[
                             SandboxHandle | None,
                             BaseException | None,
@@ -4380,6 +4320,7 @@ class Kernel:
                                         env=resolved_env,
                                         workspace_repo=None,
                                         agent_name=agent_name,
+                                        runner_resources=runner_resources,
                                     ),
                                     None,
                                 )
@@ -4408,9 +4349,7 @@ class Kernel:
                                     except BaseException:
                                         prepared_installed = True
                                     else:
-                                        prepared_installed = (
-                                            route_after_failure != current_handle
-                                        )
+                                        prepared_installed = route_after_failure != current_handle
                                 else:
                                     prepared_installed = True
                             raise cancellation
@@ -4448,6 +4387,7 @@ class Kernel:
                                 packs,
                                 workspace_deployment_id=workspace_deployment_id,
                                 agent_name=agent_name,
+                                runner_resources=runner_resources,
                                 source=source,
                                 remaining_s=remaining_s,
                                 agent_id=agent_id,
@@ -4455,9 +4395,7 @@ class Kernel:
                                 review_turn=review_turn,
                                 workspace_inference=workspace_inference,
                                 attachment_fresh_only=True,
-                                approval_resume=self._is_approval_resume(
-                                    qevent.event_id
-                                ),
+                                approval_resume=self._is_approval_resume(qevent.event_id),
                             )
                         except RouteChangedError:
                             # Another worker bound a runner after the lookup
@@ -4559,6 +4497,7 @@ class Kernel:
         *,
         workspace_deployment_id: uuid.UUID | None = None,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         source: TurnSource = TurnSource.SLACK,
         remaining_s: float | None = None,
         agent_id: uuid.UUID | None = None,
@@ -4624,9 +4563,7 @@ class Kernel:
                     or verified_review is not None
                 ):
                     raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
-            elif source is TurnSource.WEBHOOK and webhook_job_refuses_workspace(
-                event.text
-            ):
+            elif source is TurnSource.WEBHOOK and webhook_job_refuses_workspace(event.text):
                 workspace_repo = None
             else:
                 workspace_repo = await asyncio.to_thread(
@@ -4641,13 +4578,9 @@ class Kernel:
                 and workspace_repo is not None
                 and getattr(self, "_publication_creator", None) is not None
             ):
-                reader = getattr(
-                    self._publication_creator, "get_publication_lineage", None
-                )
+                reader = getattr(self._publication_creator, "get_publication_lineage", None)
                 if reader is not None:
-                    lineage = await reader(
-                        workspace_deployment_id, thread_key, workspace_repo
-                    )
+                    lineage = await reader(workspace_deployment_id, thread_key, workspace_repo)
                     if lineage is not None and lineage.state != "open":
                         raise WorkspaceSelectionRefused(
                             "This pull request is already terminal. Start a new thread."
@@ -4663,10 +4596,7 @@ class Kernel:
                         # either boundary.
                         if verified_review is None:
                             raise PendingPublicationError(thread_key)
-                        if (
-                            lineage.has_pending_outcome
-                            or verified_review.reservation_id is None
-                        ):
+                        if lineage.has_pending_outcome or verified_review.reservation_id is None:
                             raise ThreadBusyError(
                                 f"thread {thread_key} is waiting before its queued review"
                             )
@@ -4677,13 +4607,8 @@ class Kernel:
                         lineage_branch = lineage.branch
                         lineage_head = lineage.head_sha
                     if lineage is not None:
-                        publication_visible_outcome_revision = (
-                            lineage.visible_outcome_revision
-                        )
-                        if (
-                            lineage.head_sha is None
-                            and lineage.visible_outcome_revision > 0
-                        ):
+                        publication_visible_outcome_revision = lineage.visible_outcome_revision
+                        if lineage.head_sha is None and lineage.visible_outcome_revision > 0:
                             lineage_base_sha = lineage.base_sha
         if verified_review is not None and (
             lineage is None
@@ -4697,9 +4622,7 @@ class Kernel:
         if (
             workspace_deployment_id is not None
             and self._workspace is None
-            and await asyncio.to_thread(
-                self._substrate.workspace_repository, thread_key
-            )
+            and await asyncio.to_thread(self._substrate.workspace_repository, thread_key)
             is not None
         ):
             # lookup() intentionally hides suspended routes. The persistent
@@ -4729,8 +4652,7 @@ class Kernel:
                 existing_handle is None
                 or (
                     materialized_lineage_head is not None
-                    and existing_handle.workspace_materialized_head
-                    != materialized_lineage_head
+                    and existing_handle.workspace_materialized_head != materialized_lineage_head
                 )
                 or existing_handle.publication_visible_outcome_revision
                 != publication_visible_outcome_revision
@@ -4763,9 +4685,7 @@ class Kernel:
             and workspace_repo is not None
             and existing_handle is not None
             and existing_handle.workspace_repo is None
-            and not await self._workspace_handoff_ready(
-                existing_handle, remaining_s=remaining_s
-            )
+            and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
         ):
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable workspace handoff boundary"
@@ -4776,10 +4696,9 @@ class Kernel:
         # acquisition waits for. A steerable message arriving while a turn is
         # live keeps the one-live-session rule instead: it adopts and steers,
         # and the budget applies from the next new turn.
-        turn_budget_replacement = (
-            existing_handle is not None
-            and existing_handle.max_turns != (boot_env or {}).get(MAX_TURNS_ENV)
-        )
+        turn_budget_replacement = existing_handle is not None and existing_handle.max_turns != (
+            boot_env or {}
+        ).get(MAX_TURNS_ENV)
         if (
             turn_budget_replacement
             and existing_handle is not None
@@ -4791,9 +4710,7 @@ class Kernel:
         if (
             turn_budget_replacement
             and existing_handle is not None
-            and not await self._workspace_handoff_ready(
-                existing_handle, remaining_s=remaining_s
-            )
+            and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
         ):
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable turn budget handoff boundary"
@@ -4831,10 +4748,7 @@ class Kernel:
                     turn_budget_replacement
                     or (
                         workspace_repo is not None
-                        and (
-                            force_lineage_replacement
-                            or existing_handle.workspace_repo is None
-                        )
+                        and (force_lineage_replacement or existing_handle.workspace_repo is None)
                     )
                 )
                 else None
@@ -4842,12 +4756,11 @@ class Kernel:
             lineage_branch=lineage_branch,
             lineage_head=lineage_head,
             lineage_base_sha=lineage_base_sha,
-            publication_visible_outcome_revision=(
-                publication_visible_outcome_revision or 0
-            ),
+            publication_visible_outcome_revision=(publication_visible_outcome_revision or 0),
             force_lineage_replacement=force_lineage_replacement,
             pending_publication_approval=pending_publication_approval,
             agent_name=agent_name,
+            runner_resources=runner_resources,
             remaining_s=remaining_s,
             attachment_fresh_only=attachment_fresh_only,
         )
@@ -4893,8 +4806,7 @@ class Kernel:
             if await self._turn_active(handle, remaining_s=remaining_s):
                 deferred_kind = "review" if verified_review is not None else str(source)
                 raise ThreadBusyError(
-                    f"thread {thread_key} has a live session; "
-                    f"deferring the {deferred_kind} turn"
+                    f"thread {thread_key} has a live session; deferring the {deferred_kind} turn"
                 )
         else:
             active_before_steer = False
@@ -4906,9 +4818,7 @@ class Kernel:
                     # (min(600, a 30-minute budget) is still 600). Routed
                     # separately; a committed test also doubles ``status`` with a
                     # base_url-only stub here.
-                    status = await self._runner.status(
-                        handle.base_url, token=handle.token or None
-                    )
+                    status = await self._runner.status(handle.base_url, token=handle.token or None)
                 except Exception as exc:  # noqa: BLE001 -- steering still decides the route
                     logger.warning(
                         "could not read pre-steer turn liveness at %s: %r",
@@ -4950,26 +4860,20 @@ class Kernel:
                     "retrying to replace the runner's turn budget"
                 )
         if verified_review is not None:
-            reserver = getattr(
-                self._publication_creator, "reserve_review_feedback", None
-            )
+            reserver = getattr(self._publication_creator, "reserve_review_feedback", None)
             if (
                 review_turn is None
                 or workspace_deployment_id is None
                 or verified_review.origin_key != review_turn.event_id
                 or reserver is None
             ):
-                raise WorkspaceSelectionRefused(
-                    "GitHub feedback revision identity was refused."
-                )
+                raise WorkspaceSelectionRefused("GitHub feedback revision identity was refused.")
             try:
                 # This is deliberately independent of delivery `remaining_s`.
                 # The API freshly re-reads GitHub and CAS-reserves the lineage;
                 # bound the entire in-lock operation even for transports whose
                 # per-request timeout is ineffective.
-                async with asyncio.timeout(
-                    _REVIEW_RESERVE_CONTROL_PLANE_TIMEOUT_S
-                ):
+                async with asyncio.timeout(_REVIEW_RESERVE_CONTROL_PLANE_TIMEOUT_S):
                     reservation_id = await reserver(
                         review_turn, workspace_deployment_id, verified_review
                     )
@@ -4981,9 +4885,7 @@ class Kernel:
                 verified_review.reservation_id is not None
                 and reservation_id != verified_review.reservation_id
             ):
-                raise WorkspaceSelectionRefused(
-                    "GitHub feedback revision identity was refused."
-                )
+                raise WorkspaceSelectionRefused("GitHub feedback revision identity was refused.")
         # The per-request timeout is min(runner_total_timeout_s, remaining
         # delivery budget): the budget can only ever SHORTEN a request, never
         # grant one more time than the delivery has left (ADR-0131).
@@ -5095,9 +4997,7 @@ class Kernel:
             },
         )
 
-    def _pressure_record_is_safe(
-        self, candidate: PressureCandidate, record: RouteRecord
-    ) -> bool:
+    def _pressure_record_is_safe(self, candidate: PressureCandidate, record: RouteRecord) -> bool:
         """Fail closed unless the persisted route itself permits reclamation."""
 
         handle = record.handle
@@ -5136,9 +5036,7 @@ class Kernel:
     ) -> _PressureResult:
         """Detach and delete at most one proven safe idle route."""
 
-        pressure_deadline = time.monotonic() + min(
-            remaining_s, _PRESSURE_CEILING_S
-        )
+        pressure_deadline = time.monotonic() + min(remaining_s, _PRESSURE_CEILING_S)
         try:
             async with asyncio.timeout_at(pressure_deadline):
                 return await self._reclaim_idle_route_before_deadline(
@@ -5199,12 +5097,8 @@ class Kernel:
                     async with self._pressure_lock.hold(
                         self._config.lock_key(candidate.thread_key)
                     ) as lease:
-                        record = await self._substrate.pressure_get(
-                            candidate.thread_key
-                        )
-                        if record is None or not self._pressure_record_is_safe(
-                            candidate, record
-                        ):
+                        record = await self._substrate.pressure_get(candidate.thread_key)
+                        if record is None or not self._pressure_record_is_safe(candidate, record):
                             continue
                         status_remaining = min(
                             _PRESSURE_RUNNER_STATUS_S,
@@ -5220,23 +5114,20 @@ class Kernel:
                             )
                         except (TimeoutError, aiohttp.ClientError) as exc:
                             logger.warning(
-                                "idle route reclamation skipped an unreadable "
-                                "runner status: %s",
+                                "idle route reclamation skipped an unreadable runner status: %s",
                                 type(exc).__name__,
                             )
                             continue
                         if not self._pressure_status_is_safe(status):
                             continue
                         try:
-                            detached_now = (
-                                await self._substrate.detach_if_unchanged(
-                                    candidate.thread_key,
-                                    expected_claim=record.handle.claim_name,
-                                    expected_generation=record.handle.generation,
-                                    expected_expires_at_ms=candidate.expires_at_ms,
-                                    lock_key=lease.key,
-                                    lock_token=lease.token,
-                                )
+                            detached_now = await self._substrate.detach_if_unchanged(
+                                candidate.thread_key,
+                                expected_claim=record.handle.claim_name,
+                                expected_generation=record.handle.generation,
+                                expected_expires_at_ms=candidate.expires_at_ms,
+                                lock_key=lease.key,
+                                lock_token=lease.token,
                             )
                         except Exception:
                             detach_result_unknown = True
@@ -5417,6 +5308,7 @@ class Kernel:
         force_lineage_replacement: bool = False,
         pending_publication_approval: bool = False,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         remaining_s: float | None = None,
         attachment_fresh_only: bool = False,
     ) -> SandboxHandle:
@@ -5468,29 +5360,20 @@ class Kernel:
                 loop = asyncio.get_running_loop()
 
                 def run_status_probe(
-                    probe_factory: Callable[
-                        [float | None], Coroutine[Any, Any, bool]
-                    ],
+                    probe_factory: Callable[[float | None], Coroutine[Any, Any, bool]],
                     *,
                     failure: str,
                 ) -> bool:
                     """Run one bounded runner probe from the coordinator thread."""
 
                     probe_remaining_s = handoff_remaining()
-                    probe = asyncio.run_coroutine_threadsafe(
-                        probe_factory(probe_remaining_s), loop
-                    )
+                    probe = asyncio.run_coroutine_threadsafe(probe_factory(probe_remaining_s), loop)
                     request_ceiling = self._config.runner_total_timeout_s
                     if probe_remaining_s is not None:
-                        request_ceiling = max(
-                            0.0, min(request_ceiling, probe_remaining_s)
-                        )
+                        request_ceiling = max(0.0, min(request_ceiling, probe_remaining_s))
                     try:
                         return probe.result(
-                            timeout=(
-                                request_ceiling
-                                + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S
-                            )
+                            timeout=(request_ceiling + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S)
                         )
                     except Exception as exc:
                         probe.cancel()
@@ -5514,8 +5397,7 @@ class Kernel:
                             pending_publication_approval=pending_publication_approval,
                         ),
                         failure=(
-                            f"thread {thread_key} workspace handoff fence "
-                            "could not be revalidated"
+                            f"thread {thread_key} workspace handoff fence could not be revalidated"
                         ),
                     )
                     if not ready:
@@ -5534,8 +5416,7 @@ class Kernel:
                             candidate, remaining_s=probe_remaining_s
                         ),
                         failure=(
-                            f"thread {thread_key} workspace handoff candidate "
-                            "could not be attested"
+                            f"thread {thread_key} workspace handoff candidate could not be attested"
                         ),
                     )
                     if not ready:
@@ -5554,6 +5435,7 @@ class Kernel:
                 deployment_id=workspace_deployment_id,
                 env=boot_env,
                 agent_name=agent_name,
+                runner_resources=runner_resources,
                 repo_full_name=workspace_repo,
                 replace_handle=replace_handle,
                 revalidate_before_handoff=handoff_revalidation,
@@ -5561,9 +5443,7 @@ class Kernel:
                 lineage_branch=lineage_branch,
                 lineage_head=lineage_head,
                 lineage_base_sha=lineage_base_sha,
-                publication_visible_outcome_revision=(
-                    publication_visible_outcome_revision
-                ),
+                publication_visible_outcome_revision=(publication_visible_outcome_revision),
                 fresh_only=attachment_fresh_only,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
@@ -5582,6 +5462,7 @@ class Kernel:
                 env=boot_env or {},
                 workspace_repo=None,
                 agent_name=agent_name,
+                runner_resources=runner_resources,
             )
         try:
             return await asyncio.to_thread(
@@ -5589,6 +5470,7 @@ class Kernel:
                 thread_key,
                 env=boot_env,
                 agent_name=agent_name,
+                runner_resources=runner_resources,
                 fresh_only=attachment_fresh_only,
             )
         except SuspendedThreadError:
@@ -5597,7 +5479,11 @@ class Kernel:
             # the replacement boots from env alone; without this it would come
             # up generic, without the agent's bundle.
             return await asyncio.to_thread(
-                self._substrate.resume, thread_key, env=boot_env, agent_name=agent_name
+                self._substrate.resume,
+                thread_key,
+                env=boot_env,
+                agent_name=agent_name,
+                runner_resources=runner_resources,
             )
 
     @staticmethod
@@ -5771,9 +5657,7 @@ class Kernel:
         try:
             ref = await self._card_store.read_notice_ref(approval_id)
         except Exception as exc:  # noqa: BLE001 - never fail the resume
-            logger.warning(
-                "reading notice ref failed for approval %s: %s", approval_id, exc
-            )
+            logger.warning("reading notice ref failed for approval %s: %s", approval_id, exc)
             return
         if ref:
             self._adopt_ref(qevent, ReplyAck(ref=ref))
@@ -5888,8 +5772,7 @@ class Kernel:
         parsed_publication = parse_work_item_event_id(qevent.event_id)
         publication_run = (
             self._work_item_runs.get(parsed_publication.request_id)
-            if parsed_publication is not None
-            and parsed_publication.kind in {"execute", "ci"}
+            if parsed_publication is not None and parsed_publication.kind in {"execute", "ci"}
             else None
         )
         try:
@@ -6065,9 +5948,7 @@ class Kernel:
             },
         ) as approval_span:
             try:
-                await asyncio.to_thread(
-                    self._substrate.suspend, thread_key, history_ref=None
-                )
+                await asyncio.to_thread(self._substrate.suspend, thread_key, history_ref=None)
             except SandboxError as exc:
                 suspend_error = exc
                 if hasattr(approval_span, "set_status"):
@@ -6125,20 +6006,12 @@ class Kernel:
         # run. Cancellation still propagates.
         persisted_ref = self._target_for(qevent).reply_ref
         try:
-            await self._reply_for(
-                qevent, route, _join_reply_blocks(base, inference, notice)
-            )
+            await self._reply_for(qevent, route, _join_reply_blocks(base, inference, notice))
         except Exception as exc:  # noqa: BLE001 - the approval is already durable
-            logger.warning(
-                "pending notice delivery failed for approval %s: %s", created.id, exc
-            )
+            logger.warning("pending notice delivery failed for approval %s: %s", created.id, exc)
         else:
             minted_ref = self._target_for(qevent).reply_ref
-            if (
-                persisted_ref is None
-                and minted_ref is not None
-                and self._card_store is not None
-            ):
+            if persisted_ref is None and minted_ref is not None and self._card_store is not None:
                 # The row carries no ref, so remember the one the notice minted
                 # for the resume turn to adopt (#1640 under #2721 ordering).
                 try:

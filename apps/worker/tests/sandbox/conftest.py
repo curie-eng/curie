@@ -202,6 +202,8 @@ class FakeSandboxClient:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         sandbox_name = f"sbx-{name}"
         self.claims[name] = FakeClaim(

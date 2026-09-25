@@ -3548,12 +3548,13 @@ def test_quota_capacity_waits_for_external_headroom_before_retry(
                 pool: str,
                 env: dict[str, str] | None = None,
                 labels: dict[str, str] | None = None,
+                **kwargs: object,
             ) -> None:
                 capacity = h.fake_k8s.quota_claim_capacity
                 if not headroom_proved:
                     h.fake_k8s.quota_claim_capacity = None
                 try:
-                    original_create(name, pool=pool, env=env, labels=labels)
+                    original_create(name, pool=pool, env=env, labels=labels, **kwargs)
                 finally:
                     h.fake_k8s.quota_claim_capacity = capacity
 
