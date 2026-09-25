@@ -833,13 +833,17 @@ so Curie can re-read the issue, keep its one status comment, and set the
 installation discovery.
 
 Give the App **Checks: Read** and **Commit statuses: Read**. After a factory
-run publishes, it waits on the pull request's checks inside its 1800 s
+run publishes, it waits on the pull request's checks inside its execution
 deadline; the request completes only when CI is green. A failure resumes the
 same run to fix the code and push to the same pull request, for at most 3
 rounds, then the issue gets `Could not complete:` with the failing checks and
 what each round tried. No checks within 120 s of the push completes with a
-note. Checks still pending when the CI wait (1200 s from the push, or the
-execution deadline if sooner) runs out end as `ci_timeout`. Unreadable CI,
+note. Checks still pending when the CI wait (by default 1200 s from the push, or the
+execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
+`api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
+1200, 1 to 10800, checked at boot) when the repository's required checks take
+longer than 20 minutes; the wait still ends at the execution deadline if that
+comes first. Unreadable CI,
 such as a missing permission, ends as `ci_unverified`, which is never success;
 the pull request stays open either way. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.

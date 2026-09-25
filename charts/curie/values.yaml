@@ -1130,6 +1130,9 @@ api:
   # from (#3077). Set, the card replaces the phase checklist (#3125); empty omits
   # the card and the comment shows the checklist instead.
   githubFactoryCardBaseUrl: ""
+  # Seconds a published factory run waits on its pull request's CI, from the
+  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
+  githubFactoryCiWaitSeconds: 1200
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
