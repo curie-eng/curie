@@ -305,6 +305,13 @@ a rejection.
 The reply streams back into the **same message** the "awaiting approval" notice was left
 on, because the resume turn replays the original turn's reply handle.
 
+**A rejection is final until a person asks again.** If the resumed turn requests the same
+approval again (same agent, thread, route and gated tool, however the summary is worded),
+the platform refuses it: no card goes out, the refusal is recorded on the rejected
+approval's audit trail as `reraise_refused`, and the thread gets one message naming the
+rejected approval, who rejected it and when. A person asking in the thread starts a new
+turn, and that turn may raise it again.
+
 ## Driving it from the CLI
 
 Approval records live in the platform, so these verbs answer at the `local` and
@@ -382,6 +389,7 @@ case, the requesting channel is the card location.
 | `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
+| Thread says "Not requesting approval again: ... was rejected by ..." | The agent re-raised an approval a person rejected in this thread, with nobody asking since (`409 approval.rejected_in_thread`). Expected. To try again, ask for it in the thread. |
 | Agent says a request is pending, no card anywhere | The named route is not bound for this agent, so the turn escalated instead of posting. Since #2436 this case is now caught before deploy for a newly declared route; the escalation remains the backstop for a binding removed after deployment. Add the binding. |
 | `422`, or a rejected push with code `approval_routes.unbound` | The bundle declares an approval route with no entry in this agent's `approval_routes`. Bind every route the bundle declares, then redeploy. |
 | deploy or route write exits 2: "declares approval route(s) ... with no entry in this agent's approval_routes" or "this write removes approval route(s)" | The CLI's local pre-check found the same gap before sending. Run the command in the error's fix, then re-run. |

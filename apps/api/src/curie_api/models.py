@@ -1401,7 +1401,8 @@ class ApprovalAuditEntry(Base):
     approval_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"), index=True
     )
-    # What happened: resolved / denied / race_lost / expired.
+    # What happened: resolved / denied / race_lost / expired / reraise_refused
+    # (a re-raise of this rejected approval refused, #2885).
     action: Mapped[str]
     actor: Mapped[str]
     actor_channel: Mapped[str | None] = mapped_column(default=None)
