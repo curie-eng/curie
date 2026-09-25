@@ -3554,25 +3554,31 @@ async fn bind_cluster_connector_secrets(
     if secrets.is_empty() {
         return Ok(());
     }
-    let resolved = artifacts::resolve_chart(
-        chart,
-        artifacts::Channel::current(),
-        artifacts::version(),
-        artifacts::cache_root,
-        std::path::Path::new("charts/curie").is_dir(),
-    )?;
-    let chart = materialize_artifact(resolved, false, "chart").await?;
-    curie::cluster_secrets::bind(curie::cluster_secrets::BindOpts {
-        common: CommonOpts {
+    // #3082: a bundle deploy whose connector secrets already match the
+    // release must not helm-upgrade the platform, so the chart is resolved
+    // only when the bind actually changes something.
+    let chart = async {
+        let resolved = artifacts::resolve_chart(
+            chart,
+            artifacts::Channel::current(),
+            artifacts::version(),
+            artifacts::cache_root,
+            std::path::Path::new("charts/curie").is_dir(),
+        )?;
+        materialize_artifact(resolved, false, "chart").await
+    };
+    curie::cluster_secrets::bind_if_changed(
+        CommonOpts {
             namespace: namespace.to_string(),
             release: release.to_string(),
             dry_run: false,
         },
-        chart,
-        agent: agent_name.to_string(),
+        agent_name.to_string(),
         secrets,
-    })
-    .await
+        chart,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Bind the sandbox connector secrets for one deployed agent and then apply its
