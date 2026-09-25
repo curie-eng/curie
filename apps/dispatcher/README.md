@@ -150,6 +150,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `SLACK_APP_TOKEN` | "" | app-level token (`xapp-...`), Socket Mode |
 | `SLACK_BOT_TOKEN` | "" | bot token (`xoxb-...`), Web API |
 | `SLACK_SIGNING_SECRET` | "" | optional; unused in Socket Mode, kept for Bolt App construction |
+| `CURIE_SLACK_IDENTITIES` | unset | JSON naming each declared Slack identity and the env vars holding its tokens (ADR-0168 decision 1); unset means the one app, `default`. Parsed at boot; the supervisor still runs only `default` |
 | `VALKEY_HOST` | `localhost` | Valkey host (in-cluster: `valkey`) |
 | `VALKEY_PORT` | `6379` | Valkey port (compose maps it to `26379` on the host) |
 | `VALKEY_PASSWORD` | "" | Valkey password (compose dev: `valkeypass`) |
