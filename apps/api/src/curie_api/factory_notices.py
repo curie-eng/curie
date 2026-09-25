@@ -3,7 +3,7 @@
 The status row is inserted with the request at admission; the terminus stages
 its cause and detail on it. This module creates the comment, edits it in place
 whenever its rendered body changes, finalizes it once the result is shown, and
-moves the ``curie:*`` state labels on the WorkItem's issue. There is no
+moves the ``curie-factory:*`` state labels on the WorkItem's issue. There is no
 separate final comment. A refused write never rewrites the execution request.
 
 An issue-originated request comments on its issue. A revision asked for from
@@ -142,17 +142,24 @@ def marker_for(request_id: uuid.UUID) -> str:
 
 FINAL_MARKER = "<!-- curie-status:final -->"
 
-# The four state labels the pass owns (#3077). A closed set, never a prefix
-# match: human labels, including other ``curie:`` ones, are never touched.
-STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
+# The four state labels the pass owns (#3077, #3221). A closed set, never a
+# prefix match: human labels, including other ``curie:`` labels, are never
+# touched.
+STATE_LABELS = (
+    "curie-factory:queued",
+    "curie-factory:running",
+    "curie-factory:pr-open",
+    "curie-factory:needs-human",
+)
+LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
-    "waiting": "curie:queued",
-    "running": "curie:running",
-    "cancellation_requested": "curie:running",
-    "completed": "curie:pr-open",
-    "failed": "curie:needs-human",
-    "expired": "curie:needs-human",
-    # Cancelled clears all four; '' records that nothing is applied.
+    "waiting": "curie-factory:queued",
+    "running": "curie-factory:running",
+    "cancellation_requested": "curie-factory:running",
+    "completed": "curie-factory:pr-open",
+    "failed": "curie-factory:needs-human",
+    "expired": "curie-factory:needs-human",
+    # Cancelled clears the current four and the legacy four; '' records that nothing is applied.
     "cancelled": "",
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
@@ -614,7 +621,7 @@ async def _subject_title(github: _GitHub, work_item: WorkItem, target: ReplyTarg
 async def _sync_labels(
     github: _GitHub, row: FactoryStatusComment, work_item: WorkItem, status: str
 ) -> int:
-    """Add the desired state label and remove the other three, on the issue.
+    """Add the desired state label and remove the others, on the issue.
 
     Only the four state labels are ever written. A refused write is logged and
     given up; any other failure is retried next pass.
@@ -646,7 +653,9 @@ async def _sync_labels(
             )
         elif added.status_code not in {200, 201}:
             return writes
-    for name in STATE_LABELS:
+    # Legacy deletes stay unconditional. A new request starts with
+    # applied_label NULL, and the issue may still carry a legacy name.
+    for name in (*STATE_LABELS, *LEGACY_STATE_LABELS):
         if name == desired:
             continue
         try:

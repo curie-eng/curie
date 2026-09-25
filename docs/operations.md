@@ -954,11 +954,12 @@ publication lineage commit. A refused create or edit is recorded on the status
 row, stops further edits, and does not change the execution row.
 
 The same pass keeps one state label on the originating issue, for revisions
-too: `curie:queued` while waiting, `curie:running` while running or stopping,
-`curie:pr-open` after a completed run, and `curie:needs-human` after a failed
-or expired one. A cancelled run removes all four. Curie adds the desired label
-and removes the other three, and never touches any other label, including
-the factory admission label.
+too: `curie-factory:queued` while waiting, `curie-factory:running` while running
+or stopping, `curie-factory:pr-open` after a completed run, and
+`curie-factory:needs-human` after a failed or expired one. A cancelled run
+removes all four, and also removes a legacy `curie:queued`, `curie:running`,
+`curie:pr-open`, or `curie:needs-human` label by exact name. Curie still never
+touches any other label, including the factory admission label.
 
 Set `api.githubFactoryCardBaseUrl` (`GITHUB_FACTORY_CARD_BASE_URL`) to the
 API's public `https://` origin to embed a live SVG card in the status comment.
