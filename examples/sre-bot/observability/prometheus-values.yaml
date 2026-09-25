@@ -184,14 +184,47 @@ serverFiles:
                 broken metrics pipeline, a dead process, or a worker or api that
                 cannot read Valkey or Postgres, never a quiet system.
           - alert: CurieTurnAcceptedStale
+            # Counted per label set, not per series: a restart leaves the old
+            # instance's series flat in the range, where a per-series count
+            # pages, and starts the new one's at its first turn. So both
+            # windows sum without `instance`, and the alert names no process.
+            # The 90m count adds the new-series term above, so a new
+            # instance's first turn counts. The 7d gate does not: with under
+            # seven days of history every live series looks new over 7d, and
+            # a term there would page every label set with a lifetime count
+            # above zero. A label set with no series left in the 90m range,
+            # such as an old instance's after a restart with no turn since,
+            # counts as zero rather than absent. The cost: a label set whose
+            # only turns in seven days are new series' first samples, such as
+            # its first turn ever and then silence, is not armed.
             expr: |
               (
-                increase(curie_turn_accepted_total[90m]) == 0
-              )
+                sum without (instance) (
+                  (
+                    increase(curie_turn_accepted_total[90m])
+                    unless
+                    (
+                      curie_turn_accepted_total
+                      unless
+                      last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                    )
+                  )
+                  or
+                  (
+                    curie_turn_accepted_total
+                    unless
+                    last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                  )
+                )
+                or
+                0 * sum without (instance) (
+                  increase(curie_turn_accepted_total[7d])
+                )
+              ) == 0
               and
-              (
-                increase(curie_turn_accepted_total[7d]) > 0
-              )
+              sum without (instance) (
+                increase(curie_turn_accepted_total[7d])
+              ) > 0
             for: 15m
             labels:
               severity: page
