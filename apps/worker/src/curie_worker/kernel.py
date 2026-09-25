@@ -145,6 +145,7 @@ from .sandbox.types import (
     SandboxHandle,
     SuspendedThreadError,
 )
+from .slack_tokens import token_identity
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .workitem_dispatch import (
     TerminationObservation,
@@ -4563,11 +4564,18 @@ class Kernel:
         lane = self._attachments
         assert lane is not None  # guarded by the caller
         assert qevent.attachments
+        handle = qevent.reply_handle
+        identity = (
+            token_identity(handle.adapter, handle.endpoint)
+            if handle is not None
+            else DEFAULT_IDENTITY
+        )
         prepared = await asyncio.to_thread(
             lane.resolve,
             thread_key=_thread_key_for(qevent),
             agent_id=str(agent_id) if agent_id is not None else None,
             attachments=list(qevent.attachments),
+            identity=identity,
         )
         return {**(boot_env or {}), **prepared.claim_env()}, prepared
 

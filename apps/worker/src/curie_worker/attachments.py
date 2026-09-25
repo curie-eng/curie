@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from aci_protocol import Attachment
+from aci_protocol.turn import DEFAULT_IDENTITY
 
 from .workspace import WorkspaceObjectPort
 
@@ -587,7 +588,8 @@ class AttachmentCoordinator:
     concrete channel and object-store packages, exactly as the workspace lane
     is: ``files`` is the channel download, ``objects`` is the private store,
     ``clock`` is the wall clock the two independent expiry windows are measured
-    against.
+    against. ``identity_files`` holds each named Slack identity's own download
+    (ADR-0168 decision 5); ``files`` is ``default``'s.
     """
 
     def __init__(
@@ -597,12 +599,14 @@ class AttachmentCoordinator:
         objects: WorkspaceObjectPort,
         limits: AttachmentLimits | None = None,
         clock: Callable[[], float] = time.time,
+        identity_files: Mapping[str, AttachmentFilePort] | None = None,
     ) -> None:
         self.files = files
         self.objects = objects
         self.limits = limits or AttachmentLimits()
         self._clock = clock
         self._lock = threading.Lock()
+        self._identity_files: dict[str, AttachmentFilePort] = dict(identity_files or {})
 
     # -- resolve ------------------------------------------------------------
 
@@ -613,6 +617,7 @@ class AttachmentCoordinator:
         agent_id: str | None,
         attachments: Sequence[Attachment],
         generation: str | None = None,
+        identity: str = DEFAULT_IDENTITY,
     ) -> PreparedAttachments:
         """Download, park and mint the whole set, or refuse it and leave nothing.
 
@@ -636,6 +641,7 @@ class AttachmentCoordinator:
             raise AttachmentResolutionError(
                 "wiring", "attachment resolution requires a bound agent"
             )
+        files = self._files_for(identity)
 
         mint = generation or uuid.uuid4().hex
         written: list[str] = []
@@ -648,7 +654,7 @@ class AttachmentCoordinator:
                 # mid-upload leaves the chunks it already yielded under this key
                 # and only a caller that remembers the key can remove them.
                 written.append(key)
-                digest, size = self._park(attachment, key)
+                digest, size = self._park(attachment, key, files)
                 minted.append(
                     AttachmentRef(
                         name=attachment.name,
@@ -674,7 +680,22 @@ class AttachmentCoordinator:
         self._record(thread_key, prepared)
         return prepared
 
-    def _park(self, attachment: Attachment, key: str) -> tuple[str, int]:
+    def _files_for(self, identity: str) -> AttachmentFilePort:
+        """The download for ``identity``, refused before any fetch when absent."""
+
+        if identity == DEFAULT_IDENTITY:
+            return self.files
+        files = self._identity_files.get(identity)
+        if files is None:
+            raise AttachmentResolutionError(
+                "credential",
+                f"no Slack bot token is configured on this worker for identity {identity!r}",
+            )
+        return files
+
+    def _park(
+        self, attachment: Attachment, key: str, files: AttachmentFilePort
+    ) -> tuple[str, int]:
         """Stream one file into the store under its cap, returning digest+size."""
 
         digest = hashlib.sha256()
@@ -683,7 +704,7 @@ class AttachmentCoordinator:
             self.objects.put_stream(
                 key,
                 self._bounded(
-                    self.files.fetch(attachment.id),
+                    files.fetch(attachment.id),
                     name=attachment.name,
                     digest=digest,
                     counted=counted,
