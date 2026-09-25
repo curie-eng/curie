@@ -371,3 +371,69 @@ def test_a_named_connection_names_its_identity_when_slack_reports_extra_clients(
     warning = " ".join(record.getMessage() for record in caplog.records)
     assert "exactly one Curie release may connect to a given Slack app" in warning
     assert "ops-bot" in warning
+
+
+def test_the_shutdown_signal_handler_takes_no_lock_the_interrupted_thread_may_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal handler runs on the main thread, between two bytecodes of
+    whatever that thread was doing. A group of one runs its supervisor there,
+    and stopping it takes locks that thread may be holding at that moment, so
+    the handler itself must not take them.
+
+    Stopping the supervisor and the heartbeat both need ``held``, and the fake
+    group invokes the installed handler while holding it, exactly as a signal
+    landing inside the supervisor's critical section would. Every acquire is
+    bounded, so a handler that takes the lock itself fails here, not hangs.
+    """
+    from curie_dispatcher import run
+
+    _set_run_env(monkeypatch)
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-default")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-default")
+    held = threading.Lock()
+    handlers: dict[int, Any] = {}
+    stopped = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def acquire_held(what: str) -> None:
+        got = held.acquire(timeout=1.0)
+        outcome[what] = (got, threading.current_thread() is threading.main_thread())
+        if got:
+            held.release()
+
+    class Heartbeat:
+        def set(self) -> None:
+            acquire_held("heartbeat")
+
+    class Group:
+        def run(self) -> None:
+            with held:
+                handlers[run.signal.SIGTERM](run.signal.SIGTERM, None)
+            # The deferred stop may now take the lock the handler left alone.
+            outcome["stopped"] = stopped.wait(timeout=2.0)
+
+        def request_stop(self) -> None:
+            acquire_held("supervisor")
+            stopped.set()
+
+    def record_handler(signum: int, handler: Any) -> None:
+        handlers[signum] = handler
+
+    monkeypatch.setattr(run, "bootstrap_service_telemetry", lambda *a, **k: _TestTelemetry())
+    monkeypatch.setattr(run, "check_api_reachable", lambda *a, **k: None)
+    monkeypatch.setattr(
+        run, "check_slack_channel_capabilities", lambda *a, identities, **k: tuple(
+            PreflightedIdentity(i, None) for i in identities
+        )
+    )
+    monkeypatch.setattr(run, "build_supervisor", lambda *a, **k: Group())
+    monkeypatch.setattr(run, "start_heartbeat", lambda *a, **k: Heartbeat())
+    monkeypatch.setattr(run.signal, "signal", record_handler)
+
+    run.main()
+
+    assert outcome["stopped"] is True
+    # Acquired, and not on the main thread the signal interrupted.
+    assert outcome["supervisor"] == (True, False)
+    assert outcome["heartbeat"][0] is True  # type: ignore[index]
