@@ -125,6 +125,10 @@ class SocketModeConnection(Connection):
     reconnects transient websocket drops itself, so ``run`` returns only on
     graceful ``close`` or if ``connect`` raises (which the supervisor treats as a
     reconnect-with-backoff trigger).
+
+    ``slack_identity`` names the identity this connection serves when several
+    run in one process (ADR-0168 decision 2). Without it, its log lines are
+    unchanged.
     """
 
     def __init__(
@@ -133,9 +137,11 @@ class SocketModeConnection(Connection):
         app_token: str,
         *,
         logger: logging.Logger | None = None,
+        slack_identity: str | None = None,
     ) -> None:
         self._handler = SocketModeHandler(app, app_token=app_token)
         self._logger = logger or logging.getLogger(__name__)
+        self._slack_identity = slack_identity
         self._closed = threading.Event()
         self._handler.client.message_listeners.append(self._on_socket_message)
 
@@ -160,16 +166,31 @@ class SocketModeConnection(Connection):
             return
         if num_connections <= 1:
             return
-        self._logger.warning(
-            "%s: exactly one Curie release may connect to a given Slack app; "
-            "disconnect extra clients",
-            release_identity(),
-        )
+        if self._slack_identity is None:
+            self._logger.warning(
+                "%s: exactly one Curie release may connect to a given Slack app; "
+                "disconnect extra clients",
+                release_identity(),
+            )
+        else:
+            self._logger.warning(
+                "%s: exactly one Curie release may connect to a given Slack app; "
+                "disconnect extra clients of Slack identity %s",
+                release_identity(),
+                self._slack_identity,
+            )
 
     def run(self) -> None:
         self._closed.clear()
         self._handler.connect()  # type: ignore[no-untyped-call]
-        self._logger.info("socket mode connected identity=%s", release_identity())
+        if self._slack_identity is None:
+            self._logger.info("socket mode connected identity=%s", release_identity())
+        else:
+            self._logger.info(
+                "socket mode connected identity=%s slack_identity=%s",
+                release_identity(),
+                self._slack_identity,
+            )
         self._closed.wait()
 
     def close(self) -> None:
