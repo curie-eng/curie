@@ -345,3 +345,11 @@ def test_continue_never_claims_a_report_that_was_not_delivered():
     cont = _section('"continue"')
     assert "/tmp/mean-test-plan.md" in cont
     assert "never say a report was delivered" in cont
+
+
+def test_a_campaign_plans_to_fill_its_budget():
+    # MEASURED: the first campaign to finish planned 10 probes in 6 threads, in
+    # a budget that held 12 threads of four probes each. An upper bound alone
+    # read as permission to stop early.
+    plan = _section("Planning a campaign")
+    assert "Plan to fill the budget" in plan
