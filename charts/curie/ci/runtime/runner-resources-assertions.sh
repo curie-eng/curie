@@ -29,7 +29,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
+CHART="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
