@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from aci_protocol.turn import route_identity
-from channel_protocol import scoped_conversation_id
+from curie_api.threadkeys import route_thread_key
 from curie_api.threadreset import THREAD_RESET_INFLIGHT_SET, THREAD_RESET_SET
 
 _VECTOR = (
@@ -43,13 +42,12 @@ def test_the_api_builds_every_frozen_thread_key() -> None:
     assert isinstance(examples, list) and examples
     for example in examples:
         assert set(example) <= _EXAMPLE_KEYS, sorted(set(example) - _EXAMPLE_KEYS)
-        identity = route_identity(example["kind"], example.get("adapter"))
         assert (
-            scoped_conversation_id(
+            route_thread_key(
                 example["kind"],
+                example.get("adapter"),
                 example["channel"],
                 example["conversation_id"],
-                identity=identity,
             )
             == example["thread_key"]
         ), example
