@@ -2200,6 +2200,25 @@ agentSandbox:
   #         ports:
   #           - { protocol: TCP, port: 443 }
   connectorEgress: {}
+  # Per-agent package registry egress (#3083): agent name -> the CIDR entries
+  # of the package registries (npm, PyPI and similar) that agent's runner pods
+  # may reach, so an agent can run `npm ci` or the target repository's checks
+  # in its sandbox. Closed by default: nothing opens unless an agent is listed
+  # here. Each agent renders its own NetworkPolicy
+  # (<release>-agent-<name>-allow-registry-egress) selecting
+  # curietech.ai/agent=<name>, and each entry passes the same floor as
+  # connectorEgress. NetworkPolicy cannot target a DNS name, so list the
+  # registry CDN's published ranges or a registry mirror/proxy address, e.g.
+  # registry.npmjs.org and pypi.org's files are CDN fronted:
+  #   registryEgress:
+  #     factory:
+  #       - cidr: 104.16.0.0/12        # Cloudflare (registry.npmjs.org)
+  #         ports:
+  #           - { protocol: TCP, port: 443 }
+  #       - cidr: 151.101.0.0/16       # Fastly (pypi.org, files.pythonhosted.org)
+  #         ports:
+  #           - { protocol: TCP, port: 443 }
+  registryEgress: {}
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with

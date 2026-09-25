@@ -858,7 +858,12 @@ bounds a run. For a run of up to three hours, set the agent's deadline with
 `curie cluster overrides <agent> --execution-deadline 10800` and both worker
 values to 10800; the chart raises the worker termination grace to match. Whether a run
 executes the repository's tests is the bundle's instruction. The platform does
-not check it.
+not check it. To let the agent install dependencies (`npm ci`, `pip install`)
+and run those checks, declare its package registry CIDRs under
+`agentSandbox.registryEgress.<agent>`. Nothing opens by default; each declaring
+agent gets its own `<release>-agent-<agent>-allow-registry-egress` policy, and
+since NetworkPolicy cannot name a host, list the registry CDN ranges or a
+mirror's address.
 
 ### Factory work items wait for capacity
 
