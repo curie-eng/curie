@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import aiohttp
+from aci_protocol.turn import DEFAULT_IDENTITY
 from channel_protocol import ConfirmIntent, OutboundMessage
 from channel_protocol.reply import (
     NavAffordance,
@@ -51,6 +52,7 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from .behaviorpacks import NavPack
 from .blocks import approval_card, expired_approval_card, render, resolved_approval_card
+from .slack_tokens import token_identity
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
     from .reply_sink import TargetRoute
@@ -141,6 +143,21 @@ class UntrustedSlackEndpointError(RuntimeError):
     every Slack call, so honoring an arbitrary per-turn base URL hands that token
     to whoever named it (D4.4, finding 8).
     """
+
+
+class UnconfiguredSlackIdentityError(RuntimeError):
+    """A Slack route names an identity this worker holds no bot token for.
+
+    Refused before any request (ADR-0168 decision 5): another identity's token
+    would post as the wrong bot.
+    """
+
+
+def _missing_token(identity: str) -> str:
+    return (
+        f"no Slack bot token is configured on this worker for identity {identity!r}; "
+        "refusing to reply as another bot"
+    )
 
 
 def _origin(url: str) -> tuple[str, str, int]:
@@ -272,10 +289,14 @@ class SlackReplyAdapter:
         self,
         token: str,
         *,
+        identity_tokens: Mapping[str, str] | None = None,
         base_url: str | None = None,
         trusted_origins: Sequence[str] = (),
     ) -> None:
         self._token = token
+        # The positional token is ``default``'s, so every existing caller keeps
+        # its meaning; the map adds the named identities (``slack_tokens``).
+        self._tokens: dict[str, str] = {**(identity_tokens or {}), DEFAULT_IDENTITY: token}
         # Normalize "" to None so the default and an explicit-empty override map to
         # the same (real-Slack) client.
         self._default_base_url = base_url or None
@@ -293,7 +314,13 @@ class SlackReplyAdapter:
         trusted: set[_TrustedOrigin] = {_origin(self._default_base_url or REAL_SLACK_BASE_URL)}
         trusted.update(_configured_origins(trusted_origins))
         self._trusted_origins = frozenset(trusted)
-        self._clients: dict[str | None, AsyncWebClient] = {}
+        self._clients: dict[tuple[str, str | None], AsyncWebClient] = {}
+
+    def undeliverable_reason(self, kind: str, route: TargetRoute) -> str | None:
+        """Why this adapter cannot speak on ``route``, or None when it can."""
+
+        identity = token_identity(route.adapter, route.endpoint)
+        return None if identity in self._tokens else _missing_token(identity)
 
     async def emit(
         self,
@@ -310,6 +337,7 @@ class SlackReplyAdapter:
         exists for channels (email) whose reply is only sent at the end.
         """
         endpoint = route.endpoint
+        identity = token_identity(route.adapter, endpoint)
         target = event.target
         if isinstance(event, TurnStatus):
             await self._set_status(
@@ -317,6 +345,7 @@ class SlackReplyAdapter:
                 thread_ts=_thread_ts(target.conversation_id) or "",
                 status=event.status,
                 endpoint=endpoint,
+                identity=identity,
             )
             return ReplyAck(ref=None)
         if isinstance(event, ReplyUpdate):
@@ -338,6 +367,7 @@ class SlackReplyAdapter:
                     message=event.message,
                     endpoint=endpoint,
                     settled=event.settled,
+                    identity=identity,
                 )
                 return ReplyAck(ref=target.reply_ref)
             if target.reply_ref is None:
@@ -358,6 +388,7 @@ class SlackReplyAdapter:
                     nav=event.nav,
                     endpoint=endpoint,
                     best_effort_unreachable=best_effort_unreachable,
+                    identity=identity,
                 )
                 return ReplyAck(ref=ref)
             await self._update(
@@ -367,6 +398,7 @@ class SlackReplyAdapter:
                 nav=event.nav,
                 endpoint=endpoint,
                 best_effort_unreachable=best_effort_unreachable,
+                identity=identity,
             )
             return ReplyAck(ref=target.reply_ref)
         if isinstance(event, ReplyPost):
@@ -376,6 +408,7 @@ class SlackReplyAdapter:
                 requested_by=event.requested_by,
                 thread_ts=_thread_ts(target.conversation_id),
                 endpoint=endpoint,
+                identity=identity,
             )
             return ReplyAck(ref=ref)
         if isinstance(event, TurnCompleted):
@@ -395,17 +428,23 @@ class SlackReplyAdapter:
             None,
         ) in self._trusted_origins
 
-    def _client_for(self, endpoint: str | None) -> AsyncWebClient:
+    def _client_for(
+        self, endpoint: str | None, identity: str = DEFAULT_IDENTITY
+    ) -> AsyncWebClient:
         """The cached client for this turn's endpoint, or the worker default.
 
         A per-turn ``endpoint`` overrides the default; ``None`` (or empty) uses the
-        default. Clients are cached per base URL because the SDK binds the endpoint
-        at construction, so this never rebuilds a client for a repeat endpoint.
+        default. Clients are cached per ``(identity, base URL)`` because the SDK
+        binds both the token and the endpoint at construction, so this never
+        rebuilds a client for a repeat identity and endpoint.
 
         An endpoint outside the configured Slack origin raises here, which is the
         single choke point every Slack call passes through -- so the refusal lands
         before the transport fallback, before any retry, and before any request
         leaves the process with the platform bot token attached (D4.4).
+
+        ``identity`` picks the bot token (ADR-0168 decision 5), and one this
+        worker holds none for raises before any request.
         """
         if endpoint and not self._is_trusted(endpoint):
             raise UntrustedSlackEndpointError(
@@ -414,8 +453,12 @@ class SlackReplyAdapter:
                 f"{_redacted(self._default_base_url or REAL_SLACK_BASE_URL)} nor a configured "
                 "trusted dev origin (CURIE_SLACK_TRUSTED_ORIGINS)"
             )
+        token = self._tokens.get(identity)
+        if token is None:
+            raise UnconfiguredSlackIdentityError(_missing_token(identity))
         base_url = endpoint or self._default_base_url
-        client = self._clients.get(base_url)
+        key = (identity, base_url)
+        client = self._clients.get(key)
         if client is None:
             # ``retry_handlers=[]`` disables the SDK's own connection-error
             # retry, because THIS class already owns the retry policy for an
@@ -427,11 +470,11 @@ class SlackReplyAdapter:
             # blip against a reachable Slack still reclaims and retries at the
             # delivery layer, loudly and bounded (ADR-0039).
             client = (
-                AsyncWebClient(token=self._token, base_url=base_url, retry_handlers=[])
+                AsyncWebClient(token=token, base_url=base_url, retry_handlers=[])
                 if base_url
-                else AsyncWebClient(token=self._token, retry_handlers=[])
+                else AsyncWebClient(token=token, retry_handlers=[])
             )
-            self._clients[base_url] = client
+            self._clients[key] = client
         return client
 
     async def _with_transport_fallback(
@@ -442,6 +485,7 @@ class SlackReplyAdapter:
         describe: str,
         operation: str,
         best_effort_unreachable: bool = False,
+        identity: str = DEFAULT_IDENTITY,
     ) -> _T:
         """Run ``op`` against this turn's endpoint, falling back to the worker
         DEFAULT transport when that endpoint is UNREACHABLE (#530).
@@ -474,7 +518,7 @@ class SlackReplyAdapter:
         kernel matches with ``_is_approval_resume``. That shared coverage is
         deliberate and plan-ratified, not an oversight.
         """
-        primary = self._client_for(endpoint)
+        primary = self._client_for(endpoint, identity)
         resolved = endpoint or self._default_base_url
         has_distinct_default = bool(
             endpoint and self._default_base_url and resolved != self._default_base_url
@@ -491,7 +535,7 @@ class SlackReplyAdapter:
                     _redacted(endpoint),
                     exc,
                 )
-                return await op(self._client_for(None))
+                return await op(self._client_for(None, identity))
             # The best-effort swallow (#708) fires ONLY in the pure-offline case
             # where there is genuinely NO configured default transport at all
             # (``self._default_base_url is None``). It must NOT key off
@@ -528,6 +572,7 @@ class SlackReplyAdapter:
         nav: NavAffordance | None = None,
         endpoint: str | None = None,
         best_effort_unreachable: bool = False,
+        identity: str = DEFAULT_IDENTITY,
     ) -> None:
         # The runner emits Markdown; Slack renders mrkdwn. ``render`` converts to
         # mrkdwn and, if the reply carries a complete ``curie-reply`` block,
@@ -563,6 +608,7 @@ class SlackReplyAdapter:
             describe="chat_update",
             operation="update",
             best_effort_unreachable=best_effort_unreachable,
+            identity=identity,
         )
 
     async def _post_text(
@@ -574,6 +620,7 @@ class SlackReplyAdapter:
         nav: NavAffordance | None = None,
         endpoint: str | None = None,
         best_effort_unreachable: bool = False,
+        identity: str = DEFAULT_IDENTITY,
     ) -> str | None:
         """Post this turn's reply as a NEW message and return its ts.
 
@@ -595,6 +642,7 @@ class SlackReplyAdapter:
             nav: The agent's hub-button pack, or None for no hub button.
             endpoint: Per-turn Slack API base URL override, or None for the default.
             best_effort_unreachable: Swallow an unreachable transport instead of raising.
+            identity: The Slack identity whose token the call carries.
 
         Returns:
             The ts of the posted message, or None when nothing was delivered.
@@ -613,6 +661,7 @@ class SlackReplyAdapter:
             describe="chat_postMessage",
             operation="post",
             best_effort_unreachable=best_effort_unreachable,
+            identity=identity,
         )
         # The best-effort swallow returns None instead of a response when the
         # transport was unreachable and the caller opted into swallowing it. There
@@ -632,6 +681,7 @@ class SlackReplyAdapter:
         requested_by: str,
         thread_ts: str | None = None,
         endpoint: str | None = None,
+        identity: str = DEFAULT_IDENTITY,
     ) -> str | None:
         # Render the channel-neutral message into Block Kit HERE, below the seam
         # (ADR-0020): the kernel emits a Confirm intent, the Slack adapter turns it
@@ -671,6 +721,7 @@ class SlackReplyAdapter:
             ),
             describe="chat_postMessage",
             operation="post",
+            identity=identity,
         )
         ts = response.get("ts")
         return str(ts) if ts else None
@@ -683,6 +734,7 @@ class SlackReplyAdapter:
         message: OutboundMessage,
         endpoint: str | None = None,
         settled: SettledOutcome | None = None,
+        identity: str = DEFAULT_IDENTITY,
     ) -> None:
         # Render the settled approval card HERE, below the seam (ADR-0020): the
         # kernel hands the channel-neutral summary plus the semantic outcome, and
@@ -715,16 +767,22 @@ class SlackReplyAdapter:
                 await client.chat_update(channel=channel, ts=ts, text=text)
 
         await self._with_transport_fallback(
-            endpoint, op, describe="chat_update(card)", operation="update"
+            endpoint, op, describe="chat_update(card)", operation="update", identity=identity
         )
 
     async def _set_status(
-        self, *, channel: str, thread_ts: str, status: str, endpoint: str | None = None
+        self,
+        *,
+        channel: str,
+        thread_ts: str,
+        status: str,
+        endpoint: str | None = None,
+        identity: str = DEFAULT_IDENTITY,
     ) -> None:
         # Best-effort: a workspace without the assistant feature, or any transient
         # error, must never fail the turn.
         try:
-            await self._client_for(endpoint).assistant_threads_setStatus(
+            await self._client_for(endpoint, identity).assistant_threads_setStatus(
                 channel_id=channel, thread_ts=thread_ts, status=status
             )
         except Exception as exc:  # noqa: BLE001 -- status set is best-effort

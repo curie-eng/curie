@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .config import WorkerConfig
 from .slack_sink import SlackReplyAdapter, _redacted
+from .slack_tokens import slack_bot_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ class TargetRoute(BaseModel):
     ADR-0168 decision 3's Slack bot identity, but the installation's one
     pre-ADR identity carries here as None, not the string ``'default'``, until
     that decision's contract migration (#3100) flips the stored form. The
-    Slack sink does not read it until decision 5's follow-up.
+    Slack sink picks its bot token by it (``slack_tokens.token_identity``).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -243,6 +244,15 @@ class ObservedReplySink:
                 best_effort_unreachable=best_effort_unreachable,
             ),
         )
+
+    def undeliverable_reason(self, kind: str, route: TargetRoute) -> str | None:
+        """The wrapped sink's answer, or None when it cannot tell."""
+
+        check = getattr(self._sink, "undeliverable_reason", None)
+        if check is None:
+            return None
+        reason: str | None = check(kind, route)
+        return reason
 
 
 class HttpReplyAdapter:
@@ -621,6 +631,22 @@ class ReplySinkRouter:
             sink = self._adapters.get(event.target.kind, self._default)
         return await sink.emit(event, route=route, best_effort_unreachable=best_effort_unreachable)
 
+    def undeliverable_reason(self, kind: str, route: TargetRoute) -> str | None:
+        """Why the adapter for ``kind`` cannot deliver on ``route``, or None.
+
+        ``getattr`` for the reason ``aclose`` gives: ``ReplySink`` carries one
+        verb, and an adapter with nothing to check has no hook.
+        """
+
+        if route.adapter == CLUSTER_MESSAGE_ADAPTER:
+            return None
+        sink = self._adapters.get(kind, self._default)
+        check = getattr(sink, "undeliverable_reason", None)
+        if check is None:
+            return None
+        reason: str | None = check(kind, route)
+        return reason
+
     async def aclose(self) -> None:
         """Release every adapter that holds a connection of its own.
 
@@ -637,12 +663,20 @@ class ReplySinkRouter:
                 await closer()
 
 
-def build_reply_sink(config: WorkerConfig) -> ReplySinkRouter:
-    """The worker's sink: Slack below its own origin, everything else over HTTP."""
+def build_reply_sink(
+    config: WorkerConfig, *, slack_tokens: Mapping[str, str] | None = None
+) -> ReplySinkRouter:
+    """The worker's sink: Slack below its own origin, everything else over HTTP.
+
+    ``slack_tokens`` is ``slack_tokens.slack_bot_tokens``'s map; ``run.build``
+    resolves it once and hands the same map to the attachment lane.
+    """
+    tokens = slack_bot_tokens(config) if slack_tokens is None else slack_tokens
     return ReplySinkRouter(
         adapters={
             SLACK_KIND: SlackReplyAdapter(
                 config.slack_bot_token,
+                identity_tokens=tokens,
                 base_url=config.slack_api_base_url or None,
                 trusted_origins=config.slack_trusted_origins,
             ),
