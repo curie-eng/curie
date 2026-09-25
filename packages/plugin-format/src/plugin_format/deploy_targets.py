@@ -206,21 +206,36 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
                     f"at most {_NAME_MAX} characters",
                 )
             )
+        # An explicit null (`connectors:` with no value) is refused rather than
+        # read as "all": it widens the target, the one direction this field
+        # exists to prevent. Only an absent key means every connector.
+        if "connectors" in target.model_fields_set and target.connectors is None:
+            errors.append(
+                (
+                    "deploy.null_connectors",
+                    f"{where}: connectors has no value, which is refused rather than read "
+                    "as every connector: omit the key to run every connector "
+                    "connectors.yaml declares, or write `[]` to run none",
+                )
+            )
         if target.connectors is not None:
             seen: set[str] = set()
             repeated: set[str] = set()
             for connector in target.connectors:
-                if not _is_valid_connector_name(connector):
-                    errors.append(
-                        (
-                            "deploy.bad_connector_name",
-                            f"{where}: connectors lists `{connector}`, which no "
-                            "connectors.yaml could declare: a connector name must be "
-                            "lowercase alphanumeric or dashes, start and end alphanumeric, "
-                            f"and be at most {_CONNECTOR_NAME_MAX} characters",
+                if connector not in seen:
+                    seen.add(connector)
+                    if not _is_valid_connector_name(connector):
+                        errors.append(
+                            (
+                                "deploy.bad_connector_name",
+                                f"{where}: connectors lists `{connector}`, which no "
+                                "connectors.yaml could declare: a connector name must be "
+                                "lowercase alphanumeric or dashes, start and end "
+                                f"alphanumeric, and be at most {_CONNECTOR_NAME_MAX} "
+                                "characters",
+                            )
                         )
-                    )
-                if connector in seen and connector not in repeated:
+                elif connector not in repeated and _is_valid_connector_name(connector):
                     repeated.add(connector)
                     errors.append(
                         (
@@ -228,6 +243,5 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
                             f"{where}: connectors lists `{connector}` more than once",
                         )
                     )
-                seen.add(connector)
 
     return (parsed if not errors else None), errors

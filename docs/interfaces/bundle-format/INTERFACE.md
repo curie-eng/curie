@@ -155,8 +155,10 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   the join),
   `deploy.bad_slack_channel`, `deploy.bad_identity` (shape only: the installation declares its
   identities and this validator never sees it), `deploy.bad_connector_name` (the `connectors.yaml` name
-  rule), `deploy.duplicate_connector`, `deploy.unknown_connector` (an allowlist entry
-  `connectors.yaml` does not declare)). Authored mapping keys are
+  rule), `deploy.duplicate_connector`, `deploy.null_connectors` (an explicit null allowlist,
+  such as a bare `connectors:`, is refused rather than read as all; omit the key or write `[]`),
+  `deploy.unknown_connector` (an allowlist entry `connectors.yaml` does not declare)). Authored
+  mapping keys are
   checked for duplicates before validation, so a repeated target name fails closed instead of
   silently selecting the last YAML value.
 

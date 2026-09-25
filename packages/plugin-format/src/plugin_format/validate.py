@@ -38,6 +38,7 @@ from .connectors import (
     ConnectorsFile,
     validate_connectors,
 )
+from .connectors import _is_valid_name as _is_valid_connector_name
 from .deploy_targets import DeployTargetsFile, validate_deploy_targets
 from .gate_summary import check_gate_summary_template
 from .manifest import resolve_manifest
@@ -229,8 +230,17 @@ def _validate_deploy_targets(root: Path, c: _Collector) -> None:
     parsed, errors = validate_deploy_targets(data)
     for code, message in errors:
         c.error(code, message, DEPLOY_FILE)
+    # `parsed` is None whenever any target error was reported. When the file
+    # still has the right shape, re-read the model so the cross-check below is
+    # reported in the same pass instead of after the author fixes the rest.
+    if parsed is None and not {code for code, _ in errors} & _DEPLOY_SHAPE_ERRORS:
+        parsed = DeployTargetsFile.model_validate(data)
     if parsed is not None:
         _reject_unknown_target_connectors(root, parsed, c)
+
+
+# The deploy.yaml codes after which no model exists to cross-check.
+_DEPLOY_SHAPE_ERRORS = frozenset({"deploy.not_object", "deploy.invalid"})
 
 
 def _reject_unknown_target_connectors(
@@ -252,8 +262,9 @@ def _reject_unknown_target_connectors(
     else:
         declared = set()
     for name, target in targets.targets.items():
-        for connector in target.connectors or ():
-            if connector not in declared:
+        for connector in dict.fromkeys(target.connectors or ()):
+            # A malformed name already has `deploy.bad_connector_name`.
+            if connector not in declared and _is_valid_connector_name(connector):
                 c.error(
                     "deploy.unknown_connector",
                     f"targets.{name}: connectors lists `{connector}`, which "
