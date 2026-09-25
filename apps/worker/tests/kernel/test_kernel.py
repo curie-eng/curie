@@ -6337,41 +6337,59 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
     asyncio.run(go())
 
 
-def test_streaming_turn_keeps_its_route_alive_until_the_stream_ends(make_harness) -> None:
-    # #3188: a turn streaming past route_ttl_seconds must refresh its route,
-    # else the reaper deletes the claim mid-turn.
+
+@pytest.mark.parametrize("keepalive", [True, False], ids=["refreshed", "control"])
+def test_streaming_turn_route_survives_the_reaper_past_its_ttl(
+    make_harness, keepalive: bool
+) -> None:
+    # #3188: a turn streaming past route_ttl_seconds must keep its route, or
+    # reap_orphans deletes the claim under the live runner. The control
+    # disables the refresh and must see the claim reaped, proving the TTL
+    # really expires inside this test.
     async def go() -> None:
         async with make_harness() as h:
+            h.substrate._config = replace(h.substrate._config, route_ttl_seconds=1)
             h.kernel._route_ttl_seconds = 1
             calls: list[tuple[str, str]] = []
             inner = h.substrate.touch_live
 
             def spy(thread_key: str, claim_name: str) -> bool:
                 calls.append((thread_key, claim_name))
-                return inner(thread_key, claim_name)
+                return inner(thread_key, claim_name) if keepalive else False
 
             h.substrate.touch_live = spy  # type: ignore[method-assign]
             hold = asyncio.Event()
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="working ")]
             h.runner.tail = [Final(text="working done", status=DONE)]
-            ev = _qevent("long turn")
+            thread_key = _thread_key("th-1")
+            reaped: list[str] = []
 
-            async def release_later() -> None:
-                await asyncio.sleep(1.5)
+            async def reap_mid_turn() -> None:
+                # Well past the 1 s route TTL while the turn is held open.
+                await asyncio.sleep(2.5)
+                # Age every claim past the bind grace so only the route can
+                # spare it: grace = claim_timeout_seconds + 30 s margin.
+                h.substrate._config = replace(
+                    h.substrate._config, claim_timeout_seconds=-60.0
+                )
+                reaped.extend(await asyncio.to_thread(h.substrate.reap_orphans))
                 hold.set()
 
-            releaser = asyncio.create_task(release_later())
-            await asyncio.wait_for(h.kernel.process_event(ev), timeout=10.0)
-            await releaser
-            assert h.sink.last_text == "working done"
-            thread_key = _thread_key("th-1")
-            handle = h.substrate.lookup(thread_key)
-            assert handle is not None
-            assert calls, "touch_live was never called while the turn streamed"
-            assert set(calls) == {(thread_key, handle.claim_name)}
-            during = len(calls)
-            await asyncio.sleep(1.3)
-            assert len(calls) == during
+            reaper = asyncio.create_task(reap_mid_turn())
+            await asyncio.wait_for(h.kernel.process_event(_qevent("long turn")), timeout=10.0)
+            await reaper
+            assert calls, "the route was never refreshed while the turn streamed"
+            if keepalive:
+                assert reaped == []
+                assert h.sink.last_text == "working done"
+                handle = h.substrate.lookup(thread_key)
+                assert handle is not None
+                assert set(calls) == {(thread_key, handle.claim_name)}
+                during = len(calls)
+                await asyncio.sleep(1.0)
+                assert len(calls) == during, "keepalive outlived the turn"
+            else:
+                assert len(reaped) == 1
 
     asyncio.run(go())

@@ -6284,7 +6284,9 @@ class Kernel:
         mid-turn. A failed refresh is logged and retried, never fatal.
         """
 
-        interval = max(1.0, self._route_ttl_seconds / 3)
+        # Strictly inside the TTL for every positive TTL, so the first refresh
+        # never races the expiry it exists to prevent.
+        interval = self._route_ttl_seconds / 3
 
         async def _loop() -> None:
             while True:
