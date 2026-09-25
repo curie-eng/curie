@@ -1110,6 +1110,46 @@
         "title": "AgentOut",
         "type": "object"
       },
+      "AgentSchedulesOut": {
+        "description": "The scheduled hooks of one agent's in-force deployment.",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "bundle_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Error"
+          },
+          "hooks": {
+            "items": {
+              "$ref": "#/components/schemas/ScheduleHookOut"
+            },
+            "title": "Hooks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent",
+          "agent_id",
+          "bundle_error",
+          "hooks"
+        ],
+        "title": "AgentSchedulesOut",
+        "type": "object"
+      },
       "AgentUpdate": {
         "description": "Partial update of mutable agent fields. An omitted field is unchanged.\n\nFor the two nullable operator overrides -- `model` and `thinking` -- omitted\nand explicit JSON null are DIFFERENT requests, and the router tells them\napart with `model_fields_set` (#1310). Omitted leaves the current value;\nexplicit null clears the override back to the platform default. Reading\n`None` alone cannot distinguish the two, which is why setting one of these\nused to be a one-way door.\n\nThe repo binding stopped being identity in ADR-0091: one repository builds\nmany agents now, so binding is a routing fact, not a name.",
         "properties": {
@@ -5713,6 +5753,85 @@
           "pods"
         ],
         "title": "RunnerPods",
+        "type": "object"
+      },
+      "ScheduleHookOut": {
+        "description": "One cron hook on the in-force bundle, with its newest slot.",
+        "properties": {
+          "last_fire_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Fire At"
+          },
+          "last_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Outcome"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "schedule": {
+            "title": "Schedule",
+            "type": "string"
+          },
+          "trigger": {
+            "title": "Trigger",
+            "type": "string"
+          },
+          "zone": {
+            "title": "Zone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "trigger",
+          "schedule",
+          "zone",
+          "last_fire_at",
+          "last_outcome"
+        ],
+        "title": "ScheduleHookOut",
+        "type": "object"
+      },
+      "ScheduleListOut": {
+        "description": "Every in-force cron hook the platform can see.",
+        "properties": {
+          "schedules": {
+            "items": {
+              "$ref": "#/components/schemas/AgentSchedulesOut"
+            },
+            "title": "Schedules",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schedules"
+        ],
+        "title": "ScheduleListOut",
         "type": "object"
       },
       "SettingConfig": {
@@ -13129,6 +13248,72 @@
         "summary": "Ready",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/schedules": {
+      "get": {
+        "description": "Cron hooks on each in-force deployment, newest slot first in the record.",
+        "operationId": "list_schedules_schedules_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleListOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Schedules",
+        "tags": [
+          "schedules"
         ]
       }
     },

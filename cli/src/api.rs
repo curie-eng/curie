@@ -508,6 +508,32 @@ pub struct Version {
     pub bundle_ref: Option<String>,
 }
 
+/// One cron hook on an in-force deployment (`ScheduleHookOut`, #2933).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleHook {
+    pub name: String,
+    pub trigger: String,
+    pub schedule: String,
+    pub zone: String,
+    pub last_fire_at: Option<String>,
+    pub last_outcome: Option<String>,
+}
+
+/// Scheduled hooks for one agent (`AgentSchedulesOut`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentSchedules {
+    pub agent: String,
+    pub agent_id: String,
+    pub bundle_error: Option<String>,
+    pub hooks: Vec<ScheduleHook>,
+}
+
+/// `GET /schedules` (`ScheduleListOut`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleList {
+    pub schedules: Vec<AgentSchedules>,
+}
+
 /// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MemoryProvenance {
@@ -2791,6 +2817,23 @@ impl ApiClient {
             .json()
             .await
             .context("decoding version list")
+    }
+
+    /// Cron hooks on in-force deployments: `GET /schedules`.
+    pub async fn list_schedules(&self, agent: Option<&str>) -> Result<ScheduleList> {
+        let mut request = self
+            .http
+            .get(format!("{}/schedules", self.base_url))
+            .header("X-API-Key", &self.api_key);
+        if let Some(agent) = agent {
+            request = request.query(&[("agent", agent)]);
+        }
+        let resp = self.send_request(request, "GET /schedules").await?;
+        Self::expect_ok(resp, "listing schedules")
+            .await?
+            .json()
+            .await
+            .context("decoding schedule list")
     }
 
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.

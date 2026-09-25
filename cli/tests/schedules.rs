@@ -199,9 +199,14 @@ fn agent_filter_queries_schedules_and_does_not_list_agents() {
     );
     assert_api_key(request);
     assert!(
-        recorded.iter().all(|request| route(&request.path) != "/agents"),
+        recorded
+            .iter()
+            .all(|request| route(&request.path) != "/agents"),
         "the CLI must not look the agent up itself: {:?}",
-        recorded.iter().map(|request| request.path.clone()).collect::<Vec<_>>()
+        recorded
+            .iter()
+            .map(|request| request.path.clone())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -238,7 +243,10 @@ fn human_output_contains_the_hook_name_and_failed() {
 
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     let text = stdout(&output);
-    assert!(text.contains("nightly-cleanup"), "hook name missing: {text}");
+    assert!(
+        text.contains("nightly-cleanup"),
+        "hook name missing: {text}"
+    );
     assert!(text.contains("failed"), "outcome missing: {text}");
 }
 
@@ -336,8 +344,13 @@ fn missing_agent_is_exit_one() {
         request.path
     );
     assert!(
-        recorded.iter().all(|request| route(&request.path) != "/agents"),
+        recorded
+            .iter()
+            .all(|request| route(&request.path) != "/agents"),
         "an unknown agent must not be resolved through /agents: {:?}",
-        recorded.iter().map(|request| request.path.clone()).collect::<Vec<_>>()
+        recorded
+            .iter()
+            .map(|request| request.path.clone())
+            .collect::<Vec<_>>()
     );
 }

@@ -63,6 +63,7 @@ from .routers import (
     observability,
     publications,
     runs,
+    schedules,
     state,
     work_item_outcomes,
     work_items,
@@ -412,6 +413,7 @@ def create_app() -> FastAPI:
     app.include_router(control.router)
     app.include_router(evals.router)
     app.include_router(runs.router)
+    app.include_router(schedules.router)
     app.include_router(state.router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise

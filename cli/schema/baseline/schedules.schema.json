@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/schedules/v1.json",
+  "title": "curie <tier> schedules --json",
+  "description": "The agent-facing payload of `curie <tier> schedules`: the dry-run plan, or cron hooks on each in-force deployment. `last_outcome` is the newest slot value, or null when that slot is open or the hook has no row.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    },
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string"
+        },
+        "schedule": {
+          "type": "string"
+        },
+        "zone": {
+          "type": "string"
+        },
+        "last_fire_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_outcome": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "ran",
+                "deferred",
+                "skipped",
+                "blocked",
+                "reclaimed",
+                "failed"
+              ]
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "trigger",
+        "schedule",
+        "zone",
+        "last_fire_at",
+        "last_outcome"
+      ]
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "bundle_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hooks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hook"
+          }
+        }
+      },
+      "required": [
+        "agent",
+        "agent_id",
+        "bundle_error",
+        "hooks"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schedules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/agent"
+          }
+        }
+      },
+      "required": [
+        "schedules"
+      ]
+    }
+  ]
+}

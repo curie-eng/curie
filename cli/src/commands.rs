@@ -8704,6 +8704,88 @@ pub fn skill_work_items_unavailable() -> anyhow::Error {
     crate::exit::unsupported("work-items", WORK_ITEMS_REASON, WORK_ITEMS_ALT)
 }
 
+/// Why `skill schedules` cannot be answered at this tier.
+pub const SCHEDULES_REASON: &str =
+    "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
+/// Where to read scheduled hooks instead.
+pub const SCHEDULES_ALT: &str =
+    "use `curie local schedules` or `curie cluster schedules` against a platform API";
+
+/// `skill schedules`: understood, but unavailable at this tier (ADR-0041, #2933).
+pub fn skill_schedules_unavailable() -> anyhow::Error {
+    crate::exit::unsupported("schedules", SCHEDULES_REASON, SCHEDULES_ALT)
+}
+
+/// Inputs for `<tier> schedules [--agent NAME_OR_ID]`.
+pub struct SchedulesOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: Option<String>,
+    pub dry_run: bool,
+}
+
+/// Output of `<tier> schedules`. `List` is the API body, not a reshaped copy.
+pub enum SchedulesOutput {
+    DryRun(crate::ui::DryRunPlan),
+    List(crate::api::ScheduleList),
+}
+
+impl crate::ui::CliOutput for SchedulesOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            SchedulesOutput::DryRun(plan) => plan.to_json(),
+            SchedulesOutput::List(list) => serde_json::to_value(list).unwrap_or_default(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            SchedulesOutput::DryRun(plan) => plan.render(ui),
+            SchedulesOutput::List(list) => {
+                if list.schedules.is_empty() {
+                    ui.payload("no schedules");
+                    return;
+                }
+                for agent in &list.schedules {
+                    ui.payload(&agent.agent);
+                    if let Some(error) = &agent.bundle_error {
+                        ui.payload(error);
+                    }
+                    for hook in &agent.hooks {
+                        let fire = hook.last_fire_at.as_deref().unwrap_or("-");
+                        let outcome = hook.last_outcome.as_deref().unwrap_or("-");
+                        ui.payload(&format!(
+                            "{} {} {} {} {} {}",
+                            hook.name, hook.trigger, hook.schedule, hook.zone, fire, outcome
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `<tier> schedules`: list cron hooks and the newest recorded slot (`GET /schedules`).
+pub async fn schedules(opts: SchedulesOpts) -> Result<SchedulesOutput> {
+    let agent_query = opts
+        .agent
+        .as_ref()
+        .map(|agent| format!("?agent={agent}"))
+        .unwrap_or_default();
+    if opts.dry_run {
+        return Ok(SchedulesOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "GET {}/schedules{agent_query}",
+                opts.api_url.trim_end_matches('/')
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    Ok(SchedulesOutput::List(
+        client.list_schedules(opts.agent.as_deref()).await?,
+    ))
+}
+
 /// A work item ID must be a UUID. Refused locally as a usage error (exit 2)
 /// before any request is made, through the centralized error path so `--json`
 /// still gets the structured `{error, ...}` payload.
