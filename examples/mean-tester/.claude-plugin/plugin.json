@@ -1,6 +1,6 @@
 {
   "name": "mean-tester",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Mean tests another agent the way a person does: plans a campaign from its spec, asks it over Slack from its own bot, following up inside the threads it opens, and reports PASS, FAIL or UNCLEAR per probe with the reply quoted. It files nothing, fixes nothing and never resolves an approval (ADR 0169, ADR 0172).",
   "license": "Apache-2.0",
   "author": {"name": "CurieTech"},
