@@ -85,12 +85,24 @@ pub const DEFAULT_SLACK_CHANNEL: &str = "C0LOCALDEV";
 /// The API renders these; the CLI applies them. Rendering is a pure function so
 /// the API needs no cluster access for it, and cluster-write authority stays
 /// with the operator running this command (ADR-0086, #1063).
+/// What an absent `identity` means on a target the API resolved: the API
+/// predates ADR-0168 decision 8, and every target it knows is on the default.
+fn default_identity() -> String {
+    DEFAULT_SLACK_IDENTITY.to_string()
+}
+
 /// What a named `deploy.yaml` target resolves to (ADR-0089).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolvedTarget {
     pub agent: Option<String>,
     pub env: String,
     pub slack_channel: Option<String>,
+    /// The identity the binding speaks through (ADR-0168 decision 8).
+    #[serde(default = "default_identity")]
+    pub identity: String,
+    /// The connectors the bound agent runs; `None` is every declared one.
+    #[serde(default)]
+    pub connectors: Option<Vec<String>>,
 }
 
 /// One environment whose pushes a repository can no longer route (#1221).
@@ -140,6 +152,12 @@ pub struct NamedTarget {
     pub agent: Option<String>,
     pub env: String,
     pub slack_channel: Option<String>,
+    /// The identity the binding speaks through (ADR-0168 decision 8).
+    #[serde(default = "default_identity")]
+    pub identity: String,
+    /// The connectors the bound agent runs; `None` is every declared one.
+    #[serde(default)]
+    pub connectors: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

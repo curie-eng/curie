@@ -1480,6 +1480,10 @@ class ResolvedTarget(BaseModel):
     agent: str | None = None
     env: str = "dev"
     slack_channel: str | None = None
+    # @spec ADR-0168 d8: the identity the binding speaks through, and the
+    # connectors the bound agent runs (None is every declared one).
+    identity: str = "default"
+    connectors: list[str] | None = None
 
 
 class NamedTarget(ResolvedTarget):

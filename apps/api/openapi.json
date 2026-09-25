@@ -4220,9 +4220,28 @@
             ],
             "title": "Agent"
           },
+          "connectors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connectors"
+          },
           "env": {
             "default": "dev",
             "title": "Env",
+            "type": "string"
+          },
+          "identity": {
+            "default": "default",
+            "title": "Identity",
             "type": "string"
           },
           "name": {
@@ -5358,9 +5377,28 @@
             ],
             "title": "Agent"
           },
+          "connectors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connectors"
+          },
           "env": {
             "default": "dev",
             "title": "Env",
+            "type": "string"
+          },
+          "identity": {
+            "default": "default",
+            "title": "Identity",
             "type": "string"
           },
           "slack_channel": {
