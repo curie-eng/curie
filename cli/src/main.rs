@@ -2197,8 +2197,8 @@ enum LocalAction {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
         /// The worker's composed key: kind[:identity]:channel:thread-ts, each
-        /// part percent-encoded, identity only when not the default Slack app
-        /// (e.g. slack:C0EXAMPLE1:1700000000.000100).
+        /// part percent-encoded; identity only when the route names one other
+        /// than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
@@ -3049,8 +3049,8 @@ enum ClusterAction {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
         /// The worker's composed key: kind[:identity]:channel:thread-ts, each
-        /// part percent-encoded, identity only when not the default Slack app
-        /// (e.g. slack:C0EXAMPLE1:1700000000.000100).
+        /// part percent-encoded; identity only when the route names one other
+        /// than `default` (e.g. slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[command(flatten)]

@@ -75,7 +75,7 @@ fn percent_encode_unreserved(s: &str) -> String {
 
 /// The worker's internal sandbox key for a turn: percent-encoded
 /// `kind:channel:conversation_id`, with the route's identity as a segment after
-/// `kind` unless it is none or the default Slack app (ADR-0168 decision 4).
+/// `kind` unless it is none or `default` (ADR-0168 decision 4).
 /// Frozen with the Python `_thread_key_for` helper in
 /// `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member that is only
 /// the conversation_id cannot release the sandbox (#2259). A disconnected

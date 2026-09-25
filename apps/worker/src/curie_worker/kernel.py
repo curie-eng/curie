@@ -326,7 +326,7 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
 
     Each segment is percent-encoded, so no combination can collide with
     another by moving a separator. The route's identity (``route_identity``)
-    is a segment after the kind unless it is none or the default Slack app
+    is a segment after the kind unless it is none or ``default``
     (ADR-0168 decision 4), built by ``channel_protocol.scoped_conversation_id``
     itself, so a pre-ADR key is unchanged and a named one has one more
     segment. The worker only compares the key; it never parses it back.

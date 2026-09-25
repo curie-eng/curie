@@ -1,6 +1,6 @@
 """A named non-Slack route keeps its history across the key change (ADR-0168 decision 4).
 
-Under the ruling for decision 4, a route whose adapter names a non-default
+Under ADR-0168 decision 4, a route whose adapter names a non-default
 identity gains an identity segment in its thread key. A mail thread's
 transcript written before the upgrade sits under the old key. The first read
 or write under the new key adopts it, as ``transcripts._adopt_legacy`` adopts
