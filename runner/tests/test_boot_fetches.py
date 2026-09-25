@@ -543,3 +543,48 @@ def test_boot_fetches_skips_probe_on_fake_model(tmp_path: Path) -> None:
             assert fetches.conversation_replay.present
 
     anyio.run(go)
+
+
+def test_the_capability_probe_derives_the_caller_header_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR-0168 decision 7: the probe dials the hosted entries the session
+    # mounts, so it must present the caller header as well. On the fake-model
+    # path the probe only diagnoses header placeholders against the process
+    # env, which this test leaves without the token: the derived header then
+    # shows up as a missing credential, and without the header there would be
+    # nothing to report.
+    plugin_dir = tmp_path / "bundle"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "acme-bot"}), encoding="utf-8"
+    )
+    (plugin_dir / "connectors.yaml").write_text(
+        "connectors:\n  grafana:\n    image: grafana/mcp-grafana:0.17.2\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("CURIE_CONNECTOR_CALLER_TOKEN", raising=False)
+    app = _state_app(memory_value=[_MEMORY_ITEM], history_value=[_HISTORY_ITEM])
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            config = RunnerConfig.from_env(
+                {
+                    "CURIE_PLUGIN_DIR": str(plugin_dir),
+                    "CURIE_SESSION_ID": "s-boot",
+                    "CURIE_SANDBOX_ID": "b-boot",
+                    "CURIE_BUDGET": _BUDGET,
+                    "CURIE_MEMORY_REF": str(server.make_url("/agents/A/state/memory")),
+                    "CURIE_HISTORY_REF": str(server.make_url("/agents/A/state/transcript/t1")),
+                    "CURIE_CONNECTOR_RELEASE": "curie",
+                    "CURIE_CONNECTOR_AGENT": "acme-dev",
+                    "CURIE_CONNECTOR_NAMESPACE": "curie",
+                    "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+                }
+            )
+            fetches = await boot._load_boot_fetches(config, True, None)
+            assert [
+                (failure.connector, failure.credential_names)
+                for failure in fetches.connector_failures
+            ] == [("grafana", ("CURIE_CONNECTOR_CALLER_TOKEN",))]
+
+    anyio.run(go)
