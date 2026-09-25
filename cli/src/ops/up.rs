@@ -4951,6 +4951,84 @@ mod tests {
         );
     }
 
+    /// `dispatcher.slack.identities` (ADR-0168 decision 1) sits beside the
+    /// `default` block `comms` records. `up` is a full upgrade, so a list it
+    /// did not re-pass would silently undeclare every named identity, and the
+    /// API would then refuse every binding that names one.
+    #[test]
+    fn plain_up_re_supplies_recorded_slack_identities_without_reuse_values() {
+        let existing = serde_json::json!({
+            "dispatcher": {"slack": {
+                "appToken": "xapp-EXAMPLE",
+                "botToken": "xoxb-EXAMPLE",
+                "identities": [
+                    {
+                        "name": "second",
+                        "appTokenExistingSecret": "slack-second",
+                        "botTokenExistingSecret": "slack-second",
+                        "signingSecretExistingSecret": "slack-second"
+                    },
+                    {
+                        "name": "third",
+                        "appTokenExistingSecret": "slack-third",
+                        "appTokenExistingSecretKey": "app",
+                        "botTokenExistingSecret": "slack-third",
+                        "botTokenExistingSecretKey": "bot"
+                    }
+                ]
+            }}
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                retained_mail_values: None,
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                adopt: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for assignment in [
+            "dispatcher.slack.identities[0].name=second",
+            "dispatcher.slack.identities[0].appTokenExistingSecret=slack-second",
+            "dispatcher.slack.identities[0].botTokenExistingSecret=slack-second",
+            "dispatcher.slack.identities[0].signingSecretExistingSecret=slack-second",
+            "dispatcher.slack.identities[1].name=third",
+            "dispatcher.slack.identities[1].appTokenExistingSecret=slack-third",
+            "dispatcher.slack.identities[1].appTokenExistingSecretKey=app",
+            "dispatcher.slack.identities[1].botTokenExistingSecret=slack-third",
+            "dispatcher.slack.identities[1].botTokenExistingSecretKey=bot",
+        ] {
+            assert!(
+                argv.contains(&format!("--set-string {assignment}")),
+                "plain up dropped recorded Slack identity leaf {assignment}: {argv}"
+            );
+        }
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
     /// A plain `cluster up` for an unrelated reason must not silently switch
     /// the worker back to refusing every dev reply endpoint the operator had
     /// already trusted (issue #1897).
