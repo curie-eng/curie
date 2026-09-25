@@ -244,6 +244,14 @@ def test_transcript_capacity_failure_precedes_terminal_final(
         append_attempts.append(await request.json())
         return web.Response(status=413, text=sensitive_body)
 
+    async def get_history(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "not found"},
+            status=404,
+            headers={"X-Curie-Transcript-Max-Bytes": "65536"},
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_history)
     app.router.add_post("/agents/A/state/transcript/t1/append", reject_append)
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -265,6 +273,7 @@ def test_transcript_capacity_failure_precedes_terminal_final(
             store = StateApiTranscriptStore(
                 str(server.make_url("/agents/A/state/transcript/t1")), token=None
             )
+            assert await store.load() == []
             runner, _fake = _runner_with_history(store, tracer=RunTracer(provider))
             await runner.start()
             lines = [

@@ -6103,6 +6103,16 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
     asyncio.run(go())
 
 
+def test_history_persistence_error_has_dedicated_factory_cause() -> None:
+    failure = kernel_module.TurnOutcome(
+        terminal_ok=False,
+        classification="history-persistence-error",
+        error_message="conversation history capacity exceeded",
+    )
+
+    assert kernel_module._escalation_cause(failure) == "history_capacity"
+
+
 @pytest.mark.parametrize(
     ("with_side_effect", "event_id"),
     [

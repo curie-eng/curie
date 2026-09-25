@@ -395,8 +395,8 @@ def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None: 
         client,
         request_id,
         epoch,
-        "runner_escalated",
-        detail="history-persistence-error: conversation history capacity exceeded",
+        "history_capacity",
+        detail="conversation history capacity exceeded",
     )
     _reconcile()
 
@@ -404,6 +404,7 @@ def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None: 
     body = comment["body"].lower()
     assert "history capacity exceeded" in body
     assert "retry" in body
+    assert "cause: history_capacity" in body
     assert "status: failed" in body
     assert _curie_labels(sink, number) == {"curie:needs-human"}
 

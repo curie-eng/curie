@@ -16,6 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner.adapter import ClaudeAgentSession, build_options, build_structured_resume
 from curie_runner.history import (
+    HISTORY_APPEND_RESERVE_BYTES,
     ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
@@ -25,9 +26,13 @@ from curie_runner.history import (
     SummaryRecord,
     TranscriptStore,
     TurnRecord,
+    bound_turn_record,
     build_conversation_replay,
     resolve_history,
 )
+
+_STATE_VALUE_MAX_BYTES = 65_536
+_TRANSCRIPT_CAP_HEADERS = {"X-Curie-Transcript-Max-Bytes": str(_STATE_VALUE_MAX_BYTES)}
 
 
 def _fake_state_app() -> tuple[web.Application, list]:
@@ -38,9 +43,12 @@ def _fake_state_app() -> tuple[web.Application, list]:
 
     async def get_key(request: web.Request) -> web.Response:
         if not log:
-            return web.json_response({"detail": "not found"}, status=404)
+            return web.json_response(
+                {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
+            )
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": len(log)}
+            {"namespace": "transcript", "key": "t1", "value": list(log), "version": len(log)},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     async def append_key(request: web.Request) -> web.Response:
@@ -55,9 +63,6 @@ def _fake_state_app() -> tuple[web.Application, list]:
     return app, log
 
 
-_STATE_VALUE_MAX_BYTES = 65_536
-
-
 def _capped_state_app() -> tuple[web.Application, list, list[int]]:
     """A state-key fake that enforces the API's whole-value JSON byte cap."""
 
@@ -68,9 +73,12 @@ def _capped_state_app() -> tuple[web.Application, list, list[int]]:
 
     async def get_key(_request: web.Request) -> web.Response:
         if not log:
-            return web.json_response({"detail": "not found"}, status=404)
+            return web.json_response(
+                {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
+            )
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1}
+            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     async def append_key(request: web.Request) -> web.Response:
@@ -431,6 +439,56 @@ def _over_bound_turn(tag: str, harness_replay: HarnessReplayState | None = None)
     )
 
 
+def test_bounded_middle_turn_breaks_native_checkpoint_delta_chain() -> None:
+    checkpoint = TurnRecord(
+        user="checkpoint request",
+        assistant="checkpoint answer",
+        harness_replay=HarnessReplayState(
+            harness="claude", kind="checkpoint", entries=({"uuid": "C1"},)
+        ),
+    )
+    middle = bound_turn_record(
+        _over_bound_turn(
+            "middle",
+            HarnessReplayState(
+                harness="claude", kind="delta", entries=({"uuid": "M2"},)
+            ),
+        ),
+        max_value_bytes=8_000,
+    )
+    assert middle.harness_replay is None
+    latest = TurnRecord(
+        user="latest request",
+        assistant="latest answer",
+        harness_replay=HarnessReplayState(
+            harness="claude", kind="delta", entries=({"uuid": "D3"},)
+        ),
+    )
+
+    replay, summary = build_conversation_replay(
+        [checkpoint, middle, latest], max_turns=None, max_bytes=None
+    )
+
+    assert summary is None
+    assert middle.messages[0] in replay.messages
+    assert replay.harness_replay is None
+
+    fresh_checkpoint = TurnRecord(
+        user="fresh request",
+        assistant="fresh answer",
+        harness_replay=HarnessReplayState(
+            harness="claude", kind="checkpoint", entries=({"uuid": "C4"},)
+        ),
+    )
+    restored, summary = build_conversation_replay(
+        [checkpoint, middle, latest, fresh_checkpoint],
+        max_turns=None,
+        max_bytes=None,
+    )
+    assert summary is None
+    assert restored.harness_replay == fresh_checkpoint.harness_replay
+
+
 def test_single_over_bound_turn_replays_plainly_without_a_summary() -> None:
     """#2927: one turn cannot be compacted, so crossing the bound makes no summary.
 
@@ -526,6 +584,7 @@ def test_state_store_append_then_load_round_trip() -> None:
         async with TestServer(app) as server:
             url = str(server.make_url("/agents/A/state/transcript/t1"))
             store = StateApiTranscriptStore(url, token="k")
+            assert await store.load() == []
             await store.append(
                 TurnRecord(user="q1", assistant="a1", ts="2026-07-14T00:00:00+00:00")
             )
@@ -563,6 +622,12 @@ def test_state_store_append_errors_carry_only_the_http_status(
     async def reject_append(_request: web.Request) -> web.Response:
         return web.Response(status=status, text=sensitive_body)
 
+    async def get_key(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_key)
     app.router.add_post("/agents/A/state/transcript/t1/append", reject_append)
 
     async def go() -> None:
@@ -570,6 +635,7 @@ def test_state_store_append_errors_carry_only_the_http_status(
             store = StateApiTranscriptStore(
                 str(server.make_url("/agents/A/state/transcript/t1")), token=None
             )
+            assert await store.load() == []
             with pytest.raises(error_type) as caught:
                 await store.append(TurnRecord(user="question", assistant="answer"))
             assert caught.value.args == (status,)
@@ -723,6 +789,8 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
         async with TestServer(app) as server:
             key_url = str(server.make_url("/agents/A/state/transcript/t1"))
             session = ReplayExportingFake(script)
+            history_store = StateApiTranscriptStore(key_url, token=None)
+            assert await history_store.load() == []
             runner = SessionRunner(
                 session_factory=lambda: session,
                 ceiling=0,
@@ -730,7 +798,7 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
                 classifier=SideEffectClassifier(),
                 trace_name="bounded-history",
                 session_id="session-example",
-                history_store=StateApiTranscriptStore(key_url, token=None),
+                history_store=history_store,
             )
             await runner.start()
             lines = [
@@ -792,15 +860,6 @@ def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> 
     from aci_protocol import Event, SessionStatus
     from claude_agent_sdk import AssistantMessage, ResultMessage
 
-    class CountingStore(_RecordingStore):
-        def __init__(self) -> None:
-            super().__init__()
-            self.append_attempts = 0
-
-        async def append(self, record: TurnRecord) -> None:
-            self.append_attempts += 1
-            await super().append(record)
-
     empty_assistant_messages = 3_000
     script = lambda: [  # noqa: E731 - compact fixed SDK transcript fixture
         *(
@@ -834,7 +893,7 @@ def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> 
         > _STATE_VALUE_MAX_BYTES
     )
 
-    store = CountingStore()
+    store = _BoundedRecordingStore()
     runner = _recording_runner(store, script=script)
     final = _run_recording_turn(
         runner, Event(type="message", text="q", user="U", ts="1")
@@ -856,15 +915,6 @@ def test_history_durability_failure_is_sticky_after_later_successful_append() ->
 
     from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
-
-    class CountingStore(_RecordingStore):
-        def __init__(self) -> None:
-            super().__init__()
-            self.append_attempts = 0
-
-        async def append(self, record: TurnRecord) -> None:
-            self.append_attempts += 1
-            await super().append(record)
 
     oversized_messages = 3_000
     scripts = iter(
@@ -902,7 +952,7 @@ def test_history_durability_failure_is_sticky_after_later_successful_append() ->
             ],
         )
     )
-    store = CountingStore()
+    store = _BoundedRecordingStore()
     runner = _recording_runner(store, script=lambda: next(scripts))
 
     async def go() -> None:
@@ -944,7 +994,8 @@ def test_state_store_load_rejects_non_array() -> None:
 
     async def get_key(_request: web.Request) -> web.Response:
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": {"not": "a list"}, "version": 1}
+            {"namespace": "transcript", "key": "t1", "value": {"not": "a list"}, "version": 1},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     app.router.add_get("/agents/A/state/transcript/t1", get_key)
@@ -964,7 +1015,8 @@ def test_state_store_load_rejects_malformed_log_entry() -> None:
 
     async def get_key(_request: web.Request) -> web.Response:
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": [42], "version": 1}
+            {"namespace": "transcript", "key": "t1", "value": [42], "version": 1},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     app.router.add_get("/agents/A/state/transcript/t1", get_key)
@@ -1005,6 +1057,20 @@ class _RecordingStore:
 
     async def append(self, record: TurnRecord) -> None:
         self.turns.append(record)
+
+
+class _BoundedRecordingStore(_RecordingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.append_attempts = 0
+
+    async def append(self, record: TurnRecord) -> None:
+        bounded = bound_turn_record(
+            record,
+            max_value_bytes=_STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES,
+        )
+        self.append_attempts += 1
+        await super().append(bounded)
 
 
 def _run_recording_turn(runner, event):

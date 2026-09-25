@@ -16,7 +16,6 @@ from typing import Any
 import pytest
 from curie_runner.history import (
     HISTORY_APPEND_RESERVE_BYTES,
-    HISTORY_VALUE_MAX_BYTES,
     ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
@@ -29,6 +28,8 @@ from curie_runner.history import (
     build_conversation_replay,
     compact_transcript_value,
 )
+
+_STATE_VALUE_MAX_BYTES = 65_536
 
 
 def _size(value: Any) -> int:
@@ -90,7 +91,7 @@ def _marker(n: int, text_bytes: int = 1_900) -> dict[str, Any]:
 
 def test_reserve_is_the_publication_headroom() -> None:
     assert HISTORY_APPEND_RESERVE_BYTES == 8_192
-    assert HISTORY_VALUE_MAX_BYTES == 65_536
+    assert _STATE_VALUE_MAX_BYTES == 65_536
 
 
 def test_markers_first_verbatim_then_summary_then_the_latest_turn_without_native_state() -> None:
@@ -103,9 +104,13 @@ def test_markers_first_verbatim_then_summary_then_the_latest_turn_without_native
         second_marker,
         _turn("three", 20_000, native=True),
     ]
-    assert _size(value) > HISTORY_VALUE_MAX_BYTES
+    assert _size(value) > _STATE_VALUE_MAX_BYTES
 
-    compacted = compact_transcript_value(value)
+    compacted = compact_transcript_value(
+        value,
+        max_value_bytes=_STATE_VALUE_MAX_BYTES,
+        reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+    )
 
     assert compacted[:2] == [first_marker, second_marker]
     assert [item.get("type") for item in compacted[2:]] == ["summary", "turn"]
@@ -116,7 +121,7 @@ def test_markers_first_verbatim_then_summary_then_the_latest_turn_without_native
     assert kept.user == "three request"
     assert kept.harness_replay is None
     assert compacted[3]["harness_replay"] is None
-    assert _size(compacted) <= HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
+    assert _size(compacted) <= _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
 
 
 def test_prior_summary_content_carries_into_the_new_summary() -> None:
@@ -129,7 +134,11 @@ def test_prior_summary_content_carries_into_the_new_summary() -> None:
     ).to_dict()
     value = [_turn("zero", 10_000), prior, _turn("after", 25_000), _turn("latest", 25_000)]
 
-    compacted = compact_transcript_value(value)
+    compacted = compact_transcript_value(
+        value,
+        max_value_bytes=_STATE_VALUE_MAX_BYTES,
+        reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+    )
 
     summaries = [item for item in compacted if item.get("type") == "summary"]
     assert len(summaries) == 1
@@ -140,17 +149,21 @@ def test_prior_summary_content_carries_into_the_new_summary() -> None:
     assert summary.tail == ()
     assert compacted[-1]["user"] == "latest request"
     assert compacted.index(summaries[0]) < len(compacted) - 1
-    assert _size(compacted) <= HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
+    assert _size(compacted) <= _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
 
 
 def test_near_cap_latest_turn_is_bounded_to_leave_the_reserve() -> None:
     latest = _turn("huge", 63_000)
-    assert _size([latest]) <= HISTORY_VALUE_MAX_BYTES
+    assert _size([latest]) <= _STATE_VALUE_MAX_BYTES
     value = [_turn("small", 500), latest]
 
-    compacted = compact_transcript_value(value)
+    compacted = compact_transcript_value(
+        value,
+        max_value_bytes=_STATE_VALUE_MAX_BYTES,
+        reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+    )
 
-    assert _size(compacted) <= HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
+    assert _size(compacted) <= _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
     kept = compacted[-1]
     assert kept["user"] == "huge request"
     original = "huge:" + "o" * 63_000
@@ -168,12 +181,16 @@ def test_near_cap_latest_turn_is_bounded_to_leave_the_reserve() -> None:
 def test_one_turn_with_nothing_to_summarize_is_only_bounded() -> None:
     value = [_turn("alone", 62_000, native=True)]
 
-    compacted = compact_transcript_value(value)
+    compacted = compact_transcript_value(
+        value,
+        max_value_bytes=_STATE_VALUE_MAX_BYTES,
+        reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+    )
 
     assert len(compacted) == 1
     assert compacted[0]["user"] == "alone request"
     assert compacted[0]["harness_replay"] is None
-    assert _size(compacted) <= HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
+    assert _size(compacted) <= _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
 
 
 def test_turn_still_refuses_when_even_the_final_answer_cannot_fit() -> None:
@@ -257,6 +274,67 @@ def test_structural_compaction_keeps_pending_approval_call_without_orphan_result
     assert replay.messages == bounded.messages
 
 
+def test_bounding_preserves_or_omits_complete_signed_and_image_blocks() -> None:
+    record_answer = "The image was inspected"
+    signed_thinking = {
+        "type": "thinking",
+        "thinking": "reasoning " * 900,
+        "signature": "opaque-signed-thinking",
+    }
+    image = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "a" * 8_000,
+        },
+    }
+    record = TurnRecord(
+        user="Inspect the attached image",
+        assistant=record_answer,
+        messages=(
+            ConversationMessage(role="user", content="Inspect the attached image"),
+            ConversationMessage(
+                role="assistant",
+                content=[
+                    {"type": "tool_use", "id": "read-image", "name": "Read", "input": {}},
+                ],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    {"type": "tool_result", "tool_use_id": "read-image", "content": [image]}
+                ],
+            ),
+            ConversationMessage(
+                role="assistant",
+                content=[signed_thinking, {"type": "text", "text": record_answer}],
+            ),
+        ),
+    )
+    bounded = bound_turn_record(record, max_value_bytes=3_000)
+
+    assert _size([bounded.to_dict()]) <= 3_000
+    assert bounded.user == record.user
+    assert bounded.assistant == record.assistant
+    final_blocks = bounded.messages[-1].content
+    assert isinstance(final_blocks, list)
+    assert final_blocks[-1] == {"type": "text", "text": record_answer}
+    blocks = [
+        block
+        for message in bounded.messages
+        if isinstance(message.content, list)
+        for block in message.content
+    ]
+    for block in blocks:
+        if block.get("type") == "thinking":
+            assert block == signed_thinking
+        if block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+            for nested in block["content"]:
+                if nested.get("type") == "image":
+                    assert nested == image
+
+
 def test_explicit_cap_and_reserve_are_honored() -> None:
     value = [_turn("a", 3_000), _turn("b", 3_000)]
 
@@ -268,10 +346,14 @@ def test_explicit_cap_and_reserve_are_honored() -> None:
 
 def test_markers_alone_over_the_cap_are_irreducible() -> None:
     value = [*(_marker(n, 9_000) for n in range(7)), _turn("last", 1_000)]
-    assert _size(value[:-1]) > HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
+    assert _size(value[:-1]) > _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
 
     with pytest.raises(HistoryCapacityError) as caught:
-        compact_transcript_value(value)
+        compact_transcript_value(
+            value,
+            max_value_bytes=_STATE_VALUE_MAX_BYTES,
+            reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+        )
     assert caught.value.status == 413
 
 
@@ -293,7 +375,11 @@ def test_publication_outcome_stays_visible_in_the_compacted_replay() -> None:
     }
     value = [_turn("older", 20_000), marker, _turn("latest", 20_000)]
 
-    compacted = compact_transcript_value(value)
+    compacted = compact_transcript_value(
+        value,
+        max_value_bytes=_STATE_VALUE_MAX_BYTES,
+        reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+    )
 
     # The raw idempotency marker still exists verbatim.
     assert marker in compacted
@@ -332,7 +418,11 @@ def test_publication_outcome_survives_a_saturated_prior_summary() -> None:
     }
     value = [saturated_prior, marker, _turn("latest", 20_000)]
 
-    compacted = compact_transcript_value(value)
+    compacted = compact_transcript_value(
+        value,
+        max_value_bytes=_STATE_VALUE_MAX_BYTES,
+        reserve_bytes=HISTORY_APPEND_RESERVE_BYTES,
+    )
 
     # The raw idempotency marker still exists verbatim, ahead of the summary --
     # but replay ignores anything before the latest summary, so this alone does

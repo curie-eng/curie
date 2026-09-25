@@ -664,7 +664,7 @@ def test_non_capacity_append_failure_does_not_compact() -> None:
             assert caught.value.status == 500
 
     anyio.run(go)
-    assert [method for method, _status in state.methods()] == ["POST"]
+    assert [method for method, _status in state.methods()] == ["GET", "POST"]
     assert state.value == seed
 
 
@@ -686,7 +686,7 @@ def test_summary_record_append_413_raises_capacity_error_without_a_put() -> None
                 await store.append(summary)
 
     anyio.run(go)
-    assert [method for method, _status in state.methods()] == ["POST"]
+    assert [method for method, _status in state.methods()] == ["GET", "POST"]
     assert state.value == seed
 
 
@@ -727,7 +727,7 @@ def test_boot_compaction_conflict_reloads_and_replays_the_intervening_record(
 # A factory sized turn must persist even when tool call structure exceeds the cap.
 
 
-def _tiny_tool_calls_script(calls: int) -> list[Any]:
+def _tiny_tool_calls_script(calls: int, *, final: str | None = None) -> list[Any]:
     """A factory sized turn whose tool call structure outweighs its tool output."""
 
     script: list[Any] = []
@@ -743,7 +743,7 @@ def _tiny_tool_calls_script(calls: int) -> list[Any]:
                 content=[ToolResultBlock(tool_use_id=f"u{i}", content="ok", is_error=False)]
             )
         )
-    final = _FACTORY_FINAL
+    final = _FACTORY_FINAL if final is None else final
     script.append(AssistantMessage(content=[TextBlock(text=final)], model="fake-model"))
     script.append(_result(final))
     return script
@@ -779,6 +779,37 @@ def test_factory_sized_turn_persists_with_old_tool_calls_compacted() -> None:
     assert '"id": "u0"' not in stored_text
     assert f'"id": "u{_FACTORY_CALLS - 1}"' in stored_text
     assert "tool" in stored_text.lower() and "omitted" in stored_text.lower()
+
+
+def test_factory_sized_turn_preserves_long_final_answer_and_first_user() -> None:
+    first_user = "Complete factory issue 3211 with its original requirements"
+    final_answer = "Review complete. " + ("The requested behavior is verified. " * 100)
+    assert len(final_answer) > 3_000
+    state = _CappedCasState()
+
+    async def go() -> None:
+        async with TestServer(state.app()) as server:
+            store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            assert await store.load() == []
+            runner = _runner(
+                store,
+                FakeModelSession(
+                    lambda: _tiny_tool_calls_script(_FACTORY_CALLS, final=final_answer)
+                ),
+            )
+            final = await _run_turn(runner, first_user, "1")
+            assert final.status is SessionStatus.DONE, final
+            assert final.text == final_answer
+            assert runner.history_durable is True
+
+    anyio.run(go)
+    assert state.value is not None
+    assert _size(state.value) <= _CAP - _RESERVE
+    stored = TurnRecord.from_dict(state.value[-1])
+    assert stored.user == first_user
+    assert stored.messages[0].content == first_user
+    assert stored.assistant == final_answer
+    assert stored.messages[-1].content == [{"type": "text", "text": final_answer}]
 
 
 def test_runner_uses_the_cap_advertised_by_the_state_api() -> None:
