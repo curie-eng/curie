@@ -226,6 +226,7 @@ SELECT a.id AS agent_id,
        a.secrets AS secrets,
        d.id AS deployment_id,
        d.workspace_enabled AS workspace_enabled,
+       d.environment AS deployment_environment,
        a.memory AS memory,
        v.id AS version_id,
        v.version_label AS version_label,
@@ -257,6 +258,7 @@ SELECT a.id AS agent_id,
        a.secrets AS secrets,
        d.id AS deployment_id,
        d.workspace_enabled AS workspace_enabled,
+       d.environment AS deployment_environment,
        a.memory AS memory,
        v.id AS version_id,
        v.version_label AS version_label,
@@ -317,6 +319,10 @@ class ResolvedDeployment(BaseModel):
     # at boot. None falls back to the worker's configured default; unset at both
     # layers sends nothing and leaves the model's own default standing.
     thinking: str | None = None
+    # The active deployment's environment (#3166), forwarded as
+    # CURIE_DEPLOYMENT_ENVIRONMENT so runner traces carry it. Optional so old
+    # worker doubles stay source-compatible.
+    deployment_environment: str | None = None
     # The agent's permission gates (#245): tool names requiring human approval,
     # forwarded as CURIE_APPROVAL_REQUIRED_TOOLS at boot. None means no gates.
     approval_required_tools: list[str] | None = None
@@ -838,6 +844,7 @@ class BindingResolver:
             # all" is what makes an unconfigured install behave as it always has.
             thinking=(resolved.thinking if resolved.thinking is not None else self._config.thinking)
             or None,
+            deployment_environment=resolved.deployment_environment or None,
             fake_model=self._config.fake_model,
             credentials_ref=self._config.credentials,
             base_url=self._config.model_base_url,
