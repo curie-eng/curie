@@ -32,7 +32,7 @@ from curie_telemetry.redact import redact_text
 from sqlalchemy import TIMESTAMP, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import workitem_outcomes, workitems
+from . import factory_progress, workitem_outcomes, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
 from .workitem_outcomes import CiDetail
@@ -412,6 +412,8 @@ async def gate(
     round_ = len(facts.publications)
     if await valkey.exists(ci_key(request.id, round_ + 1)):
         return "fixing"
+    async with sessionmaker() as session:
+        await factory_progress.record_wait_ci(session, request.id)
     due = next_poll.get(request.id)
     if due is not None and now < due:
         return "waiting"

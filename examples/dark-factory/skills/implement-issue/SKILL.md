@@ -15,7 +15,8 @@ pairs loop: `plan` and `plan_review`, then `implement` and `review_diff`, then
 `wait_ci` back to `implement` when the pull request's checks fail. Each loop
 runs at most 3 rounds.
 
-At the start of each phase, call `mcp__curie__report_progress` with `phase`
+At the start of each phase except `wait_ci`, which the platform reports, call
+`mcp__curie__report_progress` with `phase`
 set to that phase's id, `round` for `plan`, `plan_review`, `implement` and
 `review_diff`, and an optional one-line `note` saying what you are about to
 do. The note is public on the issue, so it must contain no secrets and no raw
@@ -233,8 +234,8 @@ reviewer's latest verdict is `VERDICT: APPROVE`. Call
   checks you ran with their results, then the plan and diff review rounds it
   took, then anything you did not verify or deliberately declined.
 
-After calling it, report `wait_ci` (step 9), end your turn and say that the publication request is
-pending. Do not call it twice. Never push with git; the platform publishes
+After calling it, end your turn and say that the publication request is
+pending. Do not report `wait_ci`; the platform reports it (step 9). Do not call it twice. Never push with git; the platform publishes
 from outside the sandbox.
 
 **Stop with a stated reason** in every other case. Your final reply begins
@@ -244,8 +245,9 @@ tried, and what a maintainer must provide or decide. Do not call
 
 ## 9. Wait for CI (phase `wait_ci`)
 
-Call report_progress with phase `wait_ci` right after the publication
-request, then end the turn. When a `wait_ci` round message sends you back to
+You never report this phase. Your turn ends at the publication request, and
+the platform reports `wait_ci` once the pull request opens and it starts
+waiting on the checks. When a `wait_ci` round message sends you back to
 `implement`, report `implement` again before fixing.
 
 This phase follows a publication. The platform opens the pull request after

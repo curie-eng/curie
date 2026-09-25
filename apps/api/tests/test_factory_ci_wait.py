@@ -1263,3 +1263,61 @@ def test_a_request_with_no_publication_is_still_an_orphan_candidate(
     declared = _owner_lost(client, row["id"], epoch)
     assert declared.status_code == 200, declared.text
     assert _terminal(number) == ("cancellation_requested", "owner_lost")
+
+
+# --- #3179: the platform reports wait_ci -----------------------------------------------
+
+
+def _phases(request_id: uuid.UUID) -> list[tuple[str, int | None]]:
+    return [
+        (row["phase"], row["loop_round"])
+        for row in _rows(
+            "SELECT phase, loop_round FROM curie.execution_request_phase_reports "
+            "WHERE execution_request_id = :id ORDER BY id",
+            {"id": request_id},
+        )
+    ]
+
+
+def test_pending_ci_shows_publish_done_and_wait_for_ci_in_progress(admitted: Any) -> None:
+    from test_factory_progress import report
+
+    client, github, sink = admitted
+    number = 9790
+    sink.ci_scripts = {HEAD_A: [ci_failing(run_id=81090)], HEAD_B: [ci_pending()]}
+    published = _published(client, github, sink, number)
+    request_id = published["id"]
+    for phase, round_ in (("implement", 1), ("review_diff", 1), ("publish", None)):
+        assert report(client, request_id, phase, round=round_).status_code == 201
+
+    # The agent's turn ended at publication; the platform records wait_ci.
+    _reconcile()
+    _reconcile()
+    assert _phases(request_id)[-1] == ("wait_ci", None)
+    body = _body(sink, request_id)
+    assert "- [x] Publish PR" in body
+    assert "- [ ] **Wait for CI** (in progress)" in body
+
+    # The CI failure resumes the run: the agent loops back to implement, round 2.
+    assert len(_ci_turns(request_id)) == 1
+    assert report(client, request_id, "implement", round=2).status_code == 201
+    _reconcile()
+    body = _body(sink, request_id)
+    assert "- [ ] **Implement** (in progress, round 2 of 3)" in body
+    assert "- [ ] Wait for CI\n" in body
+    assert _phases(request_id).count(("wait_ci", None)) == 1
+
+    # The fix round publishes; its CI is pending, so wait_ci is recorded again.
+    _attach_fix(
+        published["work_item_id"],
+        request_id,
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the widget",
+        paths=["src/widget.py"],
+    )
+    _reconcile()
+    _reconcile()
+    assert _phases(request_id)[-1] == ("wait_ci", None)
+    assert "- [ ] **Wait for CI** (in progress)" in _body(sink, request_id)
+    assert _terminal(number) == ("running", None)
