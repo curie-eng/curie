@@ -48,7 +48,13 @@ def _publication_context() -> dict[str, object]:
 
 
 def _event_fields() -> dict[str, object]:
-    return {"type": "message", "text": "continue", "user": "U0EXAMPLE1", "ts": "1.0"}
+    return {
+        "kind": "event",
+        "type": "message",
+        "text": "continue",
+        "user": "U0EXAMPLE1",
+        "ts": "1.0",
+    }
 
 
 class _Event_0_5_1(_AciModel):
