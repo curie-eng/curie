@@ -290,6 +290,26 @@ def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Pat
     assert api["githubWebhookSecret"] == "not-the-dev-default"
 
 
+def test_install_values_point_the_status_card_at_the_public_webhook_base(
+    tmp_path: Path,
+) -> None:
+    config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
+    base = "https://quick-tunnel-abc.trycloudflare.com"
+    values = fe.install_values(
+        config,
+        candidate="c" * 40,
+        app_key_secret="factory-app",
+        consumer_controller=True,
+        card_base_url=base,
+    )
+    assert values["api"]["githubFactoryCardBaseUrl"] == base
+    # Before the tunnel exists there is no public base, so the value stays unset.
+    unset = fe.install_values(
+        config, candidate="c" * 40, app_key_secret="factory-app", consumer_controller=True
+    )
+    assert "githubFactoryCardBaseUrl" not in unset["api"]
+
+
 def test_namespace_undo_is_registered_before_the_create_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

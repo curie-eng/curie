@@ -237,7 +237,9 @@ def status_body(
     """The whole status comment. A ``result`` makes it the final body.
 
     Model-written notes are never rendered here, only on the card, so model
-    text cannot become a Markdown link or a mention on GitHub.
+    text cannot become a Markdown link or a mention on GitHub. The card already
+    draws the phases, so with a card the checklist and the waiting placeholder
+    are left out; without one the checklist is the fallback (#3125).
     """
 
     parts: list[str] = []
@@ -245,7 +247,7 @@ def status_body(
         parts.append(result.rstrip("\n"))
     if card_url:
         parts.append(f"![Curie status]({card_url})")
-    if phase_view is not None and phase_view.phases:
+    elif phase_view is not None and phase_view.phases:
         parts.append("\n".join(_checklist(phase_view)))
     elif result is None:
         parts.append(_WAITING_FOR_PROGRESS)

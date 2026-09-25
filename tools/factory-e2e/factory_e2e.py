@@ -747,8 +747,12 @@ def install_values(
     consumer_controller: bool,
     egress_cidrs: Sequence[str] = (),
     sandbox_pod_quota: int | None = None,
+    card_base_url: str = "",
 ) -> dict[str, Any]:
     """Helm values for the disposable install. Written to a 0600 file, never argv.
+
+    ``card_base_url`` is the public base the webhook is registered under; the
+    api serves the status card there, so GitHub can fetch the image.
 
     ``sandbox_pod_quota`` caps the namespace's sandbox pods; 0 makes every
     sandbox claim a quota refusal, so the worker defers the request for
@@ -768,6 +772,8 @@ def install_values(
             "githubRepoAllowlist": [config.repo],
         }
     )
+    if card_base_url:
+        values["api"]["githubFactoryCardBaseUrl"] = card_base_url
     values["agentSandbox"] = {
         "runner": {"tag": tag},
         "controller": {"deploy": not consumer_controller},
@@ -1932,7 +1938,9 @@ class Preflight:
         if self._api_forward is not None:
             _stop(self._api_forward)
             self._api_forward = None
-        port = _free_port()
+        # Reopen on the same port: the quick tunnel forwards to this URL, and an
+        # api roll (the card base URL upgrade) must not strand it.
+        port = int(self.api_url.rsplit(":", 1)[1]) if self.api_url else _free_port()
         process = subprocess.Popen(
             [
                 "kubectl",
@@ -2396,6 +2404,7 @@ class Preflight:
             consumer_controller=self._consumer_controller,
             egress_cidrs=self._egress_cidrs,
             sandbox_pod_quota=quota,
+            card_base_url=self.tunnel_url,
         )
         values_file = self.workdir / "values.json"
         fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2518,7 +2527,17 @@ class Preflight:
                 return
             log("webhook tunnel is down; opening another")
         self.tunnel()
+        self.point_card_at_tunnel()
         self._patch_webhook(self.tunnel_url + "/github/webhook")
+
+    def point_card_at_tunnel(self) -> None:
+        """Serve the status card from the public base the webhook uses (#3125).
+
+        The tunnel URL exists only after install, so the card base is set by an
+        upgrade; without it the status comment falls back to the checklist.
+        """
+
+        self.helm_upgrade(quota=self._sandbox_quota)
 
     def read_observed_model(self, since: float | None = None) -> str | dict[str, str]:
         """CURIE_MODEL from sandbox pods started after ``since``.
@@ -2705,6 +2724,7 @@ class Preflight:
         self.teardown.push("reset fixture repository", self.reset_fixture)
         self.ensure_label()
         self.tunnel()
+        self.point_card_at_tunnel()
         self.repoint_webhook()
         if scenario is not None:
             self.record_baseline()
