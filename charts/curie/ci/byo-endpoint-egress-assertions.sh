@@ -83,6 +83,8 @@
 #      IPv4-mapped ::ffff:169.254.169.254 counts as metadata everywhere; and
 #      ::/0 renders exactly one IPv6 except, fd00:ec2::254/128, while an
 #      IPv4-mapped ::ffff:0:0/96 allowedEgress entry is refused.
+#  33. #3083: agentSandbox.registryEgress opens nothing by default, passes the
+#      shared floor, and renders one policy per declaring agent.
 #  15. An in-chart dispatcher.apiBaseUrl (this release's API Service) is not
 #      external: api.deploy=true does not require api.egress.
 #
@@ -1370,6 +1372,54 @@ for path in pathlib.Path(out).rglob("*.yaml"):
             print(f"ok: {name} excepts {blocks}")
             sys.exit(0)
 sys.exit(f"{name} did not render")
+PYEOF
+
+echo "=== Assertion 33: agentSandbox.registryEgress is closed by default and renders a per-agent registry policy when declared (#3083) ==="
+reg_values() {
+  local name="$1"
+  local agent="$2"
+  local entry="$3"
+  local file="$TMP/reg-${name}.yaml"
+  cat > "$file" <<EOF
+agentSandbox:
+  registryEgress:
+    ${agent}:
+      - ${entry}
+EOF
+  printf '%s\n' "$file"
+}
+REG_DEFAULT_OUT="$(render_dir reg-default)" || fail "default render must succeed"
+if grep -rq -- "allow-registry-egress" "$REG_DEFAULT_OUT"; then
+  fail "no registry egress policy may render unless an agent declares one"
+fi
+echo "ok: default render opens no registry egress"
+must_fail_naming "registryEgress default route" "default or equivalently broad route" \
+  "$(reg_values slash0 bot '{ cidr: 0.0.0.0/0, ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "registryEgress port-less" "agentSandbox.registryEgress.bot entries must set ports" \
+  "$(reg_values noport bot '{ cidr: 104.16.0.0/12 }')"
+must_fail_naming "registryEgress metadata host" "must not cover the cloud metadata endpoint" \
+  "$(reg_values meta bot '{ cidr: 169.254.169.254/32, ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "registryEgress invalid agent name" "agentSandbox.registryEgress.Bad_Name has an invalid agent name" \
+  "$(reg_values badname Bad_Name '{ cidr: 104.16.0.0/12, ports: [{ protocol: TCP, port: 443 }] }')"
+REG_OK_OUT="$(render_dir reg-ok --values "$(reg_values ok factory '{ cidr: 104.16.0.0/12, ports: [{ protocol: TCP, port: 443 }] }')")" \
+  || fail "a valid registryEgress entry on port 443 must render"
+python3 - "$REG_OK_OUT" "${RELEASE}-agent-factory-allow-registry-egress" <<'PYEOF' || fail "valid registryEgress entry must render the per-agent registry policy"
+import pathlib, sys, yaml
+out, name = sys.argv[1], sys.argv[2]
+found = None
+for path in pathlib.Path(out).rglob("*.yaml"):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if doc and doc.get("kind") == "NetworkPolicy" and "allow-registry-egress" in doc["metadata"]["name"]:
+            assert doc["metadata"]["name"] == name, doc["metadata"]["name"]
+            found = doc
+if found is None:
+    sys.exit(f"{name} did not render")
+spec = found["spec"]
+assert spec["policyTypes"] == ["Egress"], spec
+assert spec["podSelector"]["matchLabels"]["curietech.ai/agent"] == "factory", spec["podSelector"]
+assert spec["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "runner-sandbox", spec["podSelector"]
+assert spec["egress"] == [{"to": [{"ipBlock": {"cidr": "104.16.0.0/12"}}], "ports": [{"protocol": "TCP", "port": 443}]}], spec["egress"]
+print(f"ok: {name} selects only agent factory's runners and opens the declared registry CIDR on 443")
 PYEOF
 
 echo
