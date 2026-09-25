@@ -62,6 +62,13 @@
       "channel": "agent@example.test",
       "conversation_id": "thread/9",
       "thread_key": "email:agent%40example.test:thread%2F9"
+    },
+    {
+      "kind": "slack",
+      "adapter": "curie-cluster-message",
+      "channel": "C0EXAMPLE1",
+      "conversation_id": "1700000000.000100",
+      "thread_key": "slack:C0EXAMPLE1:1700000000.000100"
     }
   ]
 }

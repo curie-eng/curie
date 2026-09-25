@@ -20,7 +20,13 @@ from curie_api.threadkeys import (
     route_thread_key,
     route_thread_key_matches,
 )
-from curie_api.workitem_dispatch import admit, cancel, readmit, running_for_conversation
+from curie_api.workitem_dispatch import (
+    admit,
+    cancel,
+    claim_terminate_publishes,
+    readmit,
+    running_for_conversation,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -270,5 +276,190 @@ def test_a_named_slack_key_never_finds_the_default_apps_work_item(
         named = scoped_conversation_id("slack", "C0EXAMPLE1", SLACK_TS, identity="second-bot")
         state, _ = await running_for_conversation(session, named)
         assert state == "absent"
+
+    _with_session(body)
+
+
+def test_a_continuation_does_not_find_a_legacy_work_item_under_a_different_current_adapter(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        await _legacy_mail_work_item(session)
+        # The pair's binding is bound under ADAPTER, not this one: the old
+        # key can only be ITS route's, so a lookup implying another route's
+        # identity must not adopt it.
+        other = scoped_conversation_id("email", ADDRESS, THREAD, identity="other-inbox")
+        state, _ = await running_for_conversation(session, other)
+        assert state == "absent"
+
+    _with_session(body)
+
+
+def test_a_cancelled_legacy_work_item_still_fences_publication_after_its_binding_is_deleted(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id, work_item_id, version = await _legacy_mail_work_item(session)
+        cancelled = await cancel(
+            session, work_item_id=work_item_id, expected_version=version
+        )
+        assert getattr(cancelled, "work_item", None) is not None, cancelled
+        # `thread_key_forms`'s single-binding guard would refuse to adopt the
+        # old key once the binding it names is gone; the refusal lookup must
+        # not depend on that guard, or the fence fails open right when a
+        # cancelled work item's credential most needs refusing.
+        await session.execute(
+            text("DELETE FROM curie.agent_channels WHERE agent_id = :id"), {"id": agent_id}
+        )
+        await session.commit()
+        conflict = await crud.publication_cancellation_conflict(
+            session, agent_id=agent_id, conversation_id=NEW_KEY
+        )
+        assert conflict is not None
+
+    _with_session(body)
+
+
+# --- the terminate wake for a legacy work item keys its execute wake's thread ---
+
+
+def test_a_legacy_mail_work_items_terminate_wake_keys_its_execute_wakes_thread(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id, _work_item_id, _version = await _legacy_mail_work_item(session)
+        readmitted = await readmit(session, _facts(agent_id))
+        assert getattr(readmitted, "code", None) != "identity_mismatch", readmitted
+        assert readmitted.request is not None
+        request_id = readmitted.request.id
+        # The reconciler's execute wake would resolve THIS request's live
+        # binding and key its thread `NEW_KEY` (`_execute_turn`,
+        # `load_execute_wake`); simulate it having run and needing to stop.
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests e SET "
+                "status = 'cancellation_requested', "
+                "started_at = s.ts, "
+                "execution_deadline = s.ts + interval '1800 seconds', "
+                "execution_attempts = 1, "
+                "terminal_cause = 'owner_lost', "
+                "runtime_owner = NULL, "
+                "runtime_heartbeat_expires_at = s.ts + interval '59 seconds', "
+                "version = version + 1 "
+                "FROM (SELECT clock_timestamp() - interval '60 seconds' AS ts) s "
+                "WHERE e.id = :id"
+            ),
+            {"id": request_id},
+        )
+        await session.commit()
+        published = await claim_terminate_publishes(session, retry_seconds=0, limit=10)
+        (item,) = [p for p in published if p.request_id == request_id]
+        assert item.reply_adapter == ADAPTER
+        assert (
+            route_thread_key(
+                item.reply_kind, item.reply_adapter, item.reply_address, item.reply_conversation_id
+            )
+            == NEW_KEY
+        )
+
+    _with_session(body)
+
+
+# --- the other two work-item lookups also try the pre-identity key -------------
+
+
+def test_refuse_fenced_work_item_still_fences_a_cancelled_legacy_work_item(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id, work_item_id, version = await _legacy_mail_work_item(session)
+        cancelled = await cancel(
+            session, work_item_id=work_item_id, expected_version=version
+        )
+        assert getattr(cancelled, "work_item", None) is not None, cancelled
+        with pytest.raises(crud.PublicationLineageConflict) as caught:
+            await crud._refuse_fenced_work_item(
+                session,
+                agent_id=agent_id,
+                conversation_id=NEW_KEY,
+                request_id=None,
+                runtime_epoch=None,
+            )
+        assert caught.value.code == "publication.work_item_cancelled"
+
+    _with_session(body)
+
+
+async def _bare_lineage(session: AsyncSession, agent_id: uuid.UUID) -> uuid.UUID:
+    """A lineage row that exists only to give `publication_lineage_id` a valid FK target."""
+
+    version_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO curie.agent_versions (id, agent_id, version_label, created_by) "
+            "VALUES (:id, :agent_id, 'v1', 'test')"
+        ),
+        {"id": version_id, "agent_id": agent_id},
+    )
+    deployment_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO curie.deployments (id, agent_id, version_id, environment) "
+            "VALUES (:id, :agent_id, :version_id, 'prod')"
+        ),
+        {"id": deployment_id, "agent_id": agent_id, "version_id": version_id},
+    )
+    lineage_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO curie.thread_publication_lineages "
+            "(id, agent_id, deployment_id, conversation_id, repo_full_name, base_sha, branch) "
+            "VALUES (:id, :agent_id, :deployment_id, :conversation_id, :repo, :base_sha, :branch)"
+        ),
+        {
+            "id": lineage_id,
+            "agent_id": agent_id,
+            "deployment_id": deployment_id,
+            "conversation_id": f"placeholder-{lineage_id.hex[:8]}",
+            "repo": "acme-corp/acme-bot",
+            "base_sha": "a" * 40,
+            "branch": f"curie/bind-{lineage_id.hex[:8]}",
+        },
+    )
+    await session.commit()
+    return lineage_id
+
+
+def test_bind_running_work_item_lineage_finds_a_legacy_work_items_running_request(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id, work_item_id, _version = await _legacy_mail_work_item(session)
+        readmitted = await readmit(session, _facts(agent_id))
+        assert getattr(readmitted, "code", None) != "identity_mismatch", readmitted
+        assert readmitted.request is not None
+        request_id = readmitted.request.id
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "status = 'running', started_at = clock_timestamp(), "
+                "execution_deadline = clock_timestamp() + interval '1800 seconds', "
+                "execution_attempts = 1, "
+                "version = version + 1 "
+                "WHERE id = :id"
+            ),
+            {"id": request_id},
+        )
+        await session.commit()
+        lineage_id = await _bare_lineage(session, agent_id)
+        await crud._bind_running_work_item_lineage(
+            session, agent_id=agent_id, conversation_id=NEW_KEY, lineage_id=lineage_id
+        )
+        await session.commit()
+        bound = await session.scalar(
+            text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
+            {"id": work_item_id},
+        )
+        assert bound == lineage_id
 
     _with_session(body)
