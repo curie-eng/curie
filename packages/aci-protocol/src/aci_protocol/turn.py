@@ -85,6 +85,12 @@ SLACK_KIND = "slack"
 #: Slack app (ADR-0168 decision 1).
 DEFAULT_IDENTITY = "default"
 
+#: The worker's built-in reply adapter for a disconnected ``curie cluster
+#: message`` turn. It selects where the reply is delivered, not which binding
+#: answers: the turn is the channel's own Slack turn, so it resolves as the
+#: default identity.
+CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+
 
 def route_identity(kind: str, adapter: str | None) -> str | None:
     """The identity a route's ``adapter`` names (ADR-0168 decision 3).
@@ -93,11 +99,15 @@ def route_identity(kind: str, adapter: str | None) -> str | None:
     across the upgrade, an approval row decision 5 has not backfilled, a write
     from an API pod that has not rolled. It means the default app, so every
     reader compares identities through this function and never on the raw
-    column. Any other kind is returned unchanged, because a NULL there is a
-    binding whose route is not configured yet, not an identity.
+    column. ``CLUSTER_MESSAGE_ADAPTER`` on a Slack route is a delivery
+    selector, not an identity, so it is the default too. Any other kind is
+    returned unchanged, because a NULL there is a binding whose route is not
+    configured yet, not an identity.
     """
 
     if kind == SLACK_KIND:
+        if adapter == CLUSTER_MESSAGE_ADAPTER:
+            return DEFAULT_IDENTITY
         return adapter or DEFAULT_IDENTITY
     return adapter
 
@@ -137,6 +147,10 @@ def matching_routes[R: RouteRow](
     non-Slack ``adapter=other`` selects none.
     """
 
+    if kind == SLACK_KIND and adapter == CLUSTER_MESSAGE_ADAPTER:
+        # A relay turn resolved on (kind, address) alone before the route
+        # triple, so it selects exactly what an omitted adapter selects.
+        adapter = None
     wanted = route_identity(kind, adapter)
     same_route = [r for r in rows if r.kind == kind and r.address == address]
     matches = [
