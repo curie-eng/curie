@@ -124,9 +124,9 @@ class _StubRepo:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking
+        return self._model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -138,7 +138,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
