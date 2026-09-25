@@ -2,17 +2,18 @@
 
 Date: 2026-09-25
 
-Status: Draft
+Status: Accepted
 
 Tracked in [issue #3215](https://github.com/curie-eng/curie/issues/3215), a
 prerequisite for [issue #3200](https://github.com/curie-eng/curie/issues/3200).
 
-Acceptance: Pending explicit maintainer approval of this decision. Authorization
-to prepare the prerequisite does not establish acceptance of this Draft.
+Acceptance: Brian explicitly accepted this decision on 2026-09-25 in the
+implementation conversation.
 
-Realization: The intended code paths are named below. Implementation authority
-remains pending under [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md)
-and [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
+Realization: The intended code paths are named below. Implementation and its
+verification remain tracked by issue #3215 under
+[ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) and
+[ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
 
 ## Context
 
@@ -261,7 +262,7 @@ The current schema and worker validator require a nonempty patch. Semantic
 unchanged proposal rejection and metadata only admission belong to issue #3200;
 a schema rejection is not proof of that later behavior. Issue #3200 must also
 repeat current metadata checks at admission so an edit between the precheck and
-admission cannot be overwritten. This Draft does not claim that behavior exists
+admission cannot be overwritten. This decision does not claim that behavior exists
 on the current base.
 
 ### Intended realizing paths
@@ -296,7 +297,8 @@ are:
 
 The prerequisite introduces the versioned carrier and its security contract.
 Dependent behavior in issue #3200 starts only after the prerequisite has landed
-through its own review. This Draft claims neither implementation nor acceptance.
+through its own review. Acceptance authorizes implementation; this ADR does not
+claim it is complete.
 
 ## Consequences
 
