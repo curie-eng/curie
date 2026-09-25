@@ -324,9 +324,13 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
     reply into a thread that does not exist. Same reason the dispatcher keeps
     minting bare ids: the scoping is the worker's own, and it starts here.
 
-    Each segment is percent-encoded, so the triple maps to exactly one key and
-    no (kind, address, conversation) combination can collide with another by
-    moving a separator. The key is only ever compared, never parsed back.
+    Each segment is percent-encoded, so no combination can collide with
+    another by moving a separator. The route's identity (``route_identity``)
+    is a segment after the kind unless it is none or the default Slack app
+    (ADR-0168 decision 4), so a pre-ADR key is unchanged and a named one has
+    one more segment. The worker only compares the key. The API parses it back
+    once, to find a named non-Slack route's pre-identity history
+    (``apps/api/src/curie_api/threadkeys.py``).
     """
     if qevent.reply_handle is None and qevent.hook_run is not None:
         # A targetless cron turn (#2963) has no channel pair; its thread belongs
@@ -340,6 +344,7 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
         handle.kind,
         handle.channel,
         qevent.conversation_id,
+        identity=route_identity(handle.kind, handle.adapter),
     )
 
 
