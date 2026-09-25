@@ -224,7 +224,11 @@ report, with everything not sent as `Next:` lines.
 - Wait before each read: run `sleep 20` in the shell. The target's first
   message is usually a placeholder that it edits into the answer, so a read
   straight after sending sees only the placeholder.
-- Keep several threads going: while one waits, read or send in another.
+- Keep several threads going, and act on all of them in one step: send every
+  probe that is due in one step, as parallel tool calls, and read every open
+  thread in one step. Each step counts against the runner's step limit
+  (`CURIE_MAX_TURNS`), and a turn that runs out fails with probes already
+  sent. Wait once per step, not once per thread.
 - A probe has timed out only once 180 seconds have passed since it was sent.
   Compare `date +%s` with its `ts`; never count reads instead.
 - A follow-up that got neither a placeholder nor a reply within 180 seconds,
@@ -318,6 +322,14 @@ Read the `Next:` lines of your last report in this thread and run them as the
 next part of the same campaign: the same id, the same channel, the same thread
 rate, and the expectations written there, without a new answer check. When
 none remain, say so.
+
+A turn can end before its report reaches the thread, for example when the
+platform stops it. Your history can then hold work that nobody saw. So work
+from `/tmp/mean-test-plan.md` if it is still there: every probe with a verdict
+in it was run, and every probe without one was not. Report what it holds, then
+run the rest. If the file is gone, say that the last campaign did not finish,
+and offer `rerun <id>`. Quote only what you can read back, and never say a
+report was delivered unless it is your final answer in this thread's history.
 
 ## "rerun"
 
