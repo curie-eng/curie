@@ -73,9 +73,25 @@ def _alive(pid: int) -> bool:
         return False
     # Linux answers `kill -0` for a zombie until something reaps it.
     stat = Path(f"/proc/{pid}/stat")
-    if stat.exists():
-        return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    try:
+        if stat.exists():
+            return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        # The child exited between kill and the procfs read.
+        return False
     return True
+
+
+def test_proc_stat_disappearing_after_kill_probe_means_process_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def disappeared(_path: Path) -> bool:
+        raise ProcessLookupError(3, "process exited")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "kill", lambda _pid, _signal: None)
+        patch.setattr(Path, "exists", disappeared)
+        assert not _alive(12345)
 
 
 def _gone_within(pid: int, seconds: float) -> bool:

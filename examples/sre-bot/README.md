@@ -15,17 +15,42 @@ surface by canonical `kubernetes/<tool>` name:
 - unmatched tools are refused by `curie/mcp-tool-policy@1` and never become an
   approval request.
 
-Approval is not authorization. The connector ServiceAccount in
+Approval is not authorization. Under the default grant, the connector
+ServiceAccount in
 [`manifests/kubernetes-access.yaml`](manifests/kubernetes-access.yaml) can read
 enumerated non-secret operational resources cluster-wide, but can write only
 workload APIs in the disposable `sre-demo` namespace. It cannot read Secrets or
 mutate namespaces, nodes, identities, RBAC, CRDs, admission webhooks, or any
-cluster-scoped resource. The general connector has no platform-upgrader grant.
+cluster-scoped resource, and the general connector has no platform-upgrader
+grant.
 
-`resources_create_or_update` accepts a raw manifest, so the Role is the real
-blast-radius ceiling: within `sre-demo`, an approved call can replace workload
-images, commands, and environment. Approval records intent; it does not narrow
-arguments. Review the manifest before widening that Role.
+`resources_create_or_update` accepts a raw manifest, so RBAC is the real
+blast-radius ceiling: under the default grant, within `sre-demo`, an approved
+call can replace workload images, commands, and environment. Approval records
+intent; it does not narrow arguments. Review the manifest before widening that
+Role.
+
+An installation whose SRE bot should act on the workloads it diagnoses can opt
+in to the operator grant, after the default file:
+
+```bash
+kubectl apply -f examples/sre-bot/manifests/kubernetes-operator-access.yaml
+```
+
+It widens the same ServiceAccount's reads and writes to every built-in kind
+in every namespace and at cluster scope, except Secrets, ServiceAccount tokens
+and the pod and service proxies. Reads, the kubelet's node logs included, run
+without approval; every write still waits for one. Behind that approval sit
+exec, a pod that mounts a Secret or runs as any ServiceAccount (the approval of
+a pod create is the one checkpoint in front of every Secret), admission
+webhooks and policies, APIServices, bindings that outlive the approval, Curie's
+own Deployments and SandboxTemplates, and Argo CD objects. A leaked connector
+credential carries the whole grant, including exec into any container on any
+node: its `nodes/proxy` access, which the node tools use only for logs and
+stats, reaches the kubelet's exec and run endpoints. Read the file's header first: it lists
+each path, how a cluster adds its own CRD groups, the checks to run after
+applying, and the subject namespace to change for an install outside `curie`.
+The CLI does not apply it.
 
 ## Install
 
@@ -134,9 +159,10 @@ and traces. To diagnose a failed synthetic request:
 - Kubernetes writes have no general rollback. Scaling can be reversed only when
   the prior replica count was observed; deletes, execs, raw manifest updates,
   and pod runs need workload-specific recovery.
-- An approved call outside `sre-demo` still receives a Kubernetes 403. Fixing
-  that by widening RBAC is an operator security decision, never an approval
-  retry.
+- With the default grant, an approved call outside `sre-demo` still receives a
+  Kubernetes 403. Widening it is the operator grant
+  (`manifests/kubernetes-operator-access.yaml`), an operator security decision,
+  never an approval retry.
 
 ## Platform upgrades remain separate
 
