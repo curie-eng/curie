@@ -160,6 +160,8 @@ serverFiles:
         # window. A series with no sample for longer than the 1h lookback
         # plus the rule's `for` refires once when samples resume;
         # CurieApplicationMetricsAbsent pages long before a gap that long.
+        # CurieTurnAcceptedStale uses the same term the other way round, to
+        # raise a count rather than to page; its own comment gives its costs.
         #
         # An install that sets api.approvalSweepIntervalSeconds to 0 or less
         # records no curie_approval_pending and should drop that term from
@@ -184,14 +186,56 @@ serverFiles:
                 broken metrics pipeline, a dead process, or a worker or api that
                 cannot read Valkey or Postgres, never a quiet system.
           - alert: CurieTurnAcceptedStale
+            # Counted per label set, not per series: a restart leaves the old
+            # instance's series flat in the range, where a per-series count
+            # pages, and starts the new one's at its first turn. So both
+            # windows sum without `instance`, and the alert names no process.
+            # The 90m count adds the new-series term above, reading
+            # last_over_time(X[90m]) for X, so a new instance's first turn
+            # counts for the whole window: a process that took one turn and
+            # exited, including the runner's one-turn sandboxes, still counts
+            # after X drops it. The 7d gate adds no such term: with under
+            # seven days of history every live series looks new over 7d, and
+            # a term there would page every label set with a lifetime count
+            # above zero and no turn in 90 minutes. A label set with no series left in the 90m range,
+            # such as an old instance's after a restart with no turn since,
+            # counts as zero rather than absent. The costs: a label set whose
+            # only turns in seven days are new series' first samples, such as
+            # its first turn ever and then silence, is not armed; and a label
+            # set that stops recording for good pages for up to seven days,
+            # while its turns are still in the 7d range; and after a metrics
+            # gap longer than the 1h lookback every series looks new until 90
+            # minutes after samples resume, so the 90m count reads lifetime
+            # values and a canary that stopped around the gap stays hidden
+            # until then. CurieApplicationMetricsAbsent pages the gap itself.
             expr: |
               (
-                increase(curie_turn_accepted_total[90m]) == 0
-              )
+                sum without (instance) (
+                  (
+                    increase(curie_turn_accepted_total[90m])
+                    unless
+                    (
+                      last_over_time(curie_turn_accepted_total[90m])
+                      unless
+                      last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(curie_turn_accepted_total[90m])
+                    unless
+                    last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                  )
+                )
+                or
+                0 * sum without (instance) (
+                  increase(curie_turn_accepted_total[7d])
+                )
+              ) == 0
               and
-              (
-                increase(curie_turn_accepted_total[7d]) > 0
-              )
+              sum without (instance) (
+                increase(curie_turn_accepted_total[7d])
+              ) > 0
             for: 15m
             labels:
               severity: page

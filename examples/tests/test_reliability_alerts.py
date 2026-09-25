@@ -105,6 +105,12 @@ FIRST_SAMPLE_RULES = {
     ),
 }
 
+# CurieTurnAcceptedStale counts turns per label set over each of these windows.
+TURN_ACCEPTED = "curie_turn_accepted_total"
+TURN_ACCEPTED_WINDOWS = ("90m", "7d")
+# The window whose count reads a new series from zero.
+TURN_ACCEPTED_NEW_SERIES_WINDOW = "90m"
+
 # Each gauge CurieApplicationMetricsAbsent reads, and the service that records it.
 APPLICATION_GAUGES = {
     "curie_queue_depth": "curie-worker",
@@ -194,6 +200,66 @@ def _first_sample_terms(alert: str) -> re.Match[str] | None:
         r"(?P<op2>>=|>)(?P<threshold2>[\d.]+)\)?",
         compact,
     )
+
+
+def _turn_accepted_stale_terms() -> tuple[str, list[dict], list[dict[str, str | None]]]:
+    """Reduce CurieTurnAcceptedStale to a skeleton of its per-label-set counts.
+
+    Each `S unless last_over_time(X[L] offset O)`, S being `X` or
+    `last_over_time(X[R])`, becomes `N[i]`, the i-th new-series term. Then each
+    `sum without (instance) ((increase(X[W]) unless N[i]) or N[j])`, and each plain
+    `sum without (instance) (increase(X[W]))`, becomes `C[W]`. Returns the
+    skeleton, each count's window and new-series terms (none for a plain count),
+    and every new-series term. Read after `_compact`, so a comment cannot count.
+    """
+    compact = _compact(_rule("CurieTurnAcceptedStale")["expr"])
+    # Whitespace is gone, so the name has no boundary to anchor on; a longer
+    # name or a matcher leaves `X` joined to something no pattern below reads.
+    compact = re.sub(re.escape(TURN_ACCEPTED) + r"(?:\{\})?", "X", compact)
+    terms: list[dict[str, str | None]] = []
+
+    def new_series(match: re.Match[str]) -> str:
+        terms.append(
+            {
+                "left": "X" if match["left"] == "X" else "last_over_time",
+                "range": match["range"],
+                "lookback": match["lookback"],
+                "offset": match["offset"],
+            }
+        )
+        return f"N[{len(terms) - 1}]"
+
+    compact = re.sub(
+        r"\((?P<left>X|last_over_time\(X\[(?P<range>\w+)\]\))unless(?P<paren>\()?"
+        r"last_over_time\(X\[(?P<lookback>\w+)\]offset(?P<offset>\w+)\)(?(paren)\))\)",
+        new_series,
+        compact,
+    )
+    counts: list[dict] = []
+
+    def count(match: re.Match[str]) -> str:
+        found = match.groupdict()
+        indices = [found.get(key) for key in ("first", "second")]
+        counts.append(
+            {
+                "window": found["window"],
+                "terms": [terms[int(index)] for index in indices if index is not None],
+            }
+        )
+        return f"C[{match['window']}]"
+
+    compact = re.sub(
+        r"sumwithout\(instance\)\((?P<paren>\()?increase\(X\[(?P<window>\w+)\]\)"
+        r"unlessN\[(?P<first>\d+)\](?(paren)\))orN\[(?P<second>\d+)\]\)",
+        count,
+        compact,
+    )
+    compact = re.sub(r"sumwithout\(instance\)\(increase\(X\[(?P<window>\w+)\]\)\)", count, compact)
+    while True:
+        bare = re.sub(r"\(([CN]\[\w+\])\)", r"\1", compact)
+        if bare == compact:
+            return compact, counts, terms
+        compact = bare
 
 
 def _alert_rules(values: dict) -> list[dict]:
@@ -328,6 +394,101 @@ def test_first_sample_term_looks_back_an_hour(alert: str) -> None:
     assert terms, f"{alert} has no `last_over_time(X[L] offset O)` term to read L from"
     assert _seconds(terms["lookback"]) == 3600, (
         f"{alert}: the new-series term must look back 1h, got {terms['lookback']}"
+    )
+
+
+def test_turn_accepted_stale_counts_each_window_without_instance() -> None:
+    # A restart moves a label set's turns to a new instance, so a count per
+    # series pages on the old instance and cannot see the new one's first turn.
+    skeleton, counts, _ = _turn_accepted_stale_terms()
+    windows = {_seconds(found["window"]) for found in counts}
+    assert windows == {_seconds(window) for window in TURN_ACCEPTED_WINDOWS}, (
+        "CurieTurnAcceptedStale must count each of "
+        f"{', '.join(TURN_ACCEPTED_WINDOWS)} under `sum without (instance)`, got the "
+        f"skeleton {skeleton!r}"
+    )
+    assert "increase(" not in skeleton, f"an increase() outside a per-label-set count: {skeleton!r}"
+
+
+def _turn_accepted_counts(window: str) -> list[dict]:
+    _, counts, _ = _turn_accepted_stale_terms()
+    return [c for c in counts if _seconds(c["window"]) == _seconds(window)]
+
+
+def test_turn_accepted_stale_90m_count_reads_a_new_series_over_its_window() -> None:
+    # A new instance's first turn is its first sample, which increase() cannot
+    # see; a series first sampled within the window counts from zero.
+    window = TURN_ACCEPTED_NEW_SERIES_WINDOW
+    found = _turn_accepted_counts(window)
+    assert found, f"CurieTurnAcceptedStale has no per-label-set count over {window}"
+    for count in found:
+        assert len(count["terms"]) == 2, (
+            f"the {window} count must be `sum without (instance) "
+            "((increase(X[W]) unless N) or N)` with N the new-series term"
+        )
+        offsets = [term["offset"] for term in count["terms"]]
+        assert {_seconds(offset) for offset in offsets} == {_seconds(window)}, (
+            f"the {window} count's new-series terms are offset {offsets}, not {window}"
+        )
+
+
+def test_turn_accepted_stale_90m_new_series_term_reads_the_last_sample_in_the_window() -> None:
+    # A process that takes one turn and exits drops out of the instant vector
+    # 5m after its last export, while its turn is still inside the window; read
+    # through `X`, that turn stops counting and a label set whose recent turns
+    # all came from such processes pages while turns are accepted.
+    window = TURN_ACCEPTED_NEW_SERIES_WINDOW
+    found = _turn_accepted_counts(window)
+    assert found, f"CurieTurnAcceptedStale has no per-label-set count over {window}"
+    for count in found:
+        assert count["terms"], f"the {window} count has no new-series term"
+        for term in count["terms"]:
+            left = term["left"] if term["range"] is None else f"{term['left']}[{term['range']}]"
+            reads_window = term["range"] is not None and _seconds(term["range"]) == _seconds(window)
+            assert term["left"] == "last_over_time" and reads_window, (
+                f"the {window} new-series term must read `last_over_time(X[{window}]) "
+                f"unless last_over_time(X[1h] offset {window})`; its left side is {left}"
+            )
+
+
+def test_turn_accepted_stale_7d_count_has_no_new_series_term() -> None:
+    # With under seven days of history every live series looks new over 7d, so
+    # a new-series term would arm every label set with a lifetime count above
+    # zero, for up to a week.
+    skeleton, _, _ = _turn_accepted_stale_terms()
+    found = _turn_accepted_counts("7d")
+    assert found, (
+        "CurieTurnAcceptedStale must count 7d as `sum without (instance) "
+        f"(increase(X[7d]))`, got the skeleton {skeleton!r}"
+    )
+    for count in found:
+        assert not count["terms"], f"the 7d count reads a new-series term: {skeleton!r}"
+
+
+def test_turn_accepted_stale_new_series_terms_look_back_an_hour() -> None:
+    # As for the other counter rules: a gap under an hour never makes an old
+    # series look new.
+    _, _, terms = _turn_accepted_stale_terms()
+    assert terms, (
+        "CurieTurnAcceptedStale has no `S unless last_over_time(X[L] offset O)` term to read L from"
+    )
+    lookbacks = sorted({term["lookback"] for term in terms})
+    assert {_seconds(lookback) for lookback in lookbacks} == {3600}, (
+        f"every new-series term must look back 1h, got {lookbacks}"
+    )
+
+
+def test_turn_accepted_stale_reads_a_label_set_missing_from_90m_as_zero() -> None:
+    # Once the old instance's last turn leaves the 90m range and the new one has
+    # recorded nothing, the label set has no 90m count at all; without the
+    # fallback `== 0` finds nothing and the stopped canary never pages.
+    skeleton, _, _ = _turn_accepted_stale_terms()
+    assert re.fullmatch(
+        r"\(?\(C\[90m\]or(?:0\*C\[7d\]|C\[7d\]\*0)\)==0\)?and\(?C\[7d\]>0\)?",
+        skeleton,
+    ), (
+        "CurieTurnAcceptedStale must read `(C_90m or 0 * C_7d) == 0 and C_7d > 0`, "
+        f"got the skeleton {skeleton!r}"
     )
 
 
