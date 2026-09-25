@@ -58,6 +58,13 @@ from plugin_format.yaml_loader import safe_load_unique
 
 logger = logging.getLogger(__name__)
 
+# What a hosted connector's entry carries when the worker minted a caller token
+# (ADR-0168 decision 7). A placeholder, like every other `${VAR}` in these
+# entries: the MCP client expands it from the sandbox env, so no value is
+# written anywhere.
+CALLER_HEADER = "X-Curie-Caller"
+_CALLER_PLACEHOLDER = f"${{{BootEnv.env_key('connector_caller_token')}}}"
+
 
 def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
     path = Path(plugin_dir) / CONNECTORS_FILE
@@ -88,6 +95,7 @@ def derive_mcp_servers(
     release: str | None,
     agent: str | None,
     namespace: str | None,
+    caller_header: bool = False,
 ) -> dict[str, Any]:
     """The MCP server entries for this bundle's declared connectors.
 
@@ -131,7 +139,7 @@ def derive_mcp_servers(
         return entries
 
     try:
-        return {
+        entries = {
             name: _without_unreachable_bearer(
                 mcp_entry(release, agent, namespace, name, spec), spec
             )
@@ -160,6 +168,18 @@ def derive_mcp_servers(
             exc,
         )
         return {}
+    # Only a Service Curie created gets the token. The scope-less branch above
+    # returns first, so a fallback URL never sees it, and a remote connector is
+    # somebody else's server.
+    if caller_header:
+        for name, spec in declared.connectors.items():
+            if spec.is_hosted:
+                entry = entries[name]
+                entries[name] = {
+                    **entry,
+                    "headers": {**entry.get("headers", {}), CALLER_HEADER: _CALLER_PLACEHOLDER},
+                }
+    return entries
 
 
 def _without_unreachable_bearer(entry: dict[str, Any], spec: ConnectorSpec) -> dict[str, Any]:

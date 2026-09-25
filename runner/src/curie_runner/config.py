@@ -92,6 +92,9 @@ class RunnerConfig:
     # ClaudeAgentOptions.disallowed_tools. Unset/blank keeps the historical
     # empty list so an unconfigured agent is unchanged. Not a BootEnv field.
     disallowed_tools: tuple[str, ...]
+    # The caller token this sandbox presents to its hosted connectors
+    # (ADR-0168 decision 7), or None when the worker minted none.
+    connector_caller_token: str | None = None
 
     @property
     def ceiling(self) -> int:
@@ -160,4 +163,5 @@ class RunnerConfig:
             history_max_turns=boot.history_max_turns,
             history_max_bytes=boot.history_max_bytes,
             disallowed_tools=disallowed_tools,
+            connector_caller_token=boot.connector_caller_token,
         )
