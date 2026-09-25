@@ -26,7 +26,7 @@ from .. import crud, sandbox_token, transcripts
 from ..auth import verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import AgentChannel, ThreadTranscript, WorkflowStateEntry
+from ..models import ThreadTranscript, WorkflowStateEntry
 from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespaceOut
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
@@ -112,16 +112,16 @@ async def _binding_scope(
     rejected alternative for #1525 was widening it to carry one, but a
     same-agent partition key has no privilege for that credential to carry in
     the first place).
+
+    No caller here NAMES an adapter -- the state API has no such parameter --
+    so this always resolves `adapter=None` through `crud.binding_for_route`
+    (ADR-0168 decision 3): the default Slack identity, or the single row a
+    non-Slack pair holds under migration 0023's pair constraint, exactly what
+    every caller before the ADR meant by naming only kind and address.
     """
 
-    exists = await session.scalar(
-        select(AgentChannel.id).where(
-            AgentChannel.agent_id == agent_id,
-            AgentChannel.kind == kind,
-            AgentChannel.address == address,
-        )
-    )
-    if exists is None:
+    binding = await crud.binding_for_route(session, kind, None, address)
+    if binding is None or binding.agent_id != agent_id:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"this agent has no {kind}:{address} binding"
         )

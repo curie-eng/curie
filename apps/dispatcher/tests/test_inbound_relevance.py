@@ -866,7 +866,8 @@ MATRIX: tuple[Row, ...] = (
             "legitimately arrive in production; refusing it asserts the delivered "
             "envelope matches the declared subscription surface. It also cannot move to "
             "the routing seam even in principle: QueuedTurn carries no lane and no "
-            "subtype, and BindingResolver.resolve sees only (kind, channel). A burst on "
+            "subtype, and BindingResolver.resolve sees only (kind, adapter, address). "
+            "A burst on "
             "this reason means the installed app is subscribed to something the manifest "
             "does not declare -- not 'a chatty channel'."
         ),

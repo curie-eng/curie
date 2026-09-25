@@ -310,6 +310,68 @@ describe("agent-detail client calls", () => {
     expect(fetchMock.mock.calls[1][1].method).toBe("DELETE");
   });
 
+  // ADR-0168 decision 3: the read side returns a binding's identity as
+  // `adapter`, and the selector for a move or a removal carries it straight
+  // through -- "default" is a real, sendable value (equivalent to
+  // omitting it), not a sentinel the client has to strip.
+  it("sends the selector's identity in the PATCH query when it is not null", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        id: "a1",
+        name: "deal-desk",
+        channels: [{ kind: "slack", address: "C0EXAMPLE2", adapter: "default" }],
+        model: null,
+        created_at: "now",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await patchAgentChannel(
+      "a1",
+      { kind: "slack", address: "C0EXAMPLE1", adapter: "default" },
+      { kind: "slack", address: "C0EXAMPLE2" },
+    );
+    const [requestUrl] = fetchMock.mock.calls[0];
+    expect(requestUrl).toBe(
+      "/api/agents/a1/channels?kind=slack&address=C0EXAMPLE1&adapter=default",
+    );
+  });
+
+  // A selector with no stored identity (the ordinary case today, and every
+  // pair read from an API that predates ADR-0168 decision 3) must still omit
+  // `adapter` entirely -- an older API has no such query parameter to parse.
+  it("omits adapter from the PATCH/DELETE query when the selector's identity is null", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        id: "a1",
+        name: "deal-desk",
+        channels: [{ kind: "slack", address: "C0EXAMPLE2" }],
+        model: null,
+        created_at: "now",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await patchAgentChannel(
+      "a1",
+      { kind: "slack", address: "C0EXAMPLE1", adapter: null },
+      { kind: "slack", address: "C0EXAMPLE2" },
+    );
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/agents/a1/channels?kind=slack&address=C0EXAMPLE1");
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
+    await removeAgentSurface("a1", { kind: "slack", address: "C0EXAMPLE1", adapter: null });
+    const deleteFetch = vi.mocked(fetch);
+    expect(deleteFetch.mock.calls[0][0]).toBe("/api/agents/a1/channels?kind=slack&address=C0EXAMPLE1");
+  });
+
+  it("sends the selector's identity in the DELETE query when it is not null", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await removeAgentSurface("a1", { kind: "slack", address: "C0EXAMPLE1", adapter: "finance" });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/agents/a1/channels?kind=slack&address=C0EXAMPLE1&adapter=finance",
+    );
+  });
+
   it("activates a version by POSTing a deployment", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(201, {

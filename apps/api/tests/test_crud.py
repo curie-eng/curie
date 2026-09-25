@@ -31,7 +31,7 @@ def test_full_round_trip(
     # create agent
     resp = client.post(
         "/agents",
-        json={"name": "triage-bot", "channel": {"kind": "slack", "address": "C0TRIAGE01"}},
+        json={"name": "triage-bot", "channel": {"kind": "slack", "address": "C0EXAMPLE1"}},
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text
@@ -75,7 +75,9 @@ def test_full_round_trip(
 
     got_agent = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert got_agent.status_code == 200
-    assert got_agent.json()["channels"] == [{"kind": "slack", "address": "C0TRIAGE01"}]
+    assert got_agent.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"}
+    ]
 
     listed_versions = client.get(
         f"/agents/{agent_id}/versions", headers=auth_headers
@@ -294,23 +296,27 @@ def test_update_channel_binding_moves_the_channel(
     # driven here through HTTP because that is where the round trip is real.
     agent = client.post(
         "/agents",
-        json={"name": "mover", "channel": {"kind": "slack", "address": "C000000OLD"}},
+        json={"name": "mover", "channel": {"kind": "slack", "address": "C0EXAMPLE1"}},
         headers=auth_headers,
     ).json()
     agent_id = agent["id"]
 
     resp = client.patch(
         f"/agents/{agent_id}/channels",
-        params={"kind": "slack", "address": "C000000OLD"},
-        json={"kind": "slack", "address": "C000000NEW"},
+        params={"kind": "slack", "address": "C0EXAMPLE1"},
+        json={"kind": "slack", "address": "C0EXAMPLE2"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["channels"] == [{"kind": "slack", "address": "C000000NEW"}]
+    assert resp.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default"}
+    ]
 
     # The change is persisted, not just echoed back.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
-    assert got["channels"] == [{"kind": "slack", "address": "C000000NEW"}]
+    assert got["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default"}
+    ]
 
 
 def test_add_channel_binding_appends_and_leaves_the_first_alone(
@@ -322,7 +328,7 @@ def test_add_channel_binding_appends_and_leaves_the_first_alone(
     # #38's shadow state reached through the very verb meant to prevent it.
     agent = client.post(
         "/agents",
-        json={"name": "adder", "channel": {"kind": "slack", "address": "C0000ADD01"}},
+        json={"name": "adder", "channel": {"kind": "slack", "address": "C0EXAMPLE0"}},
         headers=auth_headers,
     ).json()
 
@@ -335,8 +341,8 @@ def test_add_channel_binding_appends_and_leaves_the_first_alone(
 
     got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
     assert got["channels"] == [
-        {"kind": "slack", "address": "C0000ADD01"},
-        {"kind": "slack", "address": "C0EXAMPLE1"},
+        {"kind": "slack", "address": "C0EXAMPLE0", "adapter": "default"},
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"},
     ]
 
 
@@ -349,13 +355,13 @@ def test_delete_channel_binding_removes_only_the_named_row(
     # against every future agent.
     agent = client.post(
         "/agents",
-        json={"name": "remover", "channel": {"kind": "slack", "address": "C0000DEL01"}},
+        json={"name": "remover", "channel": {"kind": "slack", "address": "C0EXAMPLE3"}},
         headers=auth_headers,
     ).json()
     assert (
         client.post(
             f"/agents/{agent['id']}/channels",
-            json={"kind": "slack", "address": "C0000DEL02"},
+            json={"kind": "slack", "address": "C0EXAMPLE4"},
             headers=auth_headers,
         ).status_code
         == 201
@@ -364,13 +370,15 @@ def test_delete_channel_binding_removes_only_the_named_row(
     removed = client.request(
         "DELETE",
         f"/agents/{agent['id']}/channels",
-        params={"kind": "slack", "address": "C0000DEL02"},
+        params={"kind": "slack", "address": "C0EXAMPLE4"},
         headers=auth_headers,
     )
     assert removed.status_code == 204, removed.text
 
     got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
-    assert got["channels"] == [{"kind": "slack", "address": "C0000DEL01"}]
+    assert got["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE3", "adapter": "default"}
+    ]
     assert (
         _count(
             "SELECT count(*) FROM curie.agent_channels WHERE agent_id = :aid",
@@ -381,7 +389,7 @@ def test_delete_channel_binding_removes_only_the_named_row(
 
     reused = client.post(
         "/agents",
-        json={"name": "reuses", "channel": {"kind": "slack", "address": "C0000DEL02"}},
+        json={"name": "reuses", "channel": {"kind": "slack", "address": "C0EXAMPLE4"}},
         headers=auth_headers,
     )
     assert reused.status_code == 201, reused.text
@@ -392,14 +400,16 @@ def test_patch_agent_omitted_field_is_noop(
 ) -> None:
     agent = client.post(
         "/agents",
-        json={"name": "stable", "channel": {"kind": "slack", "address": "C0000KEEP1"}},
+        json={"name": "stable", "channel": {"kind": "slack", "address": "C0EXAMPLE5"}},
         headers=auth_headers,
     ).json()
     resp = client.patch(
         f"/agents/{agent['id']}", json={}, headers=auth_headers
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["channels"] == [{"kind": "slack", "address": "C0000KEEP1"}]
+    assert resp.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE5", "adapter": "default"}
+    ]
 
 
 def test_create_agent_rejects_non_id_channel(
@@ -429,14 +439,14 @@ def test_binding_writes_reject_a_non_id_channel(
     # PATCH validated would persist a dead binding through the other door.
     agent = client.post(
         "/agents",
-        json={"name": "patch-bad", "channel": {"kind": "slack", "address": "C000GOOD01"}},
+        json={"name": "patch-bad", "channel": {"kind": "slack", "address": "C0EXAMPLE6"}},
         headers=auth_headers,
     ).json()
     agent_id = agent["id"]
 
     moved = client.patch(
         f"/agents/{agent_id}/channels",
-        params={"kind": "slack", "address": "C000GOOD01"},
+        params={"kind": "slack", "address": "C0EXAMPLE6"},
         json={"kind": "slack", "address": "general"},
         headers=auth_headers,
     )
@@ -453,7 +463,9 @@ def test_binding_writes_reject_a_non_id_channel(
 
     # The rejected writes left the original channel intact, and added nothing.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
-    assert got["channels"] == [{"kind": "slack", "address": "C000GOOD01"}]
+    assert got["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE6", "adapter": "default"}
+    ]
 
 
 def test_patch_missing_agent_returns_404(

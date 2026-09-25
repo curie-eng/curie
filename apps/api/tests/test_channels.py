@@ -1551,7 +1551,13 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
             channel=_channel(kind, address),
         )
         assert created.status_code == 201, created.text
-        assert created.json()["channels"] == [{"kind": kind, "address": address}]
+        # A route-less Slack row reads as the default identity (ADR-0168
+        # decision 3); every other kind's adapter stays None -- it names no
+        # identity, only an unset egress credential.
+        read_adapter = "default" if kind == "slack" else None
+        assert created.json()["channels"] == [
+            {"kind": kind, "address": address, "adapter": read_adapter}
+        ]
 
         row = _binding_row(created.json()["id"])
         assert row["endpoint"] is None and row["adapter"] is None
@@ -1644,7 +1650,9 @@ def test_the_builtin_cluster_message_adapter_is_reserved_on_every_binding_write(
     The literal is a syntactically valid lowercase slug, so the ordinary slug
     validator alone would let a binding shadow the built-in and divert a
     connected Slack turn.  Reject it on create and patch while proving that an
-    ordinary adapter and the public read shape remain valid.
+    ordinary adapter and the public read shape remain valid -- adapter now
+    included, per ADR-0168 decision 3, since it is part of the route's
+    identity rather than a hidden credential.
     """
 
     refused_create = _create_agent(
@@ -1683,22 +1691,25 @@ def test_the_builtin_cluster_message_adapter_is_reserved_on_every_binding_write(
     fetched = channels_client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["channels"] == [
-        {"kind": "email", "address": "ordinary@example.test"}
+        {"kind": "email", "address": "ordinary@example.test", "adapter": EMAIL_ADAPTER}
     ]
     row = _binding_row(agent_id)
     assert row["adapter"] == EMAIL_ADAPTER
 
 
-def test_a_valid_route_is_stored_and_never_leaks_into_the_response(
+def test_a_valid_route_stores_the_endpoint_and_reads_back_only_the_identity(
     channels_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     """T-C13's positive half, and the constraint that moved EB-A18 here.
 
-    `ChannelBinding` doubles as `AgentOut.channel` in RESPONSES, and the public
-    read contract is exactly `{kind, address}`. The write-side rule lives on a
-    Stream-C-owned write schema precisely so it cannot pollute that shape: a
-    route configured through the write path must be durable in the row and
-    ABSENT from the read.
+    `ChannelBindingOut` is `AgentOut.channel`'s element type in RESPONSES, and
+    the public read contract is `{kind, address, adapter}` (ADR-0168 decision
+    3): `adapter` is part of the route's identity, not only a credential, so it
+    reads back. `endpoint` -- the credentialed URL a route replies through --
+    stays write-only: the write-side rule lives on a Stream-C-owned write
+    schema precisely so it cannot pollute the read shape, and a route
+    configured through the write path must be durable in the row and ABSENT
+    from the read.
     """
 
     agent_id = _bind(
@@ -1710,7 +1721,9 @@ def test_a_valid_route_is_stored_and_never_leaks_into_the_response(
 
     fetched = channels_client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
-    assert fetched.json()["channels"] == [{"kind": "email", "address": "routed@example.test"}]
+    assert fetched.json()["channels"] == [
+        {"kind": "email", "address": "routed@example.test", "adapter": EMAIL_ADAPTER}
+    ]
 
     row = _binding_row(agent_id)
     assert row["endpoint"] == EMAIL_ENDPOINT

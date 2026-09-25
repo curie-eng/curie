@@ -367,7 +367,9 @@ async def ingest_hook(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "hook reply surface requires both kind and address",
         )
-    if kind is None:
+    # Both or neither, checked just above; naming both here lets the type
+    # checker see that the `else` branch holds a full pair.
+    if kind is None or address is None:
         if len(agent.channels) != 1:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -376,20 +378,19 @@ async def ingest_hook(
             )
         binding = agent.channels[0]
     else:
-        selected = next(
-            (
-                candidate
-                for candidate in agent.channels
-                if candidate.kind == kind and candidate.address == address
-            ),
-            None,
-        )
-        if selected is None:
+        # The hook route names no adapter -- there is no such query parameter
+        # -- so `adapter=None` is the whole request: the default Slack
+        # identity, or (today) the single row a non-Slack pair holds.
+        # `crud.matching_bindings` is the one matching rule every reader of a
+        # route shares; `agent.channels` is already
+        # loaded, so this calls it directly rather than issuing a fresh query.
+        matches = crud.matching_bindings(agent.channels, kind, address, None)
+        if not matches:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
                 "this agent has no binding for the selected kind and address",
             )
-        binding = selected
+        binding = matches[0]
 
     thread_id = hook_conversation_id(agent.id, hook, partition)
     if mapping.selects_workspace and mapping.repository is not None:

@@ -177,10 +177,36 @@ pub struct ConnectorManifests {
 /// address-shape rule (#1914): an upgraded install can hold an address the write
 /// path would now refuse, and the CLI has to be able to PRINT that value rather
 /// than fail to parse the agent it belongs to.
+///
+/// `adapter` is the identity this binding speaks through (ADR-0168 decision 3):
+/// a Slack binding stored with none reads back `"default"`, a non-Slack binding
+/// reads its adapter slug or `null` when no route is configured. `#[serde(default)]`
+/// keeps a platform that predates the field parsing to `None`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub kind: String,
     pub address: String,
+    #[serde(default)]
+    pub adapter: Option<String>,
+}
+
+/// The identity every Slack binding had before ADR-0168: the installation's one
+/// Slack app (ADR-0168 decision 1), and what an omitted Slack adapter means.
+pub const DEFAULT_SLACK_IDENTITY: &str = "default";
+
+impl ChannelBinding {
+    /// `adapter`, unless it is the default Slack identity.
+    ///
+    /// That one value is what an omitted Slack adapter already means
+    /// (`aci_protocol.turn.route_identity`), so display stays silent about it
+    /// and a request leaves it out: an API that predates ADR-0168 decision 3
+    /// refuses an `adapter` it has no field for. Only Slack has a default
+    /// identity, so a non-Slack slug that happens to read "default" is kept.
+    pub fn named_adapter(&self) -> Option<&str> {
+        self.adapter
+            .as_deref()
+            .filter(|adapter| !(self.kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1459,9 +1485,17 @@ fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
     body
 }
 
-/// The `POST /agents/{id}/channels` body: the binding PAIR and nothing else.
-/// Pure so the shape is testable without a live API. The kind is never
-/// inferred -- a channel-neutral binding carries it explicitly.
+/// The `POST /agents/{id}/channels` body: the binding PAIR, plus the identity
+/// it speaks through. Pure so the shape is testable without a live API. The
+/// kind is never inferred -- a channel-neutral binding carries it explicitly.
+///
+/// `adapter` alone (no `endpoint`) names a Slack identity (ADR-0168 decision
+/// 3): Slack is an in-process ingress, so it has no transport to configure.
+/// `endpoint` and `adapter` together are the pre-ADR custom-transport form,
+/// still both-or-neither for a non-Slack ingress -- `ChannelChange::resolve`
+/// refuses a non-Slack `adapter` with no `endpoint` before this function ever
+/// sees the arguments, and clap's `--endpoint` `requires` `--adapter` covers
+/// the other direction.
 fn add_channel_body(
     kind: &str,
     address: &str,
@@ -1469,10 +1503,30 @@ fn add_channel_body(
     adapter: Option<&str>,
 ) -> serde_json::Value {
     let mut body = json!({"kind": kind, "address": address});
-    if let (Some(endpoint), Some(adapter)) = (endpoint, adapter) {
+    if let Some(endpoint) = endpoint {
         body["endpoint"] = json!(endpoint);
+    }
+    if let Some(adapter) = adapter {
         body["adapter"] = json!(adapter);
     }
+    body
+}
+
+/// The `POST /channels/token` body. Pure so the shape is testable without a
+/// live API. `adapter` travels only when the caller knows it (ADR-0168
+/// decision 3); an absent key resolves the same way the platform did before
+/// the identity existed.
+fn mint_channel_token_body(
+    kind: &str,
+    address: &str,
+    adapter: Option<&str>,
+    ttl_s: i64,
+) -> serde_json::Value {
+    let mut body = json!({"kind": kind, "address": address});
+    if let Some(adapter) = adapter {
+        body["adapter"] = json!(adapter);
+    }
+    body["ttl_s"] = json!(ttl_s);
     body
 }
 
@@ -1977,6 +2031,10 @@ impl ApiClient {
     /// (204, no body). The PAIR travels, never the address alone: on a
     /// multi-binding agent an address-only removal would drop the wrong row.
     ///
+    /// `adapter`, when given, selects which identity's binding to drop
+    /// (ADR-0168 decision 3); omitted keeps today's selection, the default
+    /// Slack identity or the pair's single non-Slack row.
+    ///
     /// The API refuses to remove an agent's LAST binding with a 409, which
     /// [`Self::expect_ok`] surfaces with the reason intact.
     pub async fn remove_agent_channel(
@@ -1984,11 +2042,16 @@ impl ApiClient {
         agent_id: &str,
         kind: &str,
         address: &str,
+        adapter: Option<&str>,
     ) -> Result<()> {
+        let mut query = vec![("kind", kind), ("address", address)];
+        if let Some(adapter) = adapter {
+            query.push(("adapter", adapter));
+        }
         let resp = self
             .http
             .delete(format!("{}/agents/{agent_id}/channels", self.base_url))
-            .query(&[("kind", kind), ("address", address)])
+            .query(&query)
             .header("X-API-Key", &self.api_key)
             .send()
             .await
@@ -1999,6 +2062,10 @@ impl ApiClient {
 
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).
     ///
+    /// `adapter`, when known, is the identity the resolved binding speaks
+    /// through (ADR-0168 decision 3); omitted resolves as the platform did
+    /// before the identity existed.
+    ///
     /// Returns the token string. Callers must not print it; decode `exp` from
     /// the `chn.` payload instead. An empty token is refused so a success
     /// cannot carry nothing.
@@ -2006,17 +2073,14 @@ impl ApiClient {
         &self,
         kind: &str,
         address: &str,
+        adapter: Option<&str>,
         ttl_s: i64,
     ) -> Result<String> {
         let resp = self
             .http
             .post(format!("{}/channels/token", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&json!({
-                "kind": kind,
-                "address": address,
-                "ttl_s": ttl_s,
-            }))
+            .json(&mint_channel_token_body(kind, address, adapter, ttl_s))
             .send()
             .await
             .context("POST /channels/token")?;
@@ -3269,7 +3333,8 @@ impl ApiClient {
 mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
-        prevalidate_series_span, validate_allowlist_entry, MAX_OBSERVABILITY_METRIC_POINTS,
+        mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
+        MAX_OBSERVABILITY_METRIC_POINTS,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -3501,6 +3566,90 @@ mod tests {
         assert_eq!(
             add_channel_body("email", "ops@example.com", None, None),
             serde_json::json!({"kind": "email", "address": "ops@example.com"})
+        );
+    }
+
+    #[test]
+    fn add_channel_body_carries_a_bare_slack_identity() {
+        // ADR-0168 decision 3: a Slack identity travels alone, with no
+        // endpoint -- Slack is an in-process ingress, so it has nothing to
+        // configure a transport for.
+        assert_eq!(
+            add_channel_body("slack", "C0EXAMPLE1", None, Some("default")),
+            serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"})
+        );
+    }
+
+    #[test]
+    fn add_channel_body_keeps_the_custom_transport_form() {
+        // The pre-ADR non-Slack form is unchanged: endpoint and adapter still
+        // travel together.
+        assert_eq!(
+            add_channel_body(
+                "discord",
+                "111111111111111111",
+                Some("https://discord-adapter.example.com/replies"),
+                Some("discord-main"),
+            ),
+            serde_json::json!({
+                "kind": "discord",
+                "address": "111111111111111111",
+                "endpoint": "https://discord-adapter.example.com/replies",
+                "adapter": "discord-main",
+            })
+        );
+    }
+
+    #[test]
+    fn channel_binding_without_adapter_deserializes_to_none() {
+        // A platform release that predates ADR-0168 decision 3 never sent the
+        // key at all; `#[serde(default)]` must still parse that row.
+        let binding: ChannelBinding =
+            serde_json::from_str(r#"{"kind":"slack","address":"C0EXAMPLE1"}"#)
+                .expect("an old-shape binding must still deserialize");
+        assert_eq!(binding.adapter, None);
+    }
+
+    #[test]
+    fn mint_token_body_carries_the_adapter_when_known() {
+        assert_eq!(
+            mint_channel_token_body("slack", "C0EXAMPLE1", Some("second"), 3600),
+            serde_json::json!({
+                "kind": "slack",
+                "address": "C0EXAMPLE1",
+                "adapter": "second",
+                "ttl_s": 3600,
+            })
+        );
+    }
+
+    #[test]
+    fn named_adapter_drops_only_the_default_slack_identity() {
+        let binding = |kind: &str, adapter: Option<&str>| ChannelBinding {
+            kind: kind.into(),
+            address: "C0EXAMPLE1".into(),
+            adapter: adapter.map(str::to_string),
+        };
+        assert_eq!(binding("slack", Some("default")).named_adapter(), None);
+        assert_eq!(
+            binding("slack", Some("second")).named_adapter(),
+            Some("second")
+        );
+        assert_eq!(binding("slack", None).named_adapter(), None);
+        // "default" names an identity only on Slack; elsewhere it is a slug.
+        assert_eq!(
+            binding("email", Some("default")).named_adapter(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn mint_token_body_omits_the_adapter_when_unknown() {
+        // Omission resolves the way the platform did before the identity
+        // existed (ADR-0168 decision 3).
+        assert_eq!(
+            mint_channel_token_body("email", "ops@example.com", None, 3600),
+            serde_json::json!({"kind": "email", "address": "ops@example.com", "ttl_s": 3600})
         );
     }
 

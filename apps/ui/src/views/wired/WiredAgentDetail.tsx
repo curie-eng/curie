@@ -9,6 +9,7 @@ import { WiredAgentBehaviorPacks } from "./WiredAgentBehaviorPacks";
 import { useStore } from "../../state/store";
 import { useWired } from "../../state/wired";
 import { useAgentVersions, useVersionFiles } from "../../api/hooks";
+import { channelIdentityKey, channelNamedIdentity } from "../../lib/format";
 import {
   createVersion,
   uploadBundle,
@@ -135,8 +136,10 @@ export function WiredAgentDetail() {
   const [modelError, setModelError] = useState<string | null>(null);
 
   // A stable string dep (not the array reference) so the reseed effect only
-  // fires when a binding's identity actually changes.
-  const channelsDepKey = (agent?.channels ?? []).map((b) => `${b.kind}:${b.address}`).join(",");
+  // fires when a binding's route actually changes -- the full triple
+  // (ADR-0168 decision 3), not only the pair, so a route whose identity
+  // changed while its pair stayed put is not mistaken for the same binding.
+  const channelsDepKey = (agent?.channels ?? []).map((b) => channelIdentityKey(b)).join(",");
 
   useEffect(() => {
     const channels = agent?.channels ?? [];
@@ -226,7 +229,13 @@ export function WiredAgentDetail() {
       // `binding` above) does not reflect the move until the refetch below
       // lands. Prefer the response's own record of the saved binding; fall
       // back to the submitted values if the response shape ever omits it.
-      const saved = updated.channels.find((b) => b.kind === next.kind && b.address === next.address) ?? next;
+      // Matched on the full triple (ADR-0168 decision 3), not only the pair,
+      // against the CURRENT identity (`binding.adapter`): the move above
+      // never touches it, so the saved row still answers under it.
+      const saved =
+        updated.channels.find(
+          (b) => b.kind === next.kind && b.address === next.address && (b.adapter ?? null) === (binding.adapter ?? null),
+        ) ?? next;
       setChannelRows((prev) => ({
         ...prev,
         [rowIndex]: { ...prev[rowIndex], selector: saved, dirty: false },
@@ -414,10 +423,16 @@ export function WiredAgentDetail() {
             const looksOff = effective.kind === "slack" && trimmed !== "" && !SLACK_ADDRESS_RE.test(trimmed);
             const saving = row?.saving ?? false;
             const error = row?.error ?? null;
+            const identity = channelNamedIdentity(effective);
             return (
               <div key={rowIndex} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ fontSize: 11, color: C.muted, fontFamily: C.mono }}>{effective.kind}</span>
+                  {identity ? (
+                    <span data-testid="channel-identity" style={{ fontSize: 11, color: C.muted, fontFamily: C.mono }}>
+                      ({identity})
+                    </span>
+                  ) : null}
                   <input
                     data-testid="channel-input"
                     value={value}

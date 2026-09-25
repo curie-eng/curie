@@ -57,7 +57,7 @@ def _ci_text(round_: int = 2) -> str:
 
 
 class _Binding:
-    async def resolve(self, kind: str, channel: str) -> object:
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,
             agent_name="acme-bot",

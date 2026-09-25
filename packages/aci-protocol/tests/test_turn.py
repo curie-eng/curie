@@ -16,6 +16,7 @@ sites are asserted by T-A17 (dispatcher), T-A18 (resume) and T-C2 (ingress).
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,7 @@ from aci_protocol import (
     parse_queued_turn,
 )
 from aci_protocol.events import _READER_CONTEXT_KEY
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, matching_routes, route_identity
 from pydantic import ValidationError
 
 # The committed cross-language golden the Rust CLI re-serializes byte-identically
@@ -569,3 +571,154 @@ def test_a_targeted_turn_still_round_trips_for_every_source(
     assert restored == turn
     assert restored.reply_handle == turn.reply_handle
     assert restored.source is source
+
+
+def test_a_slack_route_without_an_adapter_is_the_default_identity() -> None:
+    # A handle queued before ADR-0168 decision 3, or an approval row decision 5
+    # has not backfilled yet, still carries NULL. It means the one Slack app.
+    assert route_identity(SLACK_KIND, None) == DEFAULT_IDENTITY == "default"
+
+
+def test_a_named_slack_identity_is_kept() -> None:
+    assert route_identity("slack", "support-bot") == "support-bot"
+
+
+def test_another_kind_keeps_its_adapter_or_its_absence() -> None:
+    assert route_identity("email", "agentmail-sandbox") == "agentmail-sandbox"
+    # A route-less non-Slack binding stays route-less: NULL is not an identity.
+    assert route_identity("email", None) is None
+
+
+@dataclass(frozen=True)
+class _Row:
+    """A minimal stand-in for any row `matching_routes` can read: an ORM
+    object, a SQLAlchemy `Row`, or a plain object -- the function only ever
+    touches these four attributes."""
+
+    kind: str
+    address: str
+    adapter: str | None
+    endpoint: str | None
+
+
+def test_a_slack_turn_with_no_adapter_matches_the_stored_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    other_pair = _Row(kind="slack", address="C0EXAMPLE2", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row, other_pair], "slack", "C0EXAMPLE1", None) == [
+        default_row
+    ]
+
+
+def test_a_slack_turn_with_adapter_default_matches_the_same_null_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row], "slack", "C0EXAMPLE1", "default") == [default_row]
+
+
+def test_a_slack_turn_with_a_named_adapter_does_not_match_the_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+
+    assert matching_routes([default_row], "slack", "C0EXAMPLE1", "second") == []
+
+
+def test_a_slack_turn_with_no_adapter_falls_back_to_the_custom_transport_row() -> None:
+    # The pre-ADR custom-transport form (e.g. the offline hook-approval proof
+    # rig) stores a credential slug in `adapter`, not an identity, so it never
+    # matches `DEFAULT_IDENTITY` directly -- the omitted-adapter selector must
+    # still fall back to the one row on the pair that carries an endpoint.
+    custom_transport = _Row(
+        kind="slack", address="C0EXAMPLE1", adapter="proof-offline", endpoint="http://127.0.0.1:1"
+    )
+
+    assert matching_routes([custom_transport], "slack", "C0EXAMPLE1", None) == [custom_transport]
+
+
+# `curie cluster message` relays a turn with the worker's built-in reply
+# adapter. That adapter picks where the reply is delivered, not which binding
+# answers: the turn is still the channel's own Slack turn.
+_CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+
+
+def test_the_cluster_message_relay_adapter_is_not_an_identity() -> None:
+    assert route_identity(SLACK_KIND, _CLUSTER_MESSAGE_ADAPTER) == DEFAULT_IDENTITY
+
+
+def test_a_cluster_message_relay_turn_matches_the_default_row() -> None:
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    named_row = _Row(kind="slack", address="C0EXAMPLE1", adapter="second", endpoint=None)
+
+    assert matching_routes(
+        [default_row, named_row], "slack", "C0EXAMPLE1", _CLUSTER_MESSAGE_ADAPTER
+    ) == [default_row]
+
+
+def test_a_cluster_message_relay_turn_falls_back_to_the_custom_transport_row() -> None:
+    # Before the route triple a relay turn resolved on (kind, address) alone,
+    # so it reached this row the same as a turn with no adapter does.
+    custom_transport = _Row(
+        kind="slack", address="C0EXAMPLE1", adapter="proof-offline", endpoint="http://127.0.0.1:1"
+    )
+
+    assert matching_routes(
+        [custom_transport], "slack", "C0EXAMPLE1", _CLUSTER_MESSAGE_ADAPTER
+    ) == [custom_transport]
+
+
+def test_the_custom_transport_fallback_does_not_fire_with_a_given_adapter() -> None:
+    # The fallback is reserved for an OMITTED adapter (the old callers of a
+    # custom-transport row never send one). A turn that names an adapter and
+    # misses gets no match, never the endpoint-carrying row instead.
+    custom_transport = _Row(
+        kind="slack", address="C0EXAMPLE1", adapter="proof-offline", endpoint="http://127.0.0.1:1"
+    )
+
+    assert matching_routes([custom_transport], "slack", "C0EXAMPLE1", "second") == []
+
+
+def test_the_custom_transport_fallback_does_not_fire_when_a_default_row_matches() -> None:
+    # The fallback only runs when the identity comparison found NOTHING. A
+    # stored default row always wins that comparison outright, so the
+    # fallback must not also pull in an unrelated endpoint-carrying row on
+    # the same pair (which the unique `(kind, address)` constraint rules out
+    # until the contract migration for ADR-0168 decision 3 (#3100) widens it,
+    # but the function's own logic must not assume that).
+    default_row = _Row(kind="slack", address="C0EXAMPLE1", adapter=None, endpoint=None)
+    custom_transport = _Row(
+        kind="slack", address="C0EXAMPLE1", adapter="proof-offline", endpoint="http://127.0.0.1:1"
+    )
+
+    assert matching_routes([default_row, custom_transport], "slack", "C0EXAMPLE1", None) == [
+        default_row
+    ]
+
+
+def test_a_non_slack_turn_with_an_adapter_matches_only_its_own_row() -> None:
+    named = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="acme", endpoint="http://a/"
+    )
+    other = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="other", endpoint="http://b/"
+    )
+
+    assert matching_routes([named, other], "webhook", "https://example.test/hook", "acme") == [
+        named
+    ]
+    assert matching_routes([named, other], "webhook", "https://example.test/hook", "missing") == []
+
+
+def test_a_non_slack_turn_with_no_adapter_matches_every_row_on_the_pair() -> None:
+    # Migration 0023's pair constraint holds a non-Slack pair to one row, so
+    # this is only reachable with rows written out of band, but the omitted
+    # selector's semantics are still "every row on the pair", not "none".
+    first = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="acme", endpoint="http://a/"
+    )
+    second = _Row(
+        kind="webhook", address="https://example.test/hook", adapter="other", endpoint="http://b/"
+    )
+
+    assert matching_routes([first, second], "webhook", "https://example.test/hook", None) == [
+        first,
+        second,
+    ]

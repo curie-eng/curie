@@ -131,8 +131,12 @@ class TargetRoute(BaseModel):
 
     Deliberately NOT on the wire (EB-B2). ``endpoint`` is the adapter's
     server-controlled ingress URL; ``adapter`` is the operator-chosen slug that
-    selects the per-adapter egress secret (D4.2). Both are None for a Slack turn
-    on the worker's configured transport.
+    selects the per-adapter egress secret (D4.2). For a Slack turn, ``endpoint``
+    is None (its route is the worker's configured transport). ``adapter`` is
+    ADR-0168 decision 3's Slack bot identity, but the installation's one
+    pre-ADR identity carries here as None, not the string ``'default'``, until
+    that decision's contract migration (#3100) flips the stored form. The
+    Slack sink does not read it until decision 5's follow-up.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

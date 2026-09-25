@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from . import workitems
+from . import crud, workitems
 from .config import get_settings
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .workitems import (
@@ -243,14 +243,14 @@ async def _admission_refusal(
     agent = await session.get(Agent, facts.agent_id)
     if agent is None:
         return await _refuse(session, "not_found")
-    binding = await session.scalar(
-        select(AgentChannel).where(
-            AgentChannel.agent_id == facts.agent_id,
-            AgentChannel.kind == facts.kind,
-            AgentChannel.address == facts.address,
-        )
-    )
-    if binding is None:
+    # `facts` (a GitHub event's admission facts) names no adapter -- there is
+    # no such field on it -- so `adapter=None` is the whole request:
+    # `crud.binding_for_route` resolves it to the default Slack identity or
+    # the single row a non-Slack pair holds (ADR-0168 decision 3), which is
+    # what "no adapter to give" has always meant for a work item raised from a
+    # GitHub event.
+    binding = await crud.binding_for_route(session, facts.kind, None, facts.address)
+    if binding is None or binding.agent_id != facts.agent_id:
         return await _refuse(session, "binding_missing")
     if not repository_is_allowed(
         facts.repo_full_name, get_settings().github_repo_allowlist
@@ -1376,13 +1376,19 @@ async def load_execute_wake(
         return None
     binding = None
     if request.reply_kind is not None and request.reply_address is not None:
-        binding = await session.scalar(
-            select(AgentChannel).where(
-                AgentChannel.agent_id == work_item.agent_id,
-                AgentChannel.kind == request.reply_kind,
-                AgentChannel.address == request.reply_address,
-            )
+        # `ExecutionRequest` carries no `reply_adapter` column -- there is
+        # nothing for this caller to give -- so `adapter=None` is the whole
+        # request: the default Slack identity, or the single row a non-Slack
+        # pair holds (`crud.binding_for_route`, ADR-0168 decision 3), same as
+        # `_admission_refusal` above resolves the equivalent lookup from a
+        # GitHub event's facts. The `agent_id` check replaces the original
+        # query's `AgentChannel.agent_id ==` filter: a route belonging to a
+        # DIFFERENT agent reads as no binding, not this agent's wake target.
+        binding = await crud.binding_for_route(
+            session, request.reply_kind, None, request.reply_address
         )
+        if binding is not None and binding.agent_id != work_item.agent_id:
+            binding = None
     return request, work_item, binding
 
 

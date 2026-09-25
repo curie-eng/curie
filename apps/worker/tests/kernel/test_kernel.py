@@ -117,7 +117,7 @@ def _safe_candidate_status(candidate: SandboxHandle) -> dict[str, object]:
 
 
 class _HistoryBinding:
-    async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
         return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
     def boot_env(
@@ -419,7 +419,7 @@ class _BuiltInCodingBinding:
         self.deployment_id = deployment_id
         self.workspace_enabled = workspace_enabled
 
-    async def resolve(self, _kind: str, _channel: str) -> object:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> object:
         return SimpleNamespace(
             agent_id=uuid.UUID("22222222-2222-4222-8222-222222222222"),
             agent_name="test-agent",
@@ -1145,7 +1145,9 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -1325,7 +1327,9 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -1988,7 +1992,9 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
             self.workspace_enabled = True
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -2057,7 +2063,9 @@ def _workspace_binding(
             self.workspace_enabled = True
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(
@@ -3383,7 +3391,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
     from curie_worker.sandbox.k8s import _claim_view
 
     class HistoryBinding:
-        async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+        async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
             return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
         def boot_env(
@@ -4961,7 +4969,7 @@ class _TokenBinding:
         self._token = token
         self._agent_id = agent_id
 
-    async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
         return _FakeResolved(self._agent_id)
 
     def boot_env(

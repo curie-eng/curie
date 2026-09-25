@@ -105,7 +105,7 @@ def _verified(turn: QueuedTurn) -> Any:
 
 
 class ReviewBinding:
-    async def resolve(self, kind: str, channel: str) -> object:
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
         assert (kind, channel) == ("slack", CHANNEL)
         return SimpleNamespace(
             agent_id=AGENT_ID,

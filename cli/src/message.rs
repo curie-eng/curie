@@ -6140,6 +6140,7 @@ mod tests {
                 .map(|c| crate::api::ChannelBinding {
                     kind: "slack".to_string(),
                     address: c.to_string(),
+                    adapter: None,
                 })
                 .collect(),
             repo_full_name: None,
@@ -7478,6 +7479,7 @@ mod tests {
                 channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C1".into(),
+                    adapter: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,
@@ -7497,6 +7499,7 @@ mod tests {
                 channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C2".into(),
+                    adapter: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,

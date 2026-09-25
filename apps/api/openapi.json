@@ -1613,7 +1613,7 @@
       },
       "ApprovalNotificationTarget": {
         "additionalProperties": false,
-        "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch.",
+        "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch. Inheriting `ChannelBindingWrite` also inherits its Slack branch\n(ADR-0168 decision 3): a Slack notification target still needs\nno endpoint or adapter (the identity form), and may still carry the old\nendpoint-plus-adapter custom-transport pair instead -- either is valid\nhere, exactly as on any other Slack binding.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -2542,8 +2542,19 @@
       },
       "ChannelBindingOut": {
         "additionalProperties": false,
-        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe shape stays `{kind, address}`, identical to what `ChannelBinding`\nserialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring\nalready describes that as the read contract.",
+        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe read shape becomes `{kind, address, adapter}` (ADR-0168 decision 3):\n`adapter` is part of the route's identity, not a credential, so it belongs\non the read side; `endpoint` stays write-only, unchanged from before.\n`ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.",
         "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
           "address": {
             "title": "Address",
             "type": "string"
@@ -2604,7 +2615,7 @@
       },
       "ChannelBindingWrite": {
         "additionalProperties": false,
-        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because that one doubles as the\nelement type of `AgentOut.channels` in RESPONSES, and the read contract is\nexactly\n`{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and\n`adapter` are server-controlled facts an operator configures at bind time --\nwhere this kind's replies go back through, and which egress credential\nauthenticates them -- so they are durable on the row and ABSENT from every\nread. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
+        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because `ChannelBindingOut`, not this\none, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase\n2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168\ndecision 3). `endpoint` is a server-controlled fact an operator configures\nat bind time -- where this kind's replies go back through -- so it is\ndurable on the row and ABSENT from every read; `adapter` is now part of the\nroute's identity rather than only a credential, so it is present on both\nsides. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -2661,6 +2672,17 @@
         "additionalProperties": false,
         "description": "Mint request: the binding pair to scope the token to, plus its lifetime.\n\nSubclasses `ChannelBinding` so the SAME `_validate_channel_binding` the\nagents API runs judges the pair here (E11). Two write paths cannot drift\ninto two rules -- that drift is how #143 happened -- and an operator reads\nthe identical message from either endpoint.",
         "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
           "address": {
             "title": "Address",
             "type": "string"
@@ -5152,7 +5174,7 @@
         "type": "object"
       },
       "ReplyHandle": {
-        "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model supports editing an existing reply or carrying no existing\nreply reference. ``placeholder`` is a required, nullable, opaque correlation\nhandle minted by the adapter. The worker never parses it and only ever hands\nit back to the adapter that minted it. For the Slack adapter it happens to be\nthe ts of the preposted placeholder message. For another kind it is whatever\nthat adapter needs to find the same message again. ``None`` means this turn\nhas no existing reply to edit.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` legitimately carries neither, because its route is the\nworker's configured Slack origin. ``adapter`` is optional at the schema so a\nthird-party or pre-upgrade producer is not rejected outright, but every\nfirst-party mint site sets it explicitly.",
+        "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model supports editing an existing reply or carrying no existing\nreply reference. ``placeholder`` is a required, nullable, opaque correlation\nhandle minted by the adapter. The worker never parses it and only ever hands\nit back to the adapter that minted it. For the Slack adapter it happens to be\nthe ts of the preposted placeholder message. For another kind it is whatever\nthat adapter needs to find the same message again. ``None`` means this turn\nhas no existing reply to edit.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` carries no endpoint, because its route is the worker's\nconfigured Slack origin, and names its identity in ``adapter`` (ADR-0168\ndecision 3); a NULL there means ``DEFAULT_IDENTITY`` (see ``route_identity``).\n``adapter`` is optional at the schema so a third-party or pre-upgrade\nproducer is not rejected outright, but every first-party mint site sets it\nexplicitly.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -7826,7 +7848,7 @@
     },
     "/agents/{agent_id}/channels": {
       "delete": {
-        "description": "Unbind the pair, unless it is this agent's last binding.\n\nThe last one is refused: an agent with zero bindings is deployed,\nhealthy-looking and unable to receive a turn -- #38's silent-shadow state,\nand the same reason `AgentCreate.channel` is required rather than optional.\nThe count comes from the locked set, so two concurrent deletes of different\npairs cannot both read \"two left\" and leave the agent at zero.",
+        "description": "Unbind the route, unless it is this agent's last binding.\n\n`adapter` selects the IDENTITY (ADR-0168 decision 3), the same as on the\nmove endpoint above -- see `_binding_for`.\n\nThe last one is refused: an agent with zero bindings is deployed,\nhealthy-looking and unable to receive a turn -- #38's silent-shadow state,\nand the same reason `AgentCreate.channel` is required rather than optional.\nThe count comes from the locked set, so two concurrent deletes of different\npairs cannot both read \"two left\" and leave the agent at zero.",
         "operationId": "remove_agent_channel_agents__agent_id__channels_delete",
         "parameters": [
           {
@@ -7855,6 +7877,22 @@
             "schema": {
               "title": "Address",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adapter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Adapter"
             }
           },
           {
@@ -7895,7 +7933,7 @@
         ]
       },
       "patch": {
-        "description": "Move (or re-assert) the binding the `(kind, address)` pair names.\n\n`expected_generation` is an OPTIONAL compare-and-set, in the shape\n`routers/state.py` uses for its versioned rows, so the two CAS surfaces read\nalike. Optional because an operator moving a binding from the CLI has no\ngeneration to quote; a channel adapter holding a token minted against\ngeneration N does, and it is exactly the caller that must not overwrite a\nrebind it never saw.",
+        "description": "Move (or re-assert) the binding the `(kind, adapter, address)` route names.\n\n`adapter` selects the IDENTITY (ADR-0168 decision 3): omitted, it means\nSlack's default identity, and for any other kind it selects the only row\non `(kind, address)` -- see `_binding_for`.\n\n`expected_generation` is an OPTIONAL compare-and-set, in the shape\n`routers/state.py` uses for its versioned rows, so the two CAS surfaces read\nalike. Optional because an operator moving a binding from the CLI has no\ngeneration to quote; a channel adapter holding a token minted against\ngeneration N does, and it is exactly the caller that must not overwrite a\nrebind it never saw.",
         "operationId": "move_agent_channel_agents__agent_id__channels_patch",
         "parameters": [
           {
@@ -7924,6 +7962,22 @@
             "schema": {
               "title": "Address",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adapter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Adapter"
             }
           },
           {

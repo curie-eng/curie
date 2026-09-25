@@ -87,7 +87,9 @@ class OneAgentTwoBindings:
             adapter=None,
         )
 
-    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
+    async def resolve(
+        self, kind: str, adapter: str | None, address: str
+    ) -> ResolvedDeployment | None:
         self.resolve_calls.append((kind, address))
         if (kind, address) in (("slack", CHANNEL_A), ("slack", CHANNEL_B)):
             return self._deployment()

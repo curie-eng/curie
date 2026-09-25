@@ -2139,8 +2139,9 @@ enum LocalAction {
         /// Reply HTTP endpoint for a non-Slack adapter. Requires --adapter.
         #[arg(long, requires_all = ["add", "adapter"])]
         endpoint: Option<String>,
-        /// Worker credential selector for the reply adapter. Requires --endpoint.
-        #[arg(long, requires_all = ["add", "endpoint"])]
+        /// Identity for a Slack surface (default: default), or the worker
+        /// credential selector for a non-Slack adapter.
+        #[arg(long)]
         adapter: Option<String>,
         /// Remove this surface, as KIND=ADDRESS. The API refuses to remove an
         /// agent's final surface.
@@ -2982,8 +2983,9 @@ enum ClusterAction {
         /// Reply HTTP endpoint for a non-Slack adapter. Requires --adapter.
         #[arg(long, requires_all = ["add", "adapter"])]
         endpoint: Option<String>,
-        /// Worker credential selector for the reply adapter. Requires --endpoint.
-        #[arg(long, requires_all = ["add", "endpoint"])]
+        /// Identity for a Slack surface (default: default), or the worker
+        /// credential selector for a non-Slack adapter.
+        #[arg(long)]
         adapter: Option<String>,
         /// Remove this surface, as KIND=ADDRESS. The API refuses to remove an
         /// agent's final surface.

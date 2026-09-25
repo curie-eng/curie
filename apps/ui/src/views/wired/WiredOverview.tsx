@@ -1,7 +1,7 @@
 import { C } from "../../tokens";
 import { Card, SectionTitle, Button, CliHint, Dot, Notice, cliCommand } from "../../primitives";
 import { hoverBg } from "../../lib/style";
-import { formatLatency } from "../../lib/format";
+import { channelIdentityLabel, formatLatency } from "../../lib/format";
 import { useStore } from "../../state/store";
 import { useWired } from "../../state/wired";
 import { useMetricsSummary, useTraces, useAllDeployments } from "../../api/hooks";
@@ -193,7 +193,7 @@ function LiveOverview({ agents }: { agents: AgentOut[] }) {
               <Dot color={C.success} size={8} />
               <span style={{ flex: 1, fontFamily: C.mono, fontSize: 13 }}>{a.name}</span>
               <span style={{ fontSize: 12, color: C.muted, fontFamily: C.mono }}>
-                {a.channels.map((c) => c.address).join(", ")}
+                {a.channels.map((c) => channelIdentityLabel(c)).join(", ")}
               </span>
             </button>
           ))}

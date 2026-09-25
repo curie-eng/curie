@@ -549,7 +549,7 @@ def register_handlers(
         # this reason means the installed app is subscribed to something the
         # manifest does not declare. It also cannot move to the routing seam even
         # in principle: `QueuedTurn` carries no lane and no subtype, and
-        # `BindingResolver.resolve` sees only (kind, channel).
+        # `BindingResolver.resolve` sees only (kind, adapter, address).
         channel_type = event.get("channel_type")
         if channel_type != "im":
             drop(

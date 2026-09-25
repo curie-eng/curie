@@ -97,7 +97,21 @@ def valkey(runs_stream: str) -> Iterator[redis.Redis]:
 
 
 def _slack(address: str) -> dict[str, str]:
+    """The Slack-kind binding WRITE literal: two keys, so this file keeps
+    exercising an omitted-adapter write (the common case) rather than always
+    sending the explicit `"default"` spelling. See `_slack_out` for the
+    `AgentOut.channels` read shape."""
+
     return {"kind": "slack", "address": address}
+
+
+def _slack_out(address: str) -> dict[str, str]:
+    """The Slack-kind `AgentOut.channels` READ shape. The stored form is
+    unchanged until the contract migration for ADR-0168 decision 3 (#3100): an
+    omitted write is stored as NULL exactly as before the ADR, and the read
+    side is what presents that NULL as the default identity."""
+
+    return {"kind": "slack", "address": address, "adapter": "default"}
 
 
 def _create(client: TestClient, headers: dict[str, str], **fields: Any) -> Any:
@@ -232,12 +246,12 @@ def test_a_second_binding_for_one_agent_is_created_not_409(
     # Added second, sorted first: the ordering is the relationship's, not the
     # insertion order, which is the whole point of asserting it here.
     assert _channels(client, auth_headers, agent_id) == [
-        _slack("C0EXAMPLE1"),
-        _slack("C0EXAMPLE2"),
+        _slack_out("C0EXAMPLE1"),
+        _slack_out("C0EXAMPLE2"),
     ]
     # The 201 body is the agent, so a caller that adds a binding sees the whole
     # set without a second request.
-    assert added.json()["channels"] == [_slack("C0EXAMPLE1"), _slack("C0EXAMPLE2")]
+    assert added.json()["channels"] == [_slack_out("C0EXAMPLE1"), _slack_out("C0EXAMPLE2")]
 
 
 def test_a_pair_bound_to_another_agent_still_conflicts(
@@ -260,7 +274,7 @@ def test_a_pair_bound_to_another_agent_still_conflicts(
     assert "already bound" in detail, detail
 
     # Refused totally: the taker still holds exactly what it held.
-    assert _channels(client, auth_headers, taker_id) == [_slack("C0EXAMPLE2")]
+    assert _channels(client, auth_headers, taker_id) == [_slack_out("C0EXAMPLE2")]
 
 
 def test_adding_a_pair_this_agent_already_holds_is_an_idempotent_noop(
@@ -275,12 +289,12 @@ def test_adding_a_pair_this_agent_already_holds_is_an_idempotent_noop(
 
     assert duplicate.status_code == 201, duplicate.text
     assert duplicate.json()["channels"] == [
-        _slack("C0EXAMPLE1"),
-        _slack("C0EXAMPLE2"),
+        _slack_out("C0EXAMPLE1"),
+        _slack_out("C0EXAMPLE2"),
     ]
     assert _channels(client, auth_headers, agent_id) == [
-        _slack("C0EXAMPLE1"),
-        _slack("C0EXAMPLE2"),
+        _slack_out("C0EXAMPLE1"),
+        _slack_out("C0EXAMPLE2"),
     ]
 
 
@@ -335,8 +349,8 @@ def test_patching_a_binding_moves_that_row_and_bumps_generation(
     # The other binding was untouched by both writes.
     assert _row(agent_id, "slack", "C0EXAMPLE1") == sibling
     assert _channels(client, auth_headers, agent_id) == [
-        _slack("C0EXAMPLE1"),
-        {"kind": "webhook", "address": "moved-here"},
+        _slack_out("C0EXAMPLE1"),
+        {"kind": "webhook", "address": "moved-here", "adapter": None},
     ]
 
 
@@ -345,9 +359,11 @@ def test_patch_omitting_write_only_route_preserves_it(
 ) -> None:
     """A normal move cannot erase a route the read contract intentionally hides.
 
-    `AgentOut.channels` exposes only kind and address, so a console or CLI cannot
-    echo endpoint credentials back. Omission therefore means preserve, while a
-    pair of explicit nulls remains the deliberate route-clear gesture.
+    `AgentOut.channels` exposes `{kind, address, adapter}` (ADR-0168 decision
+    3): `adapter` is part of the route's identity and IS returned, while
+    `endpoint` -- the credentialed URL -- stays write-only, so a console or CLI
+    still cannot echo it back. Omission therefore means preserve, while a pair
+    of explicit nulls remains the deliberate route-clear gesture.
     """
 
     created = _create(
@@ -364,7 +380,7 @@ def test_patch_omitting_write_only_route_preserves_it(
     assert created.status_code == 201, created.text
     agent_id = str(created.json()["id"])
     assert "endpoint" not in created.json()["channels"][0]
-    assert "adapter" not in created.json()["channels"][0]
+    assert created.json()["channels"][0]["adapter"] == "acme-webhook"
 
     moved = _move(
         client,
@@ -440,9 +456,9 @@ def test_patching_a_pair_owned_by_another_agent_is_404_not_a_cross_agent_write(
     assert trespass.status_code == 404, trespass.text
 
     # The victim's binding, and its generation, are exactly as they were.
-    assert _channels(client, auth_headers, owner_id) == [_slack("C0EXAMPLE1")]
+    assert _channels(client, auth_headers, owner_id) == [_slack_out("C0EXAMPLE1")]
     assert _row(owner_id, "slack", "C0EXAMPLE1")["generation"] == 0
-    assert _channels(client, auth_headers, other_id) == [_slack("C0EXAMPLE2")]
+    assert _channels(client, auth_headers, other_id) == [_slack_out("C0EXAMPLE2")]
 
 
 def test_deleting_a_binding_leaves_the_others_and_their_tokens_alone(
@@ -473,7 +489,7 @@ def test_deleting_a_binding_leaves_the_others_and_their_tokens_alone(
 
     removed = _remove(stream_client, auth_headers, agent_id, kind="slack", address="C0EXAMPLE2")
     assert removed.status_code == 204, removed.text
-    assert _channels(stream_client, auth_headers, agent_id) == [_slack("C0EXAMPLE1")]
+    assert _channels(stream_client, auth_headers, agent_id) == [_slack_out("C0EXAMPLE1")]
 
     enqueued = stream_client.post(
         "/channels/turns",
@@ -497,7 +513,7 @@ def test_deleting_the_last_binding_is_refused_with_409(
     refused = _remove(client, auth_headers, agent_id, kind="slack", address="C0EXAMPLE1")
     assert refused.status_code == 409, refused.text
     assert "last" in refused.json()["detail"].lower(), refused.text
-    assert _channels(client, auth_headers, agent_id) == [_slack("C0EXAMPLE1")]
+    assert _channels(client, auth_headers, agent_id) == [_slack_out("C0EXAMPLE1")]
 
     # And it stops being the last one the moment a second exists.
     assert _add(client, auth_headers, agent_id, _slack("C0EXAMPLE2")).status_code == 201
@@ -505,7 +521,7 @@ def test_deleting_the_last_binding_is_refused_with_409(
         _remove(client, auth_headers, agent_id, kind="slack", address="C0EXAMPLE1").status_code
         == 204
     )
-    assert _channels(client, auth_headers, agent_id) == [_slack("C0EXAMPLE2")]
+    assert _channels(client, auth_headers, agent_id) == [_slack_out("C0EXAMPLE2")]
 
 
 def test_deleting_the_agent_removes_every_binding(
@@ -645,7 +661,7 @@ def test_a_stale_expected_generation_patch_is_409_not_an_overwrite(
     assert "stored 1" in detail, detail
 
     # The refused CAS wrote nothing at all -- not the address, not the counter.
-    assert _channels(client, auth_headers, agent_id) == [_slack("C0EXAMPLE2")]
+    assert _channels(client, auth_headers, agent_id) == [_slack_out("C0EXAMPLE2")]
     assert _row(agent_id, "slack", "C0EXAMPLE2")["generation"] == 1
 
 
@@ -675,8 +691,8 @@ def test_two_concurrent_adds_of_the_same_pair_are_both_idempotent_successes(
     assert [first.status_code, second.status_code] == [201, 201], (first.text, second.text)
 
     assert _channels(client, auth_headers, agent_id) == [
-        _slack("C0EXAMPLE1"),
-        _slack("C0EXAMPLE2"),
+        _slack_out("C0EXAMPLE1"),
+        _slack_out("C0EXAMPLE2"),
     ]
 
 

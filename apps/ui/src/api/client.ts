@@ -12,17 +12,21 @@ export interface AppConfig {
 
 // A channel-neutral binding: an agent binds one or more channels (ADR-0118),
 // so the wire carries a list, ordered `(kind, address)` server-side. `kind`
-// selects which address shape applies; `address` is the channel-kind identifier
-// the worker resolves against. Non-Slack reply routing is supplied only on the
-// write shape below.
+// selects which address shape applies; `address` is the channel-kind
+// identifier the worker resolves against; `adapter` names the bot identity the
+// route answers as (ADR-0168 decision 3) -- a Slack binding with no stored
+// identity reads back "default", and a non-Slack binding reads its adapter,
+// or null. Non-Slack reply routing is supplied only on the write shape below.
 export interface ChannelBinding {
   kind: string;
   address: string;
+  adapter?: string | null;
 }
 
 // Reply routing is accepted on writes but deliberately never returned by the
 // API. Keeping the write shape separate prevents a refetch from being mistaken
-// for a source of adapter credentials.
+// for a source of adapter credentials: the identity (`adapter`) comes back on
+// every read; the endpoint never does.
 export interface ChannelBindingWrite extends ChannelBinding {
   endpoint?: string;
   adapter?: string;
@@ -565,15 +569,26 @@ export async function updateAgent(
 // Move one surface binding to a new kind/address (ADR-0118). The pair being
 // moved is named by `selector` (its CURRENT kind/address) and rides in the
 // query string, never the body, so it can never be confused with `next`, the
-// replacement value. Reply route fields are write only and omitted here, which
-// tells the API to preserve them. Returns the updated agent.
+// replacement value. `selector.adapter` selects the IDENTITY the pair is
+// bound under (ADR-0168 decision 3) and is sent only when it is not null --
+// omitting it is what keeps this working against an API that predates the
+// ADR and has no such query parameter, and "default" is a real, sendable
+// value equivalent to omitting it. Reply route fields are write only and
+// omitted here, which tells the API to preserve them. Returns the updated
+// agent.
 export async function patchAgentChannel(
   agentId: string,
   selector: ChannelBinding,
   next: ChannelBinding,
 ): Promise<AgentOut> {
   const resp = await fetch(
-    url(`/agents/${agentId}/channels${query({ kind: selector.kind, address: selector.address })}`),
+    url(
+      `/agents/${agentId}/channels${query({
+        kind: selector.kind,
+        address: selector.address,
+        adapter: selector.adapter ?? undefined,
+      })}`,
+    ),
     {
       method: "PATCH",
       headers: headers({ "Content-Type": "application/json" }),
@@ -595,12 +610,22 @@ export async function addAgentSurface(
   return jsonOrThrow<AgentOut>(resp);
 }
 
+// Unbind one surface. `surface.adapter` selects the IDENTITY the pair is
+// bound under (ADR-0168 decision 3), on the same terms as `patchAgentChannel`
+// above: sent only when not null, so this still works against an API that
+// predates the ADR.
 export async function removeAgentSurface(
   agentId: string,
   surface: ChannelBinding,
 ): Promise<void> {
   const resp = await fetch(
-    url(`/agents/${agentId}/channels${query({ kind: surface.kind, address: surface.address })}`),
+    url(
+      `/agents/${agentId}/channels${query({
+        kind: surface.kind,
+        address: surface.address,
+        adapter: surface.adapter ?? undefined,
+      })}`,
+    ),
     { method: "DELETE", headers: headers() },
   );
   if (resp.ok) return;

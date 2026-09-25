@@ -40,12 +40,18 @@ The binding row also carries the server-controlled reply route: ``endpoint`` (th
 channel API base URL this kind's replies go back through) and ``adapter`` (the
 egress adapter identity whose credential authenticates them). Both are read here
 so the worker gets the route from the same query that resolves the agent, never
-from an ingress request body. ``slack`` legitimately carries neither: its route
-is the worker's configured Slack origin.
+from an ingress request body. ``slack`` never carries an ``endpoint``, because
+its route is the worker's configured Slack origin, but it DOES name its bot
+identity in ``adapter`` (ADR-0168 decision 3) -- a NULL there means the
+installation's one pre-ADR identity, read through ``route_identity``, never "no
+route" the way a non-Slack NULL pair does. Resolution matches on that identity,
+not the raw column (``matching_routes``, ``aci_protocol.turn``), so a route bound
+under one Slack identity does not answer a turn addressed to another.
 
-A pair that is not bound resolves to None -- a polite drop naming both halves,
-never a fallback to the address alone, because that fallback is exactly the
-silent misroute (#38) this predicate closes.
+A pair that is not bound, or bound but not to this turn's identity, resolves
+to None -- a polite drop naming both halves, never a fallback to the address
+alone, because that fallback is exactly the silent misroute (#38) this
+predicate closes.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ from typing import Any
 from urllib.parse import quote
 
 from aci_protocol import BootEnv, Budget
+from aci_protocol.turn import matching_routes
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -230,6 +237,8 @@ SELECT a.id AS agent_id,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
+       c.kind AS kind,
+       c.address AS address,
        c.endpoint AS endpoint,
        c.adapter AS adapter
 FROM {schema}.agents a
@@ -278,6 +287,8 @@ LIMIT 1
 _UNDEPLOYED_BINDING_SQL = """
 SELECT a.id AS agent_id,
        a.name AS agent_name,
+       c.kind AS kind,
+       c.address AS address,
        c.endpoint AS endpoint,
        c.adapter AS adapter
 FROM {schema}.agents a
@@ -330,11 +341,15 @@ class ResolvedDeployment(BaseModel):
     # connector secrets. (Local tier stores values on the agent row; the cluster
     # tier delivers them via a per-agent K8s Secret instead.)
     secrets: dict[str, str] | None = None
-    # The binding row's server-controlled reply route (ADR-0096 phase 2). The
-    # channel API base URL this kind's replies go back through, and the egress
-    # adapter identity whose credential authenticates them. Both NULL for
-    # `slack`, whose route is the worker's configured Slack origin; both set
-    # together for any other kind (`agent_channels_route_pair_ck`).
+    # The binding row's server-controlled reply route (ADR-0096 phase 2).
+    # `endpoint` is the channel API base URL this kind's replies go back
+    # through. `adapter` is the egress adapter identity whose credential
+    # authenticates them for a non-Slack kind, and, for `slack`, the bot
+    # IDENTITY this route names (ADR-0168 decision 3) -- `route_identity`
+    # reads a NULL there as the installation's one pre-ADR identity,
+    # `DEFAULT_IDENTITY`, never as "no route". `slack` still carries no
+    # `endpoint`, because its route is the worker's configured Slack origin;
+    # any other kind sets both together (`agent_channels_route_pair_ck`).
     endpoint: str | None = None
     adapter: str | None = None
     # Whether this agent's bindings share one general-state namespace, or each
@@ -431,20 +446,32 @@ class BindingResolver:
         )
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
 
-    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
-        """Resolve the ``(kind, address)`` routing pair to its active deployment.
+    async def resolve(
+        self, kind: str, adapter: str | None, address: str
+    ) -> ResolvedDeployment | None:
+        """Resolve a turn's route TRIPLE ``(kind, adapter, address)`` to its
+        active deployment.
 
-        Both halves are required and neither has a default: an address-only
-        overload would silently answer an unbound kind with somebody else's
-        agent, which is #38's misroute wearing the neutral-binding hat.
+        ``kind`` and ``address`` still select the SQL rows -- migration 0023's
+        ``agent_channels_kind_address_key`` still caps that pair at one bound
+        row -- but every row is narrowed in Python by ``matching_routes``
+        (ADR-0168 decision 3) against the turn's ``adapter``, so a row bound
+        under one identity does not answer a turn addressed to another once
+        that decision's contract migration (#3100) lets several identities
+        share a pair. All three are required and none has a default: an omitted
+        identity or an address-only overload would silently answer with
+        whichever row happened to be bound, which is #38's misroute wearing a
+        new hat.
         """
         async with self._engine.connect() as conn:
             result = await conn.execute(self._sql, {"kind": kind, "address": address})
-            rows = result.mappings().all()
-        if not rows:
+            rows = result.all()
+        matches = matching_routes(rows, kind, address, adapter)
+        if not matches:
             return None
-        warn_if_multiple_agents_bound(kind, address, rows)
-        return _deployment_from_row(dict(rows[0]))
+        mapped = [dict(row._mapping) for row in matches]
+        warn_if_multiple_agents_bound(kind, address, mapped)
+        return _deployment_from_row(mapped[0])
 
     async def resolve_agent(self, agent_id: uuid.UUID) -> ResolvedDeployment | None:
         """Resolve an explicit agent to its active deployment, with no binding.
@@ -457,8 +484,14 @@ class BindingResolver:
             row = result.mappings().first()
         return None if row is None else _deployment_from_row(dict(row))
 
-    async def undeployed_binding(self, kind: str, address: str) -> BoundAgent | None:
+    async def undeployed_binding(
+        self, kind: str, adapter: str | None, address: str
+    ) -> BoundAgent | None:
         """Return a bound agent after ``resolve`` found no active deployment.
+
+        Narrows by the same route triple ``resolve`` does (``matching_routes``,
+        ADR-0168 decision 3): a bound-but-undeployed diagnostic for a
+        DIFFERENT identity on this pair must not read as this turn's agent.
 
         The caller must use this only as a diagnostic after an active-resolution
         miss. Returning this record never grants a runner boot: a route remains
@@ -468,8 +501,11 @@ class BindingResolver:
             result = await conn.execute(
                 self._undeployed_binding_sql, {"kind": kind, "address": address}
             )
-            row = result.mappings().first()
-        return None if row is None else BoundAgent.model_validate(dict(row))
+            rows = result.all()
+        matches = matching_routes(rows, kind, address, adapter)
+        if not matches:
+            return None
+        return BoundAgent.model_validate(dict(matches[0]._mapping))
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""

@@ -1881,7 +1881,9 @@ def _workspace_binding(deployment_id: uuid.UUID) -> object:
             self.workspace_enabled = True
 
     class WorkspaceBinding:
-        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+        async def resolve(
+            self, _kind: str, _adapter: str | None, _channel: str
+        ) -> WorkspaceResolved:
             return WorkspaceResolved()
 
         def boot_env(

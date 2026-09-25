@@ -61,7 +61,9 @@ class StubBinding:
         self._by_route = by_route
         self.resolve_calls: list[tuple[str, str]] = []
 
-    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
+    async def resolve(
+        self, kind: str, adapter: str | None, address: str
+    ) -> ResolvedDeployment | None:
         self.resolve_calls.append((kind, address))
         return self._by_route.get((kind, address))
 

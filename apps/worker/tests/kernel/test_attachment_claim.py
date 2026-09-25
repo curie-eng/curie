@@ -227,7 +227,7 @@ class _WorkspaceBinding:
             workspace_enabled=workspace_enabled,
         )
 
-    async def resolve(self, _kind: str, _channel: str) -> _WorkspaceResolved:
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _WorkspaceResolved:
         return self.resolved
 
     def boot_env(

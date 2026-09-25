@@ -30,7 +30,7 @@ Relevance that can be decided from the routed payload belongs at the routing
 seam (``Kernel.process_event`` in the worker), not in this adapter. What stays
 here is what the seam structurally cannot see: ``QueuedTurn`` carries no Slack
 lane and no subtype, and ``BindingResolver.resolve`` receives only
-``(kind, channel)``.
+``(kind, adapter, address)``.
 """
 
 import logging

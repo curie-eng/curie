@@ -81,6 +81,25 @@ fn api(write: impl Fn(&str, &str) -> Option<Response> + Send + Sync + 'static) -
     })
 }
 
+/// One agent's wire JSON with a single binding naming a non-default identity
+/// (ADR-0168 decision 3).
+fn agent_json_with_identity(channel: &str, adapter: &str) -> String {
+    format!(
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"{channel}","adapter":"{adapter}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+    )
+}
+
+/// A read-only fixture for one binding that names a non-default identity.
+fn serve_with_identity(channel: &str, adapter: &str) -> MockServer {
+    let agent = agent_json_with_identity(channel, adapter);
+    let agents = format!("[{agent}]");
+    serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, &agents),
+        ("GET", p) if p == format!("/agents/{AGENT_ID}") => Response::json(200, &agent),
+        _ => Response::json(405, r#"{"detail":"read-only fixture"}"#),
+    })
+}
+
 /// A read-only platform fixture for rows already stored by an older release.
 fn read_api(channels: &[&str]) -> MockServer {
     let agent = agent_json(channels);
@@ -248,6 +267,50 @@ fn local_surfaces_add_forwards_a_write_only_reply_route() {
 }
 
 #[test]
+fn local_surfaces_add_names_a_slack_identity_without_an_endpoint() {
+    // ADR-0168 decision 3: --adapter alone (no --endpoint) names a Slack
+    // identity. Slack is an in-process ingress, so there is no transport to
+    // configure -- unlike `local_surfaces_add_forwards_a_write_only_reply_route`,
+    // which pairs --adapter with --endpoint for a non-Slack ingress.
+    let server = api(|m, p| {
+        (m == "POST" && p == channels_path())
+            .then(|| Response::json(201, &agent_json_with_identity(OTHER, "second-bot")))
+    });
+
+    let run = run(&[
+        "local",
+        "surfaces",
+        AGENT_NAME,
+        "--add",
+        &format!("slack={OTHER}"),
+        "--adapter",
+        "second-bot",
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "k",
+    ]);
+    assert_eq!(
+        run.code,
+        0,
+        "naming a Slack identity must succeed: {}",
+        run.output()
+    );
+
+    let post = server
+        .recorded()
+        .into_iter()
+        .find(|request| request.method == "POST" && request.path == channels_path())
+        .expect("one surface POST");
+    let body: serde_json::Value = serde_json::from_slice(&post.body).expect("JSON body");
+    assert_eq!(
+        body,
+        serde_json::json!({"kind": "slack", "address": OTHER, "adapter": "second-bot"}),
+        "the identity travels alone, with no endpoint"
+    );
+}
+
+#[test]
 fn local_surfaces_remove_deletes_the_pair() {
     let server = api(|m, p| {
         (m == "DELETE" && p.starts_with(&channels_path())).then(|| Response {
@@ -299,6 +362,50 @@ fn local_surfaces_remove_deletes_the_pair() {
     assert!(
         selector.contains("slack") && selector.contains(BOUND),
         "the removal must name the pair, got {selector}"
+    );
+}
+
+#[test]
+fn local_surfaces_remove_selects_the_identity() {
+    // ADR-0168 decision 3: --adapter on --remove selects WHICH identity's
+    // binding to drop, the same way it names one on --add.
+    let server = api(|m, p| {
+        (m == "DELETE" && p.starts_with(&channels_path())).then(|| Response {
+            status: 204,
+            content_type: "application/json".into(),
+            body: Vec::new(),
+        })
+    });
+
+    let run = run(&[
+        "local",
+        "surfaces",
+        AGENT_NAME,
+        "--remove",
+        &format!("slack={BOUND}"),
+        "--adapter",
+        "second-bot",
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "k",
+    ]);
+    assert_eq!(run.code, 0, "remove must succeed: {}", run.output());
+
+    let deletes: Vec<_> = server
+        .recorded()
+        .into_iter()
+        .filter(|r| r.method == "DELETE")
+        .collect();
+    assert_eq!(deletes.len(), 1, "exactly one binding removal");
+    let selector = format!(
+        "{} {}",
+        deletes[0].path,
+        String::from_utf8_lossy(&deletes[0].body)
+    );
+    assert!(
+        selector.contains("adapter") && selector.contains("second-bot"),
+        "the removal must name the identity to drop, got {selector}"
     );
 }
 
@@ -452,6 +559,67 @@ fn local_surfaces_json_carries_the_agent_and_its_bindings() {
     // `changed` tells an agent consumer "this is what it NOW is" apart from
     // "this is what it is", without diffing.
     assert_eq!(value["changed"], serde_json::Value::Bool(true));
+}
+
+#[test]
+fn local_surfaces_names_a_non_default_identity_human_and_json() {
+    // ADR-0168 decision 3: the identity prints next to kind:address only when
+    // it is not the default every pre-ADR install already reads as.
+    let server = read_api(&[BOUND]);
+    let identity_server = serve_with_identity(BOUND, "second-bot");
+
+    let human = run(&[
+        "local",
+        "surfaces",
+        AGENT_NAME,
+        "--api-url",
+        &identity_server.base_url,
+        "--api-key",
+        "k",
+    ]);
+    assert_eq!(human.code, 0, "{}", human.output());
+    assert!(
+        human
+            .stdout
+            .contains(&format!("slack:{BOUND} (second-bot)")),
+        "a named identity must print beside kind:address: {}",
+        human.output()
+    );
+
+    let json = run(&[
+        "local",
+        "surfaces",
+        AGENT_NAME,
+        "--api-url",
+        &identity_server.base_url,
+        "--api-key",
+        "k",
+        "--json",
+    ]);
+    assert_eq!(json.code, 0, "{}", json.output());
+    let value: serde_json::Value = serde_json::from_str(json.stdout.trim()).unwrap();
+    let binding = value["surfaces"]
+        .as_array()
+        .and_then(|surfaces| surfaces.first())
+        .expect("one surface");
+    assert_eq!(binding["adapter"], "second-bot");
+
+    // The default-identity fixture must print no suffix at all: today's
+    // single-identity output stays byte-identical.
+    let default_human = run(&[
+        "local",
+        "surfaces",
+        AGENT_NAME,
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "k",
+    ]);
+    assert!(
+        !default_human.output().contains('('),
+        "the default identity must add no visible suffix: {}",
+        default_human.output()
+    );
 }
 
 #[test]
