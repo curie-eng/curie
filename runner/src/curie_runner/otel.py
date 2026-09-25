@@ -789,7 +789,12 @@ class _GenerationSpan:
             total = self._generation_usage.get(usage_field, 0) + value
             self._generation_usage[usage_field] = total
             _set(self._active_generation, attribute_key, total)
-            self._turn_usage_observed = True
+            if value > 0:
+                # A zero is a placeholder some providers send per message; only
+                # a nonzero count is authoritative enough to disable the
+                # ResultMessage fallback (adding the total to zeros cannot
+                # double count).
+                self._turn_usage_observed = True
 
     def _close_deferred_generation(self) -> None:
         end_time_ns = self._deferred_generation_end_ns

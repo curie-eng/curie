@@ -6435,7 +6435,7 @@ class Kernel:
 
         The returned outcome merges both turns: the tools either called, and the
         first turn's reply when the continuation said nothing. A continuation
-        that cannot start leaves the first outcome, marked continued (#3128).
+        that cannot start is a runner failure, not an early stop (#3128).
         """
 
         parsed = parse_work_item_event_id(qevent.event_id)
@@ -6473,14 +6473,26 @@ class Kernel:
             turn = await self._runner.start_turn(
                 handle.base_url, event, token=handle.token or None, remaining_s=left
             )
-        except (RunnerError, aiohttp.ClientError, TimeoutError):
+        except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
+            # The agent never saw the prompt, so the ending is the runner's: the
+            # normal failure policy (retry, or escalate after a side effect)
+            # decides, not early_stop.
             logger.warning(
                 "work-item continuation failed to start for %s",
                 qevent.event_id,
                 exc_info=True,
             )
-            outcome.continued = True
-            return outcome
+            return TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                classification=(
+                    "runner-timeout" if isinstance(exc, TimeoutError) else "runner-error"
+                ),
+                error_message=str(exc) or None,
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
+                continued=True,
+            )
         _lifecycle_event("runner.turn.started", "continuation")
         try:
             second = await self._consume(
