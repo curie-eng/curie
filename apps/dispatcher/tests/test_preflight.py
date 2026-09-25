@@ -2212,17 +2212,20 @@ def test_run_main_orders_api_then_slack_preflight_then_supervisor(
     def check_slack(
         *args: object,
         **kwargs: object,
-    ) -> None:
+    ) -> tuple[str, ...]:
         assert "web_client" not in kwargs
         assert "deadline" not in kwargs
         events.append("slack")
+        return ("admitted",)
 
     def build_supervisor(
         _config: DispatcherConfig,
         *,
         logger: logging.Logger,
+        identities: object,
     ) -> RecordingSupervisor:
         assert logger.name == "curie_dispatcher"
+        assert identities == ("admitted",), "build_supervisor must connect what preflight admitted"
         events.append("supervisor")
         return RecordingSupervisor()
 
@@ -2322,7 +2325,7 @@ def test_run_main_waits_for_delayed_api_then_starts_supervisor_once(
         events.append("slack_preflight")
 
     def build_supervisor(
-        config: DispatcherConfig, *, logger: logging.Logger
+        config: DispatcherConfig, *, logger: logging.Logger, identities: object
     ) -> Supervisor:
         assert type(config) is DispatcherConfig
         assert logger.name == "curie_dispatcher"
