@@ -25,11 +25,12 @@ reclaimed event that already finished is skipped.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -4111,9 +4112,10 @@ class Kernel:
             inferred = routed.workspace_inferred_repo or (
                 carried if _same_repo(routed.handle.workspace_repo, carried) else None
             )
-            outcome = await self._consume(
-                qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
-            )
+            async with self._keep_route_alive(thread_key, routed.handle.claim_name):
+                outcome = await self._consume(
+                    qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+                )
             outcome.workspace_inferred_repo = inferred
             if verified_review is not None:
                 outcome.review_origin_key = verified_review.origin_key
@@ -6272,6 +6274,45 @@ class Kernel:
             except Exception as exc:  # noqa: BLE001 - the durable pause stands
                 logger.warning("approval notification post failed for %s: %s", created.id, exc)
         logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
+
+    @contextlib.asynccontextmanager
+    async def _keep_route_alive(self, thread_key: str, claim_name: str) -> AsyncIterator[None]:
+        """Refresh the thread route while a turn streams (#3188).
+
+        The route is written with ``route_ttl_seconds`` on claim/adopt; a turn
+        that outlives it lost its route and the reaper deleted the claim
+        mid-turn. A failed refresh is logged and retried, never fatal.
+        """
+
+        # Strictly inside the TTL for every positive TTL, so the first refresh
+        # never races the expiry it exists to prevent.
+        interval = self._route_ttl_seconds / 3
+
+        async def _loop() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    touched = await asyncio.to_thread(
+                        self._substrate.touch_live, thread_key, claim_name
+                    )
+                    if touched and self._workspace is not None:
+                        await asyncio.to_thread(
+                            self._workspace.touch,
+                            thread_key,
+                            ttl_seconds=self._route_ttl_seconds,
+                        )
+                except Exception:
+                    logger.warning(
+                        "route keepalive failed for thread %s", thread_key, exc_info=True
+                    )
+
+        task = asyncio.create_task(_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _consume(
         self,
