@@ -12,6 +12,8 @@ fn provision_plan_installs_grafana_and_the_connector_secret_without_deploying() 
     );
     let joined = lines.join("\n");
     for needle in [
+        "create namespace observability when it is absent",
+        "preserve or create Secret grafana-admin",
         "grafana-community/grafana",
         "--reuse-values",
         "curie-values.yaml",

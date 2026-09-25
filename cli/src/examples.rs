@@ -721,10 +721,17 @@ pub fn observability_provision_plan(
         observability_namespace: observability_namespace.to_string(),
     };
     let chart = Path::new(chart);
-    let mut lines = stack_install_commands(observability_namespace)
-        .into_iter()
-        .map(|command| command.display(chart))
-        .collect::<Vec<_>>();
+    let mut lines = vec![
+        format!("create namespace {observability_namespace} when it is absent"),
+        format!(
+            "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace} (without exposing its generated password)"
+        ),
+    ];
+    lines.extend(
+        stack_install_commands(observability_namespace)
+            .into_iter()
+            .map(|command| command.display(chart)),
+    );
     lines.push(curie_integration_command(&identity).display(chart));
     lines.push(format!(
         "require Secret {GRAFANA_CONNECTOR_SECRET} in namespace {namespace} to contain key {GRAFANA_CONNECTOR_KEY}"
@@ -748,10 +755,10 @@ pub async fn provision_observability(
     }
 
     require_existing_release(&opts.release, &opts.namespace).await?;
+    let chart = provision_chart(opts.chart.as_deref()).await?;
     preflight_capacity(&opts.observability_namespace).await?;
     ensure_grafana_admin_secret(&opts.observability_namespace).await?;
     let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
-    let chart = provision_chart(opts.chart.as_deref()).await?;
     let identity = InstallIdentity {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
