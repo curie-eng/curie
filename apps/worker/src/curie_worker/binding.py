@@ -228,7 +228,6 @@ SELECT a.id AS agent_id,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
        a.thinking AS thinking,
-       a.runner_resources AS runner_resources,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
@@ -262,7 +261,6 @@ SELECT a.id AS agent_id,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
        a.thinking AS thinking,
-       a.runner_resources AS runner_resources,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
@@ -712,6 +710,26 @@ class BindingResolver:
             return None
         value: str | None = row[0]
         return value
+
+    async def runner_resources_for(self, agent_id: uuid.UUID) -> dict[str, Any] | None:
+        """The agent's runner resource override, or None for the chart block.
+
+        This is a separate read from deployment resolution. Resolution runs in
+        migration tests against schemas that predate the column.
+        """
+        sql = text(
+            "SELECT runner_resources "
+            f"FROM {self._config.db_schema}.agents WHERE id = :id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        if row is None:
+            return None
+        value = row[0]
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value if isinstance(value, dict) else None
 
     async def model_settings_for(
         self, agent_id: uuid.UUID

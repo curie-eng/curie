@@ -2064,7 +2064,8 @@ class Kernel:
                     return
                 agent_id = resolved.agent_id
                 agent_name = resolved.agent_name
-                runner_resources = getattr(resolved, "runner_resources", None)
+                reader = getattr(self._binding, "runner_resources_for", None)
+                runner_resources = await reader(agent_id) if reader is not None else None
                 # No kind/address: there is no binding to scope the state
                 # namespace to. No approval grant, resumed kind or decision
                 # either: a targetless turn is never a resume.
@@ -2164,7 +2165,8 @@ class Kernel:
                     return
                 agent_id = resolved.agent_id
                 agent_name = getattr(resolved, "agent_name", None)
-                runner_resources = getattr(resolved, "runner_resources", None)
+                reader = getattr(self._binding, "runner_resources_for", None)
+                runner_resources = await reader(agent_id) if reader is not None else None
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.

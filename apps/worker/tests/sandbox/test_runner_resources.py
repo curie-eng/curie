@@ -379,9 +379,17 @@ def test_model_settings_for_selects_runner_resources() -> None:
     assert "runner_resources" in source
 
 
-def test_both_resolve_statements_select_runner_resources() -> None:
-    assert "a.runner_resources" in _RESOLVE_SQL
-    assert "a.runner_resources" in _RESOLVE_AGENT_SQL
+def test_runner_resources_are_read_apart_from_deployment_resolution() -> None:
+    # Resolution SQL stays runnable on schemas that predate the column.
+    # The claim path reads the override through runner_resources_for.
+    import inspect
+
+    from curie_worker.binding import BindingResolver
+
+    assert "a.runner_resources" not in _RESOLVE_SQL
+    assert "a.runner_resources" not in _RESOLVE_AGENT_SQL
+    source = inspect.getsource(BindingResolver.runner_resources_for)
+    assert "runner_resources" in source
 
 
 def test_docker_limit_args_uses_the_hardening_defaults_when_resources_are_absent() -> None:
