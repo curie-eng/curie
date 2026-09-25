@@ -2044,7 +2044,7 @@ def test_generations_record_the_prompt_output_and_tool_names_only() -> None:
     _, finished = _export_turn(_adapter_session_factory(script), prompt=prompt)
     first, second = _spans_by_name(finished)["llm.generation"]
 
-    assert first.attributes[_INPUT] == prompt
+    assert first.attributes[_INPUT] == f"[user prompt: {len(prompt)} chars]"
     assert "Looking at the file." in first.attributes[_OUTPUT]
     assert "[tool_use Bash]" in first.attributes[_OUTPUT]
     assert second.attributes[_INPUT] == "[tool_result Bash]"
@@ -2053,6 +2053,8 @@ def test_generations_record_the_prompt_output_and_tool_names_only() -> None:
     assert _TOOL_ARGUMENT not in material
     assert _TOOL_RESULT not in material
     assert _TOOL_CALL_ID not in material
+    # The user prompt text is never exported to OTel (e2e ladder invariant).
+    assert prompt not in material
 
 
 def test_a_failed_tool_result_is_named_as_an_error_in_the_next_input() -> None:
@@ -2099,7 +2101,9 @@ def test_generation_content_is_redacted_before_it_is_clipped() -> None:
         assert len(value) <= 8000 + 3
         assert "gh" + "p_" not in value
         assert token[:10] not in value
-    assert "[REDACTED" in generation.attributes[_INPUT]
+    assert generation.attributes[_INPUT] == f"[user prompt: {len(prompt)} chars]"
+    assert "[REDACTED" in generation.attributes[_OUTPUT]
+    assert "p p p" not in _span_wire_material(finished)
 
 
 def test_generation_content_keys_are_never_on_the_root_or_tool_spans() -> None:

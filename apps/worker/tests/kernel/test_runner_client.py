@@ -1453,26 +1453,9 @@ async def _assert_real_timeout_boundary(
         _PRIVATE_TOOL_CALL,
         _PRIVATE_TOOL_ARGUMENT,
         _PRIVATE_POST_TIMEOUT_TEXT,
+        _PRIVATE_EVENT_TEXT,
     ):
         assert private_value not in material
-    # #3128: the redacted turn prompt rides only in the llm generation span's
-    # langfuse.observation.input attribute; it must be absent everywhere else.
-    input_spans = [
-        span
-        for span in spans
-        if span.name == "llm.generation"
-        and _PRIVATE_EVENT_TEXT
-        in str((span.attributes or {}).get("langfuse.observation.input", ""))
-    ]
-    assert input_spans, "the turn prompt must appear in a generation span input"
-    for span in spans:
-        for key, value in (span.attributes or {}).items():
-            if span in input_spans and key == "langfuse.observation.input":
-                continue
-            assert _PRIVATE_EVENT_TEXT not in str(value)
-        for event in span.events:
-            for value in (event.attributes or {}).values():
-                assert _PRIVATE_EVENT_TEXT not in str(value)
     if not release_on_interrupt:
         assert handler_errors, "released-body post-timeout write must fail"
     assert fake.interrupts == 1, "an ACKed timeout stop must not be sent twice"
