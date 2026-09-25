@@ -35,12 +35,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, Version,
+    ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary,
+    ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
+    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
     SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
@@ -234,6 +235,29 @@ fn work_item_list() -> curie::api::WorkItemList {
         limit: 50,
         truncated: false,
     }
+}
+
+/// Locked `GET /schedules` body, including `last_outcome` `failed`.
+fn locked_schedule_list() -> serde_json::Value {
+    serde_json::json!({
+        "schedules": [
+            {
+                "agent": "acme-bot",
+                "agent_id": "00000000-0000-0000-0000-000000000001",
+                "bundle_error": null,
+                "hooks": [
+                    {
+                        "name": "nightly-cleanup",
+                        "trigger": "cron",
+                        "schedule": "30 2 * * *",
+                        "zone": "UTC",
+                        "last_fire_at": "2026-09-25T02:30:00Z",
+                        "last_outcome": "failed"
+                    }
+                ]
+            }
+        ]
+    })
 }
 
 fn cluster_status() -> Box<ClusterStatus> {
@@ -467,6 +491,15 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 }))
                 .expect("the recovery outcome mirror deserializes ApprovalRecoveryOut"),
             },
+        ],
+    );
+    m.insert(
+        "SchedulesOutput",
+        samples![
+            "DryRun" => SchedulesOutput::DryRun(plan()),
+            "List" => SchedulesOutput::List(
+                serde_json::from_value::<ScheduleList>(locked_schedule_list()).unwrap(),
+            ),
         ],
     );
     m.insert(
