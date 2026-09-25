@@ -316,3 +316,15 @@ def test_the_suite_judges_a_conversation_inside_a_thread():
         if (_demanded(c["grader"]["expected"], verdict) or 0) > 0
     }
     assert demanded == {"FAIL", "UNCLEAR"}
+
+
+def test_the_plan_lives_in_a_file_and_the_reply_stays_short():
+    # MEASURED on a live campaign: the platform streams every word written
+    # outside a tool call into the Slack placeholder, and a campaign's plan
+    # written there passed Slack's limit five minutes in. chat.update answered
+    # msg_too_long and the whole turn failed with probes already sent.
+    plan = _section("Planning a campaign")
+    assert "/tmp/mean-test-plan.md" in plan
+    run = _section("Running a campaign")
+    assert "Write nothing but tool calls until the report" in run
+    assert "3,000 characters" in run
