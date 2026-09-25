@@ -40,6 +40,25 @@ def _authorize(**_kwargs: Any) -> AuthorizeResult:
     )
 
 
+def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient dispatcher config and install only public test values."""
+    for name, field in DispatcherConfig.model_fields.items():
+        alias = field.validation_alias
+        monkeypatch.delenv(
+            alias if isinstance(alias, str) else name.upper(), raising=False
+        )
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
+
+
+class _TestTelemetry:
+    """A telemetry stand-in for ``run.main`` tests: ``shutdown`` is a no-op."""
+
+    def shutdown(self) -> None:
+        pass
+
+
 class FakeSocketClient:
     """Captures the envelope acks Bolt sends back over the socket."""
 

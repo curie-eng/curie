@@ -47,7 +47,7 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 from slack_sdk.web.slack_response import SlackResponse
 
-from .conftest import _black_hole_api
+from .conftest import _black_hole_api, _set_run_env, _TestTelemetry
 
 API_URL = "http://curie-api:8000"
 CHANNEL_A = "C0EXAMPLE1"
@@ -2121,23 +2121,6 @@ def test_slack_manifest_declares_the_preflight_scope() -> None:
     assert "channels:read" in manifest["oauth_config"]["scopes"]["bot"]
 
 
-def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clear ambient dispatcher config and install only public test values."""
-    for name, field in DispatcherConfig.model_fields.items():
-        alias = field.validation_alias
-        monkeypatch.delenv(
-            alias if isinstance(alias, str) else name.upper(), raising=False
-        )
-    monkeypatch.setenv(
-        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
-    )
-
-
-class _TestTelemetry:
-    def shutdown(self) -> None:
-        pass
-
-
 def test_run_main_gates_before_connecting_slack(monkeypatch: pytest.MonkeyPatch) -> None:
     """The ordering contract: the wiring gate precedes any Slack wiring.
 
@@ -2223,9 +2206,11 @@ def test_run_main_orders_api_then_slack_preflight_then_supervisor(
         *,
         logger: logging.Logger,
         identities: object,
+        declared_count: object,
     ) -> RecordingSupervisor:
         assert logger.name == "curie_dispatcher"
         assert identities == ("admitted",), "build_supervisor must connect what preflight admitted"
+        assert declared_count == 1, "a stock install declares exactly one identity"
         events.append("supervisor")
         return RecordingSupervisor()
 
@@ -2325,7 +2310,11 @@ def test_run_main_waits_for_delayed_api_then_starts_supervisor_once(
         events.append("slack_preflight")
 
     def build_supervisor(
-        config: DispatcherConfig, *, logger: logging.Logger, identities: object
+        config: DispatcherConfig,
+        *,
+        logger: logging.Logger,
+        identities: object,
+        declared_count: object,
     ) -> Supervisor:
         assert type(config) is DispatcherConfig
         assert logger.name == "curie_dispatcher"
