@@ -117,6 +117,40 @@ async def _delete_legacy(
     await session.execute(delete(WorkflowStateEntry).where(WorkflowStateEntry.id.in_(locked)))
 
 
+async def _delete_pre_identity(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, keys: list[str]
+) -> None:
+    """Delete the pre-identity row a route in ``keys`` may still have.
+
+    Called wherever a thread's history ends (``remove``,
+    ``expire_for_work_item``, and a key ``_sweep_expired`` just swept), the
+    same places ``_delete_legacy`` deletes the pre-0053 row: the rule that
+    adoption never touches the old row belongs to adoption, not to the end
+    of history, and without this the old row outlives the delete and the
+    next read on ``key`` copies it straight back.
+    SKIP LOCKED, the same as ``_delete_legacy``: a worker that has not rolled
+    and is mid-write to the old key is left alone, and a later end of
+    history catches it.
+    """
+    old_keys = [
+        old_key
+        for key in keys
+        if (old_key := await pre_identity_thread_key_for(session, agent_id, key)) is not None
+    ]
+    if not old_keys:
+        return
+    locked = (
+        select(ThreadTranscript.id)
+        .where(
+            ThreadTranscript.agent_id == agent_id,
+            ThreadTranscript.binding_scope == scope,
+            ThreadTranscript.thread_key.in_(old_keys),
+        )
+        .with_for_update(skip_locked=True)
+    )
+    await session.execute(delete(ThreadTranscript).where(ThreadTranscript.id.in_(locked)))
+
+
 async def _sweep_expired(session: AsyncSession, agent_id: uuid.UUID) -> None:
     """Delete this agent's expired transcripts.
 
@@ -139,6 +173,7 @@ async def _sweep_expired(session: AsyncSession, agent_id: uuid.UUID) -> None:
         by_scope.setdefault(scope, []).append(key)
     for scope, keys in by_scope.items():
         await _delete_legacy(session, agent_id, scope, keys)
+        await _delete_pre_identity(session, agent_id, scope, keys)
 
 
 async def _adopt_legacy(
@@ -189,8 +224,11 @@ async def _adopt_pre_identity(
 
     ADR-0168 decision 4 gave that route's key an identity segment. Same rules
     as ``_adopt_legacy``: copy when this key has no row or the old row is
-    newer, and never lock or delete the old row, which a worker that has not
-    rolled still writes. Does not commit. Returns whether anything was copied.
+    newer. The direct read of the old row here never locks or deletes it, so
+    a worker that has not rolled keeps writing it -- but the chained
+    ``_adopt_legacy(old_key)`` call below may still lock and refresh that
+    row's own pre-0053 copy, the same as any other access to that key would.
+    Does not commit. Returns whether anything was copied.
     """
     old_key = await pre_identity_thread_key_for(session, agent_id, key)
     if old_key is None:
@@ -337,6 +375,7 @@ async def remove(
         if row is not None:
             await session.delete(row)
         await _delete_legacy(session, agent_id, scope, [key])
+        await _delete_pre_identity(session, agent_id, scope, [key])
         await session.commit()
         return
     stored = row.version if row is not None else None
@@ -349,6 +388,7 @@ async def remove(
         )
         if deleted is not None:
             await _delete_legacy(session, agent_id, scope, [key])
+            await _delete_pre_identity(session, agent_id, scope, [key])
         await session.commit()
     if deleted is None:
         if stored is None:
@@ -419,3 +459,4 @@ async def expire_for_work_item(session: AsyncSession, work_item: WorkItem) -> No
             ThreadTranscript.thread_key == work_item.conversation_id,
         )
     )
+    await _delete_pre_identity(session, work_item.agent_id, None, [work_item.conversation_id])

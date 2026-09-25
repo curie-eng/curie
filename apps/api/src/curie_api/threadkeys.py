@@ -4,8 +4,14 @@ A named non-Slack route's key gained an identity segment. Rows it wrote before
 that stay under its pre-identity key, and a reader may look there on a miss,
 but only for the agent's one binding on that pair: before the route triple a
 pair held one binding (migration 0023), so the old key can only be that
-binding's. A named Slack identity did not exist before the ADR and has no old
-form.
+binding's.
+
+Every Slack route is excluded from that lookup here, including the pre-ADR
+custom-transport binding (an endpoint plus a credential in ``adapter``),
+which decision 3 already keys by that same adapter, the same as any other
+named identity. That binding's key also gains a segment under decision 4, so
+it does have an old, pre-identity key -- this module simply never looks for
+it, and that binding starts a fresh thread on the next turn.
 """
 
 from __future__ import annotations
