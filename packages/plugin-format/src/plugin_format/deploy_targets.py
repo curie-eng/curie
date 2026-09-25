@@ -54,6 +54,7 @@ from .connector_render import agent_forges_join
 # A connector allowlist entry must be a name `connectors.yaml` could declare, so
 # the rule is the one that module applies, imported for the same no-drift reason.
 from .connectors import _NAME_MAX as _CONNECTOR_NAME_MAX
+from .connectors import ADMITS_SELF
 from .connectors import _is_valid_name as _is_valid_connector_name
 
 # Curie's two deployment environments. Not open-ended: the worker's binding
@@ -154,7 +155,17 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
             # the forging check off a `None` agent: called on `None` the
             # predicate raises TypeError out of a validator whose whole contract
             # is to RETURN errors, turning "agent is required" into a crash.
-            if not _is_valid_name(target.agent):
+            if target.agent == ADMITS_SELF:
+                errors.append(
+                    (
+                        "deploy.bad_agent_name",
+                        f"{where}: `{ADMITS_SELF}` is not a valid agent name -- it is reserved "
+                        "for `admits`, where it means the agent this bundle is deployed as "
+                        "(ADR-0168 decision 7). A target genuinely named `self` would be "
+                        "indistinguishable from that sentinel.",
+                    )
+                )
+            elif not _is_valid_name(target.agent):
                 errors.append(
                     (
                         "deploy.bad_agent_name",
