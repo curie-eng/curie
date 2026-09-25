@@ -73,6 +73,14 @@ describe("WiredAgents metrics line", () => {
     expect(screen.getByText(/last 7d/)).toBeTruthy();
   });
 
+  it("shows an unknown cost, not $0.00, when the model has no price row", async () => {
+    vi.mocked(getMetricsSummary).mockResolvedValue(summary({ cost_usd: 0, cost_known: false }));
+    renderView();
+
+    await waitFor(() => expect(screen.getByText(/12 runs · 45,000 tokens · — /)).toBeTruthy());
+    expect(screen.queryByText(/\$0\.00/)).toBeNull();
+  });
+
   it("shows a neutral dash on a fetch error, never 0 runs", async () => {
     vi.mocked(getMetricsSummary).mockRejectedValue(new Error("zq-metrics-boom"));
     renderView();

@@ -25,7 +25,7 @@ export function AgentMetricsLine({ agent }: { agent: AgentOut }) {
   // (mirrors apps/ui/src/views/wired/WiredOverview.tsx).
   const runs = s ? s.runs.toLocaleString() : "—";
   const tokens = s ? s.tokens.toLocaleString() : "—";
-  const cost = s ? `$${s.cost_usd.toFixed(2)}` : "—";
+  const cost = !s || s.cost_known === false ? "—" : `$${s.cost_usd.toFixed(2)}`;
   return (
     <span style={{ fontSize: 12, color: C.muted, fontFamily: C.mono }}>
       {`${runs} runs · ${tokens} tokens · ${cost} (${METRICS_WINDOW_LABEL})`}
