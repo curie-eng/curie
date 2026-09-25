@@ -1,9 +1,9 @@
 """The mean tester is one bundle on off-the-shelf MCP servers (ADR 0172).
 
 Pins what must not drift: the bundle validates, its only MCP servers are the
-Slack and GitHub servers the runner image preinstalls, its toolPolicy (classified
-by the real plugin_format classifier) grants exactly the tools ADR 0172 names,
-nothing is filed, and every eval case judges a recorded exchange.
+Slack and GitHub servers the bundle's runner.Dockerfile installs, its toolPolicy
+(classified by the real plugin_format classifier) grants exactly the tools ADR
+0172 names, nothing is filed, and every eval case judges a recorded exchange.
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def test_there_is_no_custom_connector():
     assert not (BUNDLE / "connectors").exists()
 
 
-def test_the_only_servers_are_the_preinstalled_slack_and_github_ones():
+def test_the_only_servers_are_slack_and_github():
     servers = json.loads((BUNDLE / ".mcp.json").read_text())["mcpServers"]
     assert sorted(servers) == ["github", "slack"]
     assert servers["slack"]["command"] == "slack-mcp"
@@ -96,9 +96,12 @@ def test_the_only_servers_are_the_preinstalled_slack_and_github_ones():
     }
 
 
-def test_the_runner_image_pins_the_slack_server():
-    dockerfile = (REPO / "runner" / "Dockerfile").read_text()
-    assert f"RUN npm install -g {SLACK_MCP}\n" in dockerfile
+def test_the_bundle_image_pins_the_slack_server():
+    layer = (BUNDLE / "runner.Dockerfile").read_text()
+    assert f"RUN npm install -g {SLACK_MCP}\n" in layer
+    platform = (REPO / "runner" / "Dockerfile").read_text()
+    assert SLACK_MCP not in platform
+    assert "bless another authed third-party MCP server" not in platform
 
 
 def test_the_manifest_declares_the_three_secrets_and_no_approval_route():

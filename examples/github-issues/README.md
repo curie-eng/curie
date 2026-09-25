@@ -14,15 +14,15 @@ the sandbox at launch with `curie skill up --secret <NAME>`.
 github-issues/
   .claude-plugin/plugin.json    bundle manifest
   .mcp.json                     declares the off-the-shelf GitHub stdio server
+  runner.Dockerfile             layers that server onto the platform runner
   skills/github-issues/SKILL.md  a skill that reads and triages issues
 ```
 
-There is no server code in this bundle — that is the point. `.mcp.json` points
-`command` at `mcp-server-github`, the binary the reference server package
-installs. The runner image pre-installs that package
-(`runner/Dockerfile`: `npm install -g @modelcontextprotocol/server-github`), so
-the server starts with **no runtime network fetch**. The GitHub token is not in
-the bundle; it is forwarded by name at launch (below).
+There is no server code in this bundle. `.mcp.json` points `command` at
+`mcp-server-github`, and this bundle's `runner.Dockerfile` installs the pinned
+package on the platform runner so the server starts with **no runtime network
+fetch**. The GitHub token is not in the bundle; it is forwarded by name at
+launch (below).
 
 ## How the secret reaches the server
 
@@ -40,10 +40,12 @@ For the interactive path, run `curie`, choose **Explore examples**, then
 **GitHub issues**. Curie starts the runner, keeps the entire conversation in
 its TUI, and stops the runner when you leave the chat.
 
-Prerequisites: the runner image built once (`curie build`), a model credential
-in your environment (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`), and a
-GitHub PAT — a read-scoped (`public_repo` / `repo:read`) token is enough to list
-and read issues.
+Prerequisites: a model credential in your environment
+(`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`), and a GitHub PAT. A
+read-scoped (`public_repo` / `repo:read`) token is enough to list and read
+issues. `mcp-server-github` is installed by this bundle's `runner.Dockerfile`
+onto the platform runner. `curie build` and `curie skill up` still start the
+platform image, which does not contain that binary.
 
 ```bash
 export GITHUB_PERSONAL_ACCESS_TOKEN=ghp_your_token_here

@@ -8,7 +8,8 @@
 #   docker build -f runner/Dockerfile -t curie-runner .
 #
 # The claude-agent-sdk supplies and drives its bundled platform `claude`
-# executable. The image carries Node and npm only for pinned MCP packages. With
+# executable. The image carries Node and npm so a bundle layer can install its
+# own pinned stdio MCP server. The platform image blesses none. With
 # CURIE_FAKE_MODEL=1 the container answers synthetic events offline (no CLI or
 # model call), which is how the container smoke round trips without a credential.
 # The frozen workspace packages require the Python base below.
@@ -37,17 +38,6 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
-
-# Off-the-shelf MCP servers pre-installed at build time so a bundle that
-# declares one starts it from the on-disk binary with NO runtime network fetch
-# (the runner rootfs is read-only at runtime, so an `npx`-style fetch would fail
-# anyway). Bundles reference these by the package's bin name, e.g.
-# `"command": "mcp-server-github"` -- see examples/github-issues. Add a line here
-# to bless another authed third-party MCP server for the same shape.
-RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
-# The mean tester's Slack server (ADR 0172): bin `slack-mcp`. It is a single
-# 0.0.1 release of the fork of npm's deprecated @modelcontextprotocol/server-slack.
-RUN npm install -g @zencoderai/slack-mcp-server@0.0.1
 
 WORKDIR /app
 

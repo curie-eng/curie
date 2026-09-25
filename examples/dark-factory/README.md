@@ -60,14 +60,16 @@ the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
 - **The checkout.** Curie mounts the issue's repository at `/workspace` and
   gives every session the built-in file tools. The sandbox has no general
   network access, and it holds no push or publication credential.
-- **The issue.** `.mcp.json` declares the GitHub MCP server that the runner
-  image preinstalls, authenticated with the bundle's own
-  `GITHUB_PERSONAL_ACCESS_TOKEN` (ADR 0145: reading the ticket is the bundle's
-  job). The manifest's `toolPolicy` allows `github/get_issue` and
-  `github/add_issue_comment`. The review gate hook refuses the comment tool
-  except for one comment on the run's own issue, after a failed or capped
-  review, to post the unresolved findings. Every other GitHub tool, including every other write tool, is
-  denied by the runner, and so is any tool the server adds later.
+- **The issue.** `.mcp.json` declares the GitHub MCP server. This bundle's
+  `runner.Dockerfile` installs it on the platform runner. The server is
+  authenticated with the bundle's own `GITHUB_PERSONAL_ACCESS_TOKEN`
+  (ADR 0145: reading the ticket is the bundle's job). The manifest's
+  `toolPolicy` allows `github/get_issue` and `github/add_issue_comment`.
+  The review gate hook refuses the comment tool except for one comment on
+  the run's own issue, after a failed or capped review, to post the
+  unresolved findings. Every other GitHub tool, including every other
+  write tool, is denied by the runner, and so is any tool the server adds
+  later.
 - **Publication.** The built-in `mcp__curie__publish_changes` tool. The platform
   captures the patch and publishes it from a separate trusted job. The agent
   never pushes.

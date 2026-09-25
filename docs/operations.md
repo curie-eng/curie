@@ -855,9 +855,12 @@ one is feasible, implements, runs the repository's own checks, reviews its diff
 against every criterion, and ends in one pull request or a stated reason. Any
 other bundle can take its place; the platform does not require this one.
 
-The bundle reads the issue through the GitHub MCP server the runner image
-preinstalls, with its own `GITHUB_PERSONAL_ACCESS_TOKEN` bound at deploy
-(`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). Give it a token
+The bundle reads the issue through the GitHub MCP server installed by
+`examples/dark-factory/runner.Dockerfile` on the platform runner, with its own
+`GITHUB_PERSONAL_ACCESS_TOKEN` bound at deploy
+(`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). A deploy still
+starts the platform image, which does not contain that server, until the
+bundle can declare the layer (#3216). Give it a token
 limited to **Issues: Read and write**. Its `toolPolicy` allows `github/get_issue`
 and `github/add_issue_comment`, and the bundle's review gate hook allows that
 comment only once, to post unresolved findings after a failed or capped review,

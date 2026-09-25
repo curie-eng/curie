@@ -732,31 +732,48 @@ def test_python_pin_revert_is_rejected() -> None:
     ) in violations
 
 
-def test_runner_image_uses_bundled_claude_cli_and_keeps_pinned_github_mcp() -> None:
+def test_runner_image_uses_bundled_claude_cli_and_does_not_bless_bundle_mcp() -> None:
     dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
-    npm_operands = _dockerfile_global_npm_operands(dockerfile)
-    assert all(
-        _split_npm_operand(operand)[0] != "@anthropic-ai/claude-code"
-        for operand in npm_operands
-    )
-    github_operands = [
-        operand
-        for operand in npm_operands
-        if _split_npm_operand(operand)[0]
-        == "@modelcontextprotocol/server-github"
-    ]
-    assert len(github_operands) == 1
-    current = github_operands[0]
-    package, version = _split_npm_operand(current)
-    assert package == "@modelcontextprotocol/server-github"
-    assert version and _EXACT_NPM_VERSION.fullmatch(version)
-    assert dockerfile.count(current) == 1
-    mutated = dockerfile.replace(current, package)
+    assert _dockerfile_global_npm_operands(dockerfile) == []
+    assert "@modelcontextprotocol/server-github" not in dockerfile
+    assert "@zencoderai/slack-mcp-server" not in dockerfile
+    assert "bless another authed third-party MCP server" not in dockerfile
+    assert "COPY --from=node /usr/local/bin/node" in dockerfile
 
-    violations = _find_violations(_UV_LOCK.read_text(encoding="utf-8"), mutated)
-    assert Violation(
-        package, "global npm install is missing an exact version"
-    ) in violations
+
+def test_bundle_layers_pin_the_mcp_servers_they_moved() -> None:
+    github_issues = (
+        _REPO_ROOT / "examples" / "github-issues" / "runner.Dockerfile"
+    ).read_text(encoding="utf-8")
+    dark_factory = (
+        _REPO_ROOT / "examples" / "dark-factory" / "runner.Dockerfile"
+    ).read_text(encoding="utf-8")
+    mean_tester = (
+        _REPO_ROOT / "examples" / "mean-tester" / "runner.Dockerfile"
+    ).read_text(encoding="utf-8")
+    for text in (github_issues, dark_factory, mean_tester):
+        assert _npm_violations(_logical_instructions(text)) == []
+    assert _dockerfile_global_npm_operands(github_issues) == [
+        "@modelcontextprotocol/server-github@2025.4.8"
+    ]
+    assert _dockerfile_global_npm_operands(dark_factory) == [
+        "@modelcontextprotocol/server-github@2025.4.8"
+    ]
+    assert _dockerfile_global_npm_operands(mean_tester) == [
+        "@zencoderai/slack-mcp-server@0.0.1",
+        "@modelcontextprotocol/server-github@2025.4.8",
+    ]
+    unpinned = github_issues.replace(
+        "@modelcontextprotocol/server-github@2025.4.8",
+        "@modelcontextprotocol/server-github",
+    )
+    assert (
+        Violation(
+            "@modelcontextprotocol/server-github",
+            "global npm install is missing an exact version",
+        )
+        in _npm_violations(_logical_instructions(unpinned))
+    )
 
 
 @pytest.mark.parametrize("command", sorted(_NPM_INSTALL_ALIASES))
