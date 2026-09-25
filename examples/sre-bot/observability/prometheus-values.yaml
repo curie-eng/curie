@@ -188,15 +188,20 @@ serverFiles:
             # instance's series flat in the range, where a per-series count
             # pages, and starts the new one's at its first turn. So both
             # windows sum without `instance`, and the alert names no process.
-            # The 90m count adds the new-series term above, so a new
-            # instance's first turn counts. The 7d gate does not: with under
+            # The 90m count adds the new-series term above, reading
+            # last_over_time(X[90m]) for X, so a new instance's first turn
+            # counts for the whole window: a process that took one turn and
+            # exited, including the runner's one-turn sandboxes, still counts
+            # after X drops it. The 7d gate adds no such term: with under
             # seven days of history every live series looks new over 7d, and
             # a term there would page every label set with a lifetime count
             # above zero. A label set with no series left in the 90m range,
             # such as an old instance's after a restart with no turn since,
-            # counts as zero rather than absent. The cost: a label set whose
+            # counts as zero rather than absent. The costs: a label set whose
             # only turns in seven days are new series' first samples, such as
-            # its first turn ever and then silence, is not armed.
+            # its first turn ever and then silence, is not armed; and a label
+            # set that stops recording for good pages for up to seven days,
+            # while its turns are still in the 7d range.
             expr: |
               (
                 sum without (instance) (
@@ -204,14 +209,14 @@ serverFiles:
                     increase(curie_turn_accepted_total[90m])
                     unless
                     (
-                      curie_turn_accepted_total
+                      last_over_time(curie_turn_accepted_total[90m])
                       unless
                       last_over_time(curie_turn_accepted_total[1h] offset 90m)
                     )
                   )
                   or
                   (
-                    curie_turn_accepted_total
+                    last_over_time(curie_turn_accepted_total[90m])
                     unless
                     last_over_time(curie_turn_accepted_total[1h] offset 90m)
                   )
