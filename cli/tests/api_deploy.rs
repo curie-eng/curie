@@ -1586,3 +1586,126 @@ async fn an_undeclared_identity_is_a_usage_error_carrying_the_platform_reason() 
         "{err}"
     );
 }
+
+// --------------------------------------------------------------------------- //
+// A deploy names its identity, from --identity or a resolved target
+// --------------------------------------------------------------------------- //
+
+fn identity_deploy_opts(
+    server: &MockServer,
+    plugin_dir: &std::path::Path,
+    identity: Option<&str>,
+    target: Option<&str>,
+    slack_channel: Option<&str>,
+) -> DeployOpts {
+    DeployOpts {
+        delivery: None,
+        tier: commands::DeployTier::Local,
+        agent: None,
+        target: target.map(str::to_string),
+        identity: identity.map(str::to_string),
+        plugin_dir: plugin_dir.to_path_buf(),
+        api_url: server.base_url.clone(),
+        api_key: "k".to_string(),
+        slack_channel: slack_channel.map(str::to_string),
+        repo: None,
+        workspace: WorkspaceIntent::Preserve,
+        env: None,
+        label: Some("0.1.0-1".to_string()),
+        secret: vec![],
+        secret_binding_supported: true,
+        connect_hint: "mock API should be reachable".to_string(),
+    }
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_malformed_identity_is_refused_before_any_request() {
+    let server = serve(|req| panic!("no request expected: {} {}", req.method, req.path));
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let err = commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        Some("Ops_Bot"),
+        None,
+        Some(BOUND),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2, "{err:#}");
+    assert!(server.recorded().is_empty());
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_named_identity_with_no_channel_is_refused_before_any_write() {
+    let server = serve(|req| panic!("no request expected: {} {}", req.method, req.path));
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let err = commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        Some(IDENTITY),
+        None,
+        None,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2, "{err:#}");
+    assert!(err.to_string().contains(IDENTITY), "{err}");
+    assert!(server.recorded().is_empty());
+}
+
+fn named_identity_route(req: &support::Request) -> Response {
+    match (req.method.as_str(), req.path.as_str()) {
+        // The target names the identity; its channel comes from the flag,
+        // because the only committable Slack id is a placeholder a target refuses.
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"ops-bot","connectors":null}"#,
+        ),
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(
+            201,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, IDENTITY)]),
+        ),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    }
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_targets_identity_reaches_the_binding() {
+    let server = serve(named_identity_route);
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        None,
+        Some("dev"),
+        Some(BOUND),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(create_body(&server)["channel"]["adapter"], IDENTITY);
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn the_flag_beats_the_targets_identity() {
+    let server = serve(named_identity_route);
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        Some("default"),
+        Some("dev"),
+        Some(BOUND),
+    ))
+    .await
+    .unwrap();
+    assert!(create_body(&server)["channel"].get("adapter").is_none());
+}

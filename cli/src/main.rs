@@ -7621,6 +7621,37 @@ mod tests {
         }
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn deploy_takes_an_identity_on_both_tiers() {
+        for tier in ["local", "cluster"] {
+            let cli = try_parse_from(["curie", tier, "deploy", "--identity", "ops-bot"]).unwrap();
+            let identity = match cli.command {
+                Some(Command::Local {
+                    action: LocalAction::Deploy { identity, .. },
+                }) => identity,
+                Some(Command::Cluster {
+                    action: ClusterAction::Deploy { identity, .. },
+                    ..
+                }) => identity,
+                _ => panic!("expected {tier} deploy"),
+            };
+            assert_eq!(identity.as_deref(), Some("ops-bot"));
+        }
+        assert!(
+            try_parse_from([
+                "curie",
+                "cluster",
+                "deploy",
+                "--all-targets",
+                "--identity",
+                "x"
+            ])
+            .is_err(),
+            "every target states its own identity"
+        );
+    }
+
     #[test]
     fn local_short_file_flag_parses_for_all_verbs() {
         let cases = [

@@ -11990,6 +11990,32 @@ mod tests {
             "a resolved credential must not outlive the boot that staged it"
         );
     }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn identity_names_follow_the_deploy_yaml_rule() {
+        let longest = "a".repeat(40);
+        for ok in ["default", "ops-bot", "a", "b2", longest.as_str()] {
+            assert!(
+                super::validate_identity_name(ok).is_ok(),
+                "{ok:?} is a valid name"
+            );
+        }
+        let too_long = "a".repeat(41);
+        for bad in [
+            "",
+            "Ops",
+            "ops_bot",
+            "-ops",
+            "ops-",
+            "ops bot",
+            too_long.as_str(),
+        ] {
+            let err = super::validate_identity_name(bad).unwrap_err();
+            assert_eq!(crate::exit::classify(&err).0.code(), 2, "{bad:?}");
+            assert!(err.to_string().contains("--identity"), "{err}");
+        }
+    }
 }
 
 /// Which nullable override a `<tier> overrides` invocation intends to change.
