@@ -815,6 +815,17 @@ waiting work and requests termination of a running execution. Cancellation
 stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
+GitHub does not retry a label delivery that failed, for example while the API
+was unreachable. The work item reconciler covers that gap: every
+`GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0 disables) it lists the
+open issues carrying the factory label on each bound repository and admits any
+that has no work item, once the label is older than
+`GITHUB_FACTORY_RECONCILE_GRACE_S` (default 300). It applies the same checks as
+a delivery, including the labeling user's current write permission, and it
+never admits an issue that already has a work item, so it does not duplicate a
+delivery that arrived. A manual redelivery of the lost label after the
+reconciler admitted the issue counts as a relabel and starts a second run.
+
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
 the review subscriptions when both gates are on. Give the App **Issues: Read and write**
 so Curie can re-read the issue, keep its one status comment, and set the
