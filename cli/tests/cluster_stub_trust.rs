@@ -18,7 +18,7 @@ const CHANNEL: &str = "C0EXAMPLE1";
 const API_KEY: &str = "fixture-platform-key";
 const RELAY_ADAPTER: &str = "curie-cluster-message";
 const WORKER_CLAIM_SELECTION: &str = "kubectl get pods -n acme-system -l app.kubernetes.io/instance=acme-release,app.kubernetes.io/component=worker -o json";
-const WORKER_CLAIM_EXEC: &str = "kubectl exec -n acme-system worker-stable-a -- python -m curie_worker.upgrade_drain --mode status --json";
+const WORKER_CLAIM_EXEC: &str = "kubectl exec -n acme-system worker-stable-a -- python -m curie_worker.upgrade_drain --mode status --json --with-ttl";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -313,7 +313,7 @@ if args == ["get", "pods", "-n", "acme-system", "-l", worker_selector, "-o", "js
 
 if args == [
     "exec", "-n", "acme-system", "worker-stable-a", "--",
-    "python", "-m", "curie_worker.upgrade_drain", "--mode", "status", "--json",
+    "python", "-m", "curie_worker.upgrade_drain", "--mode", "status", "--json", "--with-ttl",
 ]:
     print('{"state":"claims_enabled","since":null,"revision":null}')
     sys.exit(0)

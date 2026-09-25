@@ -1951,17 +1951,15 @@ worker:
     timeoutSeconds: 900
     # How often the gate re-reads the in-flight set while waiting.
     pollIntervalSeconds: 5
-    # How long the quiesce flag lives. Also a floor: it is derived above the
-    # EFFECTIVE wait above, because the worker refuses a TTL that does not
-    # outlast the drain at boot, and a render the app rejects is a green
-    # `helm upgrade` followed by a CrashLoopBackOff. Finite by construction, so
-    # an upgrade killed between the two hooks cannot leave the fleet
-    # permanently unable to claim. Size it to span the expected rollout: the
-    # flag is what keeps replacement Pods from reclaiming mid-roll.
-    #
-    # Setting it at or below timeoutSeconds IS refused at render time -- that
-    # pair is written together, so contradicting yourself there is a stated
-    # intent worth surfacing rather than silently raising.
+    # The roll hold: how long the quiesce flag lives after a CLEAN drain, while
+    # the roll runs and until the post-upgrade release clears it. Capped at the
+    # EFFECTIVE wait above (#3127), so a gate whose roll never follows cannot
+    # strand a paused fleet for longer than the upgrade could have waited.
+    # While the gate is still waiting, the flag is a short lease renewed every
+    # poll (max(30s, 3 x pollIntervalSeconds)), so a gate Job that is deleted,
+    # times out or is killed releases the fleet at once or within one lease.
+    # Size it to span the expected rollout: the flag is what keeps replacement
+    # Pods from reclaiming mid-roll.
     quiesceTtlSeconds: 1800
     resources:
       requests:
