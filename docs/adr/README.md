@@ -199,4 +199,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Accepted |
 | 0175 | [A bot may limit who can talk to it](0175-a-bot-may-limit-who-can-talk-to-it.md) | Accepted |
 | 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
+| 0177 | [Approvers can answer from email and other channels, not only Slack](0177-approvers-can-answer-from-email-and-other-channels-not-only-slack.md) | Draft |
 <!-- END GENERATED: adr-index -->
