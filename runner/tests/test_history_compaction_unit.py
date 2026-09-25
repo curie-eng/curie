@@ -20,9 +20,11 @@ from curie_runner.history import (
     ConversationMessage,
     HarnessReplayState,
     HistoryCapacityError,
+    HistoryError,
     SummaryRecord,
     TurnRecord,
     _parse_records,
+    bound_turn_record,
     build_conversation_replay,
     compact_transcript_value,
 )
@@ -171,6 +173,13 @@ def test_one_turn_with_nothing_to_summarize_is_only_bounded() -> None:
     assert compacted[0]["user"] == "alone request"
     assert compacted[0]["harness_replay"] is None
     assert _size(compacted) <= HISTORY_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
+
+
+def test_turn_still_refuses_when_even_the_final_answer_cannot_fit() -> None:
+    record = TurnRecord.from_dict(_turn("irreducible", 0))
+
+    with pytest.raises(HistoryError):
+        bound_turn_record(record, max_value_bytes=100)
 
 
 def test_explicit_cap_and_reserve_are_honored() -> None:
