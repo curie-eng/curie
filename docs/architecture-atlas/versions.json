@@ -158,9 +158,9 @@
       "id": "v0.10.0-rc.2",
       "label": "v0.10.0-rc.2",
       "file": "snapshots/v0.10.0-rc.2.json",
-      "date": "2026-09-24",
+      "date": "2026-09-25",
       "branch": "next",
-      "commit": "fed6cc092ec37d0ce4c6c28706ed38d180c375c8"
+      "commit": "b9f57874e2ce96c0a5f4a6945b4518fbe04b050c"
     }
   ]
 }

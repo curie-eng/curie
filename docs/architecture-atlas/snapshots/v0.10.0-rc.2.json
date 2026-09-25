@@ -1,11 +1,11 @@
 {
   "schemaVersion": "1.4",
-  "asOf": "2026-09-24",
+  "asOf": "2026-09-25",
   "repository": {
     "name": "curie-eng/curie",
     "branch": "next",
-    "commit": "fed6cc092ec37d0ce4c6c28706ed38d180c375c8",
-    "shortCommit": "2b8f35d2",
+    "commit": "b9f57874e2ce96c0a5f4a6945b4518fbe04b050c",
+    "shortCommit": "b9f57874",
     "release": "v0.10.0-rc.2"
   },
   "title": "Curie architecture atlas",
@@ -2198,7 +2198,7 @@
       "altitude": "bot-capability",
       "x": 0.92,
       "y": 0.06,
-      "description": "A shipped example bundle that triages an alert, gathers evidence from read only tooling, and proposes a remediation behind an approval route. It demonstrates the bot capability altitude on the isolated runtime without extending it.",
+      "description": "A shipped example bundle that triages alerts, gathers Kubernetes evidence, and gates mutations through approval routes. Its default credential limits writes to demo workloads. An optional, operator applied grant expands that same connector across built in resources while keeping Secret reads blocked; approval remains the checkpoint for writes, but the connector credential itself carries the wider Kubernetes authority. This is a bundle policy choice within the isolated runtime.",
       "evidence": [
         "sre-bot-example",
         "sre-gates-code"
