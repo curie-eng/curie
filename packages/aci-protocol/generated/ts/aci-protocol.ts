@@ -721,10 +721,12 @@ export interface QueuedTurn {
  * the reply, so a sink call made *before* binding resolution can still select the
  * right credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both
  * **platform-set from the binding row** (never accepted from an ingress request
- * body); ``slack`` legitimately carries neither, because its route is the
- * worker's configured Slack origin. ``adapter`` is optional at the schema so a
- * third-party or pre-upgrade producer is not rejected outright, but every
- * first-party mint site sets it explicitly.
+ * body); ``slack`` carries no endpoint, because its route is the worker's
+ * configured Slack origin, and names its identity in ``adapter`` (ADR-0168
+ * decision 3); a NULL there means ``DEFAULT_IDENTITY`` (see ``route_identity``).
+ * ``adapter`` is optional at the schema so a third-party or pre-upgrade
+ * producer is not rejected outright, but every first-party mint site sets it
+ * explicitly.
  *
  * This interface was referenced by `ACIProtocolV051`'s JSON-Schema
  * via the `definition` "ReplyHandle".
