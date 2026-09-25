@@ -55,6 +55,13 @@ rules:
   - apiGroups: [""]
     resources: ["resourcequotas"]
     verbs: ["get"]
+  # Per-agent runner resources (#3209). get reads the chart template. create
+  # and patch write only the worker-owned copy. list and delete stay absent.
+  # A ValidatingAdmissionPolicy refuses any name that is not that copy, so
+  # this grant cannot rewrite the shared template.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get", "create", "patch"]
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects

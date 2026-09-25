@@ -2232,6 +2232,26 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pin runner cpu, memory, and ephemeral-storage. JSON object with requests and limits. Null on the API means the chart block",
+              "id": "runner_resources",
+              "long": "runner-resources",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the runner resource override back to the chart block",
+              "id": "clear_runner_resources",
+              "long": "clear-runner-resources",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -4539,6 +4559,26 @@ export const commandManifest = {
               "help": "Clear the execution-deadline override back to the platform default",
               "id": "clear_execution_deadline",
               "long": "clear-execution-deadline",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin runner cpu, memory, and ephemeral-storage. JSON object with requests and limits. Null on the API means the chart block",
+              "id": "runner_resources",
+              "long": "runner-resources",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the runner resource override back to the chart block",
+              "id": "clear_runner_resources",
+              "long": "clear-runner-resources",
               "positional": false,
               "possible_values": [
                 "true",

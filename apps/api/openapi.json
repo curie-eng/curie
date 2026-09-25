@@ -1051,6 +1051,18 @@
             ],
             "title": "Repo Full Name"
           },
+          "runner_resources": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Resources"
+          },
           "secrets": {
             "anyOf": [
               {
@@ -1240,6 +1252,18 @@
               }
             ],
             "title": "Repo Full Name"
+          },
+          "runner_resources": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Resources"
           },
           "secrets": {
             "anyOf": [

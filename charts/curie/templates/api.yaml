@@ -167,6 +167,19 @@ spec:
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS
               value: {{ .Values.worker.publication.retentionSeconds | quote }}
+            {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+            # The hard quota the API compares a per-agent runner override to.
+            # All four are set together, or none are. Ephemeral storage is not
+            # on this PriorityClass-scoped quota.
+            - name: CURIE_SANDBOX_QUOTA_REQUESTS_CPU
+              value: {{ .Values.resourceQuota.hard.requestsCpu | quote }}
+            - name: CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY
+              value: {{ .Values.resourceQuota.hard.requestsMemory | quote }}
+            - name: CURIE_SANDBOX_QUOTA_LIMITS_CPU
+              value: {{ .Values.resourceQuota.hard.limitsCpu | quote }}
+            - name: CURIE_SANDBOX_QUOTA_LIMITS_MEMORY
+              value: {{ .Values.resourceQuota.hard.limitsMemory | quote }}
+            {{- end }}
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:

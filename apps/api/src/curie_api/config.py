@@ -551,6 +551,32 @@ class Settings(BaseSettings):
     hook_backlog_window_s: int = 60
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = 60
+    # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
+    # the quota object renders, and leaves all four unset otherwise. A partial
+    # set is a broken install: the agent write refuses rather than skipping the
+    # check. Unset means this API has no quota to compare against.
+    sandbox_quota_requests_cpu: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_REQUESTS_CPU", "sandbox_quota_requests_cpu"
+        ),
+    )
+    sandbox_quota_requests_memory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY", "sandbox_quota_requests_memory"
+        ),
+    )
+    sandbox_quota_limits_cpu: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CURIE_SANDBOX_QUOTA_LIMITS_CPU", "sandbox_quota_limits_cpu"),
+    )
+    sandbox_quota_limits_memory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CURIE_SANDBOX_QUOTA_LIMITS_MEMORY", "sandbox_quota_limits_memory"
+        ),
+    )
 
     def valkey_dsn(self) -> str:
         if self.valkey_url:

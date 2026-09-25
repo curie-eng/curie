@@ -228,6 +228,7 @@ SELECT a.id AS agent_id,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
        a.thinking AS thinking,
+       a.runner_resources AS runner_resources,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
@@ -261,6 +262,7 @@ SELECT a.id AS agent_id,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
        a.thinking AS thinking,
+       a.runner_resources AS runner_resources,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
@@ -328,6 +330,9 @@ class ResolvedDeployment(BaseModel):
     # at boot. None falls back to the worker's configured default; unset at both
     # layers sends nothing and leaves the model's own default standing.
     thinking: str | None = None
+    # Per-agent runner resources (#3209). None means the chart block. A set
+    # value is applied to the next claim, not to a sandbox that is already running.
+    runner_resources: dict[str, Any] | None = None
     # The agent's permission gates (#245): tool names requiring human approval,
     # forwarded as CURIE_APPROVAL_REQUIRED_TOOLS at boot. None means no gates.
     approval_required_tools: list[str] | None = None
@@ -430,6 +435,9 @@ def _deployment_from_row(data: dict[str, Any]) -> ResolvedDeployment:
     conn_secrets = data.get("secrets")
     if isinstance(conn_secrets, str):
         data["secrets"] = json.loads(conn_secrets)
+    runner_resources = data.get("runner_resources")
+    if isinstance(runner_resources, str):
+        data["runner_resources"] = json.loads(runner_resources)
     return ResolvedDeployment.model_validate(data)
 
 
@@ -707,19 +715,25 @@ class BindingResolver:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
-        """The agent's model and thinking settings for eval sandbox boots."""
+    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
+        """The agent's model, thinking, and runner_resources for eval boots."""
         sql = text(
-            f"SELECT model, thinking FROM {self._config.db_schema}.agents WHERE id = :id"
+            "SELECT model, thinking, runner_resources "
+            f"FROM {self._config.db_schema}.agents WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         if row is None:
-            return None, None
+            return None, None, None
         model: str | None = row[0]
         thinking: str | None = row[1]
-        return model, thinking
+        runner_resources = row[2]
+        if isinstance(runner_resources, str):
+            runner_resources = json.loads(runner_resources)
+        if runner_resources is not None and not isinstance(runner_resources, dict):
+            runner_resources = None
+        return model, thinking, runner_resources
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).

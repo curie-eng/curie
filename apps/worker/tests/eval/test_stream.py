@@ -184,6 +184,8 @@ class _FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
         self.created_pools.append(pool)
@@ -970,6 +972,8 @@ def test_provisioned_runner_end_to_end(
                         pool: str,
                         env: dict[str, str] | None = None,
                         labels: dict[str, str] | None = None,
+                        runner_resources: dict[str, object] | None = None,
+                        agent_name: str | None = None,
                     ) -> None:
                         fake.responses["report model"] = (env or {}).get(MODEL_ENV, "unset")
                         super().create_claim(name, pool=pool, env=env, labels=labels)

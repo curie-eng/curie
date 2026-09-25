@@ -201,6 +201,10 @@ def test_quota_refuses_over_cpu_and_stores_within_quota(
         agent = _create_agent(client, auth_headers, "rr-quota-over")
         over = _resources()
         over["requests"]["cpu"] = "1500m"
+        # 1500m is 1.5 cores. The block's limit must stay above that or the
+        # shape check refuses it before the quota check. The hard requests.cpu
+        # quota below is 1 core, which is what this case is over.
+        over["limits"]["cpu"] = "2"
         refused = _patch(client, auth_headers, agent["id"], {"runner_resources": over})
         assert refused.status_code == 422, refused.text
         detail = _detail_text(refused)
@@ -231,6 +235,7 @@ def test_unset_quota_accepts_over_cpu_when_shape_is_valid(
         agent = _create_agent(client, auth_headers, "rr-quota-unset")
         over = _resources()
         over["requests"]["cpu"] = "1500m"
+        over["limits"]["cpu"] = "2"
         resp = _patch(client, auth_headers, agent["id"], {"runner_resources": over})
         assert resp.status_code == 200, resp.text
         assert resp.json()["runner_resources"] == over

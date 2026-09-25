@@ -1,0 +1,92 @@
+{{- if .Values.agentSandbox.deploy }}
+{{- $kube := .Capabilities.KubeVersion.Version | default "" }}
+{{- if or (eq $kube "") (semverCompare "<1.30.0-0" $kube) }}
+{{- fail (printf "per-agent runner resources need Kubernetes 1.30 or newer so ValidatingAdmissionPolicy can constrain the worker ServiceAccount; this render is %q" $kube) }}
+{{- end }}
+{{- $fullname := include "curie.fullname" . }}
+{{- $workerSA := printf "%s-worker" $fullname }}
+{{- $gvisorClass := include "curie.gvisor.runtimeClassName" . | trim }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-runner-resources
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["extensions.agents.x-k8s.io"]
+        apiVersions: ["v1beta1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["sandboxtemplates", "sandboxwarmpools"]
+  matchConditions:
+    - name: worker-service-account
+      expression: {{ printf "request.userInfo.username == 'system:serviceaccount:%s:%s'" .Release.Namespace $workerSA | quote }}
+  validations:
+    - expression: >-
+        (request.resource.resource != 'sandboxtemplates' ||
+        (object.metadata.name.endsWith('-resources') &&
+        !object.metadata.name.endsWith('-resources-pool'))) &&
+        (request.resource.resource != 'sandboxwarmpools' ||
+        object.metadata.name.endsWith('-resources-pool'))
+      message: worker-owned runner templates end in -resources and their warm pools end in -resources-pool
+    - expression: >-
+        request.resource.resource != 'sandboxtemplates' ||
+        (object.spec.podTemplate.spec.containers.all(c,
+        has(c.resources) && has(c.resources.requests) && has(c.resources.limits) &&
+        'cpu' in c.resources.requests && 'memory' in c.resources.requests &&
+        'ephemeral-storage' in c.resources.requests &&
+        'cpu' in c.resources.limits && 'memory' in c.resources.limits &&
+        'ephemeral-storage' in c.resources.limits &&
+        c.resources.requests['cpu'] != '' && c.resources.requests['memory'] != '' &&
+        c.resources.requests['ephemeral-storage'] != '' &&
+        c.resources.limits['cpu'] != '' && c.resources.limits['memory'] != '' &&
+        c.resources.limits['ephemeral-storage'] != '') &&
+        (!has(object.spec.podTemplate.spec.initContainers) ||
+        object.spec.podTemplate.spec.initContainers.all(c,
+        has(c.resources) && has(c.resources.requests) && has(c.resources.limits) &&
+        'cpu' in c.resources.requests && 'memory' in c.resources.requests &&
+        'ephemeral-storage' in c.resources.requests &&
+        'cpu' in c.resources.limits && 'memory' in c.resources.limits &&
+        'ephemeral-storage' in c.resources.limits &&
+        c.resources.requests['cpu'] != '' && c.resources.requests['memory'] != '' &&
+        c.resources.requests['ephemeral-storage'] != '' &&
+        c.resources.limits['cpu'] != '' && c.resources.limits['memory'] != '' &&
+        c.resources.limits['ephemeral-storage'] != '')))
+      message: every runner container and init container must set cpu, memory, and ephemeral-storage requests and limits
+    {{- if .Values.agentSandbox.runner.hardening.enabled }}
+    - expression: >-
+        request.resource.resource != 'sandboxtemplates' ||
+        (object.spec.podTemplate.spec.containers.all(c,
+        has(c.securityContext) &&
+        c.securityContext.readOnlyRootFilesystem == true &&
+        c.securityContext.allowPrivilegeEscalation == false &&
+        has(c.securityContext.capabilities) &&
+        c.securityContext.capabilities.drop.exists(d, d == 'ALL')) &&
+        (!has(object.spec.podTemplate.spec.initContainers) ||
+        object.spec.podTemplate.spec.initContainers.all(c,
+        has(c.securityContext) &&
+        c.securityContext.readOnlyRootFilesystem == true &&
+        c.securityContext.allowPrivilegeEscalation == false &&
+        has(c.securityContext.capabilities) &&
+        c.securityContext.capabilities.drop.exists(d, d == 'ALL'))))
+      message: runner resource templates must keep the chart hardening securityContext
+    {{- end }}
+    {{- if $gvisorClass }}
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || object.spec.podTemplate.spec.runtimeClassName == '%s'" $gvisorClass | quote }}
+      message: runner resource templates must keep the chart RuntimeClass
+    {{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-runner-resources
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  policyName: {{ $fullname }}-runner-resources
+  validationActions: ["Deny"]
+{{- end }}
