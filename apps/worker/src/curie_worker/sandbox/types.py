@@ -67,6 +67,12 @@ def claim_warm_pool(
         return agent_warm_pool_name(base_pool, agent_name)
     return base_pool
 
+# The worker's own credentials, which never enter a sandbox. The connector
+# caller signing key is here and the caller token it signs
+# (``CURIE_CONNECTOR_CALLER_TOKEN``) is deliberately not: the token is this
+# sandbox's own identity, short-lived and naming only its agent, and the runner
+# must keep it to present to its hosted connectors (ADR-0168 decision 7). The
+# key could mint a token naming any agent.
 HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
     {
         "POSTGRES_PASSWORD",
@@ -80,6 +86,7 @@ HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
 )
 
