@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import redis
 
@@ -516,6 +517,86 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
     _reconcile()
     assert len(_notices(request_id)) == 1
     assert sink.posts == 1
+
+
+@pytest.mark.parametrize("actions_status", [302, 403])
+def test_ci_fix_turn_reads_failing_actions_job_log_when_available(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, actions_status: int
+) -> None:
+    """The published head reaches the observer, report, and queued fix turn."""
+
+    client, github, sink = admitted
+    number = 9784 + (actions_status == 403)
+    job_id = 81784
+    run = check_run(
+        "unit-tests",
+        conclusion="failure",
+        title="1 test failed",
+        summary="Process completed with exit code 1.",
+        run_id=job_id,
+    )
+    run["app"] = {"slug": "github-actions"}
+    sink.ci_script = [ci_entry(run)]
+    sink.annotations[job_id] = [
+        {
+            "path": "src/widget.py",
+            "start_line": 12,
+            "end_line": 12,
+            "annotation_level": "failure",
+            "message": "Process completed with exit code 1.",
+        }
+    ]
+    published = _published(client, github, sink, number)
+
+    signed_url = "https://pipelines.actions.githubusercontent.com/acme-example/job.txt?sig=example"
+    diagnostic = "AssertionError: expected 2, got 1"
+    secret = "ghs_" + "AbCd1234" * 5
+    original_send = httpx.AsyncClient.send
+    requests: list[httpx.Request] = []
+
+    async def github_and_signed_storage(
+        self: httpx.AsyncClient, request: httpx.Request, **kwargs: Any
+    ) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/actions/jobs/{job_id}/logs":
+            requests.append(request)
+            if actions_status == 403:
+                return httpx.Response(
+                    403,
+                    json={"message": "Resource not accessible by integration"},
+                    request=request,
+                )
+            return httpx.Response(302, headers={"Location": signed_url}, request=request)
+        if str(request.url) == signed_url:
+            requests.append(request)
+            return httpx.Response(
+                200, text=f"{diagnostic}\nGITHUB_TOKEN={secret}\n", request=request
+            )
+        return await original_send(self, request, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", github_and_signed_storage)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    turns = _ci_turns(published["id"])
+    assert [turn["event_id"] for turn in turns] == [f"work-item-{published['id']}-ci-2"]
+    prompt = turns[0]["text"]
+    assert "Process completed with exit code 1." in prompt
+    assert [request.url.path for request in requests if "/actions/jobs/" in request.url.path] == [
+        f"/repos/{REPO}/actions/jobs/{job_id}/logs"
+    ]
+    report = json.loads(prompt.splitlines()[3])
+    failing = report["failing_checks"][0]
+    if actions_status == 403:
+        assert failing["job_log"] == "Job log unavailable."
+        assert diagnostic not in prompt
+        assert len(requests) == 1
+    else:
+        assert diagnostic in failing["job_log"]
+        assert secret not in prompt
+        assert "GITHUB_TOKEN=[REDACTED:secret_assignment]" in failing["job_log"]
+        assert len(requests) == 2
+        assert "authorization" not in requests[1].headers
 
 
 def test_a_green_fix_round_completes_the_same_request(admitted: Any) -> None:

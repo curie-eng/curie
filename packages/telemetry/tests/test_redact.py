@@ -116,6 +116,74 @@ def test_curie_egress_secret_assignment_is_redacted() -> None:
     assert "[REDACTED:secret_assignment]" in redacted
 
 
+def test_generic_key_assignments_keep_names_and_remove_values() -> None:
+    assignments = {
+        "AWS_SECRET_ACCESS_KEY": "FAKE" + "AWSSECRETACCESS0000",
+        "MY_PRIVATE_KEY": "FAKE" + "PRIVATEKEYVALUE0000",
+    }
+    text = "\n".join(f"{key}={value}" for key, value in assignments.items())
+
+    redacted = redact_text(text)
+
+    for key, value in assignments.items():
+        assert value not in redacted
+        assert f"{key}=[REDACTED:secret_assignment]" in redacted
+
+
+def test_named_secret_colon_field_keeps_diagnostic_context() -> None:
+    value = "FAKE" + "AWSSECRETACCESS0000"
+    line = f"step failed AWS_SECRET_ACCESS_KEY: {value} exit code 1"
+
+    redacted = redact_text(line)
+
+    assert redacted == (
+        "step failed AWS_SECRET_ACCESS_KEY: [REDACTED:secret_assignment] exit code 1"
+    )
+    assert value not in redacted
+    assert redact_text(redacted) == redacted
+
+
+def test_named_secret_json_field_keeps_other_fields() -> None:
+    value = "FAKE" + "JSONSECRETACCESS0000"
+    line = '{"AWS_SECRET_ACCESS_KEY": "' + value + '", "status": "failed"}'
+
+    redacted = redact_text(line)
+
+    assert redacted == (
+        '{"AWS_SECRET_ACCESS_KEY": "[REDACTED:secret_assignment]", '
+        '"status": "failed"}'
+    )
+    assert value not in redacted
+    assert redact_text(redacted) == redacted
+
+
+def test_named_secret_dict_field_keeps_other_fields() -> None:
+    value = "FAKE" + "DICTSECRETACCESS0000"
+    line = "{'AWS_SECRET_ACCESS_KEY': '" + value + "', 'status': 'failed'}"
+
+    redacted = redact_text(line)
+
+    assert redacted == (
+        "{'AWS_SECRET_ACCESS_KEY': '[REDACTED:secret_assignment]', "
+        "'status': 'failed'}"
+    )
+    assert value not in redacted
+    assert redact_text(redacted) == redacted
+
+
+def test_credential_assignment_is_redacted() -> None:
+    value = "FAKE" + "DATABASECREDENTIAL0000"
+    line = f"database rejected DB_CREDENTIAL={value} connection"
+
+    redacted = redact_text(line)
+
+    assert redacted == (
+        "database rejected DB_CREDENTIAL=[REDACTED:secret_assignment] connection"
+    )
+    assert value not in redacted
+    assert redact_text(redacted) == redacted
+
+
 def test_unprefixed_secret_without_assignment_or_header_context_is_not_redacted() -> None:
     # CURIE_EGRESS_SECRET has no unique prefix. A regex that claimed to
     # recognize the value itself would also redact ordinary diagnostic text.
