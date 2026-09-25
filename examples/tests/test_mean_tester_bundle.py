@@ -363,3 +363,12 @@ def test_a_campaign_waits_for_its_next_window_instead_of_ending():
     assert "Do not end the turn to wait for the thread rate" in run
     report = _section("Reporting")
     assert "at most five `Next:` lines" in report
+
+
+def test_a_campaign_waits_in_the_foreground_because_nothing_wakes_it():
+    # MEASURED: told not to end the turn to wait, a campaign ran its wait in the
+    # background and ended with "I'll continue once notified". The runner never
+    # delivers a background command's result to a finished turn.
+    run = _section("Running a campaign")
+    assert "never in the background" in run
+    assert "Nothing will wake you" in run
