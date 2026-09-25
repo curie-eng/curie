@@ -8,6 +8,7 @@ is read off the wire.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 
 import pytest
@@ -137,6 +138,39 @@ def test_a_turn_is_answered_with_the_token_of_the_identity_it_arrived_on(
                 assert await h.async_redis.exists(h.config.done_key(ev.event_id))
             assert "chat.update" in capture.methods()
             assert capture.tokens() == {f"Bearer {token}"}
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_runs(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    # No reply is possible: only the addressed bot may edit its placeholder,
+    # and any other bot's reply is the defect. So nothing runs, nothing is
+    # claimed, Slack is never called, and the log names what was refused.
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            binding = _TripleBinding({("slack", "ghost", _CHANNEL): _resolved("ghost")})
+            async with make_harness(binding=binding, sink=_sink(port)) as h:
+                h.runner.default_script = [Final(text="answer", status=DONE)]
+                ev = _qevent("hi", adapter="ghost", thread="t-ghost")
+                with caplog.at_level(logging.ERROR, logger="curie_worker.kernel"):
+                    await h.kernel.process_event(ev)
+
+                assert h.runner.opened == []
+                assert h.fake_k8s.claims == {}
+                assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert capture.requests == []
+            text = "\n".join(caplog.messages)
+            assert ev.event_id in text and "'ghost'" in text
+            assert _DEFAULT_TOKEN not in text and _OPS_TOKEN not in text
         finally:
             await server.close()
 
