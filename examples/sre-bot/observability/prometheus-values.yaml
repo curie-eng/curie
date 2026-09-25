@@ -156,13 +156,13 @@ serverFiles:
         # value counts as its increase over the same window increase() uses.
         # The costs: a Prometheus with no history of a running process, such
         # as a fresh install or a lost volume, treats every counter as new,
-        # and each one already at its threshold pages once, for about its
+        # and each one already at its threshold pages once, for up to its
         # window. A series with no sample for longer than the 1h lookback
         # plus the rule's `for` refires once when samples resume;
         # CurieApplicationMetricsAbsent pages long before a gap that long.
         #
-        # An install that sets api.approvalSweepIntervalSeconds to 0 records
-        # no curie_approval_pending and should drop that term from
+        # An install that sets api.approvalSweepIntervalSeconds to 0 or less
+        # records no curie_approval_pending and should drop that term from
         # CurieApplicationMetricsAbsent.
         rules:
           - alert: CurieApplicationMetricsAbsent
