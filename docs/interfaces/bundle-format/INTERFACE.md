@@ -95,7 +95,16 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   the placeholder at boot and then drop the name from the process env (#2503, #2559). The `url`
   fallback used by tiers below cluster derives no header and remains a follow-up. A hosted
   connector with several
-  secrets and no `bearer_secret` is `connectors.bearer_secret_required`. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  secrets and no `bearer_secret` is `connectors.bearer_secret_required`. A hosted connector may
+  declare `admits`, the agent names whose sandboxes may call it (ADR-0168 decision 7): a missing
+  list admits the deploying agent alone, `[]` refuses everyone, and a list is exact, so it does
+  not add the deploying agent. An entry is either the reserved name `self`, meaning the agent the
+  bundle is deployed as, or a name shaped like `deploy.yaml`'s agent names; either way it may not
+  repeat (`connectors.bad_admits_agent`, `connectors.duplicate_admits`), and a `url` connector
+  cannot declare `admits` at all (`connectors.remote_has_admits`). `self` is itself refused as an
+  agent name (`deploy.bad_agent_name`), since a target genuinely named `self` would be
+  indistinguishable from the sentinel. This release only accepts, validates and carries the list
+  and the entries it names; nothing enforces it until a later release. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,

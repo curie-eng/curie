@@ -141,6 +141,29 @@ the reconciler creates the Service by the same name. Enabling the flag is what
 makes the chart grant the worker create, patch and delete on the connector
 object kinds, so a worker that is not reconciling does not hold that grant.
 
+Who may call a hosted connector is decision 7 of
+[ADR-0168](../../adr/0168-one-installation-hosts-several-bot-identities.md).
+Today the rendered ingress policy, `render_ingress_networkpolicy`
+(`packages/plugin-format/src/plugin_format/connector_render.py::render_ingress_networkpolicy`),
+is still the whole check: it admits every sandbox of the release. What this
+release adds is the caller's identity, carried but not yet checked. When
+`CURIE_CONNECTOR_CALLER_SIGNING_KEY` is set, the worker's `boot_env`
+(`apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`) signs the
+resolved agent's name with `mint`
+(`apps/worker/src/curie_worker/caller_token.py::mint`), and `render_worker`
+(`packages/aci-protocol/src/aci_protocol/session.py::BootEnv.render_worker`)
+emits it as `CURIE_CONNECTOR_CALLER_TOKEN` with the connector scope. The runner's
+`derive_mcp_servers`
+(`runner/src/curie_runner/connectors.py::derive_mcp_servers`) then gives each
+hosted entry the header `CALLER_HEADER`
+(`runner/src/curie_runner/connectors.py::CALLER_HEADER`) with the token's
+placeholder, and gives none to a remote or fallback URL. The token stays in the
+sandbox env, because the MCP client expands the header from it; the signing key
+never enters a sandbox
+(`apps/worker/src/curie_worker/sandbox/types.py::HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
+The wire is frozen in `tests/vectors/connector-caller-token.json`. With no key
+set, nothing is minted and the boot env is unchanged.
+
 ## Implementations today
 
 One production host plus a fake:
