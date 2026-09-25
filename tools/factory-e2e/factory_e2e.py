@@ -141,6 +141,9 @@ OPENROUTER_KEY_URL = f"https://{OPENROUTER_HOST}/api/v1/key"
 # The factory agent's per-agent execution deadline (#3071, ADR 0171; the
 # maximum), which the ExecutionRequest deadline follows, and the chart's
 # maximum worker delivery budget.
+# Context window declared for a gateway model Claude Code's catalog does not
+# know. Conservative, so compaction starts before any supported model's limit.
+GATEWAY_CONTEXT_TOKENS = 128_000
 EXECUTION_BOUND_SECONDS = 10800
 # Wait allowance after the execution deadline for publication and the notice.
 PUBLICATION_ALLOWANCE_SECONDS = 600
@@ -761,11 +764,15 @@ def install_values(
         values["agentSandbox"]["runner"].update(
             {"fakeModel": False, "model": config.model, "credentials": config.model_api_key}
         )
-        # Claude Code's session-title request does not recognize a gateway model
-        # id. That side request fails the turn as "model error: unknown".
-        # CLAUDE_CODE_DISABLE_TERMINAL_TITLE skips it for Agent SDK sessions.
+        # A gateway model id is missing from Claude Code's model catalog, so it
+        # logs a "[claude-code:unrecognized_model]" warning. That is a warning,
+        # not the failure: the turn still reaches the gateway. Skipping the
+        # session-title side request keeps one needless call per turn off the
+        # gateway, and naming the context window silences the unknown-model
+        # notice instead of letting Claude Code guess a window.
         values["agentSandbox"]["runner"]["extraEnv"] = [
             {"name": "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "value": "1"},
+            {"name": "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "value": str(GATEWAY_CONTEXT_TOKENS)},
         ]
         # The chart maximum, so the agent's 10800 s execution deadline and not
         # the default 600 s worker budget bounds the run. The runner ceiling
