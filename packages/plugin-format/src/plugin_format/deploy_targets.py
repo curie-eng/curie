@@ -11,12 +11,20 @@ capabilities change, a target changes when the deployment topology does.
         agent: acme-dev
         env: dev
         slack_channel: C0EXAMPLE2
+        connectors: [grafana]
       prod:
         agent: acme-bot
         env: prod
+        identity: ops-bot
         slack_channel: C0EXAMPLE1
 
     curie cluster deploy --target prod
+
+``identity`` names the channel identity (the bot) a target's binding speaks
+through, and defaults to ``default``, the installation's own. ``connectors``
+limits which of ``connectors.yaml``'s connectors run for the target: absent
+means all of them, ``[]`` means none. Two agents built from one artifact can
+then hold different credentials (ADR-0168 decision 8).
 
 Before this, routing lived in whatever invoked the command. For acme-bot that
 was two GitHub Actions workflows describing a dev/prod split that did not
@@ -42,6 +50,11 @@ from pydantic import BaseModel, ConfigDict, Field
 # drift. A plain module-level import is fine here: unlike `connectors`, this
 # module is not imported by `connector_render`, so there is no cycle (#1446).
 from .connector_render import agent_forges_join
+
+# A connector allowlist entry must be a name `connectors.yaml` could declare, so
+# the rule is the one that module applies, imported for the same no-drift reason.
+from .connectors import _NAME_MAX as _CONNECTOR_NAME_MAX
+from .connectors import _is_valid_name as _is_valid_connector_name
 
 # Curie's two deployment environments. Not open-ended: the worker's binding
 # query ranks prod over dev explicitly, so a third value would silently never
@@ -69,7 +82,11 @@ class DeployTarget(BaseModel):
     # target, while the nullable shape preserves the existing schema.
     agent: str | None = None
     env: str = "dev"
+    # The channel identity the binding speaks through (ADR-0168 decision 8).
+    identity: str = "default"
     slack_channel: str | None = None
+    # `None` runs every connector the bundle declares; a list runs only those.
+    connectors: list[str] | None = None
 
 
 class DeployTargetsFile(BaseModel):
@@ -175,5 +192,42 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
                     "the agent to a channel nobody is watching and the deploy still succeeds.",
                 )
             )
+
+        # Shape only: which identities exist is the installation's to say, and
+        # this validator never sees the installation.
+        if not _is_valid_name(target.identity):
+            errors.append(
+                (
+                    "deploy.bad_identity",
+                    f"{where}: `{target.identity}` is not a valid identity name. The "
+                    "identity is the channel identity (the bot) this target's binding "
+                    "speaks through, and the installation must declare it; it must be "
+                    "lowercase alphanumeric or dashes, start and end alphanumeric, and be "
+                    f"at most {_NAME_MAX} characters",
+                )
+            )
+        if target.connectors is not None:
+            seen: set[str] = set()
+            repeated: set[str] = set()
+            for connector in target.connectors:
+                if not _is_valid_connector_name(connector):
+                    errors.append(
+                        (
+                            "deploy.bad_connector_name",
+                            f"{where}: connectors lists `{connector}`, which no "
+                            "connectors.yaml could declare: a connector name must be "
+                            "lowercase alphanumeric or dashes, start and end alphanumeric, "
+                            f"and be at most {_CONNECTOR_NAME_MAX} characters",
+                        )
+                    )
+                if connector in seen and connector not in repeated:
+                    repeated.add(connector)
+                    errors.append(
+                        (
+                            "deploy.duplicate_connector",
+                            f"{where}: connectors lists `{connector}` more than once",
+                        )
+                    )
+                seen.add(connector)
 
     return (parsed if not errors else None), errors

@@ -142,15 +142,21 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
 - `deploy.yaml` (ADR-0089, `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTargetsFile`)
   declares named deploy targets under a `targets` map, each a
   `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget` of
-  `{agent, env, slack_channel}` where `env` is `dev` or `prod`. Validated by
-  `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
+  `{agent, env, identity, slack_channel, connectors}` where `env` is `dev` or `prod`, `identity`
+  names the channel identity (the bot) the target's binding speaks through and defaults to
+  `default`, and `connectors` is an allowlist over the bundle's `connectors.yaml` connectors:
+  absent runs all of them, a list runs only those, `[]` runs none (ADR-0168 decision 8). Validated
+  by `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
   `deploy.*` codes (`deploy.not_object`, `deploy.duplicate_target`, `deploy.bad_target_name`,
   `deploy.bad_env`, `deploy.missing_agent` (a declared target must name its agent; the error names
   the target key), `deploy.bad_agent_name`, `deploy.ambiguous_agent_name` (the agent, not the
   connector, must not contain `-mcp-` or END in `-mcp`, since the agent sits immediately left of
   the `-mcp-` join — same collision as `connectors.ambiguous_name`, viewed from the other side of
   the join),
-  `deploy.bad_slack_channel`). Authored mapping keys are
+  `deploy.bad_slack_channel`, `deploy.bad_identity` (shape only: the installation declares its
+  identities and this validator never sees it), `deploy.bad_connector_name` (the `connectors.yaml` name
+  rule), `deploy.duplicate_connector`, `deploy.unknown_connector` (an allowlist entry
+  `connectors.yaml` does not declare)). Authored mapping keys are
   checked for duplicates before validation, so a repeated target name fails closed instead of
   silently selecting the last YAML value.
 
