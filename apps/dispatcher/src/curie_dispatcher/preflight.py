@@ -47,6 +47,7 @@ import math
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
@@ -281,8 +282,13 @@ def _collect_slack_destinations(
     A channel binding belongs to the identity its ``adapter`` names. An approval
     target names none in this projection, so it belongs to every identity its
     agent is bound through on Slack, or to ``default`` for an agent bound
-    through none. A name this installation does not declare, such as the
-    credential slug a pre-ADR custom-transport binding stores, is ``default``'s.
+    through none. It is ``default``'s as well when the projection shows the
+    agent another ingress, a non-Slack channel binding or hook configuration:
+    ``default`` posts the Slack cards of turns that did not arrive on Slack. A
+    cron trigger is declared in the agent's bundle, which this projection does
+    not carry, so a cron hook alone is not seen here. A name this installation
+    does not declare, such as the credential slug a pre-ADR custom-transport
+    binding stores, is ``default``'s.
     """
     if not isinstance(payload, list):
         raise ValueError("agent list is not an array")
@@ -313,9 +319,11 @@ def _collect_slack_destinations(
         if not isinstance(channels, list):
             raise ValueError("agent channels are not an array")
         bound: set[str] = set()
+        other_ingress = bool(agent.get("hook_partitions") or agent.get("source_bindings"))
         for target in channels:
             found = slack_target(target)
             if found is None:
+                other_ingress = True
                 continue
             address, owner = found
             bound.add(owner)
@@ -326,7 +334,7 @@ def _collect_slack_destinations(
             continue
         if not isinstance(approval_routes, Mapping):
             raise ValueError("approval routes are not an object")
-        posters = bound or {DEFAULT_IDENTITY}
+        posters = (bound | {DEFAULT_IDENTITY}) if other_ingress else (bound or {DEFAULT_IDENTITY})
         for route in approval_routes.values():
             if not isinstance(route, Mapping) or "resolution" not in route:
                 raise ValueError("approval route is malformed")
@@ -459,6 +467,12 @@ def check_slack_channel_capabilities(
     )
     if not declared:
         raise ValueError("Slack preflight needs at least one identity")
+    # Resolved before any call, so a seam missing for a declared name raises
+    # here rather than falling through to a production client.
+    seams = {
+        identity.name: web_clients[identity.name] if web_clients is not None else web_client
+        for identity in declared
+    }
 
     timeout_s = config.api_preflight_timeout_s
     http = api_client or httpx.Client(timeout=min(_MAX_PROBE_TIMEOUT_S, timeout_s))
@@ -529,12 +543,11 @@ def check_slack_channel_capabilities(
     several = len(declared) > 1
 
     def probe(identity: SlackIdentityCredentials) -> PreflightedIdentity:
-        injected = web_clients.get(identity.name) if web_clients is not None else web_client
         return _probe_identity(
             identity,
             owned_destinations.get(identity.name, set()),
             deadline=deadline,
-            injected=injected,
+            injected=seams[identity.name],
             logger=logger,
             monotonic=monotonic,
             several=several,
@@ -546,20 +559,30 @@ def check_slack_channel_capabilities(
     # One thread per identity against the ONE deadline: the chart's startup
     # envelope (charts/curie/templates/dispatcher.yaml) is sized for a single
     # Slack budget, and in sequence a slow identity would spend the others'.
+    #
+    # The wait ends one Slack call's timeout after that deadline, the most a
+    # probe that checks the deadline before every call can overrun it. A call
+    # that ignores its own timeout then costs only its own identity, and the
+    # pool is left without joining the thread that holds it.
+    cutoff = deadline + _SLACK_API_TIMEOUT_SECONDS
     outcomes: dict[str, PreflightedIdentity | SlackChannelPreflightError] = {}
-    with ThreadPoolExecutor(
-        max_workers=len(declared), thread_name_prefix="slack-preflight"
-    ) as pool:
+    pool = ThreadPoolExecutor(max_workers=len(declared), thread_name_prefix="slack-preflight")
+    try:
         futures = [(identity.name, pool.submit(probe, identity)) for identity in declared]
         for name, future in futures:
             try:
-                outcomes[name] = future.result()
+                outcomes[name] = future.result(timeout=max(0.0, cutoff - monotonic()))
             except SlackChannelPreflightError as exc:
                 outcomes[name] = exc
+            except FutureTimeoutError:
+                future.cancel()
+                outcomes[name] = SlackChannelPreflightError(_SLACK_CAPABILITY_DEADLINE_MESSAGE)
             except Exception:
                 # Redaction boundary, as everywhere in this module: the
                 # exception's text can carry provider bodies.
                 outcomes[name] = SlackChannelPreflightError(_IDENTITY_PROBE_FAULT_MESSAGE)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     for name, outcome in outcomes.items():
         if isinstance(outcome, SlackChannelPreflightError):
             logger.error(
@@ -589,8 +612,9 @@ def _probe_identity(
 
     Raises ``SlackChannelPreflightError`` on this identity's definitive refusal
     or when the shared deadline leaves one of its checks unattempted. With
-    ``several`` identities it also asks ``auth.test`` and names itself in the
-    summary line; a lone identity's calls and line are unchanged.
+    ``several`` identities it also asks ``auth.test``, which never refuses, and
+    names itself in the summary line; a lone identity's calls and line are
+    unchanged.
     """
     ordered_addresses = sorted(addresses)
     checked = 0
@@ -672,25 +696,6 @@ def _probe_identity(
     else:
         files_status = "verified" if _is_files_list_success(files_response) else "unverified"
 
-    # The ids decision 6 needs to admit a sibling identity's bot (ADR-0168).
-    # Asked only with several identities, on the client this identity already
-    # opened, under the same deadline. An unanswered call records nothing and
-    # skips nothing: a bad token does not stop boot today either.
-    bot_ids: SlackBotIds | None = None
-    if several:
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise SlackChannelPreflightError(_SLACK_CAPABILITY_DEADLINE_MESSAGE) from None
-        try:
-            bot_ids = bot_ids_from_auth_test(capability_client.auth_test())
-        except Exception:
-            bot_ids = None
-        if bot_ids is None:
-            logger.warning(
-                "Slack identity %s: auth.test did not answer; its bot ids are unknown",
-                identity.name,
-            )
-
     for address in ordered_addresses:
         remaining = deadline - monotonic()
         if remaining <= 0:
@@ -718,6 +723,25 @@ def _probe_identity(
             continue
 
         checked += 1
+
+    # The ids decision 6 needs to admit a sibling identity's bot (ADR-0168).
+    # Asked only with several identities, on the client this identity already
+    # opened, and last, so it cannot spend the budget a destination needs.
+    # Under the same deadline, but it refuses nothing: an expired deadline or an
+    # unanswered call records no ids and skips nothing, as an invalid token does
+    # not refuse boot either (the capability probe counts it unverified).
+    bot_ids: SlackBotIds | None = None
+    if several:
+        if deadline - monotonic() > 0:
+            try:
+                bot_ids = bot_ids_from_auth_test(capability_client.auth_test())
+            except Exception:
+                bot_ids = None
+        if bot_ids is None:
+            logger.warning(
+                "Slack identity %s: auth.test did not answer; its bot ids are unknown",
+                identity.name,
+            )
 
     # A nondefinitive `files:read` probe raises the level without changing the
     # line: the definitive answer already refused above. What is left to say is
