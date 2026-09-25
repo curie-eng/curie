@@ -81,7 +81,10 @@ UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 # SDK ResultMessage subtypes that name a known platform failure (#3071). Only
 # this explicit table maps an SDK token onto platform vocabulary; everything
 # else still goes through the allowlist unchanged.
-_RESULT_SUBTYPE_CLASSIFICATIONS = {"error_max_turns": "max-turns"}
+_RESULT_SUBTYPE_CLASSIFICATIONS = {
+    "error_max_turns": "max-turns",
+    "error_max_budget_usd": "budget-exceeded",
+}
 
 
 def map_error_classification(raw: str | None) -> str:
