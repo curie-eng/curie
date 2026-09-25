@@ -164,10 +164,15 @@ repository, or give no spec at all.
 That one request runs a whole campaign and replies with its report. To send one
 probe and nothing else, add `with exactly this probe: "…"`.
 
-Reply in the report's thread with the mention: `@mean-tester continue` runs
-what a campaign left as `Next:` lines, and `@mean-tester rerun <id>` sends a
-finished campaign's messages again. The dispatcher receives only mentions and
-direct messages, so a bare `continue` reaches nobody. For each FAIL, the report
+Send the next request as a new message, with the campaign's id:
+`@mean-tester continue <id>` runs what a campaign left as `Next:` lines, and
+`@mean-tester rerun <id>` sends a finished campaign's messages again. Not in
+the report's thread: a thread keeps every turn's history, the platform caps
+that history at 64 KiB, and one campaign's turn can use nearly all of it.
+Measured 2026-09-25: after a 31-probe campaign and one `continue`, `rerun` in
+the same thread was refused with `history-persistence-error`, and every later
+turn there would be too. The dispatcher receives only mentions and direct
+messages, so a bare `continue` reaches nobody. For each FAIL, the report
 carries an eval case for the target's `evals/cases.json`. You file the issue.
 
 ## A campaign
@@ -208,8 +213,11 @@ The operator sets three numbers under "Where you work":
 
 **Rerun.** Every probe a campaign sends carries its id: `[mean test <id>]`.
 After a fix, `@mean-tester rerun <id>` finds that campaign's messages in the
-channel and sends them again, word for word and in the same order. It reports
-each probe as fixed, still failing, newly failing or unchanged. The same
+channel and sends them again, word for word and in the same order. It reads
+the old verdicts from the campaign's report, which it finds by its id in the
+channel it was asked in, and reports each probe as fixed, still failing, newly
+failing or unchanged. When that report cannot be found, it says so and reports
+the new verdicts alone. The same
 messages are what make the second run a check of the fix, rather than a new
 test.
 
