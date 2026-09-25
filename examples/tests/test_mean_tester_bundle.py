@@ -328,3 +328,20 @@ def test_the_plan_lives_in_a_file_and_the_reply_stays_short():
     run = _section("Running a campaign")
     assert "Write nothing but tool calls until the report" in run
     assert "3,000 characters" in run
+
+
+def test_a_campaign_spends_few_agent_steps_and_the_readme_names_the_cap():
+    # MEASURED on a live campaign: the turn failed with error_max_turns at the
+    # runner's default of 20 model steps, after probes had gone out.
+    readme = " ".join((BUNDLE / "README.md").read_text().split())
+    assert "CURIE_MAX_TURNS" in readme and "agentSandbox.runner.extraEnv" in readme
+    run = _section("Running a campaign")
+    assert "in one step" in run
+
+
+def test_continue_never_claims_a_report_that_was_not_delivered():
+    # MEASURED: after a turn failed before reporting, "continue" answered that
+    # its last report had no Next: lines. No report had reached the thread.
+    cont = _section('"continue"')
+    assert "/tmp/mean-test-plan.md" in cont
+    assert "never say a report was delivered" in cont
