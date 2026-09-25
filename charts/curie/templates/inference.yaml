@@ -69,6 +69,9 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       volumes:
         - name: ollama-data
           {{- if .Values.inference.persistence.enabled }}

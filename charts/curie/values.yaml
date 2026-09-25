@@ -77,13 +77,20 @@ placement:
     affinity: {}
 
 # ---------------------------------------------------------------------------
-# PriorityClass (ADR-0059 decision 5): ranks the control plane -- worker, api,
-# dispatcher, and the data tier (postgres, valkey, clickhouse, rustfs) -- above
-# sandbox pods for node-pressure eviction, so the components that supervise,
-# drain, and reclaim a sandbox are never themselves preferred for eviction over
-# the sandboxes they manage. Priority is a ranking and preemption lever, not
-# immunity: a node fully out of a resource (e.g. disk) can still take anything
-# down regardless of priority.
+# PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
+# dispatcher, the data tier (postgres, valkey, clickhouse, rustfs), and the
+# observability and UI tier (langfuse web/worker, the OTel collector, the UI,
+# inference, the mail adapter) -- above sandbox pods for node-pressure
+# eviction, so the components that supervise, drain, and reclaim a sandbox --
+# and the components that carry its traces and metrics -- are never themselves
+# preferred for eviction over the sandboxes they manage. The observability and
+# UI tier joined the platform set in #3182: at priority 0 those pods were
+# preempted by the very sandboxes whose telemetry they collect, and the
+# collector's OTLP endpoint went `Connection refused` mid-run. The
+# runner-prewarm DaemonSet deliberately stays UNCLASSED (priority 0, below
+# `sandbox`): the image-cache pod is the designated sacrifice. Priority is a
+# ranking and preemption lever, not immunity: a node fully out of a resource
+# (e.g. disk) can still take anything down regardless of priority.
 #
 # Both names are cluster-scoped (PriorityClass has no namespace), so installing
 # a second curie release into the SAME cluster must override one release's
@@ -97,7 +104,9 @@ placement:
 priorityClasses:
   platform:
     # Renders the PriorityClass and sets priorityClassName on every
-    # control-plane pod. Set false (and repoint `name` at an existing class) if
+    # long-running platform workload (control plane, data tier, observability
+    # and UI; the full inventory is pinned by ci/render-assertions.sh
+    # Assertion 8). Set false (and repoint `name` at an existing class) if
     # the cluster/another release already defines an equivalent one.
     create: true
     name: curie-platform
