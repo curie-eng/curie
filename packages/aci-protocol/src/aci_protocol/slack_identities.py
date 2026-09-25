@@ -39,7 +39,11 @@ SLACK_CREDENTIAL_ENV_PREFIXES: tuple[str, ...] = (
     SIGNING_SECRET_ENV_PREFIX,
 )
 
-IDENTITY_NAME_PATTERN = r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+#: Hyphen-separated lowercase runs: the binding schema's ``adapter`` rule,
+#: without its underscore, so every declared name is one a binding can carry.
+#: ``charts/curie/templates/_slack-identities.tpl`` spells the same pattern,
+#: and ``charts/curie/ci/slack-identities-assertions.sh`` checks that it does.
+IDENTITY_NAME_PATTERN = r"^[a-z0-9]+(-[a-z0-9]+)*$"
 IDENTITY_NAME_MAX_LENGTH = 40
 
 _INDEX = r"(0|[1-9][0-9]*)"

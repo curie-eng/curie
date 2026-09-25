@@ -1,9 +1,10 @@
 {{/* Slack identities (ADR-0168 decision 1).
 
      dispatcher.slack is the identity named `default`; dispatcher.slack.identities
-     lists more, each by existingSecret reference only (#1759). With no list
-     entries this renders exactly the SLACK_* entries it always did and nothing
-     else. The rules the render refuses are the ones
+     lists more, each by existingSecret reference only (#1759). Once the list is
+     non-empty, the dispatcher.slack block takes references only too. With no
+     list entries this renders exactly the SLACK_* entries it always did, plain
+     values included, and nothing else. The rules the render refuses are the ones
      packages/aci-protocol/src/aci_protocol/slack_identities.py refuses at boot;
      charts/curie/ci/slack-identities-assertions.sh feeds the rendered JSON
      through that parser so the two cannot drift. */}}
@@ -45,8 +46,8 @@
 {{- if not (kindIs "string" $name) -}}
 {{- fail (printf "%s.name must be a string." $where) -}}
 {{- end -}}
-{{- if or (gt (len $name) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $name)) -}}
-{{- fail (printf "%s.name %q must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ and be at most 40 characters, the deploy target name shape." $where $name) -}}
+{{- if or (gt (len $name) 40) (not (regexMatch "^[a-z0-9]+(-[a-z0-9]+)*$" $name)) -}}
+{{- fail (printf "%s.name %q must match ^[a-z0-9]+(-[a-z0-9]+)*$ and be at most 40 characters: lowercase letters and digits in runs joined by single hyphens, a name a binding's adapter can carry." $where $name) -}}
 {{- end -}}
 {{- if eq $name "curie-cluster-message" -}}
 {{- fail (printf "%s.name %q is reserved: it is the built-in cluster-message reply adapter, a delivery selector every binding already refuses, not an identity. Choose another name." $where $name) -}}
@@ -89,8 +90,13 @@
 {{- $listed = append $listed $item -}}
 {{- end -}}
 {{- if $listed -}}
+{{- range $token := list "appToken" "botToken" "signingSecret" -}}
+{{- if get $s $token -}}
+{{- fail (printf "dispatcher.slack.%s is a plain secret value, and dispatcher.slack.identities is not empty. Once the list declares an identity, every Slack identity, default included, takes its secrets only by reference (#1759). Set dispatcher.slack.%sExistingSecret and %sExistingSecretKey instead." $token $token $token) -}}
+{{- end -}}
+{{- end -}}
 {{- if and $block (not (and (or $s.appToken $s.appTokenExistingSecret) (or $s.botToken $s.botTokenExistingSecret))) -}}
-{{- fail "dispatcher.slack is half-configured: alongside dispatcher.slack.identities it is the identity \"default\" and needs both an app token and a bot token (plain or existingSecret)." -}}
+{{- fail "dispatcher.slack is half-configured: alongside dispatcher.slack.identities it is the identity \"default\" and needs both an app token and a bot token, each by existingSecret." -}}
 {{- end -}}
 {{- if and (not $block) (not (hasKey $seen "default")) -}}
 {{- fail "dispatcher.slack.identities declares no identity named \"default\". Every Slack route that names no identity means \"default\", so configure it in dispatcher.slack or as a list entry named default." -}}

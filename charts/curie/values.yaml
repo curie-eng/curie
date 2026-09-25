@@ -1417,9 +1417,12 @@ dispatcher:
     # identity named `default`; each entry here is one more Slack app, and a
     # binding names it in `adapter`. Empty (the default) renders nothing new.
     # Each secret arrives by existingSecret reference only (#1759): a plain
-    # appToken/botToken/signingSecret key in an entry fails the render.
+    # appToken/botToken/signingSecret key in an entry fails the render, and so
+    # does a plain appToken/botToken/signingSecret in the block above once this
+    # list is non-empty. With the list empty, the block keeps taking plain
+    # values.
     #   identities:
-    #     - name: sales                     # [a-z0-9]([a-z0-9-]*[a-z0-9])?, at most 40
+    #     - name: sales                     # [a-z0-9]+(-[a-z0-9]+)*, at most 40
     #       appTokenExistingSecret: slack-sales
     #       appTokenExistingSecretKey: slackAppToken          # the default
     #       botTokenExistingSecret: slack-sales

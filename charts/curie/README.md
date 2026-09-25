@@ -1698,6 +1698,11 @@ replace or clear. That preservation lives in `cli/src/ops/up.rs`.
 ([ADR-0168](../../docs/adr/0168-one-installation-hosts-several-bot-identities.md)
 decision 1). `dispatcher.slack.identities` lists more, each by
 `existingSecret` reference only; a plain token in an entry fails the render.
+Once the list is non-empty, `default` takes its secrets by reference too: a
+plain `appToken`, `botToken` or `signingSecret` in the `dispatcher.slack` block
+fails the render, so `curie cluster comms --slack`, which writes plain block
+tokens, is refused on such an install. With no entries the block keeps
+accepting plain values, as it always has.
 
 ```yaml
 dispatcher:
@@ -1716,8 +1721,10 @@ key existed. With entries, the dispatcher, worker and API each receive
 its tokens, from one helper (`templates/_slack-identities.tpl`). Entry `n`'s bot
 token is `CURIE_SLACK_BOT_TOKEN__<n>` in all three, and the dispatcher also
 gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set, `CURIE_SLACK_SIGNING_SECRET__<n>`.
-`default` always keeps the `SLACK_*` names. The render refuses a duplicate or
-malformed name, a name of `curie-cluster-message` (reserved for the platform's
+`default` always keeps the `SLACK_*` names. The render refuses a duplicate
+name, a name that is not lowercase letters and digits in runs joined by single
+hyphens (at most 40 characters, so every name is one a binding's `adapter` can
+carry), a name of `curie-cluster-message` (reserved for the platform's
 built-in cluster-message reply adapter), a missing token reference, `default`
 configured twice or not at all, and an `extraEnv` entry naming any of these
 variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
