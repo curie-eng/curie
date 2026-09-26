@@ -556,6 +556,11 @@ drive_gated_turn() {
     id="$(wait_pending_tool "$tool" 180)" || waited=$?
     (( waited == 0 )) && break
     stop_turn
+    # Process exit alone does not prove the queued turn is over, so retry only
+    # when its JSON shows a finalized reply that is not awaiting approval.
+    if (( waited == 4 )) && ! turn_is_reply <"$out" >/dev/null 2>&1; then
+      waited=1
+    fi
     if (( waited != 4 || attempt == 2 )); then
       echo "gated turn did not produce a pending ${tool} approval" >&2
       return 1

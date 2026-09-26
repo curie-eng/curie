@@ -279,11 +279,34 @@ test "$status" = 4 && test "$SECONDS" -lt 10
             """
 evidence_dir="$HOME"
 curie_bin() { printf '%s' "$HOME/fake-curie"; }
-printf '#!/bin/sh\\necho x >> "$HOME/turns"\\n' > "$HOME/fake-curie"
+cat > "$HOME/fake-curie" <<'SHIM'
+#!/bin/sh
+echo x >> "$HOME/turns"
+echo '{"finalized":true,"reply":"provider error"}'
+SHIM
 chmod +x "$HOME/fake-curie"
 wait_pending_tool() { sleep 0.2; return 4; }
 drive_gated_turn "scale it" mcp__kubernetes__resources_scale approve && exit 9
 test "$(wc -l < "$HOME/turns")" -eq 2
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_gated_turn_is_not_retried_unless_the_first_turn_finalized(self):
+        # An exited CLI may have enqueued a turn that can still request approval.
+        result = self.run_function(
+            """
+evidence_dir="$HOME"
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+cat > "$HOME/fake-curie" <<'SHIM'
+#!/bin/sh
+echo x >> "$HOME/turns"
+echo '{"status":"enqueued"}'
+SHIM
+chmod +x "$HOME/fake-curie"
+wait_pending_tool() { sleep 0.2; return 4; }
+drive_gated_turn "scale it" mcp__kubernetes__resources_scale approve && exit 9
+test "$(wc -l < "$HOME/turns")" -eq 1
 """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
