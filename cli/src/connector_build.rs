@@ -563,6 +563,20 @@ pub fn load_lock(bundle_dir: &Path) -> Result<Option<ConnectorLockFileDecl>> {
     parse_lock(&body).map(Some)
 }
 
+/// The runner layer digest a cluster deploy binds for this bundle (#3260).
+///
+/// `Some` only when `connectors.yaml` declares `runner` and the lock records
+/// its image, which `parse_lock` has already held to the digest shape. `None`
+/// otherwise, which the deploy reads as "clear any earlier value".
+pub fn locked_runner_image(bundle_dir: &Path) -> Result<Option<String>> {
+    if load(bundle_dir)?.runner.is_none() {
+        return Ok(None);
+    }
+    Ok(load_lock(bundle_dir)?
+        .and_then(|lock| lock.runner)
+        .map(|runner| runner.image))
+}
+
 fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
     let forms = [
         spec.image.is_some(),

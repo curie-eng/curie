@@ -6,6 +6,10 @@
 //! Postgres. Rotation deletes SandboxClaims labeled for that agent; sandbox
 //! pods are not Deployments, so there is no `rollout restart` of claimed
 //! sandboxes.
+//!
+//! The same bind carries the agent's layered runner image (#3260): the digest
+//! `connectors.lock.yaml` records lands in `agentSandbox.runnerImages.<agent>`,
+//! and a bundle with no runner entry clears an earlier value.
 
 use std::collections::BTreeMap;
 
@@ -100,28 +104,56 @@ pub struct BindOpts {
     pub chart: String,
     pub agent: String,
     pub secrets: BTreeMap<String, String>,
+    pub runner_image: RunnerImageUpdate,
 }
 
-/// helm upgrade --reuse-values with a private values file, then replace the
-/// agent's claimed sandboxes so secretKeyRef env is re-resolved at pod start.
+/// What a bind does to `agentSandbox.runnerImages.<agent>` (#3260).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerImageUpdate {
+    /// Leave the release's value as it is.
+    Keep,
+    /// Bind this locked digest.
+    Set(String),
+    /// Clear an earlier value: the bundle no longer declares a runner.
+    Clear,
+}
+
+/// helm upgrade with a private values file for the secrets and a `--set` for
+/// the runner image, then replace the agent's claimed sandboxes so
+/// secretKeyRef env and the runner image are re-resolved at pod start.
 pub fn bind_commands(opts: &BindOpts) -> Result<Vec<OpsCommand>> {
     let pairs = helm_secret_pairs(&opts.agent, &opts.secrets)?;
-    if pairs.is_empty() {
+    let runner_set = match &opts.runner_image {
+        RunnerImageUpdate::Keep => None,
+        RunnerImageUpdate::Set(digest) => Some(digest.as_str()),
+        RunnerImageUpdate::Clear => Some("null"),
+    };
+    if pairs.is_empty() && runner_set.is_none() {
         return Ok(Vec::new());
     }
+    // --reset-then-reuse-values, not --reuse-values: on helm v3.20 a `null`
+    // override under --reuse-values prunes the stored value but the manifest
+    // keeps rendering the old key, so a cleared runner image never leaves.
+    let mut args = vec![
+        plain("upgrade"),
+        plain(&opts.common.release),
+        plain(&opts.chart),
+        plain("-n"),
+        plain(&opts.common.namespace),
+        plain("--reset-then-reuse-values"),
+    ];
+    if !pairs.is_empty() {
+        args.push(CmdArg::SecretValuesFile(pairs));
+    }
+    if let Some(value) = runner_set {
+        args.push(plain("--set"));
+        args.push(plain(format!(
+            "agentSandbox.runnerImages.{}={value}",
+            opts.agent
+        )));
+    }
     Ok(vec![
-        OpsCommand::new(
-            "helm",
-            vec![
-                plain("upgrade"),
-                plain(&opts.common.release),
-                plain(&opts.chart),
-                plain("-n"),
-                plain(&opts.common.namespace),
-                plain("--reuse-values"),
-                CmdArg::SecretValuesFile(pairs),
-            ],
-        ),
+        OpsCommand::new("helm", args),
         retire_claims_command(&opts.common.namespace, &opts.agent),
     ])
 }
@@ -151,19 +183,27 @@ pub enum BindNeed {
     /// release's supplied values, so a `helm upgrade` would only re-render the
     /// platform and restart its pods for nothing.
     Current,
-    /// These names are missing or hold a different value. Names only, never
-    /// values.
-    Changed(Vec<String>),
+    /// Something differs. `secrets` names the connector secrets that are
+    /// missing or hold a different value (names only, never values);
+    /// `runner_image` is true when the agent's runner image must be set to a
+    /// new digest or cleared.
+    Changed {
+        secrets: Vec<String>,
+        runner_image: bool,
+    },
 }
 
 /// Pure over the JSON `helm get values -o json` returns for the release.
 ///
 /// `--reuse-values` merges onto exactly these supplied values, so a name whose
-/// value already matches here is a no-op for the bind.
+/// value already matches here is a no-op for the bind. The runner image
+/// changes when a locked digest differs from the release's value, or when no
+/// digest is locked and the release still holds one for this agent.
 pub fn bind_need(
     release_values: &serde_json::Value,
     agent: &str,
     secrets: &BTreeMap<String, String>,
+    runner_image: Option<&str>,
 ) -> BindNeed {
     let bound = release_values
         .pointer("/agentSandbox/connectorSecrets")
@@ -178,10 +218,21 @@ pub fn bind_need(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    if changed.is_empty() {
+    let bound_runner = release_values
+        .pointer("/agentSandbox/runnerImages")
+        .and_then(|all| all.get(agent))
+        .filter(|v| !v.is_null());
+    let runner_changed = match runner_image {
+        Some(digest) => bound_runner.and_then(|v| v.as_str()) != Some(digest),
+        None => bound_runner.is_some(),
+    };
+    if changed.is_empty() && !runner_changed {
         BindNeed::Current
     } else {
-        BindNeed::Changed(changed)
+        BindNeed::Changed {
+            secrets: changed,
+            runner_image: runner_changed,
+        }
     }
 }
 
@@ -203,14 +254,20 @@ fn helm_values_command(common: &CommonOpts) -> OpsCommand {
 /// Read the release's supplied values and judge whether binding `secrets`
 /// for `agent` changes anything. A values read that fails or does not parse
 /// cannot prove the bind is a no-op, so every name counts as changed and the
-/// caller upgrades exactly as it did before this check existed.
+/// caller upgrades exactly as it did before this check existed. A locked
+/// runner image likewise counts as changed; with none locked, a failed read
+/// shows no earlier value, so nothing is cleared.
 pub async fn read_bind_need(
     common: &CommonOpts,
     agent: &str,
     secrets: &BTreeMap<String, String>,
+    runner_image: Option<&str>,
 ) -> Result<BindNeed> {
     validate_agent_resource_name(agent)?;
-    if secrets.is_empty() {
+    let desires_nothing = secrets.is_empty() && runner_image.is_none();
+    // Nothing desired only matters if an earlier runner image must be
+    // cleared, so a box without helm stays a no-op as it was before #3260.
+    if desires_nothing && require_on_path("helm").is_err() {
         return Ok(BindNeed::Current);
     }
     require_on_path("helm")?;
@@ -221,8 +278,12 @@ pub async fn read_bind_need(
         None
     };
     Ok(match parsed {
-        Some(values) => bind_need(&values, agent, secrets),
-        None => BindNeed::Changed(secrets.keys().cloned().collect()),
+        Some(values) => bind_need(&values, agent, secrets, runner_image),
+        None if desires_nothing => BindNeed::Current,
+        None => BindNeed::Changed {
+            secrets: secrets.keys().cloned().collect(),
+            runner_image: runner_image.is_some(),
+        },
     })
 }
 
@@ -239,19 +300,20 @@ pub async fn bind_if_changed<F>(
     common: CommonOpts,
     agent: String,
     secrets: BTreeMap<String, String>,
+    runner_image: Option<String>,
     chart: F,
 ) -> Result<BindNeed>
 where
     F: std::future::Future<Output = Result<String>>,
 {
-    let need = read_bind_need(&common, &agent, &secrets).await?;
+    let need = read_bind_need(&common, &agent, &secrets, runner_image.as_deref()).await?;
     let ui = crate::ui::ui();
     match &need {
         BindNeed::Current => {
-            if !secrets.is_empty() {
+            if !secrets.is_empty() || runner_image.is_some() {
                 ui.note(&format!(
-                    "connector secrets for agent {agent} are already current on release {}; \
-                     the platform release was not upgraded",
+                    "connector secrets and runner image for agent {agent} are already current \
+                     on release {}; the platform release was not upgraded",
                     common.release
                 ));
                 // Sandboxes are not platform pods: the agent's claims are
@@ -266,11 +328,29 @@ where
                 .await?;
             }
         }
-        BindNeed::Changed(names) => {
+        BindNeed::Changed {
+            secrets: names,
+            runner_image: runner_changed,
+        } => {
+            let mut what = Vec::new();
+            if !names.is_empty() {
+                what.push(format!("connector secret(s) {}", names.join(", ")));
+            }
+            let update = match (&runner_image, runner_changed) {
+                (Some(digest), true) => {
+                    what.push(format!("runner image digest {digest}"));
+                    RunnerImageUpdate::Set(digest.clone())
+                }
+                (None, true) => {
+                    what.push("removal of the runner image".to_string());
+                    RunnerImageUpdate::Clear
+                }
+                (_, false) => RunnerImageUpdate::Keep,
+            };
             ui.note(&format!(
-                "platform change required: connector secret(s) {} for agent {agent} are new or \
-                 changed, so release {} is being helm-upgraded to bind them",
-                names.join(", "),
+                "platform change required: {} for agent {agent} changed, so release {} \
+                 is being helm-upgraded to bind it",
+                what.join(" and "),
                 common.release
             ));
             let chart = chart.await?;
@@ -279,6 +359,7 @@ where
                 chart,
                 agent,
                 secrets,
+                runner_image: update,
             })
             .await?;
         }
@@ -296,7 +377,7 @@ pub async fn bind(opts: BindOpts) -> Result<()> {
     let ui = crate::ui::ui();
     let cl = ui.checklist();
     let label = format!(
-        "binding connector secrets for agent {} on release {}",
+        "binding sandbox values for agent {} on release {}",
         opts.agent, opts.common.release
     );
     for cmd in &cmds {

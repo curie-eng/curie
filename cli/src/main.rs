@@ -3632,10 +3632,10 @@ async fn bind_cluster_connector_secrets(
     chart: Option<&str>,
     agent_name: &str,
     secrets: std::collections::BTreeMap<String, String>,
+    runner_image: Option<String>,
 ) -> Result<()> {
-    if secrets.is_empty() {
-        return Ok(());
-    }
+    // No early return on empty secrets: a runner image to set or an earlier
+    // one to clear (#3260) is decided by bind_if_changed.
     // #3082: a bundle deploy whose connector secrets already match the
     // release must not helm-upgrade the platform, so the chart is resolved
     // only when the bind actually changes something.
@@ -3657,6 +3657,7 @@ async fn bind_cluster_connector_secrets(
         },
         agent_name.to_string(),
         secrets,
+        runner_image,
         chart,
     )
     .await?;
@@ -3669,7 +3670,9 @@ async fn bind_cluster_connector_secrets(
 /// connector plan already resolved for this cluster scope, bound into the
 /// per-agent Helm Secret, and only then are the connector objects applied --
 /// the one order both the single-target and `--all-targets` cluster deploy
-/// paths use.
+/// paths use. The same bind sets or clears the agent's locked runner image
+/// (#3260).
+#[allow(clippy::too_many_arguments)]
 async fn bind_and_apply_cluster_connectors(
     namespace: &str,
     release: &str,
@@ -3677,6 +3680,7 @@ async fn bind_and_apply_cluster_connectors(
     agent_name: &str,
     explicit_secrets: &[String],
     connector_env_secret_names: &[String],
+    runner_image: Option<String>,
     prepared: curie::connectors::PreparedConnectorSync,
 ) -> Result<()> {
     let bind_values = cluster_connector_bind_values(
@@ -3684,7 +3688,15 @@ async fn bind_and_apply_cluster_connectors(
         connector_env_secret_names,
         prepared.owned_secret_values(),
     )?;
-    bind_cluster_connector_secrets(namespace, release, chart, agent_name, bind_values).await?;
+    bind_cluster_connector_secrets(
+        namespace,
+        release,
+        chart,
+        agent_name,
+        bind_values,
+        runner_image,
+    )
+    .await?;
     apply_connectors(prepared).await
 }
 
@@ -5423,6 +5435,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let connector_env_secret_names = curie::connector_build::hosted_env_secret_names(
                     &curie::connector_build::load(&plugin_dir)?,
                 );
+                // The runner layer digest the lock records (#3260); None
+                // clears an earlier value on the release.
+                let runner_image = curie::connector_build::locked_runner_image(&plugin_dir)?;
 
                 let targets: Vec<Option<String>> = if all_targets {
                     let path = plugin_dir.join("deploy.yaml");
@@ -5616,6 +5631,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             &deployed.agent_name,
                             &secret,
                             &connector_env_secret_names,
+                            runner_image.clone(),
                             prepared_connectors,
                         )
                         .await
@@ -5687,6 +5703,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         &deployed.agent_name,
                         &secret,
                         &connector_env_secret_names,
+                        runner_image,
                         prepared_connectors,
                     )
                     .await?;
