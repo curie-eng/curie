@@ -1,15 +1,14 @@
 """Every other API reader of a channel route resolves by its IDENTITY
 (ADR-0168 decision 3), not the raw `adapter` column.
 
-The stored form is unchanged until that decision's contract migration
-(#3100): the default Slack identity is NULL (migrations 0023/0024), and
-nothing here writes `'default'` to a row. Every reader below compares a
-route's identity through `route_identity` -- an omitted adapter, a stored NULL
-and a wire-side `'default'` all mean the same route. Each test targets exactly
-one reader, seeding the STORED form (`adapter=None`) and, where the reader
-compares against a value that arrives over the WIRE, sending `'default'` from
-that side -- the one mismatch a raw `!=` would manufacture, since a NULL never
-equals the string `'default'`.
+Migration 0061 stores the default Slack identity by name, `'default'`, but a
+value arriving over the WIRE -- from an older caller, or a handle queued
+before the upgrade -- can still name none. Every reader below compares a
+route's identity through `route_identity`: an omitted adapter, a NULL and
+`'default'` all mean the same route. Each test targets exactly one reader,
+seeding the STORED form and, where the reader compares against a wire value,
+sending None from that side -- the one mismatch a raw `!=` would manufacture,
+since a NULL never equals the string `'default'`.
 """
 
 from __future__ import annotations
@@ -89,7 +88,7 @@ def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
         channel=_channel("slack", "C0EXAMPLE1"),
     )
     stored = _binding_row(agent_id)
-    assert stored["adapter"] is None  # the default identity's stored form
+    assert stored["adapter"] == "default"  # the default identity's stored form
 
     async def resolve() -> Any:
         engine = create_async_engine(get_settings().database_url)
@@ -103,7 +102,7 @@ def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
     binding = asyncio.run(resolve())
     assert binding is not None
     assert binding.id == stored["id"]
-    assert binding.adapter is None
+    assert binding.adapter == "default"
 
 
 def test_channel_ingress_resolves_a_non_slack_binding_end_to_end(
@@ -146,8 +145,8 @@ def test_token_mint_resolves_the_default_row_whether_adapter_is_omitted_or_wire_
 ) -> None:
     """`ChannelTokenRequest.adapter` (ADR-0168 decision 3): omitting it keeps
     minting for the row every caller before the ADR minted for, and naming it
-    explicitly as `'default'` -- the wire-side spelling of the identity a
-    NULL-stored row carries -- must mint for the SAME row, not 404 it. An API
+    explicitly as `'default'` -- the identity the row stores -- must mint for
+    the SAME row, not 404 it. An API
     without the field 422s the second request (`ChannelBinding.model_config`
     forbids extra fields), which is why the CLI leaves a default out.
     """
@@ -159,7 +158,7 @@ def test_token_mint_resolves_the_default_row_whether_adapter_is_omitted_or_wire_
         channel=_channel("slack", "C0EXAMPLE1"),
     )
     stored = _binding_row(agent_id)
-    assert stored["adapter"] is None
+    assert stored["adapter"] == "default"
 
     omitted = channels_client.post(
         "/channels/token",
@@ -189,20 +188,18 @@ def test_token_mint_resolves_the_default_row_whether_adapter_is_omitted_or_wire_
 # --------------------------------------------------------------------------
 
 
-def test_create_publication_keeps_the_binding_when_reply_adapter_is_the_wire_default(
+def test_create_publication_keeps_the_binding_when_reply_adapter_names_none(
     publication_stack: tuple[TestClient, str], auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """`binding.adapter` (stored NULL) and `data.reply_adapter` (a wire
-    `'default'`) name the SAME Slack identity, so
-    `create_publication` must adopt the binding into the new lineage rather
-    than treat the route as unbound.
+    """`binding.adapter` (stored `'default'`) and `data.reply_adapter` (None)
+    name the SAME Slack identity, so `create_publication` must adopt the
+    binding into the new lineage rather than treat the route as unbound.
 
-    `PublicationCreate`'s own validator already collapses a wire `'default'`
-    to NULL for an ordinary caller (schemas.py `_valid_reply_route`), so this
-    sets `reply_adapter` on the validated model directly (`validate_assignment`
-    is off) to hand `crud.create_publication` exactly what a caller that has
-    not gone through that collapse -- or a future phase -- would: the raw
-    wire value the reader has to resolve for itself.
+    `PublicationCreate`'s own validator already resolves an omitted adapter to
+    `'default'` (schemas.py `_valid_reply_route`), so this sets `reply_adapter`
+    on the validated model directly (`validate_assignment` is off) to hand
+    `crud.create_publication` what a caller that has not gone through that
+    resolution would: the raw value the reader has to resolve for itself.
     """
 
     client, _ = publication_stack
@@ -221,8 +218,8 @@ def test_create_publication_keeps_the_binding_when_reply_adapter_is_the_wire_def
     assert selected.status_code == 200, selected.text
 
     data = PublicationCreate.model_validate(payload)
-    assert data.reply_adapter is None  # the schema's own collapse, sanity-checked
-    data.reply_adapter = "default"  # simulate the wire value `crud` must resolve
+    assert data.reply_adapter == "default"  # the schema's own resolution
+    data.reply_adapter = None  # simulate the wire value `crud` must resolve
 
     async def create() -> uuid.UUID:
         engine = create_async_engine(get_settings().database_url)
@@ -256,39 +253,37 @@ def test_create_publication_keeps_the_binding_when_reply_adapter_is_the_wire_def
             await engine.dispose()
 
     binding_id = asyncio.run(read_binding_id())
-    assert binding_id is not None, "the wire-default reply_adapter dropped the binding"
+    assert binding_id is not None, "the omitted reply_adapter dropped the binding"
 
 
-def test_review_revision_accepts_reply_adapter_as_wire_default(
+def test_review_revision_accepts_an_omitted_reply_adapter(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
 ) -> None:
     """`create_publication`'s review-revision comparison (`crud.py`, the
     `_require_review_binding` branch) must not refuse a revision that merely
-    SPELLS the reserved binding's identity differently on the wire: the
-    original publication's Slack binding is stored with `adapter=None`
-    (the stored form) and this revision names it `reply_adapter='default'` --
-    the same identity, through `route_identity`.
+    SPELLS the reserved binding's identity differently: the original
+    publication's Slack binding is stored as `'default'` and this revision
+    names none -- the same identity, through `route_identity`.
 
     Goes around the HTTP body the same way the create_publication test does:
-    `PublicationCreate`'s own validator collapses a wire `'default'` back to
-    `None` for an ordinary Slack-no-endpoint caller, so reaching the raw value
-    `crud.create_publication` has to resolve means setting it directly on an
-    already-validated model.
+    `PublicationCreate`'s own validator resolves an omitted adapter to
+    `'default'`, so reaching the raw value `crud.create_publication` has to
+    resolve means setting it directly on an already-validated model.
     """
 
     client, truth, _ = review_lineage_app
     deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
-    reservation = _reserve_review(client, lineage, "review:wire-default")
+    reservation = _reserve_review(client, lineage, "review:no-adapter")
     assert reservation.status_code == 201, reservation.text
 
     payload = _publication_payload(
         deployment["id"], conversation_id=lineage["conversation_id"], base_sha=FIRST_REVISION_SHA
     )
-    payload.update(reply_conversation_id="review-original", review_origin_key="review:wire-default")
+    payload.update(reply_conversation_id="review-original", review_origin_key="review:no-adapter")
     data = PublicationCreate.model_validate(payload)
-    assert data.reply_adapter is None  # the schema's own collapse, sanity-checked
-    data.reply_adapter = "default"  # simulate the wire value `crud` must resolve
+    assert data.reply_adapter == "default"  # the schema's own resolution
+    data.reply_adapter = None  # simulate the wire value `crud` must resolve
 
     async def create() -> uuid.UUID:
         engine = create_async_engine(get_settings().database_url)
