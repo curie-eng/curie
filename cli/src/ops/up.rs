@@ -4049,6 +4049,21 @@ enum UpInferencePolicy {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpInvocation {
+    ClusterUp,
+    Apply,
+}
+
+impl UpInvocation {
+    fn gvisor_fix(self) -> &'static str {
+        match self {
+            Self::ClusterUp => "curie cluster up --set security.gvisor.mode=off",
+            Self::Apply => "set `platform.gvisor: off` in `curie.yaml` and rerun `curie apply`",
+        }
+    }
+}
+
 pub async fn up(
     mut opts: UpOpts,
     github_token: Option<String>,
@@ -4102,6 +4117,7 @@ pub async fn up(
         existing,
         github_token.as_deref(),
         UpInferencePolicy::Detect(inferences),
+        UpInvocation::ClusterUp,
     )
     .await
 }
@@ -4122,6 +4138,7 @@ pub(crate) async fn up_prepared(
         existing,
         github_token.as_deref(),
         UpInferencePolicy::Disabled,
+        UpInvocation::Apply,
     )
     .await
 }
@@ -4132,6 +4149,7 @@ async fn run_prepared_up(
     existing: Option<serde_json::Value>,
     github_token: Option<&str>,
     inference_policy: UpInferencePolicy,
+    invocation: UpInvocation,
 ) -> Result<ClusterUpOutput> {
     // The single call site, and deliberately the first statement of the single
     // choke point both `up()` and `up_prepared()` funnel through: upstream of
@@ -4186,7 +4204,10 @@ async fn run_prepared_up(
             opts.common.dry_run,
         ) {
             SealingPrivateKeyDisposition::Generated => {
-                ui.note("generated a sealing private key for this release; later cluster up runs preserve it");
+                match invocation {
+                    UpInvocation::ClusterUp => ui.note("generated a sealing private key for this release; later cluster up runs preserve it"),
+                    UpInvocation::Apply => ui.note("generated a sealing private key for this release; later `curie apply` runs preserve it"),
+                }
             }
             SealingPrivateKeyDisposition::Deferred => {
                 ui.note("a live run discovers sealing state and preserves an existing private key or generates one when absent; skipped here to keep --dry-run offline");
@@ -4206,9 +4227,14 @@ async fn run_prepared_up(
                 })
                 .count();
             if generated_required_secrets > 0 {
-                ui.note(&format!(
-                    "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); re-running `cluster up` reuses them"
-                ));
+                match invocation {
+                    UpInvocation::ClusterUp => ui.note(&format!(
+                        "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); re-running `cluster up` reuses them"
+                    )),
+                    UpInvocation::Apply => ui.note(&format!(
+                        "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); rerunning `curie apply` reuses them"
+                    )),
+                }
             }
         }
     }
@@ -4268,10 +4294,10 @@ async fn run_prepared_up(
             // explicit value (state 4 in `resolve_github_token`). One note per
             // outcome: when the value was empty, say so here rather than
             // trailing a second, overlapping note after this match.
-            if empty_flag {
-                ui.note("--github-token (or CURIE_GITHUB_TOKEN) was empty; preserving the GitHub credential recorded by an earlier cluster up. Pass --clear-github-token to remove it.");
-            } else {
-                ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it");
+            match invocation {
+                UpInvocation::ClusterUp if empty_flag => ui.note("--github-token (or CURIE_GITHUB_TOKEN) was empty; preserving the GitHub credential recorded by an earlier cluster up. Pass --clear-github-token to remove it."),
+                UpInvocation::ClusterUp => ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it"),
+                UpInvocation::Apply => ui.note("preserving the GitHub credential recorded by the release; set `credentials.github_token` in `curie.yaml` and rerun `curie apply` to change it"),
             }
         }
         GithubTokenPlan::Untouched
@@ -4280,7 +4306,10 @@ async fn run_prepared_up(
                 .iter()
                 .any(|(key, value)| key == GITHUB_TOKEN_REFERENCE_KEYS[0] && !value.is_empty()) =>
         {
-            ui.note("preserving the GitHub credential reference recorded by the release; pass --github-token to replace it or --clear-github-token to remove it");
+            match invocation {
+                UpInvocation::ClusterUp => ui.note("preserving the GitHub credential reference recorded by the release; pass --github-token to replace it or --clear-github-token to remove it"),
+                UpInvocation::Apply => ui.note("preserving the GitHub credential reference recorded by the release; set `credentials.github_token` in `curie.yaml` and rerun `curie apply` to replace it"),
+            }
         }
         GithubTokenPlan::Untouched => {
             // Distinct wording: an empty value with nothing recorded preserves
@@ -4291,7 +4320,10 @@ async fn run_prepared_up(
         }
     }
     if set_passthrough_leaks_github_token(&opts.operator_sets()) {
-        ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
+        match invocation {
+            UpInvocation::ClusterUp => ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too"),
+            UpInvocation::Apply => ui.warn("a GitHub credential placed under `set:` in `curie.yaml` reaches the Helm process table; use `credentials.github_token` to name a credential source instead"),
+        }
     }
 
     if !opts.allow_egress_host.is_empty()
@@ -4377,6 +4409,7 @@ async fn run_prepared_up(
         &opts.allow_egress_host,
         any_egress,
         opts.common.dry_run,
+        invocation,
     ) {
         if warn {
             ui.warn(&msg)
@@ -4435,9 +4468,9 @@ async fn run_prepared_up(
     // created (#2856). Empty/absent history is a fresh install and is left
     // alone; the Detect gVisor retry still uninstalls an unrecorded abort.
     if let Err(error) =
-        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true).await
+        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true, invocation).await
     {
-        return Err(convergence::installation_failure(&opts.common, error).await);
+        return Err(convergence::installation_failure(&opts.common, error, invocation).await);
     }
     for cmd in &cmds {
         if let Some(job) = gvisor_preflight_job.as_deref() {
@@ -4454,7 +4487,9 @@ async fn run_prepared_up(
             {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    return Err(convergence::installation_failure(&opts.common, error).await)
+                    return Err(
+                        convergence::installation_failure(&opts.common, error, invocation).await,
+                    )
                 }
             };
             match outcome {
@@ -4477,25 +4512,43 @@ async fn run_prepared_up(
                     step.warn("retrying");
                     value_plan.set(GVISOR_MODE_KEY, "off");
                     ClusterUpInference::GvisorOff.render(ui);
-                    if let Err(error) =
-                        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, false)
-                            .await
+                    if let Err(error) = discard_failed_gvisor_install_if_never_deployed(
+                        &cl,
+                        &opts.common,
+                        false,
+                        invocation,
+                    )
+                    .await
                     {
-                        return Err(convergence::installation_failure(&opts.common, error).await);
+                        return Err(convergence::installation_failure(
+                            &opts.common,
+                            error,
+                            invocation,
+                        )
+                        .await);
                     }
                     let retry = up_commands_with_plan(&opts, &value_plan)
                         .into_iter()
                         .next()
                         .expect("cluster up always has one Helm command");
                     if let Err(error) = run_step(&cl, &label, "installed", &retry).await {
-                        return Err(convergence::installation_failure(&opts.common, error).await);
+                        return Err(convergence::installation_failure(
+                            &opts.common,
+                            error,
+                            invocation,
+                        )
+                        .await);
                     }
                 }
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
                     step.fail("failed");
-                    let fix = "curie cluster up --set security.gvisor.mode=off";
+                    let fix = invocation.gvisor_fix();
+                    let instruction = match invocation {
+                        UpInvocation::ClusterUp => format!("run `{fix}`"),
+                        UpInvocation::Apply => fix.to_string(),
+                    };
                     return Err(crate::exit::CliError::failure(format!(
-                        "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."
+                        "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, {instruction}."
                     ))
                     .with_fix(fix)
                     .into());
@@ -4503,7 +4556,9 @@ async fn run_prepared_up(
             }
         } else {
             if let Err(error) = run_step(&cl, &label, "installed", cmd).await {
-                return Err(convergence::installation_failure(&opts.common, error).await);
+                return Err(
+                    convergence::installation_failure(&opts.common, error, invocation).await,
+                );
             }
         }
     }
@@ -4532,7 +4587,7 @@ async fn run_prepared_up(
     }
 
     let step = cl.step("waiting for exact target workload convergence");
-    if let Err(error) = convergence::wait(&opts.common).await {
+    if let Err(error) = convergence::wait(&opts.common, invocation).await {
         step.fail("not converged");
         return Err(error);
     }
@@ -7884,6 +7939,7 @@ async fn discard_failed_gvisor_install_if_never_deployed(
     cl: &crate::ui::Checklist,
     common: &CommonOpts,
     recorded_only: bool,
+    invocation: UpInvocation,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     let history_cmd = helm_history_cmd(common);
@@ -7900,8 +7956,13 @@ async fn discard_failed_gvisor_install_if_never_deployed(
                 err.trim()
             ))
             .with_fix(format!(
-                "inspect `helm history {} -n {}` and rerun `curie apply` or `curie cluster up`",
-                common.release, common.namespace
+                "inspect `helm history {} -n {}` and rerun `{}`",
+                common.release,
+                common.namespace,
+                match invocation {
+                    UpInvocation::ClusterUp => "curie cluster up",
+                    UpInvocation::Apply => "curie apply",
+                }
             ))
             .into());
         }
