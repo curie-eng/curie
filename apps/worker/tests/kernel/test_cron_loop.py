@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
 import redis
 from aci_protocol import QueuedTurn, TurnSource
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
@@ -267,6 +269,56 @@ def test_two_loops_sharing_one_db_and_stream_fire_a_slot_exactly_once(
             assert rows[0].slot_utc == seed.slot
             assert rows[0].outcome is None  # admitted, in flight
             assert len(_entries(sync_redis, names["stream"])) == 1
+
+    asyncio.run(body())
+
+
+def test_a_pass_that_loses_the_slot_race_logs_the_loss_at_info(
+    sync_redis: redis.Redis, names: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            trigger = _trigger(seed)
+            now = seed.slot + timedelta(seconds=30)
+            # The winner admits the slot; its pass logs at INFO either way.
+            await _pass_once(seed, names["stream"], trigger)
+            # A second replica then races the same slot. The in-flight check
+            # only guards other slots (`slot_utc <> :slot`), so this pass
+            # reaches the unique INSERT, loses it to the winner's row, and
+            # ends the pass with lost=1 and nothing else done (#3013).
+            client = _async_redis()
+            try:
+                loser = _loop(
+                    seed.engine, client, _Triggers(seed, trigger), names["stream"], seed.slot
+                )
+                with caplog.at_level(logging.DEBUG, logger="curie_worker.cron_loop"):
+                    caplog.clear()
+                    await loser.one_pass(now=now)
+
+                    [lost_line] = [
+                        record
+                        for record in caplog.records
+                        if record.name == "curie_worker.cron_loop"
+                        and "cron pass" in record.getMessage()
+                    ]
+                    assert lost_line.levelno == logging.INFO
+                    assert "1 lost" in lost_line.getMessage()
+
+                    # The watermark has moved to `now`, so this next pass has
+                    # an empty window: no work and no lost slots. It must stay
+                    # at DEBUG, or idle replicas would spam INFO (#3013).
+                    caplog.clear()
+                    await loser.one_pass(now=now)
+
+                    [idle_line] = [
+                        record
+                        for record in caplog.records
+                        if record.name == "curie_worker.cron_loop"
+                        and "cron pass" in record.getMessage()
+                    ]
+                    assert idle_line.levelno == logging.DEBUG
+            finally:
+                await client.aclose()
 
     asyncio.run(body())
 

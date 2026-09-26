@@ -66,6 +66,11 @@ rules:
     resources: ["sandboxtemplates", "sandboxwarmpools"]
     verbs: ["get", "create", "patch"]
   {{- end }}
+  # A factory execution defers as capacity when its sandbox pod is
+  # Unschedulable (#3169). The worker reads only the exact named pod.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects

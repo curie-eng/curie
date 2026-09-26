@@ -226,6 +226,12 @@
       "version": "1.0"
     },
     {
+      "result": "ObservabilityProvisionOutput",
+      "kind": "CliOutput",
+      "schema": "observability-provision.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ObservabilityRunOutput",
       "kind": "CliOutput",
       "schema": "observability-run.schema.json",

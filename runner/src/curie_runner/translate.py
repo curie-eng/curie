@@ -81,7 +81,10 @@ UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 # SDK ResultMessage subtypes that name a known platform failure (#3071). Only
 # this explicit table maps an SDK token onto platform vocabulary; everything
 # else still goes through the allowlist unchanged.
-_RESULT_SUBTYPE_CLASSIFICATIONS = {"error_max_turns": "max-turns"}
+_RESULT_SUBTYPE_CLASSIFICATIONS = {
+    "error_max_turns": "max-turns",
+    "error_max_budget_usd": "budget-exceeded",
+}
 
 
 def map_error_classification(raw: str | None) -> str:
@@ -189,7 +192,7 @@ class TurnState:
     # reported as errored *because we interrupted it*, instead of reporting a
     # failure with nothing to approve.
     approval_halt_requested: bool = False
-    # The raw ``ToolUseBlock.input`` of every publication call seen on the
+    # The exact tool ID and input of every publication call seen on the
     # stream this turn (#2294), in call order. Captured here, decided in
     # ``SessionRunner._observe_publication_calls``: this module stays pure and
     # never touches the ApprovalGate, so the same seam serves the live turn and
@@ -199,7 +202,7 @@ class TurnState:
     # standing. It is load-bearing for the case where neither SDK layer recorded
     # the call at all and the turn would otherwise finalize DONE with nothing to
     # approve.
-    publication_calls: list[dict[str, Any]] = field(default_factory=list)
+    publication_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     # How many of ``publication_calls`` the session has already acted on, so the
     # observation runs exactly once per call even though it is invoked on every
     # message of the turn.
@@ -278,6 +281,15 @@ def _translate_assistant(
 
     if activity is not None:
         activity.observe_assistant_message()
+    if gen is not None:
+        # Record the whole message's output first (#3128): the first tool_use
+        # below closes the generation, so a later block in a parallel tool
+        # response would otherwise be dropped. Tool names only, never arguments.
+        for block in message.content:
+            if isinstance(block, TextBlock) and block.text:
+                gen.observe_output(block.text)
+            elif isinstance(block, ToolUseBlock):
+                gen.observe_output(f"[tool_use {block.name}]")
     for block in message.content:
         if isinstance(block, TextBlock):
             if block.text:
@@ -299,7 +311,7 @@ def _translate_assistant(
                 # do with it; recording it here would put gate state in a
                 # deliberately pure module.
                 state.publication_calls.append(
-                    block.input if isinstance(block.input, dict) else {}
+                    (block.id, block.input if isinstance(block.input, dict) else {})
                 )
             if block.name == APPROVAL_TOOL_NAME:
                 # A policy gate fired (ADR-0010). Capture the summary (and the

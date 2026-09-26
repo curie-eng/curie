@@ -1810,32 +1810,25 @@ securityContext:
      already promised it; a gate that refuses upgrades during ordinary traffic
      is a gate that gets switched off in its first week.
 
-     The quiesce TTL is then derived above that, because the worker's OWN boot
-     validator refuses a TTL that does not outlast the wait -- so a rendered
-     pair the app would reject is a green `helm upgrade` followed by a
-     CrashLoopBackOff, the same failure `curie.worker.terminationGrace` above
-     exists to prevent.
-
-     What IS refused is the one pair an operator writes together and can only
-     get wrong by contradicting themselves: a `quiesceTtlSeconds` at or below
-     the `timeoutSeconds` they set beside it. Silently raising that one would
-     hide a stated intent rather than an unrelated default. */}}
+     The quiesce TTL is the ROLL HOLD written after a clean drain, and it is
+     capped AT the effective wait (#3127). While waiting, the gate holds the
+     marker as a short lease renewed every poll, so the hold no longer has to
+     outlast the wait; a hold longer than the wait would only strand a paused
+     fleet for longer than the upgrade could ever have waited when the roll
+     never follows. */}}
 {{- define "curie.worker.upgradeDrain.timeout" -}}
 {{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
 {{- end -}}
 
-{{/* Headroom over the effective wait, so the flag cannot lapse in the moments
-     between the gate's last poll and the roll it clears the way for. */}}
+{{/* The roll hold: min(quiesceTtlSeconds, effective wait). */}}
 {{- define "curie.worker.upgradeDrain.quiesceTtl" -}}
-{{- max (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 60) -}}
+{{- min (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (int64 (include "curie.worker.upgradeDrain.timeout" .)) -}}
 {{- end -}}
 
+{{/* No ordering rule between quiesceTtlSeconds and timeoutSeconds remains
+     (#3127): the hold is capped at the wait above, and the schema keeps both
+     positive. Kept as a hook for the templates that include it. */}}
 {{- define "curie.worker.validateUpgradeDrain" -}}
-{{- $timeout := int64 .Values.worker.upgradeDrain.timeoutSeconds -}}
-{{- $quiesce := int64 .Values.worker.upgradeDrain.quiesceTtlSeconds -}}
-{{- if le $quiesce $timeout -}}
-{{- fail (printf "worker.upgradeDrain.quiesceTtlSeconds (%d) must be strictly greater than worker.upgradeDrain.timeoutSeconds (%d) (issue #2010). As set, the fleet-wide quiesce flag lapses while the gate is still waiting, so the replicas resume claiming into a roll that is about to interrupt them -- and the gate would still report a clean drain. Fix: raise worker.upgradeDrain.quiesceTtlSeconds above %d, or lower worker.upgradeDrain.timeoutSeconds below %d." $quiesce $timeout $timeout $quiesce) -}}
-{{- end -}}
 {{- end -}}
 
 {{/* ---- Langfuse Postgres startup gate (issues #1853, #2330) ----

@@ -63,6 +63,17 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "sandbox")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      # Deliberately NO priorityClassName (#3182): unclassed means priority 0,
+      # below curie-sandbox (100000), so this sleeping image-cache pod is the
+      # chart's designated sacrifice -- a node full of sandbox CPU requests
+      # evicts the prewarm pod before anything the platform needs (Langfuse,
+      # the OTel collector, the UI, the control plane), and the DaemonSet
+      # controller recreates it when capacity returns. Do not "fix" this by
+      # promoting it to curie-platform or curie-sandbox: an explicit class of
+      # its own would also change the chart-rendered cluster-singleton
+      # inventory (ADR-0129) and the CLI's cluster-up PriorityClass preflight,
+      # which is a separate maintainer decision. Pinned by
+      # ci/render-assertions.sh Assertion 8.
       {{- with $runner.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

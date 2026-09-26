@@ -339,6 +339,37 @@ def test_reviewers_default_to_opus_and_are_read_only(name: str) -> None:
     assert "VERDICT: APPROVE" in match.group(2) and "VERDICT: CHANGES" in match.group(2)
 
 
+@pytest.mark.parametrize("name", ["plan-reviewer", "diff-reviewer"])
+def test_reviewers_tag_findings_and_approve_with_notes(name: str) -> None:
+    """Findings are blocking or a note, and notes ride along on an APPROVE (#3196)."""
+    text = (BUNDLE / "agents" / f"{name}.md").read_text()
+    match = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.DOTALL)
+    assert match
+    body = match.group(2)
+    assert "Tag every finding as blocking or a note" in body
+    # CHANGES is reserved for blocking findings; notes are listed on the approval.
+    assert "VERDICT: APPROVE\nNOTES:" in body
+    assert "`VERDICT: CHANGES` only when at least one blocking finding remains" in body
+    assert re.search(
+        r"When only notes remain, return\s+`VERDICT: APPROVE` and list the notes under `NOTES:`",
+        body,
+    )
+
+
+def test_an_approve_with_notes_reply_is_accepted(session: Session) -> None:
+    """The gate treats an APPROVE carrying a NOTES list as an approval (#3196)."""
+    plan_reply = (
+        "REVIEWER: plan-reviewer\nVERDICT: APPROVE\nNOTES:\n"
+        "- a fixtures helper would shorten the test bodies\n"
+    )
+    _, context = session.review(PLAN, plan_reply)
+    assert "APPROVED" in context
+    diff_reply = "REVIEWER: diff-reviewer\nVERDICT: APPROVE\nNOTES:\n- none\n"
+    _, context = session.review(DIFF, diff_reply)
+    assert "APPROVED" in context
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
 def test_reviewer_definitions_are_not_gitignored() -> None:
     done = subprocess.run(
         ["git", "check-ignore", "-q", "examples/dark-factory/agents/plan-reviewer.md"],

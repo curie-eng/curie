@@ -460,9 +460,17 @@
         "0057"
       ],
       "revision": "0058",
-      "sha256": "a25f4d836c6464a3e4117a81c1eebf84396f462f13274ade261649b15371459a"
+      "sha256": "efead818bd6ca09233e265335d622677a84fdf2f5d2bc90800de2844b1f8c159"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "0058"
+      ],
+      "revision": "0059",
+      "sha256": "ba1441a34a26d7c0548efab3bf9650010fade234357d30f3f7611a2ca6b07285"
     }
   ],
-  "schema_head": "0058",
+  "schema_head": "0059",
   "schema_min": "0045"
 }

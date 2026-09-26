@@ -16,18 +16,24 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner.adapter import ClaudeAgentSession, build_options, build_structured_resume
 from curie_runner.history import (
+    HISTORY_APPEND_RESERVE_BYTES,
     ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
+    HistoryCapacityError,
     HistoryError,
     NullTranscriptStore,
     StateApiTranscriptStore,
     SummaryRecord,
     TranscriptStore,
     TurnRecord,
+    bound_turn_record,
     build_conversation_replay,
     resolve_history,
 )
+
+_STATE_VALUE_MAX_BYTES = 65_536
+_TRANSCRIPT_CAP_HEADERS = {"X-Curie-Transcript-Max-Bytes": str(_STATE_VALUE_MAX_BYTES)}
 
 
 def _fake_state_app() -> tuple[web.Application, list]:
@@ -38,9 +44,12 @@ def _fake_state_app() -> tuple[web.Application, list]:
 
     async def get_key(request: web.Request) -> web.Response:
         if not log:
-            return web.json_response({"detail": "not found"}, status=404)
+            return web.json_response(
+                {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
+            )
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": len(log)}
+            {"namespace": "transcript", "key": "t1", "value": list(log), "version": len(log)},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     async def append_key(request: web.Request) -> web.Response:
@@ -55,9 +64,6 @@ def _fake_state_app() -> tuple[web.Application, list]:
     return app, log
 
 
-_STATE_VALUE_MAX_BYTES = 65_536
-
-
 def _capped_state_app() -> tuple[web.Application, list, list[int]]:
     """A state-key fake that enforces the API's whole-value JSON byte cap."""
 
@@ -68,9 +74,12 @@ def _capped_state_app() -> tuple[web.Application, list, list[int]]:
 
     async def get_key(_request: web.Request) -> web.Response:
         if not log:
-            return web.json_response({"detail": "not found"}, status=404)
+            return web.json_response(
+                {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
+            )
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1}
+            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     async def append_key(request: web.Request) -> web.Response:
@@ -362,6 +371,102 @@ def test_claude_native_checkpoint_is_restored_and_then_exports_only_a_delta(tmp_
     )
 
 
+def test_dropped_native_export_requests_a_fresh_adapter_checkpoint(tmp_path) -> None:
+    resume = build_structured_resume(
+        (), curie_session_id="curie-thread-bounded", cwd=str(tmp_path)
+    )
+    assert resume.session_store is not None
+    options = build_options(
+        plugins=[], model=None, system_prompt=None, max_turns=2,
+        max_budget_usd=1.0, resume=resume.resume, session_id=resume.session_id,
+        session_store=resume.session_store,
+    )
+    session = ClaudeAgentSession(options)
+    first_entry = {"type": "assistant", "uuid": "entry-1", "payload": "n" * 60_000}
+    anyio.run(resume.session_store.append, resume.session_key, [first_entry])
+    first_export = anyio.run(session.export_replay_state)
+    assert first_export is not None and first_export.kind == "checkpoint"
+    record = TurnRecord(
+        user="q", assistant="answer",
+        messages=(
+            ConversationMessage(role="user", content="q"),
+            ConversationMessage(role="assistant", content=[{"type": "text", "text": "answer"}]),
+        ),
+        harness_replay=first_export,
+    )
+    bounded = bound_turn_record(record, max_value_bytes=8_000)
+    assert bounded.harness_replay is None
+
+    session.request_full_checkpoint()
+    second_entry = {"type": "assistant", "uuid": "entry-2"}
+    anyio.run(resume.session_store.append, resume.session_key, [second_entry])
+    next_export = anyio.run(session.export_replay_state)
+    assert next_export == HarnessReplayState(
+        harness="claude", kind="checkpoint", entries=(first_entry, second_entry)
+    )
+
+
+def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> None:
+    from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
+    from curie_runner import RunTracer, SideEffectClassifier
+    from curie_runner.fake import FakeModelSession, default_turn
+    from curie_runner.session import SessionRunner
+
+    resume = build_structured_resume(
+        (), curie_session_id="curie-thread-state-write", cwd=str(tmp_path)
+    )
+    assert resume.session_store is not None
+    options = build_options(
+        plugins=[], model=None, system_prompt=None, max_turns=2,
+        max_budget_usd=1.0, resume=resume.resume, session_id=resume.session_id,
+        session_store=resume.session_store,
+    )
+    adapter = ClaudeAgentSession(options)
+
+    class AdapterBackedFake(FakeModelSession):
+        async def export_replay_state(self) -> HarnessReplayState | None:
+            return await adapter.export_replay_state()
+
+        def request_full_checkpoint(self) -> None:
+            adapter.request_full_checkpoint()
+
+    first_entry = {"type": "assistant", "uuid": "entry-1", "payload": "n" * 60_000}
+    second_entry = {"type": "assistant", "uuid": "entry-2"}
+    app, log, rejected_sizes = _capped_state_app()
+
+    async def go() -> None:
+        await resume.session_store.append(resume.session_key, [first_entry])
+        async with TestServer(app) as server:
+            history = StateApiTranscriptStore(
+                str(server.make_url("/agents/A/state/transcript/t1")), token=None
+            )
+            runner = SessionRunner(
+                session_factory=lambda: AdapterBackedFake(default_turn),
+                ceiling=0, tracer=RunTracer(None), classifier=SideEffectClassifier(),
+                trace_name="bounded-native-reset", session_id="session-native-reset",
+                history_store=history,
+            )
+            await runner.start()
+            lines = [
+                line async for line in runner.run_inbound(
+                    Event(type="message", text="q", user="U", ts="1")
+                )
+            ]
+            final = parse_ndjson_line(lines[-1])
+            assert isinstance(final, Final)
+            assert final.status is SessionStatus.DONE
+            assert runner.history_durable is True
+            assert len(log) == 1 and log[0]["harness_replay"] is None
+            assert rejected_sizes == []
+            await resume.session_store.append(resume.session_key, [second_entry])
+            next_export = await adapter.export_replay_state()
+            assert next_export == HarnessReplayState(
+                harness="claude", kind="checkpoint", entries=(first_entry, second_entry)
+            )
+
+    anyio.run(go)
+
+
 def test_replay_folds_native_checkpoint_and_deltas_but_drops_them_at_compaction() -> None:
     turns = [
         TurnRecord(
@@ -429,6 +534,56 @@ def _over_bound_turn(tag: str, harness_replay: HarnessReplayState | None = None)
         ),
         harness_replay=harness_replay,
     )
+
+
+def test_bounded_middle_turn_breaks_native_checkpoint_delta_chain() -> None:
+    checkpoint = TurnRecord(
+        user="checkpoint request",
+        assistant="checkpoint answer",
+        harness_replay=HarnessReplayState(
+            harness="claude", kind="checkpoint", entries=({"uuid": "C1"},)
+        ),
+    )
+    middle = bound_turn_record(
+        _over_bound_turn(
+            "middle",
+            HarnessReplayState(
+                harness="claude", kind="delta", entries=({"uuid": "M2"},)
+            ),
+        ),
+        max_value_bytes=8_000,
+    )
+    assert middle.harness_replay is None
+    latest = TurnRecord(
+        user="latest request",
+        assistant="latest answer",
+        harness_replay=HarnessReplayState(
+            harness="claude", kind="delta", entries=({"uuid": "D3"},)
+        ),
+    )
+
+    replay, summary = build_conversation_replay(
+        [checkpoint, middle, latest], max_turns=None, max_bytes=None
+    )
+
+    assert summary is None
+    assert middle.messages[0] in replay.messages
+    assert replay.harness_replay is None
+
+    fresh_checkpoint = TurnRecord(
+        user="fresh request",
+        assistant="fresh answer",
+        harness_replay=HarnessReplayState(
+            harness="claude", kind="checkpoint", entries=({"uuid": "C4"},)
+        ),
+    )
+    restored, summary = build_conversation_replay(
+        [checkpoint, middle, latest, fresh_checkpoint],
+        max_turns=None,
+        max_bytes=None,
+    )
+    assert summary is None
+    assert restored.harness_replay == fresh_checkpoint.harness_replay
 
 
 def test_single_over_bound_turn_replays_plainly_without_a_summary() -> None:
@@ -526,6 +681,7 @@ def test_state_store_append_then_load_round_trip() -> None:
         async with TestServer(app) as server:
             url = str(server.make_url("/agents/A/state/transcript/t1"))
             store = StateApiTranscriptStore(url, token="k")
+            assert await store.load() == []
             await store.append(
                 TurnRecord(user="q1", assistant="a1", ts="2026-07-14T00:00:00+00:00")
             )
@@ -563,6 +719,12 @@ def test_state_store_append_errors_carry_only_the_http_status(
     async def reject_append(_request: web.Request) -> web.Response:
         return web.Response(status=status, text=sensitive_body)
 
+    async def get_key(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "not found"}, status=404, headers=_TRANSCRIPT_CAP_HEADERS
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_key)
     app.router.add_post("/agents/A/state/transcript/t1/append", reject_append)
 
     async def go() -> None:
@@ -570,6 +732,7 @@ def test_state_store_append_errors_carry_only_the_http_status(
             store = StateApiTranscriptStore(
                 str(server.make_url("/agents/A/state/transcript/t1")), token=None
             )
+            assert await store.load() == []
             with pytest.raises(error_type) as caught:
                 await store.append(TurnRecord(user="question", assistant="answer"))
             assert caught.value.args == (status,)
@@ -620,8 +783,8 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
     from curie_runner.fake import FakeModelSession
     from curie_runner.session import SessionRunner
 
-    tool_payload = "tool-output-" + ("x" * 42_000)
-    assistant_payload = "assistant-output-" + ("y" * 42_000)
+    tool_payload = "tool-output-" + ("x" * 20_000)
+    assistant_payload = "assistant-output-" + ("y" * 20_000)
     native_payload = "native-checkpoint-" + ("z" * 42_000)
     harness_replay = HarnessReplayState(
         harness="claude",
@@ -676,12 +839,15 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
                 [raw_without_native.to_dict()], separators=(",", ":")
             ).encode("utf-8")
         )
-        > _STATE_VALUE_MAX_BYTES
+        > _STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES
     )
 
     class ReplayExportingFake(FakeModelSession):
         async def export_replay_state(self) -> HarnessReplayState:
             return harness_replay
+
+        def request_full_checkpoint(self) -> None:
+            pass
 
     script = lambda: [  # noqa: E731 - compact fixed SDK transcript fixture
         AssistantMessage(
@@ -723,6 +889,8 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
         async with TestServer(app) as server:
             key_url = str(server.make_url("/agents/A/state/transcript/t1"))
             session = ReplayExportingFake(script)
+            history_store = StateApiTranscriptStore(key_url, token=None)
+            assert await history_store.load() == []
             runner = SessionRunner(
                 session_factory=lambda: session,
                 ceiling=0,
@@ -730,7 +898,7 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
                 classifier=SideEffectClassifier(),
                 trace_name="bounded-history",
                 session_id="session-example",
-                history_store=StateApiTranscriptStore(key_url, token=None),
+                history_store=history_store,
             )
             await runner.start()
             lines = [
@@ -775,13 +943,13 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
             assert isinstance(bounded, TurnRecord)
             assert bounded.harness_replay is None
             assert bounded.user == "inspect the example workspace"
-            _assert_digest_marker(bounded.assistant, assistant_payload)
+            assert bounded.assistant == assistant_payload
             tool_result = bounded.messages[2].content
             assert isinstance(tool_result, list)
             _assert_digest_marker(tool_result[0]["content"], tool_payload)
             assistant_text = bounded.messages[3].content
             assert isinstance(assistant_text, list)
-            _assert_digest_marker(assistant_text[0]["text"], assistant_payload)
+            assert assistant_text[0]["text"] == assistant_payload
 
     anyio.run(go)
 
@@ -791,15 +959,6 @@ def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> 
 
     from aci_protocol import Event, SessionStatus
     from claude_agent_sdk import AssistantMessage, ResultMessage
-
-    class CountingStore(_RecordingStore):
-        def __init__(self) -> None:
-            super().__init__()
-            self.append_attempts = 0
-
-        async def append(self, record: TurnRecord) -> None:
-            self.append_attempts += 1
-            await super().append(record)
 
     empty_assistant_messages = 3_000
     script = lambda: [  # noqa: E731 - compact fixed SDK transcript fixture
@@ -834,19 +993,19 @@ def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> 
         > _STATE_VALUE_MAX_BYTES
     )
 
-    store = CountingStore()
+    store = _BoundedRecordingStore()
     runner = _recording_runner(store, script=script)
     final = _run_recording_turn(
         runner, Event(type="message", text="q", user="U", ts="1")
     )
 
-    assert final.status is SessionStatus.DONE
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
     assert runner.history_durable is False
     assert store.append_attempts == 0
     assert store.turns == []
     assert any(
         "history append failed" in record.getMessage()
-        and "HistoryError" in record.getMessage()
+        and "HistoryCapacityError" in record.getMessage()
         for record in caplog.records
     )
 
@@ -856,15 +1015,6 @@ def test_history_durability_failure_is_sticky_after_later_successful_append() ->
 
     from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
-
-    class CountingStore(_RecordingStore):
-        def __init__(self) -> None:
-            super().__init__()
-            self.append_attempts = 0
-
-        async def append(self, record: TurnRecord) -> None:
-            self.append_attempts += 1
-            await super().append(record)
 
     oversized_messages = 3_000
     scripts = iter(
@@ -902,7 +1052,7 @@ def test_history_durability_failure_is_sticky_after_later_successful_append() ->
             ],
         )
     )
-    store = CountingStore()
+    store = _BoundedRecordingStore()
     runner = _recording_runner(store, script=lambda: next(scripts))
 
     async def go() -> None:
@@ -915,7 +1065,7 @@ def test_history_durability_failure_is_sticky_after_later_successful_append() ->
         ]
         first_final = parse_ndjson_line(first_lines[-1])
         assert isinstance(first_final, Final)
-        assert first_final.status is SessionStatus.DONE
+        assert first_final.status is SessionStatus.CLASSIFIED_FAILURE
         assert runner.history_durable is False
         assert store.append_attempts == 0
 
@@ -944,7 +1094,8 @@ def test_state_store_load_rejects_non_array() -> None:
 
     async def get_key(_request: web.Request) -> web.Response:
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": {"not": "a list"}, "version": 1}
+            {"namespace": "transcript", "key": "t1", "value": {"not": "a list"}, "version": 1},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     app.router.add_get("/agents/A/state/transcript/t1", get_key)
@@ -964,7 +1115,8 @@ def test_state_store_load_rejects_malformed_log_entry() -> None:
 
     async def get_key(_request: web.Request) -> web.Response:
         return web.json_response(
-            {"namespace": "transcript", "key": "t1", "value": [42], "version": 1}
+            {"namespace": "transcript", "key": "t1", "value": [42], "version": 1},
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     app.router.add_get("/agents/A/state/transcript/t1", get_key)
@@ -1003,8 +1155,27 @@ class _RecordingStore:
     async def load(self) -> list[TurnRecord]:
         return list(self.turns)
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.turns.append(record)
+        return record.harness_replay is not None
+
+
+class _BoundedRecordingStore(_RecordingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.append_attempts = 0
+
+    async def append(self, record: TurnRecord) -> bool:
+        try:
+            bounded = bound_turn_record(
+                record,
+                max_value_bytes=_STATE_VALUE_MAX_BYTES - HISTORY_APPEND_RESERVE_BYTES,
+            )
+        except HistoryError:
+            raise HistoryCapacityError(413) from None
+        self.append_attempts += 1
+        await super().append(bounded)
+        return bounded.harness_replay is not None
 
 
 def _run_recording_turn(runner, event):
@@ -1062,7 +1233,7 @@ def test_failed_transcript_append_fails_closed_for_runner_replacement() -> None:
     from aci_protocol import Event, SessionStatus
 
     class FailingStore(_RecordingStore):
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             del record
             raise HistoryError("injected append failure")
 
@@ -1300,7 +1471,7 @@ def test_record_turn_swallows_store_failure() -> None:
         async def load(self) -> list[TurnRecord]:
             return []
 
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             raise HistoryError("state API unavailable")
 
     runner = SessionRunner(
@@ -1331,7 +1502,7 @@ def test_successful_turn_survives_transcript_store_failure() -> None:
         async def load(self) -> list[TurnRecord]:
             return []
 
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             self.append_attempts += 1
             raise HistoryError("state API unavailable")
 

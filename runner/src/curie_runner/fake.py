@@ -305,7 +305,7 @@ class FakeModelSession:
                 continue
             if self._can_use_tool is not None:
                 decision = await self._can_use_tool(
-                    block.name, block.input, ToolPermissionContext()
+                    block.name, block.input, ToolPermissionContext(tool_use_id=block.id)
                 )
                 if isinstance(decision, PermissionResultDeny) and decision.interrupt:
                     self._halted = True
