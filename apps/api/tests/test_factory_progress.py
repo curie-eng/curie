@@ -483,7 +483,9 @@ def _labels(view: Any) -> dict[str, str | None]:
 
 def _loop(view: Any, start: str, review: str | None = None) -> Any:
     (loop,) = [
-        loop for loop in view.loops if loop.start == start and (review is None or loop.review == review)
+        loop
+        for loop in view.loops
+        if loop.start == start and (review is None or loop.review == review)
     ]
     return loop
 
@@ -654,6 +656,8 @@ def test_third_diff_round_keeps_plan_approved_and_badges_two_review_kickbacks() 
         _reports_of(
             ("plan", 1),
             ("plan_review", 1),
+            ("plan", 2),
+            ("plan_review", 2),
             ("implement", 1),
             ("review_diff", 1),
             ("implement", 2),
@@ -670,7 +674,7 @@ def test_third_diff_round_keeps_plan_approved_and_badges_two_review_kickbacks() 
         "review_diff": "redo",
         "wait_ci": "pending",
     }
-    assert (_loop(view, "plan").approved, _loop(view, "plan").kickbacks) == (True, 0)
+    assert (_loop(view, "plan").approved, _loop(view, "plan").kickbacks) == (True, 1)
     assert (
         _loop(view, "implement", "review_diff").active,
         _loop(view, "implement", "review_diff").kickbacks,
@@ -679,7 +683,7 @@ def test_third_diff_round_keeps_plan_approved_and_badges_two_review_kickbacks() 
         2,
     )
     assert {stage.id: stage.round_label for stage in view.stages}["plan_review"] == (
-        "approved · 1 round"
+        "approved · 2 rounds"
     )
 
 
@@ -704,6 +708,51 @@ def test_ci_retry_waits_on_ci_without_counting_a_diff_review_kickback() -> None:
     assert _loop(view, "implement", "wait_ci").kickbacks == 1
     assert _loop(view, "implement", "review_diff").kickbacks == 0
     assert {stage.id: stage.round_label for stage in view.stages}["wait_ci"] == "round 2 of 3"
+
+
+def test_diff_review_after_a_ci_retry_uses_the_diff_round_on_implement() -> None:
+    view = phase_view(
+        STAGED_DECLARATION,
+        _reports_of(
+            ("implement", 1),
+            ("review_diff", 1),
+            ("publish", None),
+            ("wait_ci", None),
+            ("implement", 2),
+            ("review_diff", 2),
+        ),
+        "running",
+        None,
+    )
+    labels = {stage.id: stage.round_label for stage in view.stages}
+    assert view.current == "review_diff"
+    assert _loop(view, "implement", "review_diff").active
+    assert _loop(view, "implement", "wait_ci").kickbacks == 1
+    assert labels["review_diff"] == "round 1 of 3"
+    assert labels["implement"] == labels["review_diff"]
+
+
+def test_a_ci_fix_keeps_diff_approved_while_ci_loop_is_live() -> None:
+    view = phase_view(
+        STAGED_DECLARATION,
+        _reports_of(
+            ("implement", 1),
+            ("review_diff", 1),
+            ("publish", None),
+            ("wait_ci", None),
+            ("implement", 2),
+        ),
+        "running",
+        None,
+    )
+    diff = _loop(view, "implement", "review_diff")
+    ci = _loop(view, "implement", "wait_ci")
+    labels = {stage.id: stage.round_label for stage in view.stages}
+    assert view.current == "implement"
+    assert (diff.approved, diff.active, diff.kickbacks) == (True, False, 0)
+    assert labels["review_diff"] == "approved · 1 round"
+    assert (ci.active, ci.kickbacks, ci.round) == (True, 1, 2)
+    assert labels["wait_ci"] == "round 2 of 3"
 
 
 def test_success_marks_every_declared_stage_done_and_approves_all_loops() -> None:

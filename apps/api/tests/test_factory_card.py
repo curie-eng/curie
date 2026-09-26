@@ -18,6 +18,7 @@ Card markup contract the tests pin (the renderer is otherwise free):
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 import uuid
@@ -27,17 +28,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from curie_api.config import get_settings
 from curie_api.factory_card import CardInput, render_card
-from curie_api.factory_progress import phase_view
+from curie_api.factory_progress import phase_view, record_wait_ci
 from curie_api.models import ExecutionRequestPhaseReport
 from test_factory_progress import (
     ACTIVITY,
     DECLARATION,
     PILLS,
     STAGED_DECLARATION,
+    WORKER,
     _constraint_statuses,
     report,
 )
@@ -226,7 +230,8 @@ def test_a_card_with_a_kickback_badges_the_plan_arc(admitted: Any) -> None:  # n
             == 201
         )
     before = _parse(client.get(f"/v1/factory/cards/{_token(request_id)}.svg").text)
-    assert _badge(before, "plan") == "0"
+    assert _with_class(before, "loop-arc") == []
+    assert _with_class(before, "loop-badge") == []
 
     assert (
         report(client, request_id, "plan", round=2, declaration=STAGED_DECLARATION).status_code
@@ -235,12 +240,88 @@ def test_a_card_with_a_kickback_badges_the_plan_arc(admitted: Any) -> None:  # n
     after = _parse(client.get(f"/v1/factory/cards/{_token(request_id)}.svg").text)
 
     arcs = _with_class(after, "loop-arc")
-    assert len(arcs) == 3
+    assert len(arcs) == 1
     assert all(_local(arc.tag) == "path" for arc in arcs)
     assert _badge(after, "plan") == "1"
     assert "redo" in _classes(_stage(after, "plan_review"))
     assert "current" in _classes(_stage(after, "plan"))
     assert "round 2 of 3" in _all_text(after)
+
+
+def test_platform_wait_ci_keeps_the_latest_agent_note_in_the_card(admitted: Any) -> None:  # noqa: F811
+    client, github, _sink = admitted
+    number = 9808
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    _start_running(request_id)
+    note = "Review passed and publication requested"
+    for phase, loop_round, progress_note in (
+        ("implement", 1, None),
+        ("review_diff", 1, note),
+        ("publish", None, None),
+    ):
+        response = report(
+            client,
+            request_id,
+            phase,
+            round=loop_round,
+            note=progress_note,
+            declaration=STAGED_DECLARATION,
+        )
+        assert response.status_code == 201, response.text
+
+    async def mark_waiting() -> bool:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                return await record_wait_ci(session, request_id)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(mark_waiting())
+    assert _rows(
+        "SELECT phase, note FROM curie.execution_request_phase_reports "
+        "WHERE execution_request_id = :id ORDER BY id DESC LIMIT 1",
+        {"id": request_id},
+    ) == [{"phase": "wait_ci", "note": None}]
+
+    response = client.get(f"/v1/factory/cards/{_token(request_id)}.svg")
+    assert response.status_code == 200, response.text
+    root = _parse(response.text)
+    assert "current" in _classes(_stage(root, "wait_ci"))
+    (holder,) = [element for element in root.iter() if (element.text or "") == note]
+    assert _is_italic(holder, _style(root))
+
+
+@pytest.mark.parametrize(
+    ("cause", "pill"),
+    [("ci_failed", "NEEDS HUMAN"), ("runner_failed", "FAILED")],
+)
+def test_terminal_cause_selects_the_card_pill_at_the_route(
+    admitted: Any, cause: str, pill: str  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9807
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    epoch = _start_running(request_id)
+    assert (
+        report(client, request_id, "implement", round=1, declaration=STAGED_DECLARATION)
+        .status_code
+        == 201
+    )
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/finish",
+        headers=WORKER,
+        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause},
+    )
+    assert finished.status_code == 200, finished.text
+
+    response = client.get(f"/v1/factory/cards/{_token(request_id)}.svg")
+    assert response.status_code == 200, response.text
+    root = _parse(response.text)
+    assert pill in _all_text(root)
+    assert "blocked" in _classes(_stage(root, "implement"))
 
 
 # --- the pure renderer ------------------------------------------------------------
@@ -345,10 +426,10 @@ def test_a_diff_review_approved_after_three_rounds_badges_two() -> None:
             )
         )
     )
-    assert len(_with_class(root, "loop-arc")) == 3
+    assert len(_with_class(root, "loop-arc")) == 1
     assert _badge(root, "implement") == "2"
     assert "approved · 3 rounds" in _all_text(root)
-    assert "done" in _classes(_stage(root, "review_diff"))
+    assert "current" in _classes(_stage(root, "review_diff"))
 
 
 def test_both_loops_kicked_back_draw_two_arcs() -> None:
@@ -366,8 +447,8 @@ def test_both_loops_kicked_back_draw_two_arcs() -> None:
             )
         )
     )
-    assert len(_with_class(root, "loop-arc")) == 3
-    assert [_badge(root, loop) for loop in ("plan", "implement", "wait_ci")] == ["1", "1", "0"]
+    assert len(_with_class(root, "loop-arc")) == 2
+    assert [_badge(root, loop) for loop in ("plan", "implement")] == ["1", "1"]
 
 
 def test_every_declared_phase_has_a_slot_in_declared_order() -> None:
@@ -380,21 +461,40 @@ def test_every_declared_phase_has_a_slot_in_declared_order() -> None:
     assert "pending" in _classes(_slot(root, "wait_ci"))
 
 
+CI_RETRY_ENTRIES = (
+    ("plan", 1),
+    ("plan_review", 1),
+    ("plan", 2),
+    ("plan_review", 2),
+    ("implement", 1),
+    ("review_diff", 1),
+    ("implement", 2),
+    ("review_diff", 2),
+    ("publish", None),
+    ("wait_ci", None),
+    ("implement", 3),
+    ("review_diff", 3),
+    ("publish", None),
+    ("wait_ci", None),
+)
+
+
 @pytest.mark.parametrize(
-    ("entries", "status", "states", "badges", "arc_states"),
+    ("entries", "status", "states", "arcs"),
     [
         pytest.param(
             (("plan", 1), ("plan_review", 1), ("plan", 2)),
             "running",
             ("current", "redo", "pending", "pending", "pending"),
-            ("1", "0", "0"),
-            ("live", "pending", "pending"),
+            (("plan", "1", "live"),),
             id="second_plan_round",
         ),
         pytest.param(
             (
                 ("plan", 1),
                 ("plan_review", 1),
+                ("plan", 2),
+                ("plan_review", 2),
                 ("implement", 1),
                 ("review_diff", 1),
                 ("implement", 2),
@@ -403,45 +503,38 @@ def test_every_declared_phase_has_a_slot_in_declared_order() -> None:
             ),
             "running",
             ("done", "done", "current", "redo", "pending"),
-            ("0", "2", "0"),
-            ("approved", "live", "pending"),
+            (("plan", "1", "approved"), ("implement", "2", "live")),
             id="third_diff_round",
         ),
         pytest.param(
-            (
-                ("plan", 1),
-                ("plan_review", 1),
-                ("implement", 1),
-                ("review_diff", 1),
-                ("publish", None),
-                ("wait_ci", None),
-                ("implement", 2),
-                ("review_diff", 2),
-                ("publish", None),
-                ("wait_ci", None),
-            ),
+            CI_RETRY_ENTRIES,
             "running",
             ("done", "done", "done", "done", "current"),
-            ("0", "0", "1"),
-            ("approved", "approved", "live"),
+            (
+                ("plan", "1", "approved"),
+                ("implement", "1", "approved"),
+                ("wait_ci", "1", "live"),
+            ),
             id="ci_retry_waiting",
         ),
         pytest.param(
-            (("plan", 1), ("plan_review", 1), ("implement", 1), ("wait_ci", None)),
+            CI_RETRY_ENTRIES,
             "completed",
             ("done", "done", "done", "done", "done"),
-            ("0", "0", "0"),
-            ("approved", "approved", "approved"),
+            (
+                ("plan", "1", "approved"),
+                ("implement", "1", "approved"),
+                ("wait_ci", "1", "approved"),
+            ),
             id="succeeded",
         ),
     ],
 )
-def test_five_stages_and_three_arcs_show_the_run_state(
+def test_five_stages_and_kickback_arcs_show_the_run_state(
     entries: tuple[tuple[str, int | None], ...],
     status: str,
     states: tuple[str, ...],
-    badges: tuple[str, ...],
-    arc_states: tuple[str, ...],
+    arcs: tuple[tuple[str, str, str], ...],
 ) -> None:
     root = _parse(
         _card(status=status, declaration=STAGED_DECLARATION, reports=_reports(*entries))
@@ -455,21 +548,24 @@ def test_five_stages_and_three_arcs_show_the_run_state(
         for e in stage.iter()
         if "label" in _classes(e)
     ] == ["Plan", "Plan review", "Implement", "Review diff", "Wait for CI"]
-    assert all(state in _classes(stage) for state, stage in zip(states, stages))
+    assert all(state in _classes(stage) for state, stage in zip(states, stages, strict=True))
     labels = [next(e for e in stage.iter() if "label" in _classes(e)) for stage in stages]
     assert len({float(label.get("y") or "0") for label in labels}) == 1
     assert [float(label.get("x") or "0") for label in labels] == sorted(
         float(label.get("x") or "0") for label in labels
     )
-    assert len(_with_class(root, "loop-arc")) == 3
-    assert len(_with_class(root, "loop-badge")) == 3
-    for loop, badge, arc_state in zip(("plan", "implement", "wait_ci"), badges, arc_states):
+    assert len(_with_class(root, "loop-arc")) == len(arcs)
+    assert len(_with_class(root, "loop-badge")) == len(arcs)
+    assert {arc.get("data-loop") for arc in _with_class(root, "loop-arc")} == {
+        loop for loop, _badge_text, _state in arcs
+    }
+    for loop, badge, arc_state in arcs:
         assert _badge(root, loop) == badge
         assert arc_state in _classes(_arc(root, loop))
 
 
 def test_ci_arc_wraps_the_diff_arc_and_returns_to_implement() -> None:
-    root = _parse(_card(declaration=STAGED_DECLARATION))
+    root = _parse(_card(declaration=STAGED_DECLARATION, reports=_reports(*CI_RETRY_ENTRIES)))
     ci = _path_points(_arc(root, "wait_ci"))
     diff = _path_points(_arc(root, "implement"))
     assert len(ci) >= 4 and len(diff) >= 4
