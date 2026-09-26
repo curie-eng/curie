@@ -106,9 +106,10 @@ FENCED_TABLES = (f"{SCHEMA}.{CHANNELS}", f"{SCHEMA}.{APPROVALS}")
 LOCK_MODE = "ACCESS EXCLUSIVE"
 
 #: The one reply kind whose egress identity is legitimately implicit: Slack
-#: replies go back through the worker's configured Slack origin, so NULL is the
-#: correct -- and the only correct -- adapter for a Slack row. Named here
-#: because `load_declarations` enforces the pair rule the document states.
+#: replies go back through the worker's configured Slack origin, so a Slack
+#: row's adapter names its identity (`DEFAULT_IDENTITY` below), never an
+#: egress credential. Named here because `load_declarations` enforces the rule
+#: the document states.
 SLACK_KIND = "slack"
 
 #: The name of a Slack row's default identity (ADR-0168 decision 3), and the

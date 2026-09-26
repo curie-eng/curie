@@ -644,7 +644,7 @@ def test_two_bindings_on_one_agent_both_resolve_to_the_same_deployment() -> None
     """AC2 at the worker layer (#1525): one agent, two channels, one deployment.
 
     The mirror image of ``test_second_agent_on_a_bound_channel_is_refused``: what
-    stays refused is a second AGENT on one pair; what must become allowed is a
+    stays refused is a second AGENT on one route; what must become allowed is a
     second PAIR on one agent. Both resolves must land on the same agent AND the
     same version, because a multi-bound agent is one deployment reachable from
     two doors -- an implementation that resolved the second address to a
@@ -669,10 +669,10 @@ def test_two_bindings_on_one_agent_both_resolve_to_the_same_deployment() -> None
                 pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
 
             token = uuid.uuid4().hex[:8]
-            # The placeholder ids the plan pins, namespaced per run: the
-            # `(kind, address)` pair stays globally unique, so two copies of this
-            # file running against the shared developer Postgres cannot collide
-            # and a killed run leaves nothing that blocks the next one.
+            # The placeholder ids the plan pins, namespaced per run: the route
+            # stays globally unique (`agent_channels_route_key`), so two copies
+            # of this file running against the shared developer Postgres cannot
+            # collide and a killed run leaves nothing that blocks the next one.
             first = f"C0EXAMPLE1-{token}"
             second = f"C0EXAMPLE2-{token}"
             agent_id = await _seed_agent(
@@ -1826,7 +1826,7 @@ def test_a_non_slack_turn_with_an_adapter_resolves_only_its_own_row() -> None:
     """A non-Slack `adapter` is a credential slug (ADR-0096), not an ADR-0168
     identity, but the same route triple gates it: the turn's adapter must
     match the row's stored adapter, never fall back to "any row on the
-    pair" the way Slack's omitted-adapter selector does.
+    pair" the way an omitted non-Slack adapter does.
     """
 
     async def go() -> None:

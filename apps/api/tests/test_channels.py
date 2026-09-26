@@ -971,7 +971,8 @@ def test_a_token_minted_for_one_binding_is_refused_for_another(
     The second case is the sharp one -- since migration 0023 the same address
     can be bound under two kinds, so a containment check keyed on the address
     alone would let an email adapter enqueue into the Slack agent at the same
-    address. `channel_id` is the claim, and the pair is what resolves it.
+    address. `channel_id` is the claim: it names the row, and that row must be
+    the pair the body claims.
     """
 
     _bind(

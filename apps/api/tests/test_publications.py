@@ -259,17 +259,19 @@ def test_publication_schema_refuses_an_undeclared_slack_identity_with_no_endpoin
 
 def test_a_slack_reply_endpoint_is_a_per_turn_origin_and_the_adapter_an_identity() -> None:
     """A CLI stub turn carries its Slack Web API base in `reply_endpoint` (issue
-    #19); `reply_adapter` is still the identity, checked like any other."""
+    #19); `reply_adapter` is still the identity, checked like any other, so
+    the retired custom-transport form's credential slug beside an endpoint is
+    refused as an undeclared identity."""
 
     stub = _publication_payload(str(uuid.uuid4()))
     stub["reply_endpoint"] = "http://cli-stub.test/api/"
     assert PublicationCreate.model_validate(stub).reply_adapter == "default"
 
-    credential = _publication_payload(str(uuid.uuid4()))
-    credential["reply_endpoint"] = "http://127.0.0.1:1"
-    credential["reply_adapter"] = "proof-offline"
+    retired = _publication_payload(str(uuid.uuid4()))
+    retired["reply_endpoint"] = "http://127.0.0.1:1"
+    retired["reply_adapter"] = "proof-offline"
     with pytest.raises(ValidationError, match="'proof-offline'"):
-        PublicationCreate.model_validate(credential)
+        PublicationCreate.model_validate(retired)
 
 
 def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(

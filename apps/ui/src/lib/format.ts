@@ -38,9 +38,8 @@ export function channelIdentityLabel(binding: ChannelIdentity): string {
 }
 
 // React list key for one channel binding: the full route, not only the pair.
-// Migration 0023's constraint still holds one row per `(kind, address)`, but a
-// read-only list keyed on the pair would collide the moment two identities
-// share one, so it keys on what ADR-0168 decision 3 makes the route.
+// Two identities can share one `(kind, address)` (ADR-0168 decision 3), so a
+// list keyed on the pair would collide; it keys on the route triple instead.
 export function channelIdentityKey(binding: ChannelIdentity): string {
   return `${binding.kind}:${binding.adapter ?? ""}:${binding.address}`;
 }

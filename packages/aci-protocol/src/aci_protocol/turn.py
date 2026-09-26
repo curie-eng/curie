@@ -96,8 +96,8 @@ def route_identity(kind: str, adapter: str | None) -> str | None:
     """The identity a route's ``adapter`` names (ADR-0168 decision 3).
 
     A Slack route with no adapter predates the identity: a handle still queued
-    across the upgrade, an approval row decision 5 has not backfilled, a write
-    from an API pod that has not rolled. It means the default app, so every
+    across the upgrade, or a row written by an API pod that has not rolled
+    (migration 0061 backfills every row stored before it). It means the default app, so every
     reader compares identities through this function and never on the raw
     column. ``CLUSTER_MESSAGE_ADAPTER`` on a Slack route is a delivery
     selector, not an identity, so it is the default too. Any other kind is
