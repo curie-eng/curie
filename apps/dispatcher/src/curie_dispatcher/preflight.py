@@ -287,8 +287,8 @@ def _collect_slack_destinations(
     ``default`` posts the Slack cards of turns that did not arrive on Slack. A
     cron trigger is declared in the agent's bundle, which this projection does
     not carry, so a cron hook alone is not seen here. A name this installation
-    does not declare, such as the credential slug a pre-ADR custom-transport
-    binding stores, is ``default``'s.
+    does not declare, such as an identity the chart no longer lists, is
+    ``default``'s.
     """
     if not isinstance(payload, list):
         raise ValueError("agent list is not an array")
