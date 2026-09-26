@@ -160,6 +160,12 @@
       "version": "1.0"
     },
     {
+      "result": "LintValuesOutput",
+      "kind": "CliOutput",
+      "schema": "lint-values.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ListAgentsOutput",
       "kind": "CliOutput",
       "schema": "list-agents.schema.json",
