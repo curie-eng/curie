@@ -10,8 +10,8 @@ description: >-
   hook; a NetworkPolicy-enforcement probe ships as a helm test that must be run
   explicitly.
 type: application
-version: 0.10.1
-appVersion: "0.10.1"
+version: 0.10.2
+appVersion: "0.10.2"
 kubeVersion: ">=1.25.0-0"
 maintainers:
   - name: Curie

@@ -1193,6 +1193,7 @@ def test_create_approval_persists_gate_kind_and_granted_tool(
             summary='Tool call awaiting approval: Bash {"command": "deploy"}',
             gate_kind="permission",
             granted_tool="Bash",
+            granted_arguments={"command": "deploy", "options": {"flags": ["safe"]}},
         ),
         headers=auth_headers,
     )
@@ -1204,6 +1205,23 @@ def test_create_approval_persists_gate_kind_and_granted_tool(
     got = approvals_client.get(f"/approvals/{body['id']}", headers=auth_headers).json()
     assert got["gate_kind"] == "permission"
     assert got["granted_tool"] == "Bash"
+    async def read_arguments() -> dict[str, Any] | None:
+        from curie_api.db import create_engine
+
+        engine = create_engine()
+        try:
+            async with engine.connect() as conn:
+                return await conn.scalar(
+                    text("SELECT granted_arguments FROM curie.approvals WHERE id = :id"),
+                    {"id": uuid.UUID(body["id"])},
+                )
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(read_arguments()) == {
+        "command": "deploy",
+        "options": {"flags": ["safe"]},
+    }
 
     # A policy gate carries provenance but never authority (Decision A).
     policy = approvals_client.post(

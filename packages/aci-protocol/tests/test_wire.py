@@ -89,6 +89,7 @@ def _full_approval_request() -> ApprovalRequest:
         card_channel="C2",
         gate_kind=GateKind.PERMISSION,
         granted_tool="Bash",
+        granted_arguments={"command": "printf ok", "options": {"flags": ["a"]}},
         expires_in_seconds=3600,
     )
 
@@ -154,6 +155,7 @@ def test_approval_request_round_trips_identically() -> None:
     assert restored.card_channel == "C2"
     assert restored.gate_kind == GateKind.PERMISSION
     assert restored.granted_tool == "Bash"
+    assert restored.granted_arguments == {"command": "printf ok", "options": {"flags": ["a"]}}
     assert restored.expires_in_seconds == 3600
 
 

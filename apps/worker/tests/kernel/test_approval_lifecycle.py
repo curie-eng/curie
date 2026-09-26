@@ -2638,6 +2638,11 @@ class GrantBinding:
     async def approval_grant_tool(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
         return self.grant_tool if event_id == self.grant_event_id else None
 
+    async def approval_grant_arguments(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
+        if event_id != self.grant_event_id:
+            return None
+        return {"title": "Ship the fix"}
+
     async def approval_decision(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
         return self.decision if event_id == self.grant_event_id else None
 
@@ -2668,6 +2673,7 @@ def test_resume_claim_injects_approval_grant_tool_env(make_harness) -> None:
             resumed_env = h.fake_k8s.claim_envs[-1]
             assert resumed_env is not None
             assert resumed_env.get("CURIE_APPROVAL_GRANT_TOOL") == "mcp__github__create_issue"
+            assert resumed_env.get("CURIE_APPROVAL_GRANT_ARGUMENTS") == '{"title":"Ship the fix"}'
             assert resumed_env.get("CURIE_APPROVAL_DECISION") == "approved"
 
             # A fresh, unrelated mention has a different event id -> no grant env
@@ -2678,6 +2684,7 @@ def test_resume_claim_injects_approval_grant_tool_env(make_harness) -> None:
             fresh_env = h.fake_k8s.claim_envs[-1]
             assert fresh_env is not None
             assert "CURIE_APPROVAL_GRANT_TOOL" not in fresh_env
+            assert "CURIE_APPROVAL_GRANT_ARGUMENTS" not in fresh_env
             assert "CURIE_APPROVAL_DECISION" not in fresh_env
 
     asyncio.run(go())
@@ -4467,6 +4474,13 @@ class _WorkspacelessBinding:
         self.grant_reads.append(event_id)
         if event_id == _RESUME_EVENT_ID:
             return _GATED_TOOL
+        return None
+
+    async def approval_grant_arguments(
+        self, event_id: str, _agent_id: uuid.UUID
+    ) -> dict[str, str] | None:
+        if event_id == _RESUME_EVENT_ID:
+            return {"command": "printf ok"}
         return None
 
     async def resolve(self, _kind: str, _channel: str) -> object:

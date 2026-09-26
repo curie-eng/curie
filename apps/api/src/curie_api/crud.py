@@ -2071,6 +2071,7 @@ async def create_approval(
         card_channel=data.card_channel,
         gate_kind=data.gate_kind,
         granted_tool=data.granted_tool,
+        granted_arguments=data.granted_arguments,
         expires_at=expires_at,
     )
     session.add(approval)

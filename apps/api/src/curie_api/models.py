@@ -491,6 +491,12 @@ class Approval(Base):
     # which is the rolling-deploy window the worker's prefix fallback covers.
     gate_kind: Mapped[str | None] = mapped_column(default=None)
     granted_tool: Mapped[str | None] = mapped_column(default=None)
+    # Canonical arguments of the denied permission gated call. NULL on old
+    # approvals and policy gates; an empty object is a real argument value.
+    # Kept private to the worker's resume lookup bound to the agent.
+    granted_arguments: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
     # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
     # requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")

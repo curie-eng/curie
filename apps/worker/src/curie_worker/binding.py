@@ -130,6 +130,8 @@ CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
 # #430 one-shot post-approval allowance (ADR-0035): a runner-local knob carrying
 # the single approved tool name the runner gate lets through once on a resume boot.
 GRANT_TOOL_ENV = BootEnv.env_key("approval_grant_tool")
+# The paired argument object comes only from the approved permission row.
+GRANT_ARGUMENTS_ENV = BootEnv.env_key("approval_grant_arguments")
 # #544 Decision A2 turn-end reconciliation marker: an authority-free FACT that
 # THIS resume boot is resuming a policy-gate approval. Unlike GRANT_TOOL_ENV it
 # confers nothing -- the runner reads it only to decide whether to emit an
@@ -568,6 +570,38 @@ class BindingResolver:
             return None
         tool = summary[len(_PERMISSION_GATE_SUMMARY_PREFIX) :].split(" ", 1)[0]
         return tool or None
+
+    async def approval_grant_arguments(
+        self, event_id: str, agent_id: uuid.UUID
+    ) -> dict[str, Any] | None:
+        """Return the denied call's stored arguments for its approved resume.
+
+        The new carrier has no summary fallback. Only an approved permission
+        gate with a stored tool and a resume for the same agent may carry arguments;
+        policy approvals, old rows and malformed values return None. An empty
+        object remains a valid argument value.
+        """
+        approval_id = _parse_resume_event_id(event_id)
+        if approval_id is None:
+            return None
+        sql = text(
+            f"SELECT status, agent_id, gate_kind, granted_tool, granted_arguments "
+            f"FROM {self._config.db_schema}.approvals WHERE id = :id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": approval_id})
+            row = result.mappings().first()
+        if row is None:
+            return None
+        if row["status"] != "approved":
+            return None
+        row_agent_id = row["agent_id"]
+        if row_agent_id is None or row_agent_id != agent_id:
+            return None
+        if row["gate_kind"] != "permission" or not row["granted_tool"]:
+            return None
+        arguments: Any = row["granted_arguments"]
+        return arguments if isinstance(arguments, dict) else None
 
     async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
