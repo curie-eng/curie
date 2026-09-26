@@ -104,8 +104,7 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO curie.agents (id, name, max_usd_per_day) "
-                    "VALUES (:id, :name, :usd)"
+                    "INSERT INTO curie.agents (id, name, max_usd_per_day) VALUES (:id, :name, :usd)"
                 ),
                 {"id": agent_id, "name": f"cron_agent_{token}", "usd": max_usd_per_day},
             )
@@ -448,6 +447,56 @@ def test_target_not_bound_to_the_agent_records_failed(
             rows = await seed.runs()
             assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "failed")]
             assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("path", ["blocked", "failed"])
+def test_a_replica_that_loses_a_terminal_slot_counts_it_lost(
+    sync_redis: redis.Redis, names: dict[str, str], path: str
+) -> None:
+    # A killed agent records `blocked`; a target bound to no channel records
+    # `failed`. Both inserts are ON CONFLICT DO NOTHING, so the replica whose
+    # insert conflicts must count the slot lost, not blocked or failed (#3012).
+    async def killed(_agent_id: uuid.UUID) -> bool:
+        return True
+
+    async def body() -> None:
+        async with _seed() as seed:
+            if path == "blocked":
+                trigger, kwargs = _trigger(seed), {"is_killed": killed}
+            else:
+                unbound = f"C{uuid.uuid4().hex[:10].upper()}"
+                trigger, kwargs = _trigger(seed, target=unbound), {}
+            now = seed.slot + timedelta(seconds=30)
+            client_a, client_b = _async_redis(), _async_redis()
+            try:
+                winner = _loop(
+                    seed.engine,
+                    client_a,
+                    _Triggers(seed, trigger),
+                    names["stream"],
+                    seed.slot,
+                    **kwargs,
+                )
+                loser = _loop(
+                    seed.engine,
+                    client_b,
+                    _Triggers(seed, trigger),
+                    names["stream"],
+                    seed.slot,
+                    **kwargs,
+                )
+                first = await winner.one_pass(now=now)
+                second = await loser.one_pass(now=now)
+            finally:
+                await client_a.aclose()
+                await client_b.aclose()
+
+            assert getattr(first, path) == 1 and first.lost == 0
+            assert (second.blocked, second.failed, second.lost) == (0, 0, 1)
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, path)]
 
     asyncio.run(body())
 
