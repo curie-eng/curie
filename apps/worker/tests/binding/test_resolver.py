@@ -9,7 +9,8 @@ The binding is a row in `agent_channels` carrying `kind` and `address`
 (ADR-0096, #1459), not a column on `agents`. Since phase 2 the ROUTING KEY IS
 THE PAIR: `ReplyHandle.kind` rides the queue wire (required, D1), so
 `resolve(kind, address)` binds both halves into the predicate and migration 0023
-widens uniqueness to `(kind, address)`. There is no address-only overload and no
+widens uniqueness to `(kind, address)`; migration 0061 widens it again to the
+route triple `(kind, address, adapter)`. There is no address-only overload and no
 default for `kind` -- either would be the silent-address-fallback compatibility
 path phase 2 exists to remove.
 
@@ -82,8 +83,11 @@ async def _seed_agent(
     longer carries a `slack_channel` column at all. `kind` defaults to `slack`
     so every existing caller keeps meaning what it meant, and is a parameter so
     the kind-independence test can seed a binding the resolver has no special
-    knowledge of.
+    knowledge of. A Slack binding names its identity, `default` unless given
+    (ADR-0168 decision 3).
     """
+    if adapter is None and kind == "slack":
+        adapter = "default"
     agent_id = uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
@@ -134,6 +138,7 @@ async def _seed_binding(
     channel: str,
     kind: str = "slack",
     schema: str = _SCHEMA,
+    adapter: str | None = None,
 ) -> None:
     """Add ANOTHER binding row to an agent that already has one (#1525).
 
@@ -141,15 +146,24 @@ async def _seed_binding(
     first binding together, and the property under test here is the SECOND row.
     Against the pre-0025 schema this insert is refused by
     ``agent_channels_agent_id_key`` -- which is the red these tests are written
-    to record, not a fixture bug to work around.
+    to record, not a fixture bug to work around. A Slack binding names its
+    identity, `default` unless given, as in ``_seed_agent``.
     """
+    if adapter is None and kind == "slack":
+        adapter = "default"
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                f"INSERT INTO {schema}.agent_channels (id, agent_id, kind, address) "
-                "VALUES (:id, :agent_id, :kind, :address)"
+                f"INSERT INTO {schema}.agent_channels (id, agent_id, kind, address, adapter) "
+                "VALUES (:id, :agent_id, :kind, :address, :adapter)"
             ),
-            {"id": uuid.uuid4(), "agent_id": agent_id, "kind": kind, "address": channel},
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "kind": kind,
+                "address": channel,
+                "adapter": adapter,
+            },
         )
 
 
@@ -263,7 +277,8 @@ def test_resolves_channel_to_active_deployment_and_builds_env() -> None:
 def test_a_cluster_message_relay_turn_resolves_the_channels_default_binding() -> None:
     """`curie cluster message` queues a Slack turn whose handle carries the
     worker's built-in reply adapter; the binding `curie cluster deploy` wrote
-    for that channel stores no adapter. The relay still resolves to it."""
+    for that channel names the default identity. The relay still resolves to
+    it."""
 
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
@@ -452,19 +467,21 @@ def test_bound_agent_without_active_deployment_is_identified() -> None:
                 name=f"undeployed-{token}",
                 max_usd=None,
                 max_tokens=None,
-                endpoint="https://adapter.example.com/replies",
-                adapter="mail",
+                adapter="ops-bot",
             )
             try:
                 resolver = _resolver(engine)
-                assert await resolver.resolve("slack", None, channel) is None
-                binding = await resolver.undeployed_binding("slack", None, channel)
+                assert await resolver.resolve("slack", "ops-bot", channel) is None
+                binding = await resolver.undeployed_binding("slack", "ops-bot", channel)
                 assert binding == BoundAgent(
                     agent_id=agent_id,
                     agent_name=f"undeployed-{token}",
-                    endpoint="https://adapter.example.com/replies",
-                    adapter="mail",
+                    endpoint=None,
+                    adapter="ops-bot",
                 )
+                # The identity narrows the diagnostic too: the default identity's
+                # turn on this channel is not this agent's.
+                assert await resolver.undeployed_binding("slack", None, channel) is None
                 # The kind remains part of the lookup; this is not an address-only
                 # fallback that could surface another channel's agent.
                 assert await resolver.undeployed_binding("email", None, channel) is None
@@ -606,7 +623,7 @@ def test_second_agent_on_a_bound_channel_is_refused() -> None:
                 engine, channel=channel, name=f"agent-a-{token}", max_usd=None, max_tokens=None
             )
             try:
-                with pytest.raises(IntegrityError):
+                with pytest.raises(IntegrityError) as err:
                     await _seed_agent(
                         engine,
                         channel=channel,
@@ -614,6 +631,7 @@ def test_second_agent_on_a_bound_channel_is_refused() -> None:
                         max_usd=None,
                         max_tokens=None,
                     )
+                assert "agent_channels_route_key" in str(err.value)
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
@@ -752,8 +770,8 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
     This closes the coverage gap left by #1022, so deleting the call site in
     binding.py makes this test fail.
 
-    Two agents on one address are unreachable in the curie schema
-    (agent_channels_address_key is unique), so the rows are seeded into a
+    Two agents on one Slack route are unreachable in the curie schema
+    (agent_channels_route_key is unique), so the rows are seeded into a
     throwaway schema this test creates and drops. No curie object is touched and
     the production invariant #959 protects stays in place for everyone else on
     the box.
@@ -857,7 +875,7 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
                     # LIKE ... INCLUDING DEFAULTS copies columns, types, NOT NULL
                     # and defaults, and deliberately NOT indexes, unique
                     # constraints or foreign keys. That is the point: without
-                    # agent_channels_address_key two agents can share an address
+                    # agent_channels_route_key two agents can share a route
                     # here, and without the FKs the seeded rows need no parent
                     # rows in curie. INCLUDING ALL or INCLUDING INDEXES would
                     # copy the unique constraint back and silently break this
@@ -1615,11 +1633,10 @@ def test_resolve_agent_misses_without_an_active_deployment_or_agent() -> None:
     asyncio.run(go())
 
 
-def test_a_slack_turn_with_no_adapter_resolves_the_null_stored_default_row() -> None:
-    """ADR-0168 decision 3, the ordinary case: a Slack turn's ``adapter`` is
-    NULL on the wire (the dispatcher still mints ``adapter=None``), and the
-    stored row is the default identity's stored form -- also NULL. Both mean the
-    installation's one identity (``route_identity``), so they must resolve.
+def test_a_slack_turn_with_no_adapter_resolves_the_default_row() -> None:
+    """ADR-0168 decision 3: a handle queued before the dispatcher named
+    ``default`` carries no adapter, and the stored row names ``default``. Both
+    mean the default identity (``route_identity``), so they must resolve.
     """
 
     async def go() -> None:
@@ -1645,7 +1662,7 @@ def test_a_slack_turn_with_no_adapter_resolves_the_null_stored_default_row() -> 
                 resolved = await _resolver(engine).resolve("slack", None, channel)
                 assert resolved is not None
                 assert resolved.agent_id == agent_id
-                assert resolved.adapter is None
+                assert resolved.adapter == "default"
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
@@ -1654,10 +1671,10 @@ def test_a_slack_turn_with_no_adapter_resolves_the_null_stored_default_row() -> 
     asyncio.run(go())
 
 
-def test_a_slack_turn_with_adapter_default_resolves_the_same_null_row() -> None:
+def test_a_slack_turn_with_adapter_default_resolves_the_same_default_row() -> None:
     """The wire spelling of the default identity (``'default'``) must resolve
-    the SAME NULL-stored row as an omitted adapter -- the two are one identity
-    through ``route_identity``, never a NULL-vs-string mismatch.
+    the SAME row as an omitted adapter -- the two are one identity through
+    ``route_identity``, never a NULL-vs-string mismatch.
     """
 
     async def go() -> None:
@@ -1683,7 +1700,7 @@ def test_a_slack_turn_with_adapter_default_resolves_the_same_null_row() -> None:
                 resolved = await _resolver(engine).resolve("slack", "default", channel)
                 assert resolved is not None
                 assert resolved.agent_id == agent_id
-                assert resolved.adapter is None  # the stored form is unchanged
+                assert resolved.adapter == "default"
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
@@ -1695,7 +1712,7 @@ def test_a_slack_turn_with_adapter_default_resolves_the_same_null_row() -> None:
 def test_a_slack_turn_with_a_named_adapter_does_not_resolve_the_default_row() -> None:
     """The identity comparison, not merely the pair: a turn naming a Slack
     identity the stored row does not carry must miss, never fall back to the
-    NULL-stored default row on the same pair.
+    default row on the same pair.
     """
 
     async def go() -> None:
@@ -1728,15 +1745,8 @@ def test_a_slack_turn_with_a_named_adapter_does_not_resolve_the_default_row() ->
     asyncio.run(go())
 
 
-def test_a_slack_turn_with_no_adapter_resolves_a_custom_transport_row() -> None:
-    """The pre-ADR custom-transport form (e.g. the offline hook-approval proof
-    rig, `charts/curie/ci/hook-approval-proof.py`) stores a CREDENTIAL slug in
-    `adapter`, not an identity, so it never matches `DEFAULT_IDENTITY` on the
-    resolved-identity comparison. Its callers never send `adapter` either
-    (the dispatcher still mints ``adapter=None``), so the omitted-adapter
-    selector must still fall back to the one row on the pair that carries an
-    endpoint.
-    """
+def test_two_agents_on_one_slack_channel_answer_their_own_identity() -> None:
+    """ADR-0168 decision 3: the worker resolves by all three fields."""
 
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
@@ -1746,24 +1756,64 @@ def test_a_slack_turn_with_no_adapter_resolves_a_custom_transport_row() -> None:
                     pass
             except SQLAlchemyError as exc:
                 pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-{token}"
+            first = await _seed_agent(
+                engine, channel=channel, name=f"default-{token}", max_usd=None, max_tokens=None
+            )
+            second = await _seed_agent(
+                engine,
+                channel=channel,
+                name=f"second-{token}",
+                max_usd=None,
+                max_tokens=None,
+                adapter="second",
+            )
+            for agent_id in (first, second):
+                await _seed_deployment(
+                    engine,
+                    agent_id=agent_id,
+                    environment="prod",
+                    bundle_ref=f"bundles/{agent_id}.zip",
+                )
+            try:
+                resolver = _resolver(engine)
+                assert (await resolver.resolve("slack", None, channel)).agent_id == first
+                assert (await resolver.resolve("slack", "default", channel)).agent_id == first
+                assert (await resolver.resolve("slack", "second", channel)).agent_id == second
+                assert await resolver.resolve("slack", "third", channel) is None
+            finally:
+                await _cleanup(engine, [first, second])
+        finally:
+            await engine.dispose()
 
+    asyncio.run(go())
+
+
+def test_one_agent_on_one_slack_channel_under_two_identities_answers_both() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
             agent_id = await _seed_agent(
-                engine, channel=channel, name=f"custom-transport-{token}",
-                max_usd=None, max_tokens=None,
-                endpoint="http://127.0.0.1:1", adapter="proof-offline",
+                engine, channel=channel, name=f"two-bots-{token}", max_usd=None, max_tokens=None
             )
+            await _seed_binding(engine, agent_id=agent_id, channel=channel, adapter="second")
             await _seed_deployment(
-                engine, agent_id=agent_id, environment="prod",
-                bundle_ref=f"bundles/{token}.zip",
+                engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
             )
             try:
-                resolved = await _resolver(engine).resolve("slack", None, channel)
-                assert resolved is not None
-                assert resolved.agent_id == agent_id
-                assert resolved.endpoint == "http://127.0.0.1:1"
-                assert resolved.adapter == "proof-offline"
+                resolver = _resolver(engine)
+                for identity in ("default", "second"):
+                    resolved = await resolver.resolve("slack", identity, channel)
+                    assert resolved is not None and resolved.agent_id == agent_id
+                    assert resolved.adapter == identity
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
