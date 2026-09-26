@@ -204,26 +204,31 @@ async def _resolve_binding(
 ) -> AgentChannel | None:
     """The binding row for one `(kind, adapter, address)` route, or None.
 
-    The PAIR, never the address alone: since migration 0023 one address can be
-    bound under two kinds, and resolving on the address would let one kind's
-    adapter reach the other kind's agent. Delegates to `crud.binding_for_route`
-    (ADR-0168 decision 3), which narrows the pair's row to `adapter`'s
-    RESOLVED identity -- an omitted Slack adapter still means the default app,
-    exactly as before this router had an identity to resolve.
+    The kind too, never the address alone: one address can be bound under two
+    kinds, and resolving on the address would let one kind's adapter reach the
+    other kind's agent. Delegates to `crud.binding_for_route` (ADR-0168
+    decision 3), which narrows to `adapter`'s RESOLVED identity -- an omitted
+    Slack adapter still means the default app -- and answers a pair holding
+    several routes under an omitted non-Slack adapter with a 409 here.
     """
 
-    return await crud.binding_for_route(session, kind, adapter, address)
+    try:
+        return await crud.binding_for_route(session, kind, adapter, address)
+    except crud.AmbiguousRoute as exc:
+        raise _ambiguous(exc) from exc
+
+
+def _ambiguous(exc: crud.AmbiguousRoute) -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, str(exc))
 
 
 def _route_is_configured(row: AgentChannel) -> bool:
     """Whether this binding can actually deliver a reply.
 
     `slack` needs no per-binding route (D4.4): the worker's configured Slack
-    origin is what actually delivers. A default-identity Slack row carries
-    NULL in both `endpoint` and `adapter`, not its identity, until the
-    contract migration for ADR-0168 decision 3 (#3100) flips the stored form,
-    so it is answered by kind and never reaches the test below. Every other
-    kind needs both halves, and the DB CHECK guarantees they are
+    origin is what actually delivers, and a Slack row carries its identity and
+    no endpoint, so it is answered by kind and never reaches the test below.
+    Every other kind needs both halves, and the DB CHECK guarantees they are
     both-or-neither, so testing one of them would be enough -- both are tested
     because the guarantee is the database's, not this function's.
     """
@@ -293,8 +298,16 @@ async def mint_channel_token(
         # Selected by the TRIPLE (`data.adapter`, ADR-0168 decision 3), not
         # only the pair: an omitted `data.adapter` still resolves to the
         # default Slack identity through `route_identity`, so an unchanged
-        # caller keeps naming the same row it always did.
-        unlocked_row = await crud.binding_for_route(session, data.kind, data.adapter, data.address)
+        # caller keeps naming the same row it always did. An ambiguous pair
+        # names no single binding, and answering its 409 here would tell a
+        # principal serving neither route how many the pair holds, so it
+        # reads as unserved too.
+        try:
+            unlocked_row = await crud.binding_for_route(
+                session, data.kind, data.adapter, data.address
+            )
+        except crud.AmbiguousRoute:
+            unlocked_row = None
         if unlocked_row is None or unlocked_row.id not in adapter.bindings:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "adapter principal does not serve this binding"
@@ -305,9 +318,12 @@ async def mint_channel_token(
     # on two tokens, and neither rotation would revoke the other. `populate_existing`
     # is the same load-bearing choice as `crud.lock_agent_bindings`. Only reached
     # for a row the adapter (or the platform key) actually serves.
-    row = await crud.binding_for_route(
-        session, data.kind, data.adapter, data.address, for_update=True
-    )
+    try:
+        row = await crud.binding_for_route(
+            session, data.kind, data.adapter, data.address, for_update=True
+        )
+    except crud.AmbiguousRoute as exc:
+        raise _ambiguous(exc) from exc
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -403,6 +419,26 @@ def _authorize(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
 
+async def _claimed_row(
+    session: Any, claims: channel_token.ChannelClaims, kind: str, address: str
+) -> AgentChannel | None:
+    """The row a verified `chn` claim names, if it is still the body's pair.
+
+    None otherwise, which `_authorize` refuses with the identical 401: a caller
+    must not learn whether its token's row moved, was deleted, or never
+    matched the pair it posted to.
+    """
+
+    try:
+        channel_id = uuid.UUID(claims.channel_id)
+    except ValueError:
+        return None
+    row: AgentChannel | None = await session.get(AgentChannel, channel_id)
+    if row is None or row.kind != kind or row.address != address:
+        return None
+    return row
+
+
 def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
     """Build the `QueuedTurn` from the BINDING ROW plus the delivery's content.
 
@@ -485,11 +521,16 @@ async def ingest_turn(
     body = _parse_turn(raw)
     claims = _verify_credential(x_api_key)
     # `TurnIn` deliberately does not model `adapter` (plan D4.1, `TurnIn`'s own
-    # docstring): the credential -- not the body -- names the binding, so an
-    # omitted adapter here is not "unspecified", it is every caller of this
-    # route, including one that predates ADR-0168 decision 3. `None` resolves
-    # to the default Slack identity or the pair's single non-Slack row.
-    row = await _resolve_binding(session, body.kind, None, body.address)
+    # docstring): the credential -- not the body -- names the binding. A `chn`
+    # token's claim names its ROW, so that row is loaded by id and must be the
+    # pair the body claims; the pair alone can hold several routes (ADR-0168
+    # decision 3). A platform-key turn names no row, so `None` resolves to the
+    # default Slack identity or the pair's single non-Slack route, and an
+    # ambiguous pair is a 409.
+    if claims is not None:
+        row = await _claimed_row(session, claims, body.kind, body.address)
+    else:
+        row = await _resolve_binding(session, body.kind, None, body.address)
     _authorize(claims, row)
     if row is None:
         raise HTTPException(

@@ -380,7 +380,7 @@ async def ingest_hook(
     else:
         # The hook route names no adapter -- there is no such query parameter
         # -- so `adapter=None` is the whole request: the default Slack
-        # identity, or (today) the single row a non-Slack pair holds.
+        # identity, or the agent's single route on a non-Slack pair.
         # `crud.matching_bindings` is the one matching rule every reader of a
         # route shares; `agent.channels` is already
         # loaded, so this calls it directly rather than issuing a fresh query.
@@ -389,6 +389,15 @@ async def ingest_hook(
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
                 "this agent has no binding for the selected kind and address",
+            )
+        if len(matches) > 1:
+            # Two of this agent's routes on one pair (ADR-0168 decision 3):
+            # replying through either would be a guess.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{len(matches)} routes are bound to {kind}:{address}; this hook "
+                "cannot name an adapter, so bind one route per pair for a hook "
+                "reply surface",
             )
         binding = matches[0]
 
