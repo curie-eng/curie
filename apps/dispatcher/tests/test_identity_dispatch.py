@@ -189,7 +189,7 @@ def test_two_identities_feed_one_stream_each_stamping_its_own_identity(
 
     payloads = _payloads(redis_client, config)
     assert set(payloads) == {"Ev0EXAMPLE1", "Ev0EXAMPLE2:ops-bot"}
-    assert payloads["Ev0EXAMPLE1"]["reply_handle"]["adapter"] is None
+    assert payloads["Ev0EXAMPLE1"]["reply_handle"]["adapter"] == "default"
     assert payloads["Ev0EXAMPLE2:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
     # Each placeholder is posted by, and recorded from, the app it arrived on.
     assert payloads["Ev0EXAMPLE1"]["reply_handle"]["placeholder"] == "100.0001"
@@ -253,7 +253,7 @@ def test_the_delivery_cannot_choose_the_identity(
 
     payloads = _payloads(redis_client, config)
     assert set(payloads) == {"Ev0EXAMPLE3", "Ev0EXAMPLE4:ops-bot"}
-    assert payloads["Ev0EXAMPLE3"]["reply_handle"]["adapter"] is None
+    assert payloads["Ev0EXAMPLE3"]["reply_handle"]["adapter"] == "default"
     assert payloads["Ev0EXAMPLE4:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
 
 
@@ -274,7 +274,7 @@ def test_a_button_click_cannot_choose_the_identity(
 
     payloads = _payloads(redis_client, config)
     assert set(payloads) == {"action-trig-env-f3", "action-trig-env-f4:ops-bot"}
-    assert payloads["action-trig-env-f3"]["reply_handle"]["adapter"] is None
+    assert payloads["action-trig-env-f3"]["reply_handle"]["adapter"] == "default"
     assert payloads["action-trig-env-f4:ops-bot"]["reply_handle"]["adapter"] == "ops-bot"
 
 
