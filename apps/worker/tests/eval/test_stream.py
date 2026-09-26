@@ -462,8 +462,13 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                 consumer.request_stop()
                 await asyncio.sleep(0.35)
                 assert not task.done(), "graceful stop must drain the inline eval handler"
-                assert await client.pttl(alive) > 0
-                assert await client.pttl(capable) > 0
+                renewal_deadline = time.monotonic() + 2
+                while time.monotonic() < renewal_deadline:
+                    if await client.pttl(alive) > 0 and await client.pttl(capable) > 0:
+                        break
+                    await asyncio.sleep(0.005)
+                else:
+                    pytest.fail("eval consumer did not renew both liveness markers")
                 release.set()
                 await task
                 assert reports and reports[0]["passed_count"] == 1

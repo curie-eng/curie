@@ -1,28 +1,20 @@
-"""A large bundle upload must not stall GET /health on the uvicorn worker.
+"""A bundle upload must leave GET /health available during validation.
 
-``deploy.validate_archive`` extracts the archive to a temp dir and runs
-``plugin_format.validate_bundle``. Called directly from the async upload
-handler, that work blocked the event loop, so every other request on the
-worker waited. This drives a real one-worker uvicorn with an archive that
-takes at least 200 ms to validate, polls GET /health concurrently, and
-requires health p99 during validation to stay under 50 ms.
-
-Health samples are restricted to requests that overlap the validation
-window. p99 of the whole PUT would be dominated by body-transfer and
-object-store samples, which already run off the loop, and would hide the
-stall this test exists to catch.
+The upload runs through a real one-worker uvicorn. A wrapper around the
+archive validator pauses before its real call until a health request completes.
+If validation runs on the event loop, the health request cannot complete
+until the pause ends, so the test fails without a latency threshold.
 """
 
 from __future__ import annotations
 
 import io
-import logging
-import os
 import socket
 import tarfile
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -32,12 +24,6 @@ from curie_api import deploy
 from curie_api.main import create_app
 
 MANIFEST = '{"name": "demo-plugin", "version": "0.1.0"}'
-_MIN_VALIDATE_S = 0.200
-_HEALTH_P99_S = 0.050
-_PROBE_THREADS = 4
-_PROBE_INTERVAL_S = 0.005
-_MAX_PAD_BYTES = 150 * 1024 * 1024
-_MAX_MEMBERS = 8000
 
 
 def _skill(name: str) -> bytes:
@@ -52,56 +38,6 @@ def _tar_plain(files: dict[str, bytes], top: str = "demo-plugin") -> bytes:
             info.size = len(content)
             tf.addfile(info, io.BytesIO(content))
     return buf.getvalue()
-
-
-def _archive(n_extra: int, pad_bytes: int) -> bytes:
-    files: dict[str, bytes] = {
-        ".claude-plugin/plugin.json": MANIFEST.encode(),
-        "skills/alpha/SKILL.md": _skill("alpha"),
-    }
-    for i in range(n_extra):
-        files[f"assets/p{i}.txt"] = f"{i}\n".encode()
-    if pad_bytes:
-        chunk = os.urandom(1024)
-        files["assets/pad.bin"] = (chunk * ((pad_bytes // 1024) + 1))[:pad_bytes]
-    return _tar_plain(files)
-
-
-def _slow_archive() -> tuple[bytes, float]:
-    """Grow an archive until ``validate_archive`` takes at least 200 ms."""
-
-    n_extra = 4000
-    pad_bytes = 0
-    last_elapsed = 0.0
-    archive = b""
-    while True:
-        archive = _archive(n_extra, pad_bytes)
-        started = time.perf_counter()
-        deploy.validate_archive(archive)
-        last_elapsed = time.perf_counter() - started
-        if last_elapsed >= _MIN_VALIDATE_S:
-            return archive, last_elapsed
-        if n_extra < _MAX_MEMBERS:
-            n_extra = min(_MAX_MEMBERS, n_extra * 2)
-            continue
-        if pad_bytes == 0:
-            pad_bytes = 16 * 1024 * 1024
-            continue
-        if pad_bytes < _MAX_PAD_BYTES:
-            pad_bytes = min(_MAX_PAD_BYTES, pad_bytes * 2)
-            continue
-        raise AssertionError(
-            f"could not build an archive that takes {_MIN_VALIDATE_S:.3f}s to "
-            f"validate (last {last_elapsed:.3f}s, members={n_extra}, pad={pad_bytes})"
-        )
-
-
-def _percentile(samples: list[float], p: float) -> float:
-    if not samples:
-        raise AssertionError("no health samples overlapped validation")
-    ordered = sorted(samples)
-    rank = max(1, min(len(ordered), int((p / 100) * len(ordered) + 0.999999)))
-    return ordered[rank - 1]
 
 
 def _free_port() -> int:
@@ -183,104 +119,50 @@ def _create_version(http: httpx.Client, headers: dict[str, str]) -> tuple[str, s
     return agent.json()["id"], version.json()["id"]
 
 
-def test_health_p99_stays_under_50ms_during_a_slow_bundle_upload(
+def test_health_is_served_while_bundle_validation_is_in_progress(
     live_api: str,
     auth_headers: dict[str, str],
     clean_db: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive, validate_s = _slow_archive()
-    assert validate_s >= _MIN_VALIDATE_S
-
-    window = {"start": 0.0, "end": 0.0}
+    archive = _tar_plain(
+        {
+            ".claude-plugin/plugin.json": MANIFEST.encode(),
+            "skills/alpha/SKILL.md": _skill("alpha"),
+        }
+    )
+    entered_validation = threading.Event()
+    release_validation = threading.Event()
     real_validate = deploy.validate_archive
 
-    def _timed_validate(*args: Any, **kwargs: Any) -> tuple[str, str]:
-        window["start"] = time.perf_counter()
-        try:
-            return real_validate(*args, **kwargs)
-        finally:
-            window["end"] = time.perf_counter()
+    def _gated_validate(*args: Any, **kwargs: Any) -> tuple[str, str]:
+        entered_validation.set()
+        assert release_validation.wait(timeout=15), "health did not release validation"
+        return real_validate(*args, **kwargs)
 
-    monkeypatch.setattr(deploy, "validate_archive", _timed_validate)
+    monkeypatch.setattr(deploy, "validate_archive", _gated_validate)
 
-    samples: list[tuple[float, float]] = []
-    stop = threading.Event()
-    probe_errors: list[str] = []
-    log = logging.getLogger("curie_api")
-    previous_level = log.level
-    log.setLevel(logging.ERROR)
-
-    def _probe() -> None:
-        with httpx.Client(base_url=live_api, timeout=30.0) as probe:
-            try:
-                warmup = probe.get("/health")
-            except httpx.HTTPError as exc:
-                probe_errors.append(str(exc))
-                return
-            if warmup.status_code != 200:
-                probe_errors.append(f"health {warmup.status_code}")
-                return
-            while not stop.is_set():
-                started = time.perf_counter()
-                try:
-                    response = probe.get("/health")
-                except httpx.HTTPError as exc:
-                    probe_errors.append(str(exc))
-                    return
-                finished = time.perf_counter()
-                if response.status_code != 200:
-                    probe_errors.append(f"health {response.status_code}")
-                    return
-                samples.append((started, finished))
-                if stop.wait(_PROBE_INTERVAL_S):
-                    break
-
-    probers = [threading.Thread(target=_probe, daemon=True) for _ in range(_PROBE_THREADS)]
-    headers = auth_headers
-    try:
-        with httpx.Client(base_url=live_api, timeout=180.0) as http:
-            agent_id, version_id = _create_version(http, headers)
+    with httpx.Client(base_url=live_api, timeout=30.0) as http:
+        agent_id, version_id = _create_version(http, auth_headers)
+        with httpx.Client(base_url=live_api, timeout=5.0) as probe:
             warmup = http.get("/health")
             assert warmup.status_code == 200
-            for thread in probers:
-                thread.start()
-            time.sleep(0.05)
-            response = http.put(
-                f"/agents/{agent_id}/versions/{version_id}/bundle",
-                files={"file": ("demo.tar", archive)},
-                headers=headers,
-            )
-    finally:
-        stop.set()
-        for thread in probers:
-            if thread.is_alive() or thread.ident is not None:
-                thread.join(timeout=10)
-        log.setLevel(previous_level)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                upload = executor.submit(
+                    http.put,
+                    f"/agents/{agent_id}/versions/{version_id}/bundle",
+                    files={"file": ("demo.tar", archive)},
+                    headers=auth_headers,
+                )
+                try:
+                    assert entered_validation.wait(timeout=10), (
+                        "upload did not enter validate_archive"
+                    )
+                    health = probe.get("/health")
+                    assert health.status_code == 200, health.text
+                    assert not upload.done(), "validation ended before health completed"
+                finally:
+                    release_validation.set()
+                response = upload.result(timeout=30)
 
-    assert not probe_errors, probe_errors
     assert response.status_code == 201, response.text
-    assert window["start"] > 0 and window["end"] >= window["start"]
-    observed_validate_s = window["end"] - window["start"]
-    assert observed_validate_s >= _MIN_VALIDATE_S, (
-        f"upload-path validate_archive took {observed_validate_s * 1000:.1f}ms, "
-        f"need >= {_MIN_VALIDATE_S * 1000:.0f}ms"
-    )
-
-    overlapping = [
-        finished - started
-        for started, finished in samples
-        if started < window["end"] and finished > window["start"]
-    ]
-    p99 = _percentile(overlapping, 99)
-    print(
-        f"HEALTH_P99_MS={p99 * 1000:.2f} VALIDATE_MS={observed_validate_s * 1000:.2f} "
-        f"PRECHECK_VALIDATE_MS={validate_s * 1000:.2f} SAMPLES={len(overlapping)} "
-        f"ARCHIVE_BYTES={len(archive)}",
-        flush=True,
-    )
-    assert p99 < _HEALTH_P99_S, (
-        f"health p99 during validate_archive was {p99 * 1000:.1f}ms "
-        f"(limit {_HEALTH_P99_S * 1000:.0f}ms); validation took "
-        f"{observed_validate_s * 1000:.1f}ms over {len(overlapping)} overlapping samples"
-    )
