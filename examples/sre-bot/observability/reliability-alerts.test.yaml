@@ -3117,3 +3117,102 @@ tests:
                 curie_approval_pending on every sweep, so a missing gauge is a
                 broken metrics pipeline, a dead process, or a worker or api that
                 cannot read Valkey or Postgres, never a quiet system.
+
+  - name: queue dead letter fires and clears after its window
+    interval: 1m
+    input_series:
+      - series: 'curie_queue_dead_letter_total{service_name="curie-worker",source="worker",outcome="success"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieQueueDeadLettered
+        exp_alerts:
+          - exp_labels:
+              component: curie-queue
+              outcome: success
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: A Curie message was dead lettered
+              description: >-
+                At least one message was dead lettered in 15 minutes, including
+                a new counter series. The turn needs operator investigation.
+      - eval_time: 16m
+        alertname: CurieQueueDeadLettered
+        exp_alerts: []
+
+  - name: slow sandbox claims fire and clear after fast claims
+    interval: 1m
+    input_series:
+      - series: 'curie_sandbox_claim_duration_seconds_sum{service_name="curie-worker",operation="claim",outcome="failed"}'
+        values: '0+120x20 2430+30x30'
+      - series: 'curie_sandbox_claim_duration_seconds_count{service_name="curie-worker",operation="claim",outcome="failed"}'
+        values: '0+1x20 21+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieSandboxClaimSlow
+        exp_alerts:
+          - exp_labels:
+              component: curie-sandbox
+              operation: claim
+              outcome: failed
+              service_name: curie-worker
+              severity: page
+            exp_annotations:
+              summary: Sandbox claims are slow
+              description: >-
+                Completed sandbox claims averaged more than 60 seconds over 15
+                minutes. Check sandbox capacity and binding.
+      - eval_time: 41m
+        alertname: CurieSandboxClaimSlow
+        exp_alerts: []
+
+  - name: sandbox capacity refusal fires and clears after its window
+    interval: 1m
+    input_series:
+      - series: 'curie_sandbox_lifecycle_total{service_name="curie-worker",operation="reclaim",outcome="reclaimed-retry-refused"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieSandboxCapacityRefused
+        exp_alerts:
+          - exp_labels:
+              component: curie-sandbox
+              operation: reclaim
+              outcome: reclaimed-retry-refused
+              service_name: curie-worker
+              severity: page
+            exp_annotations:
+              summary: Sandbox capacity reclamation was refused
+              description: >-
+                A reclaim attempt was refused in 15 minutes because quota,
+                budget, or a safe route was unavailable.
+      - eval_time: 16m
+        alertname: CurieSandboxCapacityRefused
+        exp_alerts: []
+
+  - name: history persistence failure fires and clears after its window
+    interval: 1m
+    input_series:
+      - series: 'curie_history_persistence_failure_total{service_name="curie-api",source="state-api",outcome="capacity",limit="value"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CurieHistoryPersistenceFailed
+        exp_alerts:
+          - exp_labels:
+              component: curie-state
+              limit: value
+              outcome: capacity
+              service_name: curie-api
+              severity: page
+              source: state-api
+            exp_annotations:
+              summary: Curie transcript persistence hit a capacity limit
+              description: >-
+                Transcript persistence failed in 15 minutes because a value or
+                namespace capacity limit was reached.
+      - eval_time: 16m
+        alertname: CurieHistoryPersistenceFailed
+        exp_alerts: []
