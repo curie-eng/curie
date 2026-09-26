@@ -2022,6 +2022,8 @@ pub fn restrict_to(decl: &ConnectorsFileDecl, allowlist: Option<&[String]>) -> C
                 .filter(|(name, _)| allowed.contains(name))
                 .map(|(name, spec)| (name.clone(), spec.clone()))
                 .collect(),
+            // The runner layer is not a connector, so no allowlist narrows it.
+            runner: decl.runner.clone(),
         },
     }
 }
@@ -2281,5 +2283,15 @@ connectors:
         assert_eq!(hosted_env_secret_names(&only), ["GRAFANA_TOKEN"]);
         assert!(restrict_to(&decl, Some(&[])).connectors.is_empty());
         assert_eq!(restrict_to(&decl, None).connectors.len(), 2);
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn restrict_to_keeps_the_runner_layer() {
+        let decl = ConnectorsFileDecl {
+            connectors: BTreeMap::new(),
+            runner: Some(RunnerSpecDecl::default()),
+        };
+        assert!(restrict_to(&decl, Some(&[])).runner.is_some());
     }
 }
