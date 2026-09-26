@@ -71,6 +71,8 @@ _SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
 # texts empty the CLI emits no attribution instruction at all, so no model --
 # Claude or otherwise -- ever sees one.
 _SDK_ATTRIBUTION_OFF_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
+_SDK_TITLE_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+_SDK_DISABLE_TERMINAL_TITLE_ENV = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
 class _SeededSessionStore:
@@ -402,6 +404,11 @@ def build_options(
             "WebSearch",
             *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
         ]
+    sdk_env = dict(env or {})
+    title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))
+    if not title_model.strip():
+        sdk_env[_SDK_DISABLE_TERMINAL_TITLE_ENV] = "1"
+        logger.info("SDK session title request skipped: %s is not configured", _SDK_TITLE_MODEL_ENV)
     return ClaudeAgentOptions(
         plugins=plugins,
         model=model,
@@ -429,7 +436,7 @@ def build_options(
         task_budget=task_budget,
         permission_mode=permission_mode,
         can_use_tool=can_use_tool,
-        env=env or {},
+        env=sdk_env,
         # In-bundle PreToolUse guardrails from the manifest hooks field (#272).
         # Empty/None means no bundle hooks; the SDK default applies. The event
         # keys are the SDK's HookEvent literals (we emit only "PreToolUse").

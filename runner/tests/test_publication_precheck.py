@@ -609,16 +609,21 @@ def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
         def __init__(self) -> None:
             super().__init__()
             self.message_count = 0
+            self.offered_publication = False
 
         async def respond(self, request: Request) -> StreamingResponse:
             self.message_count += 1
-            # The first response can arrive during SDK tool catalog setup;
-            # offer the same tool call again after that setup completes.
-            frames = (
-                _tool_use_frames(PLATFORM_PUBLISH_TOOL_NAME, {"title": TITLE, "body": BODY})
-                if self.message_count <= 2
-                else _text_frames("The publication request was refused.")
-            )
+            names = self._names(await request.json())
+            self.tool_lists.append(names)
+            # Setup requests may arrive before the platform tool is available.
+            # Offer one call only after the real request advertises that tool.
+            if PLATFORM_PUBLISH_TOOL_NAME in names and not self.offered_publication:
+                self.offered_publication = True
+                frames = _tool_use_frames(
+                    PLATFORM_PUBLISH_TOOL_NAME, {"title": TITLE, "body": BODY}
+                )
+            else:
+                frames = _text_frames("The publication request was refused.")
             return StreamingResponse(_sse(frames), media_type="text/event-stream")
 
     stream_ids: list[str] = []
@@ -715,6 +720,7 @@ def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
                     await runner.close()
 
         assert provider.message_count >= 2
+        assert provider.offered_publication is True
         assert stream_ids == ["toolu_loopback_1"]
         assert hook_ids == stream_ids
         assert permission_ids == stream_ids
