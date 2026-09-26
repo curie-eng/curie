@@ -993,8 +993,8 @@ async def test_publication_card_transport_value_error_is_not_permanent(
 async def test_untokened_identity_card_delivery_retries_rather_than_dead_letters(
     publication: Any,
 ) -> None:
-    """final-review.md finding 3: a card addressed to an identity this worker
-    holds no bot token for is a retryable gap, not a dead letter.
+    """A card addressed to an identity this worker holds no bot token for is
+    a retryable gap, not a dead letter.
 
     ``UnconfiguredSlackIdentityError`` is not an ``InvalidReplyTargetError``,
     so it falls through the generic ``except`` below like the transport

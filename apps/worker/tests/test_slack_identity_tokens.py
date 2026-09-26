@@ -310,10 +310,9 @@ def test_two_identities_on_one_sink_each_keep_their_own_token() -> None:
 
 
 def test_default_is_never_refused_even_with_a_blank_token() -> None:
-    """Decision 3: ``default``'s token is always in the map, blank or not, so
-    a stock install with an empty ``SLACK_BOT_TOKEN`` (a stub or dev stack)
-    still sends exactly what it always sent, rather than being gated by
-    Task 6's refusal check.
+    """``default``'s token is always in the map, blank or not, so a stock
+    install with an empty ``SLACK_BOT_TOKEN`` still sends what it always sent
+    and ``undeliverable_reason`` never refuses it.
     """
     capture = _Capture()
 

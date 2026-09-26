@@ -124,7 +124,8 @@ _POLICY_ROUTE_NAME = "policy"
 
 def _routed_resolved(adapter: str | None) -> ResolvedDeployment:
     """Like ``_resolved``, but the deployment also binds an approval route to a
-    channel other than ``_CHANNEL`` -- the policy-card shape finding 1 covers.
+    channel other than ``_CHANNEL`` -- a policy-routed card, not a per-turn
+    reply.
     """
 
     return ResolvedDeployment(
@@ -314,12 +315,11 @@ def test_a_policy_routed_approval_card_posts_with_the_turns_identity_token(
     make_harness, adapter: str | None, identity: str, token: str
 ) -> None:
     """A policy-routed card belongs to no conversation and carries no per-turn
-    endpoint or thread of its own (final-review.md finding 1), but it still
-    must speak as the identity the turn arrived on: a named identity's turn
-    that requests sign-off in a channel bound to a policy route must post that
-    card under its OWN token, never ``default``'s -- an install where only
-    that identity sits in the policy channel would otherwise mint a card
-    nobody can see.
+    endpoint or thread of its own, but it still must speak as the identity the
+    turn arrived on: a named identity's turn that requests sign-off in a
+    channel bound to a policy route must post that card under its OWN token,
+    never ``default``'s -- an install where only that identity sits in the
+    policy channel would otherwise mint a card nobody can see.
     """
 
     async def go() -> None:
