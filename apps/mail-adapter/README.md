@@ -142,7 +142,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 
 AgentMail sits behind CloudFront, which rotates edge IPs, while the chart's
 NetworkPolicy admits a fixed CIDR snapshot. A dial to a rotated edge is rejected
-by the cluster and surfaces as `Connection refused`. With
+by the cluster and logs the fixed cause `connection_refused` at status 0. With
 `CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS` set, the AgentMail client prefers resolved
 addresses inside those CIDRs, falls back to the configured `/32` and `/128`
 addresses, and fails the call (status 0) when nothing admitted is available. Only
@@ -222,12 +222,13 @@ and names that verb as the fix. No platform signing key is given to the adapter.
   pending. A documented terminal 200, including a 200 duplicate receipt, settles
   it. Token rotation therefore restarts the single replica and resumes the
   original row rather than losing it.
-- **Provider failures are loud.** A `turn.completed` whose AgentMail send fails
-  acks 502, so the platform retries and eventually dead-letters, instead of
-  acking 200 and silently losing the email. A duplicate completion whose first
-  attempt is still in flight acks 503 (come back later). An AgentMail outage
-  therefore now produces visible retries and dead letters; that is the intended
-  behavior, not a regression.
+- **Provider failures are loud.** A TCP connection refusal while reading the
+  provider thread witness or sending the reply returns 424 with
+  `{"detail":"provider egress refused"}`. The worker stores that fixed cause on
+  the owed completion record, which remains pending for retry. Other retryable
+  witness and send failures return 502 and also leave the completion owed.
+  A duplicate completion whose first attempt is still in flight returns 503.
+  These failures produce visible retries instead of silently losing the email.
 - **Reply ownership is per message.** Accumulated text is durable under
   `(conversation_id, reply_ref)`, and every update and completion uses the exact
   ref the platform returned. Two turns in one thread cannot clear or inherit one

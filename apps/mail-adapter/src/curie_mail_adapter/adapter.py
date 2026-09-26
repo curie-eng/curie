@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
-from .agentmail import AgentMailClient, request
+from .agentmail import EGRESS_REFUSAL_ERROR, AgentMailClient, request
 from .config import MailAdapterConfig
 from .state import MailState
 
@@ -47,6 +47,10 @@ def _poll_should_back_off(status: int) -> bool:
 
 class ProviderThreadDeletedError(RuntimeError):
     """The provider definitively rejected the thread lookup with HTTP 404."""
+
+
+class ProviderEgressRefusedError(RuntimeError):
+    """The outbound AgentMail connection was refused before an HTTP response."""
 
 
 class MailAdapter:
@@ -327,8 +331,9 @@ class MailAdapter:
 
         Status is the gate, not the body's shape. Only a status 0 body is one
         this package synthesized locally: ``agentmail.request`` builds
-        ``{"error": str(exc)}`` for an ``OSError`` and ``{"error": "response
-        body exceeds configured byte limit"}`` for an oversize response, both
+        ``{"error": "connection_refused"}`` for a refused TCP connection,
+        ``{"error": str(exc)}`` for another ``OSError``, and ``{"error": "response
+        body exceeds configured byte limit"}`` for an oversize response, all
         local strings with a shape the adapter can reason about. Every other
         status carries a body the PROVIDER authored - arbitrary, unbounded, and
         able to carry mail content, an upstream stack trace or a page of HTML -
@@ -594,6 +599,12 @@ class MailAdapter:
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
         status, thread = self.client.get_thread(conversation_id)
+        if (
+            status == 0
+            and isinstance(thread, dict)
+            and thread.get("error") == EGRESS_REFUSAL_ERROR
+        ):
+            raise ProviderEgressRefusedError
         if status == 404:
             # Only the PROVIDER's own answer is deletion. `request` parses a JSON
             # body and hands back the raw text when it is not JSON, so a 404
@@ -623,7 +634,7 @@ class MailAdapter:
         return False
 
     def send_reply(self, event_id: str, conversation_id: str, reply_ref: str | None) -> int:
-        """Apply the provider-witness four-way recovery decision."""
+        """Apply the provider witness recovery decision."""
         if not reply_ref:
             logger.info(
                 "reply skipped: correlation=%s carries no reply_ref",
@@ -640,6 +651,12 @@ class MailAdapter:
         try:
             try:
                 carries = self.thread_carries(conversation_id, event_id)
+            except ProviderEgressRefusedError:
+                logger.warning(
+                    "provider egress connection refused during thread witness; correlation=%s",
+                    _correlation(event_id),
+                )
+                return 424
             except ProviderThreadDeletedError:
                 exists, _text = self.state.reply_text(conversation_id, reply_ref)
                 if not exists:
@@ -670,7 +687,17 @@ class MailAdapter:
                     _correlation(event_id),
                 )
                 return 502
-            status, _out = self.client.reply(reply_ref, body)
+            status, response = self.client.reply(reply_ref, body)
+            if (
+                status == 0
+                and isinstance(response, dict)
+                and response.get("error") == EGRESS_REFUSAL_ERROR
+            ):
+                logger.warning(
+                    "provider egress connection refused during send; correlation=%s",
+                    _correlation(event_id),
+                )
+                return 424
             if 200 <= status < 300:
                 self.state.finish_event(event_id)
                 if exists:

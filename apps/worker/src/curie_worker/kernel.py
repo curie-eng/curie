@@ -124,7 +124,13 @@ from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
 from .receipt import render_receipt
-from .reply_sink import DeletedReplyTargetError, ObservedReplySink, ReplySink, TargetRoute
+from .reply_sink import (
+    DeletedReplyTargetError,
+    ObservedReplySink,
+    ProviderEgressRefusedError,
+    ReplySink,
+    TargetRoute,
+)
 from .runner_client import (
     RunnerClient,
     RunnerError,
@@ -3528,7 +3534,33 @@ class Kernel:
             ):
                 logger.warning("turn.completed dead-lettered: %s", exc.reason)
             return False
+        except ProviderEgressRefusedError:
+            try:
+                await self._markers.note_provider_egress_refusal(
+                    record.event_id, generation=generation
+                )
+            except Exception as exc:  # noqa: BLE001 - retry remains owed
+                logger.warning(
+                    "turn.completed refusal cause could not be stored for %s (%s)",
+                    record.event_id,
+                    type(exc).__name__,
+                )
+            logger.warning(
+                "turn.completed provider egress refused for %s; the outbox record stands",
+                record.event_id,
+            )
+            return False
         except Exception as exc:  # noqa: BLE001 - the turn is already durably done
+            try:
+                await self._markers.clear_completion_cause(
+                    record.event_id, generation=generation
+                )
+            except Exception as cause_exc:  # noqa: BLE001 - retry remains owed
+                logger.warning(
+                    "turn.completed failure cause could not be cleared for %s (%s)",
+                    record.event_id,
+                    type(cause_exc).__name__,
+                )
             logger.warning(
                 "turn.completed delivery failed for %s (%s); the outbox record stands",
                 record.event_id,

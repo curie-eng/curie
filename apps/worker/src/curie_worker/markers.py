@@ -58,7 +58,7 @@ from pydantic import BaseModel
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
-from .reply_sink import TargetRoute
+from .reply_sink import ProviderEgressRefusedError, TargetRoute
 
 # Stored fields of the completion hash. The done flag is its OWN field rather
 # than a value inside the record JSON so it can be set in the same MULTI as the
@@ -71,6 +71,7 @@ _DONE_FIELD = "done"
 # retry that rewrote the record for the same event id owns a different identity,
 # and clearing that one would discard a completion nobody has delivered.
 _GENERATION_FIELD = "gen"
+_CAUSE_FIELD = "cause"
 
 # Set the done marker and flag the completion record done in ONE round trip.
 # The record is only touched when it still exists, so a sweeper that cleared it
@@ -117,6 +118,7 @@ _DELIVERY_GENERATION_FIELD = "gen"
 _SETTLE_FENCED_LUA = """
 if redis.call('GET', KEYS[4]) ~= ARGV[7] then return 0 end
 if redis.call('HGET', KEYS[5], ARGV[8]) ~= ARGV[9] then return 0 end
+redis.call('HDEL', KEYS[2], ARGV[11])
 redis.call('HSET', KEYS[2], ARGV[3], ARGV[5], ARGV[2], '1', ARGV[4], ARGV[6])
 redis.call('SADD', KEYS[3], ARGV[10])
 redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
@@ -149,6 +151,19 @@ if redis.call('HGET', KEYS[1], ARGV[2]) == ARGV[1] then
   return 1
 end
 return 0
+"""
+
+
+# Attribute or clear the cause only on the generation whose send observed it.
+# A stale emitter cannot change a replacement record or resurrect a cleared one.
+_UPDATE_COMPLETION_CAUSE_LUA = """
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+if ARGV[4] == '' then
+  redis.call('HDEL', KEYS[1], ARGV[3])
+else
+  redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
+end
+return 1
 """
 
 
@@ -210,6 +225,7 @@ class StoredCompletion:
     record: CompletionRecord
     done_flag: bool
     generation: str
+    cause: str | None
 
 
 class Markers:
@@ -337,6 +353,7 @@ class Markers:
         """
         generation = uuid.uuid4().hex
         async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.hdel(self._config.completion_key(event_id), _CAUSE_FIELD)
             pipe.hset(
                 self._config.completion_key(event_id),
                 mapping={
@@ -406,8 +423,33 @@ class Markers:
             _DELIVERY_GENERATION_FIELD,
             str(generation),
             event_id,
+            _CAUSE_FIELD,
         )
         return record_generation if int(settled) == 1 else None
+
+    async def note_provider_egress_refusal(self, event_id: str, *, generation: str) -> bool:
+        """Retain the fixed refusal cause only on the observed outbox generation."""
+        return await self._update_completion_cause(
+            event_id, generation=generation, cause=ProviderEgressRefusedError.reason
+        )
+
+    async def clear_completion_cause(self, event_id: str, *, generation: str) -> bool:
+        """Remove an earlier refusal when this generation fails for another cause."""
+        return await self._update_completion_cause(event_id, generation=generation, cause="")
+
+    async def _update_completion_cause(
+        self, event_id: str, *, generation: str, cause: str
+    ) -> bool:
+        updated = await self._redis.eval(
+            _UPDATE_COMPLETION_CAUSE_LUA,
+            1,
+            self._config.completion_key(event_id),
+            _GENERATION_FIELD,
+            generation,
+            _CAUSE_FIELD,
+            cause,
+        )
+        return bool(updated)
 
     async def read_completion(self, event_id: str) -> StoredCompletion | None:
         """The stored record AS STORED, or None when some emitter cleared it.
@@ -560,6 +602,7 @@ def _parse_stored(event_id: str, stored: dict[Any, Any]) -> StoredCompletion | N
         record=record.model_copy(update={"done": done_flag}),
         done_flag=done_flag,
         generation=generation,
+        cause=_as_str(stored.get(_CAUSE_FIELD)),
     )
 
 

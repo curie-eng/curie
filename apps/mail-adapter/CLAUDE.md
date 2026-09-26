@@ -20,11 +20,14 @@ the enforceable-rule summary.
   text from conversation-global state: two turns in one thread must not clear,
   inherit, or redirect one another's reply.
 - **Nothing is recorded as replied until the provider has accepted the send.**
-  A `turn.completed` whose AgentMail send failed acks 502 and one whose duplicate
-  is still in flight acks 503. Acking 200 in either case makes the worker clear
-  its durable completion record (`kernel.py` `clear_completion`, on any 2xx) and
-  the email is gone with no retry and no dead letter. Do not collapse 502 and 503
-  into one code: they mean different things in the worker's log.
+  A TCP connection refusal during the AgentMail witness or send returns 424
+  with the fixed body `{"detail":"provider egress refused"}`. The worker stores
+  that fixed cause against the matching outbox generation and keeps the
+  completion owed. Other retryable witness or send failures return 502; a
+  duplicate still in flight returns 503. Acking 200 in any of these cases makes
+  the worker clear its durable completion record (`kernel.py`
+  `clear_completion`, on any 2xx) and the email is gone with no retry and no
+  dead letter. Keep 424, 502 and 503 distinct in the worker's diagnostics.
 - **A completion claim is a timed, reclaimable durable lease.** A crash may
   leave a live lease, so restart or expiry must reclaim it and consult the
   provider-visible event witness before deciding whether to send. An unreadable
