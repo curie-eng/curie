@@ -81,6 +81,7 @@ dev = [
 root_packages = [
     "curie_api",
     "curie_worker",
+    "curie_connector_proxy",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
@@ -114,6 +115,16 @@ forbidden_modules = [
     "plugin_format",
     "claude_agent_sdk",
 ]
+
+[[tool.importlinter.contracts]]
+# The connector caller proxy (ADR-0168 decision 7) runs from the worker image
+# beside a connector that holds a production credential. Importing any
+# `curie_worker` module runs that package's `__init__`, which loads the kernel,
+# the Kubernetes client, SQLAlchemy and Valkey with it.
+name = "The connector caller proxy imports none of the worker"
+type = "forbidden"
+source_modules = ["curie_connector_proxy"]
+forbidden_modules = ["curie_worker", "kubernetes", "sqlalchemy", "redis", "boto3"]
 
 [[tool.importlinter.contracts]]
 # The SDK is a runner-side concern. If the platform ever imports it directly, the
