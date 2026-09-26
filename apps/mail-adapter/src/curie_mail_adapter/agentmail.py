@@ -8,6 +8,7 @@ Bearer auth is on every call (https://docs.agentmail.to/api-reference/overview).
 
 from __future__ import annotations
 
+import errno
 import http.client
 import ipaddress
 import json
@@ -22,6 +23,7 @@ from typing import Any
 from .config import MailAdapterConfig
 
 HTTP_TIMEOUT_SECONDS = 30.0
+EGRESS_REFUSAL_ERROR = "connection_refused"
 
 # The categories AgentMail withholds from List Messages results unless the caller
 # asks for them by name. Sending them explicitly changes nothing about what a
@@ -178,6 +180,9 @@ def request(
         status = int(exc.code)
         response_headers = dict(exc.headers.items())
     except OSError as exc:
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        if isinstance(reason, OSError) and reason.errno == errno.ECONNREFUSED:
+            return HttpResult(0, {"error": EGRESS_REFUSAL_ERROR}, {})
         return HttpResult(0, {"error": str(exc)}, {})
     if len(raw_bytes) > max_response_bytes:
         return HttpResult(

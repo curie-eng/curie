@@ -102,6 +102,12 @@ class DeletedReplyTargetError(RejectedAdapterResponseError):
     reason = "thread deleted at provider"
 
 
+class ProviderEgressRefusedError(RejectedAdapterResponseError):
+    """The adapter reports a refused outbound provider connection."""
+
+    reason = "provider egress refused"
+
+
 class OversizedAdapterResponseError(RuntimeError):
     """The adapter's acknowledgement body exceeded ``MAX_ACK_BODY_BYTES``.
 
@@ -350,19 +356,26 @@ class HttpReplyAdapter:
                         f"{response.status} (redirect); refusing to re-send the "
                         "egress credential to the redirect target"
                     )
-                if response.status == 410 and isinstance(event, TurnCompleted):
-                    # Only this explicit classification is terminal. An unrelated
-                    # adapter's generic 410 must not be mislabeled as deletion.
+                if response.status in (410, 424) and isinstance(event, TurnCompleted):
+                    # Only these explicit bodies classify provider outcomes.
+                    # An unrelated adapter's status alone is insufficient.
                     payload = await _read_capped(response, endpoint)
                     try:
                         rejection = json.loads(payload)
                     except (ValueError, UnicodeDecodeError):
                         rejection = None
-                    if (
-                        isinstance(rejection, dict)
-                        and rejection.get("detail") == DeletedReplyTargetError.reason
-                    ):
-                        raise DeletedReplyTargetError(DeletedReplyTargetError.reason)
+                    if isinstance(rejection, dict):
+                        detail = rejection.get("detail")
+                        if (
+                            response.status == 410
+                            and detail == DeletedReplyTargetError.reason
+                        ):
+                            raise DeletedReplyTargetError(DeletedReplyTargetError.reason)
+                        if (
+                            response.status == 424
+                            and detail == ProviderEgressRefusedError.reason
+                        ):
+                            raise ProviderEgressRefusedError(ProviderEgressRefusedError.reason)
                 if response.status >= 400:
                     # NOT ``raise_for_status()``: see
                     # ``RejectedAdapterResponseError``. The status is the
