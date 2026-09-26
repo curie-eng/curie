@@ -354,3 +354,41 @@ fn missing_agent_is_exit_one() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn pause_and_resume_one_named_hook_through_local_and_cluster() {
+    let server = serve(|req| match (req.method.as_str(), route(&req.path)) {
+        ("POST", "/schedules/acme-bot/nightly-cleanup/pause") => {
+            Response::json(200, r#"{"agent":"acme-bot","name":"nightly-cleanup","paused":true}"#)
+        }
+        ("POST", "/schedules/acme-bot/nightly-cleanup/resume") => {
+            Response::json(200, r#"{"agent":"acme-bot","name":"nightly-cleanup","paused":false}"#)
+        }
+        _ => Response::json(500, r#"{"detail":"unexpected"}"#),
+    });
+
+    let paused = local(
+        &["--agent", "acme-bot", "--pause", "nightly-cleanup"],
+        &server.base_url,
+        true,
+    );
+    assert_eq!(paused.status.code(), Some(0), "{}", describe(&paused));
+    assert_eq!(one_object(&paused)["paused"], json!(true));
+
+    let resumed = run_in(
+        &[
+            "cluster", "schedules", "--agent", "acme-bot", "--resume", "nightly-cleanup",
+            "--api-url", &server.base_url, "--api-key", TEST_API_KEY, "--json",
+        ],
+        &[("KUBECONFIG", MISSING_KUBECONFIG)],
+    );
+    assert_eq!(resumed.status.code(), Some(0), "{}", describe(&resumed));
+    assert_eq!(one_object(&resumed)["paused"], json!(false));
+
+    let recorded = server.recorded();
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    for request in &recorded {
+        assert_eq!(request.method, "POST");
+        assert_api_key(request);
+    }
+}
