@@ -2152,6 +2152,60 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
     assert valkey.xlen(stream) == 1
 
 
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("UPDATE curie.thread_publication_lineages SET github_installation_id=12",
+         "lineage_authority_unproved"),
+        # Migration 0042 makes GitHub identity all-or-nothing, so the only
+        # identity-less lineage is a historical one with none of it.
+        ("UPDATE curie.thread_publication_lineages SET github_repository_id=NULL,"
+         "github_installation_id=NULL,github_pr_node_id=NULL,base_ref=NULL",
+         "lineage_absent_or_ambiguous"),
+        ("UPDATE curie.thread_publication_lineages SET binding_id=NULL",
+         "lineage_authority_unproved"),
+        ("UPDATE curie.thread_publication_lineages SET binding_generation=NULL",
+         "lineage_authority_unproved"),
+        ("UPDATE curie.thread_publication_lineages SET reply_conversation_id=NULL",
+         "lineage_authority_unproved"),
+        ("DELETE FROM curie.thread_workspaces", "workspace_no_longer_authorized"),
+        ("allowlist", "workspace_no_longer_authorized"),
+    ],
+    ids=[
+        "wrong-installation",
+        "identity-less",
+        "unbound",
+        "no-binding-generation",
+        "no-reply-route",
+        "no-workspace",
+        "revoked-allowlist",
+    ],
+)
+def test_open_pr_lineage_without_proven_authority_fails_closed_before_github(
+    review_stack, monkeypatch, mutation, code
+) -> None:
+    """#2275 control: an OPEN PR whose lineage is unbound, identity-less or no
+    longer allowed is refused at admission. The PR stays open so the refusal is
+    the authority guard, not the earlier closed-PR or stale-head checks."""
+    client, truth, valkey, stream = review_stack
+    if mutation == "allowlist":
+        monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["other-org/*"]')
+        get_settings.cache_clear()
+    else:
+        review_rows(mutation)
+    assert truth.pr["state"] == "open"
+    refused = post_review(client, truth)
+    assert refused.status_code == 200, refused.text
+    assert refused.json()["errors"] == [{"code": code}]
+    assert truth.calls == []
+    assert valkey.xlen(stream) == 0
+    assert review_rows("SELECT event_id FROM curie.github_review_feedback") == []
+    assert review_rows("SELECT id FROM curie.publication_review_reservations") == []
+    assert review_rows("SELECT status,reason FROM curie.github_review_deliveries") == [
+        {"status": "rejected", "reason": code}
+    ]
+
+
 def test_forged_slack_principal_on_queued_github_feedback_is_refused_by_actual_api(
     review_stack,
 ) -> None:
