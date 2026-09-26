@@ -6453,17 +6453,11 @@ class Kernel:
         # per-turn identity of its own -- ``ApprovalRouteBinding.resolution``
         # names only a channel, never an adapter -- so it must borrow the
         # TURN's, or a named identity's card posts as ``default`` in a channel
-        # where only that identity may be a member (ADR-0168 decision 5). That
-        # borrow applies only to a Slack turn in IDENTITY form (no endpoint): a
-        # Slack turn carrying its own endpoint is the pre-ADR custom-transport
-        # form, whose ``adapter`` is a credential slug rather than an identity
-        # (``aci_protocol.turn.slack_speaking_identity``), and any other kind's
-        # adapter is that kind's own egress credential -- neither belongs on a
-        # Slack policy card.
+        # where only that identity may be a member (ADR-0168 decision 5). Only
+        # a Slack turn lends it: any other kind's adapter is that kind's own
+        # egress credential, which does not belong on a Slack policy card.
         card_adapter = (
-            None
-            if not in_requesting_channel and (handle.kind != SLACK_KIND or handle.endpoint)
-            else route.adapter
+            None if not in_requesting_channel and handle.kind != SLACK_KIND else route.adapter
         )
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
