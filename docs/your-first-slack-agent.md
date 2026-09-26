@@ -122,11 +122,8 @@ An agent runs one set of connectors, so two targets that bind the same agent
 must list the same ones. `curie cluster deploy --identity <name>` overrides a
 target's `identity` for one deploy.
 
-A named `identity` must be one your installation already declares; a deploy
-that names one the installation cannot bind is refused, and today that is
-every named identity, until the database admits one
-([#3146](https://github.com/curie-eng/curie/issues/3146)). Leave `identity`
-out until then.
+A named `identity` must be one your installation declares; a deploy naming
+one it does not declare is refused.
 
 Point a GitHub webhook at the release's API and push. A push to `dev` deploys
 to your dev bot; a merge to `main` promotes **that same artifact** to prod — not
