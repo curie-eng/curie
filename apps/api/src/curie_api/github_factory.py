@@ -232,15 +232,14 @@ async def lock_issue(session: AsyncSession, repository_id: int, issue_number: in
 
 
 async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
-    # `agent_channels_kind_address_key` (UNIQUE kind, address) is what caps
-    # this query at one row, not the `Agent.repo_full_name` join below --
-    # that join is a CORRECTNESS check (the pair's one row belongs to some
-    # OTHER agent's repo, e.g. a stale rename) rather than what narrows
-    # multiplicity. `_CHANNEL_KIND` is `GITHUB_CHANNEL_KIND`, never Slack, and
-    # this notice names no adapter, so `crud.matching_bindings` with
-    # `adapter=None` matches every row the query above already narrowed to
-    # one -- shared with every other reader of a route rather than a fourth
-    # copy of the same rule.
+    # `agent_channels_route_key` (migration 0061) lets one repository pair
+    # hold several routes, so the query can return more than one row. The
+    # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
+    # belongs to some OTHER agent's repo, e.g. a stale rename), not what
+    # narrows multiplicity. `_CHANNEL_KIND` is `GITHUB_CHANNEL_KIND`, never
+    # Slack, and this notice names no adapter, so `crud.matching_bindings`
+    # with `adapter=None` keeps every row -- shared with every other reader
+    # of a route rather than a fourth copy of the same rule.
     rows = list(
         await session.scalars(
             select(AgentChannel)
@@ -254,6 +253,14 @@ async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel
     )
     matches = crud.matching_bindings(rows, _CHANNEL_KIND, notice.repo_full_name, None)
     if not matches:
+        raise FactoryRefused("binding_missing")
+    if len(matches) > 1:
+        # Two routes on one repository under this repo's agents: never pick one.
+        logger.warning(
+            "github factory refused %s: %d routes are bound to it",
+            notice.repo_full_name,
+            len(matches),
+        )
         raise FactoryRefused("binding_missing")
     return matches[0]
 
