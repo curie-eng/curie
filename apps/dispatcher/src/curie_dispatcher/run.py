@@ -46,7 +46,7 @@ class IdentityConnection:
     Its own Web API client, Bolt app and Socket Mode supervisor, so every
     placeholder, card stamp and ephemeral is made with the token of the app the
     delivery arrived on, and one identity's reconnects never touch another's.
-    ``bot_ids`` is what preflight's ``auth.test`` reported, held for decision 6.
+    ``bot_ids`` is what preflight's ``auth.test`` reported.
     """
 
     name: str
@@ -98,6 +98,14 @@ def build_identity_connections(
         max_seconds=config.backoff_max_seconds,
         multiplier=config.backoff_multiplier,
     )
+    # Every identity whose auth.test answered, so each app admits the others'
+    # bots in a thread and names them as authors (ADR-0168 decision 6). Only a
+    # declaration of several asks auth.test, so a stock install maps nothing.
+    identity_bots = {
+        ids.bot_id: ids.bot_user_id
+        for preflighted in identities
+        if (ids := preflighted.bot_ids) is not None and ids.bot_id and ids.bot_user_id
+    }
     connections: list[IdentityConnection] = []
     for preflighted in identities:
         credentials = preflighted.credentials
@@ -108,6 +116,7 @@ def build_identity_connections(
             web_client=web_client,
             redis_client=redis_client,
             logger=logger,
+            identity_bots=identity_bots,
         )
         connect = _socket_mode_connector(
             app,

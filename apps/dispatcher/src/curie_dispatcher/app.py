@@ -9,7 +9,7 @@ authorize to keep the dispatch path offline.
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import redis
@@ -78,12 +78,15 @@ def build_app(
     authorize: Callable[..., Any] | None = None,
     logger: logging.Logger | None = None,
     resolver: Any | None = None,
+    identity_bots: Mapping[str, str] | None = None,
 ) -> App:
     """Build one identity's Bolt App with the dispatcher's handlers registered.
 
     ``identity`` is ``default`` when omitted, built from the ``SLACK_*``
     settings exactly as a stock install always built it. Its name is what every
-    turn this app mints carries (ADR-0168 decision 2).
+    turn this app mints carries (ADR-0168 decision 2). ``identity_bots`` is
+    every identity's bot id and bot user id (ADR-0168 decision 6); None admits
+    no sibling.
     """
     credentials = identity if identity is not None else default_identity_credentials(config)
     signing = credentials.signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
@@ -114,6 +117,8 @@ def build_app(
         # The approvals API client (#246), injectable so tests keep the
         # click-to-resolve path offline.
         register_kwargs["resolver"] = resolver
+    if identity_bots is not None:
+        register_kwargs["identity_bots"] = identity_bots
     register_handlers(app, **register_kwargs)
     return app
 
