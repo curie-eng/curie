@@ -259,13 +259,23 @@ A turn whose author is one of this installation's own identities counts against
 two fixed-window Valkey counters (ADR-0168 decision 6), under
 `<key_prefix>:sibling:`. On Slack, that author is an identity's bot user from
 `auth.test`. On the channel port, it is the address a binding is bound at. One
-counter is kept per session key and one per ordered identity pair for the
-conversations the pair opens. The limits are `curie_worker.sibling_turns`
-constants. Past them the kernel logs
+counter is kept per session key, admitting 5 sibling-written turns
+(`SIBLING_TURN_LIMIT`), and one per ordered identity pair, admitting 5
+conversations the pair opens (`SIBLING_OPEN_LIMIT`), both in a 600 s window
+(`SIBLING_WINDOW_SECONDS`); these are `curie_worker.sibling_turns` constants,
+not configuration. Past them the kernel logs
 `dropping event <id> from a sibling identity: sibling_conversation_limit` (or
 `sibling_pair_limit`). On Slack it edits the placeholder with a notice that
 mentions nobody, and on every kind it completes the turn as dropped. An install
 with one Slack identity and at most one adapter builds none of this.
+
+The counters count delivery attempts, not events: `check()` takes no event id,
+so a non-terminal redelivery of a turn already counted -- a binding lookup that
+raised, a lock lost mid-turn, a worker crash after the check but before the
+turn finished -- increments both counters again on retry. A legitimate sibling
+exchange can therefore be cut short a little early during an outage that
+redelivers it. That is consistent with failing safe: the counters undercount a
+conversation's true budget, never let one run longer than intended.
 
 ### The dead-letter graveyard
 

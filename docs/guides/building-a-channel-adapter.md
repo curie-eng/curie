@@ -200,7 +200,12 @@ In the order of a typical turn:
    `message` and `requested_by`.
 4. **`turn.completed`** adds `event_id` and `outcome`, one of `delivered`,
    `dropped`, `escalated`, `awaiting-approval`. This is the delivery trigger for
-   a channel like email that sends once per turn rather than streaming.
+   a channel like email that sends once per turn rather than streaming. A
+   `dropped` completion you recorded no `reply.update` text for owes no
+   message: the turn was never processed, so there is nothing of its own to
+   send. Answering it anyway would post a new message from your side of the
+   conversation -- on a sibling-limit drop (ADR-0168 decision 6), the next turn
+   of the exchange the drop just ended, at your poll or retry speed.
 
 Answer 2xx with a JSON body. The only field read off it is `ref`, an optional
 adapter-minted handle for what you just posted; a channel with nothing editable

@@ -335,7 +335,8 @@ def process_event(
     to its bot user id, from preflight's ``auth.test`` (ADR-0168 decision 6). A
     delivery from one of those bots is admitted in a thread, and its author is
     that bot user, never the event's ``user``, so the worker's sibling limit can
-    recognise it.
+    recognise it. That bot user is what an approval this turn raises later
+    shows as "Requested by", and what the agent sees as the turn's ``user``.
 
     Returns the Valkey Stream id when a job was enqueued, or None when the event
     was refused. Every refusal is logged with its enumerated ``DropReason``.
