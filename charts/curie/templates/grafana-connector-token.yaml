@@ -103,6 +103,9 @@ spec:
       {{- end }}
       serviceAccountName: {{ $hookName }}
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.grafanaConnector.updater.podSecurityContext | nindent 8 }}
       containers:
@@ -472,6 +475,9 @@ spec:
       {{- end }}
       automountServiceAccountToken: false
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.grafanaConnector.updater.podSecurityContext | nindent 8 }}
       containers:

@@ -108,6 +108,10 @@ priorityClasses:
     # and UI; the full inventory is pinned by ci/render-assertions.sh
     # Assertion 8). Set false (and repoint `name` at an existing class) if
     # the cluster/another release already defines an equivalent one.
+    # Preinstall and preupgrade hooks omit this class when create is true,
+    # because the class can be absent until normal resources are applied.
+    # Postinstall and postupgrade hooks use it. When create is false, create
+    # the named class before installing so hooks can use it.
     create: true
     name: curie-platform
     value: 1000000

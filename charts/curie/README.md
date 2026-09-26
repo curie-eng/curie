@@ -1283,6 +1283,13 @@ render. The runner-prewarm DaemonSet deliberately stays unclassed (priority
 0, below the sandbox class): the image-cache pod is the designated sacrifice
 a full node evicts first.
 
+**Priority class on hooks (#3206).** When
+`priorityClasses.platform.create: true`, preinstall and preupgrade hooks omit
+the platform priority class because it can be absent until normal resources
+are applied. Postinstall and postupgrade hooks use the configured class. When
+`priorityClasses.platform.create: false`, hooks use the configured class, so
+operators must create the named class before installing the chart.
+
 **Verifying the rails.** The security-boundary probe suite re-runs as a `helm test`:
 
 ```bash

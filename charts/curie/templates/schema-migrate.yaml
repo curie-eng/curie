@@ -49,8 +49,10 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- if or (not .Values.priorityClasses.platform.create) (not .Release.IsUpgrade) }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
+      {{- end }}
       {{- end }}
       {{- with .Values.api.imagePullSecrets }}
       imagePullSecrets:

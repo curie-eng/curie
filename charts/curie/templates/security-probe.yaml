@@ -121,6 +121,9 @@ spec:
   {{- . | nindent 2 }}
   {{- end }}
   restartPolicy: Never
+  {{- with .Values.priorityClasses.platform.name }}
+  priorityClassName: {{ . }}
+  {{- end }}
   securityContext:
     runAsNonRoot: true
     runAsUser: {{ $h.runAsUser }}
@@ -260,6 +263,9 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "curie.fullname" . }}-security-probe
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       containers:
         - name: probe
           image: {{ .Values.security.probe.kubectlImage }}
