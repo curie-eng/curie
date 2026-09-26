@@ -57,7 +57,9 @@ def _bounded_agent_label() -> dict[str, Any]:
         "ceiling": _AGENT_LABEL_CEILING,
         "reserved": ["other", "unbound"],
         "overflow": "other",
-        "unset": "unbound",
+        # Names that are not this slug, including spaces and names longer than
+        # 63 characters, share overflow. They never open their own series.
+        "pattern": r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
     }
 
 
@@ -396,9 +398,10 @@ _METRICS: dict[str, dict[str, Any]] = {
     "curie.agent.turn.completed": _definition(
         "counter",
         "{turn}",
-        "Terminal turns for one agent. The agent label admits at most 32 distinct "
-        "slugs per process; further names and non-slugs share other, and a turn "
-        "with no resolved agent is unbound.",
+        "Terminal turns for one agent. Each process admits at most 32 distinct "
+        "slugs; further slugs, non-slugs, and the reserved names other and unbound "
+        "share other. A turn with no resolved agent is unbound. The cap is per "
+        "process, so a fleet query can still fold a slug into other on one worker.",
         True,
         _AGENT_TURN_ATTRIBUTES,
     ),
@@ -602,7 +605,8 @@ def _admit_bounded(metric: str, key: str, spec: Mapping[str, Any], value: str) -
     reserved = spec["reserved"]
     if value in reserved:
         return value
-    if _AGENT_LABEL_RE.fullmatch(value) is None:
+    pattern = re.compile(str(spec.get("pattern") or _AGENT_LABEL_RE.pattern))
+    if pattern.fullmatch(value) is None:
         return overflow
     seen = _BOUNDED_SEEN.setdefault((metric, key), {})
     if value in seen:

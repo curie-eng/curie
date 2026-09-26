@@ -3670,13 +3670,21 @@ class Kernel:
         """
 
         raw = _TURN_AGENT.get()
+        # Only a missing agent is ``unbound``. A real agent whose name is a
+        # reserved label shares ``other`` so it cannot inflate the unresolved series.
+        if not raw:
+            label = "unbound"
+        elif raw in {"other", "unbound"}:
+            label = "other"
+        else:
+            label = raw
         record_metric(
             "curie.agent.turn.completed",
             attributes={
                 "service.name": "curie-worker",
                 "source": "worker",
                 "outcome": telemetry_outcome,
-                "agent": raw if raw else "unbound",
+                "agent": label,
             },
         )
 

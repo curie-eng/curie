@@ -31,6 +31,7 @@ from curie_telemetry import (
     record_metric,
     stamp_event_id,
 )
+from curie_telemetry.metrics import record_metric as validate_record_metric
 from curie_worker import consumer as consumer_module
 from curie_worker import kernel as kernel_module
 from curie_worker import runner_client as runner_client_module
@@ -424,6 +425,21 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             named_points = _metrics(probe, "curie.agent.turn.completed")
             assert named_points[-1].attributes["agent"] == "acme-bot"
             assert named_points[-1].attributes["service.name"] == "curie-worker"
+            # The probe stores attributes. The real recorder must accept them.
+            validate_record_metric(
+                "curie.agent.turn.completed",
+                attributes=named_points[-1].attributes,
+            )
+            validate_record_metric(
+                "curie.turn.completed",
+                attributes=fleet[-1].attributes,
+            )
+            token = kernel_module._TURN_AGENT.set("unbound")
+            try:
+                named.kernel._record_agent_turn("done")
+            finally:
+                kernel_module._TURN_AGENT.reset(token)
+            assert _metrics(probe, "curie.agent.turn.completed")[-1].attributes["agent"] == "other"
 
     asyncio.run(go())
 

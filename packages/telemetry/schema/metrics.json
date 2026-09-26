@@ -96,7 +96,7 @@
     "curie.agent.turn.completed": {
       "type": "counter",
       "unit": "{turn}",
-      "description": "Terminal turns for one agent. The agent label admits at most 32 distinct slugs per process; further names and non-slugs share other, and a turn with no resolved agent is unbound.",
+      "description": "Terminal turns for one agent. Each process admits at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
       "monotonic": true,
       "attributes": {
         "service.name": [
@@ -123,7 +123,7 @@
             "unbound"
           ],
           "overflow": "other",
-          "unset": "unbound"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
         }
       },
       "cardinality_bound": 272

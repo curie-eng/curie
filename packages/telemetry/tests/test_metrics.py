@@ -171,7 +171,7 @@ def test_every_metric_declares_a_finite_cardinality_contract() -> None:
                 assert isinstance(reserved, list) and reserved
                 assert len(reserved) == len(set(reserved))
                 assert domain["overflow"] in reserved
-                assert domain["unset"] in reserved
+                assert isinstance(domain.get("pattern"), str) and domain["pattern"]
                 calculated_bound *= domain["ceiling"] + len(reserved)
             else:
                 assert isinstance(domain, list) and domain
@@ -601,6 +601,15 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
         "source": "worker",
         "outcome": "done",
     }
+    # Non-slugs and the reserved labels must not consume a ceiling slot.
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "not a slug"},
+    )
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "unbound"},
+    )
     for index in range(32):
         record_metric(
             "curie.agent.turn.completed",
@@ -609,14 +618,6 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     record_metric(
         "curie.agent.turn.completed",
         attributes={**base, "agent": "acme-overflow"},
-    )
-    record_metric(
-        "curie.agent.turn.completed",
-        attributes={**base, "agent": "not a slug"},
-    )
-    record_metric(
-        "curie.agent.turn.completed",
-        attributes={**base, "agent": "unbound"},
     )
     assert provider.force_flush(timeout_millis=5000)
     labels = {
