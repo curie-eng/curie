@@ -124,7 +124,13 @@ from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
 from .receipt import render_receipt
-from .reply_sink import DeletedReplyTargetError, ObservedReplySink, ReplySink, TargetRoute
+from .reply_sink import (
+    CLUSTER_MESSAGE_ADAPTER,
+    DeletedReplyTargetError,
+    ObservedReplySink,
+    ReplySink,
+    TargetRoute,
+)
 from .runner_client import (
     RunnerClient,
     RunnerError,
@@ -6424,7 +6430,15 @@ class Kernel:
             )
             # The card's own target: a policy-routed card belongs to no
             # conversation (it posts top-level in a channel that never asked),
-            # and it mints its own ref, so it carries neither.
+            # and it mints its own ref, so it carries neither. The one exception
+            # is the cluster-message relay (#2883): it has no card message to
+            # mint and addresses the caller's session bucket by the turn's ref,
+            # exactly as the publication card outbox does (#2757).
+            card_reply_ref = (
+                self._target_for(qevent).reply_ref
+                if card_adapter == CLUSTER_MESSAGE_ADAPTER
+                else None
+            )
             card_ack = await self._sink.emit(
                 ReplyPost(
                     version=REPLY_WIRE_VERSION,
@@ -6433,7 +6447,7 @@ class Kernel:
                         kind=card_kind,
                         address=card_channel,
                         conversation_id=thread if in_requesting_channel else None,
-                        reply_ref=None,
+                        reply_ref=card_reply_ref,
                     ),
                     message=card_message,
                     requested_by=qevent.author,
