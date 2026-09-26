@@ -1360,16 +1360,20 @@ pub struct DeployNamedOpts {
 }
 
 /// `curie dev bump-version <X.Y.Z>`: set the release-coupled version across
-/// cli/Cargo.toml + Chart.yaml version/appVersion in one shot, so a release cut
-/// cannot leave the three out of sync (the drift the #489 consistency gate
-/// catches). It rewrites ONLY the line-anchored release fields (never a
+/// cli/Cargo.toml + Chart.yaml version/appVersion and promote the candidate
+/// schema window under that version. It refuses to change a window whose
+/// version is registered in the architecture atlas. It rewrites ONLY the
+/// line-anchored release fields (never a
 /// dependency `version = ` line), refreshes the CLI lockfile, and prints the
 /// commit + tag follow-up -- it does not commit, tag, or push. `--dry-run` prints
 /// the planned edits and writes nothing.
 pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
     let ui = crate::ui::ui();
     // semver X.Y.Z with an optional -rc.N (the only pre-release shape we cut).
-    let semver = regex::Regex::new(r"^\d+\.\d+\.\d+(-rc\.\d+)?$").expect("static regex");
+    let semver = regex::Regex::new(
+        r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.(0|[1-9][0-9]*))?$",
+    )
+    .expect("static regex");
     if !semver.is_match(version) {
         return Err(crate::exit::usage(format!(
             "version {version:?} must be semver X.Y.Z or X.Y.Z-rc.N"
@@ -1382,10 +1386,26 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
 
     let cargo_path = root.join("cli/Cargo.toml");
     let chart_path = root.join("charts/curie/Chart.yaml");
+    let catalog_path = root.join("cli/src/application_schema_windows.json");
+    let atlas_path = root.join("docs/architecture-atlas/versions.json");
     let cargo = std::fs::read_to_string(&cargo_path)
         .with_context(|| format!("reading {}", cargo_path.display()))?;
     let chart = std::fs::read_to_string(&chart_path)
         .with_context(|| format!("reading {}", chart_path.display()))?;
+    let catalog = std::fs::read_to_string(&catalog_path)
+        .with_context(|| format!("reading {}", catalog_path.display()))?;
+    let atlas = std::fs::read_to_string(&atlas_path)
+        .with_context(|| format!("reading {}", atlas_path.display()))?;
+    let published = atlas_version_registered(&atlas, version)?;
+    let catalog_value: serde_json::Value =
+        serde_json::from_str(&catalog).context("parsing application schema window catalog")?;
+    let had_window = catalog_value
+        .get("windows")
+        .and_then(serde_json::Value::as_object)
+        .context("catalog has no release windows")?
+        .contains_key(version);
+    let catalog_new = promote_candidate_window(&catalog, version, published)?;
+    let catalog_changed = catalog_new != catalog;
 
     // Line-anchored so a dependency `version = "x"` line is never touched: only
     // the first `version = ` at column 0 (the [package] version) is rewritten.
@@ -1406,12 +1426,31 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
                 format!("cli/Cargo.toml: version = \"{version}\""),
                 format!("charts/curie/Chart.yaml: version: {version}"),
                 format!("charts/curie/Chart.yaml: appVersion: \"{version}\""),
+                if catalog_changed {
+                    if had_window {
+                        format!(
+                            "cli/src/application_schema_windows.json: update unpublished windows[{version}] from candidate"
+                        )
+                    } else {
+                        format!(
+                            "cli/src/application_schema_windows.json: promote candidate to windows[{version}]"
+                        )
+                    }
+                } else {
+                    format!(
+                        "cli/src/application_schema_windows.json: windows[{version}] already matches candidate"
+                    )
+                },
                 "cargo update -p curie (refresh Cargo.lock)".to_string(),
             ],
         });
         return Ok(());
     }
 
+    if catalog_changed {
+        std::fs::write(&catalog_path, catalog_new)
+            .with_context(|| format!("writing {}", catalog_path.display()))?;
+    }
     std::fs::write(&cargo_path, cargo_new)
         .with_context(|| format!("writing {}", cargo_path.display()))?;
     std::fs::write(&chart_path, chart_new)
@@ -1419,6 +1458,16 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
     ui.note(&format!(
         "set version {version} in cli/Cargo.toml and charts/curie/Chart.yaml"
     ));
+    if catalog_changed {
+        ui.note(&format!(
+            "{} the candidate schema window for application {version}",
+            if had_window { "updated" } else { "promoted" }
+        ));
+    } else {
+        ui.note(&format!(
+            "application {version} schema window already matches the candidate"
+        ));
+    }
 
     // Refresh the CLI lockfile so the committed Cargo.lock matches the new crate
     // version. Best-effort: a missing cargo or offline registry must not fail the
@@ -1440,6 +1489,83 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
         version: version.to_string(),
     });
     Ok(())
+}
+
+fn atlas_version_registered(manifest: &str, version: &str) -> Result<bool> {
+    let atlas: serde_json::Value =
+        serde_json::from_str(manifest).context("parsing architecture atlas versions")?;
+    let versions = atlas
+        .get("versions")
+        .and_then(serde_json::Value::as_array)
+        .context("architecture atlas versions manifest is malformed")?;
+    let target = format!("v{version}");
+    let mut registered = false;
+    for entry in versions {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("architecture atlas version entry has no id")?;
+        registered |= id == target;
+    }
+    Ok(registered)
+}
+
+fn promote_candidate_window(catalog: &str, version: &str, published: bool) -> Result<String> {
+    let mut payload: serde_json::Value =
+        serde_json::from_str(catalog).context("parsing application schema window catalog")?;
+    let candidate = payload
+        .get("candidate")
+        .and_then(serde_json::Value::as_object)
+        .context("catalog has no candidate schema window")?
+        .clone();
+    let candidate_min = candidate
+        .get("schema_min")
+        .and_then(serde_json::Value::as_str)
+        .context("candidate has no schema_min")?;
+    let candidate_head = candidate
+        .get("schema_head")
+        .and_then(serde_json::Value::as_str)
+        .context("candidate has no schema_head")?;
+    let revisions = payload
+        .get("revisions")
+        .and_then(serde_json::Value::as_array)
+        .context("catalog has no revisions")?;
+    let min_index = revisions
+        .iter()
+        .position(|revision| revision.as_str() == Some(candidate_min))
+        .context("candidate schema_min is not a catalog revision")?;
+    let head_index = revisions
+        .iter()
+        .position(|revision| revision.as_str() == Some(candidate_head))
+        .context("candidate schema_head is not a catalog revision")?;
+    if min_index > head_index {
+        bail!("candidate schema_min is after candidate schema_head");
+    }
+    let windows = payload
+        .get_mut("windows")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("catalog has no release windows")?;
+    let candidate = serde_json::Value::Object(candidate);
+    if let Some(existing) = windows.get(version) {
+        if existing == &candidate {
+            return Ok(catalog.to_string());
+        }
+        if published {
+            bail!(
+                "application {version} is registered in the architecture atlas; bump to the next version"
+            );
+        }
+    }
+    if published && !windows.contains_key(version) {
+        bail!(
+            "application {version} is registered in the architecture atlas but has no catalog window; cannot promote the candidate"
+        );
+    }
+    windows.insert(version.to_string(), candidate);
+    let mut updated = serde_json::to_string_pretty(&payload)
+        .context("serializing application schema window catalog")?;
+    updated.push('\n');
+    Ok(updated)
 }
 
 /// Replace the first line beginning with `prefix` (after optional leading
@@ -8825,12 +8951,12 @@ mod tests {
         absent_container_note, check_deploy_routes_bound, declared_approval_routes,
         github_repo_allowlist_is_empty, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
-        plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
-        report_sweep, resolve_cases_path, resolve_env_file_credentials, route_write_refusal,
-        routing_warning, seed_env_if_missing, select_in_force_deployment, select_passthrough_env,
-        sweep_json_row, sweep_table_row, unbound_approval_routes, validate_channel_binding,
-        ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan, EnvSeed, RecordedStatePlan,
-        RecordedStateQuery, RecordedTeardown, SweepRow,
+        plan_recorded_teardown, plan_skill_down, promote_candidate_window, recorded_ids_match,
+        replace_first_line, report_sweep, resolve_cases_path, resolve_env_file_credentials,
+        route_write_refusal, routing_warning, seed_env_if_missing, select_in_force_deployment,
+        select_passthrough_env, sweep_json_row, sweep_table_row, unbound_approval_routes,
+        validate_channel_binding, ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan,
+        EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
     use serde_json::json;
@@ -9468,6 +9594,77 @@ mod tests {
         let out = replace_first_line(chart, "appVersion:", "appVersion: \"0.5.0\"").unwrap();
         assert!(out.contains("appVersion: \"0.5.0\""));
         assert!(replace_first_line(chart, "nonexistent:", "x").is_none());
+    }
+
+    const RELEASE_CATALOG: &str = r#"{
+        "revisions": ["0045", "0058", "0059"],
+        "candidate": {"schema_min": "0045", "schema_head": "0059"},
+        "windows": {
+            "0.10.0": {"schema_min": "0045", "schema_head": "0058"},
+            "0.10.1": {"schema_min": "0045", "schema_head": "0058"}
+        }
+    }"#;
+
+    #[test]
+    fn bump_version_promotes_candidate_and_preserves_prior_release_windows() {
+        let promoted = promote_candidate_window(RELEASE_CATALOG, "0.10.2", false)
+            .expect("new release can claim the candidate window");
+        let catalog: serde_json::Value = serde_json::from_str(&promoted).unwrap();
+        assert_eq!(catalog["windows"]["0.10.2"], catalog["candidate"]);
+        assert_eq!(catalog["windows"]["0.10.2"]["schema_head"], "0059");
+        for version in ["0.10.0", "0.10.1"] {
+            assert_eq!(catalog["windows"][version]["schema_min"], "0045");
+            assert_eq!(catalog["windows"][version]["schema_head"], "0058");
+        }
+    }
+
+    #[test]
+    fn bump_version_repeating_the_same_promotion_is_idempotent() {
+        let once = promote_candidate_window(RELEASE_CATALOG, "0.10.2", false).unwrap();
+        let twice = promote_candidate_window(&once, "0.10.2", true).unwrap();
+        let once: serde_json::Value = serde_json::from_str(&once).unwrap();
+        let twice: serde_json::Value = serde_json::from_str(&twice).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn bump_version_refuses_to_rewrite_a_registered_window() {
+        let error = promote_candidate_window(RELEASE_CATALOG, "0.10.1", true)
+            .expect_err("registered 0.10.1 must keep its published schema head");
+        assert!(format!("{error:#}").contains("0.10.1"));
+        assert!(format!("{error:#}").contains("next version"));
+    }
+
+    #[test]
+    fn bump_version_refuses_to_create_a_missing_registered_window() {
+        let error = promote_candidate_window(RELEASE_CATALOG, "0.10.2", true)
+            .expect_err("registered 0.10.2 must already have a catalog window");
+        assert!(format!("{error:#}").contains("0.10.2"));
+        assert!(format!("{error:#}").contains("no catalog window"));
+    }
+
+    #[test]
+    fn bump_version_can_repromote_an_unregistered_window() {
+        let promoted = promote_candidate_window(RELEASE_CATALOG, "0.10.1", false)
+            .expect("unregistered version can be prepared again");
+        let catalog: serde_json::Value = serde_json::from_str(&promoted).unwrap();
+        assert_eq!(catalog["windows"]["0.10.1"], catalog["candidate"]);
+        assert_eq!(catalog["windows"]["0.10.1"]["schema_head"], "0059");
+        assert_eq!(catalog["windows"]["0.10.0"]["schema_head"], "0058");
+    }
+
+    #[tokio::test]
+    async fn bump_version_refuses_leading_zero_components() {
+        for version in ["00.10.2", "0.010.2", "0.10.02", "0.10.2-rc.01"] {
+            let error = super::bump_version(version, true)
+                .await
+                .expect_err("noncanonical version must be refused before reading the checkout");
+            assert_eq!(
+                crate::exit::classify(&error).0,
+                crate::exit::ExitClass::Usage,
+                "{version}: {error:#}"
+            );
+        }
     }
 
     /// Scaffold a bundle at `dir` under `name`, then overwrite its manifest's
