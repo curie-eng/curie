@@ -103,6 +103,25 @@ targets:
     slack_channel: C0YOURPRODCHANNEL
 ```
 
+Two optional keys per target. `identity` names the bot the target speaks
+through when your installation runs more than one; leave it out for the
+installation's own bot. `connectors` lists which of your `connectors.yaml`
+connectors run for that target; leave it out to run all of them, or write `[]`
+for none:
+
+```yaml
+  prod:
+    agent: my-agent
+    env: prod
+    identity: ops-bot
+    slack_channel: C0YOURPRODCHANNEL
+    connectors: [grafana]
+```
+
+An agent runs one set of connectors, so two targets that bind the same agent
+must list the same ones. `curie cluster deploy --identity <name>` overrides a
+target's `identity` for one deploy.
+
 Point a GitHub webhook at the release's API and push. A push to `dev` deploys
 to your dev bot; a merge to `main` promotes **that same artifact** to prod — not
 a rebuild, so what you tested is what ships. Full webhook wiring:
