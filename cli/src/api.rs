@@ -80,27 +80,29 @@ pub(crate) struct ClusterMessageReplyEvent {
 /// so this is a valid Slack channel-ID shape, not a `#name`.
 pub const DEFAULT_SLACK_CHANNEL: &str = "C0LOCALDEV";
 
+/// @spec ADR-0168 d8. What an absent `identity` means on a target the API
+/// resolved: the API predates this decision, and every target it knows is on
+/// the default.
+fn default_identity() -> String {
+    DEFAULT_SLACK_IDENTITY.to_string()
+}
+
 /// Kubernetes objects the API derived from a version's `connectors.yaml`.
 ///
 /// The API renders these; the CLI applies them. Rendering is a pure function so
 /// the API needs no cluster access for it, and cluster-write authority stays
 /// with the operator running this command (ADR-0086, #1063).
-/// What an absent `identity` means on a target the API resolved: the API
-/// predates ADR-0168 decision 8, and every target it knows is on the default.
-fn default_identity() -> String {
-    DEFAULT_SLACK_IDENTITY.to_string()
-}
-
 /// What a named `deploy.yaml` target resolves to (ADR-0089).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolvedTarget {
     pub agent: Option<String>,
     pub env: String,
     pub slack_channel: Option<String>,
-    /// The identity the binding speaks through (ADR-0168 decision 8).
+    /// @spec ADR-0168 d8. The identity the binding speaks through.
     #[serde(default = "default_identity")]
     pub identity: String,
-    /// The connectors the bound agent runs; `None` is every declared one.
+    /// @spec ADR-0168 d8. The connectors the bound agent runs; `None` is
+    /// every declared one.
     #[serde(default)]
     pub connectors: Option<Vec<String>>,
 }
@@ -152,10 +154,11 @@ pub struct NamedTarget {
     pub agent: Option<String>,
     pub env: String,
     pub slack_channel: Option<String>,
-    /// The identity the binding speaks through (ADR-0168 decision 8).
+    /// @spec ADR-0168 d8. The identity the binding speaks through.
     #[serde(default = "default_identity")]
     pub identity: String,
-    /// The connectors the bound agent runs; `None` is every declared one.
+    /// @spec ADR-0168 d8. The connectors the bound agent runs; `None` is
+    /// every declared one.
     #[serde(default)]
     pub connectors: Option<Vec<String>>,
 }
