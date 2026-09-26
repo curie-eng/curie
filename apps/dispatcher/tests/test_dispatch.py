@@ -468,11 +468,13 @@ def test_the_mint_keeps_the_thread_ts_bare_on_every_channel(
         assert turn.reply_handle.placeholder == BOT_TS, channel
 
     # And the placeholder itself was posted into the bare thread on each channel.
-    posted = [
+    # The two envelopes are handled concurrently, so compare in a stable order:
+    # the pin is which (channel, thread) pairs were posted, not which finished first.
+    posted = sorted(
         (call.kwargs["channel"], call.kwargs["thread_ts"])
         for call in web_client.chat_postMessage.call_args_list
-    ]
-    assert posted == [(CHANNEL_A, thread_ts), (CHANNEL_B, thread_ts)]
+    )
+    assert posted == sorted([(CHANNEL_A, thread_ts), (CHANNEL_B, thread_ts)])
 
 
 def test_button_click_prefers_value_over_action_id(
