@@ -18,8 +18,8 @@ CURIE_HOOK_APPROVAL_RECEIPT_IMAGE Imported receipt fixture image
 
 Required Helm values for the installed release:
 
-worker.slackTrustedOrigins: "http://127.0.0.1:1"
-worker.slackApiBaseUrl: ""
+worker.slackApiBaseUrl: "http://127.0.0.1:1"
+worker.slackTrustedOrigins: ""
 
 Build the receipt fixture from ``cli/scripts/fixtures/mcp-receipt/Dockerfile``
 with ``cli/scripts/fixtures/mcp-receipt`` as the Docker build context, import
@@ -33,10 +33,9 @@ part in the proof; preflight checks that condition. Slack acknowledges the
 ``TurnCompleted`` event without a transport call, so the proof requires the
 initial completion hash to be absent after the done marker appears.
 
-The agent binding uses an explicit disconnected per turn endpoint. Leaving the
-binding endpoint blank selects the reachable Slack service, where an empty bot
-token produces ``not_authed``. That is an authentication refusal, outside this
-fixture's intentional transport failure.
+The agent binds the channel under the default identity. The worker's own Slack
+origin is the refusing endpoint, so the initial stream fails loudly there, and
+the empty bot token never reaches a reachable Slack.
 
 The alert summary must require the receipt tool before any narrative. Initial
 turn streaming fails loudly at the disconnected endpoint, so narrative before
@@ -77,30 +76,43 @@ RECEIPT_LINE = "MCP_RECEIPT tools/call"
 RECEIPT_TOOL = "mcp__plugin_hook-approval-proof_receipt__receipt_read"
 RUNS_STREAM = "curie:runs"
 OFFLINE_ENDPOINT = "http://127.0.0.1:1"
-OFFLINE_ADAPTER = "proof-offline"
+ROUTE_IDENTITY = "default"
 COMMAND_TIMEOUT_SECONDS = 180
 
 
 def _thread_key(conversation_id: str) -> str:
     """The worker's internal thread key for this proof's Slack route.
 
-    This rig's route names ``OFFLINE_ADAPTER``, which is neither absent nor the
-    default identity, so per ADR-0168 decision 4 it is a segment after the
-    kind: ``channel_protocol.identity.scoped_conversation_id`` called with
-    ``identity=aci_protocol.turn.route_identity("slack", OFFLINE_ADAPTER)``,
-    which the worker's own ``_thread_key_for`` builds the same way. This
-    script cannot import those packages -- they need pydantic and a newer
-    Python than the bare ``python3`` this rig runs under -- so the rule is
-    reproduced here instead of called.
+    This rig's route is the default identity, which adds no segment
+    (ADR-0168 decision 4): ``channel_protocol.identity.scoped_conversation_id``
+    called with ``identity=ROUTE_IDENTITY``, which the worker's own
+    ``_thread_key_for`` builds the same way. This script cannot import those
+    packages -- they need pydantic and a newer Python than the bare
+    ``python3`` this rig runs under -- so the rule is reproduced here instead
+    of called.
     """
     return ":".join(
         urllib.parse.quote(part, safe="")
-        for part in ("slack", OFFLINE_ADAPTER, CHANNEL, conversation_id)
+        for part in ("slack", CHANNEL, conversation_id)
     )
 
 
 class ProofError(RuntimeError):
     pass
+
+
+def check_offline_slack_origin(worker_env: dict[str, Any]) -> None:
+    """The worker's own Slack origin is the refusing endpoint, and nothing else is trusted."""
+    origin = worker_env.get("SLACK_API_BASE_URL", {})
+    if origin.get("value") != OFFLINE_ENDPOINT or "valueFrom" in origin:
+        raise ProofError(
+            "proof release must set worker.slackApiBaseUrl to the offline endpoint"
+        )
+    trusted = worker_env.get("CURIE_SLACK_TRUSTED_ORIGINS")
+    if trusted is not None and (
+        trusted.get("value") not in {None, ""} or "valueFrom" in trusted
+    ):
+        raise ProofError("proof release must trust no extra Slack origin")
 
 
 class HttpStatus(ProofError):
@@ -326,18 +338,7 @@ class Proof:
         }
         if not all(self.platform_images.values()):
             raise ProofError("proof release has an empty candidate image reference")
-        slack_default = worker_env.get("SLACK_API_BASE_URL")
-        if slack_default is not None and (
-            slack_default.get("value") not in {None, ""}
-            or "valueFrom" in slack_default
-        ):
-            raise ProofError("proof release must not configure a default Slack endpoint")
-        trusted_origins = worker_env.get("CURIE_SLACK_TRUSTED_ORIGINS", {})
-        if (
-            trusted_origins.get("value") != OFFLINE_ENDPOINT
-            or "valueFrom" in trusted_origins
-        ):
-            raise ProofError("proof release must trust only the exact offline endpoint")
+        check_offline_slack_origin(worker_env)
         slack_check = self.kubectl(
             [
                 "exec",
@@ -558,12 +559,7 @@ class Proof:
             "/agents",
             body={
                 "name": AGENT,
-                "channel": {
-                    "kind": "slack",
-                    "address": CHANNEL,
-                    "endpoint": OFFLINE_ENDPOINT,
-                    "adapter": OFFLINE_ADAPTER,
-                },
+                "channel": {"kind": "slack", "address": CHANNEL},
                 "model": self.model,
                 "approval_routes": route,
             },
@@ -1034,10 +1030,10 @@ class Proof:
                 raise ProofError("signed hook did not produce exactly one stream event")
             reply_handle = original_events[0][1].get("reply_handle")
             if not isinstance(reply_handle, dict) or (
-                reply_handle.get("endpoint") != OFFLINE_ENDPOINT
-                or reply_handle.get("adapter") != OFFLINE_ADAPTER
+                reply_handle.get("endpoint") is not None
+                or reply_handle.get("adapter") != ROUTE_IDENTITY
             ):
-                raise ProofError("signed hook did not retain the offline reply route")
+                raise ProofError("signed hook did not carry the default identity's route")
 
             deadline = time.monotonic() + self.timeout
             approval, initial_turns = self.initial_state(
