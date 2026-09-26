@@ -7,10 +7,12 @@ through create_app(); the renderer cases call the pure ``render_card``.
 
 Card markup contract the tests pin (the renderer is otherwise free):
 
-- each phase slot is a ``<g>`` with ``data-phase="<id>"`` and a class naming its
-  state (``done``, ``current``, ``redo``, ``pending``);
-- each drawn loop arc is a ``<path>`` with class ``loop-arc``, and its badge a
-  ``<text>`` with class ``loop-badge``;
+- each stage is a ``<g>`` with ``data-stage="<id>"`` and a class naming its
+  state (``done``, ``current``, ``redo``, ``pending``, ``blocked``);
+- each loop arc is a ``<path>`` with class ``loop-arc`` and ``data-loop``, and
+  its numbered badge is a ``<text>`` with class ``loop-badge``;
+- a legacy declaration without stages renders one group per phase with
+  ``data-phase="<id>"`` and no arcs;
 - the pill dot carries class ``live`` exactly when the pill is live.
 """
 
@@ -31,7 +33,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.factory_card import CardInput, render_card
 from curie_api.factory_progress import phase_view
 from curie_api.models import ExecutionRequestPhaseReport
-from test_factory_progress import ACTIVITY, DECLARATION, PILLS, _constraint_statuses, report
+from test_factory_progress import (
+    ACTIVITY,
+    DECLARATION,
+    PILLS,
+    STAGED_DECLARATION,
+    _constraint_statuses,
+    report,
+)
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     REPO,
     _label,
@@ -79,6 +88,28 @@ def _with_class(root: ET.Element, name: str) -> list[ET.Element]:
 def _slot(root: ET.Element, phase: str) -> ET.Element:
     (slot,) = [e for e in root.iter() if e.get("data-phase") == phase]
     return slot
+
+
+def _stage(root: ET.Element, stage: str) -> ET.Element:
+    (slot,) = [e for e in root.iter() if e.get("data-stage") == stage]
+    return slot
+
+
+def _arc(root: ET.Element, loop: str) -> ET.Element:
+    (arc,) = [e for e in _with_class(root, "loop-arc") if e.get("data-loop") == loop]
+    return arc
+
+
+def _badge(root: ET.Element, loop: str) -> str:
+    (badge,) = [e for e in _with_class(root, "loop-badge") if e.get("data-loop") == loop]
+    return "".join(badge.itertext()).strip()
+
+
+def _path_points(path: ET.Element) -> list[tuple[float, float]]:
+    return [
+        (float(x), float(y))
+        for x, y in re.findall(r"(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", path.get("d") or "")
+    ]
 
 
 def _all_text(root: ET.Element) -> str:
@@ -182,27 +213,33 @@ def test_the_card_escapes_the_issue_title_and_shows_the_note_in_italics(
     assert _is_italic(holder, style)
 
 
-def test_a_card_with_a_kickback_draws_one_arc_badged_one(admitted: Any) -> None:  # noqa: F811
+def test_a_card_with_a_kickback_badges_the_plan_arc(admitted: Any) -> None:  # noqa: F811
     client, github, _sink = admitted
     number = 9806
     _label(client, github, number)
     request_id = _request(number)["id"]
     _start_running(request_id)
     for phase, loop_round in (("read_issue", None), ("plan", 1), ("plan_review", 1)):
-        assert report(client, request_id, phase, round=loop_round).status_code == 201
+        assert (
+            report(client, request_id, phase, round=loop_round, declaration=STAGED_DECLARATION)
+            .status_code
+            == 201
+        )
     before = _parse(client.get(f"/v1/factory/cards/{_token(request_id)}.svg").text)
-    assert _with_class(before, "loop-arc") == []
+    assert _badge(before, "plan") == "0"
 
-    assert report(client, request_id, "plan", round=2).status_code == 201
+    assert (
+        report(client, request_id, "plan", round=2, declaration=STAGED_DECLARATION).status_code
+        == 201
+    )
     after = _parse(client.get(f"/v1/factory/cards/{_token(request_id)}.svg").text)
 
     arcs = _with_class(after, "loop-arc")
-    assert len(arcs) == 1
-    assert _local(arcs[0].tag) == "path"
-    badges = _with_class(after, "loop-badge")
-    assert ["".join(b.itertext()).strip() for b in badges] == ["1"]
-    assert "redo" in _classes(_slot(after, "plan_review"))
-    assert "current" in _classes(_slot(after, "plan"))
+    assert len(arcs) == 3
+    assert all(_local(arc.tag) == "path" for arc in arcs)
+    assert _badge(after, "plan") == "1"
+    assert "redo" in _classes(_stage(after, "plan_review"))
+    assert "current" in _classes(_stage(after, "plan"))
     assert "round 2 of 3" in _all_text(after)
 
 
@@ -233,6 +270,7 @@ def _card(
     started_at: datetime | None = NOW - timedelta(minutes=12, seconds=4),
     terminal_at: datetime | None = None,
     revision_pr: int | None = None,
+    needs_human: bool = False,
 ) -> str:
     terminal_cause = None if status in LIVE else ("completed" if status == "completed" else "x")
     view = phase_view(declaration or DECLARATION, reports or [], status, terminal_cause)
@@ -251,6 +289,7 @@ def _card(
             note=note,
             phase_view=view,
             cause_text=cause_text,
+            needs_human=needs_human,
         )
     )
 
@@ -292,6 +331,7 @@ def test_no_review_kickback_means_no_arc() -> None:
 def test_a_diff_review_approved_after_three_rounds_badges_two() -> None:
     root = _parse(
         _card(
+            declaration=STAGED_DECLARATION,
             reports=_reports(
                 ("plan", 1),
                 ("plan_review", 1),
@@ -305,15 +345,16 @@ def test_a_diff_review_approved_after_three_rounds_badges_two() -> None:
             )
         )
     )
-    assert len(_with_class(root, "loop-arc")) == 1
-    assert ["".join(b.itertext()).strip() for b in _with_class(root, "loop-badge")] == ["2"]
-    assert "approved, 3 rounds" in _all_text(root)
-    assert "done" in _classes(_slot(root, "review_diff"))
+    assert len(_with_class(root, "loop-arc")) == 3
+    assert _badge(root, "implement") == "2"
+    assert "approved · 3 rounds" in _all_text(root)
+    assert "done" in _classes(_stage(root, "review_diff"))
 
 
 def test_both_loops_kicked_back_draw_two_arcs() -> None:
     root = _parse(
         _card(
+            declaration=STAGED_DECLARATION,
             reports=_reports(
                 ("plan", 1),
                 ("plan_review", 1),
@@ -325,20 +366,155 @@ def test_both_loops_kicked_back_draw_two_arcs() -> None:
             )
         )
     )
-    assert len(_with_class(root, "loop-arc")) == 2
-    assert sorted("".join(b.itertext()).strip() for b in _with_class(root, "loop-badge")) == [
-        "1",
-        "1",
-    ]
+    assert len(_with_class(root, "loop-arc")) == 3
+    assert [_badge(root, loop) for loop in ("plan", "implement", "wait_ci")] == ["1", "1", "0"]
 
 
 def test_every_declared_phase_has_a_slot_in_declared_order() -> None:
     root = _parse(_card(reports=_reports(("read_issue", None), ("pin_criteria", None))))
     slots = [e.get("data-phase") for e in root.iter() if e.get("data-phase")]
     assert slots == [phase["id"] for phase in DECLARATION["phases"]]
+    assert _with_class(root, "loop-arc") == []
     assert "done" in _classes(_slot(root, "read_issue"))
     assert "current" in _classes(_slot(root, "pin_criteria"))
     assert "pending" in _classes(_slot(root, "wait_ci"))
+
+
+@pytest.mark.parametrize(
+    ("entries", "status", "states", "badges", "arc_states"),
+    [
+        pytest.param(
+            (("plan", 1), ("plan_review", 1), ("plan", 2)),
+            "running",
+            ("current", "redo", "pending", "pending", "pending"),
+            ("1", "0", "0"),
+            ("live", "pending", "pending"),
+            id="second_plan_round",
+        ),
+        pytest.param(
+            (
+                ("plan", 1),
+                ("plan_review", 1),
+                ("implement", 1),
+                ("review_diff", 1),
+                ("implement", 2),
+                ("review_diff", 2),
+                ("implement", 3),
+            ),
+            "running",
+            ("done", "done", "current", "redo", "pending"),
+            ("0", "2", "0"),
+            ("approved", "live", "pending"),
+            id="third_diff_round",
+        ),
+        pytest.param(
+            (
+                ("plan", 1),
+                ("plan_review", 1),
+                ("implement", 1),
+                ("review_diff", 1),
+                ("publish", None),
+                ("wait_ci", None),
+                ("implement", 2),
+                ("review_diff", 2),
+                ("publish", None),
+                ("wait_ci", None),
+            ),
+            "running",
+            ("done", "done", "done", "done", "current"),
+            ("0", "0", "1"),
+            ("approved", "approved", "live"),
+            id="ci_retry_waiting",
+        ),
+        pytest.param(
+            (("plan", 1), ("plan_review", 1), ("implement", 1), ("wait_ci", None)),
+            "completed",
+            ("done", "done", "done", "done", "done"),
+            ("0", "0", "0"),
+            ("approved", "approved", "approved"),
+            id="succeeded",
+        ),
+    ],
+)
+def test_five_stages_and_three_arcs_show_the_run_state(
+    entries: tuple[tuple[str, int | None], ...],
+    status: str,
+    states: tuple[str, ...],
+    badges: tuple[str, ...],
+    arc_states: tuple[str, ...],
+) -> None:
+    root = _parse(
+        _card(status=status, declaration=STAGED_DECLARATION, reports=_reports(*entries))
+    )
+    assert (root.get("width"), root.get("height")) == ("878", "300")
+    stage_ids = ("plan", "plan_review", "implement", "review_diff", "wait_ci")
+    stages = [_stage(root, stage_id) for stage_id in stage_ids]
+    assert [
+        "".join(e.itertext()).strip()
+        for stage in stages
+        for e in stage.iter()
+        if "label" in _classes(e)
+    ] == ["Plan", "Plan review", "Implement", "Review diff", "Wait for CI"]
+    assert all(state in _classes(stage) for state, stage in zip(states, stages))
+    labels = [next(e for e in stage.iter() if "label" in _classes(e)) for stage in stages]
+    assert len({float(label.get("y") or "0") for label in labels}) == 1
+    assert [float(label.get("x") or "0") for label in labels] == sorted(
+        float(label.get("x") or "0") for label in labels
+    )
+    assert len(_with_class(root, "loop-arc")) == 3
+    assert len(_with_class(root, "loop-badge")) == 3
+    for loop, badge, arc_state in zip(("plan", "implement", "wait_ci"), badges, arc_states):
+        assert _badge(root, loop) == badge
+        assert arc_state in _classes(_arc(root, loop))
+
+
+def test_ci_arc_wraps_the_diff_arc_and_returns_to_implement() -> None:
+    root = _parse(_card(declaration=STAGED_DECLARATION))
+    ci = _path_points(_arc(root, "wait_ci"))
+    diff = _path_points(_arc(root, "implement"))
+    assert len(ci) >= 4 and len(diff) >= 4
+    assert min(y for _x, y in ci) < min(y for _x, y in diff)
+    implement = _stage(root, "implement")
+    (icon,) = [e for e in implement.iter() if _local(e.tag) == "circle"]
+    assert ci[-1][0] == float(icon.get("cx") or "nan")
+    assert ci[0][0] > diff[0][0]
+
+
+def test_staged_header_uses_recorded_activity_and_the_declared_reviewer() -> None:
+    note = "Checking <the> fix"
+    root = _parse(_card(declaration=STAGED_DECLARATION, note=note))
+    text = _all_text(root)
+    assert "12m 04s" in text
+    assert ACTIVITY["model"] in text
+    assert "turns 14" in text
+    assert "tool calls 37" in text
+    assert "last tool Bash" in text
+    assert "anthropic/claude-opus-5.5" in text
+    assert "loop cap 3" in text
+    (holder,) = [element for element in root.iter() if (element.text or "") == note]
+    assert _is_italic(holder, _style(root))
+
+
+@pytest.mark.parametrize(
+    ("status", "needs_human", "pill"),
+    [("failed", False, "FAILED"), ("failed", True, "NEEDS HUMAN")],
+)
+def test_terminal_failure_marks_its_stage_with_an_amber_cross(
+    status: str, needs_human: bool, pill: str
+) -> None:
+    root = _parse(
+        _card(
+            status=status,
+            needs_human=needs_human,
+            declaration=STAGED_DECLARATION,
+            reports=_reports(("implement", 1)),
+            cause_text="Review did not pass",
+        )
+    )
+    assert pill in _all_text(root)
+    assert "blocked" in _classes(_stage(root, "implement"))
+    assert _with_class(_stage(root, "implement"), "icon-blocked")
+    assert not _with_class(root, "live")
 
 
 def test_elapsed_is_minutes_and_padded_seconds_and_a_hyphen_before_start() -> None:

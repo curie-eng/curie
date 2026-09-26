@@ -58,6 +58,21 @@ DECLARATION: dict[str, Any] = {
         {"start": "implement", "review": "review_diff", "cap": 3},
     ],
 }
+STAGED_DECLARATION: dict[str, Any] = {
+    **DECLARATION,
+    "reviewer_model": "anthropic/claude-opus-5.5",
+    "stages": [
+        {"id": "plan", "label": "Plan", "phases": ["read_issue", "pin_criteria", "plan"]},
+        {"id": "plan_review", "label": "Plan review", "phases": ["plan_review"]},
+        {"id": "implement", "label": "Implement", "phases": ["failing_test", "implement"]},
+        {"id": "review_diff", "label": "Review diff", "phases": ["review_diff", "publish"]},
+        {"id": "wait_ci", "label": "Wait for CI", "phases": ["wait_ci"]},
+    ],
+    "loops": [
+        *DECLARATION["loops"],
+        {"start": "implement", "review": "wait_ci", "cap": 3},
+    ],
+}
 ACTIVITY: dict[str, Any] = {
     "model": "glm-5.3-flash",
     "turns": 14,
@@ -289,6 +304,33 @@ def test_a_token_for_a_request_that_does_not_exist_is_404(admitted: Any) -> None
                 }
             },
         ),
+        (
+            "a",
+            {
+                "declaration": {
+                    "phases": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+                    "stages": [{"id": "only", "label": "Only", "phases": ["a"]}],
+                }
+            },
+        ),
+        (
+            "a",
+            {
+                "declaration": {
+                    "phases": [{"id": "a", "label": "A"}],
+                    "stages": [{"id": "only", "label": "Only", "phases": ["a", "a"]}],
+                }
+            },
+        ),
+        (
+            "a",
+            {
+                "declaration": {
+                    "phases": [{"id": "a", "label": "A"}],
+                    "stages": [{"id": "only", "label": "Only", "phases": ["unknown"]}],
+                }
+            },
+        ),
     ],
 )
 def test_an_invalid_report_is_422_and_stores_nothing(
@@ -431,12 +473,18 @@ def _states(view: Any) -> dict[str, str]:
     return {phase.id: phase.state for phase in view.phases}
 
 
+def _stage_states(view: Any) -> dict[str, str]:
+    return {stage.id: stage.state for stage in view.stages}
+
+
 def _labels(view: Any) -> dict[str, str | None]:
     return {phase.id: phase.round_label for phase in view.phases}
 
 
-def _loop(view: Any, start: str) -> Any:
-    (loop,) = [loop for loop in view.loops if loop.start == start]
+def _loop(view: Any, start: str, review: str | None = None) -> Any:
+    (loop,) = [
+        loop for loop in view.loops if loop.start == start and (review is None or loop.review == review)
+    ]
     return loop
 
 
@@ -552,6 +600,129 @@ def test_an_out_of_order_report_takes_the_latest_as_current() -> None:
     states = _states(view)
     assert states["plan"] == "current"
     assert states["implement"] == "pending"
+
+
+@pytest.mark.parametrize(
+    ("phase", "stage"),
+    [
+        ("read_issue", "plan"),
+        ("pin_criteria", "plan"),
+        ("plan", "plan"),
+        ("plan_review", "plan_review"),
+        ("failing_test", "implement"),
+        ("implement", "implement"),
+        ("review_diff", "review_diff"),
+        ("publish", "review_diff"),
+        ("wait_ci", "wait_ci"),
+    ],
+)
+def test_each_reported_phase_selects_its_declared_stage(phase: str, stage: str) -> None:
+    view = phase_view(STAGED_DECLARATION, _reports_of((phase, None)), "running", None)
+    assert view.current == phase
+    assert [slot.id for slot in view.stages if slot.state == "current"] == [stage]
+
+
+def test_a_declaration_without_stages_keeps_one_stage_per_phase() -> None:
+    view = phase_view(DECLARATION, _reports_of(("pin_criteria", None)), "running", None)
+    assert [(stage.id, stage.phase_ids) for stage in view.stages] == [
+        (phase["id"], (phase["id"],)) for phase in DECLARATION["phases"]
+    ]
+    assert _stage_states(view)["pin_criteria"] == "current"
+
+
+def test_second_plan_round_marks_plan_current_and_review_redo() -> None:
+    view = phase_view(
+        STAGED_DECLARATION,
+        _reports_of(("plan", 1), ("plan_review", 1), ("plan", 2)),
+        "running",
+        None,
+    )
+    assert _stage_states(view) == {
+        "plan": "current",
+        "plan_review": "redo",
+        "implement": "pending",
+        "review_diff": "pending",
+        "wait_ci": "pending",
+    }
+    assert (_loop(view, "plan").kickbacks, _loop(view, "plan").active) == (1, True)
+    assert {stage.id: stage.round_label for stage in view.stages}["plan_review"] == "round 2 of 3"
+
+
+def test_third_diff_round_keeps_plan_approved_and_badges_two_review_kickbacks() -> None:
+    view = phase_view(
+        STAGED_DECLARATION,
+        _reports_of(
+            ("plan", 1),
+            ("plan_review", 1),
+            ("implement", 1),
+            ("review_diff", 1),
+            ("implement", 2),
+            ("review_diff", 2),
+            ("implement", 3),
+        ),
+        "running",
+        None,
+    )
+    assert _stage_states(view) == {
+        "plan": "done",
+        "plan_review": "done",
+        "implement": "current",
+        "review_diff": "redo",
+        "wait_ci": "pending",
+    }
+    assert (_loop(view, "plan").approved, _loop(view, "plan").kickbacks) == (True, 0)
+    assert (
+        _loop(view, "implement", "review_diff").active,
+        _loop(view, "implement", "review_diff").kickbacks,
+    ) == (
+        True,
+        2,
+    )
+    assert {stage.id: stage.round_label for stage in view.stages}["plan_review"] == (
+        "approved · 1 round"
+    )
+
+
+def test_ci_retry_waits_on_ci_without_counting_a_diff_review_kickback() -> None:
+    view = phase_view(
+        STAGED_DECLARATION,
+        _reports_of(
+            ("implement", 1),
+            ("review_diff", 1),
+            ("publish", None),
+            ("wait_ci", None),
+            ("implement", 2),
+            ("review_diff", 2),
+            ("publish", None),
+            ("wait_ci", None),
+        ),
+        "running",
+        None,
+    )
+    assert _stage_states(view)["wait_ci"] == "current"
+    assert _stage_states(view)["review_diff"] == "done"
+    assert _loop(view, "implement", "wait_ci").kickbacks == 1
+    assert _loop(view, "implement", "review_diff").kickbacks == 0
+    assert {stage.id: stage.round_label for stage in view.stages}["wait_ci"] == "round 2 of 3"
+
+
+def test_success_marks_every_declared_stage_done_and_approves_all_loops() -> None:
+    view = phase_view(
+        STAGED_DECLARATION,
+        _reports_of(("plan", 1), ("plan_review", 1), ("implement", 1), ("wait_ci", None)),
+        "completed",
+        "completed",
+    )
+    assert view.current is None
+    assert set(_stage_states(view).values()) == {"done"}
+    assert all(loop.approved for loop in view.loops)
+
+
+@pytest.mark.parametrize("status", ["failed", "expired"])
+def test_terminal_failure_marks_the_current_stage_blocked(status: str) -> None:
+    view = phase_view(STAGED_DECLARATION, _reports_of(("implement", 1)), status, "x")
+    assert _stage_states(view)["implement"] == "blocked"
+    assert _stage_states(view)["review_diff"] == "pending"
 
 
 # --- 8: every request status has a pill ---------------------------------------------------

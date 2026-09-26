@@ -221,6 +221,14 @@ def test_progress_declaration_lists_the_skill_phases_in_order() -> None:
     assert declared["loops"] == [
         {"start": "plan", "review": "plan_review", "cap": 3},
         {"start": "implement", "review": "review_diff", "cap": 3},
+        {"start": "implement", "review": "wait_ci", "cap": 3},
+    ]
+    assert declared["stages"] == [
+        {"id": "plan", "label": "Plan", "phases": ["read_issue", "pin_criteria", "plan"]},
+        {"id": "plan_review", "label": "Plan review", "phases": ["plan_review"]},
+        {"id": "implement", "label": "Implement", "phases": ["failing_test", "implement"]},
+        {"id": "review_diff", "label": "Review diff", "phases": ["review_diff", "publish"]},
+        {"id": "wait_ci", "label": "Wait for CI", "phases": ["wait_ci"]},
     ]
 
 
