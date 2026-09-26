@@ -283,7 +283,11 @@ serverFiles:
             # worker records the lag as 0 when Valkey cannot compute it, which
             # happens once entries inside the group's range are deleted, so an
             # installation that trims the run stream loses this rule. This
-            # chart does not trim it.
+            # chart does not trim it. And the worker records the lag from its
+            # maintenance loop, which can wait on a full slot semaphore while
+            # every slot stays busy; the lag then stops arriving, this rule
+            # goes quiet, and CurieApplicationMetricsAbsent pages instead,
+            # since the queue-depth gauge stops with it.
             expr: |
               min_over_time(max without (instance) (curie_queue_lag)[15m:1m]) > 0
               and
