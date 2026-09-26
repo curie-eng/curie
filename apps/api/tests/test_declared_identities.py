@@ -7,10 +7,10 @@ environment, and the fixture clears it again on the way out so no later test
 reads this one's declaration.
 """
 
+import asyncio
 import json
 import re
 from collections.abc import Callable, Iterator
-from typing import Any
 
 import pytest
 from aci_protocol.slack_identities import IDENTITY_NAME_PATTERN
@@ -19,6 +19,8 @@ from curie_api.identities import declared_identities, refuse_undeclared
 from curie_api.schemas import _CHANNEL_KIND, ChannelBindingWrite
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 TWO_IDENTITIES = json.dumps(
     [
@@ -136,23 +138,7 @@ def test_a_malformed_declaration_fails_settings(monkeypatch: pytest.MonkeyPatch)
         Settings()
 
 
-# --- a declared name meets the database ----------------------------------------
-#
-# The write schema admits a declared identity, but 0024's
-# `agent_channels_route_pair_ck` still refuses a Slack row naming one with no
-# endpoint. These drive real HTTP against the real Postgres, so the refusal is
-# the database's own, and pin that it reaches the caller as a named 422 rather
-# than a 500.
-
-UNSTORABLE = "cannot be stored until the database admits it"
-ISSUE_3146 = "https://github.com/curie-eng/curie/issues/3146"
-
-
-def _refused_as_unstorable(response: Any) -> None:
-    assert response.status_code == 422, response.text
-    detail = response.json()["detail"]
-    assert isinstance(detail, str), detail
-    assert UNSTORABLE in detail and ISSUE_3146 in detail, detail
+# --- a declared name is stored -----------------------------------------------
 
 
 def _create_agent(client: TestClient, headers: dict[str, str], name: str, address: str) -> str:
@@ -165,7 +151,23 @@ def _create_agent(client: TestClient, headers: dict[str, str], name: str, addres
     return str(created.json()["id"])
 
 
-def test_adding_a_binding_naming_a_declared_identity_is_a_named_422(
+def _stored(agent_id: str) -> dict[str, str | None]:
+    async def go() -> dict[str, str | None]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                rows = await conn.execute(
+                    text("SELECT address, adapter FROM curie.agent_channels WHERE agent_id = :a"),
+                    {"a": agent_id},
+                )
+                return {address: adapter for address, adapter in rows.all()}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+def test_adding_a_binding_naming_a_declared_identity_stores_it(
     client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
@@ -180,12 +182,11 @@ def test_adding_a_binding_naming_a_declared_identity_is_a_named_422(
         headers=auth_headers,
     )
 
-    _refused_as_unstorable(added)
-    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert [c["address"] for c in fetched.json()["channels"]] == ["C0EXAMPLE1"]
+    assert added.status_code == 201, added.text
+    assert _stored(agent_id) == {"C0EXAMPLE1": "default", "C0EXAMPLE2": "second"}
 
 
-def test_moving_a_binding_onto_a_declared_identity_is_a_named_422(
+def test_moving_a_binding_onto_a_declared_identity_stores_it(
     client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
@@ -201,14 +202,14 @@ def test_moving_a_binding_onto_a_declared_identity_is_a_named_422(
         headers=auth_headers,
     )
 
-    _refused_as_unstorable(moved)
-    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert fetched.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"}
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["channels"] == [
+        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "second"}
     ]
+    assert _stored(agent_id) == {"C0EXAMPLE1": "second"}
 
 
-def test_creating_an_agent_bound_to_a_declared_identity_is_a_named_422(
+def test_creating_an_agent_bound_to_a_declared_identity_stores_it(
     client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
@@ -225,6 +226,5 @@ def test_creating_an_agent_bound_to_a_declared_identity_is_a_named_422(
         headers=auth_headers,
     )
 
-    _refused_as_unstorable(created)
-    listed = client.get("/agents", headers=auth_headers)
-    assert "declared-create" not in [agent["name"] for agent in listed.json()]
+    assert created.status_code == 201, created.text
+    assert _stored(str(created.json()["id"])) == {"C0EXAMPLE1": "second"}
