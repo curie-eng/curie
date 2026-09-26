@@ -9,7 +9,14 @@ import pytest
 from aci_protocol import ErrorEvent, Event, Final, Interrupt, SessionStatus, parse_ndjson
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    RateLimitEvent,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
+from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import RunTracer, SideEffectClassifier, build_options, create_app
 from curie_runner import session as session_module
 from curie_runner.adapter import ClaudeAgentSession, McpServerReconnector
@@ -1693,6 +1700,36 @@ def test_transient_model_error_is_not_fast_failed() -> None:
     assert "rate_limit" not in classifications
     assert events[-1].status == SessionStatus.DONE  # reached the model's result
     assert fake.interrupts == 0  # not aborted
+
+
+def test_model_error_without_result_ends_in_classified_failure() -> None:
+    runner, _ = _runner(
+        lambda: [AssistantMessage(content=[], model="m", error="unknown")]
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert events[0].classification == "unclassified"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_rejected_rate_limit_without_result_ends_in_classified_failure() -> None:
+    runner, _ = _runner(
+        lambda: [
+            RateLimitEvent(
+                rate_limit_info=RateLimitInfo(status="rejected"),
+                uuid="u",
+                session_id="s",
+            )
+        ]
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert events[0].classification == "rate-limit"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
 
 
 def test_budget_halt_logged(caplog) -> None:

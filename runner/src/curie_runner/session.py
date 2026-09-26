@@ -1211,6 +1211,10 @@ class SessionRunner:
             status = SessionStatus.CLASSIFIED_FAILURE
         elif self._interrupt_requested:
             status = SessionStatus.IDLE_AWAITING_INPUT
+        elif state.error_classification is not None:
+            # An assistant error without a result is a failed turn. Translation
+            # already maps raw SDK tokens, so unknown tokens stay unclassified.
+            status = SessionStatus.CLASSIFIED_FAILURE
         else:
             status = SessionStatus.DONE
         self._merge_gate_block(state)
