@@ -283,9 +283,15 @@ def test_a_patch_difference_is_compatible_in_both_directions() -> None:
 
 
 def test_targetless_turns_start_a_new_incompatible_protocol_line() -> None:
-    assert PROTOCOL_VERSION == "0.5.2"
+    assert PROTOCOL_VERSION == "0.5.3"
     assert is_compatible("0.4.5", PROTOCOL_VERSION) is False
     assert is_compatible(PROTOCOL_VERSION, "0.4.5") is False
+
+
+def test_publication_context_uses_a_compatible_patch_version() -> None:
+    assert is_compatible("0.5.1", PROTOCOL_VERSION) is True
+    assert is_compatible(PROTOCOL_VERSION, "0.5.1") is True
+    assert is_compatible("0.6.0", PROTOCOL_VERSION) is False
 
 
 def test_a_payload_written_before_attachments_existed_decodes_with_none() -> None:

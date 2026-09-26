@@ -917,6 +917,7 @@ fn overlay_fixture(agent: &str, plugin_dir: &Path) -> Value {
     let mut lock = ConnectorLockFileDecl {
         version: LOCK_VERSION,
         connectors: BTreeMap::new(),
+        ..Default::default()
     };
     for (name, image) in [("kubernetes", TEMPO_IMAGE), ("k8s-write", WRITE_IMAGE)] {
         lock.connectors.insert(
@@ -1208,6 +1209,7 @@ async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
     let lock = ConnectorLockFileDecl {
         version: LOCK_VERSION,
         connectors: BTreeMap::new(),
+        ..Default::default()
     };
     let error = curie::commands::bring_up_local(dir.path(), &lock, &scope("sre-bot"), "curie")
         .await

@@ -1378,7 +1378,9 @@ def test_hook_recorded_publish_is_not_recorded_twice_by_the_stream(
     assert gate.publication_title == "Hook recorded"
     assert gate.publication_body == "hook body"
     assert final.approval_summary == gate.pending_summary
-    assert gate.observe_publication({"title": "another", "body": "x"}) is False
+    assert anyio.run(
+        gate.observe_publication, "publish-2", {"title": "another", "body": "x"}
+    ) is False
     assert gate.publication_title == "Hook recorded"
     # A gate layer DID deny this call and asked the CLI to stop, which is exactly
     # what distinguishes this path from the fallback one -- and why no warning

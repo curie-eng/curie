@@ -151,6 +151,24 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   Docker, no registry, no network -- which is what lets the API run it and stay a pure renderer
   (ADR-0087). Delivery is deliberately NOT judged here: a `local-daemon` lock is legitimate for a
   local-tier deploy, and refusing it belongs to the cluster preflight.
+- A layered runner (ADR-0173). `connectors.yaml` may carry an optional top-level `runner:` block,
+  `packages/plugin-format/src/plugin_format/connectors.py::RunnerSpec`, whose only key is a
+  `build` of the same shape and rules as a connector's (`context` inside the bundle, `dockerfile`
+  defaulting to `Dockerfile`, non-empty `platforms`). The runner Dockerfile must declare
+  `ARG CURIE_RUNNER_IMAGE` before its first `FROM`, and that first `FROM` must be
+  `${CURIE_RUNNER_IMAGE}` (optionally `AS name`); a literal base is refused as
+  `connectors.runner_base_not_arg`
+  (`packages/plugin-format/src/plugin_format/connector_lock.py::check_runner_dockerfile`).
+  `curie build --plugin-dir <dir> [--registry <ref>] [--runner-image <ref>]` pins the platform
+  runner (default: the one `curie skill up` runs) to a digest, passes it as that build argument,
+  and records a `runner:` entry in `connectors.lock.yaml`,
+  `packages/plugin-format/src/plugin_format/connector_lock.py::RunnerLockEntry`, carrying
+  `image`, `base`, `delivery`, `platforms` and `source_digest`. Both `image` and `base` obey the
+  digest rule of `delivery`. Intake reports a missing or stale runner entry as
+  `connectors.lock_missing` / `connectors.lock_stale`, and
+  `packages/plugin-format/src/plugin_format/connector_lock.py::resolve_runner_image` is the one
+  resolver a renderer uses: `None` for a bundle with no `runner:`, otherwise exactly the recorded
+  digest.
 - `deploy.yaml` (ADR-0089, `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTargetsFile`)
   declares named deploy targets under a `targets` map, each a
   `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget` of

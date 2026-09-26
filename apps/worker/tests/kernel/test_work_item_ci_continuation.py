@@ -20,6 +20,7 @@ import pytest
 from aci_protocol import (
     Final,
     HookRunRef,
+    PublicationContext,
     QueuedTurn,
     ReplyHandle,
     SessionStatus,
@@ -45,6 +46,38 @@ PR_URL = f"https://github.com/{WORK_ITEM_REPO}/pull/77"
 HEAD = "a1" * 20
 EPOCH = 7
 PUBLISH_TOOL = "mcp__curie__publish_changes"
+
+
+class _PublicationApi:
+    async def get_publication_lineage(self, *_args: object) -> None:
+        return None
+
+    async def get_publication_precheck_context(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        work_item_id: uuid.UUID,
+        execution_request_id: uuid.UUID,
+        runtime_epoch: int,
+        queued_event_id: str,
+    ) -> PublicationContext:
+        return PublicationContext(
+            agent_id=AGENT_ID,
+            deployment_id=deployment_id,
+            work_item_id=work_item_id,
+            execution_request_id=execution_request_id,
+            runtime_epoch=runtime_epoch,
+            conversation_id=f"work-item-{work_item_id}",
+            lineage_id=uuid.uuid4(),
+            lineage_version=1,
+            expected_head=HEAD,
+            queued_event_id=queued_event_id,
+            precheck_url="https://api.example.com/publications/precheck",
+            capability="ppc.example.signature",
+            observed_title="Existing pull request",
+            observed_body_sha256="b" * 64,
+            observed_at=datetime.now(UTC),
+        )
 
 
 def _ci_text(round_: int = 2) -> str:
@@ -126,6 +159,7 @@ class _WorkItems:
         if self.running is None:
             return None
         return WorkItemRunning(
+            work_item_id=self.running,
             request_id=self.running,
             runtime_epoch=EPOCH,
             execution_deadline=datetime.now(UTC) + timedelta(minutes=20),
@@ -224,7 +258,11 @@ def test_a_targetless_ci_id_is_refused() -> None:
 
 def test_a_ci_turn_is_a_factory_work_item_turn(make_harness) -> None:
     async def exercise() -> None:
-        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
             assert h.kernel._is_factory_work_item_turn(f"work-item-{uuid.uuid4()}-ci-2")
 
     asyncio.run(exercise())
@@ -234,7 +272,11 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
     make_harness,
 ) -> None:
     async def exercise() -> None:
-        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
             request_id = uuid.uuid4()
             work_items = _WorkItems(running=request_id)
             h.kernel._work_items = work_items
@@ -258,6 +300,9 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             assert finish["runtime_epoch"] == EPOCH
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "ci_fix_unpublished"
+            assert finish["detail"] is None
+            # A CI fix turn has its own bounded loop: no #3128 continuation.
+            assert len(h.runner.opened) == 1
 
     asyncio.run(exercise())
 
@@ -268,7 +313,7 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
     from curie_worker.approvals import CreatedPublication
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
 
-    class PublicationApi:
+    class PublicationApi(_PublicationApi):
         def __init__(self) -> None:
             self.creates: list[object] = []
 
@@ -333,7 +378,11 @@ def test_a_continuation_for_a_replaced_request_runs_no_turn(make_harness) -> Non
     """A relabel made a NEW running request; the old request's CI round is stale."""
 
     async def exercise() -> None:
-        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
             old_request, new_request = uuid.uuid4(), uuid.uuid4()
             work_items = _WorkItems(running=new_request)
             h.kernel._work_items = work_items
@@ -355,7 +404,11 @@ def test_a_continuation_for_a_replaced_request_runs_no_turn(make_harness) -> Non
 @pytest.mark.parametrize("state", ["ended", "absent"])
 def test_a_continuation_for_an_ended_execution_runs_no_turn(make_harness, state: str) -> None:
     async def exercise() -> None:
-        async with make_harness(binding=_Binding(), workspace_factory=_Workspace) as h:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
             request_id = uuid.uuid4()
             work_items = _WorkItems(running=None, ended=state == "ended")
             h.kernel._work_items = work_items

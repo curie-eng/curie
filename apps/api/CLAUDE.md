@@ -53,6 +53,16 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   `settings.github_webhook_secret`), not the API key -- GitHub cannot send an
   `X-API-Key` header. It lives outside the `require_api_key` dependency
   deliberately (`routers/github.py`); do not add the API-key dependency to it.
+- **Publication comparison is a scoped credential exception (ADR 0174).**
+  `POST /publications/precheck` accepts only the API issued `ppc` capability
+  in `X-Curie-Publication-Precheck`. Its sole scope is `publication.precheck`.
+  The worker mints it through `POST /v1/internal/publications/precheck/context`
+  using its internal worker credential. Mint and comparison verify the running
+  WorkItem request, runtime epoch, lease, deadline and lineage before and after
+  the provider read. Comparison reads one current pull request and writes only
+  its shared Valkey attempt budget. It cannot create publication or approval
+  state or redeem repository credentials. State and other scoped credentials
+  do not authorize comparison, and `ppc` authorizes no other route.
 - **Git-flow never calls the GitHub API.** `gitflow.py` builds the bundle by
   archiving the pushed sha directly from the repo over the git protocol (bare
   repos in tests, the real remote in production). This keeps the flow

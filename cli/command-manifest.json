@@ -5901,6 +5901,67 @@
               ],
               "hidden": false,
               "name": "install"
+            },
+            {
+              "about": "Provision the observability stack on an existing Curie release and require the Grafana connector token. Does not install the platform and does not deploy the SRE bot",
+              "args": [
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the Curie release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name of the Curie install. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "observability"
+                  ],
+                  "global": false,
+                  "help": "Kubernetes namespace of the retained observability stack. Default: observability",
+                  "id": "observability_namespace",
+                  "long": "observability-namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Chart directory. When omitted, use the same chart resolution as install",
+                  "id": "chart",
+                  "long": "chart",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print the ordered plan without calling kubectl or helm",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "provision-observability"
             }
           ]
         }
@@ -6020,6 +6081,14 @@
           "help": "Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp)",
           "id": "registry",
           "long": "registry",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "id": "runner_image",
+          "long": "runner-image",
           "positional": false,
           "required": false
         },

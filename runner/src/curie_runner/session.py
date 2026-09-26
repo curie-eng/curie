@@ -58,7 +58,6 @@ from .history import (
     NullTranscriptStore,
     TranscriptStore,
     TurnRecord,
-    bound_turn_record,
     close_suspended_tool_calls,
 )
 from .mcp_tool_capability import ConnectorAvailability, ConnectorCapabilityFailure
@@ -437,36 +436,39 @@ class SessionRunner:
                         self._session_id,
                         type(exc).__name__,
                     )
-            record = bound_turn_record(
-                TurnRecord(
-                    user=event.text,
-                    assistant=state.final_text,
-                    ts=utcnow_iso(),
-                    messages=messages,
-                    status=self._status.value,
-                    approval=(
-                        ApprovalContext(
-                            summary=state.approval_summary,
-                            route=state.approval_route,
-                            gate_kind=state.approval_gate_kind,
-                            granted_tool=state.approval_granted_tool,
-                            decision=self._approval_decision,
+            record = TurnRecord(
+                user=event.text,
+                assistant=state.final_text,
+                ts=utcnow_iso(),
+                messages=messages,
+                status=self._status.value,
+                approval=(
+                    ApprovalContext(
+                        summary=state.approval_summary,
+                        route=state.approval_route,
+                        gate_kind=state.approval_gate_kind,
+                        granted_tool=state.approval_granted_tool,
+                        decision=self._approval_decision,
+                    )
+                    if any(
+                        (
+                            state.approval_summary,
+                            state.approval_route,
+                            state.approval_gate_kind,
+                            state.approval_granted_tool,
+                            self._approval_decision,
                         )
-                        if any(
-                            (
-                                state.approval_summary,
-                                state.approval_route,
-                                state.approval_gate_kind,
-                                state.approval_granted_tool,
-                                self._approval_decision,
-                            )
-                        )
-                        else None
-                    ),
-                    harness_replay=harness_replay,
-                )
+                    )
+                    else None
+                ),
+                harness_replay=harness_replay,
             )
-            await self._history.append(record)
+            native_retained = await self._history.append(record)
+            if harness_replay is not None and not native_retained:
+                requester = getattr(self._session, "request_full_checkpoint", None)
+                if not callable(requester):
+                    raise RuntimeError("native replay exporter cannot reset its checkpoint")
+                requester()
         except HistoryCapacityError as exc:
             self._history_loss_observed = True
             self._history_durable = False
@@ -737,6 +739,7 @@ class SessionRunner:
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
                 self._approval_gate.reset()
+                self._approval_gate.bind_publication_context(event.publication_context)
             tracker = BudgetTracker(ceiling=self._ceiling)
             metric_outcome = "interrupted"
             metric_attributes = {
@@ -968,6 +971,8 @@ class SessionRunner:
                                 self._turn_epoch = None
             finally:
                 self._active_state = None
+                if self._approval_gate is not None:
+                    self._approval_gate.clear_publication_context()
                 try:
                     emit_completed_metrics()
                 finally:
@@ -1014,6 +1019,8 @@ class SessionRunner:
 
         assert self._session is not None
         gen.query_observed()
+        # The prompt text never reaches OTel (e2e ladder gate); record its size only.
+        gen.observe_prompt(event.text)
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
             if isinstance(message, StreamedToolUseBoundary):
@@ -1089,7 +1096,7 @@ class SessionRunner:
             # strictly before any ResultMessage iteration classifies the turn
             # (#2294). Never a task, and nothing is awaited between observing a
             # publication call and classifying the turn that made it.
-            self._observe_publication_calls(state)
+            await self._observe_publication_calls(state)
             decided_result_final: Final | None = None
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
@@ -1108,6 +1115,7 @@ class SessionRunner:
                         decided_result_final = _apply_approval_override(
                             self._reclassify(sdk_final), state
                         )
+                gen.record_result_usage(getattr(message, "usage", None))
                 gen.result_boundary_observed(
                     failed=result_failed,
                     terminal_reason=terminal_reason,
@@ -1245,7 +1253,7 @@ class SessionRunner:
         else:
             yield to_ndjson_line(self._with_connector_notice(final))
 
-    def _observe_publication_calls(self, state: TurnState) -> None:
+    async def _observe_publication_calls(self, state: TurnState) -> None:
         """Record every publication call the runner sees on the stream (#2294).
 
         The runner's own observer, alongside the PreToolUse hook (#1852) and
@@ -1281,7 +1289,7 @@ class SessionRunner:
 
         gate = self._approval_gate
         while state.publication_calls_observed < len(state.publication_calls):
-            payload = state.publication_calls[state.publication_calls_observed]
+            tool_use_id, payload = state.publication_calls[state.publication_calls_observed]
             state.publication_calls_observed += 1
             if gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
                 # The model named the publication tool where the platform has no
@@ -1293,11 +1301,13 @@ class SessionRunner:
                 )
                 continue
             try:
-                recorded = gate.observe_publication(payload)
+                recorded = await gate.observe_publication(tool_use_id, payload)
             except ValueError as exc:
                 # First reason wins for the message; the loop carries on so a
                 # corrected retry later in the same turn can still record.
                 state.publication_unrecorded = state.publication_unrecorded or str(exc)
+                continue
+            if recorded is None:
                 continue
             if recorded:
                 # Neutral wording, and NOT a warning: against the real SDK this
@@ -1321,6 +1331,13 @@ class SessionRunner:
                     "publication already recorded this turn session=%s",
                     self._session_id,
                 )
+
+    def _has_unhandled_publication(self, state: TurnState) -> bool:
+        gate = self._approval_gate
+        return any(
+            gate is None or not gate.publication_refused(tool_use_id)
+            for tool_use_id, _ in state.publication_calls
+        )
 
     def _log_publication_fallback_alone(self, state: TurnState) -> None:
         """Warn when the stream observer was the ONLY layer that decided (#2294).
@@ -1350,7 +1367,7 @@ class SessionRunner:
 
         gate = self._approval_gate
         if (
-            not state.publication_calls
+            not self._has_unhandled_publication(state)
             or gate is None
             or gate.pending_summary is None
             or gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
@@ -1385,7 +1402,7 @@ class SessionRunner:
         """
 
         if (
-            not state.publication_calls
+            not self._has_unhandled_publication(state)
             or final.status is not SessionStatus.AWAITING_APPROVAL
             or final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
         ):
@@ -1449,7 +1466,7 @@ class SessionRunner:
         """
 
         if (
-            not state.publication_calls
+            not self._has_unhandled_publication(state)
             or final.status is SessionStatus.AWAITING_APPROVAL
             or final.status is SessionStatus.CLASSIFIED_FAILURE
             or self._interrupt_requested

@@ -45,6 +45,42 @@
         "expected": "(?is)^.{0,300}?(can(no|')?t|cannot|unable to|must not|do ?n[o']?t (push|merge)|never (push|merge)|won'?t (push|merge)|publish_changes|decline)",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "reports-each-phase-once",
+      "input": "You called report_progress when you entered the phase you are working in, and you are still working in that same phase. While you keep working, must you call report_progress again? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*(no\\b)",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "knows-a-text-only-message-ends-the-run",
+      "input": "Before you have called publish_changes or stopped with Could not complete:, what happens if you send a message that has no tool call in it? Answer in one or two sentences.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)\\b(ends?|stops?|terminates?)\\b[^.]{0,60}\\brun\\b|\\brun\\b[^.]{0,60}\\b(ends?|stops?|terminates?)\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "approve-with-notes-ends-the-loop",
+      "input": "The plan reviewer replied 'VERDICT: APPROVE' with a NOTES list of three non-blocking refinements. Do you run another plan review round before implementing? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "diff-notes-go-in-the-pull-request-body",
+      "input": "The diff reviewer replied 'VERDICT: APPROVE' with a NOTES list of two non-blocking refinements. Do you edit the code to address them before publishing? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b.{0,400}?(pull request|pr\\b)",
+        "case_sensitive": false
+      }
     }
   ]
 }

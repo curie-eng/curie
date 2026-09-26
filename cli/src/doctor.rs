@@ -1089,7 +1089,7 @@ fn evaluate_with_worker_claims(
                     ),
                 )
             }
-            crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => missing(
+            crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable { .. } => missing(
                 "worker-claims",
                 "Worker claims",
                 worker_claims
@@ -1557,6 +1557,33 @@ mod tests {
 
     fn find<'a>(checks: &'a [Check], id: &str) -> &'a Check {
         checks.iter().find(|c| c.id == id).expect(id)
+    }
+
+    /// #3127: the worker-claims detail names the marker's remaining TTL, so an
+    /// operator can tell a live drain from a marker about to lapse.
+    #[test]
+    fn worker_claims_detail_names_the_remaining_marker_ttl() {
+        let quiescing = crate::worker_claims::ClaimsState::Quiescing {
+            since: "2026-09-25T10:00:00+00:00".into(),
+            revision: 7,
+            ttl_seconds: Some(120),
+        };
+        let checks = evaluate_with_worker_claims(&wired(), Some(&quiescing));
+        let check = find(&checks, "worker-claims");
+        assert_eq!(check.state, State::Missing);
+        assert_eq!(
+            check.detail,
+            "waiting for upgrade revision 7 since 2026-09-25T10:00:00+00:00; \
+             marker expires in 120s"
+        );
+
+        let unavailable = crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable {
+            ttl_seconds: Some(30),
+        };
+        let checks = evaluate_with_worker_claims(&wired(), Some(&unavailable));
+        assert!(find(&checks, "worker-claims")
+            .detail
+            .contains("marker expires in 30s"));
     }
 
     /// The one check this issue is about, pulled out of a full `evaluate`.

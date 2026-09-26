@@ -1231,6 +1231,19 @@ already-configured control-plane pod at admission time. Both objects are
 independently toggleable (`resourceQuota.enabled`, `limitRange.enabled`,
 each default `true`) and every ceiling is overridable, per ADR-0059 decision 6.
 
+**Which pods outrank sandboxes (ADR-0059 decision 5, #3182).** Every
+long-running platform workload carries `priorityClassName:
+priorityClasses.platform.name`: the control plane (api, worker, dispatcher),
+the data tier (postgres, valkey, clickhouse, rustfs), the observability and
+UI tier (langfuse web/worker, the OTel collector, the UI, inference, the
+mail adapter), and the vendored agent-sandbox controller. At priority 0 those
+observability and UI pods were preempted by the very sandboxes whose traces
+and metrics they carry (#3182); `ci/render-assertions.sh` Assertion 8 holds
+the inventory exhaustive, so a new template that forgets its class fails the
+render. The runner-prewarm DaemonSet deliberately stays unclassed (priority
+0, below the sandbox class): the image-cache pod is the designated sacrifice
+a full node evicts first.
+
 **Verifying the rails.** The security-boundary probe suite re-runs as a `helm test`:
 
 ```bash

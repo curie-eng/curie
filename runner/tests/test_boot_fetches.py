@@ -30,6 +30,7 @@ from curie_runner.server import create_app
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
 _DELAY = 1.5
+_TRANSCRIPT_CAP_HEADERS = {"X-Curie-Transcript-Max-Bytes": "65536"}
 
 _MEMORY_ITEM = {
     "content": "prefer ruff over flake8",
@@ -112,6 +113,7 @@ def _state_app(
             return web.Response(
                 text=history_error_body or "history failed",
                 status=history_status,
+                headers=_TRANSCRIPT_CAP_HEADERS,
             )
         return web.json_response(
             {
@@ -119,7 +121,8 @@ def _state_app(
                 "key": "t1",
                 "value": list(history_value or []),
                 "version": 1,
-            }
+            },
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     app.router.add_get("/agents/A/state/memory/log", get_memory)
@@ -290,7 +293,8 @@ def _capped_history_app(
                 "key": "t1",
                 "value": list(records),
                 "version": 1,
-            }
+            },
+            headers=_TRANSCRIPT_CAP_HEADERS,
         )
 
     async def reject_summary(request: web.Request) -> web.Response:

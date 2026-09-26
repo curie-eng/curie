@@ -78,6 +78,7 @@ from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
 from .progress import ProgressActivity, build_progress_tool, resolve_progress
+from .publication_precheck import PublicationPrecheck
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
 from .server import bind_status_attestation, create_app
@@ -418,6 +419,12 @@ def build_runner(
     state_mounted = state_client is not None
     if approval_gate is not None:
         approval_gate.state_server_mounted = state_mounted
+        approval_gate.publication_precheck = PublicationPrecheck(
+            mounted_workspace,
+            os.environ.get(BootEnv.env_key("state_url"))
+            or os.environ.get(BootEnv.env_key("progress_url")),
+            network_enabled=not fake_model,
+        )
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,

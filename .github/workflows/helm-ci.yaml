@@ -576,6 +576,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/prewarm-bundle-fetch-assertions.sh
 
+      # Prove a bundle's layered runner image (agentSandbox.runnerImages,
+      # ADR-0173, #3217) reaches only that agent's SandboxTemplate, and that
+      # the prewarm DaemonSet pulls every distinct runner digest rendered.
+      - name: helm render assertions (per-agent runner images)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/runner-images-assertions.sh
+
       # Prove the dispatcher is told where the platform API is and how to
       # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
       # uses the same helper (issue #2316). Unwired, the dispatcher falls back

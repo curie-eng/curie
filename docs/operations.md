@@ -373,6 +373,14 @@ upgrade phase and the last known-good version.
 
 ### `curie cluster upgrade`
 
+For the 0.10.1 history capacity change, deploy the API image with the
+`X-Curie-Transcript-Max-Bytes` response header to every API pod before
+deploying the new worker or runner image. Keep the previous worker and runner
+image pins during that API rollout. Check the header on transcript GET responses
+for both an existing key and a missing key through every API pod, then roll out
+the worker and runner. The new runner requires that header at boot, so a mixed
+API rollout can refuse to start a history backed turn.
+
 ```bash
 # release build: --chart defaults to the version-pinned release asset for --to
 curie cluster upgrade --to 0.9.0
@@ -829,18 +837,25 @@ reconciler admitted the issue counts as a relabel and starts a second run.
 Subscribe the App webhook to **Issues** and **Issue comments** in addition to
 the review subscriptions when both gates are on. Give the App **Issues: Read and write**
 so Curie can re-read the issue, keep its one status comment, and set the
-`curie:*` state labels. **Metadata: Read** is already implied by repository
+`curie-factory:*` state labels. **Metadata: Read** is already implied by repository
 installation discovery.
 
-Give the App **Checks: Read** and **Commit statuses: Read**. After a factory
-run publishes, it waits on the pull request's checks inside its 1800 s
+Give the App **Checks: Read**, **Commit statuses: Read**, and **Actions: Read**.
+The Actions permission lets repair rounds include the failing job's log tail.
+Without it, CI verdicts still use checks and commit statuses; the repair prompt
+keeps the check summary and says `Job log unavailable.` After a factory
+run publishes, it waits on the pull request's checks inside its execution
 deadline; the request completes only when CI is green. A failure resumes the
 same run to fix the code and push to the same pull request, for at most 3
 rounds, then the issue gets `Could not complete:` with the failing checks and
 what each round tried. No checks within 120 s of the push completes with a
-note. Checks still pending when the CI wait (1200 s from the push, or the
-execution deadline if sooner) runs out end as `ci_timeout`. Unreadable CI,
-such as a missing permission, ends as `ci_unverified`, which is never success;
+note. Checks still pending when the CI wait (by default 1200 s from the push, or the
+execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
+`api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
+1200, 1 to 10800, checked at boot) when the repository's required checks take
+longer than 20 minutes; the wait still ends at the execution deadline if that
+comes first. Unreadable CI, such as missing Checks or Commit statuses permission,
+ends as `ci_unverified`, which is never success;
 the pull request stays open either way. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.
 
@@ -877,7 +892,31 @@ and run those checks, declare its package registry CIDRs under
 `agentSandbox.registryEgress.<agent>`. Nothing opens by default; each declaring
 agent gets its own `<release>-agent-<agent>-allow-registry-egress` policy, and
 since NetworkPolicy cannot name a host, list the registry CDN ranges or a
-mirror's address.
+mirror's address. When the bundle layers its own runner image
+(ADR-0173), set `agentSandbox.runnerImages.<agent>` to the digest reference
+`curie build` recorded in its connectors.lock.yaml. That agent gets its own
+SandboxTemplate rendering the digest, and the runner prewarm DaemonSet pulls it
+on every node. A tag is refused at render time.
+
+For a run that can last three hours, set an illustrative $100 USD cap after
+deploying the agent:
+
+```bash
+curie cluster budget dark-factory --limit 100
+```
+
+Tune the limit to the model and expected workload. The SDK applies it to each
+session; it does not meter daily spend across runs. It does not guarantee a
+$100 bill. On OpenRouter's Anthropic Messages route, the
+[documented response](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message)
+contains token usage but no billed cost field. The conclusion that the SDK
+cost used for Curie's USD cap is an estimate is an inference from those
+documented response fields, not a live billing measurement. OpenRouter reports
+cost through its separate [generation metadata endpoint](https://openrouter.ai/docs/api/api-reference/generations/get-generation).
+Check OpenRouter Activity or the cost of each generation for actual billing.
+The [SDK budget example](https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py)
+checks the cap after each API call, so the estimate can exceed the limit by
+one API call.
 
 ### Factory work items wait for capacity
 
@@ -933,13 +972,20 @@ When publication succeeds, the result names the exact pull request
 URL. When the run cannot complete, the result starts with `Could not complete:`
 and a plain sentence for the cause. When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
-of keys and tokens. A last `Cause:` line names the platform cause code
+of keys and tokens. An execute turn that ends without publishing is prompted
+once more in the same session. If it still does not publish, it ends as
+`early_stop` (it called no work tool and never reported progress) or
+`no_pull_request`, and an `Agent's last message:` block carries the agent's
+final reply, redacted and shown inside a code fence so none of it renders.
+A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `runner_failed`, `no_pull_request`,
-`publication_denied`, `publication_expired`, `publication_failed`, or a
+`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
 classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
-`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`, or
-`workspace_error`). A model provider that answers HTTP 402 or reports exhausted
+`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+`workspace_error`, or `history_capacity`). A history capacity result tells the
+operator to inspect work already done and retry. A model provider that answers
+HTTP 402 or reports exhausted
 credits ends the run as `model_credit_exhausted` without retrying. A run that a
 relabel replaced ends with `Stopped: the label was added again, so a new run
 replaced this one.`, and the new run gets its own status comment. The
@@ -948,11 +994,15 @@ publication lineage commit. A refused create or edit is recorded on the status
 row, stops further edits, and does not change the execution row.
 
 The same pass keeps one state label on the originating issue, for revisions
-too: `curie:queued` while waiting, `curie:running` while running or stopping,
-`curie:pr-open` after a completed run, and `curie:needs-human` after a failed
-or expired one. A cancelled run removes all four. Curie adds the desired label
-and removes the other three, and never touches any other label, including
-the factory admission label.
+too: `curie-factory:queued` while waiting, `curie-factory:running` while running
+or stopping, `curie-factory:pr-open` after a completed run, and
+`curie-factory:needs-human` after a failed or expired one. A cancelled run
+removes all four. The same pass removes a legacy `curie:queued`,
+`curie:running`, `curie:pr-open`, or `curie:needs-human` label by exact name
+whenever it sets or clears the state label, including after an upgrade.
+Curie still never touches any other label, including the factory admission
+label. An older release rolled back onto this schema does not know the new
+names, so it will not remove a `curie-factory:*` label it finds.
 
 Set `api.githubFactoryCardBaseUrl` (`GITHUB_FACTORY_CARD_BASE_URL`) to the
 API's public `https://` origin to embed a live SVG card in the status comment.
@@ -999,7 +1049,12 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
 1. Installs the candidate commit's published `sha-<commit>` images from that
    commit's chart into a namespace it creates (`test-factory-<commit>` by
    default, or `--namespace test-factory-<slug>`). If the cluster already runs
-   the agent-sandbox controller, the install is consumer mode.
+   the agent-sandbox controller, the install is consumer mode. Without
+   `--candidate`, the candidate is the newest first-parent commit of
+   `origin/next`, within its last 30, whose images are all published. A tip
+   that CI is still building is skipped and logged, and the run is refused
+   when none of the 30 has its images. An explicit `--candidate` is used as
+   given and refused when its images are not published.
 2. Turns on factory intake, binds one agent to the fixture repository, deploys
    the default factory bundle (`examples/dark-factory`) onto it with a
    short-lived installation token limited to Issues: Read as the bundle's
@@ -1011,6 +1066,41 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
 4. Passes when GitHub's delivery log shows that the `issues.labeled` delivery
    got HTTP 200 and `factory_admitted`, and
    `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
+
+Before it creates its namespace, the driver removes what a crashed run on this
+machine left behind. Each namespace it creates carries its run id and a
+`curie.dev/factory-e2e-holder` annotation of `<hostname>:<pid>`. A harness
+namespace whose holder is on this host with a dead process is stale: the driver
+uninstalls its release, deletes it, its publication namespace, and its cluster
+roles, role bindings and PriorityClasses, and waits until they are gone. Each
+install creates the chart CRDs the cluster lacks itself, already carrying the
+harness owner label, before Helm runs; once every stale release is removed and
+no other harness namespace remains, the sweep deletes the CRDs carrying that
+label. A namespace held from another host, or one with no holder (written
+before holders existed), is reported in the evidence and left alone, since
+another machine may still own it; delete it by hand once you know its run
+ended.
+
+If the App webhook already points at a quick tunnel when the run starts, the
+driver probes that tunnel's health endpoint up to four times, ten seconds
+apart, and only calls it dead if every probe fails; one 200 response counts it
+alive. A live tunnel belongs to another run, so the run is refused. A dead
+tunnel is a crashed run's: the run goes ahead and its teardown leaves the
+webhook on `CURIE_FACTORY_WEBHOOK_RESTORE_URL`, or, when that is unset, parks
+it on `https://example.com/curie-factory-e2e/parked` until you set a real
+URL.
+
+`--hold` (on `preflight` and `run`) keeps a passing install up instead of
+tearing it down at once. The driver logs the kube context, namespace,
+release, local api URL, tunnel and webhook URL, fixture repository and
+factory agent, and writes them under `hold` in the evidence file straight
+away, so a second shell can read them. The api key is never printed: the
+evidence names a `0600` file in the run's private work directory that holds
+it. Every minute the driver reopens the api port-forward or the tunnel if
+either died and refreshes the bundle's installation token when it is due; a
+failed check is logged and the hold continues. Ctrl-C or
+`kill -TERM <pid>` ends the hold and runs the normal teardown, and the result
+stays `passed`. A run that fails never holds.
 
 On every exit it restores the webhook URL, resets the fixture again, stops the
 tunnel, and deletes the namespace and its publication namespace. Each undo is
@@ -1027,15 +1117,26 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_APP_ID`, `CURIE_FACTORY_INSTALLATION_ID` | Override `app.json` |
 | `CURIE_FACTORY_APP_PRIVATE_KEY_FILE`, `CURIE_FACTORY_WEBHOOK_SECRET_FILE` | Override the files in the App directory |
 | `CURIE_FACTORY_REPO` | Fixture repository `owner/name` |
-| `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A human account with write access that opens the issue (a `gh` login for the second) |
+| `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A dedicated test GitHub account with write access that opens issues, comments and moves the fixture branch (a `gh` login for the second). It must not be the operator's own account |
+| `CURIE_FACTORY_OPERATOR_LOGIN` | The operator's GitHub login, compared with the actor's (default: the login of the default `gh` account). The run is refused when they match, and refused too when neither is known, naming this variable to set |
 | `CURIE_FACTORY_LABEL`, `CURIE_FACTORY_MENTION` | Intake label (default `curie-factory`) and mention login (default the App slug) |
 | `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses instead of creating them |
-| `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start) |
+| `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start, or the parked URL when that was a dead quick tunnel) |
 | `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
 | `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
 | `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
+| `CURIE_FACTORY_MODEL_CONTEXT_TOKENS` | The model's context window, passed to the sandbox as `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 128000 for the default model, unset for any other) |
+
+The App must already be installed on the fixture repository. Adding a
+repository to an App installation is a manual step: in GitHub, open the App's
+installation settings (**Settings > Applications > Installed GitHub Apps >
+Configure** for a user, or the organization's equivalent), then pick the
+repository under **Repository access**, or choose **All repositories**. The API
+refuses this with 403 for a user token, so the tool cannot do it for you.
+Installing the App on all repositories of the fixture owner makes new fixture
+forks work with no further step.
 
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
@@ -1048,11 +1149,15 @@ malicious instruction) on the configured model and again on
 credential), then one authorized same-PR revision and label removal of one
 waiting request and one running request. After the waiting cancellation it
 raises the sandbox pod quota to the chart default with `helm upgrade
---reuse-values`, so the per-agent sandbox warm pool survives. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` so the model session
-does not die while titling itself. A request that
+--reuse-values`, so the per-agent sandbox warm pool survives. A gateway model
+is not in Claude Code's model catalog, so the runner logs a
+`[claude-code:unrecognized_model]` warning. It is only a warning: the turn still
+reaches the gateway. The sandbox sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` to skip
+the session-title side request and `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to declare the
+model's context window (`CURIE_FACTORY_MODEL_CONTEXT_TOKENS`), which silences the notice. A request that
 has not started, a delivery the tunnel rejected, or a run that escalates in
 the first few seconds is cancelled and opened again. A refusal still has to
-end as `no_pull_request`, and the budget case still has to end as
+end as `no_pull_request` or `early_stop`, and the budget case still has to end as
 `execution_deadline`. The case is given up well before the hour-long
 never-started cap. Hidden checks run
 against each resulting pull request and are not part of the ticket. The JSON evidence
@@ -1071,11 +1176,13 @@ comment` requires no pull request, and `--expect any` accepts either. A success
 comment must name the exact opened pull request URL anywhere in its body. A
 failure comment must contain `Could not complete:` followed by an explanation.
 Its cause must be one the run accepts: each `--expect-cause` given, or by
-default `no_pull_request` for `--expect comment` and `no_pull_request` or
+default `no_pull_request` or `early_stop` for `--expect comment`, plus
 `execution_deadline` for `--expect any`. When `--expect comment` or `--expect
-any` accepts a `no_pull_request` ending, the agent's final transcript reply must
-separately contain `Could not complete:` followed by its reason. Each
-`--expect-reason` must match that transcript reply, ignoring case. The platform
+any` accepts a `no_pull_request` or `early_stop` ending, the agent's final reply
+must separately contain `Could not complete:` followed by its reason. The reply
+is read from the final comment's `Agent's last message:` block, and from the
+thread transcript only when the comment has none. Each `--expect-reason` must
+match that reply, ignoring case. The platform
 cause does not establish the agent's reason. Only a comment the App posted with
 this run's execution request marker counts, and more than one fails. A rename out of
 `.github/` fails like a change inside it. A known secret or credential-shaped

@@ -437,6 +437,7 @@ class FakeK8s:
     quota_headroom_calls: list[tuple[QuotaRejection, float]] = field(default_factory=list)
     ready_reason: str | None = None
     ready_message: str | None = None
+    unschedulable_message: str | None = None
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
     # every existing test lives in: every sandbox gets ``port=None`` and dials
@@ -575,6 +576,10 @@ class FakeK8s:
         if isinstance(result, BaseException):
             raise result
         return result
+
+    def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        assert request_timeout_seconds > 0
+        return self.unschedulable_message
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode

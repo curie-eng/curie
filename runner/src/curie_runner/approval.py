@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
+from aci_protocol import PublicationContext
 from claude_agent_sdk import HookMatcher, SdkMcpTool, create_sdk_mcp_server, tool
 from claude_agent_sdk.types import (
     CanUseTool,
@@ -72,6 +73,7 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .publication_precheck import PublicationPrecheck
 from .state import STATE_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
@@ -690,6 +692,8 @@ class ApprovalGate:
     grantable_by_route: dict[str, str] = field(default_factory=dict)
     publication_title: str | None = None
     publication_body: str | None = None
+    publication_precheck: PublicationPrecheck | None = field(default=None, repr=False)
+    _publication_pending_id: str | None = None
     # Set by ``block()`` whenever the gate refuses a call (#1852). Since the
     # refusal now carries the SDK's turn-stopping flags, the CLI aborts the turn
     # and its terminal result arrives shaped like a failure; this marker is how
@@ -739,6 +743,9 @@ class ApprovalGate:
         self.policy_route = None
         self.publication_title = None
         self.publication_body = None
+        self._publication_pending_id = None
+        if self.publication_precheck is not None:
+            self.publication_precheck.clear()
         # Strictly per-turn, and cleared with the other pending state rather
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
@@ -749,6 +756,46 @@ class ApprovalGate:
         if self._boot_turn_seen:
             self.grant_tool = None
         self._boot_turn_seen = True
+
+    def bind_publication_context(self, context: PublicationContext | None) -> None:
+        if self.publication_precheck is None and context is not None:
+            self.publication_precheck = PublicationPrecheck(None, None, network_enabled=False)
+        if self.publication_precheck is not None:
+            self.publication_precheck.bind(context)
+
+    def clear_publication_context(self) -> None:
+        if self.publication_precheck is not None:
+            self.publication_precheck.clear()
+
+    def publication_refused(self, tool_use_id: str | None) -> bool:
+        return (
+            self.publication_precheck is not None
+            and tool_use_id in self.publication_precheck.refused_ids
+        )
+
+    async def check_publication(
+        self, tool_use_id: str | None, tool_input: dict[str, Any]
+    ) -> str | None:
+        if self.publication_precheck is None:
+            return None
+        refusal = await self.publication_precheck.decide(tool_use_id, tool_input)
+        if (
+            refusal is not None
+            and self.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+            and self._publication_pending_id == tool_use_id
+        ):
+            # A conflicting observation invalidates this call's earlier record.
+            # Other tools retain ownership of their existing approval slot.
+            self.pending_summary = None
+            self.pending_display = None
+            self.pending_route = None
+            self.pending_gate_kind = None
+            self.pending_granted_tool = None
+            self.pending_halt = False
+            self.publication_title = None
+            self.publication_body = None
+            self._publication_pending_id = None
+        return refusal
 
     def consume_grant(self, tool_name: str) -> bool:
         """Spend the one-shot grant iff it names ``tool_name`` (single use)."""
@@ -806,39 +853,29 @@ class ApprovalGate:
         self.pending_granted_tool = tool_name
         return True
 
-    def observe_publication(self, tool_input: dict[str, Any]) -> bool:
-        """Record a publication request the runner saw on the STREAM (#2294).
+    async def observe_publication(
+        self, tool_use_id: str | None, tool_input: dict[str, Any]
+    ) -> bool | None:
+        """Await the shared decision before recording a streamed publication.
 
-        The runner's own observer of a publication call, alongside the
-        PreToolUse hook (#1852) and ``can_use_tool`` (#245) rather than behind
-        them. Against the real SDK the stream reaches the session loop BEFORE
-        the CLI dispatches PreToolUse (observed live, #2294), so this is
-        normally the FIRST writer of the record and the hook's ``block`` then
-        finds it standing and only adds the halt marker; the fake tier inverts
-        that order, and there this call is the duplicate. It replaces neither
-        layer -- both still DECIDE the call, which this never does.
+        The real SDK may deliver the stream before either permission callback.
+        Every observer uses the exact call ID, so only one comparison runs and
+        a continuing refusal never creates pending state. An approval decision
+        records the first pending proposal without setting the halt marker;
+        only the SDK callbacks request that stop. This observer never grants
+        permission to execute the publication tool.
 
-        What it closes is the case where NEITHER layer recorded the call (a
-        hook that raised is reported and the call proceeds; a concurrently
-        dispatched bundle hook; an input shape a layer abstains on): the stream
-        still carries the ``ToolUseBlock``, and without this the turn finalizes
-        DONE with nothing for a human to approve.
-
-        It can only ever RECORD or raise -- it never returns an allow decision
-        and never mints a grant, so it cannot widen authority: ``safe_grant_tool``
-        already refuses a sandbox grant for the publish tool, and a second call
-        blocks again. It deliberately leaves ``pending_halt`` False: the runner
-        did not ask the CLI to stop this turn, and claiming otherwise would
-        relabel an unrelated failure as awaiting-approval.
-
-        Returns True when it created the pending record, False when one already
-        stands (an earlier call this turn, or a gate layer that got there first
-        on the fake tier -- exactly one record per turn either way). Raises
-        ``ValueError`` on a malformed title/body, identically to ``block``; the
-        session turns that into a fail-closed classified failure.
+        Return None for a continuing refusal, True for a new pending record,
+        and False when a previous record already owns the slot. A malformed
+        proposal raises ValueError for the existing terminal failure handling.
         """
 
-        return self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
+        if await self.check_publication(tool_use_id, tool_input) is not None:
+            return None
+        recorded = self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
+        if recorded:
+            self._publication_pending_id = tool_use_id
+        return recorded
 
 
 class _GateDecision(NamedTuple):
@@ -862,6 +899,7 @@ class _GateDecision(NamedTuple):
     blocked: bool
     ungated: bool
     refusal: str | None = None
+    continue_turn: bool = False
 
 
 def is_mcp_tool(live_tool_name: str) -> bool:
@@ -1018,10 +1056,15 @@ def policy_disallowed_tools(
     )
 
 
-def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any]) -> _GateDecision:
+async def _decide_gate(
+    gate: ApprovalGate,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    tool_use_id: str | None,
+) -> _GateDecision:
     """Apply the gate rule to one candidate call, mutating ``gate`` as needed.
 
-    Mirrors the pre-extraction ``can_use_tool`` logic verbatim: a tool outside
+    Publication awaits its shared precheck before the ordinary rule: a tool outside
     ``gate.required`` is ungated (no state change, allow); a gated tool with an
     unspent one-shot grant is granted (the grant is spent here, allow); anything
     else is blocked (``gate.block`` records it, deny). The caller still owns
@@ -1030,6 +1073,12 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
     flag) -- this function decides, it does not render.
     """
 
+    if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
+        refusal = await gate.check_publication(tool_use_id, tool_input)
+        if refusal is not None:
+            return _GateDecision(
+                blocked=False, ungated=False, refusal=refusal, continue_turn=True
+            )
     outcome = _tool_policy_outcome(gate, tool_name)
     if outcome is ToolPolicyDecision.DENY:
         return _GateDecision(
@@ -1055,6 +1104,12 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
+    if (
+        tool_name == PLATFORM_PUBLISH_TOOL_NAME
+        and gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+        and gate._publication_pending_id is None
+    ):
+        gate._publication_pending_id = tool_use_id
     return _GateDecision(blocked=True, ungated=False)
 
 
@@ -1090,14 +1145,16 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
         # approved action completes) and re-arms the gate. ``_decide_gate``
         # applies this rule (shared with the hook below).
         try:
-            decision = _decide_gate(gate, tool_name, tool_input)
+            decision = await _decide_gate(gate, tool_name, tool_input, _context.tool_use_id)
         except ValueError as exc:
             return PermissionResultDeny(
                 message=f"Publication request was not recorded: {exc}. Correct it and retry.",
                 interrupt=True,
             )
         if decision.refusal is not None:
-            return PermissionResultDeny(message=decision.refusal, interrupt=True)
+            return PermissionResultDeny(
+                message=decision.refusal, interrupt=not decision.continue_turn
+            )
         if decision.blocked:
             # ``interrupt`` is the SDK-native "deny AND stop the turn" flag
             # (``PermissionResultDeny.interrupt``, claude_agent_sdk/types.py:247-252),
@@ -1224,7 +1281,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # used by ``build_can_use_tool`` above); the grant, if any, is spent as
         # a side effect of this call.
         try:
-            decision = _decide_gate(gate, tool_name, tool_input)
+            decision = await _decide_gate(gate, tool_name, tool_input, _tool_use_id)
         except ValueError as exc:
             reason = f"Publication request was not recorded: {exc}. Correct it and retry."
             return {
@@ -1237,6 +1294,15 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "stopReason": reason,
             }
         if decision.refusal is not None:
+            if decision.continue_turn:
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": decision.refusal,
+                    },
+                    "continue_": True,
+                }
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",

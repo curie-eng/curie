@@ -34,14 +34,17 @@ import importlib
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import curie_worker.upgrade_drain as _drain_mod
 import pytest
 import redis.asyncio
 from curie_test_support.valkey import (
@@ -196,9 +199,14 @@ def _status_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     config: WorkerConfig,
+    *,
+    with_ttl: bool = False,
 ) -> tuple[dict[str, object], str]:
     _configure_module_env(monkeypatch, config)
-    assert main(["--mode", "status", "--json"]) == 0
+    args = ["--mode", "status", "--json"]
+    if with_ttl:
+        args.append("--with-ttl")
+    assert main(args) == 0
     captured = capsys.readouterr()
     lines = captured.out.splitlines()
     assert len(lines) == 1, f"status must write one JSON object, got {lines!r}"
@@ -730,6 +738,12 @@ def test_status_writes_one_safe_json_object_for_absent_owned_and_malformed_marke
         status, stderr = _status_json(monkeypatch, capsys, config)
         assert status == {"state": "quiescing", "since": None, "revision": None}
         assert "install-status" not in stderr
+
+        status, stderr = _status_json(monkeypatch, capsys, config, with_ttl=True)
+        ttl_seconds = status.pop("ttl_seconds")
+        assert isinstance(ttl_seconds, int) and ttl_seconds > 0
+        assert status == {"state": "quiescing", "since": None, "revision": None}
+        assert "install-status" not in stderr
     finally:
         async def cleanup() -> None:
             client: AsyncRedis = AsyncRedis(
@@ -1183,3 +1197,276 @@ def test_client_selects_ssl_connection_when_tls_is_set() -> None:
         client.connection_pool.connection_class
         is redis.asyncio.connection.SSLConnection
     )
+
+
+# --- the marker is a renewed lease while waiting (#3127) ----------------------
+#
+# A drain Job that is killed mid-wait (helm cancelled then the Job deleted,
+# activeDeadlineSeconds, SIGKILL, node loss) must not leave the fleet paused for
+# the long quiesce TTL. While waiting, the marker is a short lease renewed each
+# poll; only a clean drain extends it to the roll hold. The lease is patched to a
+# tiny value so the tests run in about a second.
+
+_TINY_LEASE_S = 0.5
+
+
+async def _hold_live_delivery(client: AsyncRedis, config: WorkerConfig) -> str:
+    """A pending entry whose lease key exists until the test deletes it."""
+    entry_id = await _pending(client, config, "replica-a")
+    await client.set(
+        config.delivery_lease_key(config.stream, config.consumer_group, entry_id),
+        "replica-a",
+        ex=60,
+    )
+    return config.delivery_lease_key(config.stream, config.consumer_group, entry_id)
+
+
+def test_quiesce_lease_is_three_polls_floored_at_thirty_seconds() -> None:
+    lease = _drain_mod.quiesce_lease_s
+    assert lease(_drain_config(upgrade_drain_poll_interval_s=2.0)) == 30.0
+    assert lease(_drain_config(upgrade_drain_poll_interval_s=20.0)) == 60.0
+
+
+def test_quiesce_lease_is_capped_at_the_effective_drain_wait() -> None:
+    """Three polls can outrun the drain timeout itself; a lease longer than the
+    wait it is meant to bound would outlive the whole drain and defeat #3127's
+    point -- the lease must never exceed ``min(max(30, 3*poll), timeout)``."""
+    lease = _drain_mod.quiesce_lease_s
+    assert (
+        lease(
+            _drain_config(
+                upgrade_drain_poll_interval_s=300.0, upgrade_drain_timeout_s=660.0
+            )
+        )
+        == 660.0
+    )
+
+
+def test_marker_is_a_renewed_short_lease_while_waiting_then_the_roll_hold(
+    names, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: ANN001
+    monkeypatch.setattr(_drain_mod, "quiesce_lease_s", lambda _c: _TINY_LEASE_S)
+
+    async def go() -> None:
+        async with _gate(
+            names, upgrade_drain_timeout_s=10.0, upgrade_quiesce_ttl_s=20.0
+        ) as (gate, config, client):
+            lease_key = await _hold_live_delivery(client, config)
+            key = config.upgrade_quiesce_key()
+            waiter = asyncio.create_task(gate.await_drained(poll_interval_s=0.05))
+            try:
+                await asyncio.sleep(0.2)
+                first = await client.pttl(key)
+                assert 0 < first <= int(_TINY_LEASE_S * 1000), (
+                    f"waiting marker PTTL {first}ms is not the short lease"
+                )
+                # More than two leases elapse; only renewal keeps it alive.
+                await asyncio.sleep(_TINY_LEASE_S * 2 + 0.2)
+                later = await client.pttl(key)
+                assert 0 < later <= int(_TINY_LEASE_S * 1000), (
+                    f"waiting marker was not renewed as a lease (PTTL {later})"
+                )
+                await client.delete(lease_key)
+                outcome = await asyncio.wait_for(waiter, timeout=5.0)
+            finally:
+                waiter.cancel()
+                with contextlib.suppress(BaseException):
+                    await waiter
+            assert outcome.drained is True
+            hold = await client.pttl(key)
+            assert 19_000 <= hold <= 20_000, (
+                f"a clean drain did not extend the marker to the roll hold ({hold}ms)"
+            )
+
+    asyncio.run(go())
+
+
+def test_marker_survives_a_delivery_scan_slower_than_the_lease(
+    names, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: ANN001
+    """The renewal in ``test_marker_is_a_renewed_short_lease...`` above happens
+    between fast scans. If ``unsettled_deliveries`` itself is slower than the
+    lease, a renewal loop gated on that scan's completion lets the marker lapse
+    mid-scan -- the fleet resumes while a delivery is still being enumerated.
+    Renewal must run independently of the scan, not just between iterations."""
+    monkeypatch.setattr(_drain_mod, "quiesce_lease_s", lambda _c: 0.5)
+
+    calls = 0
+
+    async def fake_unsettled(self: object) -> tuple[str, ...]:  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(1.6)
+            return ("fake/lane/entry-1",)
+        return ()
+
+    monkeypatch.setattr(
+        _drain_mod.UpgradeDrainGate, "unsettled_deliveries", fake_unsettled
+    )
+
+    async def go() -> None:
+        async with _gate(
+            names, upgrade_drain_timeout_s=10.0, upgrade_quiesce_ttl_s=20.0
+        ) as (gate, config, client):
+            key = config.upgrade_quiesce_key()
+            waiter = asyncio.create_task(gate.await_drained(poll_interval_s=0.05))
+            try:
+                await asyncio.sleep(0.8)
+                assert await client.exists(key), (
+                    "the marker lapsed mid-scan at ~0.8s despite a 0.5s lease"
+                )
+                await asyncio.sleep(0.6)
+                assert await client.exists(key), (
+                    "the marker lapsed mid-scan at ~1.4s despite a 0.5s lease"
+                )
+                outcome = await asyncio.wait_for(waiter, timeout=5.0)
+            finally:
+                waiter.cancel()
+                with contextlib.suppress(BaseException):
+                    await waiter
+            assert outcome.drained is True
+            hold = await client.pttl(key)
+            assert 19_000 <= hold <= 20_000, (
+                f"a clean drain did not extend the marker to the roll hold ({hold}ms)"
+            )
+
+    asyncio.run(go())
+
+
+def test_an_abandoned_gate_marker_expires_within_one_lease(
+    names, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: ANN001
+    """Hard kill: no cleanup code runs, so only the lease expiry can heal."""
+    monkeypatch.setattr(
+        _drain_mod, "quiesce_lease_s", lambda _c: _TINY_LEASE_S, raising=False
+    )
+
+    async def go() -> None:
+        async with _gate(
+            names, upgrade_drain_timeout_s=10.0, upgrade_quiesce_ttl_s=20.0
+        ) as (gate, config, client):
+            await _hold_live_delivery(client, config)
+            key = config.upgrade_quiesce_key()
+            waiter = asyncio.create_task(gate.await_drained(poll_interval_s=0.05))
+            await asyncio.sleep(0.2)
+            assert await client.exists(key)
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiter
+            await asyncio.sleep(_TINY_LEASE_S + 0.3)
+            assert not await client.exists(key), (
+                "an abandoned drain left the fleet paused past one lease"
+            )
+
+    asyncio.run(go())
+
+
+def test_sigterm_mid_wait_clears_the_marker_and_refuses(
+    names, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: ANN001
+    """Job deletion and activeDeadlineSeconds deliver SIGTERM: clear at once."""
+    monkeypatch.setattr(
+        _drain_mod, "quiesce_lease_s", lambda _c: 5.0, raising=False
+    )
+    # Guard: if run_gate installs no handler, SIGTERM must not kill pytest.
+    stray: list[int] = []
+    previous = signal.signal(signal.SIGTERM, lambda signum, _f: stray.append(signum))
+
+    async def go() -> None:
+        config = _config(
+            names, upgrade_drain_timeout_s=10.0, upgrade_quiesce_ttl_s=20.0
+        )
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        key = config.upgrade_quiesce_key()
+        try:
+            await _hold_live_delivery(client, config)
+            started = time.monotonic()
+            gate_task = asyncio.create_task(run_gate(config, mode="drain"))
+            for _ in range(100):
+                if await client.exists(key):
+                    break
+                await asyncio.sleep(0.02)
+            assert await client.exists(key), "the gate never wrote the marker"
+            os.kill(os.getpid(), signal.SIGTERM)
+            code = await asyncio.wait_for(gate_task, timeout=8.0)
+            elapsed = time.monotonic() - started
+            assert code == 1
+            assert elapsed < 5.0, (
+                f"SIGTERM did not stop the gate; it ran {elapsed:.1f}s to its timeout"
+            )
+            assert not await client.exists(key), "SIGTERM left the marker set"
+        finally:
+            await client.delete(key)
+            await client.aclose()
+
+    try:
+        asyncio.run(go())
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert stray == [], "run_gate installed no SIGTERM handler"
+
+
+def test_claim_status_reports_remaining_ttl_only_while_quiescing(
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # noqa: ANN001
+    config = _config(
+        names,
+        installation_id="install-ttl",
+        upgrade_revision=7,
+        upgrade_legacy_quiesce=False,
+    )
+    key = _scoped_quiesce_key(config, "install-ttl")
+
+    async def arrange(value: str | None) -> dict[str, object]:
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        try:
+            await client.delete(key)
+            gate = UpgradeDrainGate(client, config)
+            if value == "owned":
+                await gate.request_quiesce(ttl_s=120.0)
+            elif value is not None:
+                await client.set(key, value, ex=60)
+            return dict(await gate.claim_status())
+        finally:
+            await client.aclose()
+
+    try:
+        assert asyncio.run(arrange(None)) == {
+            "state": "claims_enabled",
+            "since": None,
+            "revision": None,
+        }
+        owned = asyncio.run(arrange("owned"))
+        ttl = owned.get("ttl_seconds")
+        assert isinstance(ttl, int) and not isinstance(ttl, bool), owned
+        assert 0 < ttl <= 120
+        assert owned["state"] == "quiescing" and owned["revision"] == 7
+
+        status, _err = _status_json(monkeypatch, capsys, config)
+        assert status["state"] == "quiescing"
+        assert "ttl_seconds" not in status
+
+        status, _err = _status_json(monkeypatch, capsys, config, with_ttl=True)
+        assert status["state"] == "quiescing"
+        assert isinstance(status.get("ttl_seconds"), int)
+        assert 0 < int(status["ttl_seconds"]) <= 120  # type: ignore[call-overload]
+
+        bad = asyncio.run(arrange("not-json"))
+        assert bad["state"] == "quiescing" and bad["since"] is None
+        assert isinstance(bad.get("ttl_seconds"), int)
+        assert 0 < int(bad["ttl_seconds"]) <= 60  # type: ignore[call-overload]
+    finally:
+        asyncio.run(arrange(None))

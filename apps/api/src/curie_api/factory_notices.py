@@ -3,7 +3,7 @@
 The status row is inserted with the request at admission; the terminus stages
 its cause and detail on it. This module creates the comment, edits it in place
 whenever its rendered body changes, finalizes it once the result is shown, and
-moves the ``curie:*`` state labels on the WorkItem's issue. There is no
+moves the ``curie-factory:*`` state labels on the WorkItem's issue. There is no
 separate final comment. A refused write never rewrites the execution request.
 
 An issue-originated request comments on its issue. A revision asked for from
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -88,12 +89,20 @@ _CAUSE_TEXT = {
         "the provider limit."
     ),
     "model_error": "the model provider returned an error the run could not recover from.",
-    "budget_exceeded": "the run used its whole token budget before it finished.",
+    "budget_exceeded": (
+        "the run reached its output token limit or USD cap before it finished. "
+        "To raise the USD cap, run `curie cluster budget <agent> --limit <usd>`, then retry."
+    ),
     "runner_timeout": "the run took longer than its time limit.",
     "workspace_error": "the repository workspace could not be prepared for the run.",
+    "history_capacity": (
+        "conversation history capacity exceeded. Work may have happened. "
+        "Inspect the result and retry."
+    ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
     "runner_failed": "the run ended without a result.",
-    "no_pull_request": "the run finished but did not open a pull request.",
+    "early_stop": "the agent stopped before doing any work on the issue.",
+    "no_pull_request": "the run ended without publishing a pull request.",
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "no runner capacity came free before the wait expired.",
     "owner_lost": "the worker running this request stopped responding.",
@@ -122,6 +131,10 @@ _CAUSE_TEXT = {
 
 # The CI gate's causes (#3097) carry their own labelled lines, not a provider message.
 _CI_DETAIL_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
+# A run that ended without publishing carries the agent's own last message
+# (#3128). That text is model-authored, so it renders inert inside a code fence.
+_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
+_BACKTICK_RUN = re.compile(r"`+")
 
 
 def cause_text(cause: str) -> str:
@@ -136,22 +149,34 @@ def marker_for(request_id: uuid.UUID) -> str:
 
 FINAL_MARKER = "<!-- curie-status:final -->"
 
-# The four state labels the pass owns (#3077). A closed set, never a prefix
-# match: human labels, including other ``curie:`` ones, are never touched.
-STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
+# The four state labels the pass owns (#3077, #3221). A closed set, never a
+# prefix match: human labels, including other ``curie:`` labels, are never
+# touched.
+STATE_LABELS = (
+    "curie-factory:queued",
+    "curie-factory:running",
+    "curie-factory:pr-open",
+    "curie-factory:needs-human",
+)
+LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
-    "waiting": "curie:queued",
-    "running": "curie:running",
-    "cancellation_requested": "curie:running",
-    "completed": "curie:pr-open",
-    "failed": "curie:needs-human",
-    "expired": "curie:needs-human",
-    # Cancelled clears all four; '' records that nothing is applied.
+    "waiting": "curie-factory:queued",
+    "running": "curie-factory:running",
+    "cancellation_requested": "curie-factory:running",
+    "completed": "curie-factory:pr-open",
+    "failed": "curie-factory:needs-human",
+    "expired": "curie-factory:needs-human",
+    # Cancelled clears the current four and the legacy four; '' records that nothing is applied.
     "cancelled": "",
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
 _WAITING_FOR_PROGRESS = "_Waiting for the agent to report progress._"
 _MARKDOWN_SPECIAL = set("\\`*_[]()#<>!|")
+# #3127 AC2: queued work isn't stuck, it's waiting out an upgrade.
+_PAUSED_FOR_UPGRADE_LINE = (
+    "Paused: this Curie installation is paused for an upgrade. "
+    "Queued work starts when the upgrade finishes."
+)
 
 
 def desired_label(status: str) -> str:
@@ -195,13 +220,29 @@ def result_section(
         )
     else:
         text = f"Could not complete: {cause_text(cause)}\n"
-        if detail is not None and detail.strip():
+        if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
+            text += _agent_message_block(detail.strip())
+        elif cause != "history_capacity" and detail is not None and detail.strip():
             label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
     return text
+
+
+def _agent_message_block(message: str) -> str:
+    """The agent's last message, fenced so GitHub renders none of it.
+
+    The fence is longer than any backtick run in the message, so the message
+    cannot close it and spoof the ``Cause:`` line. HTML comment openers are
+    broken because the marker scan reads the raw body.
+    """
+
+    message = message.replace("<!--", "<\u200b!--")
+    longest = max((len(run) for run in _BACKTICK_RUN.findall(message)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"
 
 
 def _escape_markdown(value: str) -> str:
@@ -233,11 +274,14 @@ def status_body(
     pill_label: str,
     phase_view: PhaseView | None,
     result: str | None,
+    paused_for_upgrade: bool = False,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
     Model-written notes are never rendered here, only on the card, so model
-    text cannot become a Markdown link or a mention on GitHub.
+    text cannot become a Markdown link or a mention on GitHub. The card already
+    draws the phases, so with a card the checklist and the waiting placeholder
+    are left out; without one the checklist is the fallback (#3125).
     """
 
     parts: list[str] = []
@@ -245,11 +289,13 @@ def status_body(
         parts.append(result.rstrip("\n"))
     if card_url:
         parts.append(f"![Curie status]({card_url})")
-    if phase_view is not None and phase_view.phases:
+    elif phase_view is not None and phase_view.phases:
         parts.append("\n".join(_checklist(phase_view)))
     elif result is None:
         parts.append(_WAITING_FOR_PROGRESS)
     parts.append(f"Status: {pill_label}")
+    if paused_for_upgrade and pill_label == "QUEUED":
+        parts.append(_PAUSED_FOR_UPGRADE_LINE)
     if result is not None:
         parts.append(FINAL_MARKER)
     parts.append(marker_for(request_id))
@@ -271,7 +317,11 @@ def _desired_label_sql() -> Any:
 
 
 async def sync_status_comments(
-    session: AsyncSession, settings: Settings, *, limit: int = 20
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    limit: int = 20,
+    paused_for_upgrade: bool = False,
 ) -> int:
     """Create, edit, finalize and label every due status comment this pass can lock.
 
@@ -337,6 +387,7 @@ async def sync_status_comments(
                 request,
                 pr_url=pr_url,
                 latest=bool(latest),
+                paused_for_upgrade=paused_for_upgrade,
             )
             row.attempts += 1
     await session.commit()
@@ -361,6 +412,7 @@ async def _sync_one(
     *,
     pr_url: str | None,
     latest: bool,
+    paused_for_upgrade: bool = False,
 ) -> int:
     assert request.objective is not None
     target = parse_reply_target(
@@ -389,7 +441,15 @@ async def _sync_one(
     writes = 0
     if row.finalized_at is None:
         writes += await _sync_comment(
-            session, github, settings, row, work_item, request, target, pr_url=pr_url
+            session,
+            github,
+            settings,
+            row,
+            work_item,
+            request,
+            target,
+            pr_url=pr_url,
+            paused_for_upgrade=paused_for_upgrade,
         )
     if latest and row.refused_at is None:
         writes += await _sync_labels(github, row, work_item, request.status)
@@ -406,10 +466,20 @@ async def _sync_comment(
     target: ReplyTarget,
     *,
     pr_url: str | None,
+    paused_for_upgrade: bool = False,
 ) -> int:
     if row.subject_title is None:
         row.subject_title = await _subject_title(github, work_item, target)
-    body = await _render(session, settings, row, work_item, request, target, pr_url=pr_url)
+    body = await _render(
+        session,
+        settings,
+        row,
+        work_item,
+        request,
+        target,
+        pr_url=pr_url,
+        paused_for_upgrade=paused_for_upgrade,
+    )
     terminal = FINAL_MARKER in body
     writes = 0
     if row.comment_id is None:
@@ -466,6 +536,7 @@ async def _render(
     target: ReplyTarget,
     *,
     pr_url: str | None,
+    paused_for_upgrade: bool = False,
 ) -> str:
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
@@ -513,6 +584,7 @@ async def _render(
         pill_label=pill_label,
         phase_view=view,
         result=result,
+        paused_for_upgrade=paused_for_upgrade,
     )
 
 
@@ -556,7 +628,7 @@ async def _subject_title(github: _GitHub, work_item: WorkItem, target: ReplyTarg
 async def _sync_labels(
     github: _GitHub, row: FactoryStatusComment, work_item: WorkItem, status: str
 ) -> int:
-    """Add the desired state label and remove the other three, on the issue.
+    """Add the desired state label and remove the others, on the issue.
 
     Only the four state labels are ever written. A refused write is logged and
     given up; any other failure is retried next pass.
@@ -588,7 +660,9 @@ async def _sync_labels(
             )
         elif added.status_code not in {200, 201}:
             return writes
-    for name in STATE_LABELS:
+    # Legacy deletes stay unconditional. A new request starts with
+    # applied_label NULL, and the issue may still carry a legacy name.
+    for name in (*STATE_LABELS, *LEGACY_STATE_LABELS):
         if name == desired:
             continue
         try:

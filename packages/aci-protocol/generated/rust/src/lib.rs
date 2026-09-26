@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.2";
+pub const PROTOCOL_VERSION: &str = "0.5.3";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -351,6 +351,25 @@ pub struct ApprovalRequest {
     pub expires_in_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PublicationContext {
+    pub agent_id: String,
+    pub deployment_id: String,
+    pub work_item_id: String,
+    pub execution_request_id: String,
+    pub runtime_epoch: i64,
+    pub conversation_id: String,
+    pub lineage_id: String,
+    pub lineage_version: i64,
+    pub expected_head: String,
+    pub queued_event_id: String,
+    pub precheck_url: String,
+    pub capability: String,
+    pub observed_title: String,
+    pub observed_body_sha256: String,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum InboundMessage {
@@ -364,6 +383,8 @@ pub enum InboundMessage {
         session_id: Option<String>,
         #[serde(default)]
         history_ref: Option<String>,
+        #[serde(default)]
+        publication_context: Option<PublicationContext>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -488,6 +509,7 @@ mod tests {
             ts: "1.0".to_string(),
             session_id: None,
             history_ref: None,
+            publication_context: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
@@ -526,13 +548,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.3","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.4","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.2","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.3","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

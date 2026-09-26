@@ -277,12 +277,27 @@ class ConnectorSpec(BaseModel):
         return self.image is not None or self.build is not None
 
 
+class RunnerSpec(BaseModel):
+    """The bundle's own runner layer, built on the platform runner (ADR 0173).
+
+    Source only: the bundle declares where the layer is built from and
+    ``curie build`` records what it built to in ``connectors.lock.yaml``, so no
+    ``image:`` key exists here to be silently preferred over the lock.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    build: ConnectorBuild
+
+
 class ConnectorsFile(BaseModel):
     """The parsed ``connectors.yaml``."""
 
     model_config = ConfigDict(extra="forbid")
 
     connectors: dict[str, ConnectorSpec] = Field(default_factory=dict)
+    # Optional: every bundle that declares none keeps the platform runner.
+    runner: RunnerSpec | None = None
 
 
 _NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
@@ -777,5 +792,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                 errors.append(
                     ("connectors.bad_env_name", f"{where}: `{key}` is not a valid env var name")
                 )
+
+    if parsed.runner is not None:
+        _validate_build("runner", parsed.runner.build, errors)
 
     return (parsed if not errors else None), errors

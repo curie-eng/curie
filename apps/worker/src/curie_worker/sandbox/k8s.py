@@ -490,6 +490,28 @@ class KubernetesSandboxClient:
             status_used=getattr(status, "used", None),
         )
 
+    def pod_unschedulable(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> str | None:
+        try:
+            pod = self._core_api.read_namespaced_pod(
+                name,
+                self._namespace,
+                _request_timeout=request_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001 - unknown pod state keeps the claim timeout
+            return None
+        status = getattr(pod, "status", None)
+        for condition in getattr(status, "conditions", None) or []:
+            if (
+                getattr(condition, "type", None) == "PodScheduled"
+                and getattr(condition, "status", None) == "False"
+                and getattr(condition, "reason", None) == "Unschedulable"
+            ):
+                message = getattr(condition, "message", None)
+                return message if isinstance(message, str) and message else "Unschedulable"
+        return None
+
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         self._api.patch_namespaced_custom_object(
             CORE_GROUP,
