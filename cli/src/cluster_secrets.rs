@@ -254,9 +254,10 @@ fn helm_values_command(common: &CommonOpts) -> OpsCommand {
 /// Read the release's supplied values and judge whether binding `secrets`
 /// for `agent` changes anything. A values read that fails or does not parse
 /// cannot prove the bind is a no-op, so every name counts as changed and the
-/// caller upgrades exactly as it did before this check existed. A locked
-/// runner image likewise counts as changed; with none locked, a failed read
-/// shows no earlier value, so nothing is cleared.
+/// caller upgrades exactly as it did before this check existed. The runner
+/// image counts as changed too: with none locked, an unread release could
+/// still hold an earlier image, and a `null` override of an absent key is
+/// harmless, so the clear is sent rather than silently skipped.
 pub async fn read_bind_need(
     common: &CommonOpts,
     agent: &str,
@@ -279,10 +280,9 @@ pub async fn read_bind_need(
     };
     Ok(match parsed {
         Some(values) => bind_need(&values, agent, secrets, runner_image),
-        None if desires_nothing => BindNeed::Current,
         None => BindNeed::Changed {
             secrets: secrets.keys().cloned().collect(),
-            runner_image: runner_image.is_some(),
+            runner_image: true,
         },
     })
 }
@@ -917,18 +917,30 @@ esac
     }
 
     #[tokio::test]
-    async fn failed_values_read_with_no_runner_and_no_secrets_does_nothing() {
+    async fn failed_values_read_with_no_runner_still_clears_the_runner_image() {
         let _env = crate::PROCESS_ENV_LOCK.lock().await;
         let helm = StubbedHelm::install(&serde_json::json!({}));
         // `cat` of a missing file fails, so `helm get values` exits non-zero.
+        // An unread release could still hold an earlier image (AC2), so the
+        // clear is sent rather than assumed unnecessary.
         std::fs::remove_file(helm.dir.path().join("values.json")).unwrap();
         let need = bind_if_changed(common(), "acme-a".into(), BTreeMap::new(), None, async {
-            panic!("a no-op bind must not resolve a chart")
+            Ok("charts/curie".to_string())
         })
         .await
         .unwrap();
-        assert_eq!(need, BindNeed::Current);
-        assert_eq!(helm.helm_log(), "");
-        assert_eq!(helm.kubectl_log(), None);
+        assert_eq!(
+            need,
+            BindNeed::Changed {
+                secrets: Vec::new(),
+                runner_image: true
+            }
+        );
+        assert!(
+            helm.helm_log()
+                .contains("agentSandbox.runnerImages.acme-a=null"),
+            "{}",
+            helm.helm_log()
+        );
     }
 }
