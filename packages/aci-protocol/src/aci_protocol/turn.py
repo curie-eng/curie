@@ -130,18 +130,17 @@ def slack_speaking_identity(kind: str, adapter: str | None, endpoint: str | None
 
 
 class RouteRow(Protocol):
-    """The four columns ``matching_routes`` reads off a candidate row.
+    """The three columns ``matching_routes`` reads off a candidate row.
 
     Structural on purpose: an ORM row (`apps/api`'s ``AgentChannel``), a raw
     SQLAlchemy ``Row`` from a labeled SELECT, or any other object exposing
-    these four attributes satisfies it, so the one matching rule can run over
+    these three attributes satisfies it, so the one matching rule can run over
     whichever shape its caller already holds.
     """
 
     kind: str
     address: str
     adapter: str | None
-    endpoint: str | None
 
 
 def matching_routes[R: RouteRow](
@@ -158,10 +157,9 @@ def matching_routes[R: RouteRow](
     For Slack, ``adapter`` names an IDENTITY and the match is on the RESOLVED
     identity (``route_identity``), never the raw column, so an omitted
     adapter means 'default'. For any other kind, an omitted adapter selects
-    every row on ``(kind, address)`` -- migration 0023's pair constraint holds
-    that to one row until the contract migration for ADR-0168 decision 3
-    (#3100), so a caller narrowing to one row sees at most one, and a
-    non-Slack ``adapter=other`` selects none.
+    every row on ``(kind, address)`` -- the triple key (migration 0061) lets
+    several routes share a pair, and a caller that needs one row narrows
+    further -- and a non-Slack ``adapter=other`` selects none.
     """
 
     if kind == SLACK_KIND and adapter == CLUSTER_MESSAGE_ADAPTER:
@@ -170,22 +168,11 @@ def matching_routes[R: RouteRow](
         adapter = None
     wanted = route_identity(kind, adapter)
     same_route = [r for r in rows if r.kind == kind and r.address == address]
-    matches = [
+    return [
         r
         for r in same_route
         if (adapter is None and kind != SLACK_KIND) or route_identity(r.kind, r.adapter) == wanted
     ]
-    if not matches and kind == SLACK_KIND and adapter is None:
-        # The pre-ADR custom-transport Slack binding (e.g. the offline
-        # hook-approval proof rig) stores a
-        # CREDENTIAL slug in `adapter`, not an identity, so it never matches
-        # the 'default' identity above. Its old callers never send `adapter`
-        # either, so the omitted-adapter selector falls back to the one row
-        # on this pair that carries an endpoint. Retired by the contract
-        # migration for ADR-0168 decision 3 (#3100), which refuses a Slack
-        # endpoint outright.
-        matches = [r for r in same_route if r.endpoint is not None]
-    return matches
 
 
 class ReplyHandle(_AciModel):
