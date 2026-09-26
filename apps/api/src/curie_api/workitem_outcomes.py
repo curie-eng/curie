@@ -354,8 +354,7 @@ def _pick_lineage(
     item: WorkItem, lineages: Iterable[ThreadPublicationLineage]
 ) -> ThreadPublicationLineage | None:
     """The linked lineage when set; otherwise the conversation's lineage for the
-    same agent and repository, open first, then newest (D2: nothing links
-    ``publication_lineage_id`` in production yet)."""
+    same agent and repository, open first, then newest for older unlinked rows."""
 
     candidates = list(lineages)
     if item.publication_lineage_id is not None:
