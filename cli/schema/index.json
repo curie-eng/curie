@@ -310,6 +310,12 @@
       "version": "2.0"
     },
     {
+      "result": "HookFireOutput",
+      "kind": "CliOutput",
+      "schema": "hook-fire.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "VersionsOutput",
       "kind": "CliOutput",
       "schema": "versions.schema.json",

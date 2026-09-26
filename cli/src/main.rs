@@ -1614,6 +1614,12 @@ enum SkillAction {
         #[command(flatten)]
         sampling: EvalSamplingArgs,
     },
+    /// Run a declared cron hook against the local runner, or report that a
+    /// durable schedule or record is unavailable at this tier (ADR-0099).
+    Hook {
+        #[command(subcommand)]
+        action: SkillHookAction,
+    },
     /// Interview to generate a starter `evals/cases.json` (guided eval generation).
     EvalInit {
         /// Where to write the suite (default: evals/cases.json).
@@ -1622,6 +1628,71 @@ enum SkillAction {
         /// Overwrite an existing suite file instead of refusing.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillHookAction {
+    /// Run the named cron hook now against the local runner. No durable record.
+    Fire {
+        /// Trigger name from `.claude-plugin/plugin.json`.
+        name: String,
+        /// Plugin bundle directory.
+        #[arg(long, default_value = ".")]
+        plugin_dir: PathBuf,
+        /// Runner base URL. Default: the URL recorded by `skill up`.
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Not available at this tier: there is no scheduler.
+    Schedule,
+    /// Not available at this tier: there is no hook run record.
+    Record,
+}
+
+/// Subcommands of `curie local hook`.
+#[derive(Subcommand)]
+enum LocalHookAction {
+    /// Run one cron hook now, bypassing its schedule, and print the run record.
+    Fire {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// How long to wait for the turn to settle, in seconds.
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Subcommands of `curie cluster hook`.
+#[derive(Subcommand)]
+enum ClusterHookAction {
+    /// Run one cron hook now, bypassing its schedule, and print the run record.
+    Fire {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// How long to wait for the turn to settle, in seconds.
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -2321,6 +2392,11 @@ enum LocalAction {
         /// Print what would be requested and exit without making a request.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    Hook {
+        #[command(subcommand)]
+        action: LocalHookAction,
     },
     /// Delete an agent via the local platform API.
     Delete {
@@ -3230,6 +3306,11 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    Hook {
+        #[command(subcommand)]
+        action: ClusterHookAction,
+    },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
         #[command(flatten)]
@@ -3321,6 +3402,20 @@ impl ClusterTargetSources {
         let Some((_, action_matches)) = cluster_matches.subcommand() else {
             return Self::default();
         };
+        // `cluster hook fire` carries namespace on the leaf, not on `hook`.
+        let action_matches = match action_matches.subcommand() {
+            Some(("fire", fire_matches))
+                if action_matches
+                    .try_get_one::<String>("namespace")
+                    .ok()
+                    .flatten()
+                    .is_none()
+                    && fire_matches.try_get_one::<String>("namespace").is_ok() =>
+            {
+                fire_matches
+            }
+            _ => action_matches,
+        };
         Self {
             namespace_supplied: matches!(
                 action_matches.value_source("namespace"),
@@ -3389,6 +3484,11 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::Delete { conn, .. } => {
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
+        ClusterAction::Hook { action } => match action {
+            ClusterHookAction::Fire { conn, .. } => {
+                (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
+            }
+        },
         ClusterAction::Versions { target }
         | ClusterAction::Memory { target, .. }
         | ClusterAction::Approvals { target, .. } => (
@@ -3489,6 +3589,12 @@ fn retarget_cluster_action(
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);
         }
+        ClusterAction::Hook { action } => match action {
+            ClusterHookAction::Fire { conn, .. } => {
+                replace(&mut conn.namespace, &namespace);
+                replace(&mut conn.release, &release);
+            }
+        },
         ClusterAction::Versions { target }
         | ClusterAction::Memory { target, .. }
         | ClusterAction::Approvals { target, .. } => {
@@ -4294,6 +4400,24 @@ async fn run(command: Option<Command>) -> Result<()> {
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
             SkillAction::WorkItems { .. } => Err(commands::skill_work_items_unavailable()),
             SkillAction::Schedules { .. } => Err(commands::skill_schedules_unavailable()),
+            SkillAction::Hook { action } => match action {
+                SkillHookAction::Schedule => {
+                    Err(commands::skill_hook_record_unavailable("schedule"))
+                }
+                SkillHookAction::Record => Err(commands::skill_hook_record_unavailable("record")),
+                SkillHookAction::Fire {
+                    name,
+                    plugin_dir,
+                    url,
+                } => {
+                    let classified_failure =
+                        commands::skill_hook_fire(&plugin_dir, &name, url).await?;
+                    if classified_failure {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
+            },
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
@@ -4650,6 +4774,27 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?,
             ),
+            LocalAction::Hook { action } => {
+                let LocalHookAction::Fire {
+                    agent,
+                    name,
+                    wait_secs,
+                    api_url,
+                    api_key,
+                    dry_run,
+                } = action;
+                emit(
+                    commands::hook_fire(commands::HookFireOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        dry_run,
+                        wait_secs,
+                    })
+                    .await?,
+                )
+            }
             LocalAction::Memory { target, add } => match add {
                 None => emit(commands::memory(target.into()).await?),
                 Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
@@ -6049,6 +6194,28 @@ async fn run(command: Option<Command>) -> Result<()> {
                         pause,
                         resume,
                         dry_run,
+                    })
+                    .await?,
+                )
+            }
+            ClusterAction::Hook { action } => {
+                let ClusterHookAction::Fire {
+                    agent,
+                    name,
+                    wait_secs,
+                    conn,
+                    dry_run,
+                } = action;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::hook_fire(commands::HookFireOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        dry_run,
+                        wait_secs,
                     })
                     .await?,
                 )

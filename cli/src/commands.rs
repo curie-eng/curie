@@ -8783,6 +8783,120 @@ pub fn skill_schedules_unavailable() -> anyhow::Error {
     crate::exit::unsupported("schedules", SCHEDULES_REASON, SCHEDULES_ALT)
 }
 
+/// Why `skill hook schedule` and `skill hook record` cannot be answered here.
+pub const HOOK_RECORD_REASON: &str =
+    "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
+/// Where a durable hook record lives instead.
+pub const HOOK_RECORD_ALT: &str =
+    "use `curie local hook fire` or `curie cluster hook fire`, which print the run record";
+
+/// `skill hook schedule` and `skill hook record` (ADR-0099, #2932).
+pub fn skill_hook_record_unavailable(verb: &str) -> anyhow::Error {
+    crate::exit::unsupported(verb, HOOK_RECORD_REASON, HOOK_RECORD_ALT)
+}
+
+/// The prompt of one cron hook declared in `.claude-plugin/plugin.json`.
+pub fn hook_prompt(plugin_dir: &Path, name: &str) -> Result<String> {
+    let path = plugin_dir.join(".claude-plugin/plugin.json");
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).context("parsing plugin.json")?;
+    let triggers = value
+        .get("triggers")
+        .and_then(|item| item.as_array())
+        .context("plugin.json has no triggers array")?;
+    for trigger in triggers {
+        if trigger.get("type").and_then(|item| item.as_str()) != Some("cron") {
+            continue;
+        }
+        if trigger.get("name").and_then(|item| item.as_str()) != Some(name) {
+            continue;
+        }
+        let prompt = trigger
+            .get("prompt")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .context("cron hook has no prompt")?;
+        return Ok(prompt.to_string());
+    }
+    bail!("no cron hook named {name}")
+}
+
+/// `skill hook fire`: run the named hook against the local runner. No run row.
+pub async fn skill_hook_fire(plugin_dir: &Path, name: &str, url: Option<String>) -> Result<bool> {
+    let prompt = hook_prompt(plugin_dir, name)?;
+    send(&prompt, "hook", SendType::Job.into(), url, false).await
+}
+
+/// Inputs for `<tier> hook fire`.
+pub struct HookFireOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: String,
+    pub name: String,
+    pub dry_run: bool,
+    pub wait_secs: u64,
+}
+
+/// Output of `<tier> hook fire`.
+pub enum HookFireOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Record(crate::api::HookFireRecord),
+}
+
+impl crate::ui::CliOutput for HookFireOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            HookFireOutput::DryRun(plan) => plan.to_json(),
+            HookFireOutput::Record(record) => serde_json::to_value(record).unwrap_or_default(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            HookFireOutput::DryRun(plan) => plan.render(ui),
+            HookFireOutput::Record(record) => {
+                let outcome = record.outcome.as_deref().unwrap_or("-");
+                ui.payload(&format!(
+                    "{} {} {} {} {}",
+                    record.agent, record.name, record.slot_utc, outcome, record.id
+                ));
+            }
+        }
+    }
+}
+
+fn hook_fire_path(agent: &str, name: &str) -> String {
+    format!("/agents/{agent}/hooks/{name}/fire")
+}
+
+/// `<tier> hook fire`: run the hook now and print the record once it settles.
+pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
+    let path = hook_fire_path(&opts.agent, &opts.name);
+    if opts.dry_run {
+        return Ok(HookFireOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!("POST {}{path}", opts.api_url.trim_end_matches('/'))],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let mut record = client.fire_hook(&opts.agent, &opts.name).await?;
+    let deadline = Instant::now() + Duration::from_secs(opts.wait_secs);
+    while record.outcome.is_none() {
+        if Instant::now() >= deadline {
+            return Err(crate::exit::transient(format!(
+                "hook {} did not settle within {}s; run {}",
+                opts.name, opts.wait_secs, record.id
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        record = client
+            .get_hook_run(&opts.agent, &opts.name, &record.id)
+            .await?;
+    }
+    Ok(HookFireOutput::Record(record))
+}
+
 /// Inputs for `<tier> schedules [--agent NAME_OR_ID]`.
 pub struct SchedulesOpts {
     pub api_url: String,

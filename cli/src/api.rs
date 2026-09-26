@@ -567,6 +567,20 @@ pub struct ScheduleList {
     pub schedules: Vec<AgentSchedules>,
 }
 
+/// One test-fire run record (`HookFireOut`, #2932).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct HookFireRecord {
+    pub id: String,
+    pub agent_id: String,
+    pub agent: String,
+    pub name: String,
+    pub trigger: String,
+    pub slot_utc: String,
+    pub outcome: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+
 /// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MemoryProvenance {
@@ -2964,6 +2978,51 @@ impl ApiClient {
             .json()
             .await
             .context("decoding schedule control")
+    }
+
+    /// Start a hook now: `POST /agents/{agent}/hooks/{name}/fire`.
+    pub async fn fire_hook(&self, agent: &str, name: &str) -> Result<HookFireRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent}/hooks/{name}/fire",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "POST /agents/{agent}/hooks/{name}/fire",
+            )
+            .await?;
+        Self::expect_ok(resp, "firing hook")
+            .await?
+            .json()
+            .await
+            .context("decoding hook fire")
+    }
+
+    /// Read one hook run: `GET /agents/{agent}/hooks/{name}/runs/{id}`.
+    pub async fn get_hook_run(
+        &self,
+        agent: &str,
+        name: &str,
+        run_id: &str,
+    ) -> Result<HookFireRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent}/hooks/{name}/runs/{run_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{agent}/hooks/{name}/runs/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading hook run")
+            .await?
+            .json()
+            .await
+            .context("decoding hook run")
     }
 
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.
