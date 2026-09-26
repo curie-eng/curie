@@ -93,8 +93,17 @@ than an open bag of `gen_ai.*` names.
   background-loop, eval work, transcript-capacity, and supervised-task restarts. `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
-  operation classes and outcomes, not event, run, session, sandbox, user, agent, or
-  deployment identifiers, so the application-defined series space remains bounded.
+  operation classes and outcomes, not event, run, session, sandbox, user, or
+  deployment identifiers. The one exception is `curie.agent.turn.completed`, whose
+  `agent` label admits at most 32 distinct slugs per process and folds the rest,
+  plus any name that is not a 1 to 63 character slug, into `other`
+  (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
+  Admission is first-come and resets when the process restarts, so the same slug
+  can be named on one worker and counted as `other` on another. A rising
+  `agent="other"` series means the ceiling or the slug rule is hiding a name.
+  `unbound` is only a turn that never resolved an agent. A real agent named
+  `other` or `unbound` shares `other`. Every other instrument refuses an
+  agent identifier. The application-defined series space remains bounded.
   Standard resource identity still contributes one anonymous `service.instance.id` per
   running process. It is independent of turn input and adds at most one resource series
   per live or restarted process, never one per event, session, user, or sandbox. The
