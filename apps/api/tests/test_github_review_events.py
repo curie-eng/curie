@@ -732,6 +732,9 @@ def _review_stack(
             stream,
             f"{stream}:dead",
             f"curie:github-review:{truth.feedback.event_id}",
+            "curie:github-review:held",
+            f"curie:github-review:held:{truth.feedback.event_id}",
+            f"curie:github-review:held:{truth.feedback.event_id}:deliveries",
         )
         client = owned.enter_context(TestClient(create_app()))
         real_client = httpx.Client
@@ -742,6 +745,8 @@ def _review_stack(
         external = httpx.AsyncClient(transport=httpx.MockTransport(truth.handle))
         owned.callback(client.portal.call, external.aclose)
         client.app.state.http_client = external
+        # Held feedback replays through the reconciler's own client (#2962).
+        client.app.state.github_review_reconciler._client = external
         auth = {"X-API-Key": get_settings().api_key}
         agent = client.post(
             "/agents",
@@ -1745,7 +1750,10 @@ def test_real_enqueue_refusal_backs_off_then_recovers_without_second_quota(revie
             engine = create_async_engine(get_settings().database_url, pool_size=1, max_overflow=0)
             try:
                 contender = GitHubReviewReconciler(
-                    async_sessionmaker(engine, expire_on_commit=False), restricted, get_settings()
+                    async_sessionmaker(engine, expire_on_commit=False),
+                    restricted,
+                    get_settings(),
+                    client.app.state.http_client,
                 )
                 return await asyncio.gather(*(contender.reconcile_once() for _ in range(4)))
             finally:
@@ -2645,7 +2653,7 @@ def test_review_graveyard_cursor_survives_restart_and_never_treats_absence_as_te
     ]
     assert cursor == valkey.xrange(dead, count=128)[-1][0]
     restarted = GitHubReviewReconciler(
-        reconciler._sessionmaker, reconciler._valkey, reconciler._settings
+        reconciler._sessionmaker, reconciler._valkey, reconciler._settings, reconciler._client
     )
     if not trim:
         assert client.portal.call(restarted.reconcile_terminal) == 1
@@ -2763,7 +2771,7 @@ def test_concurrent_review_observers_settle_once_and_malformed_match_keeps_curso
 
     async def competing():
         observers = [GitHubReviewReconciler(
-            reconciler._sessionmaker, reconciler._valkey, reconciler._settings
+            reconciler._sessionmaker, reconciler._valkey, reconciler._settings, reconciler._client
         ) for _ in range(4)]
         return await asyncio.gather(*(observer.reconcile_terminal() for observer in observers))
 
@@ -2820,3 +2828,143 @@ def test_review_terminal_observer_never_cancels_consumed_publication_or_reuses_a
     assert review_rows("SELECT status FROM curie.approvals WHERE id=:id", {
         "id": publication.json()["approval_id"]
     }) == [{"status": "pending"}]
+
+
+HELD_INDEX = "curie:github-review:held"
+SECOND_DELIVERY = str(uuid.UUID(int=3))
+
+
+def _identity_pending_review(client: TestClient, truth: GitHubTruth, valkey, stream: str):
+    """Deliver a review while the PR exists on GitHub but the lineage lacks identity (#2962)."""
+    valkey.delete(stream)  # Only the fixture's approval-resume input; no review yet.
+    assert review_rows(
+        "SELECT github_repository_id, pr_number, binding_id IS NOT NULL AS bound "
+        "FROM curie.thread_publication_lineages"
+    ) == [{"github_repository_id": None, "pr_number": None, "bound": True}]
+    return post_review(client, truth)
+
+
+def test_review_before_lineage_identity_is_held_then_admitted_when_identity_lands(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    held = _identity_pending_review(client, truth, valkey, stream)
+    assert held.status_code == 200, held.text
+    assert held.json()["status"] == "feedback_held"
+    assert review_rows("SELECT event_id FROM curie.github_review_feedback") == []
+    assert review_rows(
+        "SELECT status, reason, event_id FROM curie.github_review_deliveries"
+    ) == [{"status": "retryable", "reason": "lineage_identity_pending", "event_id": None}]
+    assert valkey.zrange(HELD_INDEX, 0, -1) == [truth.feedback.event_id]
+    stored = [json.loads(valkey.get(f"{HELD_INDEX}:{truth.feedback.event_id}"))]
+    assert valkey.smembers(f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries") == {DELIVERY}
+    assert 0 < valkey.ttl(f"{HELD_INDEX}:{truth.feedback.event_id}") <= 1800
+    # Only the normalized feedback is retained, never the raw webhook body.
+    from dataclasses import fields
+
+    from curie_api.github_review_events import UnverifiedFeedback
+
+    assert set(stored[0]["feedback"]) == {f.name for f in fields(UnverifiedFeedback)}
+    assert stored[0]["feedback"]["pr_number"] == 17
+    again = post_review(client, truth)
+    assert again.json()["status"] == "feedback_held"
+    # A second delivery header for the same comment joins the one hold.
+    second = post_review(client, truth, delivery=SECOND_DELIVERY)
+    assert second.json()["status"] == "feedback_held"
+    assert valkey.zrange(HELD_INDEX, 0, -1) == [truth.feedback.event_id]
+    assert valkey.smembers(f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries") == {
+        DELIVERY,
+        SECOND_DELIVERY,
+    }
+
+    valkey.delete(stream)
+    publish_through_worker(client, pr_number=17)
+
+    assert valkey.zrange(HELD_INDEX, 0, -1) == []
+    assert review_rows(
+        "SELECT event_id, status FROM curie.github_review_feedback"
+    ) == [{"event_id": truth.feedback.event_id, "status": "queued"}]
+    assert review_rows(
+        "SELECT status, reason, event_id FROM curie.github_review_deliveries "
+        "ORDER BY delivery_id"
+    ) == [{"status": "accepted", "reason": None, "event_id": truth.feedback.event_id}] * 2
+    assert valkey.exists(f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries") == 0
+    turns = [json.loads(fields["payload"]) for _, fields in valkey.xrange(stream)]
+    assert [t["event_id"] for t in turns if t["event_id"] == truth.feedback.event_id] == [
+        truth.feedback.event_id
+    ]
+
+
+def test_review_for_an_unknown_pr_is_still_rejected_not_held(review_stack) -> None:
+    client, truth, valkey, stream = review_stack
+    # Identity is recorded for PR 17; no lineage is pending identity.
+    review_rows("UPDATE curie.thread_publication_lineages SET status='closed'")
+    response = post_review(client, truth)
+    assert response.status_code == 200, response.text
+    assert response.json()["errors"] == [{"code": "lineage_absent_or_ambiguous"}]
+    assert valkey.zrange(HELD_INDEX, 0, -1) == []
+    assert review_rows("SELECT status FROM curie.github_review_deliveries") == [
+        {"status": "rejected"}
+    ]
+
+
+def test_review_for_a_long_running_publication_is_still_held(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    # A publication may take longer than the hold window before its PR exists;
+    # the lineage's age must not turn the pending state into a refusal.
+    review_rows(
+        "UPDATE curie.thread_publication_lineages "
+        "SET created_at = created_at - interval '1 day', "
+        "updated_at = updated_at - interval '1 day'"
+    )
+    response = _identity_pending_review(client, truth, valkey, stream)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "feedback_held"
+    assert valkey.zrange(HELD_INDEX, 0, -1) == [truth.feedback.event_id]
+
+
+def test_held_review_whose_hold_expires_is_rejected_by_the_reconciler(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    held = _identity_pending_review(client, truth, valkey, stream)
+    assert held.json()["status"] == "feedback_held"
+    assert post_review(client, truth, delivery=SECOND_DELIVERY).json()["status"] == (
+        "feedback_held"
+    )
+    key = f"{HELD_INDEX}:{truth.feedback.event_id}"
+    record = json.loads(valkey.get(key))
+    record["held_at"] -= 86400
+    valkey.set(key, json.dumps(record), keepttl=True)
+    valkey.zadd(HELD_INDEX, {truth.feedback.event_id: 0})
+    client.portal.call(client.app.state.github_review_reconciler.reconcile_once)
+    assert valkey.get(key) is None
+    assert valkey.zrange(HELD_INDEX, 0, -1) == []
+    assert review_rows("SELECT event_id FROM curie.github_review_feedback") == []
+    assert review_rows(
+        "SELECT status, reason FROM curie.github_review_deliveries"
+    ) == [{"status": "rejected", "reason": "lineage_absent_or_ambiguous"}] * 2
+
+
+def test_receipt_of_a_lost_hold_is_rejected_not_left_retryable(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    held = _identity_pending_review(client, truth, valkey, stream)
+    assert held.json()["status"] == "feedback_held"
+    # The key expired (or Valkey lost it) while the index entry and the SQL
+    # receipt remain; the receipt is older than the key's maximum lifetime.
+    valkey.delete(
+        f"{HELD_INDEX}:{truth.feedback.event_id}",
+        f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries",
+    )
+    review_rows(
+        "UPDATE curie.github_review_deliveries SET created_at = created_at - interval '1 day'"
+    )
+    client.portal.call(client.app.state.github_review_reconciler.reconcile_once)
+    assert valkey.zrange(HELD_INDEX, 0, -1) == []
+    assert review_rows(
+        "SELECT status, reason FROM curie.github_review_deliveries"
+    ) == [{"status": "rejected", "reason": "lineage_absent_or_ambiguous"}]

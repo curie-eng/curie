@@ -5,6 +5,7 @@ GitHub side effects belong to the trusted worker publication reconciler.
 """
 
 import asyncio
+import logging
 import re
 import time
 import uuid
@@ -55,6 +56,8 @@ from ..schemas import (
 )
 from ..workspace_policy import credential_mode, repository_is_allowed
 from .publication_precheck import precheck_error
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/publications",
@@ -501,7 +504,33 @@ async def advance_publication_lineage(
             status.HTTP_409_CONFLICT,
             {"code": exc.code, "message": exc.message},
         ) from exc
+    await _replay_held_review_feedback(request, lineage)
     return await _publication_lineage_out(session, lineage)
+
+
+async def _replay_held_review_feedback(
+    request: Request, lineage: ThreadPublicationLineage
+) -> None:
+    """Admit review feedback held while this lineage awaited identity (#2962).
+
+    Best effort: the reconciler retries every pass, so a failure here only
+    delays the review and never fails the committed lineage advance.
+    """
+    if (
+        not get_settings().github_review_ingress_enabled
+        or lineage.status != "open"
+        or lineage.github_repository_id is None
+        or lineage.pr_number is None
+    ):
+        return
+    try:
+        async with asyncio.timeout(10):
+            await request.app.state.github_review_reconciler.replay_held(
+                repository_id=lineage.github_repository_id,
+                pr_number=lineage.pr_number,
+            )
+    except Exception:
+        logger.warning("held GitHub review replay after identity failed; reconciler retries")
 
 
 @router.get("", response_model=list[PublicationOut])

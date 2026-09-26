@@ -55,6 +55,17 @@ class FeedbackUnavailable(FeedbackIgnored):
     """Current authority could not be read; retry without executing a turn."""
 
 
+class FeedbackHeld(FeedbackIgnored):
+    """The PR's lineage exists but has not yet recorded GitHub identity (#2962).
+
+    The caller holds the normalized feedback and replays it; GitHub never
+    redelivers a failed webhook, so neither a refusal nor a 503 is safe here.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("lineage_identity_pending")
+
+
 @dataclass(frozen=True)
 class UnverifiedFeedback:
     """Parsed sender claims; current GitHub truth and lineage still must agree."""

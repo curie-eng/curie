@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,19 +14,26 @@ import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
 from channel_protocol import scoped_conversation_id
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import crud
 from .config import Settings
 from .delivery import enqueue_owned, take_backlog_slot
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable, UnverifiedFeedback
+from .github_review_audit import settle_review_delivery
+from .github_review_events import (
+    FeedbackHeld,
+    FeedbackIgnored,
+    FeedbackUnavailable,
+    UnverifiedFeedback,
+)
 from .github_review_terminal import read_review_dead_letter, worker_event_is_terminal
 from .github_review_truth import BoundReviewLineage, verify_feedback_truth
 from .models import (
     AgentChannel,
     Deployment,
+    GitHubReviewDelivery,
     GitHubReviewFeedback,
     Publication,
     PublicationReviewReservation,
@@ -80,6 +88,8 @@ async def review_context(
             .limit(2)
         )
     )
+    if not candidates and await _identity_pending(session, feedback):
+        raise FeedbackHeld()
     if len(candidates) != 1:
         raise FeedbackIgnored("lineage_absent_or_ambiguous")
     lineage = candidates[0]
@@ -121,14 +131,49 @@ async def review_context(
     return ReviewContext(lineage, binding, lineage.reply_conversation_id)
 
 
-def feedback_from_row(row: GitHubReviewFeedback) -> UnverifiedFeedback:
-    data = dict(row.feedback)
+async def _identity_pending(session: AsyncSession, feedback: UnverifiedFeedback) -> bool:
+    """Whether a new bound lineage for this repository still awaits GitHub identity.
+
+    Publication creates the lineage before the PR exists and records identity
+    only after the worker observes the PR (#2962). Feedback in that gap must be
+    held, not refused. No age bound applies here: publication may take any
+    time before the PR exists. The hold's own lifetime (held_at plus the hold
+    window) bounds how long an unrelated PR in the same repository waits
+    before its refusal.
+    """
+    pending = await session.scalar(
+        select(ThreadPublicationLineage.id)
+        .where(
+            ThreadPublicationLineage.status == "open",
+            ThreadPublicationLineage.github_repository_id.is_(None),
+            ThreadPublicationLineage.pr_number.is_(None),
+            ThreadPublicationLineage.binding_id.is_not(None),
+            func.lower(ThreadPublicationLineage.repo_full_name)
+            == feedback.repo_full_name.casefold(),
+        )
+        .limit(1)
+    )
+    return pending is not None
+
+
+def normalized_feedback(feedback: UnverifiedFeedback) -> dict[str, Any]:
+    """The only stored form of feedback; never the raw webhook body."""
+    stored: dict[str, Any] = json.loads(json.dumps(asdict(feedback), default=str))
+    return stored
+
+
+def feedback_from_json(stored: dict[str, Any]) -> UnverifiedFeedback:
+    data = dict(stored)
     try:
         data["delivery_id"] = uuid.UUID(data["delivery_id"])
         data["created_at"] = datetime.fromisoformat(data["created_at"])
         return UnverifiedFeedback(**data)
     except (TypeError, ValueError, KeyError):
         raise FeedbackIgnored("stored_feedback_invalid") from None
+
+
+def feedback_from_row(row: GitHubReviewFeedback) -> UnverifiedFeedback:
+    return feedback_from_json(row.feedback)
 
 
 def feedback_provenance(feedback: UnverifiedFeedback) -> dict[str, Any]:
@@ -202,7 +247,7 @@ async def admit_feedback(
             binding_id=context.binding.id,
             binding_generation=context.binding.generation,
             agent_id=context.lineage.agent_id,
-            feedback=json.loads(json.dumps(asdict(feedback), default=str)),
+            feedback=normalized_feedback(feedback),
             turn=turn.model_dump(mode="json"),
             traceparent=canonicalize_traceparent(traceparent),
         )
@@ -236,6 +281,190 @@ async def validate_stored_context(
     return feedback, context
 
 
+# Held feedback lives in Valkey, not SQL, so the stable train needs no
+# migration (#2962). Losing Valkey loses held reviews, which degrades to the
+# pre-#2962 behavior: that review is never admitted and must be re-posted.
+_HELD_INDEX = "curie:github-review:held"
+
+
+def _held_key(event_id: str) -> str:
+    return f"{_HELD_INDEX}:{event_id}"
+
+
+def _held_deliveries_key(event_id: str) -> str:
+    # Every delivery header GitHub sent for this one event; each has a receipt.
+    return f"{_HELD_INDEX}:{event_id}:deliveries"
+
+
+async def hold_feedback(
+    valkey: redis.Redis,
+    feedback: UnverifiedFeedback,
+    *,
+    traceparent: str | None,
+    settings: Settings,
+) -> None:
+    """Retain feedback whose lineage awaits identity; a repeat is a no-op."""
+    now = time.time()
+    record = {
+        "feedback": normalized_feedback(feedback),
+        "traceparent": canonicalize_traceparent(traceparent),
+        "attempts": 0,
+        "held_at": now,
+        "next_attempt_at": now,
+    }
+    ttl = max(1, int(2 * settings.github_review_identity_hold_s))
+    await valkey.set(_held_key(feedback.event_id), json.dumps(record), nx=True, ex=ttl)
+    deliveries = _held_deliveries_key(feedback.event_id)
+    await valkey.sadd(deliveries, str(feedback.delivery_id))
+    await valkey.expire(deliveries, ttl, nx=True)
+    await valkey.zadd(_HELD_INDEX, {feedback.event_id: now}, nx=True)
+
+
+async def replay_held_feedback(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    valkey: redis.Redis,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    *,
+    repository_id: int | None = None,
+    pr_number: int | None = None,
+) -> list[str]:
+    """Re-run admission for held feedback and settle its delivery receipt.
+
+    Without a PR filter only entries whose backoff has elapsed are tried. With
+    one, the PR's entries are tried at once because its identity was just
+    recorded. Returns admitted event ids that still need enqueueing.
+    """
+    targeted = repository_id is not None and pr_number is not None
+    now = time.time()
+    raw = await (
+        valkey.zrange(_HELD_INDEX, 0, -1)
+        if targeted
+        else valkey.zrangebyscore(_HELD_INDEX, "-inf", now, start=0, num=100)
+    )
+    window = settings.github_review_identity_hold_s
+    if not targeted:
+        await _reject_orphaned_held_receipts(sessionmaker, 2 * window)
+    admitted: list[str] = []
+    for member in raw:
+        event_id = member.decode() if isinstance(member, bytes) else str(member)
+        stored = await valkey.get(_held_key(event_id))
+        if stored is None:
+            # The key expired or Valkey lost it. Its receipts are rejected by
+            # _reject_orphaned_held_receipts once they are past the key's TTL.
+            await valkey.zrem(_HELD_INDEX, event_id)
+            await valkey.delete(_held_deliveries_key(event_id))
+            continue
+        record = json.loads(stored)
+        data = record["feedback"]
+        if targeted and (
+            data.get("repository_id") != repository_id or data.get("pr_number") != pr_number
+        ):
+            continue
+        delivery_ids = {
+            uuid.UUID(m.decode() if isinstance(m, bytes) else str(m))
+            for m in await valkey.smembers(_held_deliveries_key(event_id))
+        }
+        outcome: str
+        async with sessionmaker() as session, session.begin():
+            # Receipt locks serialize replayers and a same-header redelivery.
+            # Skip the event while any of its receipts is busy.
+            audits: list[GitHubReviewDelivery] = []
+            busy = False
+            for delivery_id in sorted(delivery_ids):
+                audit = await session.scalar(
+                    select(GitHubReviewDelivery)
+                    .where(GitHubReviewDelivery.delivery_id == delivery_id)
+                    .with_for_update(skip_locked=True)
+                )
+                if audit is not None:
+                    audits.append(audit)
+                elif await session.get(GitHubReviewDelivery, delivery_id) is not None:
+                    busy = True
+                    break
+            if busy:
+                continue
+            age = time.time() - float(record["held_at"])
+            try:
+                feedback = feedback_from_json(data)
+                row, created = await admit_feedback(
+                    session,
+                    feedback,
+                    settings=settings,
+                    client=client,
+                    traceparent=record["traceparent"],
+                )
+            except FeedbackHeld:
+                if age >= window:
+                    _settle_held(audits, "rejected", "lineage_absent_or_ambiguous")
+                    outcome = "drop"
+                else:
+                    outcome = "retry"
+            except FeedbackUnavailable as exc:
+                # Provider outage is transient; the key's TTL bounds retention.
+                if age >= 2 * window:
+                    _settle_held(audits, "rejected", exc.code)
+                    outcome = "drop"
+                else:
+                    outcome = "retry"
+            except FeedbackIgnored as exc:
+                _settle_held(audits, "rejected", exc.code)
+                outcome = "drop"
+            else:
+                _settle_held(audits, "accepted", event_id=row.event_id)
+                outcome = "drop"
+                if created or row.status == "waiting":
+                    admitted.append(row.event_id)
+        # After commit: a lost delete only causes an idempotent re-admission.
+        if outcome == "drop":
+            await valkey.delete(_held_key(event_id), _held_deliveries_key(event_id))
+            await valkey.zrem(_HELD_INDEX, event_id)
+        else:
+            record["attempts"] = int(record["attempts"]) + 1
+            record["next_attempt_at"] = time.time() + min(
+                60, 5 * 2 ** min(record["attempts"] - 1, 4)
+            )
+            await valkey.set(_held_key(event_id), json.dumps(record), xx=True, keepttl=True)
+            await valkey.zadd(_HELD_INDEX, {event_id: record["next_attempt_at"]}, xx=True)
+    return admitted
+
+
+def _settle_held(
+    audits: list[GitHubReviewDelivery],
+    status: str,
+    reason: str | None = None,
+    *,
+    event_id: str | None = None,
+) -> None:
+    for audit in audits:
+        if audit.status in {"pending", "retryable"}:
+            settle_review_delivery(audit, status, reason, event_id=event_id)
+
+
+async def _reject_orphaned_held_receipts(
+    sessionmaker: async_sessionmaker[AsyncSession], older_than_s: float
+) -> None:
+    """Settle held receipts whose Valkey hold can no longer exist.
+
+    A hold key lives at most ``older_than_s`` from its first delivery, so a
+    receipt still waiting past that age lost its hold to TTL or to Valkey.
+    """
+    async with sessionmaker() as session, session.begin():
+        stale = await session.scalars(
+            select(GitHubReviewDelivery)
+            .where(
+                GitHubReviewDelivery.status == "retryable",
+                GitHubReviewDelivery.reason == "lineage_identity_pending",
+                GitHubReviewDelivery.created_at
+                <= func.now() - timedelta(seconds=older_than_s),
+            )
+            .limit(100)
+            .with_for_update(skip_locked=True)
+        )
+        for audit in stale:
+            settle_review_delivery(audit, "rejected", "lineage_absent_or_ambiguous")
+
+
 class GitHubReviewReconciler:
     """SQL outbox to the existing atomic receipt + bounded runs consumer."""
 
@@ -244,12 +473,34 @@ class GitHubReviewReconciler:
         sessionmaker: async_sessionmaker[AsyncSession],
         valkey: redis.Redis,
         settings: Settings,
+        client: httpx.AsyncClient,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._valkey = valkey
         self._settings = settings
+        self._client = client
+
+    async def replay_held(self, *, repository_id: int, pr_number: int) -> int:
+        """Admit and enqueue one PR's held feedback right after identity lands."""
+        admitted = await replay_held_feedback(
+            self._sessionmaker,
+            self._valkey,
+            self._settings,
+            self._client,
+            repository_id=repository_id,
+            pr_number=pr_number,
+        )
+        enqueued = 0
+        for event_id in admitted:
+            enqueued += await self.reconcile_once(event_id)
+        return enqueued
 
     async def reconcile_once(self, event_id: str | None = None) -> int:
+        if event_id is None:
+            # Admitted rows are waiting outbox rows that this same pass enqueues.
+            await replay_held_feedback(
+                self._sessionmaker, self._valkey, self._settings, self._client
+            )
         await self.reconcile_terminal(event_id)
         async with self._sessionmaker() as session:
             statement = (
