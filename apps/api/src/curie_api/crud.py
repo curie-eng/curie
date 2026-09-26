@@ -403,14 +403,9 @@ async def agent_id_for_route(
     identities can share one `(kind, address)`.
 
     Selects the rows on `(kind, address)` and narrows to `adapter`'s RESOLVED
-    identity in PYTHON, because a SQL predicate on the raw `adapter` column
-    would miss a legacy NULL -- `route_identity` is what turns that NULL into
-    'default' for Slack, and there is no portable SQL equivalent to call
-    without duplicating the identity rule in a second language. Migration
-    0023's `agent_channels_kind_address_key` (UNIQUE kind, address) holds the
-    candidate set to at most one row until the contract migration for
-    ADR-0168 decision 3 (#3100) widens it to the triple; the loop is for when
-    several identities can share a pair.
+    identity through `route_identity`, the one rule every reader compares
+    identities by. `agent_channels_route_key` holds at most one row per
+    resolved route, so the first match is the only one.
     """
 
     wanted = route_identity(kind, adapter)
@@ -426,49 +421,16 @@ async def agent_id_for_route(
     return None
 
 
-async def agent_id_for_channel_pair(
-    session: AsyncSession, kind: str, address: str
-) -> uuid.UUID | None:
-    """Which agent holds this PAIR, ignoring identity -- if any.
-
-    A deliberately narrower question than `agent_id_for_route`: the database
-    constraint is still `agent_channels_kind_address_key` (UNIQUE kind,
-    address; migration 0023, until the contract migration for ADR-0168
-    decision 3 (#3100) widens it to the triple), so this is the lookup that
-    answers what the constraint actually enforces. `agent_id_for_route` can
-    legitimately return `None` while this agent still holds the pair under a
-    DIFFERENT identity -- a custom-transport binding a bare identity-form
-    write collided with, for instance -- and `_raise_binding_conflict` falls
-    back to this lookup so that case still names the right agent instead of
-    reading as "another agent already bound". `add_agent_channel` asks it too,
-    to recognize a re-POST of a pair this agent already holds as idempotent.
-
-    Not the routing question: that is `agent_id_for_route`'s. This one exists
-    only because the pair constraint has not widened yet.
-    """
-
-    owner: uuid.UUID | None = await session.scalar(
-        select(AgentChannel.agent_id).where(
-            AgentChannel.kind == kind, AgentChannel.address == address
-        )
-    )
-    return owner
-
-
 async def agent_holds_channel_pair(
     session: AsyncSession, agent_id: uuid.UUID, kind: str, address: str
 ) -> bool:
     """Does THIS agent hold a row on `(kind, address)`, under any identity?
 
-    Not `agent_id_for_channel_pair`: that answers who (if anyone) holds the
-    pair with one arbitrary row when several could match, which only holds
-    today because `agent_channels_kind_address_key` (migration 0023) still
-    caps the pair to one row; once the contract migration for ADR-0168
-    decision 3 (#3146) widens it to the triple, two agents can hold the same
-    pair under two identities, and picking an arbitrary row would answer the
-    wrong agent's question. This asks the narrower thing every caller here
-    actually needs -- filtered on `agent_id` in the query itself, so it stays
-    correct on either side of that migration.
+    State is scoped to the agent across its identities, and
+    `agent_channels_route_key` lets two agents hold one pair under two
+    identities, so "who holds the pair" has no single answer. This asks the
+    narrower thing every caller here needs, filtered on `agent_id` in the
+    query itself.
     """
 
     held = await session.scalar(
