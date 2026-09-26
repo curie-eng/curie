@@ -132,6 +132,12 @@ pub struct Facts {
     /// runnable, while `model_pin_fix` keeps its own `<ns>`/`<release>`
     /// placeholders (#1950).
     pub target: Option<(String, String)>,
+    /// A validated `curie.yaml` was loaded for this doctor run, so a release
+    /// model remedy can update the declared installation and reapply it.
+    pub declared_installation: bool,
+    /// The exact observed context when it differs from the file's context.
+    /// The apply remedy passes it explicitly to address this same cluster.
+    pub apply_context: Option<String>,
     /// Non-secret provider inferred from the bound `CURIE_CREDENTIALS` value.
     /// The credential itself is deliberately discarded during observation.
     pub model_credential_provider: Option<&'static str>,
@@ -646,27 +652,35 @@ pub(crate) fn helm_truthy(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-/// The command that pins the model at the source it is actually in force from.
+/// Pin the model at the source it is actually in force from.
 ///
-/// Bare and runnable, with angle-bracket placeholders only: a fix string that
-/// names a flag which does not exist fails for whoever pastes it (#1813). Note
-/// `curie cluster up` has NO `--model` -- that flag belongs to `skill up` -- so
-/// the release default is set through `--set <key>=`, where the key is the one
-/// the release actually reads ([`ReleaseModelKey`]) rather than always
-/// `agentSandbox.runner.model`, which a local-inference install ignores. The
-/// namespace and release come from the run itself rather than defaulting to
-/// `curie/curie` (#1358 item 1).
+/// A file backed release gets the chart key under `set:` and an apply command.
+/// Direct cluster diagnosis keeps the runnable `cluster up --set` command.
+/// Both paths use the key the release actually reads ([`ReleaseModelKey`]);
+/// local inference installs ignore `agentSandbox.runner.model`. Direct cluster
+/// commands name the namespace and release diagnosed by this run (#1358).
 fn model_pin_fix(f: &Facts, source: &ModelSource) -> String {
     match source {
         ModelSource::Agent(name) => {
             format!("curie cluster overrides {name} --model <dated-snapshot-id>")
         }
         ModelSource::ReleaseDefault(key) => {
+            let key = key.chart_key();
+            if f.declared_installation {
+                let apply = match f.apply_context.as_deref() {
+                    Some(context) => {
+                        format!("curie apply --context {}", crate::ops::shell_quote(context))
+                    }
+                    None => "curie apply".to_string(),
+                };
+                return format!(
+                    "set `{key}: \"<dated-snapshot-id>\"` under `set:` in `curie.yaml`, then run `{apply}`"
+                );
+            }
             let (namespace, release) = match &f.target {
                 Some((namespace, release)) => (namespace.as_str(), release.as_str()),
                 None => ("<ns>", "<release>"),
             };
-            let key = key.chart_key();
             format!(
                 "curie cluster up --namespace {namespace} --release {release} \
                  --set {key}=<dated-snapshot-id>"
@@ -5463,12 +5477,16 @@ pub async fn doctor(
     release: &str,
     api_url: Option<&str>,
     api_key: Option<&str>,
+    declared_installation: bool,
+    apply_context: Option<&str>,
 ) -> DoctorOutput {
     let resolved = resolve_api(namespace, release, api_url, api_key).await;
     let api = resolved
         .as_ref()
         .map(|(url, key)| (url.as_str(), key.as_str()));
-    let (facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    let (mut facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    facts.declared_installation = declared_installation;
+    facts.apply_context = apply_context.map(str::to_string);
     let checks = evaluate_with_worker_claims(&facts, worker_claims.as_ref());
     let summary = summary(&checks);
     DoctorOutput { checks, summary }

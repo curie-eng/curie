@@ -1921,6 +1921,8 @@ fn doctor_output_validates() {
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
         target: Some(("acme".to_string(), "acme".to_string())),
+        declared_installation: false,
+        apply_context: None,
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },
@@ -2001,6 +2003,8 @@ fn doctor_ready_tracks_the_checks() {
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
         target: Some(("acme".to_string(), "acme".to_string())),
+        declared_installation: false,
+        apply_context: None,
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },

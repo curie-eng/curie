@@ -1199,13 +1199,14 @@ fn prepared_apply_progress_uses_the_file_recovery_path() {
 
     assert!(
         shown.contains("generated strong per-release secrets")
-            && shown.contains("re-running `curie apply` reuses them"),
+            && shown.contains("rerunning `curie apply` reuses them"),
         "the credential progress line must tell file based installs to rerun apply:\n{shown}"
     );
     assert!(
-        shown.contains("resolved provider IPs can rotate; re-run `curie apply`")
-            && !shown.contains("re-run `curie cluster up` if model calls start failing"),
-        "the provider progress line must preserve the apply invocation:\n{shown}"
+        shown.contains("platform.egress[].host")
+            && shown.contains("rerun `curie apply`")
+            && !shown.contains("curie cluster up"),
+        "the sealed model warning must use the file based remedy:\n{shown}"
     );
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();

@@ -6106,14 +6106,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                     ));
                 }
             }
-            if let Some(target) =
-                curie::kube_context::pin_for_cluster_command(curie::installation::resolve_context(
+            let selected_context = curie::kube_context::pin_for_cluster_command(
+                curie::installation::resolve_context(
                     context.as_deref(),
                     declared
                         .as_ref()
                         .and_then(|cfg| cfg.install.context.as_deref()),
-                ))?
-            {
+                ),
+            )?;
+            if let Some(target) = &selected_context {
                 ui::ui().note(&format!(
                     "Kubernetes context: {} (cluster {})",
                     target.context, target.cluster
@@ -6136,11 +6137,24 @@ async fn run(command: Option<Command>) -> Result<()> {
             // Discover independently. `zip` required both flags, so a bare
             // `curie doctor` never reached the platform API (#1367). Errors
             // are discarded inside `doctor`: gather is failure-tolerant.
+            let matching_file = declared.as_ref().filter(|config| {
+                config.install.namespace == target.namespace
+                    && config.install.release == target.release
+            });
+            let apply_context = matching_file.and_then(|config| {
+                selected_context.as_ref().and_then(|selected| {
+                    (curie::installation::resolve_context(None, config.install.context.as_deref())
+                        != Some(selected.context.as_str()))
+                    .then_some(selected.context.as_str())
+                })
+            });
             let out = curie::doctor::doctor(
                 &target.namespace,
                 &target.release,
                 api_url.as_deref(),
                 api_key.as_deref(),
+                matching_file.is_some(),
+                apply_context,
             )
             .await;
             if out.release_not_serving() {
