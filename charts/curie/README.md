@@ -1244,6 +1244,20 @@ already-configured control-plane pod at admission time. Both objects are
 independently toggleable (`resourceQuota.enabled`, `limitRange.enabled`,
 each default `true`) and every ceiling is overridable, per ADR-0059 decision 6.
 
+The `ResourceQuota` is an admission ceiling, not a scheduling guarantee
+(#2949). It admits up to min(`sandboxPodCount`, `requestsCpu` / runner cpu
+request, `requestsMemory` / runner memory request, `limitsCpu` / runner cpu
+limit, `limitsMemory` / runner memory limit) sandboxes (8 with the shipped
+defaults, bound by `limitsCpu`) whether or not the nodes can hold them; past node capacity, sandboxes sit Pending until the
+claim times out. `helm install`/`upgrade` NOTES compare that ceiling with
+what fits on the schedulable nodes and warn when it is higher. That report
+lists Nodes and Pods cluster-wide during install/upgrade; if the helm identity
+cannot, the release fails, so set `resourceQuota.capacityReport=false`. A quota
+refusal is a pod create rejected with "exceeded quota"
+(`kubectl describe resourcequota <fullname>-sandbox-quota`); an unschedulable
+sandbox is a Pending pod with `FailedScheduling` events. The arithmetic and a
+worked example sit at `resourceQuota` in `values.yaml`.
+
 **Which pods outrank sandboxes (ADR-0059 decision 5, #3182).** Every
 long-running platform workload carries `priorityClassName:
 priorityClasses.platform.name`: the control plane (api, worker, dispatcher),

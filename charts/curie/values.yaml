@@ -2720,6 +2720,43 @@ resourceQuota:
   # (`priorityClasses.sandbox.create: false`) whose name differs from
   # `priorityClasses.sandbox.name`. Setting it overrides the derivation.
   sandboxPriorityClassName: ""
+  # THE QUOTA IS AN ADMISSION CEILING, NOT A SCHEDULING GUARANTEE (#2949).
+  # Kubernetes checks these numbers against the requests of sandbox pods, never
+  # against what the nodes can hold. A quota above node capacity admits sandboxes
+  # that then sit Pending until the claim times out.
+  #
+  #   quota ceiling = min(sandboxPodCount,
+  #                       requestsCpu    / agentSandbox.runner.resources.requests.cpu,
+  #                       requestsMemory / agentSandbox.runner.resources.requests.memory,
+  #                       limitsCpu      / agentSandbox.runner.resources.limits.cpu,
+  #                       limitsMemory   / agentSandbox.runner.resources.limits.memory)
+  #   (a term whose per-sandbox value is unset or 0 is skipped). With the
+  #   shipped defaults: min(50, 4/50m=80, 8Gi/192Mi=42, 8/1=8, 16Gi/768Mi=21)
+  #   = 8, so limitsCpu is the binding term.
+  #   what fits     = sum over schedulable nodes of
+  #                   floor((allocatable - non-sandbox pod requests) / per-sandbox request),
+  #                   taking the smaller of the cpu and memory counts per node
+  #
+  # Worked example: 3 nodes with 3.23 cpu free between them (roughly 1.08 each),
+  # 1 cpu per sandbox -> 1 fits per node, 3 in total. A quota of
+  # requestsCpu: "8" advertised 8; sandboxes 4 through 8 were admitted and
+  # never scheduled. `helm install`/`upgrade` NOTES print both numbers and a
+  # warning when the ceiling exceeds what fits.
+  #
+  # Telling the refusals apart:
+  #   quota refusal: the pod create is rejected with "exceeded quota" --
+  #     kubectl describe resourcequota <fullname>-sandbox-quota -n <ns>
+  #   unschedulable: the pod exists, is Pending, and has FailedScheduling events --
+  #     kubectl get events --field-selector reason=FailedScheduling -n <ns>
+  # Remedy for the second: lower hard.* to what fits, or add node capacity.
+  #
+  # capacityReport: the NOTES comparison above. To compute "what fits" it
+  # lists every Node and every Pod cluster-wide (Helm `lookup`) during
+  # install/upgrade. If the identity running helm is forbidden to list Nodes or
+  # Pods across all namespaces, that lookup errors and Helm FAILS THE RELEASE.
+  # Set false in that case; the quota itself is unaffected, only the report is
+  # skipped and no lookup runs.
+  capacityReport: true
   hard:
     requestsCpu: "4"
     requestsMemory: 8Gi

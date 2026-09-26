@@ -627,6 +627,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/tenant-capacity-assertions.sh
 
+      # Prove the sandbox quota-vs-node-capacity arithmetic (issue #2949): the
+      # quota is an admission ceiling, not a scheduling guarantee, so NOTES
+      # compares its ceiling with what fits on schedulable nodes and warns when
+      # it is higher. Fixture Node/Pod data drives the pure helpers.
+      - name: helm render assertions (sandbox quota vs node capacity)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/sandbox-capacity-fit-assertions.sh
+
       # Prove the in-chart rustfs resource floors (issue #2706). Presence is
       # not the defect; the 512Mi memory ceiling is. The shipped default sat
       # under a measured 1120Mi working set, so every install OOMKilled in a
