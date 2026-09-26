@@ -155,14 +155,17 @@ resolved agent's name with `mint`
 emits it as `CURIE_CONNECTOR_CALLER_TOKEN` with the connector scope. The runner's
 `derive_mcp_servers`
 (`runner/src/curie_runner/connectors.py::derive_mcp_servers`) then gives each
-hosted entry the header `CALLER_HEADER`
+hosted entry the header `X-Curie-Caller`
 (`runner/src/curie_runner/connectors.py::CALLER_HEADER`) with the token's
 placeholder, and gives none to a remote or fallback URL. The token stays in the
 sandbox env, because the MCP client expands the header from it; the signing key
 never enters a sandbox
 (`apps/worker/src/curie_worker/sandbox/types.py::HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
 The wire is frozen in `tests/vectors/connector-caller-token.json`. With no key
-set, nothing is minted and the boot env is unchanged.
+set, nothing is minted and the boot env is unchanged. Nothing checks the token
+yet, and no proxy strips the header before it reaches the connector: until one
+does, the hosted server image itself receives `X-Curie-Caller`, including on
+its own OAuth discovery requests.
 
 ## Implementations today
 

@@ -104,7 +104,10 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   cannot declare `admits` at all (`connectors.remote_has_admits`). `self` is itself refused as an
   agent name (`deploy.bad_agent_name`), since a target genuinely named `self` would be
   indistinguishable from the sentinel. This release only accepts, validates and carries the list
-  and the entries it names; nothing enforces it until a later release. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  and the entries it names; nothing enforces it until a later release. A consumer built before the
+  first release carrying #3107 refuses `admits` as `connectors.invalid`: an older API or CLI
+  refuses the bundle, and an older runner mounts none of its connectors. Declare `admits` only once
+  the API, the CLI and every runner image are on that release. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,

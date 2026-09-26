@@ -1747,9 +1747,12 @@ it.
 
 The worker signs each sandbox's connector caller token (ADR-0168 decision 7)
 with an Ed25519 key it reads from a Secret you name. Nothing verifies the
-token yet. The chart never generates the key, for the reason it never generates
-the sealing key: it has no lookup-persist, so a chart-side key would change on
-every upgrade.
+token yet. BYO only in this release: the chart does not generate the key.
+`curie cluster up` does not mint or persist one yet either, so a render
+without cluster access (`helm template`, a client-only upgrade) has nothing
+that could keep a generated key stable. A later release has `curie cluster
+up` generate the key and carry it forward, the way it already does for the
+sealing keypair.
 
 The Secret holds both halves as standard base64: the 32-byte seed under
 `connectorCaller.signingKeyKey` (default `signingKey`) and its 32-byte public
@@ -1767,7 +1770,8 @@ connectorCaller:
 
 Only the worker receives the signing key. Leaving `existingSecret` empty mints
 no token, and every sandbox boots as before. A plain `curie cluster up` does
-not carry `connectorCaller` forward yet, so pass it with every upgrade.
+not carry `connectorCaller` forward yet, so pass it with every upgrade:
+`curie cluster up --set connectorCaller.existingSecret=<name>`.
 
 ### Reserved environment variables
 
