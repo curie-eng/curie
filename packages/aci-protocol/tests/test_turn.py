@@ -639,7 +639,7 @@ def test_another_kinds_slack_calls_speak_as_the_default_identity(
 class _Row:
     """A minimal stand-in for any row `matching_routes` can read: an ORM
     object, a SQLAlchemy `Row`, or a plain object -- the function only ever
-    touches these four attributes."""
+    touches kind, address and adapter; `endpoint` lets a case carry one."""
 
     kind: str
     address: str
