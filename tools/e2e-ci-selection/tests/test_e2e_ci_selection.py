@@ -271,8 +271,10 @@ def _git_ignored(path: str) -> bool:
 
 
 def _directory_files(directory: str, excluded: tuple[str, ...]) -> tuple[str, ...]:
+    # Tracked files only: an untracked leftover such as a mergetool .orig is
+    # not in any diff, and .helmignore keeps it out of the package.
     completed = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", directory],
+        ["git", "ls-files", "-z", "--", directory],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
