@@ -104,8 +104,7 @@ def _two_agents_api() -> httpx.Client:
         _agent(
             channels=[
                 {"kind": "slack", "address": CHANNEL_A, "adapter": "default"},
-                # A pre-ADR custom-transport binding stores a credential slug,
-                # which no identity is named; `default` probes it.
+                # An identity the chart no longer declares is `default`'s.
                 {"kind": "slack", "address": CHANNEL_E, "adapter": "hook-proof"},
             ],
             approval_routes={"security": {"resolution": {"kind": "slack", "address": CHANNEL_C}}},

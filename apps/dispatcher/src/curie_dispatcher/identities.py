@@ -106,16 +106,15 @@ def resolve_identity_credentials(
     return tuple(resolved)
 
 
-def minted_adapter(slack_identity: str) -> str | None:
+def minted_adapter(slack_identity: str) -> str:
     """The ``ReplyHandle.adapter`` a turn arriving on ``slack_identity`` carries.
 
-    ``default`` still mints none: every reader resolves a missing Slack adapter
-    to ``default`` (``aci_protocol.turn.route_identity``), and a worker from
-    before the route triple resolves only that form. #3146 stores the name and
-    moves this writer to it.
+    The identity whose app the delivery arrived on, ``default`` included
+    (ADR-0168 decision 3); a handle queued before this still reads as
+    ``default`` through ``aci_protocol.turn.route_identity``.
     """
 
-    return None if slack_identity == DEFAULT_IDENTITY else slack_identity
+    return slack_identity
 
 
 def delivery_key(slack_delivery_id: str, slack_identity: str) -> str:
