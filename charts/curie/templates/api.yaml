@@ -171,6 +171,18 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+            # The connector caller public keys and the proxy image (ADR-0168
+            # decision 7). The API renders a caller proxy into every hosted
+            # connector it renders when the current key is set; the worker
+            # alone holds the signing half.
+            - name: CURIE_CONNECTOR_CALLER_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.connectorCaller.existingSecret "existingSecretKey" .Values.connectorCaller.verifyKeyKey "defaultKey" "connectorCallerVerifyKey") | nindent 18 }}
+            - name: CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY
+              value: {{ .Values.connectorCaller.previousVerifyKey | default "" | quote }}
+            - name: CURIE_CONNECTOR_PROXY_IMAGE
+              value: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS

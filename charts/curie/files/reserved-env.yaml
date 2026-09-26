@@ -11,7 +11,7 @@ worker:
   CURIE_ATTACHMENT_RETENTION_TTL_SECONDS: worker.attachments.retentionTtlSeconds
   CURIE_CLAIM_TIMEOUT_SECONDS: worker.claimTimeoutSeconds
   CURIE_CONNECTOR_APP_NAME: nameOverride
-  CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.existingSecret
+  CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.signingKey
   CURIE_CONNECTOR_RECONCILE: worker.connectorReconciler.enabled
   CURIE_CONNECTOR_RECONCILE_INTERVAL_S: worker.connectorReconciler.intervalSeconds
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret
@@ -99,6 +99,9 @@ api:
   COMMIT_POLL_INTERVAL_S: api.commitPollIntervalSeconds
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_APPROVAL_RECOVERY_ENABLED: api.approvalRecovery.enabled
+  CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY: connectorCaller.previousVerifyKey
+  CURIE_CONNECTOR_CALLER_PUBLIC_KEY: connectorCaller.verifyKey
+  CURIE_CONNECTOR_PROXY_IMAGE: worker.image
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
