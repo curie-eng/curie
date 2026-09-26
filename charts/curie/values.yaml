@@ -901,6 +901,11 @@ otelCollector:
   #  - cidr: 192.0.2.10/32
   #    ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
+  # SDK metrics use delta aggregation so each export carries the measurements
+  # made since the prior collection. Override to cumulative or lowmemory when
+  # the receiving backend requires that preference. A workload extraEnv entry
+  # with the same OTEL variable takes precedence.
+  metricsTemporalityPreference: delta
   # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
   # credentials so they never enter Helm values. The two sources are mutually
   # exclusive; a literal is only for non-sensitive values such as a tenant id.
