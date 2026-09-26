@@ -113,8 +113,8 @@ def test_an_identity_with_a_blank_bot_token_is_named_and_left_out(
         ("default", None, "default"),
         ("ops-bot", None, "ops-bot"),
         (CLUSTER_MESSAGE_ADAPTER, None, "default"),
-        # The pre-ADR custom-transport form: `adapter` is a credential slug.
-        ("agentmail-sandbox", "http://stub.example/api/", "default"),
+        # A CLI stub turn's per-turn Slack origin does not pick the token.
+        ("ops-bot", "http://stub.example/api/", "ops-bot"),
         (None, "http://stub.example/api/", "default"),
     ],
 )
