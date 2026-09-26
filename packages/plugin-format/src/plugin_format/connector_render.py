@@ -35,6 +35,8 @@ import base64
 import binascii
 import hashlib
 import json
+import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
@@ -137,6 +139,12 @@ CALLER_PROXY_ALTERNATE_PORT = 8481
 CALLER_PROXY_CONTAINER = "caller-proxy"
 _CALLER_PORT_NAME = "caller"
 _PUBLIC_KEY_BYTES = 32
+# The suffix of the Service that reaches a proxied connector's server directly.
+_DIRECT_SUFFIX = "-direct"
+_PULL_POLICIES = frozenset({"Always", "IfNotPresent", "Never"})
+# A Secret name: a DNS subdomain.
+_SECRET_NAME = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
+_SECRET_NAME_MAX = 253
 
 
 @dataclass(frozen=True)
@@ -146,14 +154,28 @@ class ConnectorProxy:
     ``public_keys`` is the current key first, then the previous one during a
     rotation, each the standard base64 of a 32-byte Ed25519 public key. The
     proxy admits a token either key verifies.
+
+    The proxy runs from the worker image, so it pulls as the worker does:
+    ``pull_policy`` and ``pull_secrets`` are the worker's, and ``None`` and
+    ``()`` leave the cluster default.
     """
 
     image: str
     public_keys: tuple[str, ...]
+    pull_policy: str | None = None
+    pull_secrets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.image.strip():
             raise ValueError("the connector proxy image is empty")
+        if self.pull_policy is not None and self.pull_policy not in _PULL_POLICIES:
+            raise ValueError(
+                f"the connector proxy pull policy {self.pull_policy!r} is not one of "
+                f"{', '.join(sorted(_PULL_POLICIES))}"
+            )
+        for name in self.pull_secrets:
+            if len(name) > _SECRET_NAME_MAX or not _SECRET_NAME.fullmatch(name):
+                raise ValueError(f"the connector proxy pull secret {name!r} is not a Secret name")
         if not self.public_keys:
             raise ValueError("the connector proxy has no caller public key")
         for text in self.public_keys:
@@ -284,6 +306,32 @@ def object_name(release: str, agent: str, connector: str) -> str:
     return f"{base[:keep].rstrip('-')}-{digest}"
 
 
+def direct_service_name(release: str, agent: str, connector: str) -> str:
+    """The name of the Service that reaches a proxied connector's server directly.
+
+    ``object_name`` with ``-direct`` appended. A name that would pass the DNS
+    label limit keeps the suffix and is shortened with a digest of the whole
+    name, as ``object_name`` shortens its own.
+    """
+
+    base = f"{object_name(release, agent, connector)}{_DIRECT_SUFFIX}"
+    if len(base) <= _DNS_LABEL_MAX:
+        return base
+    digest = hashlib.sha256(base.encode()).hexdigest()[:_DIGEST_LEN]
+    keep = _DNS_LABEL_MAX - len(_DIRECT_SUFFIX) - _DIGEST_LEN - 1
+    return f"{base[:keep].rstrip('-')}-{digest}{_DIRECT_SUFFIX}"
+
+
+def shadows_a_direct_service(connector: str, hosted: Collection[str]) -> bool:
+    """Whether this connector's object name is a hosted sibling's direct Service name.
+
+    Connector ``x-direct`` and the direct Service of sibling ``x`` render one
+    name, so the two would overwrite a single Service.
+    """
+
+    return connector.endswith(_DIRECT_SUFFIX) and connector[: -len(_DIRECT_SUFFIX)] in hosted
+
+
 def service_dns(release: str, agent: str, connector: str, namespace: str) -> str:
     return f"{object_name(release, agent, connector)}.{namespace}.svc.cluster.local"
 
@@ -324,6 +372,32 @@ def render_service(
             "type": "ClusterIP",
             "selector": _labels(release, agent, connector),
             "ports": [{"name": "http", "port": spec.port, "targetPort": target}],
+        },
+    }
+
+
+def render_direct_service(
+    release: str, agent: str, connector: str, spec: ConnectorSpec
+) -> dict[str, Any]:
+    """The Service that reaches a proxied connector's server itself (ADR-0168 decision 7).
+
+    For callers that are not agents, such as a keep-alive Job. It selects the
+    same pods on ``spec.port``, which neither rendered NetworkPolicy opens, so
+    only an operator-applied peer-ingress policy naming that port admits a
+    caller through it.
+    """
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": direct_service_name(release, agent, connector),
+            "labels": _labels(release, agent, connector),
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": _labels(release, agent, connector),
+            "ports": [{"name": "http", "port": spec.port, "targetPort": "http"}],
         },
     }
 
@@ -504,6 +578,11 @@ def render_deployment(
                         *([_proxy_container(agent, spec, proxy)] if proxy is not None else []),
                     ],
                     **({"volumes": volumes} if volumes else {}),
+                    **(
+                        {"imagePullSecrets": [{"name": name} for name in proxy.pull_secrets]}
+                        if proxy is not None and proxy.pull_secrets
+                        else {}
+                    ),
                 },
             },
         },
@@ -522,6 +601,7 @@ def _proxy_container(agent: str, spec: ConnectorSpec, proxy: ConnectorProxy) -> 
     return {
         "name": CALLER_PROXY_CONTAINER,
         "image": proxy.image,
+        **({"imagePullPolicy": proxy.pull_policy} if proxy.pull_policy is not None else {}),
         "command": ["python", "-m", "curie_connector_proxy"],
         "env": [
             {"name": "CURIE_CALLER_PROXY_PORT", "value": str(port)},
@@ -694,6 +774,7 @@ def render(
         )
     return [
         render_service(release, agent, connector, spec, proxy),
+        *([render_direct_service(release, agent, connector, spec)] if proxy is not None else []),
         render_deployment(release, agent, namespace, connector, spec, secret_name, proxy),
         render_networkpolicy(release, agent, app_name, connector, spec, proxy),
         render_ingress_networkpolicy(release, agent, app_name, connector, spec, proxy),

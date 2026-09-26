@@ -1,4 +1,8 @@
 {{- $resumeReconcilerGrace := include "curie.api.resumeReconciler.grace" . -}}
+{{- $connectorProxyPullSecrets := list }}
+{{- range .Values.worker.imagePullSecrets }}
+{{- $connectorProxyPullSecrets = append $connectorProxyPullSecrets .name }}
+{{- end }}
 {{- if .Values.api.deploy }}
 apiVersion: v1
 kind: Service
@@ -174,7 +178,8 @@ spec:
             # The connector caller public keys and the proxy image (ADR-0168
             # decision 7). The API renders a caller proxy into every hosted
             # connector it renders when the current key is set; the worker
-            # alone holds the signing half.
+            # alone holds the signing half. The proxy runs from the worker
+            # image, so it pulls with the worker's policy and pull secrets.
             - name: CURIE_CONNECTOR_CALLER_PUBLIC_KEY
               valueFrom:
                 secretKeyRef:
@@ -183,6 +188,10 @@ spec:
               value: {{ .Values.connectorCaller.previousVerifyKey | default "" | quote }}
             - name: CURIE_CONNECTOR_PROXY_IMAGE
               value: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+            - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY
+              value: {{ .Values.worker.image.pullPolicy | quote }}
+            - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS
+              value: {{ join "," $connectorProxyPullSecrets | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS

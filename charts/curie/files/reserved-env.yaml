@@ -102,6 +102,8 @@ api:
   CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY: connectorCaller.previousVerifyKey
   CURIE_CONNECTOR_CALLER_PUBLIC_KEY: connectorCaller.verifyKey
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
+  CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY: worker.image.pullPolicy
+  CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS: worker.imagePullSecrets
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes

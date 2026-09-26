@@ -594,8 +594,9 @@ class Settings(BaseSettings):
 
     # The caller proxy every hosted connector render carries (ADR-0168
     # decision 7): the public key the worker's signing key pairs with, the one
-    # it replaced during a rotation, and the image the proxy runs from. An
-    # empty current key renders no proxy.
+    # it replaced during a rotation, and the image the proxy runs from, with
+    # the worker's pull policy and comma-separated pull secret names. An empty
+    # current key renders no proxy.
     connector_caller_public_key: str = Field(
         default="",
         validation_alias=AliasChoices(
@@ -612,6 +613,18 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("CURIE_CONNECTOR_PROXY_IMAGE", "connector_proxy_image"),
     )
+    connector_proxy_image_pull_policy: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY", "connector_proxy_image_pull_policy"
+        ),
+    )
+    connector_proxy_image_pull_secrets: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
+        ),
+    )
 
     def connector_proxy(self) -> ConnectorProxy | None:
         """The proxy each hosted connector renders with, or None for none."""
@@ -623,6 +636,12 @@ class Settings(BaseSettings):
         return ConnectorProxy(
             image=self.connector_proxy_image.strip(),
             public_keys=(current, previous) if previous else (current,),
+            pull_policy=self.connector_proxy_image_pull_policy.strip() or None,
+            pull_secrets=tuple(
+                name.strip()
+                for name in self.connector_proxy_image_pull_secrets.split(",")
+                if name.strip()
+            ),
         )
 
     def valkey_dsn(self) -> str:
