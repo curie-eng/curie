@@ -124,8 +124,8 @@ async def _agent_with_channel(session: AsyncSession) -> uuid.UUID:
     )
     await session.execute(
         text(
-            "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
-            "VALUES (:id, :agent_id, 'slack', :address)"
+            "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+            "VALUES (:id, :agent_id, 'slack', :address, 'default')"
         ),
         {"id": uuid.uuid4(), "agent_id": agent_id, "address": ADDRESS},
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -39,6 +40,8 @@ from .workitems import (
     _terminalize_execution,
 )
 from .workspace_policy import repository_is_allowed
+
+logger = logging.getLogger(__name__)
 
 RefusalCode = Literal[
     "not_found",
@@ -267,12 +270,18 @@ async def _admission_refusal(
     if agent is None:
         return await _refuse(session, "not_found")
     # `facts` (a GitHub event's admission facts) names no adapter -- there is
-    # no such field on it -- so `adapter=None` is the whole request:
-    # `crud.binding_for_route` resolves it to the default Slack identity or
-    # the single row a non-Slack pair holds (ADR-0168 decision 3), which is
-    # what "no adapter to give" has always meant for a work item raised from a
-    # GitHub event.
-    binding = await crud.binding_for_route(session, facts.kind, None, facts.address)
+    # no such field on it -- so `adapter=None` is the whole request: the
+    # default Slack identity or the agent's single route on a non-Slack pair
+    # (ADR-0168 decision 3). Scoped to the agent, since another agent's route
+    # on the pair is not this work item's; two of this agent's routes on one
+    # pair are ambiguous, which admission refuses rather than picking one.
+    try:
+        binding = await crud.binding_for_route(
+            session, facts.kind, None, facts.address, agent_id=facts.agent_id
+        )
+    except crud.AmbiguousRoute:
+        logger.warning("work item admission for agent %s is ambiguous", facts.agent_id)
+        binding = None
     if binding is None or binding.agent_id != facts.agent_id:
         return await _refuse(session, "binding_missing")
     if not repository_is_allowed(
@@ -1437,18 +1446,26 @@ async def load_execute_wake(
         return None
     binding = None
     if request.reply_kind is not None and request.reply_address is not None:
-        # `ExecutionRequest` carries no `reply_adapter` column -- there is
-        # nothing for this caller to give -- so `adapter=None` is the whole
-        # request: the default Slack identity, or the single row a non-Slack
-        # pair holds (`crud.binding_for_route`, ADR-0168 decision 3), same as
-        # `_admission_refusal` above resolves the equivalent lookup from a
-        # GitHub event's facts. The `agent_id` check replaces the original
-        # query's `AgentChannel.agent_id ==` filter: a route belonging to a
-        # DIFFERENT agent reads as no binding, not this agent's wake target.
-        binding = await crud.binding_for_route(
-            session, request.reply_kind, None, request.reply_address
+        # `ExecutionRequest` carries no `reply_adapter` column, so the identity
+        # is decoded from the work item's own key, the same source the
+        # terminate wake uses (ADR-0168 decisions 3 and 4), and the lookup is
+        # scoped to the work item's agent: a route belonging to a DIFFERENT
+        # agent reads as no binding, not this agent's wake target.
+        adapter = await legacy_route_adapter_of(
+            session, work_item.agent_id, work_item.conversation_id
         )
-        if binding is not None and binding.agent_id != work_item.agent_id:
+        try:
+            binding = await crud.binding_for_route(
+                session,
+                request.reply_kind,
+                adapter,
+                request.reply_address,
+                agent_id=work_item.agent_id,
+            )
+        except crud.AmbiguousRoute:
+            logger.warning(
+                "execute wake for request %s names an ambiguous route", request.id
+            )
             binding = None
     return request, work_item, binding
 
