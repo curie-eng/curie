@@ -529,8 +529,10 @@ def test_leaseless_claim_is_reclaimed_once_its_start_is_a_lease_old(
 
 
 def test_leaseless_claim_inside_a_lease_of_its_start_is_not_reclaimed(
-    sync_redis: redis.Redis, names: dict[str, str]
+    sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
+
     async def body() -> None:
         async with _seed() as seed:
             previous = seed.slot - timedelta(days=1)
@@ -549,6 +551,7 @@ def test_leaseless_claim_inside_a_lease_of_its_start_is_not_reclaimed(
                 (previous, None),
                 (seed.slot, "skipped"),
             ]
+            assert fires == [_fire_labels("skipped")]
 
     asyncio.run(body())
 
