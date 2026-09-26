@@ -926,6 +926,30 @@ const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 /// secret classifier below all read the one key.
 const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
 
+/// Secret and key *names* the SRE example installer records on
+/// `grafanaConnector`. None of these leaves holds a credential value: the
+/// token stays in the Kubernetes Secret those names point at.
+///
+/// A plain `cluster up` copies live operator values forward, then skips any
+/// key [`is_secret_value_key`] matches so a password cannot ride on argv.
+/// These names contain "secret", "key", "token", or "password", so that skip
+/// deleted `adminSecretName`, `secretName`, and `secretKey` from an sre-bot
+/// release and left every other `grafanaConnector` leaf in place (#2921).
+/// The same skip would drop `adminUserKey`, `adminPasswordKey`, and
+/// `tokenName` the moment an install records them.
+const GRAFANA_CONNECTOR_REFERENCE_KEYS: &[&str] = &[
+    "grafanaConnector.adminSecretName",
+    "grafanaConnector.adminUserKey",
+    "grafanaConnector.adminPasswordKey",
+    "grafanaConnector.tokenName",
+    "grafanaConnector.secretName",
+    "grafanaConnector.secretKey",
+];
+
+fn is_grafana_connector_reference_key(key: &str) -> bool {
+    GRAFANA_CONNECTOR_REFERENCE_KEYS.contains(&key)
+}
+
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
@@ -1196,6 +1220,33 @@ fn resolve_preserved_slack_trusted_origins_value(
     }
 }
 
+/// Carry recorded Grafana connector Secret and key names into a later plain
+/// `cluster up` (issue #2921).
+///
+/// The example installer writes them with `helm upgrade --reuse-values`. `up`
+/// is a full upgrade, and the live-value copy refuses secret-shaped key names,
+/// so a rerun that only changes the model dropped the three names the chart
+/// hook and the connector pods address. Re-supplied here, one leaf at a time,
+/// through `--set-string`: the values are names, not credentials, and an
+/// operator `--set` for one leaf still owns that leaf. Empty and absent
+/// records stay absent.
+fn resolve_preserved_grafana_connector_reference_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+    for key in GRAFANA_CONNECTOR_REFERENCE_KEYS {
+        if overridden.contains(*key) {
+            continue;
+        }
+        if let Some(value) = preserved_value(existing, key) {
+            opts.set_string
+                .push(format!("{key}={}", escape_helm_set_string_value(&value)));
+        }
+    }
+}
+
 fn resolve_preserved_runner_egress_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
@@ -1291,9 +1342,10 @@ fn is_retained_mail_key(key: &str) -> bool {
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
 /// [`resolve_preserved_runner_egress_values`],
-/// [`resolve_preserved_gvisor_mode_value`], and
-/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, which survive
-/// untouched.
+/// [`resolve_preserved_gvisor_mode_value`],
+/// [`resolve_preserved_slack_trusted_origins_value`], and
+/// [`resolve_preserved_grafana_connector_reference_values`] re-supply, which
+/// survive untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1318,6 +1370,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
+        || is_grafana_connector_reference_key(key)
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1362,9 +1415,14 @@ pub fn is_secret_value_key(key: &str) -> bool {
     // Most preserve-on-up keys are credentials, but an inferred gVisor posture
     // is ordinary safety configuration and must remain visible in `curie diff`.
     // A Slack trusted-origin list (issue #1897) is the same shape: it is
-    // operator-visible dev configuration -- hostnames, not a token -- and
+    // operator-visible dev configuration, hostnames rather than a token, and
     // masking it would hide the very value the operator opens `curie diff` to
-    // confirm survived the upgrade.
+    // confirm survived the upgrade. Grafana connector reference names (#2921)
+    // are the same kind of configuration: Secret and data-key names, not the
+    // token those names point at.
+    if is_grafana_connector_reference_key(key) {
+        return false;
+    }
     if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY && key != SLACK_TRUSTED_ORIGINS_KEY)
         || key == GITHUB_TOKEN_KEY
         || key == MODEL_CREDENTIAL_KEY
@@ -1963,6 +2021,7 @@ fn complete_up_opts_without_runner_egress(
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
+    resolve_preserved_grafana_connector_reference_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -2095,6 +2154,7 @@ fn overlay_family_is_managed(key: &str) -> bool {
         || key_is_or_descends_from(key, GVISOR_MODE_KEY)
         || key_is_or_descends_from(key, ALLOWED_EGRESS_KEY)
         || key_is_or_descends_from(key, SLACK_TRUSTED_ORIGINS_KEY)
+        || is_grafana_connector_reference_key(key)
         || key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY)
         || key_is_or_descends_from(key, "api.extraEnv")
         || key_is_or_descends_from(key, "dispatcher.extraEnv")
@@ -5209,6 +5269,200 @@ mod tests {
         assert!(
             !is_secret_value_key("worker.slackTrustedOrigins"),
             "the trusted-origin list is operator-visible configuration, not a credential"
+        );
+    }
+
+    fn grafana_reference_release() -> serde_json::Value {
+        serde_json::json!({
+            "grafanaConnector": {
+                "enabled": true,
+                "url": "http://grafana.observability.svc.cluster.local",
+                "namespace": "observability",
+                "adminSecretName": "acme-grafana-admin",
+                "adminUserKey": "admin-user",
+                "adminPasswordKey": "admin-password",
+                "tokenName": "acme-sre-token",
+                "secretName": "acme-grafana-connector",
+                "secretKey": "ACME_GRAFANA_TOKEN",
+                "restartDeploymentNames": ["curie-sre-bot-mcp-grafana", "curie-sre-bot-mcp-tempo"]
+            },
+            "rustfs": {"auth": {"secretKey": "do-not-print-this-password"}}
+        })
+    }
+
+    fn finish_recorded_up(
+        existing: Option<&serde_json::Value>,
+        set: Vec<String>,
+        set_string: Vec<String>,
+        overlay_live: bool,
+    ) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                retained_mail_values: None,
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                adopt: false,
+                no_expose: true,
+                set,
+                set_string,
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            existing,
+            None,
+            false,
+            overlay_live,
+        )
+        .unwrap()
+    }
+
+    fn helm_argv(opts: &UpOpts) -> String {
+        let (materialized, _guards) = up_commands(opts)[0].materialize_secret_files().unwrap();
+        materialized.argv().join(" ")
+    }
+
+    /// The names the example installer records are not credential values.
+    /// A plain `cluster up` must hand each one back, and must not print a
+    /// real store password that only shares the "secret"/"key" spelling.
+    #[test]
+    fn plain_up_re_supplies_grafana_connector_reference_names() {
+        let opts = finish_recorded_up(Some(&grafana_reference_release()), vec![], vec![], true);
+        let argv = helm_argv(&opts);
+        for assignment in [
+            "grafanaConnector.adminSecretName=acme-grafana-admin",
+            "grafanaConnector.adminUserKey=admin-user",
+            "grafanaConnector.adminPasswordKey=admin-password",
+            "grafanaConnector.tokenName=acme-sre-token",
+            "grafanaConnector.secretName=acme-grafana-connector",
+            "grafanaConnector.secretKey=ACME_GRAFANA_TOKEN",
+        ] {
+            let rendered = format!("--set-string {assignment}");
+            assert_eq!(
+                argv.matches(rendered.as_str()).count(),
+                1,
+                "plain up must re-supply {assignment} exactly once: {argv}"
+            );
+        }
+        assert!(
+            argv.contains("--set grafanaConnector.enabled=true"),
+            "non-secret grafanaConnector leaves must still be copied: {argv}"
+        );
+        assert!(
+            argv.contains(
+                "--set-string grafanaConnector.restartDeploymentNames[0]=curie-sre-bot-mcp-grafana"
+            ),
+            "restart targets are not secret-shaped and must survive: {argv}"
+        );
+        assert!(
+            !argv.contains("do-not-print-this-password"),
+            "a real secretKey value must stay off the helm argv: {argv}"
+        );
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+        let shown = up_commands(&opts)[0].display();
+        assert!(
+            !shown.contains("do-not-print-this-password"),
+            "a real secretKey value must stay out of the displayed command: {shown}"
+        );
+    }
+
+    /// `apply` does not copy the live overlay, but these names are sibling-verb
+    /// state, same as a Slack origin list. The resolver has to run on that
+    /// path too, or the next apply repeats the drop.
+    #[test]
+    fn apply_path_re_supplies_grafana_connector_reference_names() {
+        let opts = finish_recorded_up(Some(&grafana_reference_release()), vec![], vec![], false);
+        let argv = helm_argv(&opts);
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretName=acme-grafana-connector"),
+            "apply must re-supply the recorded connector Secret name: {argv}"
+        );
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretKey=ACME_GRAFANA_TOKEN"),
+            "apply must re-supply the recorded connector Secret key: {argv}"
+        );
+        assert!(
+            !argv.contains("do-not-print-this-password"),
+            "apply must not move a store password onto argv: {argv}"
+        );
+    }
+
+    /// One leaf the operator sets on this run stays theirs. The other recorded
+    /// names still come back.
+    #[test]
+    fn explicit_grafana_connector_secret_name_overrides_the_recorded_value() {
+        let opts = finish_recorded_up(
+            Some(&grafana_reference_release()),
+            vec![],
+            vec!["grafanaConnector.secretName=operator-chosen-secret".into()],
+            true,
+        );
+        let argv = helm_argv(&opts);
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretName=operator-chosen-secret"),
+            "the operator secret name must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("acme-grafana-connector"),
+            "an explicit secret name must suppress the recorded one: {argv}"
+        );
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretKey=ACME_GRAFANA_TOKEN"),
+            "overriding one leaf must not drop the other recorded names: {argv}"
+        );
+    }
+
+    #[test]
+    fn up_invents_no_grafana_connector_reference_when_none_is_recorded() {
+        for existing in [
+            Some(serde_json::json!({
+                "grafanaConnector": {"secretName": "", "secretKey": ""}
+            })),
+            Some(serde_json::json!({})),
+            None,
+        ] {
+            let opts = finish_recorded_up(existing.as_ref(), vec![], vec![], true);
+            let argv = helm_argv(&opts);
+            assert!(
+                !argv.contains("grafanaConnector.secretName"),
+                "up must not supply a connector Secret name it has no record of: {argv}"
+            );
+            assert!(
+                !argv.contains("grafanaConnector.secretKey"),
+                "up must not supply a connector Secret key it has no record of: {argv}"
+            );
+        }
+    }
+
+    #[test]
+    fn grafana_connector_reference_names_are_preserved_and_never_masked() {
+        for key in GRAFANA_CONNECTOR_REFERENCE_KEYS {
+            assert!(
+                is_preserved_by_up(key),
+                "diff must not report a reset for {key}"
+            );
+            assert!(
+                !is_secret_value_key(key),
+                "{key} names a Secret or a data key; masking it hides the install"
+            );
+        }
+        assert!(
+            is_secret_value_key("rustfs.auth.secretKey"),
+            "a store password that only shares the spelling must stay masked"
+        );
+        assert!(
+            !is_preserved_by_up("rustfs.auth.secretKey"),
+            "a store password is not a Grafana connector reference"
         );
     }
 
