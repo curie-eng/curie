@@ -252,7 +252,8 @@ fn locked_schedule_list() -> serde_json::Value {
                         "schedule": "30 2 * * *",
                         "zone": "UTC",
                         "last_fire_at": "2026-09-25T02:30:00Z",
-                        "last_outcome": "failed"
+                        "last_outcome": "failed",
+                        "paused": false
                     }
                 ]
             }
@@ -501,6 +502,11 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "List" => SchedulesOutput::List(
                 serde_json::from_value::<ScheduleList>(locked_schedule_list()).unwrap(),
             ),
+            "Control" => SchedulesOutput::Control(curie::api::ScheduleControl {
+                agent: "acme-bot".to_string(),
+                name: "nightly-cleanup".to_string(),
+                paused: true,
+            }),
         ],
     );
     m.insert(

@@ -309,6 +309,17 @@ _LAST_SLOT_SQL = """
 SELECT max(slot_utc) FROM {schema}.hook_runs WHERE agent_id = :agent_id AND name = :name
 """
 
+_CONTROL_SQL = """
+SELECT paused_at, resume_from, generation FROM {schema}.schedule_controls
+WHERE agent_id = :agent_id AND name = :name
+"""
+
+_CLEAR_RESUME_SQL = """
+UPDATE {schema}.schedule_controls SET resume_from = NULL
+WHERE agent_id = :agent_id AND name = :name AND paused_at IS NULL
+  AND resume_from = :resume_from AND generation = :generation
+"""
+
 _SKIP_SQL = """
 INSERT INTO {schema}.hook_runs
        (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at)
@@ -413,6 +424,8 @@ class CronSchedulerLoop:
         self._in_flight_sql = text(_IN_FLIGHT_SQL.format(schema=db_schema))
         self._fail_run_sql = text(_FAIL_RUN_SQL.format(schema=db_schema))
         self._last_slot_sql = text(_LAST_SLOT_SQL.format(schema=db_schema))
+        self._control_sql = text(_CONTROL_SQL.format(schema=db_schema))
+        self._clear_resume_sql = text(_CLEAR_RESUME_SQL.format(schema=db_schema))
         self._skip_sql = text(_SKIP_SQL.format(schema=db_schema))
         self._deferred_sql = text(_DEFERRED_SQL.format(schema=db_schema))
         self._settle_deferred_sql = text(_SETTLE_DEFERRED_SQL.format(schema=db_schema))
@@ -484,9 +497,14 @@ class CronSchedulerLoop:
         return None if row is None else row[0]
 
     async def _window_start(
-        self, target: _Target, name: str, window_start: datetime, now: datetime
+        self,
+        target: _Target,
+        name: str,
+        window_start: datetime,
+        now: datetime,
+        resume_from: datetime | None,
     ) -> datetime:
-        """The pass window's start, reaching back to the hook's last slot.
+        """The pass window's start, reaching back to the last slot or resume.
 
         Whatever the start, it never passes the in-force deployment (a slot
         from before it belongs to whatever schedule was deployed then) or
@@ -500,10 +518,22 @@ class CronSchedulerLoop:
         start = window_start
         if isinstance(last, datetime) and last < start:
             start = last
+        if resume_from is not None and resume_from < start:
+            start = resume_from
         floor = now - _CATCH_UP_LOOKBACK
         if target.deployed_at is not None:
             floor = max(floor, target.deployed_at)
         return max(start, floor)
+
+    async def _control(
+        self, conn: AsyncConnection, target: _Target, name: str
+    ) -> tuple[datetime | None, datetime | None, int]:
+        """Read durable control state without caching it across passes."""
+
+        row = (
+            await conn.execute(self._control_sql, {"agent_id": target.agent_id, "name": name})
+        ).first()
+        return (None, None, 0) if row is None else (row[0], row[1], row[2])
 
     async def _skip(
         self, target: _Target, name: str, slots: list[datetime], summary: CronPassSummary
@@ -542,6 +572,7 @@ class CronSchedulerLoop:
         slot: datetime,
         now: datetime,
         summary: CronPassSummary,
+        defer_if_busy: bool,
     ) -> None:
         name = str(trigger["name"])
         if await self._is_killed(target.agent_id) or self._budget_spent(target):
@@ -560,9 +591,16 @@ class CronSchedulerLoop:
 
         async with self._engine.begin() as conn:
             await self._lock(conn, target, name)
+            paused_at, _, _ = await self._control(conn, target, name)
+            if paused_at is not None:
+                await self._insert(conn, target, name, slot, "deferred")
+                return
             if await self._blocked_by_in_flight(conn, target, name, slot, now):
-                await self._insert(conn, target, name, slot, "skipped")
-                summary.skipped += 1
+                await self._insert(
+                    conn, target, name, slot, "deferred" if defer_if_busy else "skipped"
+                )
+                if not defer_if_busy:
+                    summary.skipped += 1
                 return
             run_id = await self._insert(conn, target, name, slot, None)
         if run_id is None:
@@ -723,6 +761,11 @@ class CronSchedulerLoop:
                 continue
             async with self._engine.begin() as conn:
                 await self._lock(conn, target, name)
+                paused_at, _, _ = await self._control(conn, target, name)
+                if paused_at is not None:
+                    # The pause raced the pass. Leave the row deferred for a
+                    # later pass after resume.
+                    return
                 if await self._blocked_by_in_flight(conn, target, name, slot, now):
                     # Another fire of this hook is live; stay deferred until it
                     # settles or this slot ages out.
@@ -767,13 +810,34 @@ class CronSchedulerLoop:
                     continue
                 try:
                     zone = str(trigger.get("timezone") or "UTC")
+                    async with self._engine.connect() as conn:
+                        paused_at, resume_from, generation = await self._control(
+                            conn, target, str(name)
+                        )
+                    if paused_at is not None:
+                        continue
                     await self._retry_deferred(target, trigger, zone, now, summary)
-                    start = await self._window_start(target, str(name), window_start, now)
+                    start = await self._window_start(
+                        target, str(name), window_start, now, resume_from
+                    )
                     due = resolve_slots(str(schedule), zone, start, now)
                     fire, skipped = plan_catch_up(str(schedule), zone, due, now)
                     await self._skip(target, str(name), skipped, summary)
                     if fire is not None:
-                        await self._admit(target, trigger, fire, now, summary)
+                        await self._admit(
+                            target, trigger, fire, now, summary, resume_from is not None
+                        )
+                    if resume_from is not None:
+                        async with self._engine.begin() as conn:
+                            await conn.execute(
+                                self._clear_resume_sql,
+                                {
+                                    "agent_id": target.agent_id,
+                                    "name": str(name),
+                                    "resume_from": resume_from,
+                                    "generation": generation,
+                                },
+                            )
                 except Exception:
                     # Ends with this hook. The agent's other hooks, and every
                     # later agent, still run: the order is arbitrary.

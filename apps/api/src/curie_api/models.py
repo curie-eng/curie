@@ -1685,6 +1685,20 @@ class ConsoleSession(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class ScheduleControl(Base):
+    """Operator pause state for one agent and named cron hook."""
+
+    __tablename__ = "schedule_controls"
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    resume_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/schedules/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/schedules/v2.json",
   "title": "curie <tier> schedules --json",
   "description": "The agent-facing payload of `curie <tier> schedules`: the dry-run plan, or cron hooks on each in-force deployment. `last_outcome` is the newest slot value, or null when that slot is open or the hook has no row.",
   "$defs": {
@@ -62,6 +62,9 @@
               ]
             }
           ]
+        },
+        "paused": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -70,8 +73,19 @@
         "schedule",
         "zone",
         "last_fire_at",
-        "last_outcome"
+        "last_outcome",
+        "paused"
       ]
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": { "type": "string" },
+        "name": { "type": "string" },
+        "paused": { "type": "boolean" }
+      },
+      "required": ["agent", "name", "paused"]
     },
     "agent": {
       "type": "object",
@@ -107,6 +121,9 @@
   "oneOf": [
     {
       "$ref": "#/$defs/dryRun"
+    },
+    {
+      "$ref": "#/$defs/control"
     },
     {
       "type": "object",

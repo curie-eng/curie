@@ -307,7 +307,7 @@
       "result": "SchedulesOutput",
       "kind": "CliOutput",
       "schema": "schedules.schema.json",
-      "version": "1.0"
+      "version": "2.0"
     },
     {
       "result": "VersionsOutput",

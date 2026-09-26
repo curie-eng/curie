@@ -23,7 +23,13 @@ from ..auth import require_api_key
 from ..config import get_settings
 from ..db import SCHEMA
 from ..deps import SessionDep, StoreDep
-from ..schemas import AgentSchedulesOut, ScheduleHookOut, ScheduleListOut, ScheduleOutcome
+from ..schemas import (
+    AgentSchedulesOut,
+    ScheduleControlOut,
+    ScheduleHookOut,
+    ScheduleListOut,
+    ScheduleOutcome,
+)
 from ..storage import ObjectStore
 
 _OUTCOMES: dict[str, ScheduleOutcome] = {
@@ -61,6 +67,37 @@ SELECT DISTINCT ON (name)
 FROM {schema}.hook_runs
 WHERE agent_id = :agent_id
 ORDER BY name, slot_utc DESC
+"""
+
+_PAUSED_SQL = """
+SELECT name FROM {schema}.schedule_controls
+WHERE agent_id = :agent_id AND paused_at IS NOT NULL
+"""
+
+# Match the worker's per agent and hook admission lock. The lock and state
+# change share one transaction, so a pause cannot race an admitted fire.
+_LOCK_SQL = """
+SELECT pg_advisory_xact_lock(hashtextextended(CAST(:agent_id AS text) || ':' || :name, 0))
+"""
+
+_PAUSE_SQL = """
+INSERT INTO {schema}.schedule_controls (agent_id, name, paused_at, resume_from)
+VALUES (:agent_id, :name, now(), NULL)
+ON CONFLICT (agent_id, name) DO UPDATE
+SET paused_at = COALESCE(schedule_controls.paused_at, now()),
+    resume_from = schedule_controls.resume_from,
+    generation = schedule_controls.generation
+        + CASE WHEN schedule_controls.paused_at IS NULL THEN 1 ELSE 0 END
+"""
+
+_RESUME_SQL = """
+UPDATE {schema}.schedule_controls
+SET resume_from = CASE WHEN paused_at IS NULL THEN resume_from
+                       WHEN resume_from IS NULL THEN paused_at
+                       ELSE LEAST(resume_from, paused_at) END,
+    paused_at = NULL,
+    generation = generation + CASE WHEN paused_at IS NOT NULL THEN 1 ELSE 0 END
+WHERE agent_id = :agent_id AND name = :name
 """
 
 
@@ -131,6 +168,12 @@ async def _latest(
     return latest
 
 
+async def _paused(session: AsyncSession, agent_id: uuid.UUID) -> set[str]:
+    statement = text(_PAUSED_SQL.format(schema=SCHEMA))
+    rows = (await session.execute(statement, {"agent_id": agent_id})).all()
+    return {row[0] for row in rows}
+
+
 async def _hooks_for(
     store: ObjectStore,
     session: AsyncSession,
@@ -145,6 +188,7 @@ async def _hooks_for(
     except Exception:
         return [], _UNREADABLE
     latest = await _latest(session, agent_id)
+    paused = await _paused(session, agent_id)
     hooks: list[ScheduleHookOut] = []
     for name, schedule, zone in _cron_hooks(declared):
         slot = latest.get(name)
@@ -158,6 +202,7 @@ async def _hooks_for(
                 zone=zone,
                 last_fire_at=last_fire_at,
                 last_outcome=last_outcome,
+                paused=name in paused,
             )
         )
     return hooks, None
@@ -197,3 +242,48 @@ async def list_schedules(
         )
     listed.sort(key=lambda item: item.agent)
     return ScheduleListOut(schedules=listed)
+
+
+async def _named_hook(session: AsyncSession, store: ObjectStore, raw_agent: str, name: str) -> Any:
+    agent = await _resolve_agent(session, raw_agent)
+    rows = await _in_force(session, agent.id)
+    if not rows or rows[0]["bundle_ref"] is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
+    try:
+        data = await store.get(rows[0]["bundle_ref"])
+        declared = await run_in_threadpool(_read_triggers, data)
+    except Exception as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, _UNREADABLE) from exc
+    if name not in {hook_name for hook_name, _, _ in _cron_hooks(declared)}:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
+    return agent
+
+
+async def _change_pause(
+    session: AsyncSession, store: ObjectStore, raw_agent: str, name: str, *, pause: bool
+) -> ScheduleControlOut:
+    agent = await _named_hook(session, store, raw_agent, name)
+    params = {"agent_id": agent.id, "name": name}
+    await session.execute(text(_LOCK_SQL), {"agent_id": str(agent.id), "name": name})
+    statement = _PAUSE_SQL if pause else _RESUME_SQL
+    await session.execute(text(statement.format(schema=SCHEMA)), params)
+    await session.commit()
+    return ScheduleControlOut(agent=agent.name, name=name, paused=pause)
+
+
+@router.post("/{agent}/{name}/pause", response_model=ScheduleControlOut)
+async def pause_schedule(
+    agent: str, name: str, session: SessionDep, store: StoreDep
+) -> ScheduleControlOut:
+    """Pause a named cron hook without changing its in force bundle."""
+
+    return await _change_pause(session, store, agent, name, pause=True)
+
+
+@router.post("/{agent}/{name}/resume", response_model=ScheduleControlOut)
+async def resume_schedule(
+    agent: str, name: str, session: SessionDep, store: StoreDep
+) -> ScheduleControlOut:
+    """Resume a named cron hook with one bounded catch up opportunity."""
+
+    return await _change_pause(session, store, agent, name, pause=False)

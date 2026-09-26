@@ -2294,6 +2294,22 @@ enum LocalAction {
         /// Scope to one agent (name or id). Omit to list every deployed agent.
         #[arg(long, value_name = "NAME_OR_ID")]
         agent: Option<String>,
+        /// Pause one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "resume",
+            requires = "agent"
+        )]
+        pause: Option<String>,
+        /// Resume one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "pause",
+            requires = "agent"
+        )]
+        resume: Option<String>,
         #[arg(
             long,
             default_value = message::DEFAULT_LOCAL_API_URL,
@@ -3192,6 +3208,22 @@ enum ClusterAction {
         /// Scope to one agent (name or id). Omit to list every deployed agent.
         #[arg(long, value_name = "NAME_OR_ID")]
         agent: Option<String>,
+        /// Pause one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "resume",
+            requires = "agent"
+        )]
+        pause: Option<String>,
+        /// Resume one named cron hook on the selected agent.
+        #[arg(
+            long,
+            value_name = "HOOK",
+            conflicts_with = "pause",
+            requires = "agent"
+        )]
+        resume: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be requested and exit without making a request.
@@ -4602,6 +4634,8 @@ async fn run(command: Option<Command>) -> Result<()> {
             }),
             LocalAction::Schedules {
                 agent,
+                pause,
+                resume,
                 api_url,
                 api_key,
                 dry_run,
@@ -4610,6 +4644,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_url,
                     api_key,
                     agent,
+                    pause,
+                    resume,
                     dry_run,
                 })
                 .await?,
@@ -5998,6 +6034,8 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             ClusterAction::Schedules {
                 agent,
+                pause,
+                resume,
                 conn,
                 dry_run,
             } => {
@@ -6008,6 +6046,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_url,
                         api_key,
                         agent,
+                        pause,
+                        resume,
                         dry_run,
                     })
                     .await?,

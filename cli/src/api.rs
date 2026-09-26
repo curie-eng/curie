@@ -542,6 +542,14 @@ pub struct ScheduleHook {
     pub zone: String,
     pub last_fire_at: Option<String>,
     pub last_outcome: Option<String>,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleControl {
+    pub agent: String,
+    pub name: String,
+    pub paused: bool,
 }
 
 /// Scheduled hooks for one agent (`AgentSchedulesOut`).
@@ -2932,6 +2940,30 @@ impl ApiClient {
             .json()
             .await
             .context("decoding schedule list")
+    }
+
+    pub async fn control_schedule(
+        &self,
+        agent: &str,
+        name: &str,
+        pause: bool,
+    ) -> Result<ScheduleControl> {
+        let action = if pause { "pause" } else { "resume" };
+        let mut url = reqwest::Url::parse(&format!("{}/schedules", self.base_url))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("schedule URL cannot hold path segments"))?
+            .push(agent)
+            .push(name)
+            .push(action);
+        let request = self.http.post(url).header("X-API-Key", &self.api_key);
+        let response = self
+            .send_request(request, "POST /schedules control")
+            .await?;
+        Self::expect_ok(response, "changing schedule control")
+            .await?
+            .json()
+            .await
+            .context("decoding schedule control")
     }
 
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.

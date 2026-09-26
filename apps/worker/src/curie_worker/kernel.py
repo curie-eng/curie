@@ -1062,6 +1062,10 @@ class CatchUpExpired(ThreadBusyError):
     """A deferred cron slot's retry reached its start after its catch-up bound."""
 
 
+class HookPaused(ThreadBusyError):
+    """An operator paused the cron hook before the runner accepted its turn."""
+
+
 class PendingPublicationError(ThreadBusyError):
     """A thread-owned publication must settle before another turn can start."""
 
@@ -2555,8 +2559,13 @@ class Kernel:
                         return
                     if (
                         qevent.source is TurnSource.CRON
-                        and not targetless
-                        and isinstance(busy, (LiveSessionBusy, CatchUpExpired))
+                        and (
+                            isinstance(busy, HookPaused)
+                            or (
+                                not targetless
+                                and isinstance(busy, (LiveSessionBusy, CatchUpExpired))
+                            )
+                        )
                     ):
                         # ADR-0099 Concurrency and idle (#2929): the busy read ran
                         # under the per-thread lock. Record the fire deferred and
@@ -4463,6 +4472,23 @@ class Kernel:
             # its response context.
             turn.close()
 
+    async def _start_turn_under_hook_control(
+        self, handle: SandboxHandle, event: Event, remaining_s: float | None
+    ) -> TurnStream:
+        """Serialize runner admission with the operator pause action."""
+
+        carry = _HOOK_RUN_CARRY.get()
+        if carry is not None and carry.recorder is not None and carry.ref is not None:
+            async with carry.recorder.start_guard(carry.ref) as allowed:
+                if not allowed:
+                    raise HookPaused("cron hook paused before runner start")
+                return await self._runner.start_turn(
+                    handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+                )
+        return await self._runner.start_turn(
+            handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+        )
+
     async def _route_attachment_and_start(
         self,
         qevent: QueuedTurn,
@@ -4688,11 +4714,8 @@ class Kernel:
                                 run=self._run_for_event(qevent.event_id),
                                 remaining_s=remaining_s,
                             )
-                            turn = await self._runner.start_turn(
-                                handle.base_url,
-                                event,
-                                token=handle.token or None,
-                                remaining_s=remaining_s,
+                            turn = await self._start_turn_under_hook_control(
+                                handle, event, remaining_s
                             )
                         except BaseException:
                             self._unregister_run(agent_id, thread_key)
@@ -5277,9 +5300,7 @@ class Kernel:
                 run=run,
                 remaining_s=remaining_s,
             )
-            turn = await self._runner.start_turn(
-                handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
-            )
+            turn = await self._start_turn_under_hook_control(handle, event, remaining_s)
         except BaseException:
             self._unregister_run(agent_id, thread_key)
             raise

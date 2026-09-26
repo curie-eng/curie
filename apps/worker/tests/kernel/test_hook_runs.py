@@ -239,6 +239,77 @@ def test_cron_retry_past_its_catch_up_bound_records_skipped(
     asyncio.run(go())
 
 
+def test_queued_cron_fire_is_rejected_after_operator_pause(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """A fire already in the stream must not start after pause commits."""
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            async with run.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.schedule_controls "
+                        "(agent_id, name, paused_at) VALUES (:agent_id, :name, now())"
+                    ),
+                    {"agent_id": run.agent_id, "name": run.ref.name},
+                )
+            await h.kernel.process_event(_event(hook_run=run.ref))
+
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
+            assert ended_at is not None
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_pause_during_claim_rejects_the_cron_turn_before_runner_start(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """A pause after the entry read still prevents the pending runner start."""
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original = h.kernel._claim_or_resume
+
+            async def held_claim(*args: object, **kwargs: object) -> object:
+                entered.set()
+                await release.wait()
+                return await original(*args, **kwargs)
+
+            h.kernel._claim_or_resume = held_claim
+            task = asyncio.create_task(h.kernel.process_event(_event(hook_run=run.ref)))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                async with run.engine.begin() as conn:
+                    await conn.execute(
+                        text(
+                            "INSERT INTO curie.schedule_controls "
+                            "(agent_id, name, paused_at) VALUES (:agent_id, :name, now())"
+                        ),
+                        {"agent_id": run.agent_id, "name": run.ref.name},
+                    )
+            finally:
+                release.set()
+            await task
+
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
+            assert ended_at is not None
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
 def test_cron_retry_whose_bound_runs_out_during_the_claim_records_skipped(
     make_harness,
     make_hook_run,
