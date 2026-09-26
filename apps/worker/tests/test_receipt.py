@@ -65,6 +65,7 @@ def test_uncertain_bash_calls_are_counted_without_guessing_their_effects() -> No
             {"command": "sed -i 's/a/b/' file"},
             {"command": "git diff --output=report.txt"},
             {"command": "cat $(touch marker)"},
+            {"command": "rg --pre rm x ."},
         )
     ]
 
@@ -72,8 +73,26 @@ def test_uncertain_bash_calls_are_counted_without_guessing_their_effects() -> No
 
     assert receipt is not None
     assert receipt.count("Bash") == 1
-    assert "5 Bash calls" in receipt
+    assert "6 Bash calls" in receipt
     assert "changes not described" in receipt
+
+
+def test_large_bash_result_joins_the_generic_call_count() -> None:
+    receipt = render_receipt(
+        [
+            _action(
+                tool="Bash",
+                undoable=False,
+                result=None,
+                detail="tool result too large to record",
+            ),
+            _action(tool="Bash", undoable=False, result=None),
+        ]
+    )
+
+    assert receipt is not None
+    assert "2 Bash calls" in receipt
+    assert receipt.count("Bash") == 1
 
 
 def test_repeated_bash_noise_keeps_meaningful_summary_and_failure() -> None:

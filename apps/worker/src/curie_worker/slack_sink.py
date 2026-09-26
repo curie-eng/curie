@@ -201,6 +201,7 @@ def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
 _EDIT_MAX_BYTES = 4000
 _CUT_NOTE = "\n…\n_(Cut here: Slack refuses a longer edit.)_"
 _RECEIPT_HEADER = "\n\n_What I changed:_\n"
+_RECEIPT_EDIT_MAX_BYTES = 2500
 
 
 def _fit_edit(text: str) -> str:
@@ -216,8 +217,12 @@ def _fit_edit(text: str) -> str:
     suffix = separator + receipt if separator else ""
     if not separator:
         answer = text
-    if len(suffix.encode("utf-8")) >= _EDIT_MAX_BYTES - len(_CUT_NOTE.encode("utf-8")):
-        answer, suffix = text, ""
+    if len(suffix.encode("utf-8")) > _RECEIPT_EDIT_MAX_BYTES:
+        marker = "\n• …more receipt details omitted"
+        allowed = _RECEIPT_EDIT_MAX_BYTES - len(marker.encode("utf-8"))
+        kept = suffix.encode("utf-8")[:allowed].decode("utf-8", "ignore")
+        line_end = kept.rfind("\n")
+        suffix = kept[:line_end] + marker
     budget = _EDIT_MAX_BYTES - len(_CUT_NOTE.encode("utf-8")) - len(suffix.encode("utf-8"))
     head = answer.encode("utf-8")[:budget].decode("utf-8", "ignore")
     line_end = head.rfind("\n")

@@ -36,12 +36,17 @@ _MAX_LINES = 10
 # explained itself are both not-undoable, and flattening them to one line would
 # hide which happened.
 _UNDECLARED = "cannot be undone: nothing reported a prior state"
-_GENERIC_BASH_DETAILS = {None, "non-idempotent tool completed", "non-idempotent tool executed"}
+_GENERIC_BASH_DETAILS = {
+    None,
+    "non-idempotent tool completed",
+    "non-idempotent tool executed",
+    "tool result too large to record",
+}
 _READ_ONLY_COMMANDS = (
     r"pwd",
     r"ls(?: -[alh]+)?(?: [\w./-]+)*",
     r"cat [\w./-]+(?: [\w./-]+)*",
-    r"rg(?: -[nSi]+)? [\w./:-]+(?: [\w./-]+)*",
+    r"rg(?: -[nSi]+)? [\w./:][\w./:-]*(?: [\w./][\w./-]*)*",
     r"sed -n '[0-9,$]+p' [\w./-]+",
     r"git status(?: --short)?",
     r"git diff(?: --stat)?",

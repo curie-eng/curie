@@ -957,6 +957,16 @@ def test_a_long_edit_keeps_the_action_receipt_with_the_answer() -> None:
     assert sent.endswith(receipt)
 
 
+def test_an_oversized_receipt_stays_in_the_long_edit_with_an_omission_notice() -> None:
+    receipt = "_What I changed:_\n" + ("• " + "é" * 300 + "\n") * 10
+    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long answer.")
+    assert "_What I changed:_" in sent
+    assert sent.endswith("more receipt details omitted")
+
+
 def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
     line = "• called `a_tool` — non-idempotent tool completed\n"
     text = line * 78  # 3,900 characters: under the limit counted as characters
