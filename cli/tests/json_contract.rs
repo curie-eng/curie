@@ -2332,6 +2332,7 @@ fn approvals_output_validates_all_variants() {
     let pending = ApprovalsOutput::Pending {
         agent: "d".to_string(),
         records: vec![approval_record()],
+        routes: Default::default(),
         truncated: false,
     };
     assert_valid("approvals.schema.json", &pending.to_json());

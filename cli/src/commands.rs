@@ -6891,6 +6891,9 @@ pub enum ApprovalsOutput {
     Pending {
         agent: String,
         records: Vec<crate::api::ApprovalRecord>,
+        /// Current route bindings fetched with the agent for this list read.
+        /// These are display context, never a snapshot of resolve authority.
+        routes: BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
         /// `true` when `records.len()` hit the server's page-size cap
         /// (`ApiClient::APPROVALS_LIST_LIMIT`), meaning more pending approvals
         /// may exist beyond what was fetched (#670). Always present (never
@@ -6950,6 +6953,22 @@ fn approval_record_json(r: &crate::api::ApprovalRecord) -> serde_json::Value {
     })
 }
 
+fn pending_approval_record_json(
+    record: &crate::api::ApprovalRecord,
+    routes: &BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
+) -> serde_json::Value {
+    let mut row = approval_record_json(record);
+    let current_route_approvers = record
+        .route
+        .as_ref()
+        .and_then(|route| routes.get(route))
+        .and_then(|binding| binding.approvers.as_ref());
+    // This reports the route configuration observed when listing. The API
+    // reads the binding again when an actor attempts to resolve the approval.
+    row["current_route_approvers"] = serde_json::json!(current_route_approvers);
+    row
+}
+
 impl crate::ui::CliOutput for ApprovalsOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -6966,10 +6985,11 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             ApprovalsOutput::Pending {
                 agent,
                 records,
+                routes,
                 truncated,
             } => serde_json::json!({
                 "agent": agent,
-                "pending": records.iter().map(approval_record_json).collect::<Vec<_>>(),
+                "pending": records.iter().map(|record| pending_approval_record_json(record, routes)).collect::<Vec<_>>(),
                 "count": records.len(),
                 "truncated": truncated,
             }),
@@ -7031,6 +7051,7 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             ApprovalsOutput::Pending {
                 agent,
                 records,
+                routes,
                 truncated,
             } => {
                 if records.is_empty() {
@@ -7056,10 +7077,20 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                             .as_deref()
                             .filter(|c| !c.is_empty())
                             .unwrap_or("(requesting channel)");
+                        let approvers = match r.route.as_deref() {
+                            Some(route) => routes.get(route).map_or_else(
+                                || {
+                                    "route binding missing; restore it before resolution"
+                                        .to_string()
+                                },
+                                describe_approvers,
+                            ),
+                            None => format!("members of {card} (routeless default)"),
+                        };
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{} — {} [tool: {tool}, route: {route}, channel: {card}, by: {}]",
+                                "{}: {} [tool: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
                                 r.summary, r.conversation_id, r.author
                             ),
                         );
@@ -7633,6 +7664,7 @@ pub async fn approvals(
         return Ok(ApprovalsOutput::Pending {
             agent: agent.name,
             records,
+            routes: agent.approval_routes.unwrap_or_default(),
             truncated,
         });
     }

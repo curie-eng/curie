@@ -420,6 +420,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Pending" => ApprovalsOutput::Pending {
                 agent: "a".to_string(),
                 records: vec![approval_record()],
+                routes: Default::default(),
                 truncated: false,
             },
             "Resolved" => ApprovalsOutput::Resolved { record: approval_record() },
