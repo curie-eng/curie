@@ -22,8 +22,8 @@ import json
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Sequence
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
@@ -110,6 +110,47 @@ def _str(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _fresh_ci_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
+    """Keep only checks and statuses created for the metadata revision."""
+
+    return replace(
+        detail,
+        check_runs=[
+            run
+            for run in detail.check_runs
+            if (started := _github_time(run.get("started_at"))) is not None
+            and started > fresh_after
+        ],
+        statuses=[
+            item
+            for item in detail.statuses
+            if (created := _github_time(item.get("created_at"))) is not None
+            and created > fresh_after
+        ],
+    )
+
+
+_METADATA_EDIT_CHECKS = frozenset({"PR body (real newlines)", "Fix pin verification"})
+
+
+def _metadata_revision_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
+    fresh = _fresh_ci_detail(detail, fresh_after)
+    fresh_names = {run.get("name") for run in fresh.check_runs}
+    fresh_contexts = {item.get("context") for item in fresh.statuses}
+    return replace(
+        detail,
+        check_runs=fresh.check_runs + [
+            run for run in detail.check_runs
+            if run.get("name") not in fresh_names
+            and run.get("name") not in _METADATA_EDIT_CHECKS
+        ],
+        statuses=fresh.statuses + [
+            item for item in detail.statuses
+            if item.get("context") not in fresh_contexts
+        ],
+    )
+
+
 def decide(
     detail: CiDetail,
     *,
@@ -118,6 +159,7 @@ def decide(
     execution_deadline: datetime,
     ci_wait_seconds: int,
     prior_round_had_checks: bool = False,
+    fresh_after: datetime | None = None,
 ) -> Verdict:
     """The CI verdict for one observation. Pure: time is an argument."""
 
@@ -130,9 +172,44 @@ def decide(
                 return Verdict(kind="timed_out", reason=reason)
             return Verdict(kind="pending", reason=reason)
         return Verdict(kind="unverified", reason=reason)
+    check_runs = detail.check_runs
+    statuses = detail.statuses
+    if fresh_after is not None:
+        fresh = _fresh_ci_detail(detail, fresh_after)
+        fresh_runs, fresh_statuses = fresh.check_runs, fresh.statuses
+        fresh_names = {run.get("name") for run in fresh_runs}
+        missing_rerun = any(
+            run.get("name") in _METADATA_EDIT_CHECKS
+            and run.get("name") not in fresh_names
+            for run in check_runs
+        )
+        fresh_failure = any(
+            run.get("status") == "completed"
+            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            for run in fresh_runs
+        ) or any(item.get("state") in _FAILING_STATES for item in fresh_statuses)
+        unchanged_failure = any(
+            run.get("name") not in _METADATA_EDIT_CHECKS
+            and run.get("status") == "completed"
+            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            for run in check_runs
+        ) or any(item.get("state") in _FAILING_STATES for item in statuses)
+        if (
+            not fresh_failure
+            and not unchanged_failure
+            and (missing_rerun or not fresh_runs and not fresh_statuses)
+        ):
+            return Verdict(
+                kind="unverified" if expired else "pending",
+                reason="checks_not_rerun" if expired else "checks_awaiting_metadata_rerun",
+            )
+        # A PR metadata edit reruns body checks, but it does not rerun the main
+        # suite on the unchanged commit. Keep its passing or pending evidence.
+        effective = _metadata_revision_detail(detail, fresh_after)
+        check_runs, statuses = effective.check_runs, effective.statuses
     failing: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
-    for run in detail.check_runs:
+    for run in check_runs:
         name, status, conclusion = _str(run.get("name")), run.get("status"), run.get("conclusion")
         if status != "completed":
             pending.append({"name": name, "status": _str(status)})
@@ -141,7 +218,7 @@ def decide(
         elif conclusion not in _PASSING_CONCLUSIONS:
             # ``stale`` (and anything unrecognised) waits for a fresh conclusion.
             pending.append({"name": name, "status": _str(conclusion)})
-    for status_item in detail.statuses:
+    for status_item in statuses:
         context, state = _str(status_item.get("context")), status_item.get("state")
         if state in _FAILING_STATES:
             failing.append({"context": context, "state": _str(state)})
@@ -150,7 +227,7 @@ def decide(
     if failing:
         # Fail fast: the whole budget is what remains of the execution deadline.
         return Verdict(kind="failing", failing=failing, pending=pending)
-    if not detail.check_runs and not detail.statuses:
+    if not check_runs and not statuses:
         in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
         if in_grace and not expired:
             return Verdict(kind="pending")
@@ -163,6 +240,16 @@ def decide(
     if pending:
         return Verdict(kind="timed_out" if expired else "pending", pending=pending)
     return Verdict(kind="green")
+
+
+def _github_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
 
 
 # --- text -----------------------------------------------------------------------------
@@ -463,18 +550,24 @@ async def gate(
     latest = facts.publications[-1]
     observed_sha = lineage.head_sha
     detail = await workitem_outcomes.observe_ci_detail(lineage, work_item, settings, client)
+    metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
+    fresh_after = latest.metadata_updated_at if metadata_only else None
     async with sessionmaker() as session:
         now = await workitems._database_now(session)
         await session.rollback()
     head_sha = detail.head_sha or observed_sha or ""
-    verdict = decide(
-        detail,
-        now=now,
-        published_at=facts.published_at,
-        execution_deadline=request.execution_deadline,
-        ci_wait_seconds=settings.github_factory_ci_wait_s,
-        prior_round_had_checks=round_ > 1,
-    )
+    if metadata_only and fresh_after is None:
+        verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
+    else:
+        verdict = decide(
+            detail,
+            now=now,
+            published_at=facts.published_at,
+            execution_deadline=request.execution_deadline,
+            ci_wait_seconds=settings.github_factory_ci_wait_s,
+            prior_round_had_checks=round_ > 1,
+            fresh_after=fresh_after,
+        )
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"
@@ -491,7 +584,12 @@ async def gate(
             head_sha=head_sha,
             round_=round_ + 1,
             text=continuation_text(
-                _issue_url(settings, work_item), pr_url or "", head_sha, round_ + 1, detail
+                _issue_url(settings, work_item),
+                pr_url or "",
+                head_sha,
+                round_ + 1,
+                _metadata_revision_detail(detail, fresh_after)
+                if fresh_after is not None else detail,
             ),
             owner=owner,
             now=now,

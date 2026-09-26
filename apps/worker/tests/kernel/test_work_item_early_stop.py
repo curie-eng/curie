@@ -444,6 +444,39 @@ def test_a_publication_is_held_for_approval_and_never_finished(
     asyncio.run(exercise())
 
 
+def test_failed_publication_approval_finishes_factory_request_immediately(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_worker.approvals import ApprovalBackendError
+
+    class FailedPublicationApi(_PublicationApi):
+        async def create_publication(self, request: object) -> object:
+            self.creates.append(request)
+            raise ApprovalBackendError("publication snapshot failed")
+
+    async def exercise() -> None:
+        publications = FailedPublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            )
+            assert len(publications.creates) == 1
+            assert [finish["cause"] for finish in items.finishes] == [
+                "approval_create_failed"
+            ]
+            assert "hold_for_approval" not in items.calls
+
+    asyncio.run(exercise())
+
+
 # --- W4: bounded to one ------------------------------------------------------------
 
 

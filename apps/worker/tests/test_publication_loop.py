@@ -8,6 +8,8 @@ import logging
 import os
 import threading
 import uuid
+from dataclasses import replace
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -179,6 +181,7 @@ class _Store:
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         self.completed[publication_id] = (outcome, pr_url)
         if outcome == "failed" and error is not None:
@@ -593,11 +596,15 @@ def _work(
         branch=LINEAGE_BRANCH,
         pr_number=None,
         pr_url=None,
+        github_repository_id=None,
+        github_pr_node_id=None,
         expected_prior_head=PRIOR_HEAD,
         expected_remote_head=None,
         base_sha="a" * 40,
         patch=b"diff --git a/README.md b/README.md\n",
         changed_paths=("README.md",),
+        observed_title_sha256=None,
+        observed_body_sha256=None,
         title="Update repository",
         body="Approved platform publication.",
         target=_target(kind),
@@ -633,11 +640,15 @@ def _lineage_work(
         branch=LINEAGE_BRANCH,
         pr_number=pr_number,
         pr_url=pr_url,
+        github_repository_id=9001 if pr_number is not None else None,
+        github_pr_node_id="PR_example_123" if pr_number is not None else None,
         expected_prior_head=expected_prior_head,
         expected_remote_head=(expected_prior_head if pr_number is not None else None),
         base_sha=expected_prior_head or PRIOR_HEAD,
         patch=b"diff --git a/README.md b/README.md\n",
         changed_paths=("README.md",),
+        observed_title_sha256=None,
+        observed_body_sha256=None,
         title="Update repository",
         body="Approved platform publication.",
         target=_target(),
@@ -2517,8 +2528,47 @@ async def test_lineage_advance_carries_the_publication_lease_fence(
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": REVISION_HEAD,
+            "metadata_updated_at": None,
         }
     ]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_metadata_only_job_forwards_update_marker_to_lineage_authority(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    import hashlib
+
+    original = _lineage_work(publication)
+    work = replace(
+        original,
+        patch=b"",
+        changed_paths=(),
+        observed_title_sha256=hashlib.sha256(original.title.encode()).hexdigest(),
+        observed_body_sha256=hashlib.sha256(original.body.encode()).hexdigest(),
+    )
+    cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
+    github.head_sha = PRIOR_HEAD
+    marker_time = datetime.fromisoformat("2026-09-25T12:34:56+00:00")
+    cluster.observation = publication.PublicationJobObservation(
+        phase="succeeded",
+        pr_url=PR_URL,
+        pr_number=123,
+        commit_sha=PRIOR_HEAD,
+        logs=(
+            f"CURIE_PR_UPDATED_AT={marker_time.isoformat()}\n"
+            f"CURIE_PR_URL={PR_URL}\n"
+            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={PRIOR_HEAD}\n"
+        ),
+    )
+
+    await loop.reconcile(work)
+
+    assert len(lineage.advances) == 1
+    assert lineage.advances[0]["head_sha"] == PRIOR_HEAD
+    assert lineage.advances[0]["metadata_updated_at"] == marker_time
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
 
 

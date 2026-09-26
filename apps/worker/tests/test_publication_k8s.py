@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import json
 import os
@@ -72,6 +73,10 @@ def _payload(module: Any, patch: bytes = b"diff --git a/a b/a\n") -> Any:
         pr_url=None,
         title="Update repository",
         body="Approved platform publication.",
+        observed_title_sha256=None,
+        observed_body_sha256=None,
+        github_repository_id=9001 if not patch else None,
+        github_pr_node_id="PR_example_123" if not patch else None,
     )
 
 
@@ -104,6 +109,10 @@ def _lineage_resources(module: Any) -> Any:
         pr_url="https://github.com/acme-corp/acme-bot/pull/123",
         title="Update repository",
         body="Approved platform publication.",
+        observed_title_sha256=None,
+        observed_body_sha256=None,
+        github_repository_id=9001,
+        github_pr_node_id="PR_example_123",
     )
     return module.build_publication_resources(
         payload,
@@ -386,6 +395,10 @@ def test_lineage_revision_payload_rejects_checkout_and_expected_head_disagreemen
         pr_url="https://github.com/acme-corp/acme-bot/pull/123",
         title="Update repository",
         body="Approved platform publication.",
+        observed_title_sha256=None,
+        observed_body_sha256=None,
+        github_repository_id=9001,
+        github_pr_node_id="PR_example_123",
     )
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="expected prior head"):
@@ -429,11 +442,13 @@ def _pull_response(
         head_payload["sha"] = head_sha
     return {
         "number": number,
+        "node_id": "PR_example_123",
         "html_url": url,
         "state": state,
         "merged": merged,
         "title": "Update repository",
         "body": "Approved platform publication.",
+        "updated_at": "2026-09-25T21:00:00Z",
         "head": head_payload,
         "base": {"ref": base, "repo": {"full_name": "acme-corp/acme-bot"}},
     }
@@ -452,6 +467,7 @@ class _GitHubApiHandler(BaseHTTPRequestHandler):
     queued_responses: list[tuple[int, dict[str, str], Any]] = []
     requests: list[tuple[str, str | None]] = []
     post_count = 0
+    patch_bodies: list[dict[str, Any]] = []
 
     def _respond(self) -> None:
         type(self).requests.append((self.path, self.headers.get("Authorization")))
@@ -477,6 +493,11 @@ class _GitHubApiHandler(BaseHTTPRequestHandler):
         self.rfile.read(content_length)
         self._respond()
 
+    def do_PATCH(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        type(self).patch_bodies.append(json.loads(self.rfile.read(content_length)))
+        self._respond()
+
     def log_message(self, _format: str, *args: object) -> None:
         return
 
@@ -499,9 +520,11 @@ def _run_github_guard(
     credential.write_text(WRITE_CREDENTIAL)
     facts = tmp_path / "pr-facts.json"
     expected_head = expected_head or (
-        PRIOR_HEAD if mode == "pre-push" else REVISION_HEAD
+        PRIOR_HEAD if mode in {"pre-push", "metadata-only"} else REVISION_HEAD
     )
     prepared = deepcopy(responses)
+    if prepared and isinstance(prepared[0][2], dict):
+        prepared[0][2].setdefault("id", 9001)
     for _status, _headers, payload in prepared:
         rows = payload if isinstance(payload, list) else [payload]
         for row in rows:
@@ -510,6 +533,7 @@ def _run_github_guard(
     _GitHubApiHandler.queued_responses = prepared
     _GitHubApiHandler.requests = []
     _GitHubApiHandler.post_count = 0
+    _GitHubApiHandler.patch_bodies = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GitHubApiHandler)
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -534,6 +558,274 @@ def _run_github_guard(
         thread.join()
         server.server_close()
     return completed, list(_GitHubApiHandler.requests)
+
+
+def test_body_only_revision_updates_stored_pull_without_a_commit_or_push(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    # GitHub documents PATCH /repos/{owner}/{repo}/pulls/{pull_number} with
+    # title and body fields and a 200 response:
+    # https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request
+    payload = replace(_payload(publication_k8s, b""),
+        revision_number=2, base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD, expected_remote_head=PRIOR_HEAD,
+        pr_number=123, pr_url="https://github.com/acme-corp/acme-bot/pull/123",
+        body="Corrected body for CI.\n",
+        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
+        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
+    )
+    assert _job_env(resources)["EXPECTED_GITHUB_REPOSITORY_ID"] == "9001"
+    assert _job_env(resources)["EXPECTED_GITHUB_PR_NODE_ID"] == "PR_example_123"
+    old_pull = _pull_response()
+    updated_pull = {**old_pull, "body": payload.body}
+    completed, requests = _run_github_guard(
+        tmp_path, resources, mode="metadata-only",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, old_pull),
+            (200, {}, updated_pull),
+        ],
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "CURIE_PR_UPDATED_AT=2026-09-25T21:00:00+00:00" in completed.stdout
+    assert _GitHubApiHandler.patch_bodies == [{"body": payload.body}]
+    assert requests[-1][0] == "/repos/acme-corp/acme-bot/pulls/123"
+    script = resources.config_map["data"]["publish.sh"]
+    assert 'if [[ ! -s "$patch_path" ]]; then' in script
+    assert 'echo "CURIE_COMMIT_SHA=$BASE_SHA"' in script
+    assert script.index('echo "CURIE_COMMIT_SHA=$BASE_SHA"') < script.index('git_with_timeout push')
+
+
+@pytest.mark.parametrize(
+    ("repository_id", "pr_node_id"),
+    [(9002, "PR_example_123"), (9001, "PR_other_123")],
+)
+def test_metadata_revision_refuses_changed_immutable_github_identity_before_patch(
+    publication_k8s: Any,
+    tmp_path: Path,
+    repository_id: int,
+    pr_node_id: str,
+) -> None:
+    # GitHub REST returns repository id and pull request node_id:
+    # https://docs.github.com/en/rest/repos/repos#get-a-repository
+    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    payload = replace(
+        _payload(publication_k8s, b""),
+        revision_number=2,
+        base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD,
+        expected_remote_head=PRIOR_HEAD,
+        pr_number=123,
+        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
+        body="Corrected body for CI.\n",
+        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
+        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
+    )
+    current_pull = {**_pull_response(), "node_id": pr_node_id}
+    completed, _ = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="metadata-only",
+        responses=[
+            (200, {}, {"id": repository_id, "default_branch": "main"}),
+            (200, {}, current_pull),
+            (200, {}, {**current_pull, "body": payload.body}),
+        ],
+    )
+    assert completed.returncode != 0
+    assert "identity" in completed.stderr
+    assert _GitHubApiHandler.patch_bodies == []
+
+
+@pytest.mark.parametrize("missing", ["github_repository_id", "github_pr_node_id"])
+def test_metadata_revision_requires_stored_immutable_github_identity(
+    publication_k8s: Any, missing: str
+) -> None:
+    payload = replace(
+        _payload(publication_k8s, b""),
+        pr_number=123,
+        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
+        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
+        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
+        **{missing: None},
+    )
+    with pytest.raises(publication_k8s.PublicationResourceError, match="stored GitHub identity"):
+        publication_k8s.build_publication_resources(
+            payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
+        )
+
+
+def test_body_only_revision_refuses_ambiguous_patch_response_despite_matching_get(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    payload = replace(
+        _payload(publication_k8s, b""),
+        revision_number=2,
+        base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD,
+        expected_remote_head=PRIOR_HEAD,
+        pr_number=123,
+        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
+        body="Corrected body for CI.\n",
+        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
+        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
+    )
+    old_pull = _pull_response()
+    # A gateway timeout cannot establish whether GitHub applied the PATCH.
+    # A later GET can match the proposal without proving this revision owns
+    # its update time.
+    updated_pull = {
+        **old_pull,
+        "body": payload.body,
+        "updated_at": "2026-09-25T21:01:00Z",
+    }
+    completed, requests = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="metadata-only",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, old_pull),
+            (504, {}, {"message": "upstream response lost"}),
+            (200, {}, updated_pull),
+        ],
+    )
+    assert _GitHubApiHandler.patch_bodies == [{"body": payload.body}]
+    assert [path for path, _auth in requests[:3]] == [
+        "/repos/acme-corp/acme-bot",
+        "/repos/acme-corp/acme-bot/pulls/123",
+        "/repos/acme-corp/acme-bot/pulls/123",
+    ]
+    assert all(
+        path == "/repos/acme-corp/acme-bot/pulls/123"
+        for path, _auth in requests[3:]
+    )
+    assert completed.returncode != 0
+    assert "CURIE_PR_UPDATED_AT=" not in completed.stdout
+    assert "CURIE_PR_URL=" not in completed.stdout
+    assert "CURIE_PR_NUMBER=" not in completed.stdout
+
+
+def test_body_only_revision_refuses_pull_already_equal_to_proposal(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    payload = replace(
+        _payload(publication_k8s, b""),
+        revision_number=2,
+        base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD,
+        expected_remote_head=PRIOR_HEAD,
+        pr_number=123,
+        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
+        body="Corrected body for CI.\n",
+        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
+        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
+    )
+    current_pull = {**_pull_response(), "body": payload.body}
+    completed, requests = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="metadata-only",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, current_pull),
+        ],
+    )
+    assert len(requests) == 2
+    assert _GitHubApiHandler.patch_bodies == []
+    assert completed.returncode != 0
+    assert "CURIE_PR_UPDATED_AT=" not in completed.stdout
+    assert "CURIE_PR_URL=" not in completed.stdout
+    assert "CURIE_PR_NUMBER=" not in completed.stdout
+
+
+def test_body_only_revision_refuses_external_edit_after_approval(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    payload = replace(
+        _payload(publication_k8s, b""),
+        revision_number=2,
+        base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD,
+        expected_remote_head=PRIOR_HEAD,
+        pr_number=123,
+        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
+        body="Corrected body for CI.\n",
+        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
+        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
+    )
+    changed_pull = {**_pull_response(), "body": "A maintainer edited this body."}
+    completed, requests = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="metadata-only",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, changed_pull),
+        ],
+    )
+    assert completed.returncode != 0
+    assert "changed after publication approval" in completed.stderr
+    assert len(requests) == 2
+    assert _GitHubApiHandler.patch_bodies == []
+
+
+def test_body_only_revision_accepts_github_null_for_observed_empty_body(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    payload = replace(
+        _payload(publication_k8s, b""),
+        revision_number=2,
+        base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD,
+        expected_remote_head=PRIOR_HEAD,
+        pr_number=123,
+        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
+        body="A new body.\n",
+        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
+        observed_body_sha256=hashlib.sha256(b"").hexdigest(),
+    )
+    resources = publication_k8s.build_publication_resources(
+        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
+    )
+    old_pull = {**_pull_response(), "body": None}
+    updated_pull = {**old_pull, "body": payload.body}
+    completed, _ = _run_github_guard(
+        tmp_path,
+        resources,
+        mode="metadata-only",
+        responses=[
+            (200, {}, {"default_branch": "main"}),
+            (200, {}, old_pull),
+            (200, {}, updated_pull),
+        ],
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert _GitHubApiHandler.patch_bodies == [{"body": payload.body}]
+
+
+def test_metadata_only_first_publication_is_refused(publication_k8s: Any) -> None:
+    with pytest.raises(publication_k8s.PublicationResourceError, match="stored pull request"):
+        publication_k8s.build_publication_resources(
+            _payload(publication_k8s, b""),
+            credential=WRITE_CREDENTIAL,
+            settings=_settings(publication_k8s),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1036,6 +1328,10 @@ def _publication_resources_for_commit(
             ),
             title="Update repository",
             body="Approved platform publication.",
+            observed_title_sha256=None,
+            observed_body_sha256=None,
+            github_repository_id=9001 if pr_number is not None else None,
+            github_pr_node_id="PR_example_123" if pr_number is not None else None,
         ),
         credential="Bearer local-test-token",
         settings=_settings(module),

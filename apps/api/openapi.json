@@ -4593,7 +4593,6 @@
               "type": "string"
             },
             "maxItems": 4096,
-            "minItems": 1,
             "title": "Changed Paths",
             "type": "array"
           },
@@ -4624,8 +4623,55 @@
             ],
             "title": "Expires In Seconds"
           },
+          "observed_body_sha256": {
+            "anyOf": [
+              {
+                "pattern": "[0-9a-f]{64}",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Body Sha256"
+          },
+          "observed_lineage_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Lineage Id"
+          },
+          "observed_lineage_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Lineage Version"
+          },
+          "observed_title": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Title"
+          },
           "patch_b64": {
-            "minLength": 1,
             "title": "Patch B64",
             "type": "string"
           },

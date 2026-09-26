@@ -1281,6 +1281,11 @@ class Publication(Base):
     # these bytes while preserving the audit/result metadata.
     patch_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
     changed_paths: Mapped[list[str]] = mapped_column(JSONB)
+    observed_title_sha256: Mapped[str | None] = mapped_column(default=None)
+    observed_body_sha256: Mapped[str | None] = mapped_column(default=None)
+    metadata_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     title: Mapped[str]
     body: Mapped[str] = mapped_column(Text)
     reply_kind: Mapped[str]

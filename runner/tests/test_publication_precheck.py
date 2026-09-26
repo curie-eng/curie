@@ -386,7 +386,6 @@ def test_refused_proposal_can_be_corrected_with_a_file_change_in_the_same_turn(
 @pytest.mark.parametrize(
     ("status", "reply", "reason"),
     [
-        (200, {"result": "metadata_changed"}, "metadata_only_unsupported"),
         (409, {"detail": {"code": "stale_context"}}, "stale_context"),
         (503, {"detail": "precheck_unavailable"}, "precheck_unavailable"),
     ],
@@ -409,8 +408,30 @@ def test_remote_refusal_is_actionable_and_does_not_park_the_turn(
             frames = await _run(runner, model, _event(_context(head, url)))
             _assert_refusal(model, gate, frames, reason)
             assert len(calls) == 1
-            if reason == "metadata_only_unsupported":
-                assert "file" in model.permissions[0].message.casefold()
+
+    anyio.run(go)
+
+
+def test_body_only_revision_reaches_publication_approval(
+    tmp_path: Path,
+    workspace: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        repo, head = workspace
+        changed_body = "Correct the pull request body for CI.\n"
+        async with _api([(200, {"result": "metadata_changed"})]) as (url, calls):
+            runner = await _boot(tmp_path, repo, url, monkeypatch)
+            gate = runner._approval_gate
+            assert gate is not None
+            model = _PublicationModel(
+                gate, [("bodyfix", {"title": TITLE, "body": changed_body})]
+            )
+            frames = await _run(runner, model, _event(_context(head, url)))
+            assert frames[-1]["status"] == "awaiting-approval"
+            assert gate.publication_body == changed_body
+            assert gate.publication_title == TITLE
+            assert len(calls) == 1
 
     anyio.run(go)
 

@@ -48,10 +48,6 @@ def _safe_changed_path(path: str) -> bool:
 
 
 def _validate_changed_paths(paths: tuple[str, ...]) -> None:
-    if not paths:
-        raise WorkspacePreparationError(
-            "publication-validation", "snapshot contains no changed paths"
-        )
     if any(
         tuple(part.casefold() for part in PurePosixPath(path).parts[:2])
         == (".github", "workflows")
@@ -94,6 +90,16 @@ def validate_snapshot_against_base(
     if len(snapshot.patch) > max_patch_bytes:
         raise WorkspacePreparationError(
             "publication-validation", f"patch exceeds {max_patch_bytes} raw bytes"
+        )
+    if not snapshot.changed_paths:
+        if snapshot.patch:
+            raise WorkspacePreparationError(
+                "publication-validation", "snapshot patch has no declared changed paths"
+            )
+        return
+    if not snapshot.patch:
+        raise WorkspacePreparationError(
+            "publication-validation", "snapshot changed paths have no patch"
         )
     _validate_changed_paths(snapshot.changed_paths)
 
