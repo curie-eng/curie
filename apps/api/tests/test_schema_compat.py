@@ -41,7 +41,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
-REVIEW_SCHEMA_MIN = "0045"
+# The window floor: the newest contract revision (0061, ADR-0168 decision 3).
+APP_SCHEMA_MIN = "0061"
 PREV = "0040"
 
 
@@ -91,11 +92,11 @@ def _exec(sql: str, params: dict[str, Any] | None = None) -> None:
 
 def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
-    assert window.schema_min == REVIEW_SCHEMA_MIN
+    assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
-    if HEAD != CONTRACT:
+    if HEAD != APP_SCHEMA_MIN:
         assert kinds[HEAD] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
@@ -116,6 +117,23 @@ def test_planner_refuses_0041_contract_without_forward_only() -> None:
     assert decision.pending[0].revision == CONTRACT
     assert decision.pending[0].kind == KIND_CONTRACT
     assert "forward-only" in decision.reason.lower()
+
+
+def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -> None:
+    """0061 (ADR-0168 decision 3) is a contract, as 0041 was: the app that
+    stores `default` cannot serve a database whose 0024 check refuses it."""
+    kinds = load_kinds()
+    assert kinds["0061"] == KIND_CONTRACT
+    assert load_window().schema_min == "0061"
+    decision = plan_upgrade(
+        current_revision="0060",
+        window=load_window(),
+        kinds=kinds,
+        pending=("0061",),
+        forward_only=False,
+    )
+    assert decision.action == "refuse"
+    assert "0061" in decision.reason
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
@@ -197,7 +215,7 @@ def _prepare_schema_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("revision", ("0041", "0042", "0044"))
+@pytest.mark.parametrize("revision", ("0041", "0042", "0044", "0060"))
 def test_api_lifespan_refuses_schema_missing_required_consumers(
     isolated_migration_db: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -387,7 +405,7 @@ def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
 
     # Red-on-revert: the current image still closes the application rollback window.
     n = load_window()
-    assert n.schema_min == REVIEW_SCHEMA_MIN
+    assert n.schema_min == APP_SCHEMA_MIN
     assert n.schema_head == HEAD
     assert can_serve(PREV, n, {PREV, CONTRACT, HEAD}) is False
 
