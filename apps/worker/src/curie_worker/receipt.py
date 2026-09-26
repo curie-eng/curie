@@ -24,7 +24,7 @@ from typing import Any
 
 # A connector's summary is not a size this platform controls, and a receipt is
 # read in a chat client beneath an answer someone actually asked for.
-_SUMMARY_MAX = 160
+_SUMMARY_MAX = 96
 
 _HEADER = "_What I changed:_"
 # The receipt sits beneath the answer; past this many lines it lists the first
@@ -55,7 +55,11 @@ _READ_ONLY_COMMANDS = (
 
 def _clamp(text: str) -> str:
     text = " ".join(str(text).split())
-    return text if len(text) <= _SUMMARY_MAX else text[: _SUMMARY_MAX - 1].rstrip() + "…"
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _SUMMARY_MAX:
+        return text
+    budget = _SUMMARY_MAX - len("…".encode())
+    return encoded[:budget].decode("utf-8", "ignore").rstrip() + "…"
 
 
 def _described(action: dict[str, Any]) -> str:
@@ -65,7 +69,7 @@ def _described(action: dict[str, Any]) -> str:
     summary = result.get("summary") if isinstance(result, dict) else None
     if isinstance(summary, str) and summary.strip():
         return _clamp(summary)
-    return f"called `{action.get('tool') or 'a tool'}`"
+    return f"called `{_clamp(action.get('tool') or 'a tool')}`"
 
 
 def _verdict(action: dict[str, Any]) -> str:

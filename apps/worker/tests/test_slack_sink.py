@@ -967,6 +967,31 @@ def test_an_oversized_receipt_stays_in_the_long_edit_with_an_omission_notice() -
     assert sent.endswith("more receipt details omitted")
 
 
+def test_a_late_failed_action_is_kept_in_a_long_slack_reply() -> None:
+    from curie_worker.receipt import render_receipt
+
+    actions = [
+        {
+            "tool": f"tool_{i}",
+            "status": "succeeded" if i < 9 else "failed",
+            "undoable": False,
+            "result": {"summary": ("late failure " if i == 9 else f"action {i} ") + "é" * 160},
+            "detail": "é" * 160,
+        }
+        for i in range(10)
+    ]
+    receipt = render_receipt(actions)
+    assert receipt is not None
+
+    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert "_What I changed:_" in sent
+    assert "late failure" in sent
+    assert "failed" in sent
+    assert "more receipt details omitted" not in sent
+
+
 def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
     line = "• called `a_tool` — non-idempotent tool completed\n"
     text = line * 78  # 3,900 characters: under the limit counted as characters

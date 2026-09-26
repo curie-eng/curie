@@ -222,6 +222,33 @@ def test_a_long_summary_is_clamped() -> None:
     assert len(receipt) < 1000
 
 
+def test_late_failure_survives_the_slack_receipt_budget() -> None:
+    actions = [
+        _action(
+            tool=f"tool_{i}",
+            undoable=False,
+            result={"summary": "é" * 160 + str(i)},
+            detail="é" * 160,
+        )
+        for i in range(9)
+    ]
+    actions.append(
+        _action(
+            tool="late_failure",
+            status="failed",
+            undoable=False,
+            result={"summary": "late failed action " + "é" * 160},
+        )
+    )
+
+    receipt = render_receipt(actions)
+
+    assert receipt is not None
+    assert len(("\n\n" + receipt).encode("utf-8")) <= 2500
+    assert "late failed action" in receipt
+    assert "failed" in receipt
+
+
 def test_a_long_turn_lists_a_bounded_receipt_and_counts_the_rest() -> None:
     """A receipt is read beneath an answer, and must not crowd it out (#3064).
 
