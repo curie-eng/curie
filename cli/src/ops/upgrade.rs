@@ -704,6 +704,20 @@ pub(crate) fn target_runner_ref(
     crate::cluster_secrets::effective_runner_ref(&values, Some(to))
 }
 
+/// The pure part of [`Upgrade::compute_runner_layer_clears`] (#3218): once the
+/// current and target runner references are resolved (or known unknown), the
+/// layers an upgrade leaves stale is a function of just those two references
+/// and the layered agent list. Delegates to
+/// [`crate::cluster_secrets::layers_stopping_to_match`]; kept as a separate,
+/// directly testable seam here rather than inlined at the call site.
+fn layer_clears_from_refs(
+    layered: &[String],
+    current: Option<&str>,
+    target: Option<&str>,
+) -> Vec<String> {
+    crate::cluster_secrets::layers_stopping_to_match(layered, current, target)
+}
+
 /// The operator-facing line naming every agent whose layered runner stops
 /// matching (#3218, ADR 0173 decision 5). `None` when there are none.
 pub(crate) fn runner_layer_notice(agents: &[String]) -> Option<String> {
@@ -1824,11 +1838,8 @@ impl LiveHost {
                 .ok()
             },
         );
-        self.runner_layer_clears = crate::cluster_secrets::layers_stopping_to_match(
-            &layered,
-            current.as_deref(),
-            target.as_deref(),
-        );
+        self.runner_layer_clears =
+            layer_clears_from_refs(&layered, current.as_deref(), target.as_deref());
     }
 
     /// The target chart's own `agentSandbox.runner` defaults, when the chart
@@ -2695,6 +2706,103 @@ mod drain_preflight_naming_tests {
             drain_preflight_observation(false, "connection refused"),
             None,
             "an unreadable API is still pending, not a terminal failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runner_layer_guard_tests {
+    use super::*;
+
+    fn runner_values(fields: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"agentSandbox": {"runner": fields}})
+    }
+
+    #[test]
+    fn target_runner_ref_layers_overlay_over_chart_default() {
+        let chart_default = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "0.9.0",
+        }));
+        // The overlay only sets a digest; the image field must still come
+        // from the chart default underneath it.
+        let overlay = runner_values(serde_json::json!({"digest": "sha256:aaaa"}));
+        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.0")
+            .expect("image known from chart default");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:aaaa");
+    }
+
+    #[test]
+    fn target_runner_ref_overlay_null_removes_chart_default_field() {
+        let chart_default = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "0.9.0",
+            "digest": "sha256:aaaa",
+        }));
+        // An explicit null in the overlay clears the chart default's digest,
+        // so the tag (falling back to `to`) takes over.
+        let overlay = runner_values(serde_json::json!({"digest": null}));
+        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.9")
+            .expect("tag known from chart default");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.0");
+    }
+
+    #[test]
+    fn target_runner_ref_empty_tag_falls_back_to_to() {
+        let overlay = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "",
+        }));
+        let reference = target_runner_ref(None, &overlay, "0.9.5").expect("to backs an empty tag");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.5");
+    }
+
+    #[test]
+    fn target_runner_ref_digest_wins_over_tag() {
+        let overlay = runner_values(serde_json::json!({
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "tag": "0.9.0",
+            "digest": "sha256:bbbb",
+        }));
+        let reference = target_runner_ref(None, &overlay, "0.9.0").expect("digest known");
+        assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:bbbb");
+    }
+
+    #[test]
+    fn target_runner_ref_none_when_no_image_known() {
+        let overlay = serde_json::json!({});
+        assert_eq!(target_runner_ref(None, &overlay, "0.9.0"), None);
+    }
+
+    #[test]
+    fn layer_clears_from_refs_same_digest_clears_nothing() {
+        let layered = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let reference = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
+        assert!(layer_clears_from_refs(&layered, Some(reference), Some(reference)).is_empty());
+    }
+
+    #[test]
+    fn layer_clears_from_refs_differing_digest_clears_all_layered_agents() {
+        let layered = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let current = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
+        let target = "ghcr.io/curie-eng/curie-runner@sha256:bbbb";
+        assert_eq!(
+            layer_clears_from_refs(&layered, Some(current), Some(target)),
+            layered
+        );
+    }
+
+    #[test]
+    fn layer_clears_from_refs_unknown_reference_clears_all_layered_agents() {
+        let layered = vec!["agent-a".to_string()];
+        let reference = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
+        assert_eq!(
+            layer_clears_from_refs(&layered, None, Some(reference)),
+            layered
+        );
+        assert_eq!(
+            layer_clears_from_refs(&layered, Some(reference), None),
+            layered
         );
     }
 }
