@@ -874,7 +874,7 @@ def _parse_approval_targets(
     endpoint = notification.get("endpoint")
     adapter = notification.get("adapter")
     address_shape = _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
-    slack = kind == POLICY_CARD_KIND
+    not_slack = kind != POLICY_CARD_KIND
     if (
         not isinstance(kind, str)
         or _CHANNEL_SLUG.fullmatch(kind) is None
@@ -886,14 +886,14 @@ def _parse_approval_targets(
             adapter is not None
             and (not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None)
         )
-        or (slack and endpoint is not None)
-        or (not slack and (endpoint is None or adapter is None))
+        or (endpoint is None if not_slack else endpoint is not None)
+        or (not_slack and adapter is None)
         or (endpoint is not None and not _valid_notification_endpoint(endpoint))
         or (
-            (kind, route_identity(kind, adapter), address)
+            (kind, address) == resolution_pair
+            if not_slack
+            else (kind, route_identity(kind, adapter), address)
             == (POLICY_CARD_KIND, DEFAULT_IDENTITY, resolution_pair[1])
-            if slack
-            else (kind, address) == resolution_pair
         )
     ):
         return None
