@@ -235,6 +235,63 @@ def test_two_caller_headers_are_invalid() -> None:
 
 
 # @spec ADR-0168 d7
+def test_the_forwarding_client_adds_no_header_the_caller_did_not_send() -> None:
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession(
+                skip_auto_headers=("Accept", "Accept-Encoding", "User-Agent")
+            ) as client:
+                async with client.get(
+                    proxy.make_url("/mcp"), headers={caller.HEADER: _TOKEN}
+                ) as answer:
+                    assert answer.status == 201
+            [seen] = upstream.seen
+            # The caller sent none of these; the proxy's own client must not
+            # invent them on the hop to the server, or a caller that never
+            # asked for a compressed body gets one anyway.
+            for name in ("Accept", "Accept-Encoding", "User-Agent"):
+                assert name not in seen["headers"]
+
+    _run(go)
+
+
+# @spec ADR-0168 d7
+def test_a_path_with_an_encoded_newline_gets_the_refusal_not_a_404() -> None:
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.get(proxy.make_url("/foo%0Abar")) as answer:
+                    assert answer.status == server.REFUSAL_STATUS
+                    assert answer.content_type == _REFUSAL["content_type"]
+                    expected = next(
+                        v["body"] for v in _REFUSAL["vectors"] if v["refusal"] == caller.MISSING
+                    )
+                    assert await answer.json() == expected
+            # The server is never contacted, encoded newline or not.
+            assert upstream.seen == []
+
+    _run(go)
+
+
+# @spec ADR-0168 d7
+def test_a_connection_header_naming_host_does_not_drop_it() -> None:
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.get(
+                    proxy.make_url("/mcp"),
+                    headers={caller.HEADER: _TOKEN, "Connection": "Host"},
+                ) as answer:
+                    assert answer.status == 201
+            [seen] = upstream.seen
+            # Host is never hop-by-hop, whatever a caller's Connection header
+            # names; the server still reads the address the sandbox dialled.
+            assert seen["headers"]["Host"] == f"{proxy.host}:{proxy.port}"
+
+    _run(go)
+
+
+# @spec ADR-0168 d7
 def test_hop_by_hop_headers_stop_at_the_proxy() -> None:
     async def go() -> None:
         async with _serving() as (upstream, proxy):
@@ -343,6 +400,10 @@ def test_an_empty_admits_list_parses_and_admits_nobody() -> None:
     [
         (server.LISTEN_PORT_ENV, ""),
         (server.LISTEN_PORT_ENV, "0"),
+        # Arabic-Indic digits for 8480: `str.isdigit()` accepts them, and
+        # Python's own `int()` parses them, so a naive digit check would
+        # silently admit a non-ASCII port.
+        (server.LISTEN_PORT_ENV, "٨٤٨٠"),
         (server.UPSTREAM_PORT_ENV, "70000"),
         (server.PUBLIC_KEYS_ENV, ""),
         (server.PUBLIC_KEYS_ENV, "not-a-key"),
