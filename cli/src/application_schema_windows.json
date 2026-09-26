@@ -59,6 +59,10 @@
     "0057",
     "0058"
   ],
+  "candidate": {
+    "schema_min": "0045",
+    "schema_head": "0058"
+  },
   "windows": {
     "0.8.0": {
       "schema_min": "0001",

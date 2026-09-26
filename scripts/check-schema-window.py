@@ -102,7 +102,7 @@ def _semantic_version_key(version: str) -> tuple[int, int, int, int, int] | None
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate the newest catalog schema window against the Alembic "
+            "Validate the candidate schema window against the Alembic "
             "head and verify that Chart.yaml appVersion is catalogued."
         )
     )
@@ -129,11 +129,16 @@ def main() -> int:
     if catalog_error is not None:
         return _fail(catalog_error)
     if not isinstance(payload, dict):
-        return _fail("catalog missing windows/revisions")
+        return _fail("catalog missing candidate/windows/revisions")
     revisions = payload.get("revisions")
+    candidate = payload.get("candidate")
     windows = payload.get("windows")
-    if not isinstance(revisions, list) or not isinstance(windows, dict):
-        return _fail("catalog missing windows/revisions")
+    if (
+        not isinstance(revisions, list)
+        or not isinstance(candidate, dict)
+        or not isinstance(windows, dict)
+    ):
+        return _fail("catalog missing candidate/windows/revisions")
     catalog_ids = {item for item in revisions if isinstance(item, str)}
 
     versions = repo_root / "apps" / "api" / "alembic" / "versions"
@@ -173,45 +178,88 @@ def main() -> int:
     chart_window = windows.get(app_version)
     if not isinstance(chart_window, dict):
         return _fail(f"catalog has no window for appVersion {app_version}")
+    chart_min = chart_window.get("schema_min")
+    chart_head = chart_window.get("schema_head")
+    if not isinstance(chart_min, str) or chart_min not in catalog_ids:
+        return _fail(
+            f"windows[{app_version!r}].schema_min is not a catalog revision: "
+            f"{chart_min!r}"
+        )
+    if not isinstance(chart_head, str) or chart_head not in catalog_ids:
+        return _fail(
+            f"windows[{app_version!r}].schema_head is not a catalog revision: "
+            f"{chart_head!r}"
+        )
+    if revisions.index(chart_min) > revisions.index(chart_head):
+        return _fail(
+            f"windows[{app_version!r}].schema_min is after its schema_head"
+        )
 
-    newest_app_version: str | None = None
-    newest_version_key: tuple[int, int, int, int, int] | None = None
-    chart_is_release_candidate = False
     for version in windows:
-        version_key = _semantic_version_key(version)
-        if version_key is None:
+        if _semantic_version_key(version) is None:
             return _fail(
                 f"catalog window key is not a supported semantic version: {version!r}"
             )
-        if version == app_version:
-            chart_is_release_candidate = version_key[3] == 0
-        if newest_version_key is None or version_key > newest_version_key:
-            newest_app_version = version
-            newest_version_key = version_key
 
-    if newest_app_version is None:
-        return _fail("catalog has no schema windows")
-    newest_window = windows[newest_app_version]
-    if not isinstance(newest_window, dict):
-        return _fail(
-            f"catalog window for newest appVersion {newest_app_version} is not an object"
-        )
-    schema_head = newest_window.get("schema_head")
+    schema_min = candidate.get("schema_min")
+    schema_head = candidate.get("schema_head")
+    if not isinstance(schema_min, str) or schema_min not in catalog_ids:
+        return _fail(f"candidate.schema_min is not a catalog revision: {schema_min!r}")
+    if not isinstance(schema_head, str) or schema_head not in catalog_ids:
+        return _fail(f"candidate.schema_head is not a catalog revision: {schema_head!r}")
+    if revisions.index(schema_min) > revisions.index(schema_head):
+        return _fail("candidate.schema_min is after candidate.schema_head")
     if schema_head != head:
         return _fail(
-            f"windows[{newest_app_version!r}].schema_head is {schema_head!r} "
+            f"candidate.schema_head is {schema_head!r} "
             f"but alembic head is {head}"
         )
-    if chart_is_release_candidate and chart_window.get("schema_head") != head:
+
+    api_window_path = (
+        repo_root / "apps" / "api" / "src" / "curie_api" / "schema_compat.json"
+    )
+    try:
+        api_window = json.loads(api_window_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _fail(f"cannot read API schema compatibility window: {exc}")
+    if not isinstance(api_window, dict):
+        return _fail("API schema compatibility window is not an object")
+    if (
+        api_window.get("schema_min") != schema_min
+        or api_window.get("schema_head") != schema_head
+    ):
         return _fail(
-            f"windows[{app_version!r}].schema_head is "
-            f"{chart_window.get('schema_head')!r} but alembic head is {head}"
+            "candidate schema bounds do not match "
+            "apps/api/src/curie_api/schema_compat.json"
+        )
+
+    atlas_path = repo_root / "docs" / "architecture-atlas" / "versions.json"
+    try:
+        atlas = json.loads(atlas_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _fail(f"cannot read architecture atlas versions: {exc}")
+    atlas_versions = atlas.get("versions") if isinstance(atlas, dict) else None
+    if not isinstance(atlas_versions, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("id"), str)
+        for item in atlas_versions
+    ):
+        return _fail("architecture atlas versions manifest is malformed")
+    if chart_min != schema_min or chart_head != schema_head:
+        if any(item["id"] == f"v{app_version}" for item in atlas_versions):
+            return _fail(
+                f"windows[{app_version!r}] differs from candidate; "
+                "the chart appVersion is registered in the architecture atlas, "
+                "so bump to the next version"
+            )
+        return _fail(
+            f"windows[{app_version!r}] differs from candidate; "
+            f"rerun curie dev bump-version {app_version} for the same version"
         )
 
     print(
         "schema-window OK: "
         f"chart appVersion {app_version} "
-        f"catalog appVersion {newest_app_version} schema_head {head}"
+        f"candidate schema_head {head}"
     )
     return 0
 
