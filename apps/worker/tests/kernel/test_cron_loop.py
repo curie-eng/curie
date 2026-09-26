@@ -59,7 +59,7 @@ class _Seed:
     slot: datetime
     bundle_ref: str
 
-    async def runs(self) -> list[Any]:
+    async def runs(self, name: str = HOOK) -> list[Any]:
         async with self.engine.connect() as conn:
             return list(
                 (
@@ -68,9 +68,33 @@ class _Seed:
                             "SELECT id, outcome, slot_utc, ended_at FROM curie.hook_runs "
                             "WHERE agent_id = :a AND name = :n ORDER BY slot_utc"
                         ),
-                        {"a": self.agent_id, "n": HOOK},
+                        {"a": self.agent_id, "n": name},
                     )
                 ).all()
+            )
+
+    async def set_control(
+        self,
+        name: str,
+        *,
+        paused_at: datetime | None,
+        resume_from: datetime | None,
+    ) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO curie.schedule_controls "
+                    "(agent_id, name, paused_at, resume_from) "
+                    "VALUES (:agent_id, :name, :paused_at, :resume_from) "
+                    "ON CONFLICT (agent_id, name) DO UPDATE SET "
+                    "paused_at = EXCLUDED.paused_at, resume_from = EXCLUDED.resume_from"
+                ),
+                {
+                    "agent_id": self.agent_id,
+                    "name": name,
+                    "paused_at": paused_at,
+                    "resume_from": resume_from,
+                },
             )
 
     async def add_run(
@@ -253,6 +277,28 @@ async def _pass_once(
     client = _async_redis()
     try:
         loop = _loop(seed.engine, client, _Triggers(seed, trigger), stream, seed.slot, **kwargs)
+        await loop.one_pass(now=seed.slot + timedelta(seconds=30))
+    finally:
+        await client.aclose()
+
+
+async def _pass_triggers(
+    seed: _Seed,
+    stream: str,
+    triggers: list[dict[str, Any]],
+    *,
+    started_at: datetime | None = None,
+) -> None:
+    client = _async_redis()
+    try:
+        loop = _loop(
+            seed.engine,
+            client,
+            _Triggers(seed, *triggers),
+            stream,
+            seed.slot,
+            started_at=started_at,
+        )
         await loop.one_pass(now=seed.slot + timedelta(seconds=30))
     finally:
         await client.aclose()
@@ -782,5 +828,71 @@ def test_deferred_fire_past_its_own_interval_records_skipped(
                 t.hook_run is None or t.hook_run.slot_utc != seed.slot.isoformat()
                 for t in _entries(sync_redis, names["stream"])
             )
+
+    asyncio.run(body())
+
+
+def test_paused_trigger_does_not_fire_while_another_hook_keeps_running(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A durable pause suppresses only its named hook on the same agent."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await seed.set_control(
+                HOOK,
+                paused_at=seed.slot - timedelta(minutes=30),
+                resume_from=None,
+            )
+            paused = _trigger(seed)
+            independent = _trigger(seed, name="independent")
+            await _pass_triggers(seed, names["stream"], [paused, independent])
+
+            assert await seed.runs(HOOK) == []
+            other_rows = await seed.runs("independent")
+            assert [(row.slot_utc, row.outcome) for row in other_rows] == [
+                (seed.slot, None)
+            ]
+            entries = _entries(sync_redis, names["stream"])
+            assert len(entries) == 1
+            assert entries[0].hook_run is not None
+            assert entries[0].hook_run.name == "independent"
+
+    asyncio.run(body())
+
+
+def test_resumed_hook_catches_up_one_slot_after_a_worker_restart(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """The persisted resume floor exposes the gap to a fresh loop, which still
+    fires only the newest eligible slot and records every older one skipped."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            paused_at = seed.slot - timedelta(hours=3, minutes=30)
+            await seed.set_control(HOOK, paused_at=None, resume_from=paused_at)
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+
+            # This fresh worker starts after the older missed slots, so they
+            # can only be found through the durable resume marker.
+            await _pass_once(
+                seed,
+                names["stream"],
+                trigger,
+                started_at=seed.slot - timedelta(seconds=10),
+            )
+
+            assert [
+                (row.slot_utc, row.outcome) for row in await seed.runs(HOOK)
+            ] == [
+                (seed.slot - timedelta(hours=3), "skipped"),
+                (seed.slot - timedelta(hours=2), "skipped"),
+                (seed.slot - timedelta(hours=1), "skipped"),
+                (seed.slot, None),
+            ]
+            entries = _entries(sync_redis, names["stream"])
+            assert len(entries) == 1
+            assert entries[0].hook_run is not None
+            assert entries[0].hook_run.slot_utc == seed.slot.isoformat()
 
     asyncio.run(body())

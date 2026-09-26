@@ -179,6 +179,18 @@ def _schedules(client: Any, headers: dict[str, str], agent: str | None = None) -
     return client.get("/schedules", params=params, headers=headers)
 
 
+def _schedule_action(
+    client: Any,
+    headers: dict[str, str],
+    agent_id: str,
+    hook_name: str,
+    action: str,
+) -> Any:
+    return client.post(
+        f"/schedules/{agent_id}/{hook_name}/{action}", headers=headers
+    )
+
+
 def _body(response: Any) -> dict[str, Any]:
     assert response.status_code == 200, response.text
     body = response.json()
@@ -392,3 +404,64 @@ def test_a_run_for_a_hook_the_bundle_no_longer_declares_is_omitted(
     row = _agent(_body(_schedules(client, auth_headers)), "acme-renamed")
     assert [hook["name"] for hook in row["hooks"]] == ["kept"]
     assert _hook(row, "kept")["last_outcome"] == "ran"
+
+
+def test_pause_and_resume_only_change_the_named_hook_for_the_named_agent(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    owner_id, owner_version = _publish(
+        client,
+        auth_headers,
+        _archive(
+            _bundle(
+                tmp_path / "owner",
+                [
+                    _cron("nightly-cleanup", "0 9 * * *"),
+                    _cron("weekly-report", "0 16 * * FRI"),
+                ],
+            )
+        ),
+        "acme-pause-owner",
+        channel="C0EXAMPLE3",
+    )
+    _deploy(client, auth_headers, owner_id, owner_version, "dev")
+    other_id, other_version = _publish(
+        client,
+        auth_headers,
+        _archive(_bundle(tmp_path / "other", [_cron("nightly-cleanup", "0 8 * * *")])),
+        "acme-pause-other",
+        channel="C0EXAMPLE4",
+    )
+    _deploy(client, auth_headers, other_id, other_version, "dev")
+
+    unauthenticated = _schedule_action(client, {}, owner_id, "nightly-cleanup", "pause")
+    assert unauthenticated.status_code != 200
+
+    paused = _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "pause"
+    )
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["paused"] is True
+
+    body = _body(_schedules(client, auth_headers))
+    owner = _agent(body, "acme-pause-owner")
+    other = _agent(body, "acme-pause-other")
+    assert _hook(owner, "nightly-cleanup")["paused"] is True
+    assert _hook(owner, "weekly-report")["paused"] is False
+    assert _hook(other, "nightly-cleanup")["paused"] is False
+
+    resumed = _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "resume"
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["paused"] is False
+
+    body = _body(_schedules(client, auth_headers))
+    owner = _agent(body, "acme-pause-owner")
+    other = _agent(body, "acme-pause-other")
+    assert _hook(owner, "nightly-cleanup")["paused"] is False
+    assert _hook(owner, "weekly-report")["paused"] is False
+    assert _hook(other, "nightly-cleanup")["paused"] is False
