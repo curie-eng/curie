@@ -8207,8 +8207,16 @@ fn check_deploy_routes_bound(
          approvals {name}"
     );
     for route in unbound.iter().chain(bound.iter().copied()) {
-        fix.push_str(&format!(" --route-resolution {route}=<channel>"));
+        fix.push_str(&format!(
+            " --route-resolution {route}=<channel> --route-approvers {route}=users:<user-id>"
+        ));
     }
+    // #2902: an operator principal resolves only a route bound to an explicit
+    // user list, so name it here rather than leave the channel-members default.
+    fix.push_str(
+        " (the explicit users list is what lets an operator principal resolve these \
+         approvals from the CLI; drop --route-approvers to leave approval to channel members)",
+    );
     if !bound.is_empty() {
         fix.push_str(
             " (a route write replaces the whole map, so this repeats the routes already bound; \
@@ -10491,8 +10499,15 @@ mod tests {
         );
         assert!(message.contains("was created by this deploy"), "{message}");
         assert!(
-            fix.contains("curie local approvals deal-desk --route-resolution ops=<channel>"),
+            fix.contains(
+                "curie local approvals deal-desk --route-resolution ops=<channel> \
+                 --route-approvers ops=users:<user-id>"
+            ),
             "{fix}"
+        );
+        assert!(
+            fix.contains("operator principal"),
+            "the fix says why an explicit user list matters (#2902): {fix}"
         );
         assert!(!fix.contains("curie cluster approvals"), "{fix}");
         assert!(
@@ -10536,6 +10551,10 @@ mod tests {
         assert!(fix.contains("--route-resolution ops=<channel>"), "{fix}");
         assert!(
             fix.contains("--route-resolution finance=<channel>"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("--route-approvers finance=users:<user-id>"),
             "{fix}"
         );
         assert!(fix.contains("--routes-from"), "{fix}");

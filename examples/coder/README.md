@@ -44,6 +44,44 @@ the platform publishes from outside the sandbox and posts the pull-request URL
 back to the thread. The sandbox never receives the operator GitHub credential,
 and publication does not depend on a synchronous Slack reply.
 
+## Approving publication without Slack
+
+This bundle declares no `approvalPolicy`, so its publication approval is raised
+against the requesting channel. An operator principal
+(`curie cluster approvals <agent> --mint-operator-principal <USER>`) cannot
+resolve that; it gets `403 operator approval principals can resolve only routes
+bound to an explicit user list`. To approve from the CLI, declare the gate in
+`.claude-plugin/plugin.json`:
+
+```json
+"approvalPolicy": {
+  "gates": [
+    { "gate": "mcp__curie__publish_changes", "route": "publication" }
+  ]
+}
+```
+
+The route must be bound before a deploy can succeed, and for CLI approval it must
+be bound with an explicit user list: deploy accepts a binding without
+`--route-approvers`, but an operator principal then still gets the 403. A deploy whose bundle declares a route the agent has not bound is refused with
+no version, bundle, or deployment created; for a new agent, that first deploy
+still creates the agent so the route can be bound. Its error prints the bind
+command. Bind, then deploy again:
+
+```bash
+curie cluster deploy --plugin-dir examples/coder \
+  --agent acme-dev --env dev --slack-channel C0EXAMPLE1   # refused; creates acme-dev
+curie cluster approvals acme-dev \
+  --route-resolution publication=C0EXAMPLE1 \
+  --route-approvers publication=users:U0EXAMPLE1
+curie cluster deploy --plugin-dir examples/coder \
+  --agent acme-dev --env dev --slack-channel C0EXAMPLE1
+```
+
+The card then shows `route: publication`, and
+`curie cluster approvals acme-dev --resolve <id>` with
+`CURIE_APPROVAL_PRINCIPAL_TOKEN` set resolves it.
+
 ## Evals
 
 `evals/cases.json` grades this skill-less bundle the same way at every tier.
