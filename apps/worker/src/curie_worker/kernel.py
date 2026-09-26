@@ -833,24 +833,11 @@ def _parse_approval_targets(
     or duplicate targets must not produce a durable approval with ambiguous
     authority.
 
-    ADR-0168 decision 3 splits the notification target's both-or-neither rule
-    by kind. A Slack notification WITH an endpoint is the pre-ADR
-    custom-transport form and keeps both-or-neither: ``adapter`` there is a
-    credential slug, not an identity, and a stray endpoint with no adapter (or
-    the reverse) is a half-configured transport. A Slack notification with NO
-    endpoint may name an identity in ``adapter``, or none (the default) --
-    ``adapter`` alone is a complete, resolvable Slack route (D4.4), not a
-    half-configured one. Any other kind still requires both, unconditionally
-    (enforced below by ``kind != POLICY_CARD_KIND`` on its own).
-
-    Duplicate detection against the resolution target follows the same split:
-    a Slack notification with no endpoint duplicates the resolution when they
-    name the SAME IDENTITY (``route_identity``), because that is the same
-    Slack route by decision 3; a Slack notification WITH an endpoint (custom
-    transport) and any other kind duplicate the resolution on the raw
-    ``(kind, address)`` pair, as they always have -- ``adapter`` there is a
-    credential slug, not an identity, so comparing it would let two different
-    credentials on the SAME pair pass as distinct targets.
+    ADR-0168 decision 3: a Slack notification names its identity in
+    ``adapter``, or none for the default, and has no endpoint; any other kind
+    needs both. A Slack notification duplicates the resolution when it names
+    the same identity (``route_identity``) on the same channel; any other kind
+    duplicates it on the raw ``(kind, address)`` pair.
     """
 
     if not isinstance(binding, dict) or set(binding) - {
@@ -887,13 +874,7 @@ def _parse_approval_targets(
     endpoint = notification.get("endpoint")
     adapter = notification.get("adapter")
     address_shape = _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
-    # True for every shape EXCEPT a Slack notification with no endpoint: a
-    # non-Slack kind (always) or a Slack custom-transport notification (an
-    # endpoint present). That one exception is where `adapter` names an
-    # ADR-0168 decision 3 IDENTITY rather than a credential slug, so both the
-    # both-or-neither gate and the duplicate check below treat it apart from
-    # every other shape, which still goes by the raw `(kind, address)` pair.
-    not_slack_identity_form = kind != POLICY_CARD_KIND or endpoint is not None
+    slack = kind == POLICY_CARD_KIND
     if (
         not isinstance(kind, str)
         or _CHANNEL_SLUG.fullmatch(kind) is None
@@ -905,14 +886,14 @@ def _parse_approval_targets(
             adapter is not None
             and (not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None)
         )
-        or (not_slack_identity_form and (endpoint is None) != (adapter is None))
+        or (slack and endpoint is not None)
+        or (not slack and (endpoint is None or adapter is None))
         or (endpoint is not None and not _valid_notification_endpoint(endpoint))
-        or (kind != POLICY_CARD_KIND and endpoint is None)
         or (
-            (kind, address) == resolution_pair
-            if not_slack_identity_form
-            else (kind, route_identity(kind, adapter), address)
+            (kind, route_identity(kind, adapter), address)
             == (POLICY_CARD_KIND, DEFAULT_IDENTITY, resolution_pair[1])
+            if slack
+            else (kind, address) == resolution_pair
         )
     ):
         return None
