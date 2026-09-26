@@ -32,7 +32,7 @@ from .models import (
     ThreadPublicationLineage,
     ThreadWorkspace,
 )
-from .schemas import ReviewRevisionReserve
+from .schemas import BUILTIN_CLUSTER_MESSAGE_ADAPTER, ReviewRevisionReserve
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,10 @@ class ReviewContext:
     lineage: ThreadPublicationLineage
     binding: AgentChannel
     conversation_id: str
+    # The reply adapter of the publication that opened this lineage. The
+    # built-in cluster-message relay binds a route-less channel (#2789), so the
+    # binding alone would send the review reply to the Slack sink.
+    origin_adapter: str | None = None
 
     @property
     def truth(self) -> BoundReviewLineage:
@@ -118,7 +122,13 @@ async def review_context(
         ) != lineage.conversation_id
     ):
         raise FeedbackIgnored("binding_no_longer_authorized")
-    return ReviewContext(lineage, binding, lineage.reply_conversation_id)
+    origin_adapter = await session.scalar(
+        select(Publication.reply_adapter)
+        .where(Publication.lineage_id == lineage.id)
+        .order_by(Publication.revision_number)
+        .limit(1)
+    )
+    return ReviewContext(lineage, binding, lineage.reply_conversation_id, origin_adapter)
 
 
 def feedback_from_row(row: GitHubReviewFeedback) -> UnverifiedFeedback:
@@ -144,6 +154,28 @@ def feedback_provenance(feedback: UnverifiedFeedback) -> dict[str, Any]:
     return provenance
 
 
+def review_reply_handle(context: ReviewContext) -> ReplyHandle:
+    """Reply where the conversation came from, on its captured binding."""
+    binding = context.binding
+    if context.origin_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+        # The relay refuses a post without a session ref. The original CLI
+        # session is long gone, so this turn gets a fresh bucket of its own.
+        return ReplyHandle(
+            kind=binding.kind,
+            channel=binding.address,
+            placeholder=str(uuid.uuid4()),
+            endpoint=None,
+            adapter=BUILTIN_CLUSTER_MESSAGE_ADAPTER,
+        )
+    return ReplyHandle(
+        kind=binding.kind,
+        channel=binding.address,
+        placeholder=None,
+        endpoint=binding.endpoint,
+        adapter=binding.adapter,
+    )
+
+
 def review_turn(feedback: UnverifiedFeedback, context: ReviewContext) -> QueuedTurn:
     provenance = feedback_provenance(feedback)
     return QueuedTurn(
@@ -159,13 +191,7 @@ def review_turn(feedback: UnverifiedFeedback, context: ReviewContext) -> QueuedT
         # SLACK is the frozen protocol's legacy category for person messages,
         # including another transport; WEBHOOK means a job and cannot steer.
         source=TurnSource.SLACK,
-        reply_handle=ReplyHandle(
-            kind=context.binding.kind,
-            channel=context.binding.address,
-            placeholder=None,
-            endpoint=context.binding.endpoint,
-            adapter=context.binding.adapter,
-        ),
+        reply_handle=review_reply_handle(context),
         received_at=datetime.now(UTC).isoformat(),
     )
 
