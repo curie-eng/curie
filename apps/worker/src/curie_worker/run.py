@@ -14,7 +14,7 @@ import math
 import os
 import signal
 import time
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
@@ -37,7 +37,6 @@ from .approvals import ApprovalClient
 from .attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
-    AttachmentResolutionError,
     SlackFileClient,
 )
 from .binding import BindingResolver
@@ -347,25 +346,6 @@ def _sandbox_client(
     return KubernetesSandboxClient(sub_config.namespace)
 
 
-class _NoDefaultSlackFileClient:
-    """Stands in for ``default``'s file client when this worker holds no bot token.
-
-    ``SlackFileClient`` itself refuses a blank token at construction, so it
-    cannot represent ``default`` here: the lane's switch (ADR-0168 decision 5's
-    ruling) can now be ON from a NAMED identity's token alone while ``default``'s
-    stays blank. This is reachable only by a turn that resolves to ``default``
-    (no adapter, or the pre-ADR custom-transport form) on such a worker, and it
-    refuses the fetch the same way an unconfigured named identity does, rather
-    than crashing the whole build at boot.
-    """
-
-    def fetch(self, file_id: str) -> Iterator[bytes]:
-        raise AttachmentResolutionError(
-            "credential",
-            "no Slack bot token is configured on this worker for identity 'default'",
-        )
-
-
 def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     async_redis: AsyncRedis = AsyncRedis(
         **config.valkey_client_kwargs(),
@@ -456,13 +436,16 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     slack_tokens = slack_bot_tokens(config, environ=env)
     attachments = (
         AttachmentCoordinator(
+            # The lane is on when any identity holds a token, so `default`'s
+            # may be blank here; `_files_for` refuses that identity before any
+            # fetch rather than this module standing in a broken port for it.
             files=(
                 SlackFileClient(
                     token=config.slack_bot_token,
                     read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
                 )
                 if config.slack_bot_token
-                else _NoDefaultSlackFileClient()
+                else None
             ),
             identity_files={
                 name: SlackFileClient(

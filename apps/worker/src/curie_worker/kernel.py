@@ -53,7 +53,7 @@ from aci_protocol import (
     ToolNote,
     TurnSource,
 )
-from aci_protocol.turn import DEFAULT_IDENTITY, route_identity
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import (
     MESSAGE_VERSION,
     Action,
@@ -6195,8 +6195,8 @@ class Kernel:
         # channel it POSTS TO, never from the turn that requested it. In the
         # requesting channel the card joins the thread and rides the trigger's
         # own transport. A route-bound channel has no such thread and is policy,
-        # not a per-turn reply: it posts top-level over the worker's default
-        # Slack transport, because ``ApprovalRouteBinding.resolution`` is
+        # not a per-turn reply: it posts top-level over the worker's configured
+        # Slack origin, because ``ApprovalRouteBinding.resolution`` is
         # Slack-only by construction (``schemas.py`` validates the explicit
         # pair), and the authorizer proves membership of that channel through a
         # verified Slack card click. Notification transport never feeds this
@@ -6216,7 +6216,22 @@ class Kernel:
             handle.channel,
         )
         card_endpoint = handle.endpoint if in_requesting_channel else None
-        card_adapter = route.adapter if in_requesting_channel else None
+        # A policy-routed card (NOT in the requesting channel) carries no
+        # per-turn identity of its own -- ``ApprovalRouteBinding.resolution``
+        # names only a channel, never an adapter -- so it must borrow the
+        # TURN's, or a named identity's card posts as ``default`` in a channel
+        # where only that identity may be a member (ADR-0168 decision 5). That
+        # borrow applies only to a Slack turn in IDENTITY form (no endpoint): a
+        # Slack turn carrying its own endpoint is the pre-ADR custom-transport
+        # form, whose ``adapter`` is a credential slug rather than an identity
+        # (``aci_protocol.turn.slack_speaking_identity``), and any other kind's
+        # adapter is that kind's own egress credential -- neither belongs on a
+        # Slack policy card.
+        card_adapter = (
+            None
+            if not in_requesting_channel and (handle.kind != SLACK_KIND or handle.endpoint)
+            else route.adapter
+        )
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
         # Slack adapter renders it into the approval card's buttons below the

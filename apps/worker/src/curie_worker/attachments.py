@@ -589,18 +589,23 @@ class AttachmentCoordinator:
     is: ``files`` is the channel download, ``objects`` is the private store,
     ``clock`` is the wall clock the two independent expiry windows are measured
     against. ``identity_files`` holds each named Slack identity's own download
-    (ADR-0168 decision 5); ``files`` is ``default``'s.
+    (ADR-0168 decision 5); ``files`` is ``default``'s, or None on a worker that
+    holds no bot token for it.
     """
 
     def __init__(
         self,
         *,
-        files: AttachmentFilePort,
+        files: AttachmentFilePort | None,
         objects: WorkspaceObjectPort,
         limits: AttachmentLimits | None = None,
         clock: Callable[[], float] = time.time,
         identity_files: Mapping[str, AttachmentFilePort] | None = None,
     ) -> None:
+        # None when this worker holds no bot token for `default` (ADR-0168
+        # decision 5): `_files_for` refuses that identity the same way it
+        # refuses an unconfigured named one, rather than a caller having to
+        # stand in a port whose every method raises.
         self.files = files
         self.objects = objects
         self.limits = limits or AttachmentLimits()
@@ -683,9 +688,7 @@ class AttachmentCoordinator:
     def _files_for(self, identity: str) -> AttachmentFilePort:
         """The download for ``identity``, refused before any fetch when absent."""
 
-        if identity == DEFAULT_IDENTITY:
-            return self.files
-        files = self._identity_files.get(identity)
+        files = self.files if identity == DEFAULT_IDENTITY else self._identity_files.get(identity)
         if files is None:
             raise AttachmentResolutionError(
                 "credential",
