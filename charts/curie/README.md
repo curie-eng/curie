@@ -304,7 +304,9 @@ instrumented workload:
 `otelCollector.metricsTemporalityPreference` defaults to `delta` for push
 exporters. It sets `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` on every
 instrumented workload, including runner sandboxes. Set it to `cumulative` for
-a backend that requires cumulative counters and histograms. The collector
+a backend that requires cumulative counters and histograms. Prometheus remote
+write requires cumulative points, so the supplied SRE observability overlay
+sets this value to `cumulative`. The collector
 copies each runner's anonymous `service.instance.id` resource value onto its
 metric points so concurrent sandboxes retain separate series; it does not add
 an instance label to other services. For a release wide served turn count, use

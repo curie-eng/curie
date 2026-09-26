@@ -1,4 +1,6 @@
 otelCollector:
+  # Prometheus remote write drops delta counters and histograms.
+  metricsTemporalityPreference: cumulative
   extraExporters:
     otlphttp/tempo:
       endpoint: http://tempo.observability.svc.cluster.local:4318

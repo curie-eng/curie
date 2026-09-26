@@ -41,6 +41,9 @@ permanent overlay deployed.
 
    - `prometheusremotewrite/soak` under Collector exporters
    - that name on `service.pipelines.metrics.exporters` alongside `nop/metrics`
+   - `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative` on the
+     instrumented workloads, because Prometheus remote write drops delta
+     counters and histograms
    - `--web.enable-remote-write-receiver` on Prometheus
    - the `curie-reliability` alert group
    - a single intended node-exporter port when the isolation overlay is applied
