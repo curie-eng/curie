@@ -103,6 +103,29 @@ def _gone_within(pid: int, seconds: float) -> bool:
     return not _alive(pid)
 
 
+def _asleep(pid: int) -> bool:
+    """Whether the process is in an interruptible sleep, as in a wait."""
+
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        return stat.read_text().rsplit(")", 1)[1].split()[0] == "S"
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    # macOS reports a sleep of more than about 20 seconds as idle.
+    return state[:1] in ("S", "I")
+
+
+def _wait_until_asleep(pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while not _asleep(pid):
+        assert time.monotonic() < deadline, "the tool never started waiting"
+        time.sleep(0.01)
+
+
 def _kill_quietly(pid: int) -> None:
     try:
         os.kill(pid, 9)
@@ -318,6 +341,63 @@ def test_timeout_passes_on_a_term_that_arrives_while_the_command_starts() -> Non
     try:
         assert process.stdout is not None
         assert process.stdout.readline() == "ready\n"
+        process.terminate()
+        assert process.wait(timeout=10) == -15, "the TERM never reached the command"
+        assert _group_gone_within(process.pid, 3), "the command outlived the helper"
+    finally:
+        process.kill()
+        process.wait()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, 9)
+
+
+# gnu-process.py with every Python handler it installs set to restart the call
+# it interrupts, so a handler that fires during the wait runs only once the
+# wait returns. That is where a signal already stands when it lands just before
+# the wait starts: CPython runs a Python handler only between bytecodes.
+RESTARTING_HANDLERS = """
+import importlib.util, signal, sys
+spec = importlib.util.spec_from_file_location("gnu_process", sys.argv[1])
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+install = signal.signal
+def restarting(signum, handler):
+    previous = install(signum, handler)
+    if callable(handler):
+        signal.siginterrupt(signum, False)
+    return previous
+signal.signal = restarting
+sys.exit(helper.timeout(sys.argv[2:]))
+"""
+
+
+def test_timeout_passes_on_a_term_that_lands_as_it_starts_waiting() -> None:
+    """A TERM that lands as the helper starts its wait must not wait with it.
+
+    Otherwise the command runs on until it exits of its own accord. On a
+    loaded CI runner a TERM can land between the helper's last bytecode and
+    the wait it then blocks in.
+    """
+
+    _require_a_group_of_its_own([str(HELPER), "timeout"])
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            RESTARTING_HANDLERS,
+            str(HELPER),
+            "30",
+            "sh",
+            "-c",
+            "echo ready; exec sleep 30",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline() == "ready\n"
+        _wait_until_asleep(process.pid)
         process.terminate()
         assert process.wait(timeout=10) == -15, "the TERM never reached the command"
         assert _group_gone_within(process.pid, 3), "the command outlived the helper"
