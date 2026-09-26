@@ -68,3 +68,28 @@ fn missing_release_recovery_never_prints_a_placeholder_target() {
         );
     }
 }
+
+#[test]
+fn file_backed_model_pin_recovery_uses_curie_apply_and_the_file_key() {
+    let facts = Facts {
+        model_release_default: Some("claude-sonnet-5".into()),
+        target: Some(("acme".into(), "acme-bot".into())),
+        declared_installation: true,
+        ..Default::default()
+    };
+
+    let fix = evaluate(&facts)
+        .into_iter()
+        .find(|check| check.id == "model-pin")
+        .and_then(|check| check.fix)
+        .expect("a floating file backed release model must offer a fix");
+
+    assert!(
+        fix.contains("curie apply") && fix.contains("agentSandbox.runner.model"),
+        "the fix must direct the operator to apply and name the file key: {fix}"
+    );
+    assert!(
+        !fix.contains("cluster up --set"),
+        "the file backed fix must not return to the cluster up override shape: {fix}"
+    );
+}
