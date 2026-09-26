@@ -531,8 +531,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "render the same Service, Deployment, both NetworkPolicies and the "
                     "same `app.kubernetes.io/name` pod selector, handing one agent's "
                     "sandbox the other's connector and the credential bound to it "
-                    "(the connector is deliberately unauthenticated, ADR-0086) -- rename "
-                    "the connector so it does not start with `mcp-` or contain `-mcp-`",
+                    "(ADR-0086) -- rename the connector so it does not start with `mcp-` "
+                    "or contain `-mcp-`",
                 )
             )
         forms = [bool(spec.image), bool(spec.build), bool(spec.url)]

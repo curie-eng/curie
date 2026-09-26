@@ -31,11 +31,15 @@ not write.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
-from .connectors import ConnectorSpec
+from .connectors import ADMITS_SELF, ConnectorSpec
 
 # Service names are DNS labels, so 63 characters is the hard ceiling. Names that
 # would exceed it are truncated and disambiguated with a digest rather than
@@ -125,6 +129,69 @@ def connector_forges_join(connector: str) -> bool:
     return _JOIN in f"-{connector}"
 
 
+# The port the caller proxy listens on in every hosted connector pod (ADR-0168
+# decision 7), and the one it moves to when a server declares that port itself.
+# Every example declares 8000.
+CALLER_PROXY_PORT = 8480
+CALLER_PROXY_ALTERNATE_PORT = 8481
+CALLER_PROXY_CONTAINER = "caller-proxy"
+_CALLER_PORT_NAME = "caller"
+_PUBLIC_KEY_BYTES = 32
+
+
+@dataclass(frozen=True)
+class ConnectorProxy:
+    """What the render needs to put a caller proxy in front of a connector.
+
+    ``public_keys`` is the current key first, then the previous one during a
+    rotation, each the standard base64 of a 32-byte Ed25519 public key. The
+    proxy admits a token either key verifies.
+    """
+
+    image: str
+    public_keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.image.strip():
+            raise ValueError("the connector proxy image is empty")
+        if not self.public_keys:
+            raise ValueError("the connector proxy has no caller public key")
+        for text in self.public_keys:
+            try:
+                raw = base64.b64decode(text, validate=True)
+            except (binascii.Error, ValueError):
+                raise ValueError("a caller public key is not standard base64") from None
+            if len(raw) != _PUBLIC_KEY_BYTES:
+                raise ValueError(
+                    f"a caller public key decodes to {len(raw)} bytes; an Ed25519 public "
+                    f"key is {_PUBLIC_KEY_BYTES}"
+                )
+
+
+def caller_proxy_port(spec: ConnectorSpec) -> int:
+    """The port the caller proxy takes in this connector's pod."""
+
+    return CALLER_PROXY_ALTERNATE_PORT if spec.port == CALLER_PROXY_PORT else CALLER_PROXY_PORT
+
+
+def resolved_admits(spec: ConnectorSpec, agent: str) -> list[str]:
+    """The agent names this connector's proxy admits, with ``self`` resolved.
+
+    A missing list is the deploying agent alone and ``[]`` is nobody (ADR-0168
+    decision 7). ``self`` becomes ``agent``, the stored name the worker signs
+    into the token, and a list naming both collapses to one entry.
+    """
+
+    if spec.admits is None:
+        return [agent]
+    admitted: list[str] = []
+    for entry in spec.admits:
+        name = agent if entry == ADMITS_SELF else entry
+        if name not in admitted:
+            admitted.append(name)
+    return admitted
+
+
 def sandbox_selector(release: str, app_name: str) -> dict[str, str]:
     """The pods Rail 1's default-deny egress selects, exactly.
 
@@ -167,11 +234,11 @@ def object_name(release: str, agent: str, connector: str) -> str:
     names distinct per (release, agent, connector) but the join it introduced is
     a bare substring, so two DIFFERENT tuples could still render one Service,
     one Deployment, both NetworkPolicies and -- worst -- one
-    ``app.kubernetes.io/name``, which IS the pod selector. The connector is
-    deliberately unauthenticated (ADR-0086: the network is not one layer of the
-    access control, it is the whole of it), so this name is the only thing
-    binding a sandbox to a credential and a collision hands one agent another
-    agent's production token with nothing logged.
+    ``app.kubernetes.io/name``, which IS the pod selector. That selector is what
+    both NetworkPolicies and the Service bind to, and the caller proxy's
+    ``admits`` list rides in the Deployment it names (ADR-0168 decision 7), so a
+    collision hands one agent another agent's production token with nothing
+    logged.
 
     Raising, rather than quietly deriving some other unique name, is what keeps
     the other half of this function's contract intact. "Stable and derivable"
@@ -237,8 +304,18 @@ def host_aliases(release: str, agent: str, connector: str, namespace: str, port:
     ]
 
 
-def render_service(release: str, agent: str, connector: str, spec: ConnectorSpec) -> dict[str, Any]:
+def render_service(
+    release: str,
+    agent: str,
+    connector: str,
+    spec: ConnectorSpec,
+    proxy: ConnectorProxy | None = None,
+) -> dict[str, Any]:
+    """The Service the sandbox dials. It keeps ``spec.port``, so the URL and the
+    allowed hosts do not move; with a proxy it lands on the proxy's port."""
+
     name = object_name(release, agent, connector)
+    target = _CALLER_PORT_NAME if proxy is not None else "http"
     return {
         "apiVersion": "v1",
         "kind": "Service",
@@ -246,7 +323,7 @@ def render_service(release: str, agent: str, connector: str, spec: ConnectorSpec
         "spec": {
             "type": "ClusterIP",
             "selector": _labels(release, agent, connector),
-            "ports": [{"name": "http", "port": spec.port, "targetPort": "http"}],
+            "ports": [{"name": "http", "port": spec.port, "targetPort": target}],
         },
     }
 
@@ -301,6 +378,7 @@ def render_deployment(
     connector: str,
     spec: ConnectorSpec,
     secret_name: str,
+    proxy: ConnectorProxy | None = None,
 ) -> dict[str, Any]:
     name = object_name(release, agent, connector)
     subs = substitutions(release, agent, connector, namespace, spec.port)
@@ -422,7 +500,8 @@ def render_deployment(
                                 "requests": {"cpu": "10m", "memory": "64Mi"},
                                 "limits": {"cpu": "500m", "memory": "256Mi"},
                             },
-                        }
+                        },
+                        *([_proxy_container(agent, spec, proxy)] if proxy is not None else []),
                     ],
                     **({"volumes": volumes} if volumes else {}),
                 },
@@ -431,8 +510,55 @@ def render_deployment(
     }
 
 
+def _proxy_container(agent: str, spec: ConnectorSpec, proxy: ConnectorProxy) -> dict[str, Any]:
+    """The caller proxy: it checks each request's token and forwards to the server.
+
+    Every value is a literal. The public keys are public, and the proxy holds no
+    key that can mint. The hardening and the bounds match the server's; 128Mi
+    is roughly three times the proxy's measured peak.
+    """
+
+    port = caller_proxy_port(spec)
+    return {
+        "name": CALLER_PROXY_CONTAINER,
+        "image": proxy.image,
+        "command": ["python", "-m", "curie_connector_proxy"],
+        "env": [
+            {"name": "CURIE_CALLER_PROXY_PORT", "value": str(port)},
+            {"name": "CURIE_CALLER_PROXY_UPSTREAM_PORT", "value": str(spec.port)},
+            {"name": "CURIE_CALLER_PROXY_PUBLIC_KEYS", "value": ",".join(proxy.public_keys)},
+            {
+                "name": "CURIE_CALLER_PROXY_ADMITS",
+                "value": json.dumps(resolved_admits(spec, agent), separators=(",", ":")),
+            },
+        ],
+        "ports": [{"name": _CALLER_PORT_NAME, "containerPort": port}],
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": {"drop": ["ALL"]},
+        },
+        "resources": {
+            "requests": {"cpu": "10m", "memory": "64Mi"},
+            "limits": {"cpu": "500m", "memory": "128Mi"},
+        },
+    }
+
+
+def _policy_port(spec: ConnectorSpec, proxy: ConnectorProxy | None) -> int:
+    # NetworkPolicy matches the destination pod port after the Service DNAT
+    # (see the module docstring), so with a proxy both policies name the
+    # proxy's port and nothing Curie renders opens `spec.port`.
+    return caller_proxy_port(spec) if proxy is not None else spec.port
+
+
 def render_networkpolicy(
-    release: str, agent: str, app_name: str, connector: str, spec: ConnectorSpec
+    release: str,
+    agent: str,
+    app_name: str,
+    connector: str,
+    spec: ConnectorSpec,
+    proxy: ConnectorProxy | None = None,
 ) -> dict[str, Any]:
     """Egress from the sandbox to this connector.
 
@@ -453,7 +579,7 @@ def render_networkpolicy(
             "egress": [
                 {
                     "to": [{"podSelector": {"matchLabels": _labels(release, agent, connector)}}],
-                    "ports": [{"protocol": "TCP", "port": spec.port}],
+                    "ports": [{"protocol": "TCP", "port": _policy_port(spec, proxy)}],
                 }
             ],
         },
@@ -461,16 +587,22 @@ def render_networkpolicy(
 
 
 def render_ingress_networkpolicy(
-    release: str, agent: str, app_name: str, connector: str, spec: ConnectorSpec
+    release: str,
+    agent: str,
+    app_name: str,
+    connector: str,
+    spec: ConnectorSpec,
+    proxy: ConnectorProxy | None = None,
 ) -> dict[str, Any]:
     """Ingress to this connector: any sandbox in this release, and nothing else.
 
     The egress policy above says where the sandbox may GO. It says nothing
     about who may ARRIVE, and those are not the same question. Without this,
-    every pod in the namespace can call the connector -- and the connector is
-    deliberately unauthenticated, because the sandbox holds no credential to
-    authenticate WITH. So the network is not one layer of the access control
-    here, it is the whole of it.
+    every pod in the namespace can call the connector. With a caller proxy
+    (ADR-0168 decision 7) this policy decides who may ask at all and the proxy
+    decides which agent is asking; on an install with no caller key there is no
+    proxy, and this policy is the whole of the access control. With a proxy it
+    opens only the proxy's port (``_policy_port``).
 
     What that is worth is concrete: a connector holds a production credential
     and answers anyone who asks. In a namespace that also runs Postgres,
@@ -512,7 +644,7 @@ def render_ingress_networkpolicy(
             "ingress": [
                 {
                     "from": [{"podSelector": {"matchLabels": sandbox_selector(release, app_name)}}],
-                    "ports": [{"protocol": "TCP", "port": spec.port}],
+                    "ports": [{"protocol": "TCP", "port": _policy_port(spec, proxy)}],
                 }
             ],
         },
@@ -528,6 +660,7 @@ def render(
     connector: str,
     spec: ConnectorSpec,
     secret_name: str,
+    proxy: ConnectorProxy | None = None,
 ) -> list[dict[str, Any]]:
     """Every object needed to run one hosted connector. Empty for a remote one.
 
@@ -560,10 +693,10 @@ def render(
             "before anything renders."
         )
     return [
-        render_service(release, agent, connector, spec),
-        render_deployment(release, agent, namespace, connector, spec, secret_name),
-        render_networkpolicy(release, agent, app_name, connector, spec),
-        render_ingress_networkpolicy(release, agent, app_name, connector, spec),
+        render_service(release, agent, connector, spec, proxy),
+        render_deployment(release, agent, namespace, connector, spec, secret_name, proxy),
+        render_networkpolicy(release, agent, app_name, connector, spec, proxy),
+        render_ingress_networkpolicy(release, agent, app_name, connector, spec, proxy),
     ]
 
 
