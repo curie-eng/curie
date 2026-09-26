@@ -73,7 +73,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from . import sandbox_token
+from . import caller_token, sandbox_token
 from .behaviorpacks import BehaviorPacks
 from .config import WorkerConfig
 
@@ -860,8 +860,8 @@ class BindingResolver:
         # and none is set -- preserving the pre-#410 no-key path.
         state_token: str | None = None
         app_state_token: str | None = None
+        exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
         if self._config.api_key:
-            exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             state_token = sandbox_token.mint(
                 self._config.api_key,
                 agent=str(resolved.agent_id),
@@ -872,6 +872,17 @@ class BindingResolver:
                 self._config.api_key,
                 agent=str(resolved.agent_id),
                 scope="state.app",
+                exp=exp,
+            )
+        # The caller token (ADR-0168 decision 7): this sandbox's agent, signed
+        # for its hosted connectors, with the state tokens' expiry. No key mints
+        # none, which is the stock install. render_worker emits it only with
+        # the connector scope.
+        connector_caller_token: str | None = None
+        if self._config.connector_caller_signing_key.strip():
+            connector_caller_token = caller_token.mint(
+                self._config.connector_caller_signing_key,
+                agent=resolved.agent_name,
                 exp=exp,
             )
         env = BootEnv.render_worker(
@@ -898,6 +909,7 @@ class BindingResolver:
             connector_release=self._config.connector_release or None,
             connector_agent=resolved.agent_name,
             connector_namespace=self._config.connector_namespace or None,
+            connector_caller_token=connector_caller_token,
             # The agent's pinned model (#254) overrides the worker default; None
             # falls back to the platform default.
             model=resolved.model if resolved.model is not None else self._config.model,

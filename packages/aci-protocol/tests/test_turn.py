@@ -290,7 +290,7 @@ def test_a_patch_difference_is_compatible_in_both_directions() -> None:
 
 
 def test_targetless_turns_start_a_new_incompatible_protocol_line() -> None:
-    assert PROTOCOL_VERSION == "0.5.2"
+    assert PROTOCOL_VERSION == "0.5.3"
     assert is_compatible("0.4.5", PROTOCOL_VERSION) is False
     assert is_compatible(PROTOCOL_VERSION, "0.4.5") is False
 

@@ -1765,6 +1765,36 @@ A worker holding no token for the identity a turn names drops the turn before
 it runs, logs the identity, and leaves the placeholder as the dispatcher posted
 it: it never answers as another bot.
 
+### The connector caller key pair
+
+The worker signs each sandbox's connector caller token (ADR-0168 decision 7)
+with an Ed25519 key it reads from a Secret you name. Nothing verifies the
+token yet. BYO only in this release: the chart does not generate the key.
+`curie cluster up` does not mint or persist one yet either, so a render
+without cluster access (`helm template`, a client-only upgrade) has nothing
+that could keep a generated key stable. A later release has `curie cluster
+up` generate the key and carry it forward, the way it already does for the
+sealing keypair.
+
+The Secret holds both halves as standard base64: the 32-byte seed under
+`connectorCaller.signingKeyKey` (default `signingKey`) and its 32-byte public
+key under `connectorCaller.verifyKeyKey` (default `verifyKey`). With PyNaCl
+installed:
+
+```bash
+python3 -c 'import base64, nacl.signing as s; k = s.SigningKey.generate(); print(base64.b64encode(bytes(k)).decode()); print(base64.b64encode(bytes(k.verify_key)).decode())'
+```
+
+```yaml
+connectorCaller:
+  existingSecret: my-connector-caller   # holds signingKey and verifyKey
+```
+
+Only the worker receives the signing key. Leaving `existingSecret` empty mints
+no token, and every sandbox boots as before. A plain `curie cluster up` does
+not carry `connectorCaller` forward yet, so pass it with every upgrade:
+`curie cluster up --set connectorCaller.existingSecret=<name>`.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement

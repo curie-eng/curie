@@ -89,6 +89,13 @@ pub struct ConnectorSpecDecl {
     #[serde(default = "default_port")]
     pub port: u32,
     pub unhosted_url: Option<String>,
+    /// The agents admitted to this connector (ADR-0168 decision 7), each the
+    /// reserved `self` or an agent name. Carried as written, not judged and not
+    /// resolved: `None` and `Some(vec![])` mean different things to the
+    /// platform, `self` means an agent the CLI never learns, and
+    /// `plugin_format.validate_connectors` owns the rules.
+    #[serde(default)]
+    pub admits: Option<Vec<String>>,
 
     // -- remote form --
     pub url: Option<String>,
@@ -156,6 +163,7 @@ impl Default for ConnectorSpecDecl {
             env: BTreeMap::new(),
             port: default_port(),
             unhosted_url: None,
+            admits: None,
             url: None,
             headers: BTreeMap::new(),
             secrets: Vec::new(),

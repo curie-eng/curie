@@ -43,6 +43,8 @@ from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
 
+from . import caller_token
+
 
 def _default_consumer_name() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
@@ -134,10 +136,21 @@ CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_pars
 MAX_DELIVERY_BUDGET_S = 10800.0
 
 
+class CallerSigningKeyError(RuntimeError):
+    """The connector caller signing key cannot sign.
+
+    Not a ``ValueError``: pydantic wraps one of those in a ``ValidationError``
+    that prints the whole settings input, which would put the key in the boot
+    log.
+    """
+
+
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
 
-    model_config = SettingsConfigDict(frozen=True, populate_by_name=True, extra="ignore")
+    model_config = SettingsConfigDict(
+        frozen=True, populate_by_name=True, extra="ignore", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -266,6 +279,14 @@ class WorkerConfig(BaseSettings):
     # scope that names a Service which cannot exist.
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
+
+    # The Ed25519 seed that signs each sandbox's connector caller token
+    # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
+    # renders it only from `connectorCaller.existingSecret`, and it never
+    # enters a sandbox (`sandbox.types.HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
+    connector_caller_signing_key: str = Field(
+        default="", validation_alias="CURIE_CONNECTOR_CALLER_SIGNING_KEY", repr=False
+    )
 
     # The shimmer caption, kept SEPARATE from the dispatcher's placeholder text
     # because the two surfaces have different grammar. Slack renders an
@@ -450,6 +471,24 @@ class WorkerConfig(BaseSettings):
                 "is unset; connector object names are derived from these, so "
                 "the reconciler would manage a parallel set under wrong names"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _caller_signing_key_is_a_seed(self) -> WorkerConfig:
+        """Fail at construction on a signing key that cannot sign.
+
+        Otherwise every scoped boot would raise at mint time, one turn at a
+        time.
+        """
+
+        if not self.connector_caller_signing_key.strip():
+            return self
+        try:
+            caller_token.signing_key(self.connector_caller_signing_key)
+        except ValueError as exc:
+            raise CallerSigningKeyError(
+                f"CURIE_CONNECTOR_CALLER_SIGNING_KEY is unusable: {exc}"
+            ) from None
         return self
 
     @model_validator(mode="after")

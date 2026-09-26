@@ -318,6 +318,7 @@ def _config_for(
     agent: str | None = None,
     namespace: str | None = None,
     approval_grant_tool: str | None = None,
+    caller_token: str | None = None,
 ) -> RunnerConfig:
     """A RunnerConfig built the way a real boot builds one.
 
@@ -336,6 +337,7 @@ def _config_for(
             connector_release=release,
             connector_agent=agent,
             connector_namespace=namespace,
+            connector_caller_token=caller_token,
         )
         | _SUBSTRATE_ENV
     )
@@ -1110,3 +1112,94 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
     assert spawn["STDIO_TOKEN"] == "keep-me"
     github = session.options.mcp_servers["github"]
     assert github["headers"]["Authorization"] == "Bearer ghp_sentinel"
+
+
+# --------------------------------------------------------------------------- #
+# The caller token header (ADR-0168 decision 7)
+#
+# The worker signs this sandbox's agent into CURIE_CONNECTOR_CALLER_TOKEN, and
+# each hosted connector's entry names it in X-Curie-Caller. The value stays a
+# placeholder that the MCP client expands from the sandbox env, and it goes
+# only to a Service Curie created: a remote or fallback URL is somebody else's
+# server.
+# --------------------------------------------------------------------------- #
+_CALLER_HEADER = "X-Curie-Caller"
+_CALLER_PLACEHOLDER = "${CURIE_CONNECTOR_CALLER_TOKEN}"
+
+
+def test_a_hosted_connector_presents_the_caller_token(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE, caller_header=True)
+    assert servers["grafana"]["headers"] == {
+        "Authorization": "Bearer ${T}",
+        _CALLER_HEADER: _CALLER_PLACEHOLDER,
+    }
+
+
+def test_no_token_means_no_caller_header(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE)
+    assert servers["grafana"]["headers"] == {"Authorization": "Bearer ${T}"}
+
+
+def test_the_caller_header_survives_the_pod_only_bearer_trim(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, GITHUB_POD_CREDENTIAL), **SCOPE, caller_header=True
+    )
+    assert servers["github"]["headers"] == {_CALLER_HEADER: _CALLER_PLACEHOLDER}
+
+
+def test_a_remote_connector_never_receives_the_caller_token(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, HOSTED + REMOTE.replace("connectors:\n", ""))
+    servers = derive_mcp_servers(root, **SCOPE, caller_header=True)
+    assert servers["internal"] == {"type": "http", "url": "https://mcp.internal/mcp"}
+    assert _CALLER_HEADER in servers["grafana"]["headers"]
+
+
+def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, HOSTED_WITH_FALLBACK),
+        release=None,
+        agent=None,
+        namespace=None,
+        caller_header=True,
+    )
+    assert servers["grafana"] == {"type": "http", "url": "http://host.docker.internal:8765/mcp"}
+
+
+def test_a_minted_token_reaches_the_session_and_stays_in_its_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole chain: worker render, RunnerConfig, the session's MCP servers.
+    # Unlike a hosted Bearer, the token is not dropped from the spawn env: the
+    # MCP client expands the header from it, and it names only this agent.
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    config = _config_for(
+        _bundle(tmp_path, GITHUB_POD_CREDENTIAL),
+        release="curie",
+        agent="acme-dev",
+        namespace="curie",
+        caller_token="cct.payload.signature",
+    )
+    assert config.connector_caller_token == "cct.payload.signature"
+    spawn = {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
+    assert isinstance(session, _CapturedSession)
+    assert session.options.mcp_servers["github"]["headers"] == {
+        _CALLER_HEADER: _CALLER_PLACEHOLDER
+    }
+    assert spawn == {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+
+
+def test_a_boot_without_a_token_hands_the_runner_none(tmp_path: Path) -> None:
+    config = _config_for(
+        _bundle(tmp_path, GITHUB_POD_CREDENTIAL),
+        release="curie",
+        agent="acme-dev",
+        namespace="curie",
+    )
+    assert config.connector_caller_token is None
