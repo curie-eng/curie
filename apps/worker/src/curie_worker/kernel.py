@@ -5013,12 +5013,15 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable workspace handoff boundary"
             )
-        # Turn budget fence (#3071). CURIE_MAX_TURNS binds only at boot, so a
-        # live route booted with a different budget is replaced (not adopted)
-        # once it reaches the same durable handoff boundary a late workspace
-        # acquisition waits for. A steerable message arriving while a turn is
-        # live keeps the one-live-session rule instead: it adopts and steers,
-        # and the budget applies from the next new turn.
+        # Turn budget fence (#3071), generalized to a runner booted without a
+        # caller token (ADR-0168 decision 7). CURIE_MAX_TURNS and the caller
+        # token both bind only at boot, so a live route booted with a
+        # different budget, or before the install had a caller key, is
+        # replaced (not adopted) once it reaches the same durable handoff
+        # boundary a late workspace acquisition waits for. A steerable
+        # message arriving while a turn is live keeps the one-live-session
+        # rule instead: it adopts and steers, and the replacement applies
+        # from the next new turn.
         turn_budget_replacement = existing_handle is not None and _boots_differently(
             existing_handle, boot_env
         )
@@ -5178,15 +5181,17 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
-            # Turn budget fence (#3071), finish-race side. The route was kept
-            # only to steer a live turn; that turn ended (or its liveness was
-            # unreadable), and CURIE_MAX_TURNS binds at boot, so a new turn must
-            # not open on this runner. Retry: the redelivery finds the turn
-            # idle and takes the replacement path above.
+            # Turn budget fence (#3071), finish-race side, generalized to a
+            # runner booted without a caller token (ADR-0168 decision 7). The
+            # route was kept only to steer a live turn; that turn ended (or
+            # its liveness was unreadable), and CURIE_MAX_TURNS and the
+            # caller token both bind at boot, so a new turn must not open on
+            # this runner. Retry: the redelivery finds the turn idle and
+            # takes the replacement path above.
             if _boots_differently(handle, boot_env):
                 raise ThreadBusyError(
                     f"thread {thread_key} turn ended before its steer; "
-                    "retrying to replace the runner's turn budget"
+                    "retrying to replace the runner's turn budget or caller token"
                 )
         if verified_review is not None:
             reserver = getattr(self._publication_creator, "reserve_review_feedback", None)

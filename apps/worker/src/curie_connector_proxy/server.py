@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, TCPConnector, web
+from aiohttp.typedefs import Handler
 from multidict import CIMultiDict, CIMultiDictProxy
 from nacl.signing import VerifyKey
 from yarl import URL
@@ -72,7 +73,11 @@ class ProxyConfig:
 
         def port(name: str) -> int:
             raw = env.get(name, "")
-            if not raw.isdigit() or not 0 < int(raw) < 65536:
+            # `str.isdigit()` accepts non-ASCII decimal digits (Arabic-Indic,
+            # for one), and Python's own `int()` parses them, so an ASCII
+            # check comes first: a strict digit check alone would admit a
+            # port no socket call spells the same way.
+            if not raw.isascii() or not raw.isdigit() or not 0 < int(raw) < 65536:
                 raise ValueError(f"{name} must be a TCP port, got {raw!r}")
             return int(raw)
 
@@ -112,11 +117,14 @@ def refusal_body(refusal: str) -> dict[str, object]:
 
 
 def _forwardable(headers: CIMultiDictProxy[str]) -> CIMultiDict[str]:
+    # RFC 9110 7.6.1 lets a `Connection` header name additional hop-by-hop
+    # headers, but `Host` is never one of them: a caller naming it there must
+    # not strip the header the server's allowed-hosts check depends on.
     named = {
         token.strip().lower()
         for value in headers.getall("Connection", [])
         for token in value.split(",")
-    }
+    } - {"host"}
     return CIMultiDict(
         (key, value)
         for key, value in headers.items()
@@ -142,7 +150,16 @@ def _decide(request: web.Request) -> caller.Decision:
     )
 
 
-async def _handle(request: web.Request) -> web.StreamResponse:
+@web.middleware
+async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
+    del handler  # Every request is decided and answered here; never delegated.
+    # A middleware, not a route: aiohttp's router unquotes a path before
+    # matching it against a route's regex, and an unquoted embedded newline
+    # (from `%0A`) fails `.*` (which does not match `\n`) even in a
+    # catch-all, giving the router's own 404 -- a path the server was never
+    # asked about answering as though it had been. A middleware runs around
+    # routing's result either way, so every request, matched or not, is
+    # decided and never silently let through to the router's default.
     decision = _decide(request)
     logger.info(
         "caller=%s outcome=%s method=%s path=%s",
@@ -194,14 +211,17 @@ def make_app(config: ProxyConfig, *, clock: Callable[[], float] = time.time) -> 
             connector=TCPConnector(limit=0),
             timeout=ClientTimeout(total=None, sock_connect=5),
             auto_decompress=False,
+            # The forwarding client must add nothing a caller did not send: a
+            # caller that sent no Accept-Encoding must not get a compressed
+            # body back because the proxy's own client asked for one.
+            skip_auto_headers=("Accept", "Accept-Encoding", "User-Agent"),
         )
         app[_UPSTREAM] = session
         yield
         await session.close()
 
-    app = web.Application()
+    app = web.Application(middlewares=[_handle])
     app[_CONFIG] = config
     app[_CLOCK] = clock
     app.cleanup_ctx.append(upstream)
-    app.router.add_route("*", "/{tail:.*}", _handle)
     return app
