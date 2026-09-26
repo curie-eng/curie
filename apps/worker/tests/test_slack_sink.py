@@ -947,6 +947,51 @@ def test_an_edit_over_slacks_limit_is_cut_to_fit_and_says_so() -> None:
     assert sent.rstrip().endswith("(Cut here: Slack refuses a longer edit.)_")
 
 
+def test_a_long_edit_keeps_the_action_receipt_with_the_answer() -> None:
+    receipt = "_What I changed:_\n• 25 Bash calls; changes not described"
+    sent = _captured_update("A long report line.\n" * 600 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long report line.")
+    assert "(Cut here: Slack refuses a longer edit.)_" in sent
+    assert sent.endswith(receipt)
+
+
+def test_an_oversized_receipt_stays_in_the_long_edit_with_an_omission_notice() -> None:
+    receipt = "_What I changed:_\n" + ("• " + "é" * 300 + "\n") * 10
+    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long answer.")
+    assert "_What I changed:_" in sent
+    assert sent.endswith("more receipt details omitted")
+
+
+def test_a_late_failed_action_is_kept_in_a_long_slack_reply() -> None:
+    from curie_worker.receipt import render_receipt
+
+    actions = [
+        {
+            "tool": f"tool_{i}",
+            "status": "succeeded" if i < 9 else "failed",
+            "undoable": False,
+            "result": {"summary": ("late failure " if i == 9 else f"action {i} ") + "é" * 160},
+            "detail": "é" * 160,
+        }
+        for i in range(10)
+    ]
+    receipt = render_receipt(actions)
+    assert receipt is not None
+
+    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert "_What I changed:_" in sent
+    assert "late failure" in sent
+    assert "failed" in sent
+    assert "more receipt details omitted" not in sent
+
+
 def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
     line = "• called `a_tool` — non-idempotent tool completed\n"
     text = line * 78  # 3,900 characters: under the limit counted as characters
