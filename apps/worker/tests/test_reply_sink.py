@@ -50,7 +50,7 @@ from curie_worker.reply_sink import (
     TargetRoute,
     build_reply_sink,
 )
-from curie_worker.slack_sink import UntrustedSlackEndpointError
+from curie_worker.slack_sink import UnconfiguredSlackIdentityError, UntrustedSlackEndpointError
 
 # EB-B4: the per-adapter egress credential travels in this header, and only this
 # header. Pinned as a constant so a rename shows up as one failure, not thirty.
@@ -918,7 +918,13 @@ def test_non_reserved_kinds_keep_the_generic_http_fallback(kind: str) -> None:
 
 
 def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
-    """Only the exact reserved slug may preempt existing kind routing."""
+    """Only the exact reserved slug may preempt existing kind routing.
+
+    A Slack route's ``adapter`` is its identity (ADR-0168 decision 3), so a
+    slug that is also an HTTP adapter's credential stays on the Slack sink,
+    which refuses it as an undeclared identity before any request: neither
+    the adapter's secret nor another bot's token leaves the worker.
+    """
 
     async def go() -> None:
         capture = _Capture()
@@ -929,16 +935,15 @@ def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
             port = server.port
             assert port is not None
             sink = build_reply_sink(_config(port))
-            await sink.emit(
-                _update("slack"),
-                route=TargetRoute(
-                    endpoint=f"http://127.0.0.1:{port}/slack/api/",
-                    adapter=ADAPTER_A,
-                ),
-            )
-            assert capture.paths() == ["/slack/api/chat.update"]
-            assert capture.bodies_mentioning(SLACK_TOKEN)
-            assert capture.secrets() == [None]
+            with pytest.raises(UnconfiguredSlackIdentityError, match=f"'{ADAPTER_A}'"):
+                await sink.emit(
+                    _update("slack"),
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{port}/slack/api/",
+                        adapter=ADAPTER_A,
+                    ),
+                )
+            assert capture.paths() == []
         finally:
             if sink is not None:
                 await sink.aclose()

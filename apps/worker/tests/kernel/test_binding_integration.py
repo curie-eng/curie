@@ -51,10 +51,9 @@ class StubBinding:
     async def resolve(
         self, kind: str, adapter: str | None, address: str
     ) -> ResolvedDeployment | None:
-        # Canned per-pair, like the real resolver under migration 0023's pair
-        # constraint: at most one row can be bound per pair, so there is only
-        # one identity to answer with. `adapter` is accepted (the real
-        # signature, ADR-0168 decision 3) and unused here for the same reason.
+        # Canned per-pair: every case here binds one route per pair, so there
+        # is only one identity to answer with. `adapter` is accepted (the real
+        # signature, ADR-0168 decision 3) and unused here for that reason.
         return self._by_route.get((kind, address))
 
     async def undeployed_binding(self, kind: str, adapter: str | None, address: str) -> Any | None:
