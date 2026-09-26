@@ -2286,3 +2286,119 @@ def test_released_state_readback_rejects_an_owner_that_remains_memory_false(
     rendered = "\n".join(failures).lower()
     assert "memory" in rendered
     assert "true" in rendered
+
+
+@pytest.mark.parametrize(
+    ("revisions", "expected"),
+    [
+        (("0060_hook_runs_deferred.py",), False),
+        (("0061_agent_channels_route_identity.py",), True),
+        (("0061_something_else.py",), False),
+    ],
+)
+def test_route_identity_readback_is_pinned_to_the_exact_0061_file(
+    gate: ModuleType, tmp_path: Path, revisions: tuple[str, ...], expected: bool
+) -> None:
+    tree = _fake_released_tree(tmp_path, revisions=revisions)
+
+    assert gate._candidate_supports_route_identity(tree) is expected
+
+
+def test_route_identity_readback_argument_is_enabled_only_by_0061(
+    gate: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: list[list[str]] = []
+
+    def _fake_run_in_tree(command: list[str], **_kwargs: Any) -> Any:
+        captured.append(command)
+        return gate.CommandResult(0, "ok")
+
+    monkeypatch.setattr(gate, "_run_in_tree", _fake_run_in_tree)
+    for name, revision in (
+        ("before", "0060_hook_runs_deferred.py"),
+        ("after", "0061_agent_channels_route_identity.py"),
+    ):
+        gate._run_readback(
+            _fake_released_tree(tmp_path / name, revisions=(revision,)),
+            database_url="postgresql+asyncpg://gate/test",
+            phase=gate.READBACK_PHASE,
+            ref="candidate",
+            commit="0" * 40,
+            seed_metadata=gate.SeedMetadata(legacy_state=None),
+        )
+
+    assert "--expect-slack-identity" not in captured[0]
+    assert _argument_value(captured[1], "--expect-slack-identity") == "default"
+
+
+def test_readback_names_every_slack_binding_that_is_not_the_expected_identity(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    failures = readback._collect_failures(
+        _all_dumps(gate, readback),
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=(("gate-valid", "C0EXAMPLE1", None),),
+    )
+
+    assert any("C0EXAMPLE1" in f and "'default'" in f for f in failures), failures
+
+
+def test_readback_names_a_serialized_slack_binding_that_is_not_the_expected_identity(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    dumps = tuple(
+        readback.AgentDump(
+            name=agent.name,
+            addresses=(agent.address,),
+            dump={
+                "name": agent.name,
+                "channels": [{"kind": "slack", "address": agent.address, "adapter": None}],
+            },
+            error=None,
+        )
+        for agent in gate.SEED_FIXTURE
+    )
+    observed = tuple((agent.name, agent.address, "default") for agent in gate.SEED_FIXTURE)
+
+    failures = readback._collect_failures(
+        dumps,
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=observed,
+    )
+
+    assert failures
+    assert all("serialized" in failure for failure in failures), failures
+
+
+def test_readback_refuses_an_identity_expectation_that_observed_nothing(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    failures = readback._collect_failures(
+        _all_dumps(gate, readback),
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=(),
+    )
+
+    assert any("no Slack binding" in failure for failure in failures), failures
+
+
+def test_readback_passes_when_every_slack_binding_names_the_expected_identity(
+    gate: ModuleType, readback: ModuleType
+) -> None:
+    observed = tuple((agent.name, agent.address, "default") for agent in gate.SEED_FIXTURE)
+
+    failures = readback._collect_failures(
+        _all_dumps(gate, readback),
+        expected_agents=_expected_names(gate),
+        expected_addresses=_expected_addresses(gate),
+        slack_identity="default",
+        slack_identity_observations=observed,
+    )
+
+    assert failures == ()
