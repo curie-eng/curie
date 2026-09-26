@@ -704,7 +704,7 @@ mod tests {
 
     // @spec ADR-0168 d8
     #[test]
-    fn speak_as_stamps_a_named_identity_and_leaves_the_default_alone() {
+    fn speak_as_stamps_a_named_identity_over_the_default() {
         let turn = || synthetic_turn("slack", "C0EXAMPLE1", "U1", "hi", "1.0", "1.1", None);
         let named = speak_as(turn(), Some("ops-bot"));
         assert_eq!(
@@ -713,8 +713,24 @@ mod tests {
         );
         assert_eq!(thread_key_for_turn(&named), "slack:ops-bot:C0EXAMPLE1:1.0");
         let default = speak_as(turn(), None);
-        assert_eq!(default.reply_handle.as_ref().unwrap().adapter, None);
+        assert_eq!(
+            default.reply_handle.as_ref().unwrap().adapter.as_deref(),
+            Some(DEFAULT_SLACK_IDENTITY)
+        );
         assert_eq!(thread_key_for_turn(&default), "slack:C0EXAMPLE1:1.0");
+    }
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_stub_turn_names_the_default_identity() {
+        let turn = synthetic_turn("slack", "C0EXAMPLE1", "U1", "hi", "1.0", "1.1", None);
+        assert_eq!(
+            turn.reply_handle.as_ref().unwrap().adapter.as_deref(),
+            Some(DEFAULT_SLACK_IDENTITY)
+        );
+        assert_eq!(thread_key_for_turn(&turn), "slack:C0EXAMPLE1:1.0");
+        let mail = synthetic_turn("email", "a@example.com", "U1", "hi", "1.0", "1.1", None);
+        assert_eq!(mail.reply_handle.as_ref().unwrap().adapter, None);
     }
 
     #[test]
