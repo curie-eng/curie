@@ -323,6 +323,12 @@ are operator-configured collector exporters; installing Grafana, Loki, Tempo,
 Prometheus, or another retained backend is deliberately separate from this
 chart's OTLP write path.
 
+The SRE bot Prometheus overlay includes alerts for dead lettered messages,
+slow sandbox claims, refused capacity reclamation, and transcript persistence
+failures. It counts a counter's first observed sample so failures are visible
+even when a process has just started. See
+[`examples/sre-bot/observability/prometheus-values.yaml`](../../examples/sre-bot/observability/prometheus-values.yaml).
+
 The chart-managed collector is a bounded gateway, not a lossless store. Every
 network exporter uses retry plus a bounded sending queue. `memory_limiter` runs
 before `batch`, and the default persistent `file_storage` queue uses a 1Gi PVC

@@ -426,6 +426,148 @@ serverFiles:
                 curie_http_server_request_total for /channels/token with
                 outcome 5xx increased in the last hour, counting a series'
                 first sample as an increase from zero.
+          - alert: CurieQueueDeadLettered
+            # The worker records a message sent to the dead letter stream with
+            # outcome success. Any such message in 15m pages after 5m. The
+            # header explains why the second term counts a counter's first
+            # sample.
+            expr: |
+              increase(
+                curie_queue_dead_letter_total{outcome="success"}[15m]
+              ) > 0
+              or
+              (
+                curie_queue_dead_letter_total{outcome="success"}
+                unless
+                last_over_time(
+                  curie_queue_dead_letter_total{outcome="success"}[1h]
+                  offset 15m
+                )
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-queue
+            annotations:
+              summary: A Curie message was dead lettered
+              description: >-
+                At least one message was dead lettered in 15 minutes, including
+                a new counter series. The turn needs operator investigation.
+          - alert: CurieSandboxClaimSlow
+            # Average claim duration across all worker instances, including
+            # failed, claimed, and reused outcomes. The first sample term
+            # counts the initial histogram counter value for a newly observed
+            # series, using the same 15m window as increase. The average must
+            # exceed 60 seconds for 5m.
+            expr: |
+              (
+                sum by (service_name, operation, outcome) (
+                  increase(
+                    curie_sandbox_claim_duration_seconds_sum{
+                      operation="claim"
+                    }[15m]
+                  )
+                  or
+                  (
+                    curie_sandbox_claim_duration_seconds_sum{
+                      operation="claim"
+                    }
+                    unless
+                    last_over_time(
+                      curie_sandbox_claim_duration_seconds_sum{
+                        operation="claim"
+                      }[1h] offset 15m
+                    )
+                  )
+                )
+                /
+                sum by (service_name, operation, outcome) (
+                  increase(
+                    curie_sandbox_claim_duration_seconds_count{
+                      operation="claim"
+                    }[15m]
+                  )
+                  or
+                  (
+                    curie_sandbox_claim_duration_seconds_count{
+                      operation="claim"
+                    }
+                    unless
+                    last_over_time(
+                      curie_sandbox_claim_duration_seconds_count{
+                        operation="claim"
+                      }[1h] offset 15m
+                    )
+                  )
+                )
+              ) > 60
+            for: 5m
+            labels:
+              severity: page
+              component: curie-sandbox
+            annotations:
+              summary: Sandbox claims are slow
+              description: >-
+                Completed sandbox claims averaged more than 60 seconds over 15
+                minutes. Check sandbox capacity and binding.
+          - alert: CurieSandboxCapacityRefused
+            # Page on any reclaim refusal caused by invalid quota, exhausted
+            # budget, lack of a safe route, or a refused retry during the last
+            # 15m.
+            expr: |
+              increase(
+                curie_sandbox_lifecycle_total{
+                  operation="reclaim",
+                  outcome=~"refused-(invalid-quota|no-budget|no-safe-route)|reclaimed-retry-refused"
+                }[15m]
+              ) > 0
+              or
+              (
+                curie_sandbox_lifecycle_total{
+                  operation="reclaim",
+                  outcome=~"refused-(invalid-quota|no-budget|no-safe-route)|reclaimed-retry-refused"
+                }
+                unless
+                last_over_time(
+                  curie_sandbox_lifecycle_total{
+                    operation="reclaim",
+                    outcome=~"refused-(invalid-quota|no-budget|no-safe-route)|reclaimed-retry-refused"
+                  }[1h] offset 15m
+                )
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-sandbox
+            annotations:
+              summary: Sandbox capacity reclamation was refused
+              description: >-
+                A reclaim attempt was refused in 15 minutes because quota,
+                budget, or a safe route was unavailable.
+          - alert: CurieHistoryPersistenceFailed
+            # Page when transcript persistence hits either capacity limit in
+            # the last 15m, including the first sample of a new counter.
+            expr: |
+              increase(
+                curie_history_persistence_failure_total[15m]
+              ) > 0
+              or
+              (
+                curie_history_persistence_failure_total
+                unless
+                last_over_time(
+                  curie_history_persistence_failure_total[1h] offset 15m
+                )
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-state
+            annotations:
+              summary: Curie transcript persistence hit a capacity limit
+              description: >-
+                Transcript persistence failed in 15 minutes because a value or
+                namespace capacity limit was reached.
           - alert: CurieMailAdapterNotReady
             # Two terms, because `unavailable > 0` alone cannot see a
             # Deployment scaled to zero: kube-state-metrics reports
