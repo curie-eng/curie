@@ -13016,20 +13016,50 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         };
         match built {
             Ok((plan, image)) => {
-                runner_entry = Some(cb::RunnerLockEntryDecl {
-                    image: image.clone(),
-                    base: base.clone(),
-                    delivery: plan.delivery,
-                    platforms: plan.platforms.clone(),
-                    source_digest: plan.source_digest.clone(),
-                });
-                records.push(ConnectorBuildRecord {
-                    name: "runner".to_string(),
-                    image,
-                    delivery: plan.delivery,
-                    platforms: plan.platforms,
-                    source_digest: plan.source_digest,
-                });
+                // Local-daemon delivery builds on a mutable tag, not a digest
+                // pin: if `base_arg` was retagged between the pre-build
+                // inspect above and this build finishing, the layer was built
+                // on a base other than the one `base` records. Re-inspect and
+                // refuse to write a lock that would misrecord it.
+                let mut mismatch = None;
+                if plan.delivery == cb::Delivery::LocalDaemon {
+                    match crate::docker::docker(&cb::image_inspect_argv(base_arg).argv()).await {
+                        Ok(current_id) => {
+                            let current_id = current_id.trim();
+                            if current_id != base {
+                                mismatch = Some(anyhow::anyhow!(
+                                    "runner: the platform runner {base_arg} changed during the \
+                                     build (inspected {base}, now {current_id}); refusing to \
+                                     record a lock for a base the layer was not built on"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            mismatch = Some(err.context(format!(
+                                "runner: re-inspect the platform runner {base_arg} after build"
+                            )))
+                        }
+                    }
+                }
+                match mismatch {
+                    Some(err) => failure = Some(err),
+                    None => {
+                        runner_entry = Some(cb::RunnerLockEntryDecl {
+                            image: image.clone(),
+                            base: base.clone(),
+                            delivery: plan.delivery,
+                            platforms: plan.platforms.clone(),
+                            source_digest: plan.source_digest.clone(),
+                        });
+                        records.push(ConnectorBuildRecord {
+                            name: "runner".to_string(),
+                            image,
+                            delivery: plan.delivery,
+                            platforms: plan.platforms,
+                            source_digest: plan.source_digest,
+                        });
+                    }
+                }
             }
             Err(err) => failure = Some(err),
         }

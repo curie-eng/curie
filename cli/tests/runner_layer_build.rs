@@ -34,6 +34,13 @@ fn write_executable(path: &Path, body: &str) {
 }
 
 /// A fake `docker` that logs one line per invocation (argv joined by spaces).
+///
+/// The `imagetools inspect` answer is grounded in observed output, not guessed:
+/// on 2026-09-25, `docker buildx imagetools inspect
+/// ghcr.io/curie-eng/curie-runner:0.10.0 --format '{{json .Manifest}}'` printed
+/// an index whose top level carries `schemaVersion`, `mediaType`, `digest`
+/// (`sha256:97f8e848...`), `size` 1609 and `manifests`. The top-level `digest`
+/// is the one field the CLI reads.
 fn install_fake_docker(tools: &Path, log: &Path) {
     let script = format!(
         r#"#!/bin/sh
