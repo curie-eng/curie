@@ -55,10 +55,8 @@ def _slack(address: str) -> dict[str, str]:
 
 
 def _slack_out(address: str) -> dict[str, str]:
-    """The Slack-kind `AgentOut.channels` READ shape. The stored form is
-    unchanged until the contract migration for ADR-0168 decision 3 (#3100): an
-    omitted or `"default"` write is stored as NULL exactly as before the ADR,
-    and the read side is what presents that NULL as the default identity."""
+    """The Slack-kind `AgentOut.channels` READ shape: an omitted write stores
+    and reads back the default identity by name (ADR-0168 decision 3)."""
 
     return {"kind": "slack", "address": address, "adapter": "default"}
 

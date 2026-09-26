@@ -252,10 +252,10 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         # collision on either rolls BOTH back, and no agent is ever left behind
         # bound to nothing (#38's silent-shadow state).
         # `endpoint`/`adapter` are the server-controlled reply route (ADR-0096
-        # phase 2): both NULL for `slack` and for a binding whose route is
-        # configured later, both set together otherwise. The write schema has
-        # already refused a half-configured pair, and
-        # `agent_channels_route_pair_ck` refuses one from an out-of-band writer.
+        # phase 2): for `slack` the identity alone (ADR-0168 decision 3), for
+        # any other kind both NULL until configured or both set together. The
+        # write schema has already refused any other shape, and
+        # `agent_channels_route_ck` refuses one from an out-of-band writer.
         # A create binds exactly ONE channel (ADR-0118 keeps the create
         # singular); the rest arrive through `add_channel_binding`.
         channels=[
@@ -575,36 +575,29 @@ async def update_channel_binding(
     the outer transaction's `FOR UPDATE` locks.
     """
 
+    previous_kind = binding.kind
     binding.kind = channel.kind
     binding.address = channel.address
     # The reply route moves WITH the pair (ADR-0096 phase 2): a move that
     # re-points the pair and leaves the old endpoint/adapter behind would send
     # the new route's replies to the previous adapter, authenticated as it. This
     # is also the cutover's step 10 -- bind first, move the route in later.
+    # Omitting both route fields preserves the stored route only within one
+    # kind: `agent_channels_route_ck` gives Slack and every other kind different
+    # route shapes, so a move across that line takes the new kind's.
     endpoint_sent = "endpoint" in channel.model_fields_set
     adapter_sent = "adapter" in channel.model_fields_set
     if endpoint_sent:
         binding.endpoint = channel.endpoint
         binding.adapter = channel.adapter
-    elif channel.kind == SLACK_KIND and adapter_sent:
-        # ADR-0168 decision 3: a Slack PATCH may name a new
-        # identity ALONE, with no endpoint (`ChannelBindingPatch
-        # ._check_route_presence` already allows this shape -- Slack's
-        # implicit transport carries no endpoint). The
-        # `"endpoint" in model_fields_set` gate above predates the identity
-        # form and would otherwise silently drop the one field this branch's
-        # caller actually sent.
-        #
-        # `endpoint` is cleared too, not left as it was: naming an identity
-        # alone means moving TO the identity form (`ChannelBindingPatch`'s own
-        # docstring), and 0024's `agent_channels_route_pair_ck` CHECKs
-        # `(endpoint IS NULL) = (adapter IS NULL)` at the database -- writing
-        # `channel.adapter` (None, the stored form of the default identity)
-        # while a stale endpoint from a prior custom-transport row survives
-        # would violate it. A row that WAS on the custom-transport form
-        # therefore loses that transport on this move, which is the point:
-        # the caller asked to be addressed by identity, not by a lingering URL.
+    elif channel.kind == SLACK_KIND and (adapter_sent or previous_kind != SLACK_KIND):
+        # A Slack route is its identity with no endpoint (ADR-0168 decision 3):
+        # naming one, or arriving from another kind, takes that shape.
         binding.adapter = channel.adapter
+        binding.endpoint = None
+    elif previous_kind == SLACK_KIND and channel.kind != SLACK_KIND:
+        # A Slack identity is no route for another kind: route-less until set.
+        binding.adapter = None
         binding.endpoint = None
     binding.generation += 1
     await session.flush()

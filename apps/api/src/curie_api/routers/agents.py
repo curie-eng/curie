@@ -44,8 +44,6 @@ router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(requ
 # violated constraint's name) as plain attributes on the wrapped driver
 # exception -- there is no psycopg-style `.diag` namespace.
 _UNIQUE_VIOLATION = "23505"
-# Postgres SQLSTATE for a check_violation.
-_CHECK_VIOLATION = "23514"
 
 # The real unique constraints an agent write can violate -- on `agents` and on
 # its `agent_channels` binding (from the alembic migrations) -- mapped to the
@@ -86,25 +84,6 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
 }
 
 
-# The CHECK constraints a caller's binding write can reach once the write
-# schema has passed it, mapped to a 422 naming why. Keyed by constraint name so
-# an entry goes quiet by itself once a migration drops or renames its
-# constraint. Any other check violation stays a server fault.
-_CHECK_CONSTRAINT_MESSAGES = {
-    # 0024's both-or-neither route check. The write schema admits a Slack
-    # binding naming a declared identity with no endpoint (ADR-0168 decision
-    # 1), and this check still refuses that row until
-    # [#3146](https://github.com/curie-eng/curie/issues/3146) widens it. The
-    # schema already refuses every other shape this check covers.
-    "agent_channels_route_pair_ck": (
-        "a Slack binding naming an identity other than 'default' cannot be "
-        "stored until the database admits it "
-        "(https://github.com/curie-eng/curie/issues/3146). The identity is "
-        "declared; bind the channel under 'default' instead"
-    ),
-}
-
-
 def _driver_diag(exc: IntegrityError, attr: str) -> str | None:
     """Read an asyncpg diagnostic field, walking the `__cause__` chain.
 
@@ -128,20 +107,15 @@ def classify_integrity_error(exc: IntegrityError) -> tuple[int, str] | None:
     """Map a caller-caused constraint violation to a `(status, message)` pair.
 
     A genuine unique_violation (SQLSTATE 23505) is a caller conflict (409). A
-    check_violation (23514) on a constraint in `_CHECK_CONSTRAINT_MESSAGES` is
-    a request the database cannot store (422). A NOT NULL or FK violation, or
-    any other check, is a server fault and must surface as a 500, so this
-    returns `None` for those (the caller re-raises). The human message is
+    NOT NULL, FK or check violation is a server fault and must surface as a
+    500, so this returns `None` for those (the caller re-raises): the write
+    schemas refuse every shape `agent_channels_route_ck` covers before the
+    database sees it. The human message is
     chosen by the violated constraint's name from asyncpg's structured fields,
     not by substring-matching the stringified driver error.
     """
     sqlstate = _driver_diag(exc, "sqlstate")
     constraint_name = _driver_diag(exc, "constraint_name")
-    if sqlstate == _CHECK_VIOLATION:
-        check_message = _CHECK_CONSTRAINT_MESSAGES.get(constraint_name or "")
-        if check_message is None:
-            return None
-        return status.HTTP_422_UNPROCESSABLE_ENTITY, check_message
     if sqlstate != _UNIQUE_VIOLATION:
         return None
     message = "agent violates a uniqueness constraint"
@@ -518,16 +492,12 @@ async def _raise_binding_conflict(
     that may have moved again; no rollback would leave the session failed and
     answer 500 `PendingRollbackError` on the lookup itself.
 
-    A non-unique violation (NOT NULL, FK) is a server fault, so it is re-raised
-    rather than dressed up as a conflict; a mapped check violation is not a
-    conflict either, and goes back as its own status and message.
+    A non-unique violation (NOT NULL, FK, check) is a server fault, so it is
+    re-raised rather than dressed up as a conflict.
     """
 
-    classified = classify_integrity_error(exc)
-    if classified is None:
+    if classify_integrity_error(exc) is None:
         raise exc
-    if classified[0] != status.HTTP_409_CONFLICT:
-        raise HTTPException(*classified) from exc
     route_owner = await crud.agent_id_for_route(
         session, channel.kind, channel.adapter, channel.address
     )
@@ -577,11 +547,8 @@ async def add_agent_channel(
             async with session.begin_nested():  # SAVEPOINT
                 await crud.add_channel_binding(session, agent_id, data)
         except IntegrityError as exc:
-            classified = classify_integrity_error(exc)
-            if classified is None:
+            if classify_integrity_error(exc) is None:
                 raise
-            if classified[0] != status.HTTP_409_CONFLICT:
-                raise HTTPException(*classified) from exc
             # Two concurrent idempotent adds can both observe the pair absent;
             # the winner inserts and the loser reaches the unique constraint.
             # Once the savepoint has rolled back, treat that winner as the same
