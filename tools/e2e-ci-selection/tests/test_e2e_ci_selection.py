@@ -345,13 +345,13 @@ def test_matrix_input_guard_checks_every_packaged_chart_file(tmp_path: Path) -> 
     anchor = "    docs: []\n"
     assert anchor in text
     registry = tmp_path / "registry.yaml"
-    registry.write_text(text.replace(anchor, f"{anchor}    charts/curie/files: []\n"))
+    registry.write_text(
+        text.replace(anchor, f"{anchor}    charts/curie/files/agent-sandbox: []\n")
+    )
     assert _unselected_matrix_inputs(
         tmp_path, 'helm package "$REPO_ROOT/charts/curie"\n', registry
     ) == [
         "charts/curie/files/agent-sandbox/controller.yaml: does not select released-upgrade",
-        "charts/curie/files/reserved-env.yaml: does not select released-upgrade",
-        "charts/curie/files/schema-compat.json: does not select released-upgrade",
     ]
 
 
