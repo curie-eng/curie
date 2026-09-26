@@ -28,6 +28,7 @@ from pathlib import Path
 
 import anyio
 from aci_protocol import Event, OtelConfig
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from curie_runner import (
     RunTracer,
     SideEffectClassifier,
@@ -163,6 +164,10 @@ _PHASE_V1_ADDITIONS = {
     "curie.tool.call.index": "int",
     "curie.generation.ttft_ms": "int",
     "curie.tool.outcome": "str",
+    # #3128: generation content and result-only usage scope.
+    "langfuse.observation.input": "str",
+    "langfuse.observation.output": "str",
+    "curie.usage.scope": "str",
 }
 
 
@@ -356,7 +361,50 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
 
     anyio.run(go)
 
-    for finished in exporter.get_finished_spans():
+    # #3128: a provider that reports usage only on the ResultMessage stamps the
+    # turn total on the final generation with curie.usage.scope. Its own
+    # provider: closing the runner above shuts the shared one down.
+    result_exporter = InMemorySpanExporter()
+    result_provider = TracerProvider()
+    result_provider.add_span_processor(SimpleSpanProcessor(result_exporter))
+    result_only = SessionRunner(
+        session_factory=lambda: FakeModelSession(
+            script_factory=lambda: [
+                AssistantMessage(
+                    content=[TextBlock(text="hi")], model="fake-model", usage=None
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="sdk-session",
+                    result="hi",
+                    usage={"input_tokens": 5, "output_tokens": 1},
+                ),
+            ]
+        ),
+        ceiling=0,
+        tracer=RunTracer(result_provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="fake-model",
+    )
+
+    async def go_result_only() -> None:
+        await result_only.start()
+        try:
+            async for _ in result_only.run_turn(
+                Event(type="message", text="go", user="U0EXAMPLE1", ts="2")
+            ):
+                pass
+        finally:
+            await result_only.close()
+
+    anyio.run(go_result_only)
+
+    for finished in [*exporter.get_finished_spans(), *result_exporter.get_finished_spans()]:
         if finished.attributes:
             emitted.update(finished.attributes)
 

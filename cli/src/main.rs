@@ -758,6 +758,10 @@ enum Command {
         /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
         #[arg(long, value_name = "REF", requires = "plugin_dir")]
         registry: Option<String>,
+        /// The platform runner a declared runner layer builds on (default: the
+        /// runner `curie skill up` uses). Resolved to a digest before building.
+        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        runner_image: Option<String>,
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
         force: bool,
@@ -1022,6 +1026,26 @@ enum SreBotAction {
         /// install.
         #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
         workspace_repo: Vec<String>,
+    },
+    /// Provision the observability stack on an existing Curie release and
+    /// require the Grafana connector token. Does not install the platform
+    /// and does not deploy the SRE bot.
+    ProvisionObservability {
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
+        /// Chart directory. When omitted, use the same chart resolution as install.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the ordered plan without calling kubectl or helm.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1807,6 +1831,11 @@ enum LocalAction {
         /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
         /// thread. Pair with --channel to keep multi-turn context.
         #[arg(long)]
@@ -1864,6 +1893,11 @@ enum LocalAction {
         /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Valkey password (compose default `valkeypass`). Prefer the
         /// CURIE_VALKEY_PASSWORD env var over passing a real secret on the
         /// command line, where it leaks via `ps` and shell history.
@@ -1942,6 +1976,12 @@ enum LocalAction {
         /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Identity (bot) the Slack binding this deploy writes speaks through
+        /// (ADR-0168 decision 8). Overrides the target's `identity`; omitted,
+        /// the target's is used, else the installation's own. Needs a channel:
+        /// --slack-channel, or the target's slack_channel.
+        #[arg(long, value_name = "NAME")]
+        identity: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
@@ -2097,6 +2137,13 @@ enum LocalAction {
         /// Clear the execution-deadline override back to the platform default.
         #[arg(long)]
         clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -2662,6 +2709,11 @@ enum ClusterAction {
         /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
         /// thread. Pair with --channel to keep multi-turn context.
         #[arg(long)]
@@ -2745,6 +2797,11 @@ enum ClusterAction {
         /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
+        /// Send as this agent's Slack binding (ADR-0168 decision 8): the channel
+        /// and the identity come from the binding. Pair with --channel when the
+        /// agent answers on several.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -2825,7 +2882,7 @@ enum ClusterAction {
         /// and forgetting one leaves an agent that exists and never updates.
         /// Ordered dev-first so a run that fails part-way leaves prod on its
         /// previous version rather than ahead of a dev that never landed.
-        #[arg(long, conflicts_with_all = ["target", "agent", "env", "slack_channel"])]
+        #[arg(long, conflicts_with_all = ["target", "agent", "env", "slack_channel", "identity"])]
         all_targets: bool,
         /// Deploy under this agent name instead of the manifest's `name`.
         ///
@@ -2865,6 +2922,12 @@ enum ClusterAction {
         /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Identity (bot) the Slack binding this deploy writes speaks through
+        /// (ADR-0168 decision 8). Overrides the target's `identity`; omitted,
+        /// the target's is used, else the installation's own. Needs a channel:
+        /// --slack-channel, or the target's slack_channel.
+        #[arg(long, value_name = "NAME")]
+        identity: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
@@ -2961,6 +3024,13 @@ enum ClusterAction {
         /// Clear the execution-deadline override back to the platform default.
         #[arg(long)]
         clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -3598,25 +3668,31 @@ async fn bind_cluster_connector_secrets(
     if secrets.is_empty() {
         return Ok(());
     }
-    let resolved = artifacts::resolve_chart(
-        chart,
-        artifacts::Channel::current(),
-        artifacts::version(),
-        artifacts::cache_root,
-        std::path::Path::new("charts/curie").is_dir(),
-    )?;
-    let chart = materialize_artifact(resolved, false, "chart").await?;
-    curie::cluster_secrets::bind(curie::cluster_secrets::BindOpts {
-        common: CommonOpts {
+    // #3082: a bundle deploy whose connector secrets already match the
+    // release must not helm-upgrade the platform, so the chart is resolved
+    // only when the bind actually changes something.
+    let chart = async {
+        let resolved = artifacts::resolve_chart(
+            chart,
+            artifacts::Channel::current(),
+            artifacts::version(),
+            artifacts::cache_root,
+            std::path::Path::new("charts/curie").is_dir(),
+        )?;
+        materialize_artifact(resolved, false, "chart").await
+    };
+    curie::cluster_secrets::bind_if_changed(
+        CommonOpts {
             namespace: namespace.to_string(),
             release: release.to_string(),
             dry_run: false,
         },
-        chart,
-        agent: agent_name.to_string(),
+        agent_name.to_string(),
         secrets,
-    })
-    .await
+        chart,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Bind the sandbox connector secrets for one deployed agent and then apply its
@@ -3786,47 +3862,67 @@ async fn run(command: Option<Command>) -> Result<()> {
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
-            action:
-                ExampleAction::SreBot {
-                    action:
-                        SreBotAction::Install {
-                            observability,
-                            dry_run,
-                            slack_channel,
-                            platform_upgrade,
-                            namespace,
-                            release,
-                            observability_namespace,
-                            workspace_repo,
-                            approvers,
-                        },
+            action: ExampleAction::SreBot { action },
+        }) => match action {
+            SreBotAction::Install {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            })
+            .await?
+            {
+                curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+                curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            },
+            SreBotAction::ProvisionObservability {
+                namespace,
+                release,
+                observability_namespace,
+                chart,
+                dry_run,
+            } => match curie::examples::provision_observability(
+                curie::examples::ObservabilityProvisionOpts {
+                    namespace,
+                    release,
+                    observability_namespace,
+                    chart,
+                    dry_run,
                 },
-        }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
-            observability,
-            dry_run,
-            slack_channel,
-            platform_upgrade,
-            namespace,
-            release,
-            observability_namespace,
-            workspace_repo,
-            approvers,
-        })
-        .await?
-        {
-            curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
-            curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            )
+            .await?
+            {
+                curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
+                curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
+            },
         },
         Some(Command::Build {
             tag,
             plugin_dir,
             registry,
+            runner_image,
             force,
         }) => match plugin_dir {
             Some(plugin_dir) => emit(
                 commands::build_connectors(commands::ConnectorBuildOpts {
                     plugin_dir,
                     registry,
+                    runner_image,
                     force,
                 })
                 .await?,
@@ -4325,6 +4421,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Message {
                 text,
                 channel,
+                agent,
                 thread,
                 r#continue,
                 valkey_password,
@@ -4357,6 +4454,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         timeout_secs,
                         api_url,
                         api_key,
+                        agent,
                     },
                     state,
                     // Empty is unset (#540), so the recorded-env bail below still
@@ -4368,6 +4466,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 message::message(MessageOpts {
                     text,
                     channel: resolved.channel,
+                    agent: resolved.agent,
                     thread: resolved.thread,
                     namespace: "curie".into(),
                     release: "curie".into(),
@@ -4391,6 +4490,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 cases,
                 case_id,
                 channel,
+                agent,
                 valkey_password,
                 api_url,
                 api_key,
@@ -4406,6 +4506,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     cases,
                     case_ids: case_id,
                     channel,
+                    agent,
                     namespace: "curie".into(),
                     release: "curie".into(),
                     listen_host: None,
@@ -4430,6 +4531,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 plugin_dir,
                 agent,
                 target,
+                identity,
                 api_url,
                 api_key,
                 slack_channel,
@@ -4449,6 +4551,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     plugin_dir,
                     agent,
                     target,
+                    identity,
                     api_url,
                     api_key,
                     slack_channel,
@@ -4565,6 +4668,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_thinking,
                 execution_deadline,
                 clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
                 api_url,
                 api_key,
                 dry_run,
@@ -4581,6 +4686,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     commands::OverrideChange::resolve_execution_deadline(
                         execution_deadline,
                         clear_execution_deadline,
+                    )?,
+                    commands::OverrideChange::resolve_runner_resources(
+                        runner_resources,
+                        clear_runner_resources,
                     )?,
                 )
                 .await?,
@@ -5027,6 +5136,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Message {
                 text,
                 channel,
+                agent,
                 thread,
                 r#continue,
                 namespace,
@@ -5071,6 +5181,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_key: api_key
                             .clone()
                             .unwrap_or_else(|| message::DEFAULT_API_KEY.to_string()),
+                        agent,
                     },
                     state,
                     // Empty is unset (#540), so the recorded-env bail below still
@@ -5108,6 +5219,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 message::message(MessageOpts {
                     text,
                     channel: resolved.channel,
+                    agent: resolved.agent,
                     thread: resolved.thread,
                     namespace: resolved.namespace,
                     release: resolved.release,
@@ -5131,6 +5243,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 cases,
                 case_id,
                 channel,
+                agent,
                 namespace,
                 release,
                 listen_host,
@@ -5171,6 +5284,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     cases,
                     case_ids: case_id,
                     channel,
+                    agent,
                     namespace,
                     release,
                     listen_host,
@@ -5195,6 +5309,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 plugin_dir,
                 agent,
                 target,
+                identity,
                 all_targets,
                 api_url,
                 namespace,
@@ -5462,6 +5577,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             plugin_dir: plugin_dir.clone(),
                             agent: agent.clone(),
                             target: Some(target.clone()),
+                            identity: None,
                             api_url: api_url.clone(),
                             api_key: api_key.clone(),
                             slack_channel: slack_channel.clone(),
@@ -5575,6 +5691,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
+                        identity: identity.clone(),
                         api_url: api_url.clone(),
                         api_key: api_key.clone(),
                         slack_channel: slack_channel.clone(),
@@ -5669,6 +5786,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_thinking,
                 execution_deadline,
                 clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
                 conn,
                 dry_run,
             } => {
@@ -5683,6 +5802,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     execution_deadline,
                     clear_execution_deadline,
                 )?;
+                let runner_resources = commands::OverrideChange::resolve_runner_resources(
+                    runner_resources,
+                    clear_runner_resources,
+                )?;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
@@ -5696,6 +5819,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model,
                         thinking,
                         execution_deadline,
+                        runner_resources,
                     )
                     .await?,
                 )
@@ -6272,6 +6396,23 @@ mod tests {
     #[test]
     fn clap_surface_is_valid() {
         on_parse_stack(|| Cli::command().debug_assert());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn the_drivers_take_an_agent_selector() {
+        for argv in [
+            ["curie", "local", "message", "--agent", "ops", "hi"],
+            ["curie", "cluster", "message", "--agent", "ops", "hi"],
+        ] {
+            assert!(try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        for argv in [
+            ["curie", "local", "eval", "--agent", "ops"],
+            ["curie", "cluster", "eval", "--agent", "ops"],
+        ] {
+            assert!(try_parse_from(argv).is_ok(), "{argv:?}");
+        }
     }
 
     /// clap's derived parser is deep enough that debug bin tests overflow the
@@ -7592,6 +7733,37 @@ mod tests {
             }
             _ => panic!("expected cluster deploy command"),
         }
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn deploy_takes_an_identity_on_both_tiers() {
+        for tier in ["local", "cluster"] {
+            let cli = try_parse_from(["curie", tier, "deploy", "--identity", "ops-bot"]).unwrap();
+            let identity = match cli.command {
+                Some(Command::Local {
+                    action: LocalAction::Deploy { identity, .. },
+                }) => identity,
+                Some(Command::Cluster {
+                    action: ClusterAction::Deploy { identity, .. },
+                    ..
+                }) => identity,
+                _ => panic!("expected {tier} deploy"),
+            };
+            assert_eq!(identity.as_deref(), Some("ops-bot"));
+        }
+        assert!(
+            try_parse_from([
+                "curie",
+                "cluster",
+                "deploy",
+                "--all-targets",
+                "--identity",
+                "x"
+            ])
+            .is_err(),
+            "every target states its own identity"
+        );
     }
 
     #[test]

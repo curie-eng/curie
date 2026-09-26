@@ -55,6 +55,22 @@ rules:
   - apiGroups: [""]
     resources: ["resourcequotas"]
     verbs: ["get"]
+  {{- if .Values.agentSandbox.deploy }}
+  # Per-agent runner resources (#3209). get reads the chart template. create
+  # and patch write only the worker-owned copy. list and delete stay absent.
+  # The ValidatingAdmissionPolicy in runner-resources-admission.yaml is rendered
+  # on the same condition and refuses any name that is not that copy, so this
+  # grant cannot rewrite the shared template. Kubernetes older than 1.30 fails
+  # that template, which fails this render before the grant is installed.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get", "create", "patch"]
+  {{- end }}
+  # A factory execution defers as capacity when its sandbox pod is
+  # Unschedulable (#3169). The worker reads only the exact named pod.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects
@@ -307,6 +323,15 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.sealing.previousPrivateKeyExistingSecret "existingSecretKey" .Values.sealing.previousPrivateKeyExistingSecretKey "defaultKey" "sealingPreviousPrivateKey") | nindent 18 }}
+            {{- if .Values.connectorCaller.existingSecret }}
+            # The connector caller signing key (ADR-0168 decision 7). Only the
+            # worker signs, so only the worker holds it.
+            - name: CURIE_CONNECTOR_CALLER_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.connectorCaller.existingSecret | quote }}
+                  key: {{ .Values.connectorCaller.signingKeyKey | quote }}
+            {{- end }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -354,10 +379,11 @@ spec:
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
             # Agents with a per-agent pool but no connector secrets
-            # (agentSandbox.registryEgress, #3083); the worker routes their
-            # claims to that pool so the registry NetworkPolicy selects them.
+            # (agentSandbox.registryEgress, #3083, and agentSandbox.runnerImages,
+            # ADR-0173); the worker routes their claims to that pool so the
+            # registry NetworkPolicy selects them and the layered image runs.
             - name: CURIE_AGENT_SANDBOX_POOLS
-              value: {{ keys (.Values.agentSandbox.registryEgress | default dict) | sortAlpha | join "," | quote }}
+              value: {{ concat (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) | uniq | sortAlpha | join "," | quote }}
             - name: CURIE_RUNNER_PORT
               value: {{ .Values.agentSandbox.runner.port | quote }}
             # Heartbeat file the worker's asyncio loop touches each tick; the

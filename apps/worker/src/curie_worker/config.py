@@ -43,6 +43,8 @@ from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
 
+from . import caller_token
+
 
 def _default_consumer_name() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
@@ -134,10 +136,21 @@ CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_pars
 MAX_DELIVERY_BUDGET_S = 10800.0
 
 
+class CallerSigningKeyError(RuntimeError):
+    """The connector caller signing key cannot sign.
+
+    Not a ``ValueError``: pydantic wraps one of those in a ``ValidationError``
+    that prints the whole settings input, which would put the key in the boot
+    log.
+    """
+
+
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
 
-    model_config = SettingsConfigDict(frozen=True, populate_by_name=True, extra="ignore")
+    model_config = SettingsConfigDict(
+        frozen=True, populate_by_name=True, extra="ignore", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -266,6 +279,14 @@ class WorkerConfig(BaseSettings):
     # scope that names a Service which cannot exist.
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
+
+    # The Ed25519 seed that signs each sandbox's connector caller token
+    # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
+    # renders it only from `connectorCaller.existingSecret`, and it never
+    # enters a sandbox (`sandbox.types.HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
+    connector_caller_signing_key: str = Field(
+        default="", validation_alias="CURIE_CONNECTOR_CALLER_SIGNING_KEY", repr=False
+    )
 
     # The shimmer caption, kept SEPARATE from the dispatcher's placeholder text
     # because the two surfaces have different grammar. Slack renders an
@@ -453,6 +474,24 @@ class WorkerConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _caller_signing_key_is_a_seed(self) -> WorkerConfig:
+        """Fail at construction on a signing key that cannot sign.
+
+        Otherwise every scoped boot would raise at mint time, one turn at a
+        time.
+        """
+
+        if not self.connector_caller_signing_key.strip():
+            return self
+        try:
+            caller_token.signing_key(self.connector_caller_signing_key)
+        except ValueError as exc:
+            raise CallerSigningKeyError(
+                f"CURIE_CONNECTOR_CALLER_SIGNING_KEY is unusable: {exc}"
+            ) from None
+        return self
+
+    @model_validator(mode="after")
     def _lease_spans_three_heartbeats(self) -> WorkerConfig:
         """Fail at construction if the lease cannot survive two lost heartbeats.
 
@@ -575,29 +614,6 @@ class WorkerConfig(BaseSettings):
                 f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a "
                 "per-request ceiling above the overall budget is dead "
                 "configuration, since the budget always expires first"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _quiesce_outlives_the_drain_wait(self) -> WorkerConfig:
-        """Fail at construction if the quiesce flag can lapse mid-drain.
-
-        The gate sets the flag once and then waits up to
-        ``upgrade_drain_timeout_s`` for the in-flight deliveries to settle. A
-        TTL at or below that wait expires the flag while the gate is still
-        waiting, so the replicas resume claiming into an upgrade that is about
-        to roll them -- re-creating the very interruption the gate exists to
-        prevent, and doing it silently (the gate would still report a clean
-        drain). Strictly greater, so there is real headroom.
-        """
-        if self.upgrade_quiesce_ttl_s <= self.upgrade_drain_timeout_s:
-            raise ValueError(
-                "CURIE_UPGRADE_QUIESCE_TTL_S "
-                f"({self.upgrade_quiesce_ttl_s!r}) must be strictly greater than "
-                "CURIE_UPGRADE_DRAIN_TIMEOUT_S "
-                f"({self.upgrade_drain_timeout_s!r}): a flag that lapses mid-drain "
-                "lets the replicas resume claiming into a roll that is about to "
-                "interrupt them"
             )
         return self
 
@@ -785,10 +801,13 @@ class WorkerConfig(BaseSettings):
     upgrade_drain_poll_interval_s: float = Field(
         default=5.0, gt=0, validation_alias="CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S"
     )
-    # How long the quiesce flag lives. FINITE on purpose: an upgrade that is
-    # killed between the gate and the post-upgrade release must not leave the
-    # fleet permanently unable to claim, so the flag lapses on its own. It must
-    # also outlast the drain wait, which is what the validator below enforces.
+    # The roll hold: how long the quiesce flag lives after a CLEAN drain, while
+    # the roll runs and until the post-upgrade release clears it. FINITE on
+    # purpose: an upgrade that is killed between the gate and the release must
+    # not leave the fleet permanently unable to claim. It need not outlast the
+    # drain wait (#3127): while waiting, the gate holds the flag as a short lease
+    # renewed every poll (``upgrade_drain.quiesce_lease_s``), and the chart caps
+    # this hold at the effective drain wait.
     upgrade_quiesce_ttl_s: float = Field(
         default=1200.0, gt=0, validation_alias="CURIE_UPGRADE_QUIESCE_TTL_S"
     )

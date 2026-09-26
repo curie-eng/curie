@@ -217,6 +217,64 @@ def test_sdk_max_turns_result_is_classified_max_turns() -> None:
     assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
 
 
+def test_sdk_usd_budget_result_is_classified_budget_exceeded() -> None:
+    state = TurnState()
+    msg = ResultMessage(
+        subtype="error_max_budget_usd",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=5,
+        session_id="s",
+        result=None,
+    )
+
+    events = _translate(msg, state)
+
+    # The SDK documents this subtype in its official budget example:
+    # https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "budget-exceeded"
+    assert events[0].message == "run failed"
+    assert state.error_classification == "budget-exceeded"
+    assert isinstance(events[1], Final)
+    assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_unknown_sdk_result_subtype_stays_unclassified() -> None:
+    state = TurnState()
+    msg = ResultMessage(
+        subtype="error_future_budget",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="s",
+        result="run failed",
+    )
+
+    events = _translate(msg, state)
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "unclassified"
+    assert "error_future_budget" in events[0].message
+    assert state.error_classification is None
+    assert isinstance(events[1], Final)
+    assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_budget_named_assistant_error_stays_unclassified() -> None:
+    msg = AssistantMessage(content=[], model="m", error="error_max_budget_usd")
+
+    events = _translate(msg)
+
+    assert [event.type for event in events] == ["error"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "unclassified"
+
+
 def test_assistant_error_field_emits_error_event() -> None:
     msg = AssistantMessage(content=[], model="m", error="rate_limit")
     events = _translate(msg)

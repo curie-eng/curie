@@ -25,9 +25,11 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
+from curie_telemetry.redact import redact_text
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +70,15 @@ CI_CREDENTIAL_SLOTS = 4
 CI_DETAIL_DEADLINE_SECONDS = 20.0
 # Annotations are read for at most this many failing check runs per observation.
 CI_DETAIL_ANNOTATED_RUNS = 5
+CI_DETAIL_LOGGED_JOBS = 5
+CI_JOB_LOG_TAIL_BYTES = 64 * 1024
+CI_JOB_LOG_MAX_DECODED_BYTES = 8 * 1024 * 1024
+CI_JOB_LOG_MAX_CHARS = 6_000
+CI_JOB_LOG_MAX_LINES = 80
+CI_JOB_LOG_TIMEOUT_SECONDS = 5.0
+_CI_LOG_HOST = "pipelines.actions.githubusercontent.com"
+# GitHub's job log redirect has also been observed on Azure Blob storage.
+_CI_AZURE_LOG_HOST = re.compile(r"productionresults[a-z0-9]+\.blob\.core\.windows\.net")
 _CI_CREDENTIAL_GUARD = threading.BoundedSemaphore(CI_CREDENTIAL_SLOTS)
 
 _PUBLISHING = frozenset({"approved", "launching", "running"})
@@ -755,6 +766,8 @@ class CiDetail:
     check_runs: list[dict[str, Any]] = field(default_factory=list)
     statuses: list[dict[str, Any]] = field(default_factory=list)
     annotations: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    job_logs: dict[int, str] = field(default_factory=dict)
+    job_log_unavailable: set[int] = field(default_factory=set)
 
 
 def _detail_unavailable(reason: str, head_sha: str | None) -> CiDetail:
@@ -770,6 +783,81 @@ def _check_runs_reason(payload: Any) -> str | None:
     return verdict
 
 
+def _signed_job_log_url(location: str | None) -> httpx.URL | None:
+    """Accept only observed GitHub Actions log storage hosts."""
+
+    if not location or len(location) > 4096:
+        return None
+    try:
+        parts = urlsplit(location)
+        url = httpx.URL(location)
+    except (ValueError, httpx.InvalidURL):
+        return None
+    if (
+        parts.scheme != "https"
+        or "@" in parts.netloc
+        or parts.fragment
+        or not (
+            url.host == _CI_LOG_HOST
+            or (url.host is not None and _CI_AZURE_LOG_HOST.fullmatch(url.host))
+        )
+        or url.port not in (None, 443)
+    ):
+        return None
+    return url
+
+
+async def _fetch_job_log(
+    client: httpx.AsyncClient,
+    base: str,
+    job_id: int,
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> str | None:
+    """Read one bounded log; any provider or download error is optional."""
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            response = await client.get(
+                f"{base}/actions/jobs/{job_id}/logs",
+                headers=headers,
+                timeout=timeout_seconds,
+                auth=None,
+                follow_redirects=False,
+            )
+            if response.status_code != 302:
+                return None
+            url = _signed_job_log_url(response.headers.get("Location"))
+            if url is None:
+                return None
+            # build_request inherits client defaults. Strip credentials before
+            # sending to the signed URL, and disable client level auth as well.
+            request = client.build_request("GET", url)
+            for name in ("authorization", "proxy-authorization", "cookie", "x-github-api-version"):
+                request.headers.pop(name, None)
+            download = await client.send(
+                request, stream=True, auth=None, follow_redirects=False
+            )
+            try:
+                if download.status_code != 200:
+                    return None
+                tail = bytearray()
+                consumed = 0
+                async for chunk in download.aiter_bytes(chunk_size=8192):
+                    consumed += len(chunk)
+                    if consumed > CI_JOB_LOG_MAX_DECODED_BYTES:
+                        return None
+                    tail.extend(chunk)
+                    if len(tail) > CI_JOB_LOG_TAIL_BYTES:
+                        del tail[:-CI_JOB_LOG_TAIL_BYTES]
+            finally:
+                await download.aclose()
+            redacted = redact_text(tail.decode("utf-8", errors="replace"))
+            return "\n".join(redacted.splitlines()[-CI_JOB_LOG_MAX_LINES:])[-CI_JOB_LOG_MAX_CHARS:]
+    except (TimeoutError, httpx.HTTPError, ValueError):
+        return None
+
+
 async def observe_ci_detail(
     lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
 ) -> CiDetail:
@@ -782,9 +870,10 @@ async def observe_ci_detail(
 
     raw = getattr(lineage, "head_sha", None) if lineage is not None else None
     head_sha = raw if isinstance(raw, str) and _SHA_RE.fullmatch(raw) else None
+    log_deadline = asyncio.get_running_loop().time() + CI_DETAIL_DEADLINE_SECONDS - 0.5
     try:
         return await asyncio.wait_for(
-            _observe_ci_detail(lineage, work_item, settings, client),
+            _observe_ci_detail(lineage, work_item, settings, client, log_deadline),
             timeout=CI_DETAIL_DEADLINE_SECONDS,
         )
     except TimeoutError:
@@ -792,7 +881,11 @@ async def observe_ci_detail(
 
 
 async def _observe_ci_detail(
-    lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
+    lineage: Any,
+    work_item: Any,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    log_deadline: float,
 ) -> CiDetail:
     head_sha = getattr(lineage, "head_sha", None) if lineage is not None else None
     if not isinstance(head_sha, str) or not _SHA_RE.fullmatch(head_sha):
@@ -822,6 +915,7 @@ async def _observe_ci_detail(
                     params=params,
                     headers=headers,
                     timeout=settings.github_app_timeout_seconds,
+                    auth=None,
                     follow_redirects=False,
                 )
             except httpx.TimeoutException:
@@ -858,6 +952,8 @@ async def _observe_ci_detail(
             return _detail_unavailable("malformed_response", head_sha)
         check_runs: list[dict[str, Any]] = list(runs_payload["check_runs"])
         annotations: dict[int, list[dict[str, Any]]] = {}
+        job_logs: dict[int, str] = {}
+        job_log_unavailable: set[int] = set()
         failing_ids = [
             run["id"]
             for run in check_runs
@@ -874,6 +970,32 @@ async def _observe_ci_detail(
             # never changes the verdict.
             if reason is None and isinstance(payload, list):
                 annotations[run_id] = [item for item in payload if isinstance(item, dict)]
+        action_ids = list(
+            dict.fromkeys(
+                run["id"]
+                for run in check_runs
+                if run.get("status") == "completed"
+                and run.get("conclusion") in _FAILING_CONCLUSIONS
+                and isinstance(run.get("id"), int)
+                and not isinstance(run.get("id"), bool)
+                and isinstance(run.get("app"), dict)
+                and run["app"].get("slug") == "github-actions"
+            )
+        )
+        job_log_unavailable.update(action_ids[CI_DETAIL_LOGGED_JOBS:])
+        for job_id in action_ids[:CI_DETAIL_LOGGED_JOBS]:
+            time_left = max(0.0, log_deadline - asyncio.get_running_loop().time())
+            log = await _fetch_job_log(
+                client,
+                base,
+                job_id,
+                headers,
+                min(CI_JOB_LOG_TIMEOUT_SECONDS, time_left),
+            )
+            if log:
+                job_logs[job_id] = log
+            else:
+                job_log_unavailable.add(job_id)
     finally:
         del token
         headers.clear()
@@ -884,4 +1006,6 @@ async def _observe_ci_detail(
         check_runs=check_runs,
         statuses=list(statuses),
         annotations=annotations,
+        job_logs=job_logs,
+        job_log_unavailable=job_log_unavailable,
     )

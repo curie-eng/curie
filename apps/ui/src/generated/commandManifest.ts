@@ -1279,6 +1279,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -1400,6 +1408,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
@@ -1603,6 +1619,14 @@ export const commandManifest = {
               "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
               "id": "slack_channel",
               "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
               "positional": false,
               "required": false
             },
@@ -2242,6 +2266,26 @@ export const commandManifest = {
               "help": "Clear the execution-deadline override back to the platform default",
               "id": "clear_execution_deadline",
               "long": "clear-execution-deadline",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin runner cpu, memory, and ephemeral-storage. JSON object with requests and limits. Null on the API means the chart block",
+              "id": "runner_resources",
+              "long": "runner-resources",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the runner resource override back to the chart block",
+              "id": "clear_runner_resources",
+              "long": "clear-runner-resources",
               "positional": false,
               "possible_values": [
                 "true",
@@ -3856,6 +3900,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -4029,6 +4081,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
@@ -4324,6 +4384,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Bind this agent to a GitHub repository (`owner/name`) so pushes to its dev/prod branches deploy it (ADR-0014)",
               "id": "repo",
               "long": "repo",
@@ -4606,6 +4674,26 @@ export const commandManifest = {
               "help": "Clear the execution-deadline override back to the platform default",
               "id": "clear_execution_deadline",
               "long": "clear-execution-deadline",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin runner cpu, memory, and ephemeral-storage. JSON object with requests and limits. Null on the API means the chart block",
+              "id": "runner_resources",
+              "long": "runner-resources",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the runner resource override back to the chart block",
+              "id": "clear_runner_resources",
+              "long": "clear-runner-resources",
               "positional": false,
               "possible_values": [
                 "true",
@@ -5864,6 +5952,67 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "install"
+            },
+            {
+              "about": "Provision the observability stack on an existing Curie release and require the Grafana connector token. Does not install the platform and does not deploy the SRE bot",
+              "args": [
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the Curie release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name of the Curie install. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "observability"
+                  ],
+                  "global": false,
+                  "help": "Kubernetes namespace of the retained observability stack. Default: observability",
+                  "id": "observability_namespace",
+                  "long": "observability-namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Chart directory. When omitted, use the same chart resolution as install",
+                  "id": "chart",
+                  "long": "chart",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print the ordered plan without calling kubectl or helm",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "provision-observability"
             }
           ]
         }
@@ -5983,6 +6132,14 @@ export const commandManifest = {
           "help": "Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp)",
           "id": "registry",
           "long": "registry",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "id": "runner_image",
+          "long": "runner-image",
           "positional": false,
           "required": false
         },

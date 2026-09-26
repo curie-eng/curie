@@ -202,10 +202,15 @@ class RecordingSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
         fresh_only: bool = False,
     ) -> Any:
         handle = self._inner.claim(
-            thread_key, env=env, agent_name=agent_name, fresh_only=fresh_only
+            thread_key,
+            env=env,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            fresh_only=fresh_only,
         )
         self.claims.append((thread_key, handle.sandbox_name))
         return handle

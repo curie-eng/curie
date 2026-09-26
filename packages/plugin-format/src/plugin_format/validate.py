@@ -417,6 +417,9 @@ def _validate_connector_lock(root: Path, c: _Collector) -> None:
                 CONNECTOR_LOCK_FILE,
             )
 
+    if declared.runner is not None and not _validate_runner_lock(root, declared, lock, c):
+        complete = False
+
     if complete and lock is not None:
         # The last rule the model cannot express: an image that is not a digest
         # of its delivery's shape. `apply_lock` owns that refusal, so intake
@@ -425,8 +428,72 @@ def _validate_connector_lock(root: Path, c: _Collector) -> None:
         # connector can never render must not be stored.
         try:
             connector_lock.apply_lock(declared, lock, portable=False)
+            connector_lock.resolve_runner_image(declared, lock, portable=False)
         except ValueError as exc:
             c.error("connectors.lock_invalid", f"{CONNECTOR_LOCK_FILE}: {exc}", CONNECTOR_LOCK_FILE)
+
+
+def _validate_runner_lock(
+    root: Path, declared: ConnectorsFile, lock: ConnectorLockFile | None, c: _Collector
+) -> bool:
+    """The runner layer's intake rules (ADR 0173); True when all of them pass.
+
+    The same containment, presence and freshness rules a built connector gets,
+    plus the base-as-argument rule on its Dockerfile.
+    """
+
+    runner = declared.runner
+    assert runner is not None
+    build = runner.build
+    try:
+        context = resolve_context(root, build.context)
+    except ValueError as exc:
+        c.error("connectors.build_context_escapes", f"runner: {exc}", CONNECTORS_FILE)
+        return False
+    if not context.is_dir():
+        c.error(
+            "connectors.build_context_missing",
+            f"runner: `build.context` is {build.context!r}, which this bundle does not "
+            "contain, so there is nothing to build or to hash. Add the runner build context "
+            "to the bundle or correct the path.",
+            CONNECTORS_FILE,
+        )
+        return False
+    ok = True
+    dockerfile = context / build.dockerfile
+    try:
+        text = dockerfile.read_text(encoding="utf-8") if dockerfile.is_file() else None
+    except OSError:
+        text = None
+    refusal = (
+        connector_lock.check_runner_dockerfile(text)
+        if text is not None
+        else f"the runner Dockerfile {build.dockerfile!r} is missing from the build context, "
+        f"so nothing can declare `ARG {connector_lock.RUNNER_BASE_ARG}`"
+    )
+    if refusal is not None:
+        ok = False
+        c.error("connectors.runner_base_not_arg", f"runner: {refusal}", CONNECTORS_FILE)
+    entry = lock.runner if lock is not None else None
+    if entry is None:
+        c.error(
+            "connectors.lock_missing",
+            f"runner: {CONNECTORS_FILE} declares a runner layer but {CONNECTOR_LOCK_FILE} "
+            "has no runner entry for it, so nothing pins what would be deployed. Run "
+            "`curie build --plugin-dir <dir>` and commit the lock it writes.",
+            CONNECTOR_LOCK_FILE,
+        )
+        return False
+    if source_digest_of(context, build) != entry.source_digest:
+        c.error(
+            "connectors.lock_stale",
+            f"runner: {CONNECTOR_LOCK_FILE} records a runner source digest that no longer "
+            "matches this bundle's runner build input, so the recorded image was built from "
+            "something else. Rebuild it with `curie build --plugin-dir <dir>`.",
+            CONNECTOR_LOCK_FILE,
+        )
+        return False
+    return ok
 
 
 def _reject_connector_name_collisions(root: Path, parsed: ConnectorsFile, c: _Collector) -> None:

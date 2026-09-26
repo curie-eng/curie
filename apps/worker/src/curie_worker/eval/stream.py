@@ -548,8 +548,11 @@ class EvalStreamConsumer(StreamConsumer):
 
         suite = loaded.suite
         thinking: str | None = None
+        runner_resources: dict[str, Any] | None = None
         if item.target_url is None:
-            stored_model, thinking = await self._repo_lookup.model_settings_for(item.agent_id)
+            stored_model, thinking, runner_resources = await self._repo_lookup.model_settings_for(
+                item.agent_id
+            )
             resolved_model = (
                 item.model
                 if item.model is not None
@@ -584,7 +587,10 @@ class EvalStreamConsumer(StreamConsumer):
             return result
 
         base_url, release_key, token = await self._acquire_target(
-            item, model=resolved_model, thinking=thinking
+            item,
+            model=resolved_model,
+            thinking=thinking,
+            runner_resources=runner_resources,
         )
         if base_url is None:
             return await self._report_failed(
@@ -698,7 +704,12 @@ class EvalStreamConsumer(StreamConsumer):
         return None if files is None else _select_scorer(files)
 
     async def _acquire_target(
-        self, item: EvalJob, *, model: str | None, thinking: str | None
+        self,
+        item: EvalJob,
+        *,
+        model: str | None,
+        thinking: str | None,
+        runner_resources: dict[str, Any] | None = None,
     ) -> tuple[str | None, str | None, str | None]:
         if item.target_url is not None:
             # dev/test shortcut: eval a given runner. Not a claim of ours, so no
@@ -721,6 +732,7 @@ class EvalStreamConsumer(StreamConsumer):
                     release_key,
                     env=env,
                     agent_name=agent_name,
+                    runner_resources=runner_resources,
                 )
         except SandboxError:
             logger.exception("could not provision a runner for eval %s", item.sha)

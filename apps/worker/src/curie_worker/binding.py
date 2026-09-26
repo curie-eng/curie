@@ -73,7 +73,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from . import sandbox_token
+from . import caller_token, sandbox_token
 from .behaviorpacks import BehaviorPacks
 from .config import WorkerConfig
 
@@ -340,6 +340,9 @@ class ResolvedDeployment(BaseModel):
     # at boot. None falls back to the worker's configured default; unset at both
     # layers sends nothing and leaves the model's own default standing.
     thinking: str | None = None
+    # Per-agent runner resources (#3209). None means the chart block. A set
+    # value is applied to the next claim, not to a sandbox that is already running.
+    runner_resources: dict[str, Any] | None = None
     # The agent's permission gates (#245): tool names requiring human approval,
     # forwarded as CURIE_APPROVAL_REQUIRED_TOOLS at boot. None means no gates.
     approval_required_tools: list[str] | None = None
@@ -442,6 +445,9 @@ def _deployment_from_row(data: dict[str, Any]) -> ResolvedDeployment:
     conn_secrets = data.get("secrets")
     if isinstance(conn_secrets, str):
         data["secrets"] = json.loads(conn_secrets)
+    runner_resources = data.get("runner_resources")
+    if isinstance(runner_resources, str):
+        data["runner_resources"] = json.loads(runner_resources)
     return ResolvedDeployment.model_validate(data)
 
 
@@ -729,21 +735,47 @@ class BindingResolver:
         value: str | None = row[0]
         return value
 
-    async def model_settings_for(
-        self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None]:
-        """The agent's model and thinking settings for eval sandbox boots."""
+    async def runner_resources_for(self, agent_id: uuid.UUID) -> dict[str, Any] | None:
+        """The agent's runner resource override, or None for the chart block.
+
+        This is a separate read from deployment resolution. Resolution runs in
+        migration tests against schemas that predate the column.
+        """
         sql = text(
-            f"SELECT model, thinking FROM {self._config.db_schema}.agents WHERE id = :id"
+            "SELECT runner_resources "
+            f"FROM {self._config.db_schema}.agents WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         if row is None:
-            return None, None
+            return None
+        value = row[0]
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value if isinstance(value, dict) else None
+
+    async def model_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
+        """The agent's model, thinking, and runner_resources for eval boots."""
+        sql = text(
+            "SELECT model, thinking, runner_resources "
+            f"FROM {self._config.db_schema}.agents WHERE id = :id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        if row is None:
+            return None, None, None
         model: str | None = row[0]
         thinking: str | None = row[1]
-        return model, thinking
+        runner_resources = row[2]
+        if isinstance(runner_resources, str):
+            runner_resources = json.loads(runner_resources)
+        if runner_resources is not None and not isinstance(runner_resources, dict):
+            runner_resources = None
+        return model, thinking, runner_resources
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).
@@ -852,8 +884,8 @@ class BindingResolver:
         # and none is set -- preserving the pre-#410 no-key path.
         state_token: str | None = None
         app_state_token: str | None = None
+        exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
         if self._config.api_key:
-            exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             state_token = sandbox_token.mint(
                 self._config.api_key,
                 agent=str(resolved.agent_id),
@@ -864,6 +896,17 @@ class BindingResolver:
                 self._config.api_key,
                 agent=str(resolved.agent_id),
                 scope="state.app",
+                exp=exp,
+            )
+        # The caller token (ADR-0168 decision 7): this sandbox's agent, signed
+        # for its hosted connectors, with the state tokens' expiry. No key mints
+        # none, which is the stock install. render_worker emits it only with
+        # the connector scope.
+        connector_caller_token: str | None = None
+        if self._config.connector_caller_signing_key.strip():
+            connector_caller_token = caller_token.mint(
+                self._config.connector_caller_signing_key,
+                agent=resolved.agent_name,
                 exp=exp,
             )
         env = BootEnv.render_worker(
@@ -890,6 +933,7 @@ class BindingResolver:
             connector_release=self._config.connector_release or None,
             connector_agent=resolved.agent_name,
             connector_namespace=self._config.connector_namespace or None,
+            connector_caller_token=connector_caller_token,
             # The agent's pinned model (#254) overrides the worker default; None
             # falls back to the platform default.
             model=resolved.model if resolved.model is not None else self._config.model,

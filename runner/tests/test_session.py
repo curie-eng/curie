@@ -128,9 +128,10 @@ class _RecordingTranscriptStore:
     async def load(self) -> list[TurnRecord]:
         return list(self.turns)
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.attempts.append(record)
         self.turns.append(record)
+        return record.harness_replay is not None
 
 
 class _BlockedTranscriptStore(_RecordingTranscriptStore):
@@ -139,15 +140,16 @@ class _BlockedTranscriptStore(_RecordingTranscriptStore):
         self.entered = anyio.Event()
         self.release = anyio.Event()
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.attempts.append(record)
         self.entered.set()
         await self.release.wait()
         self.turns.append(record)
+        return record.harness_replay is not None
 
 
 class _CapacityTranscriptStore(_RecordingTranscriptStore):
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         from curie_runner.history import HistoryCapacityError
 
         self.attempts.append(record)
@@ -160,7 +162,7 @@ class _FirstBlockedTranscriptStore(_RecordingTranscriptStore):
         self.entered = anyio.Event()
         self.cancelled = anyio.Event()
 
-    async def append(self, record: TurnRecord) -> None:
+    async def append(self, record: TurnRecord) -> bool:
         self.attempts.append(record)
         if len(self.attempts) == 1:
             self.entered.set()
@@ -169,6 +171,7 @@ class _FirstBlockedTranscriptStore(_RecordingTranscriptStore):
             finally:
                 self.cancelled.set()
         self.turns.append(record)
+        return record.harness_replay is not None
 
 
 class _ReplayExportSession(FakeModelSession):
@@ -244,6 +247,14 @@ def test_transcript_capacity_failure_precedes_terminal_final(
         append_attempts.append(await request.json())
         return web.Response(status=413, text=sensitive_body)
 
+    async def get_history(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "not found"},
+            status=404,
+            headers={"X-Curie-Transcript-Max-Bytes": "65536"},
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_history)
     app.router.add_post("/agents/A/state/transcript/t1/append", reject_append)
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -265,6 +276,7 @@ def test_transcript_capacity_failure_precedes_terminal_final(
             store = StateApiTranscriptStore(
                 str(server.make_url("/agents/A/state/transcript/t1")), token=None
             )
+            assert await store.load() == []
             runner, _fake = _runner_with_history(store, tracer=RunTracer(provider))
             await runner.start()
             lines = [
@@ -439,13 +451,14 @@ def test_approval_capacity_failure_clears_pending_approval(script_factory) -> No
 
 def test_capacity_loss_stays_sticky_after_a_later_successful_append() -> None:
     class RecoveringStore(_RecordingTranscriptStore):
-        async def append(self, record: TurnRecord) -> None:
+        async def append(self, record: TurnRecord) -> bool:
             from curie_runner.history import HistoryCapacityError
 
             self.attempts.append(record)
             if len(self.attempts) == 1:
                 raise HistoryCapacityError(413)
             self.turns.append(record)
+            return record.harness_replay is not None
 
     store = RecoveringStore()
     runner, _fake = _runner_with_history(store)

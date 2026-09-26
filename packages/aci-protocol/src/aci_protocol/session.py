@@ -393,6 +393,12 @@ class BootEnv(_AciModel):
     connector_namespace: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_CONNECTOR_NAMESPACE", "worker")
     )
+    # The signed caller token this sandbox presents to its hosted connectors
+    # (ADR-0168 decision 7). Emitted only with the connector scope above, since
+    # only a scoped boot mounts a hosted connector to present it to.
+    connector_caller_token: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CONNECTOR_CALLER_TOKEN", "worker")
+    )
     # Substrate-authoritative; see the class docstring's anti-clobber note.
     port: int | None = Field(default=None, json_schema_extra=_env("CURIE_RUNNER_PORT", "substrate"))
     # Worker-authoritative with a chart fallback default.
@@ -544,6 +550,7 @@ class BootEnv(_AciModel):
         connector_release: str | None = None,
         connector_agent: str | None = None,
         connector_namespace: str | None = None,
+        connector_caller_token: str | None = None,
     ) -> dict[str, str]:
         """Render the worker binding's boot-env subset.
 
@@ -611,6 +618,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("connector_release")] = connector_release
             env[cls.env_key("connector_agent")] = connector_agent
             env[cls.env_key("connector_namespace")] = connector_namespace
+            if connector_caller_token:
+                env[cls.env_key("connector_caller_token")] = connector_caller_token
         return env
 
     def to_env(self) -> dict[str, str]:
@@ -648,6 +657,8 @@ class BootEnv(_AciModel):
             env[self.env_key("connector_agent")] = self.connector_agent
         if self.connector_namespace is not None:
             env[self.env_key("connector_namespace")] = self.connector_namespace
+        if self.connector_caller_token is not None:
+            env[self.env_key("connector_caller_token")] = self.connector_caller_token
         if self.state_url is not None:
             env[self.env_key("state_url")] = self.state_url
         if self.state_token is not None:
@@ -721,6 +732,7 @@ class BootEnv(_AciModel):
             connector_release=_str_or_none(env.get("CURIE_CONNECTOR_RELEASE")),
             connector_agent=_str_or_none(env.get("CURIE_CONNECTOR_AGENT")),
             connector_namespace=_str_or_none(env.get("CURIE_CONNECTOR_NAMESPACE")),
+            connector_caller_token=_str_or_none(env.get("CURIE_CONNECTOR_CALLER_TOKEN")),
             port=_required_int(env.get("CURIE_RUNNER_PORT")),
             base_url=_str_or_none(env.get("ANTHROPIC_BASE_URL")),
             # Empty is "not declared" for both, matching sdk_auth's own

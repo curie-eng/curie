@@ -59,7 +59,8 @@ def claim_warm_pool(
     agent_pools: frozenset[str],
 ) -> str:
     """Route connector-secret claims, and agents the chart gave their own pool
-    (``agentSandbox.registryEgress``, #3083), to the per-agent pool; otherwise
+    (``agentSandbox.registryEgress``, #3083, or ``agentSandbox.runnerImages``,
+    ADR-0173), to the per-agent pool; otherwise
     the generic pool."""
 
     marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
@@ -67,6 +68,12 @@ def claim_warm_pool(
         return agent_warm_pool_name(base_pool, agent_name)
     return base_pool
 
+# The worker's own credentials, which never enter a sandbox. The connector
+# caller signing key is here and the caller token it signs
+# (``CURIE_CONNECTOR_CALLER_TOKEN``) is deliberately not: the token is this
+# sandbox's own identity, short-lived and naming only its agent, and the runner
+# must keep it to present to its hosted connectors (ADR-0168 decision 7). The
+# key could mint a token naming any agent.
 HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
     {
         "POSTGRES_PASSWORD",
@@ -80,6 +87,7 @@ HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
 )
 
@@ -214,7 +222,8 @@ class SubstrateConfig:
     namespace: str
     warm_pool: str
     # Agents the chart renders a per-agent pool for without connector secrets
-    # (agentSandbox.registryEgress, #3083), from CURIE_AGENT_SANDBOX_POOLS.
+    # (agentSandbox.registryEgress, #3083, or agentSandbox.runnerImages,
+    # ADR-0173), from CURIE_AGENT_SANDBOX_POOLS.
     agent_pools: frozenset[str] = frozenset()
     runner_port: int = 8080
     # How long a live route stays bound with no touch. After expiry the claim
@@ -345,6 +354,8 @@ class SandboxClient(Protocol):
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        runner_resources: dict[str, object] | None = None,
+        agent_name: str | None = None,
     ) -> None:
         """Create a claim after excluding host credentials from the child environment.
 
@@ -373,6 +384,15 @@ class SandboxClient(Protocol):
         request_timeout_seconds: float,
     ) -> bool: ...
 
+    def pod_unschedulable(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> str | None:
+        """The scheduler's message when pod ``name`` is ``PodScheduled=False``
+        with reason ``Unschedulable``; None when it is scheduled, missing, or
+        unreadable."""
+
+        ...
+
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None: ...
 
 
@@ -382,6 +402,15 @@ class SandboxError(Exception):
 
 class ClaimTimeoutError(SandboxError):
     """The claim did not bind a ready sandbox within the configured timeout."""
+
+
+class UnschedulableClaimError(ClaimTimeoutError):
+    """The claim timed out while its pod was Unschedulable: no node has room.
+
+    A ClaimTimeoutError subclass, so every caller that handles a claim timeout
+    keeps doing so; only the factory work-item path treats it as capacity
+    (#3169).
+    """
 
 
 class CapacityExhaustedError(SandboxError):

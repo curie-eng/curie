@@ -1231,6 +1231,19 @@ already-configured control-plane pod at admission time. Both objects are
 independently toggleable (`resourceQuota.enabled`, `limitRange.enabled`,
 each default `true`) and every ceiling is overridable, per ADR-0059 decision 6.
 
+**Which pods outrank sandboxes (ADR-0059 decision 5, #3182).** Every
+long-running platform workload carries `priorityClassName:
+priorityClasses.platform.name`: the control plane (api, worker, dispatcher),
+the data tier (postgres, valkey, clickhouse, rustfs), the observability and
+UI tier (langfuse web/worker, the OTel collector, the UI, inference, the
+mail adapter), and the vendored agent-sandbox controller. At priority 0 those
+observability and UI pods were preempted by the very sandboxes whose traces
+and metrics they carry (#3182); `ci/render-assertions.sh` Assertion 8 holds
+the inventory exhaustive, so a new template that forgets its class fails the
+render. The runner-prewarm DaemonSet deliberately stays unclassed (priority
+0, below the sandbox class): the image-cache pod is the designated sacrifice
+a full node evicts first.
+
 **Verifying the rails.** The security-boundary probe suite re-runs as a `helm test`:
 
 ```bash
@@ -1758,6 +1771,36 @@ opened per ordered identity pair, both in a 600 s window. A bot fanning work
 out to a sibling across more than 5 threads in ten minutes is cut off past the
 fifth, and the drop is visible on Slack as the placeholder edited to a notice
 that names nobody, so the exchange cannot restart itself.
+
+### The connector caller key pair
+
+The worker signs each sandbox's connector caller token (ADR-0168 decision 7)
+with an Ed25519 key it reads from a Secret you name. Nothing verifies the
+token yet. BYO only in this release: the chart does not generate the key.
+`curie cluster up` does not mint or persist one yet either, so a render
+without cluster access (`helm template`, a client-only upgrade) has nothing
+that could keep a generated key stable. A later release has `curie cluster
+up` generate the key and carry it forward, the way it already does for the
+sealing keypair.
+
+The Secret holds both halves as standard base64: the 32-byte seed under
+`connectorCaller.signingKeyKey` (default `signingKey`) and its 32-byte public
+key under `connectorCaller.verifyKeyKey` (default `verifyKey`). With PyNaCl
+installed:
+
+```bash
+python3 -c 'import base64, nacl.signing as s; k = s.SigningKey.generate(); print(base64.b64encode(bytes(k)).decode()); print(base64.b64encode(bytes(k.verify_key)).decode())'
+```
+
+```yaml
+connectorCaller:
+  existingSecret: my-connector-caller   # holds signingKey and verifyKey
+```
+
+Only the worker receives the signing key. Leaving `existingSecret` empty mints
+no token, and every sandbox boots as before. A plain `curie cluster up` does
+not carry `connectorCaller` forward yet, so pass it with every upgrade:
+`curie cluster up --set connectorCaller.existingSecret=<name>`.
 
 ### Reserved environment variables
 

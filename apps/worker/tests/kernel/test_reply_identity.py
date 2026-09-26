@@ -238,6 +238,7 @@ class _CiWorkItems:
     async def running_for_conversation(self, _conversation_id: str) -> WorkItemRunning:
         return WorkItemRunning(
             request_id=self.running,
+            work_item_id=self.running,
             runtime_epoch=1,
             execution_deadline=datetime.now(UTC) + timedelta(minutes=20),
         )

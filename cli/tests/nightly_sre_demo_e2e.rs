@@ -85,6 +85,97 @@ fn populated_prereqs() -> Vec<(&'static str, &'static str)> {
     vec![("CURIE_CREDENTIALS", "sk-or-test-not-a-real-key")]
 }
 
+fn line_bounds(text: &str, index: usize) -> (usize, usize) {
+    let start = text[..index].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[index..].find('\n').map_or(text.len(), |at| index + at);
+    (start, end)
+}
+
+fn shell_command_containing(text: &str, index: usize) -> String {
+    let (mut start, mut end) = line_bounds(text, index);
+    while start > 0 {
+        let prev_end = start - 1;
+        let prev_start = text[..prev_end].rfind('\n').map_or(0, |at| at + 1);
+        if text[prev_start..prev_end].trim_end().ends_with('\\') {
+            start = prev_start;
+        } else {
+            break;
+        }
+    }
+    while text[start..end].trim_end().ends_with('\\') && end < text.len() {
+        let next = end + 1;
+        end = text[next..].find('\n').map_or(text.len(), |at| next + at);
+    }
+    text[start..end].to_string()
+}
+
+fn is_workflow_job_key(line: &str) -> bool {
+    let Some(body) = line.strip_prefix("  ") else {
+        return false;
+    };
+    if body.starts_with(' ') {
+        return false;
+    }
+    let Some(name) = body.trim_end().strip_suffix(':') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn workflow_job_containing(text: &str, needle: &str) -> String {
+    let jobs_at = text
+        .find("\njobs:\n")
+        .expect("the SRE demo workflow must declare a jobs block");
+    let jobs = &text[jobs_at + 1..];
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    let mut in_job = false;
+    for line in jobs.lines() {
+        if is_workflow_job_key(line) {
+            if in_job {
+                blocks.push(current);
+                current = String::new();
+            }
+            in_job = true;
+        }
+        if in_job {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if in_job && !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+        .into_iter()
+        .find(|block| block.contains(needle))
+        .unwrap_or_else(|| panic!("no workflow job name contains {needle}; jobs section:\n{jobs}"))
+}
+
+fn connector_block<'a>(text: &'a str, name: &str) -> &'a str {
+    let marker = format!("\n  {name}:");
+    let Some(start) = text.find(&marker) else {
+        panic!(
+            "examples/sre-bot/connectors.yaml must declare connector {name}; file contents:\n{text}"
+        );
+    };
+    let tail = &text[start..];
+    let mut offset = marker.len();
+    let mut end = tail.len();
+    while let Some(rel) = tail[offset..].find("\n  ") {
+        let at = offset + rel + 3;
+        if tail[at..].starts_with(|c: char| !c.is_whitespace()) {
+            end = offset + rel;
+            break;
+        }
+        offset = at;
+    }
+    &tail[..end]
+}
+
 #[test]
 fn workflow_declares_dispatch_schedule_and_release_candidate_triggers() {
     let text = workflow();
@@ -485,5 +576,94 @@ fn script_is_executable() {
     assert!(
         mode & 0o111 != 0,
         "cli/scripts/sre-demo-e2e.sh must be executable; mode={mode:#o}"
+    );
+}
+
+#[test]
+fn phase_run_provisions_observability_before_the_first_cluster_deploy() {
+    let text = script();
+    let Some(deploy_at) = text.find("cluster deploy") else {
+        panic!("sre-demo-e2e.sh must still cluster deploy; file contents:\n{text}");
+    };
+    let Some(provision_at) = text.find("example sre-bot provision-observability") else {
+        panic!(
+            "sre-demo-e2e.sh must invoke example sre-bot provision-observability \
+             before the first cluster deploy; file contents:\n{text}"
+        );
+    };
+    assert!(
+        provision_at < deploy_at,
+        "example sre-bot provision-observability must occur before the first \
+         cluster deploy; file contents:\n{text}"
+    );
+    let (line_start, line_end) = line_bounds(&text, provision_at);
+    assert!(
+        !text[line_start..line_end].trim_start().starts_with('#'),
+        "provision-observability must be a command, not a comment; file contents:\n{text}"
+    );
+    let invocation = shell_command_containing(&text, provision_at);
+    for flag in ["--namespace", "--release", "--chart"] {
+        assert!(
+            invocation.contains(flag),
+            "the provision-observability invocation must include {flag}; \
+             invocation:\n{invocation}"
+        );
+    }
+}
+
+#[test]
+fn cluster_deploy_still_passes_the_sre_bot_plugin_dir() {
+    let text = script();
+    let Some(deploy_at) = text.find("cluster deploy") else {
+        panic!("sre-demo-e2e.sh must cluster deploy; file contents:\n{text}");
+    };
+    let invocation = shell_command_containing(&text, deploy_at);
+    assert!(
+        invocation.contains("--plugin-dir"),
+        "cluster deploy must still pass --plugin-dir; invocation:\n{invocation}"
+    );
+    assert!(
+        invocation.contains("examples/sre-bot"),
+        "cluster deploy must still pass examples/sre-bot; invocation:\n{invocation}"
+    );
+}
+
+#[test]
+fn connectors_keep_grafana_and_tempo_on_the_shared_secret() {
+    let text = connectors();
+    for name in ["grafana", "tempo"] {
+        let block = connector_block(&text, name);
+        assert!(
+            block.contains("from_secret: curie-grafana-connector"),
+            "connector {name} must declare from_secret: curie-grafana-connector; \
+             block:\n{block}"
+        );
+    }
+}
+
+#[test]
+fn acceptance_does_not_disable_the_grafana_connector() {
+    let script = script();
+    let workflow = workflow();
+    assert!(
+        !script.contains("grafanaConnector.enabled=false"),
+        "sre-demo-e2e.sh must not set grafanaConnector.enabled=false; file contents:\n{script}"
+    );
+    assert!(
+        !workflow.contains("grafanaConnector.enabled=false"),
+        "the SRE demo workflow must not set grafanaConnector.enabled=false; \
+         file contents:\n{workflow}"
+    );
+}
+
+#[test]
+fn five_assertion_job_timeout_is_120_minutes() {
+    let text = workflow();
+    let job = workflow_job_containing(&text, "Five SRE demo assertions on kind");
+    assert!(
+        job.lines()
+            .any(|line| line.trim() == "timeout-minutes: 120"),
+        "the job whose name contains Five SRE demo assertions on kind must set \
+         timeout-minutes: 120; job:\n{job}"
     );
 }

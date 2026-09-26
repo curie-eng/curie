@@ -63,11 +63,18 @@ outcome is one of:
   approval gate.
 - `blocked`: the agent is killed or its budget is spent, so the slot was not
   run.
-- `skipped`: an earlier run of the same trigger was still in flight.
+- `skipped`: an earlier run of the same trigger was still in flight, or the
+  slot was missed and is not the one catch-up fires.
 
-Missed slots are not replayed. A worker that was down for a day fires only the
-latest due slot when it returns, and a fresh worker never fires a slot from
-before it started.
+Catch-up is bounded to one slot. When the scheduler comes back and finds slots
+it slept through since the trigger's last recorded slot, it fires only the
+newest one and records every older one `skipped`. The newest is skipped as well
+when it is older than the schedule's own interval or 24 hours, whichever is
+shorter, so a weekly trigger that comes back two days late starts fresh. The
+scheduler looks back at most 35 days and never past the agent's current
+deployment, records at most the newest 1000 skipped slots per trigger, and a
+trigger with no recorded slot
+never fires a slot from before the worker started.
 
 Approvals fail closed on targetless turns (#3007). A targetless turn has no
 channel to post an approval card to or resume in, so a gated tool call ends the
@@ -85,9 +92,16 @@ platform API and no run record.
 
 A hook that failed on its newest slot is visible in that one response,
 including when the three newest slots all failed. A slot that has not ended
-yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, and
-`skipped`. `deferred` and `reclaimed` are part of the run record vocabulary
-and are not written by the current scheduler.
+yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, `deferred`,
+and `skipped`. `reclaimed` is part of the run record vocabulary and is not
+written by the current scheduler.
+
+A fire aimed at a thread that holds a live session does not steer that
+session or open a second one. It records `deferred`, and the scheduler fires
+it again on each later tick until the thread is idle. A deferred slot that
+waits longer than the schedule's interval, or longer than six hours for a
+coarser schedule, records `skipped` instead. A hook with no `target` is never
+deferred.
 
 Webhook triggers validate at deploy but are not yet wired to a live wake-up;
 see the [triggers seam](../interfaces/triggers/INTERFACE.md).

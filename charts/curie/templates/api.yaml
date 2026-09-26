@@ -163,10 +163,31 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: internalWorkerToken
+            # Mirrors the worker's CURIE_INSTALLATION_ID (#3127): the API scopes
+            # the same per-installation upgrade quiesce key the worker writes.
+            - name: CURIE_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: installationId
+                  optional: false
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS
               value: {{ .Values.worker.publication.retentionSeconds | quote }}
+            {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+            # The hard quota the API compares a per-agent runner override to.
+            # All four are set together, or none are. Ephemeral storage is not
+            # on this PriorityClass-scoped quota.
+            - name: CURIE_SANDBOX_QUOTA_REQUESTS_CPU
+              value: {{ .Values.resourceQuota.hard.requestsCpu | quote }}
+            - name: CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY
+              value: {{ .Values.resourceQuota.hard.requestsMemory | quote }}
+            - name: CURIE_SANDBOX_QUOTA_LIMITS_CPU
+              value: {{ .Values.resourceQuota.hard.limitsCpu | quote }}
+            - name: CURIE_SANDBOX_QUOTA_LIMITS_MEMORY
+              value: {{ .Values.resourceQuota.hard.limitsMemory | quote }}
+            {{- end }}
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
@@ -184,6 +205,8 @@ spec:
               value: {{ .Values.api.githubFactoryMention | quote }}
             - name: GITHUB_FACTORY_CARD_BASE_URL
               value: {{ .Values.api.githubFactoryCardBaseUrl | quote }}
+            - name: GITHUB_FACTORY_CI_WAIT_S
+              value: {{ .Values.api.githubFactoryCiWaitSeconds | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the

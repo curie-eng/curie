@@ -26,6 +26,9 @@ from typing import Any
 _SUMMARY_MAX = 160
 
 _HEADER = "_What I changed:_"
+# The receipt sits beneath the answer; past this many lines it lists the first
+# ones and counts the rest.
+_MAX_LINES = 10
 
 # Said when an action reported nothing at all. Deliberately distinct from a
 # connector's own sentence: an undeclared third-party tool and a tool that
@@ -78,4 +81,14 @@ def render_receipt(actions: list[dict[str, Any]]) -> str | None:
     if not actions:
         return None
     lines = [f"• {_described(action)} — {_verdict(action)}" for action in actions]
+    if len(lines) > _MAX_LINES:
+        # A turn with a hundred calls used to end with a hundred lines, and the
+        # reply plus receipt passed the channel's size limit, so the answer
+        # itself was lost (#3064). A failed call is the line a person most needs,
+        # so failures are kept first, then the rest in the order they ran.
+        failed = [i for i, a in enumerate(actions) if a.get("status") == "failed"]
+        order = failed + [i for i in range(len(lines)) if i not in failed]
+        kept = sorted(order[:_MAX_LINES])
+        omitted = len(lines) - len(kept)
+        lines = [lines[i] for i in kept] + [f"• …and {omitted} more actions not listed"]
     return "\n".join([_HEADER, *lines])

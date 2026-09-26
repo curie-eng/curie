@@ -24,7 +24,9 @@ capabilities change, a target changes when the deployment topology does.
 through, and defaults to ``default``, the installation's own. ``connectors``
 limits which of ``connectors.yaml``'s connectors run for the target: absent
 means all of them, ``[]`` means none. Two agents built from one artifact can
-then hold different credentials (ADR-0168 decision 8).
+then hold different credentials (ADR-0168 decision 8). Every connector object
+is named per agent, not per target, so the allowlist is a property of the
+agent: two targets binding one agent must agree on it (ADR-0168 decision 8).
 
 Before this, routing lived in whatever invoked the command. For acme-bot that
 was two GitHub Actions workflows describing a dev/prod split that did not
@@ -54,6 +56,7 @@ from .connector_render import agent_forges_join
 # A connector allowlist entry must be a name `connectors.yaml` could declare, so
 # the rule is the one that module applies, imported for the same no-drift reason.
 from .connectors import _NAME_MAX as _CONNECTOR_NAME_MAX
+from .connectors import ADMITS_SELF, ConnectorsFile
 from .connectors import _is_valid_name as _is_valid_connector_name
 
 # Curie's two deployment environments. Not open-ended: the worker's binding
@@ -154,7 +157,17 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
             # the forging check off a `None` agent: called on `None` the
             # predicate raises TypeError out of a validator whose whole contract
             # is to RETURN errors, turning "agent is required" into a crash.
-            if not _is_valid_name(target.agent):
+            if target.agent == ADMITS_SELF:
+                errors.append(
+                    (
+                        "deploy.bad_agent_name",
+                        f"{where}: `{ADMITS_SELF}` is not a valid agent name -- it is reserved "
+                        "for `admits`, where it means the agent this bundle is deployed as "
+                        "(ADR-0168 decision 7). A target genuinely named `self` would be "
+                        "indistinguishable from that sentinel.",
+                    )
+                )
+            elif not _is_valid_name(target.agent):
                 errors.append(
                     (
                         "deploy.bad_agent_name",
@@ -244,4 +257,56 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
                         )
                     )
 
+    # @spec ADR-0168 d8. Connector objects are named per agent, not per target
+    # (`<release>-<agent>-mcp-<connector>`), so one agent can run one set.
+    first_by_agent: dict[str, tuple[str, frozenset[str] | None]] = {}
+    for name, target in parsed.targets.items():
+        if target.agent is None:
+            continue
+        wanted = None if target.connectors is None else frozenset(target.connectors)
+        first_name, first_wanted = first_by_agent.setdefault(target.agent, (name, wanted))
+        if first_wanted != wanted:
+            errors.append(
+                (
+                    "deploy.conflicting_connectors",
+                    f"targets.{name}: agent `{target.agent}` is also bound by "
+                    f"targets.{first_name} with a different connectors list. Every "
+                    "connector object is named per agent "
+                    "(`<release>-<agent>-mcp-<connector>`), not per target, so one "
+                    "agent runs one set: give both targets the same connectors, or "
+                    "bind them to different agents",
+                )
+            )
+
     return (parsed if not errors else None), errors
+
+
+def connectors_for_agent(targets: DeployTargetsFile | None, agent: str) -> frozenset[str] | None:
+    """The connectors ``agent`` runs, or None for every declared one.
+
+    @spec ADR-0168 d8. The validator makes every target naming one agent agree,
+    so the first match is the answer.
+    """
+
+    if targets is None:
+        return None
+    for target in targets.targets.values():
+        if target.agent == agent:
+            return None if target.connectors is None else frozenset(target.connectors)
+    return None
+
+
+def restrict_connectors(
+    declared: ConnectorsFile, allowlist: frozenset[str] | None
+) -> ConnectorsFile:
+    """``declared`` narrowed to ``allowlist``; None returns it unchanged. @spec ADR-0168 d8."""
+
+    if allowlist is None:
+        return declared
+    return declared.model_copy(
+        update={
+            "connectors": {
+                name: spec for name, spec in declared.connectors.items() if name in allowlist
+            }
+        }
+    )

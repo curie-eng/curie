@@ -21,6 +21,7 @@ from .events import (
     InboundMessage,
     Interrupt,
     OutboundEvent,
+    PublicationContext,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
@@ -91,6 +92,7 @@ __all__ = [
     "derive_dead_letter_stream_name",
     # inbound
     "Event",
+    "PublicationContext",
     "Interrupt",
     "InboundMessage",
     # outbound

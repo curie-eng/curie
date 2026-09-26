@@ -1103,11 +1103,13 @@
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
           "/publications",
+          "/publications/precheck",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/github/reviews/{event_id}/reserve",
           "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
           "/v1/internal/publications/lineage",
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
@@ -1157,7 +1159,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4000
+      "cardinality_bound": 4080
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1237,11 +1239,13 @@
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
           "/publications",
+          "/publications/precheck",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/github/reviews/{event_id}/reserve",
           "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
           "/v1/internal/publications/lineage",
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
@@ -1291,7 +1295,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4000
+      "cardinality_bound": 4080
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1371,11 +1375,13 @@
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
           "/publications",
+          "/publications/precheck",
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/github/reviews/{event_id}/reserve",
           "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
           "/v1/internal/publications/lineage",
           "/v1/internal/publications/review-reservations",
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
@@ -1418,7 +1424,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 800
+      "cardinality_bound": 816
     },
     "curie.background.loop": {
       "type": "counter",

@@ -648,12 +648,25 @@ async def list_namespaces_for_binding(
 
 
 async def _get_state(
-    agent_id: uuid.UUID, scope: str | None, namespace: str, key: str, session: AsyncSession
+    agent_id: uuid.UUID,
+    scope: str | None,
+    namespace: str,
+    key: str,
+    session: AsyncSession,
+    response: Response,
 ) -> StateEntryOut:
     if namespace == TRANSCRIPT_NAMESPACE:
+        headers = {
+            "X-Curie-Transcript-Max-Bytes": str(get_settings().transcript_max_thread_bytes)
+        }
         row = await transcripts.get(session, agent_id, scope, key)
         if row is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "state entry not found")
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "state entry not found",
+                headers=headers,
+            )
+        response.headers.update(headers)
         return _transcript_out(row)
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if entry is None:
@@ -667,9 +680,9 @@ async def _get_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def get_state(
-    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep, response: Response
 ) -> StateEntryOut:
-    return await _get_state(agent_id, None, namespace, key, session)
+    return await _get_state(agent_id, None, namespace, key, session, response)
 
 
 @router.get(
@@ -678,10 +691,16 @@ async def get_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def get_state_for_binding(
-    agent_id: uuid.UUID, kind: str, address: str, namespace: str, key: str, session: SessionDep
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    response: Response,
 ) -> StateEntryOut:
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _get_state(agent_id, scope, namespace, key, session)
+    return await _get_state(agent_id, scope, namespace, key, session, response)
 
 
 async def _list_state(

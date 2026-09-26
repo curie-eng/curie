@@ -199,6 +199,9 @@ def _checkpointing_fake(*tags: str, replay_messages: Any = ()) -> Any:
                 ),
             )
 
+        def request_full_checkpoint(self) -> None:
+            """Every export above is already a full checkpoint."""
+
     turns = iter(tags)
 
     def next_turn() -> list[Any]:
@@ -304,8 +307,10 @@ class _Thread:
         from curie_runner.history import StateApiTranscriptStore
 
         async def go() -> None:
+            store = StateApiTranscriptStore(self.key_url, token=self.api_key)
+            assert await store.load() == []
             runner = _runner(
-                StateApiTranscriptStore(self.key_url, token=self.api_key),
+                store,
                 _checkpointing_fake("coding"),
             )
             final = await _run_turn(runner, text, "1")
@@ -372,6 +377,105 @@ class _Thread:
 _CODING_TEXT = "CODING-2927: quantize the pricing rules to cents and publish a PR"
 _REVIEW_TEXT = "REVIEW-2927: address the review comments on PR 41 and push a revision"
 _FOLLOWUP_TEXT = "FOLLOWUP-2927: rebase the pricing branch and rerun the full suite"
+
+
+def test_assembled_factory_sized_turn_persists_through_the_api(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    served_api: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aci_protocol import SessionStatus
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ResultMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+    from curie_runner.fake import FakeModelSession
+    from curie_runner.history import StateApiTranscriptStore, TurnRecord
+
+    thread = _Thread(client, auth_headers, served_api, tmp_path, monkeypatch)
+    final_text = "The factory work passed review and the pull request was published."
+
+    def factory_turn() -> list[Any]:
+        script: list[Any] = []
+        for index in range(400):
+            script.append(
+                AssistantMessage(
+                    content=[
+                        ToolUseBlock(
+                            id=f"factory{index}", name="Bash", input={"command": "ls"}
+                        )
+                    ],
+                    model="fake-model",
+                )
+            )
+            script.append(
+                UserMessage(
+                    content=[
+                        ToolResultBlock(
+                            tool_use_id=f"factory{index}", content="ok", is_error=False
+                        )
+                    ]
+                )
+            )
+        script.append(AssistantMessage(content=[TextBlock(text=final_text)], model="fake-model"))
+        script.append(
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="fake-session",
+                result=final_text,
+                usage={"input_tokens": 10, "output_tokens": 10},
+            )
+        )
+        return script
+
+    async def go() -> None:
+        store = StateApiTranscriptStore(thread.key_url, token=thread.api_key)
+        assert await store.load() == []
+        runner = _runner(store, FakeModelSession(factory_turn))
+        final = await _run_turn(runner, "Complete factory issue", "1")
+        assert final.status is SessionStatus.DONE, final
+        assert final.text == final_text
+        assert runner.history_durable is True
+
+    anyio.run(go)
+    value = thread.stored()
+    assert _size(value) <= _CAP - _RESERVE
+    turn = TurnRecord.from_dict(value[-1])
+    assert turn.assistant == final_text
+    stored_text = json.dumps(turn.to_dict())
+    assert '"id": "factory0"' not in stored_text
+    assert '"id": "factory399"' in stored_text
+
+    async def resume() -> None:
+        from curie_runner import __main__ as boot
+
+        store, replay, capacity_exceeded = await boot._load_history(thread.config)
+        assert capacity_exceeded is False
+        assert final_text in _replay_text(replay.messages)
+        runner = _runner(
+            store,
+            _checkpointing_fake("followup", replay_messages=replay.messages),
+            resumed=replay.present,
+            capacity_exceeded=capacity_exceeded,
+        )
+        final = await _run_turn(runner, "Review the published change", "2")
+        assert final.status is SessionStatus.DONE, final
+        assert runner.history_durable is True
+
+    anyio.run(resume)
+    assert _size(thread.stored()) <= _CAP - _RESERVE
+    assert "Review the published change" in thread.boot_replay()
 
 
 def test_assembled_one_turn_coding_thread_resumes_review_turn(

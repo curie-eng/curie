@@ -33,6 +33,7 @@ from .types import (
     SandboxView,
     SubstrateConfig,
     SuspendedThreadError,
+    UnschedulableClaimError,
     agent_warm_pool_name,
     claim_warm_pool,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "AffinityStore",
     "CapacityExhaustedError",
     "ClaimTimeoutError",
+    "UnschedulableClaimError",
     "ClaimView",
     "DockerError",
     "DockerSandboxClient",

@@ -61,6 +61,7 @@ from .routers import (
     hooks,
     memory,
     observability,
+    publication_precheck,
     publications,
     runs,
     schedules,
@@ -179,9 +180,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.resume_queue,
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
-                publication_patch_retention_seconds=(
-                    settings.publication_patch_retention_seconds
-                ),
+                publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
             )
         )
     else:
@@ -411,6 +410,7 @@ def create_app() -> FastAPI:
     app.include_router(approval_recovery.router)
     app.include_router(approvals.router)
     app.include_router(actions.router)
+    app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
     app.include_router(work_items.router)

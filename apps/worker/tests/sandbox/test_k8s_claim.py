@@ -74,6 +74,8 @@ class _FakeApi:
         self.request_timeouts: list[tuple[str, float]] = []
         self.quota: object | None = None
         self.quota_error: BaseException | None = None
+        self.pod: object | None = None
+        self.pod_error: BaseException | None = None
 
     def create_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, body: dict[str, Any]
@@ -127,6 +129,19 @@ class _FakeApi:
             raise self.quota_error
         assert self.quota is not None
         return self.quota
+
+
+    def read_namespaced_pod(
+        self,
+        name: str,
+        namespace: str,
+        *,
+        _request_timeout: float,
+    ) -> object:
+        self.request_timeouts.append((f"get:pods:{namespace}:{name}", _request_timeout))
+        if self.pod_error is not None:
+            raise self.pod_error
+        return self.pod
 
 
 def _client(api: _FakeApi) -> KubernetesSandboxClient:
@@ -605,6 +620,7 @@ def test_host_credentials_are_never_written_to_the_claim(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
     for name in denied_names:
         monkeypatch.setenv(name, "placeholder")
@@ -619,6 +635,26 @@ def test_host_credentials_are_never_written_to_the_claim(
     assert denied_names.isdisjoint(claim_env_names)
     assert "CURIE_BUDGET" in claim_env_names
     assert "CURIE_CREDENTIALS" not in claim_env_names
+
+
+def test_the_caller_token_rides_the_claim_and_its_signing_key_never_does() -> None:
+    # ADR-0168 decision 7. The token is the sandbox's own short-lived identity
+    # and the runner needs it, so it is a claim entry like the runner token.
+    # The key that signs it is the worker's, and would let a sandbox mint a
+    # token naming any agent.
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-caller",
+        pool="pool",
+        env={
+            "CURIE_BUDGET": "{}",
+            "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+            "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder",
+        },
+    )
+    entries = _env_entries(api)
+    assert {"name": "CURIE_CONNECTOR_CALLER_TOKEN", "value": "cct.payload.signature"} in entries
+    assert all(e.get("name") != "CURIE_CONNECTOR_CALLER_SIGNING_KEY" for e in entries)
 
 
 def test_no_slack_identity_token_reaches_the_claim() -> None:
@@ -870,3 +906,66 @@ def test_claim_metadata_agent_label_is_not_additional_pod_metadata() -> None:
     assert body["metadata"]["labels"]["curietech.ai/agent"] == "acme-a"
     assert "additionalPodMetadata" not in body["spec"]
     assert body["spec"]["warmPoolRef"]["name"] == "curie-agent-acme-a-runner-pool"
+
+
+def _pod(*conditions: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(status=SimpleNamespace(conditions=list(conditions)))
+
+
+def _condition(type_: str, status: str, reason: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        type=type_,
+        status=status,
+        reason=reason,
+        message="0/1 nodes are available: 1 Insufficient cpu.",
+    )
+
+
+def test_unschedulable_pod_reports_the_scheduler_message() -> None:
+    """#3169: PodScheduled=False with reason Unschedulable is the no-room signal."""
+
+    api = _FakeApi()
+    api.pod = _pod(_condition("PodScheduled", "False", "Unschedulable"))
+
+    assert (
+        _client(api).pod_unschedulable("sbx-1", request_timeout_seconds=0.5)
+        == "0/1 nodes are available: 1 Insufficient cpu."
+    )
+    assert api.request_timeouts == [("get:pods:test-ns:sbx-1", 0.5)]
+
+
+@pytest.mark.parametrize(
+    "pod",
+    [
+        _pod(_condition("PodScheduled", "True")),
+        _pod(_condition("PodScheduled", "False", "SchedulerError")),
+        _pod(_condition("Ready", "False", "Unschedulable")),
+        _pod(),
+        SimpleNamespace(status=None),
+        None,
+    ],
+    ids=["scheduled", "other_reason", "other_type", "no_conditions", "no_status", "none"],
+)
+def test_a_scheduled_or_unknown_pod_is_not_unschedulable(pod: object) -> None:
+    api = _FakeApi()
+    api.pod = pod
+
+    assert _client(api).pod_unschedulable("sbx-1", request_timeout_seconds=0.5) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        k8s_module.k8s_client.ApiException(status=404),
+        k8s_module.k8s_client.ApiException(status=403),
+        TimeoutError("pod read timed out"),
+    ],
+    ids=["missing", "forbidden", "timeout"],
+)
+def test_an_unreadable_pod_is_not_unschedulable(error: BaseException) -> None:
+    """Unknown pod state keeps today's claim-timeout failure, never a defer."""
+
+    api = _FakeApi()
+    api.pod_error = error
+
+    assert _client(api).pod_unschedulable("sbx-1", request_timeout_seconds=0.5) is None

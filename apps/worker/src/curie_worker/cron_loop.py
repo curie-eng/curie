@@ -15,15 +15,27 @@ whose watermarks differ can resolve different slots of one hook, so admission
 also takes a transaction-scoped advisory lock per ``(agent, name)`` and treats
 any other open row for that hook as in flight.
 
-**Missed slots are slept through, not replayed.** A pass covers (watermark,
-now] and considers only the latest due slot per hook. A worker that was down
-for a day fires once when it returns, not once per missed slot, and a fresh
-worker never fires a slot from before it started.
+**Catch-up is bounded to one slot (#2930).** A pass covers (watermark, now],
+reaching back to the hook's last recorded slot when that is earlier, so a
+restarted worker still sees the slots it slept through. It fires only the
+newest due slot and records every older one ``skipped``. The newest is skipped
+too once it is older than the schedule's own interval or ``CATCH_UP_CEILING``,
+whichever is shorter. A hook with no recorded slot never fires a slot from
+before this worker started, and no hook reaches back past its deployment. The
+reach back stops at ``_CATCH_UP_LOOKBACK`` and one pass records at most
+``_MAX_SKIPPED_ROWS`` skipped slots per hook.
 
 **One hook's failure ends with that hook.** An exception while reading one
 agent's triggers, or resolving or admitting one hook, is caught and logged, and
 the rest of the pass continues, for the same reason as the connector loop: the
 order is arbitrary, so aborting would starve whichever hooks sorted later.
+
+**A deferred fire is retried, within the catch-up bound.** The kernel records
+``deferred`` when a targeted fire meets a live session on its thread, read under
+the per-thread lock (ADR-0099, #2929). Each pass reopens such a slot and puts it
+back on the stream under a fresh event id, until it runs or is past the same
+catch-up age bound a missed slot uses. Past the bound the slot is recorded
+``skipped``.
 
 **A pass never kills the worker.** ``run_forever`` wraps the pass whole. The
 loop shares a process with the kernel, so a scheduling problem fails loudly
@@ -59,6 +71,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from .bundle_store import BundleReader, extract_bundle
+from .hook_runs import retry_event_id
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +84,20 @@ _ITERATION_MARGIN = timedelta(hours=3)
 # A stale in-flight row is one whose turn has outlived every delivery deadline
 # plus this slack; the kernel should have closed it long ago.
 _STALE_SLACK_S = 60.0
+
+# A missed slot older than this is skipped rather than fired, however coarse the
+# schedule: a monthly hook four weeks late starts fresh.
+CATCH_UP_CEILING = timedelta(hours=24)
+
+# How far back a restarted worker looks for slots it slept through. It bounds
+# the slot enumeration (a minute schedule enumerates about 50,000 slots at
+# most) while a monthly hook down four weeks still gets its missed slot
+# recorded.
+_CATCH_UP_LOOKBACK = timedelta(days=35)
+
+# The most skipped rows one pass writes for one hook, newest kept. A minute
+# schedule down for days would otherwise write thousands of rows in one pass.
+_MAX_SKIPPED_ROWS = 1000
 
 
 def resolve_slots(
@@ -105,6 +132,60 @@ def resolve_slots(
             slots.append(utc)
     slots.sort()
     return slots
+
+
+def catch_up_bound(
+    schedule: str, zone: str, slot: datetime, ceiling: timedelta = CATCH_UP_CEILING
+) -> timedelta:
+    """How long after ``slot`` it may still fire: a missed slot on restart, or a
+    deferred one on retry (#2929).
+
+    The schedule's own interval at ``slot`` (the gap to the next slot, in the
+    hook's zone), capped by ``ceiling`` for a coarse schedule.
+    """
+
+    following = resolve_slots(schedule, zone, slot, slot + ceiling)
+    return following[0] - slot if following else ceiling
+
+
+def slot_is_stale(
+    schedule: str,
+    zone: str,
+    slot: datetime,
+    now: datetime,
+    ceiling: timedelta = CATCH_UP_CEILING,
+) -> bool:
+    """Whether ``slot`` is past the catch-up age bound at ``now``.
+
+    The bound is the schedule's own interval at ``slot`` (the gap to the next
+    slot, in the hook's zone), capped by ``ceiling`` for a coarse schedule.
+    """
+
+    return now - slot > catch_up_bound(schedule, zone, slot, ceiling)
+
+
+def plan_catch_up(
+    schedule: str, zone: str, due: list[datetime], now: datetime
+) -> tuple[datetime | None, list[datetime]]:
+    """The one slot to fire and the slots to record skipped.
+
+    Args:
+        schedule: The hook's cron expression.
+        zone: The hook's IANA zone.
+        due: Ascending unrecorded slots, as ``resolve_slots`` returns them.
+        now: The pass instant.
+
+    Returns:
+        The newest due slot, or None when nothing is due or it is stale, and
+        every other due slot, ascending.
+    """
+
+    if not due:
+        return None, []
+    newest = due[-1]
+    if slot_is_stale(schedule, zone, newest, now):
+        return None, list(due)
+    return newest, list(due[:-1])
 
 
 class TriggerSource(Protocol):
@@ -178,6 +259,7 @@ SELECT DISTINCT ON (a.id)
        a.name AS agent_name,
        v.id AS version_id,
        v.bundle_ref AS bundle_ref,
+       d.deployed_at AS deployed_at,
        a.max_usd_per_day AS max_usd_per_day,
        a.max_output_tokens_per_run AS max_output_tokens_per_run
 FROM {schema}.agents a
@@ -223,10 +305,44 @@ WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL AND slot_utc <> 
 LIMIT 1
 """
 
+_LAST_SLOT_SQL = """
+SELECT max(slot_utc) FROM {schema}.hook_runs WHERE agent_id = :agent_id AND name = :name
+"""
+
+_SKIP_SQL = """
+INSERT INTO {schema}.hook_runs
+       (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at)
+VALUES (:id, :agent_id, :name, :slot, :version_id, 'skipped', now(), now())
+ON CONFLICT (agent_id, name, slot_utc) DO NOTHING
+"""
+
+_DEFERRED_SQL = """
+SELECT slot_utc FROM {schema}.hook_runs
+WHERE agent_id = :agent_id AND name = :name AND outcome = 'deferred'
+ORDER BY slot_utc
+"""
+
+_SETTLE_DEFERRED_SQL = """
+UPDATE {schema}.hook_runs SET outcome = CAST(:outcome AS text), ended_at = now()
+WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
+"""
+
+# The reopen is a CAS on ``deferred``, so of two replicas retrying one slot
+# exactly one gets the row back in flight and enqueues it.
+_REOPEN_SQL = """
+UPDATE {schema}.hook_runs SET outcome = NULL, ended_at = NULL, started_at = now()
+WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
+RETURNING id
+"""
+
 _FAIL_RUN_SQL = """
 UPDATE {schema}.hook_runs SET outcome = 'failed', ended_at = now()
 WHERE id = :id AND outcome IS NULL
 """
+
+
+class _UnboundTarget(Exception):
+    """A hook's target matches no single binding of its agent."""
 
 
 @dataclass(frozen=True)
@@ -235,6 +351,7 @@ class _Target:
     agent_name: str
     version_id: uuid.UUID
     bundle_ref: str | None
+    deployed_at: datetime | None
     max_usd_per_day: float | None
     max_output_tokens_per_run: int | None
 
@@ -244,6 +361,7 @@ class CronPassSummary:
     """What one pass decided, one counter per slot outcome."""
 
     admitted: int = 0
+    retried: int = 0
     blocked: int = 0
     skipped: int = 0
     failed: int = 0
@@ -251,7 +369,7 @@ class CronPassSummary:
 
     @property
     def did_work(self) -> bool:
-        return bool(self.admitted or self.blocked or self.skipped or self.failed)
+        return bool(self.admitted or self.retried or self.blocked or self.skipped or self.failed)
 
 
 class CronSchedulerLoop:
@@ -294,6 +412,11 @@ class CronSchedulerLoop:
         self._lock_sql = text(_LOCK_SQL)
         self._in_flight_sql = text(_IN_FLIGHT_SQL.format(schema=db_schema))
         self._fail_run_sql = text(_FAIL_RUN_SQL.format(schema=db_schema))
+        self._last_slot_sql = text(_LAST_SLOT_SQL.format(schema=db_schema))
+        self._skip_sql = text(_SKIP_SQL.format(schema=db_schema))
+        self._deferred_sql = text(_DEFERRED_SQL.format(schema=db_schema))
+        self._settle_deferred_sql = text(_SETTLE_DEFERRED_SQL.format(schema=db_schema))
+        self._reopen_sql = text(_REOPEN_SQL.format(schema=db_schema))
 
     async def _targets(self) -> list[_Target]:
         async with self._engine.connect() as conn:
@@ -304,6 +427,7 @@ class CronSchedulerLoop:
                 agent_name=row["agent_name"],
                 version_id=row["version_id"],
                 bundle_ref=row["bundle_ref"],
+                deployed_at=row["deployed_at"],
                 max_usd_per_day=row["max_usd_per_day"],
                 max_output_tokens_per_run=row["max_output_tokens_per_run"],
             )
@@ -359,6 +483,58 @@ class CronSchedulerLoop:
         ).first()
         return None if row is None else row[0]
 
+    async def _window_start(
+        self, target: _Target, name: str, window_start: datetime, now: datetime
+    ) -> datetime:
+        """The pass window's start, reaching back to the hook's last slot.
+
+        Whatever the start, it never passes the in-force deployment (a slot
+        from before it belongs to whatever schedule was deployed then) or
+        ``_CATCH_UP_LOOKBACK``.
+        """
+
+        async with self._engine.connect() as conn:
+            last = (
+                await conn.execute(self._last_slot_sql, {"agent_id": target.agent_id, "name": name})
+            ).scalar()
+        start = window_start
+        if isinstance(last, datetime) and last < start:
+            start = last
+        floor = now - _CATCH_UP_LOOKBACK
+        if target.deployed_at is not None:
+            floor = max(floor, target.deployed_at)
+        return max(start, floor)
+
+    async def _skip(
+        self, target: _Target, name: str, slots: list[datetime], summary: CronPassSummary
+    ) -> None:
+        if not slots:
+            return
+        if len(slots) > _MAX_SKIPPED_ROWS:
+            logger.warning(
+                "cron hook %s for agent=%s missed %d slots; recording the newest %d skipped",
+                name,
+                target.agent_name,
+                len(slots),
+                _MAX_SKIPPED_ROWS,
+            )
+            slots = slots[-_MAX_SKIPPED_ROWS:]
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                self._skip_sql,
+                [
+                    {
+                        "id": uuid.uuid4(),
+                        "agent_id": target.agent_id,
+                        "name": name,
+                        "slot": slot,
+                        "version_id": target.version_id,
+                    }
+                    for slot in slots
+                ],
+            )
+        summary.skipped += len(slots)
+
     async def _admit(
         self,
         target: _Target,
@@ -374,6 +550,68 @@ class CronSchedulerLoop:
             summary.blocked += 1
             return
 
+        try:
+            handle = await self._reply_handle(target, trigger)
+        except _UnboundTarget:
+            async with self._engine.begin() as conn:
+                await self._insert(conn, target, name, slot, "failed")
+            summary.failed += 1
+            return
+
+        async with self._engine.begin() as conn:
+            await self._lock(conn, target, name)
+            if await self._blocked_by_in_flight(conn, target, name, slot, now):
+                await self._insert(conn, target, name, slot, "skipped")
+                summary.skipped += 1
+                return
+            run_id = await self._insert(conn, target, name, slot, None)
+        if run_id is None:
+            # Another replica recorded this slot first.
+            summary.lost += 1
+            return
+
+        try:
+            await self._enqueue(target, trigger, handle, slot, run_id)
+        except Exception:
+            summary.failed += 1
+            raise
+        summary.admitted += 1
+
+    async def _lock(self, conn: AsyncConnection, target: _Target, name: str) -> None:
+        await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
+
+    async def _blocked_by_in_flight(
+        self,
+        conn: AsyncConnection,
+        target: _Target,
+        name: str,
+        slot: datetime,
+        now: datetime,
+    ) -> bool:
+        await conn.execute(
+            self._close_stale_sql,
+            {
+                "agent_id": target.agent_id,
+                "name": name,
+                "slot": slot,
+                "cutoff": now - self._stale_after,
+            },
+        )
+        in_flight = (
+            await conn.execute(
+                self._in_flight_sql,
+                {"agent_id": target.agent_id, "name": name, "slot": slot},
+            )
+        ).first()
+        return in_flight is not None
+
+    async def _reply_handle(self, target: _Target, trigger: dict[str, Any]) -> ReplyHandle | None:
+        """The bound route a targeted hook replies on; None for a targetless one.
+
+        Raises ``_UnboundTarget`` when the target matches no single binding.
+        """
+
+        name = str(trigger["name"])
         handle: ReplyHandle | None = None
         address = trigger.get("target")
         if address is not None:
@@ -397,10 +635,7 @@ class CronSchedulerLoop:
                     address,
                     len(bindings),
                 )
-                async with self._engine.begin() as conn:
-                    await self._insert(conn, target, name, slot, "failed")
-                summary.failed += 1
-                return
+                raise _UnboundTarget
             binding = bindings[0]
             handle = ReplyHandle(
                 kind=binding["kind"],
@@ -409,38 +644,26 @@ class CronSchedulerLoop:
                 endpoint=binding["endpoint"],
                 adapter=binding["adapter"],
             )
+        return handle
 
-        async with self._engine.begin() as conn:
-            await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
-            await conn.execute(
-                self._close_stale_sql,
-                {
-                    "agent_id": target.agent_id,
-                    "name": name,
-                    "slot": slot,
-                    "cutoff": now - self._stale_after,
-                },
-            )
-            in_flight = (
-                await conn.execute(
-                    self._in_flight_sql,
-                    {"agent_id": target.agent_id, "name": name, "slot": slot},
-                )
-            ).first()
-            if in_flight is not None:
-                await self._insert(conn, target, name, slot, "skipped")
-                summary.skipped += 1
-                return
-            run_id = await self._insert(conn, target, name, slot, None)
-        if run_id is None:
-            # Another replica recorded this slot first.
-            summary.lost += 1
-            return
-
+    async def _enqueue(
+        self,
+        target: _Target,
+        trigger: dict[str, Any],
+        handle: ReplyHandle | None,
+        slot: datetime,
+        run_id: uuid.UUID,
+        *,
+        retry_expires_at: datetime | None = None,
+    ) -> None:
+        name = str(trigger["name"])
         agent = str(target.agent_id)
         slot_iso = slot.isoformat()
+        event_id = f"cron:{agent}:{name}:{slot_iso}"
+        if retry_expires_at is not None:
+            event_id = retry_event_id(event_id, retry_expires_at)
         turn = QueuedTurn(
-            event_id=f"cron:{agent}:{name}:{slot_iso}",
+            event_id=event_id,
             conversation_id=hook_conversation_id(target.agent_id, name),
             # The author is the platform: no person sent this.
             author=f"cron:{name}",
@@ -455,9 +678,68 @@ class CronSchedulerLoop:
         except Exception:
             async with self._engine.begin() as conn:
                 await conn.execute(self._fail_run_sql, {"id": run_id})
-            summary.failed += 1
             raise
-        summary.admitted += 1
+
+    async def _retry_deferred(
+        self,
+        target: _Target,
+        trigger: dict[str, Any],
+        zone: str,
+        now: datetime,
+        summary: CronPassSummary,
+    ) -> None:
+        """Reopen each deferred slot of this hook, or age it out as skipped."""
+
+        name = str(trigger["name"])
+        schedule = str(trigger["schedule"])
+        async with self._engine.connect() as conn:
+            slots = [
+                row[0]
+                for row in (
+                    await conn.execute(
+                        self._deferred_sql, {"agent_id": target.agent_id, "name": name}
+                    )
+                ).all()
+            ]
+        for slot in slots:
+            key = {"agent_id": target.agent_id, "name": name, "slot": slot}
+            expires_at = slot + catch_up_bound(schedule, zone, slot)
+            if slot_is_stale(schedule, zone, slot, now):
+                async with self._engine.begin() as conn:
+                    await conn.execute(self._settle_deferred_sql, {**key, "outcome": "skipped"})
+                summary.skipped += 1
+                continue
+            if await self._is_killed(target.agent_id) or self._budget_spent(target):
+                async with self._engine.begin() as conn:
+                    await conn.execute(self._settle_deferred_sql, {**key, "outcome": "blocked"})
+                summary.blocked += 1
+                continue
+            try:
+                handle = await self._reply_handle(target, trigger)
+            except _UnboundTarget:
+                async with self._engine.begin() as conn:
+                    await conn.execute(self._settle_deferred_sql, {**key, "outcome": "failed"})
+                summary.failed += 1
+                continue
+            async with self._engine.begin() as conn:
+                await self._lock(conn, target, name)
+                if await self._blocked_by_in_flight(conn, target, name, slot, now):
+                    # Another fire of this hook is live; stay deferred until it
+                    # settles or this slot ages out.
+                    continue
+                row = (await conn.execute(self._reopen_sql, key)).first()
+            if row is None:
+                # Another replica reopened or settled it first.
+                summary.lost += 1
+                continue
+            try:
+                await self._enqueue(
+                    target, trigger, handle, slot, row[0], retry_expires_at=expires_at
+                )
+            except Exception:
+                summary.failed += 1
+                raise
+            summary.retried += 1
 
     async def one_pass(self, now: datetime | None = None) -> CronPassSummary:
         """Schedule every deployed agent's cron triggers for (watermark, now]."""
@@ -484,10 +766,14 @@ class CronSchedulerLoop:
                 if not name or not schedule or not prompt:
                     continue
                 try:
-                    zone = trigger.get("timezone") or "UTC"
-                    slots = resolve_slots(str(schedule), str(zone), window_start, now)
-                    if slots:
-                        await self._admit(target, trigger, slots[-1], now, summary)
+                    zone = str(trigger.get("timezone") or "UTC")
+                    await self._retry_deferred(target, trigger, zone, now, summary)
+                    start = await self._window_start(target, str(name), window_start, now)
+                    due = resolve_slots(str(schedule), zone, start, now)
+                    fire, skipped = plan_catch_up(str(schedule), zone, due, now)
+                    await self._skip(target, str(name), skipped, summary)
+                    if fire is not None:
+                        await self._admit(target, trigger, fire, now, summary)
                 except Exception:
                     # Ends with this hook. The agent's other hooks, and every
                     # later agent, still run: the order is arbitrary.
@@ -498,10 +784,15 @@ class CronSchedulerLoop:
                         target.agent_name,
                     )
 
-        log = logger.info if summary.did_work else logger.debug
+        # A pass that only lost a slot race to another replica did no work,
+        # but it is the one signal that replicas are contending for slots, so
+        # it must stay visible at INFO (#3013). A pass where nothing happened
+        # stays at DEBUG.
+        log = logger.info if (summary.did_work or summary.lost) else logger.debug
         log(
-            "cron pass: %d admitted, %d blocked, %d skipped, %d failed, %d lost",
+            "cron pass: %d admitted, %d retried, %d blocked, %d skipped, %d failed, %d lost",
             summary.admitted,
+            summary.retried,
             summary.blocked,
             summary.skipped,
             summary.failed,
