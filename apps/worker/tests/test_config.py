@@ -1516,6 +1516,19 @@ def test_the_caller_signing_key_is_unset_by_default(monkeypatch: pytest.MonkeyPa
     assert WorkerConfig().connector_caller_signing_key == ""
 
 
+def test_a_whitespace_only_signing_key_counts_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A Secret mounted as a file can end up all-newline (an empty value plus
+    # the trailing newline `echo` adds). The boot check strips before judging
+    # "is anything configured at all", so this constructs cleanly rather than
+    # tripping ``CallerSigningKeyError`` -- the same ``.strip()`` gate minting
+    # uses (Task 5), so the two agree on what "unset" means.
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", "\n")
+    assert WorkerConfig().connector_caller_signing_key == "\n"
+
+
 def test_the_caller_signing_key_reads_only_its_curie_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1549,3 +1562,28 @@ def test_the_caller_signing_key_stays_out_of_the_config_repr() -> None:
     config = WorkerConfig(connector_caller_signing_key=seed)
     assert config.connector_caller_signing_key == seed
     assert seed not in repr(config)
+
+
+def test_an_unrelated_validation_error_does_not_print_the_signing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A field-level failure only ever carries its OWN raw value, but a
+    # model-level ``@model_validator(mode="after")`` failure -- like the
+    # dead-letter-equals-stream guard below -- is handed pydantic's whole raw
+    # settings input as its error's context. With a valid signing key ALSO
+    # set, that context includes the key, and pydantic's default `str()`
+    # rendering prints it via `input_value=...`. `hide_input_in_errors`
+    # suppresses that clause from `str()`/`repr()` unconditionally, which is
+    # the only rendering anything in the worker actually prints today.
+    _clear_all_config_env(monkeypatch)
+    seed = _caller_seed()
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", seed)
+    monkeypatch.setenv("CURIE_STREAM", "runs")
+    monkeypatch.setenv("CURIE_DEAD_LETTER_STREAM", "runs")
+
+    with pytest.raises(ValidationError) as refused:
+        WorkerConfig()
+
+    assert "CURIE_DEAD_LETTER_STREAM" in str(refused.value)
+    assert "input_value" not in str(refused.value)
+    assert seed not in str(refused.value)

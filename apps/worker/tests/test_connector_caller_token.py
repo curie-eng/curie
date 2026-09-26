@@ -92,3 +92,23 @@ def test_surrounding_whitespace_in_a_mounted_key_is_ignored() -> None:
     assert caller_token.mint(seed + "\n", agent="acme-dev", exp=1790000000) == _vectors()[0][
         "minted"
     ]
+
+
+def test_a_damaged_key_that_would_repair_into_a_different_key_is_refused() -> None:
+    # Without `validate=True`, `base64.b64decode` silently discards any
+    # character outside the base64 alphabet instead of refusing the input. A
+    # Secret damaged in transit could then "repair" into a 32-byte seed that
+    # decodes cleanly -- just not the one anybody wrote down. This seed's
+    # first character is replaced with `-` (not base64) and a different,
+    # still-valid character is inserted right after; dropping the `-` and
+    # keeping that character still decodes to 32 bytes, but to different
+    # bytes than the original seed (a base64 symbol is a bijection onto its
+    # 6 bits, so swapping the leading symbol always changes the decode).
+    original = base64.b64encode(bytes(SigningKey.generate())).decode()
+    replacement = "A" if original[0] != "A" else "B"
+    damaged = "-" + replacement + original[1:]
+    assert len(base64.b64decode(damaged, validate=False)) == 32
+    assert base64.b64decode(damaged, validate=False) != base64.b64decode(original)
+
+    with pytest.raises(ValueError):
+        caller_token.signing_key(damaged)

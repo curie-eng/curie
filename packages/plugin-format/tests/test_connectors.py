@@ -963,9 +963,13 @@ def test_a_build_form_connector_carries_admits_too() -> None:
     )
 
 
-def test_admits_on_a_remote_connector_is_refused() -> None:
+@pytest.mark.parametrize("admits", [["acme-dev"], []])
+def test_admits_on_a_remote_connector_is_refused(admits: list[str]) -> None:
+    # An empty list is still an explicit ``admits:`` on a ``url`` connector, so
+    # it must be refused the same as a populated one -- a guard written as
+    # ``spec.admits and spec.url`` would miss it, because ``[]`` is falsy.
     assert _codes(
-        {"connectors": {"internal": {"url": "https://mcp.example.com/mcp", "admits": ["acme-dev"]}}}
+        {"connectors": {"internal": {"url": "https://mcp.example.com/mcp", "admits": admits}}}
     ) == ["connectors.remote_has_admits"]
 
 
