@@ -256,8 +256,8 @@ def test_released_upgrade_does_not_select_unrelated_paths(
 
 
 def _repo_root_references(script: str) -> list[str]:
-    references = re.findall(r"\$\{?REPO_ROOT\}?/([\w.][\w./-]*)", script)
-    return sorted({reference.rstrip("./") for reference in references})
+    references = re.findall(r"\$\{?REPO_ROOT\}?\"?/([\w.][\w./-]*)", script)
+    return sorted({reference.rstrip("/") for reference in references})
 
 
 def _git_ignored(path: str) -> bool:
@@ -383,6 +383,14 @@ def test_matrix_input_guard_names_each_read_the_registry_drops(tmp_path: Path) -
         (
             'DIR="${REPO_ROOT}/cli/scripts"\n',
             ["cli/scripts: unlisted directory"],
+        ),
+        (
+            'BIN="$REPO_ROOT"/cli/src/main.rs\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            'CHARTS="$REPO_ROOT/charts/curie/.."\n',
+            ["charts/curie/..: unlisted directory"],
         ),
         (
             'HELPER="$REPO_ROOT/cli/scripts/no-such-helper.py"\n',
