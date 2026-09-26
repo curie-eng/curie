@@ -55,10 +55,17 @@ Fix pin: <supported selector>
 
      REQUIRED when this pull request closes an issue labeled `bug` (a GitHub
      closing keyword plus a same-repo #N): CI fails without a Fix pin line. If
-     there is no selector to declare (a revert, a docs-only fix, or a bug
-     closed by deletion), use the escape hatch instead, with a non-empty
-     reason:
+     there is no selector to declare (a revert, a docs-only fix, a change
+     that touches only test files, or a bug closed by deletion), use the
+     escape hatch instead, with a non-empty reason:
 Fix pin: n/a - <reason>
+
+     A selector can never be declared for a change that touches only test
+     files: the verifier proves a pin by reversing changed product files,
+     refuses a diff with no product file to reverse, and fails the check
+     before any test runs. Such a change must use the escape hatch above
+     (the retry fix for #1922 declared a selector anyway and spent a CI
+     round on this refusal).
 
      The pin's tier is derived from the selector's location, not from prose:
      unit tests, cli/tests/local/test_*.py (local), charts/curie/ci/* (cluster
