@@ -622,7 +622,7 @@ def _agent_row(name: str) -> str:
             async with sessionmaker() as session:
                 agent = Agent(
                     name=name,
-                    channels=[AgentChannel(kind="slack", address="C0EXAMPLE4")],
+                    channels=[AgentChannel(kind="slack", address="C0EXAMPLE4", adapter="default")],
                 )
                 session.add(agent)
                 await session.commit()

@@ -115,13 +115,9 @@ def test_channel_ingress_resolves_a_non_slack_binding_end_to_end(
     clean_db: None,
 ) -> None:
     """Drives the REAL ingress (`POST /channels/turns`) for a non-Slack
-    binding: every other ingress test here names a Slack address, whose
-    custom-transport fallback in `crud.matching_bindings` can mask a
-    positional argument mix-up at
-    `_resolve_binding`'s call site (`_resolve_binding(session, body.kind,
-    None, body.address)`) -- swap `adapter` and `address` there and a Slack
-    test can still pass by falling back to the endpoint-carrying row, while a
-    non-Slack pair, which has no such fallback, resolves to nothing and 404s.
+    binding, whose route is resolved from its token's claim: every other
+    ingress test here names a Slack address, so this is the one that proves
+    the adapter-bearing row itself reaches the minted turn.
     """
 
     address = f"ingress-identity-{uuid.uuid4().hex[:8]}@example.test"
@@ -312,15 +308,9 @@ def test_review_revision_accepts_an_omitted_reply_adapter(
 def test_approval_recovery_does_not_list_slack_among_adapter_backed_kinds(
     client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """A Slack row's `adapter` is stored as NULL (the default identity,
-    ADR-0168 decision 3; `route_identity`), so a bare Slack row must NOT read
-    as adapter-authenticated egress. The fix in `_binding_facts` is defensive
-    rather than a live-bug fix: `agent_channels_route_pair_ck` (0024) makes
-    "adapter set, no endpoint" unstorable for ANY kind, so the only Slack row
-    this installation can ever store with a truthy `adapter` is the pre-ADR
-    custom-transport form, WITH an endpoint -- and that form's adapter IS a
-    real egress credential, so it must stay in the set. Both reachable shapes
-    are tested.
+    """A Slack row's `adapter` is its identity (`'default'` here, ADR-0168
+    decision 3), never an egress credential, so a Slack binding must NOT read
+    as adapter-authenticated egress however truthy its adapter is.
     """
 
     default_identity = client.post(
@@ -333,22 +323,6 @@ def test_approval_recovery_does_not_list_slack_among_adapter_backed_kinds(
     )
     assert default_identity.status_code == 201, default_identity.text
     default_agent_id = default_identity.json()["id"]
-
-    custom_transport = client.post(
-        "/agents",
-        json={
-            "name": f"recovery-identity-custom-{uuid.uuid4().hex[:8]}",
-            "channel": {
-                "kind": "slack",
-                "address": "C0EXAMPLE2",
-                "endpoint": "http://127.0.0.1:1",
-                "adapter": "proof-offline",
-            },
-        },
-        headers=auth_headers,
-    )
-    assert custom_transport.status_code == 201, custom_transport.text
-    custom_agent_id = custom_transport.json()["id"]
 
     async def read_adapter_kinds(agent_id: str) -> set[str]:
         engine = create_async_engine(get_settings().database_url)
@@ -363,7 +337,6 @@ def test_approval_recovery_does_not_list_slack_among_adapter_backed_kinds(
             await engine.dispose()
 
     assert "slack" not in asyncio.run(read_adapter_kinds(default_agent_id))
-    assert "slack" in asyncio.run(read_adapter_kinds(custom_agent_id))
 
 
 # --------------------------------------------------------------------------

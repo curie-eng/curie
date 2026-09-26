@@ -441,10 +441,17 @@ async def _seed_binding(
         )
         await session.execute(
             text(
-                "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
-                "VALUES (:id, :agent, :kind, :addr)"
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                "VALUES (:id, :agent, :kind, :addr, :adapter)"
             ),
-            {"id": uuid.uuid4(), "agent": agent_id, "kind": kind, "addr": address},
+            {
+                "id": uuid.uuid4(),
+                "agent": agent_id,
+                "kind": kind,
+                "addr": address,
+                # A Slack row names its identity (migration 0061).
+                "adapter": "default" if kind == "slack" else None,
+            },
         )
         await session.commit()
     return agent_id

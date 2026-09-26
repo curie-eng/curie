@@ -256,7 +256,9 @@ def test_the_downgrade_refuses_a_non_slack_binding(
     command.upgrade(cfg, "head")
 
     _sql(
-        "UPDATE curie.agent_channels SET kind = :kind, address = :addr "
+        # Route-less, as any other kind may be: a Slack row's identity is no
+        # route for it (migration 0061's agent_channels_route_ck).
+        "UPDATE curie.agent_channels SET kind = :kind, address = :addr, adapter = NULL "
         "WHERE agent_id = :id",
         {"kind": kind, "addr": "acme-room-7", "id": agent_id},
     )

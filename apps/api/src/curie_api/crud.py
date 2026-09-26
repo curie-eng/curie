@@ -341,10 +341,8 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
 async def lock_agent_bindings(session: AsyncSession, agent_id: uuid.UUID) -> list[AgentChannel]:
     """`SELECT ... FOR UPDATE` the agent's WHOLE binding set, in route order.
 
-    Ordered by the route `(kind, adapter, address)` (ADR-0168 decision 3), so
-    the lock order stays total if several identities ever share a pair.
-    `Agent.channels` reads `(kind, address)`; the two orders agree while
-    migration 0023's `agent_channels_kind_address_key` holds one row per pair.
+    Ordered by the whole route `(kind, adapter, address)` (ADR-0168 decision
+    3), so the lock order stays total when several identities share a pair.
 
     Every mutating binding handler opens with this, and then picks its target
     out of the returned list rather than issuing a second, unlocked query --
@@ -501,8 +499,7 @@ async def update_channel_binding(
 
     Mutated IN PLACE rather than replaced: assigning a fresh row would make the
     insert of the replacement race the delete of the original inside one flush,
-    tripping `agent_channels_kind_address_key` on a move that is perfectly
-    legal.
+    tripping `agent_channels_route_key` on a move that is perfectly legal.
 
     That in-place mutation is exactly why `generation` exists (ADR-0096 D5): the
     row id is a stable identity, so a credential minted against this binding
