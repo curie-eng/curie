@@ -29,6 +29,7 @@ from curie_worker.publication_store import (
     PublicationStoreError,
 )
 from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
+from curie_worker.slack_sink import UnconfiguredSlackIdentityError
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -987,6 +988,34 @@ async def test_publication_card_transport_value_error_is_not_permanent(
 
     assert store.card_delivery_permanent == [False]
     assert store.completed == {}
+
+
+async def test_untokened_identity_card_delivery_retries_rather_than_dead_letters(
+    publication: Any,
+) -> None:
+    """final-review.md finding 3: a card addressed to an identity this worker
+    holds no bot token for is a retryable gap, not a dead letter.
+
+    ``UnconfiguredSlackIdentityError`` is not an ``InvalidReplyTargetError``,
+    so it falls through the generic ``except`` below like the transport
+    ``ValueError`` above: ``permanent`` stays False and the durable
+    ``reconcile_attempts`` counter, not this one call, decides when the
+    publication finally gives up.
+    """
+    loop, store, _, _, _, _ = _loop(publication, _Cards())
+    loop._replies = build_reply_sink(WorkerConfig(slack_bot_token=""))
+    work = _card_work()
+    work.route = TargetRoute(endpoint=None, adapter="ghost")
+    store.card_pending = work
+
+    with pytest.raises(UnconfiguredSlackIdentityError):
+        await loop.deliver_pending_card()
+
+    assert store.card_delivery_permanent == [False]
+    assert store.completed == {}
+    assert len(store.card_delivery_retries) == 1
+    _, error = store.card_delivery_retries[0]
+    assert "ghost" in error
 
 
 async def test_cluster_message_card_relay_outage_is_a_bounded_retry(
