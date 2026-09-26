@@ -208,6 +208,123 @@ test "$(cat "$HOME/audit")" = example-id
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_rearm_receives_the_scale_id_across_row_subshells(self):
+        # run_assertion runs each row in a subshell, so a plain variable set by
+        # the scale row never reached the re-arm row (#3207).
+        result = self.run_function(
+            """
+evidence_dir="$HOME"
+OBSERVATION_FAILURES=0
+wait_replicas() { :; }
+drive_gated_turn() { case "$3" in approve) printf first-id ;; reject) printf second-id ;; esac; }
+run_assertion scale assert_scale
+run_assertion rearm assert_rearm
+test "$OBSERVATION_FAILURES" = 0
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("rearm: PASS", result.stderr)
+
+    def test_rearm_still_rejects_a_reused_scale_id(self):
+        result = self.run_function(
+            """
+evidence_dir="$HOME"
+OBSERVATION_FAILURES=0
+wait_replicas() { :; }
+drive_gated_turn() { printf same-id; }
+run_assertion scale assert_scale
+run_assertion rearm assert_rearm
+"""
+        )
+        self.assertIn("rearm: FAILED", result.stderr)
+
+    def test_operator_audit_forwards_the_api_service_http_port(self):
+        # The chart serves curie-api on a named http port (8000); a hardcoded
+        # 80 made kubectl port-forward exit before every audit check (#3207).
+        result = self.run_function(
+            """
+mkdir -p "$HOME/bin"
+cat > "$HOME/bin/kubectl" <<'SHIM'
+#!/bin/sh
+case "$*" in
+  *"get svc"*) printf 8000 ;;
+  *port-forward*) printf '%s\\n' "$*" > "$HOME/forward"; exit 1 ;;
+esac
+SHIM
+chmod +x "$HOME/bin/kubectl"
+PATH="$HOME/bin:$PATH"
+discover_release_secret() { echo curie-secrets; }
+assert_operator_audit example-id || true
+grep -q -- 'svc/curie-api [0-9]*:8000$' "$HOME/forward"
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_turn_that_exits_without_an_approval_stops_the_wait(self):
+        result = self.run_function(
+            """
+pending_for_tool() { return 1; }
+sleep 0 & TURN_PID=$!
+wait "$TURN_PID"
+SECONDS=0
+status=0
+wait_pending_tool mcp__kubernetes__resources_scale 60 || status=$?
+test "$status" = 4 && test "$SECONDS" -lt 10
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_gated_turn_retries_once_only_when_no_approval_appeared(self):
+        result = self.run_function(
+            """
+evidence_dir="$HOME"
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+cat > "$HOME/fake-curie" <<'SHIM'
+#!/bin/sh
+echo x >> "$HOME/turns"
+echo '{"finalized":true,"reply":"provider error"}'
+SHIM
+chmod +x "$HOME/fake-curie"
+wait_pending_tool() { sleep 0.2; return 4; }
+drive_gated_turn "scale it" mcp__kubernetes__resources_scale approve && exit 9
+test "$(wc -l < "$HOME/turns")" -eq 2
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_gated_turn_is_not_retried_unless_the_first_turn_finalized(self):
+        # An exited CLI may have enqueued a turn that can still request approval.
+        result = self.run_function(
+            """
+evidence_dir="$HOME"
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+cat > "$HOME/fake-curie" <<'SHIM'
+#!/bin/sh
+echo x >> "$HOME/turns"
+echo '{"status":"enqueued"}'
+SHIM
+chmod +x "$HOME/fake-curie"
+wait_pending_tool() { sleep 0.2; return 4; }
+drive_gated_turn "scale it" mcp__kubernetes__resources_scale approve && exit 9
+test "$(wc -l < "$HOME/turns")" -eq 1
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_gated_turn_is_not_retried_after_a_pending_wait_timeout(self):
+        result = self.run_function(
+            """
+evidence_dir="$HOME"
+curie_bin() { printf '%s' "$HOME/fake-curie"; }
+printf '#!/bin/sh\\necho x >> "$HOME/turns"\\n' > "$HOME/fake-curie"
+chmod +x "$HOME/fake-curie"
+wait_pending_tool() { sleep 0.2; return 1; }
+drive_gated_turn "scale it" mcp__kubernetes__resources_scale approve && exit 9
+test "$(wc -l < "$HOME/turns")" -eq 1
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_cluster_turn_invokes_cluster_message(self):
         result = self.run_function(
             """
@@ -420,6 +537,18 @@ class MCPOutcomes(unittest.TestCase):
 
         self.assertEqual(
             self.probe(forbidden=MCPError(-32602, "unknown tool: configuration_view"))["catalog"],
+            "pass",
+        )
+
+    def test_pinned_server_quoted_unknown_tool_error_is_a_refusal(self):
+        from mcp.shared.exceptions import MCPError
+
+        # Observed from the pinned kubernetes-mcp-server digest on kind (#3207):
+        # tools/call configuration_view -> -32602 'unknown tool "configuration_view"'.
+        self.assertEqual(
+            self.probe(forbidden=MCPError(-32602, 'unknown tool "configuration_view"'))[
+                "forbidden_invocation"
+            ],
             "pass",
         )
 
