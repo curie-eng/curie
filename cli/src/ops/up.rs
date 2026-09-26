@@ -700,7 +700,82 @@ fn resolve_preserved_values(
     let mut all = resolve_comms_values(existing, operator_sets);
     all.extend(resolve_github_app_values(existing, operator_sets));
     all.extend(resolve_preserved_sealing_values(existing, operator_sets));
+    all.extend(resolve_credential_values(
+        existing,
+        operator_sets,
+        crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS,
+    ));
     all
+}
+
+/// What `cluster up` does with the connector caller key pair (ADR-0168
+/// decision 7), decided as the sealing key's is: an operator `--set` or a
+/// named Secret wins, a recorded pair comes back unchanged, and only a release
+/// with none gains one. `--dev` mints none, as it mints no sealing key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallerKeyDisposition {
+    OperatorSet,
+    External,
+    Preserved,
+    Deferred,
+    Generated,
+}
+
+fn connector_caller_key_disposition(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> CallerKeyDisposition {
+    use crate::connector_caller::{
+        CONNECTOR_CALLER_EXISTING_SECRET, CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY,
+    };
+    let set = operator_set_keys(operator_sets);
+    if set.contains(CONNECTOR_CALLER_SIGNING_KEY) || set.contains(CONNECTOR_CALLER_VERIFY_KEY) {
+        return CallerKeyDisposition::OperatorSet;
+    }
+    let named = operator_set_entries(operator_sets)
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key.trim() == CONNECTOR_CALLER_EXISTING_SECRET)
+        .map(|(_, value)| !value.is_empty())
+        .unwrap_or_else(|| preserved_value(existing, CONNECTOR_CALLER_EXISTING_SECRET).is_some());
+    if named {
+        return CallerKeyDisposition::External;
+    }
+    if preserved_value(existing, CONNECTOR_CALLER_SIGNING_KEY).is_some() {
+        return CallerKeyDisposition::Preserved;
+    }
+    if dry_run {
+        CallerKeyDisposition::Deferred
+    } else {
+        CallerKeyDisposition::Generated
+    }
+}
+
+/// The connector caller key pair to add to the values file: a new pair only
+/// when the release records none, names no Secret, and the operator set none.
+/// A recorded pair already rides [`resolve_preserved_values`].
+fn generate_connector_caller_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> Result<Vec<(String, String)>> {
+    if connector_caller_key_disposition(existing, operator_sets, dry_run)
+        != CallerKeyDisposition::Generated
+    {
+        return Ok(Vec::new());
+    }
+    let pair = crate::connector_caller::generate_keypair()?;
+    Ok(vec![
+        (
+            crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY.to_string(),
+            pair.signing_key,
+        ),
+        (
+            crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY.to_string(),
+            pair.verify_key,
+        ),
+    ])
 }
 
 /// Resolve managed values for an actual or previewed `cluster up`.
@@ -1438,6 +1513,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS.contains(&key)
         || MODEL_CREDENTIAL_REFERENCE_KEYS.contains(&key)
         || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
@@ -2100,6 +2176,11 @@ fn complete_up_opts_without_runner_egress(
             &operator_sets,
             opts.common.dry_run,
         ));
+        opts.secrets.extend(generate_connector_caller_values(
+            existing,
+            &operator_sets,
+            opts.common.dry_run,
+        )?);
     } else {
         // `--dev` keeps the chart's published credential defaults (#195) and
         // must not mint a sealing key, but it is still a FULL helm upgrade:
@@ -2175,6 +2256,7 @@ fn overlay_overridden_keys(
         .iter()
         .chain(GITHUB_APP_MANAGED_KEYS)
         .chain(crate::sealing::SEALING_MANAGED_KEYS)
+        .chain(crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS)
         .chain(MODEL_CREDENTIAL_REFERENCE_KEYS)
         .chain(GITHUB_TOKEN_REFERENCE_KEYS)
     {
@@ -2239,6 +2321,9 @@ fn overlay_family_is_managed(key: &str) -> bool {
             .iter()
             .any(|(managed, _)| key_is_or_descends_from(key, managed))
         || crate::sealing::SEALING_MANAGED_KEYS
+            .iter()
+            .any(|managed| key_is_or_descends_from(key, managed))
+        || crate::connector_caller::CONNECTOR_CALLER_MANAGED_KEYS
             .iter()
             .any(|managed| key_is_or_descends_from(key, managed))
         || key_is_or_descends_from(key, GITHUB_TOKEN_KEY)
@@ -4229,6 +4314,11 @@ async fn run_prepared_up(
             SealingPrivateKeyDisposition::OperatorSet
             | SealingPrivateKeyDisposition::Preserved
             | SealingPrivateKeyDisposition::External => {}
+        }
+        if connector_caller_key_disposition(existing.as_ref(), &operator_sets, opts.common.dry_run)
+            == CallerKeyDisposition::Generated
+        {
+            ui.note("generated a connector caller key pair for this release; later cluster up runs preserve it");
         }
         if existing.is_none() && !opts.common.dry_run {
             let generated_required_secrets = opts

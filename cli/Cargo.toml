@@ -79,6 +79,10 @@ jsonschema = { version = "0.56", default-features = false }
 serde_norway = "0.9.42"
 crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"
+# The connector caller key pair `cluster up` generates (ADR-0168 decision 7):
+# Ed25519, the primitive the worker signs with. No default features, which
+# keeps the lock to this crate and `ed25519`; nothing here parses PKCS#8.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "zeroize"] }
 # GitHub App auth signs a JWT with RS256 (`github_app::sign_app_jwt`), which
 # GitHub requires, so RSA is not optional here. The backend is: `rust_crypto`
 # pulls the pure-Rust `rsa` crate, which carries RUSTSEC-2023-0071 (Marvin
