@@ -323,6 +323,15 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.sealing.previousPrivateKeyExistingSecret "existingSecretKey" .Values.sealing.previousPrivateKeyExistingSecretKey "defaultKey" "sealingPreviousPrivateKey") | nindent 18 }}
+            {{- if .Values.connectorCaller.existingSecret }}
+            # The connector caller signing key (ADR-0168 decision 7). Only the
+            # worker signs, so only the worker holds it.
+            - name: CURIE_CONNECTOR_CALLER_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.connectorCaller.existingSecret | quote }}
+                  key: {{ .Values.connectorCaller.signingKeyKey | quote }}
+            {{- end }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE

@@ -21,6 +21,15 @@ pub const CLUSTER_SECRET_PLACEHOLDER: &str = "secretKeyRef";
 
 /// Chart agent names match templates/agent-sandbox.yaml.
 fn validate_agent_resource_name(agent: &str) -> Result<()> {
+    // `self` is reserved for `admits` (ADR-0168 decision 7), where it means
+    // the agent this bundle is deployed as. A real agent named `self` would
+    // be indistinguishable from that sentinel wherever `admits` is resolved.
+    if agent == "self" {
+        bail!(
+            "agent name \"self\" is not valid -- it is reserved for `admits`, where it means \
+             the agent this bundle is deployed as"
+        );
+    }
     let valid = agent.len() <= 40
         && agent
             .chars()
@@ -414,6 +423,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Not_A_DNS"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_name_self_is_rejected_as_reserved() {
+        // `self` is well-formed RFC 1123, so only a dedicated check catches
+        // it. `admits:` reads `self` as the sentinel for "the deploying
+        // agent"; a real agent named `self` would be indistinguishable from
+        // it wherever `admits` is resolved.
+        let err = helm_secret_pairs("self", &secrets())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("self"), "{err}");
+        assert!(err.contains("admits"), "{err}");
     }
 
     #[test]

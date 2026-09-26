@@ -11,6 +11,7 @@ worker:
   CURIE_ATTACHMENT_RETENTION_TTL_SECONDS: worker.attachments.retentionTtlSeconds
   CURIE_CLAIM_TIMEOUT_SECONDS: worker.claimTimeoutSeconds
   CURIE_CONNECTOR_APP_NAME: nameOverride
+  CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.existingSecret
   CURIE_CONNECTOR_RECONCILE: worker.connectorReconciler.enabled
   CURIE_CONNECTOR_RECONCILE_INTERVAL_S: worker.connectorReconciler.intervalSeconds
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret

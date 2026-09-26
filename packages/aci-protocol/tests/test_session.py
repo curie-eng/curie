@@ -184,6 +184,7 @@ def _full_boot_env() -> BootEnv:
         connector_release="curie",
         connector_agent="acme-dev",
         connector_namespace="curie-prod",
+        connector_caller_token="cct.full-payload.full-signature",
         port=9090,
         base_url="http://litellm:4000",
         api_backend="messages",
@@ -548,6 +549,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         connector_release="curie",
         connector_agent="acme-dev",
         connector_namespace="curie",
+        connector_caller_token="cct.payload.signature",
         bundle_version="abc123def456",
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
@@ -791,6 +793,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_CONNECTOR_RELEASE",
         "CURIE_CONNECTOR_AGENT",
         "CURIE_CONNECTOR_NAMESPACE",
+        "CURIE_CONNECTOR_CALLER_TOKEN",
         "CURIE_RUNNER_PORT",
         "ANTHROPIC_BASE_URL",
         "CURIE_MODEL_API_BACKEND",
@@ -976,3 +979,42 @@ def test_connector_scope_is_absent_by_default() -> None:
     # Absent is meaningful, not degraded: the skill tier hosts nothing, so there
     # is no Service to derive a URL from.
     assert not [k for k in _worker_env() if k.startswith("CURIE_CONNECTOR_")]
+
+
+# --- The connector caller token (ADR-0168 decision 7). ----------------------
+
+_SCOPE = {
+    "connector_release": "curie",
+    "connector_agent": "acme-dev",
+    "connector_namespace": "curie-prod",
+}
+
+
+def test_the_caller_token_rides_with_the_connector_scope() -> None:
+    # Only a scoped boot mounts hosted connectors, and the token is addressed
+    # to them alone. Without the scope there is nothing to present it to.
+    scoped = _worker_env(**_SCOPE, connector_caller_token="cct.payload.signature")
+    assert scoped["CURIE_CONNECTOR_CALLER_TOKEN"] == "cct.payload.signature"
+
+    unscoped = _worker_env(connector_caller_token="cct.payload.signature")
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in unscoped
+
+
+@pytest.mark.parametrize("token", [None, ""])
+def test_no_caller_token_is_rendered_when_none_was_minted(token: str | None) -> None:
+    # An install with no signing key mints nothing, and its boot env is the
+    # one it had before the key existed.
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in _worker_env(
+        **_SCOPE, connector_caller_token=token
+    )
+
+
+def test_the_caller_token_survives_the_worker_render_and_the_consumer_parse() -> None:
+    boot = BootEnv.from_env(
+        _worker_env(**_SCOPE, connector_caller_token="cct.payload.signature") | _SUBSTRATE_ENV
+    )
+    assert boot.connector_caller_token == "cct.payload.signature"
+
+
+def test_the_caller_token_has_one_producer_the_worker() -> None:
+    assert _producers_of("CURIE_CONNECTOR_CALLER_TOKEN") == {"worker"}

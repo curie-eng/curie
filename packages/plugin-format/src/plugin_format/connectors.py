@@ -55,6 +55,11 @@ CONNECTORS_FILE = "connectors.yaml"
 # ending alphanumeric. Rejecting here beats a confusing apply-time failure.
 _NAME_MAX = 40
 
+# The reserved `admits` entry naming the agent the bundle is deployed as, so a
+# bundle admits its own agent without naming it and stays portable across
+# deploy targets (ADR-0168 decision 7).
+ADMITS_SELF = "self"
+
 
 class SecretRef(BaseModel):
     """A credential that already exists in the cluster (#1163).
@@ -145,6 +150,13 @@ class ConnectorSpec(BaseModel):
     # same expansion `.mcp.json` has always used -- so the value can be supplied
     # per machine with `--secret`, and the bundle stays safe to commit.
     unhosted_url: str | None = None
+
+    # The agents whose sandboxes may call this connector (ADR-0168 decision 7).
+    # None admits the deploying agent alone, the same as `[self]`, and `[]`
+    # admits no agent. A list is exact: it does not add the deploying agent, so
+    # a bundle that lists other agents and wants its own agent in lists
+    # `self` too. Entries are carried as written; nothing resolves `self` here.
+    admits: list[str] | None = None
 
     # -- remote form --
     url: str | None = None
@@ -622,6 +634,40 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "connector with `env` and `args` instead",
                 )
             )
+        if spec.admits is not None and spec.url is not None:
+            errors.append(
+                (
+                    "connectors.remote_has_admits",
+                    f"{where}: `admits` lists the agents Curie lets reach a connector it "
+                    "hosts; a `url` connector is reached wherever it already runs, so "
+                    "the list would refuse nobody",
+                )
+            )
+        # The agent-name rule is deploy.yaml's (`deploy_targets._NAME_RE`), which
+        # is this module's pattern and cap. deploy_targets imports this module,
+        # so the rule cannot be imported back; a test pins the two equal.
+        seen_admitted: set[str] = set()
+        for admitted in spec.admits or []:
+            if admitted in seen_admitted:
+                continue
+            seen_admitted.add(admitted)
+            if admitted != ADMITS_SELF and not _is_valid_name(admitted):
+                errors.append(
+                    (
+                        "connectors.bad_admits_agent",
+                        f"{where}: admits lists `{admitted}`, which is neither "
+                        f"`{ADMITS_SELF}` nor an agent name: an agent name must be "
+                        "lowercase alphanumeric or dashes, start and end alphanumeric, "
+                        f"and be at most {_NAME_MAX} characters",
+                    )
+                )
+            elif spec.admits is not None and spec.admits.count(admitted) > 1:
+                errors.append(
+                    (
+                        "connectors.duplicate_admits",
+                        f"{where}: admits lists `{admitted}` more than once",
+                    )
+                )
         for declared in spec.secrets:
             if isinstance(declared, str):
                 continue

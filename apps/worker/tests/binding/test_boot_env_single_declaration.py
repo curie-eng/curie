@@ -211,6 +211,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runs agent-authored code.
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        # The connector caller signing key (ADR-0168 decision 7), read from the
+        # WORKER's env by WorkerConfig to sign CURIE_CONNECTOR_CALLER_TOKEN, which
+        # IS a declared boot key. The key itself never enters a sandbox: holding
+        # it, agent-authored code could mint a token naming any agent.
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
         "CURIE_EVAL_CONSUMER_GROUP",
         "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
         "CURIE_EVAL_STREAM",

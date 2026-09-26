@@ -109,6 +109,7 @@ def test_create_claim_excludes_host_credentials_from_child_env(
         "CURIE_ADAPTER_CREDENTIALS",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+        "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
     }
     for name in denied_names:
         monkeypatch.setenv(name, "placeholder")
@@ -128,6 +129,23 @@ def test_create_claim_excludes_host_credentials_from_child_env(
     assert denied_names.isdisjoint(child_env_names)
     assert "CURIE_BUDGET" in child_env_names
     assert "CURIE_CREDENTIALS" in child_env_names
+
+
+def test_create_claim_forwards_the_caller_token_and_never_its_signing_key() -> None:
+    # ADR-0168 decision 7: the same split as the claim CR, on the substrate
+    # that forwards env by value.
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-caller",
+        pool="pool",
+        env={
+            "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+            "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder",
+        },
+    )
+    forwarded = _flag_values(client.calls[0], "-e")
+    assert "CURIE_CONNECTOR_CALLER_TOKEN=cct.payload.signature" in forwarded
+    assert not [e for e in forwarded if e.startswith("CURIE_CONNECTOR_CALLER_SIGNING_KEY=")]
 
 
 def test_create_claim_preserves_declared_connector_secret() -> None:

@@ -349,6 +349,22 @@
           ],
           "title": "Connector Agent"
         },
+        "connector_caller_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CONNECTOR_CALLER_TOKEN",
+          "producer": [
+            "worker"
+          ],
+          "title": "Connector Caller Token"
+        },
         "connector_namespace": {
           "anyOf": [
             {
@@ -1643,6 +1659,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.2",
-  "title": "ACI Protocol v0.5.2"
+  "protocolVersion": "0.5.3",
+  "title": "ACI Protocol v0.5.3"
 }
