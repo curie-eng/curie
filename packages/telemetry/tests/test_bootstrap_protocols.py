@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 from curie_telemetry import bootstrap as bootstrap_module
+from opentelemetry.sdk.metrics._internal.instrument import Counter, Histogram
+from opentelemetry.sdk.metrics.export import AggregationTemporality
 
 
 class _ExporterProbe:
@@ -145,3 +147,50 @@ def test_malformed_header_diagnostic_never_echoes_credential(
     assert headers is None
     assert "ignored malformed OTLP exporter header entry" in caplog.text
     assert credential not in caplog.text
+
+
+@pytest.mark.parametrize("protocol", ("grpc", "http/protobuf"))
+@pytest.mark.parametrize(
+    ("preference", "expected_temporality"),
+    (
+        ("delta", AggregationTemporality.DELTA),
+        ("cumulative", AggregationTemporality.CUMULATIVE),
+    ),
+)
+def test_metric_exporter_uses_temporality_from_passed_environment(
+    protocol: str,
+    preference: str,
+    expected_temporality: AggregationTemporality,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grpc_instances: list[_ExporterProbe] = []
+    http_instances: list[_ExporterProbe] = []
+
+    def grpc_exporter(**kwargs: Any) -> _ExporterProbe:
+        instance = _ExporterProbe(**kwargs)
+        grpc_instances.append(instance)
+        return instance
+
+    def http_exporter(**kwargs: Any) -> _ExporterProbe:
+        instance = _ExporterProbe(**kwargs)
+        http_instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(bootstrap_module, "GrpcOTLPMetricExporter", grpc_exporter)
+    monkeypatch.setattr(bootstrap_module, "HttpOTLPMetricExporter", http_exporter)
+
+    exporter = bootstrap_module._metric_exporter(
+        {
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector.example.com:4318",
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": protocol,
+            "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": preference,
+        }
+    )
+
+    selected = grpc_instances if protocol == "grpc" else http_instances
+    rejected = http_instances if protocol == "grpc" else grpc_instances
+    assert selected == [exporter]
+    assert rejected == []
+    temporality = selected[0].kwargs["preferred_temporality"]
+    assert temporality[Counter] is expected_temporality
+    assert temporality[Histogram] is expected_temporality
