@@ -571,6 +571,20 @@ pub fn load_lock(bundle_dir: &Path) -> Result<Option<ConnectorLockFileDecl>> {
     parse_lock(&body).map(Some)
 }
 
+/// The runner layer digest a cluster deploy binds for this bundle (#3260).
+///
+/// `Some` only when `connectors.yaml` declares `runner` and the lock records
+/// its image, which `parse_lock` has already held to the digest shape. `None`
+/// otherwise, which the deploy reads as "clear any earlier value".
+pub fn locked_runner_image(bundle_dir: &Path) -> Result<Option<String>> {
+    if load(bundle_dir)?.runner.is_none() {
+        return Ok(None);
+    }
+    Ok(load_lock(bundle_dir)?
+        .and_then(|lock| lock.runner)
+        .map(|runner| runner.image))
+}
+
 fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
     let forms = [
         spec.image.is_some(),
@@ -2301,5 +2315,44 @@ connectors:
             runner: Some(RunnerSpecDecl::default()),
         };
         assert!(restrict_to(&decl, Some(&[])).runner.is_some());
+    }
+}
+
+#[cfg(test)]
+mod locked_runner_image_tests {
+    use super::*;
+
+    const RUNNER_IMAGE: &str = "ghcr.io/acme-corp/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    const RUNNER_CONNECTORS: &str = "connectors: {}\nrunner:\n  build:\n    context: runner\n    \
+         platforms: [linux/amd64, linux/arm64]\n";
+
+    fn runner_lock() -> String {
+        format!(
+            "version: 1\nconnectors: {{}}\nrunner:\n  image: {RUNNER_IMAGE}\n  \
+             base: ghcr.io/curie-eng/curie-runner@sha256:{}\n  delivery: registry\n  \
+             platforms: [linux/amd64, linux/arm64]\n  source_digest: sha256:{}\n",
+            "b".repeat(64),
+            "2".repeat(64),
+        )
+    }
+
+    #[test]
+    fn a_locked_runner_resolves_to_its_recorded_digest() {
+        // #3260 AC1: the deploy reads the digest the lock recorded, never a tag.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONNECTORS_FILE), RUNNER_CONNECTORS).unwrap();
+        std::fs::write(dir.path().join(CONNECTOR_LOCK_FILE), runner_lock()).unwrap();
+        let image = locked_runner_image(dir.path()).unwrap();
+        assert_eq!(image.as_deref(), Some(RUNNER_IMAGE));
+        assert!(image.unwrap().contains("@sha256:"));
+    }
+
+    #[test]
+    fn a_bundle_without_a_runner_declares_none_even_without_a_lock() {
+        // #3260 AC2: no runner entry is what clears an earlier value.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONNECTORS_FILE), "connectors: {}\n").unwrap();
+        assert_eq!(locked_runner_image(dir.path()).unwrap(), None);
     }
 }

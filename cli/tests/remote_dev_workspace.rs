@@ -372,6 +372,9 @@ fn run_fanout(
     .expect("write deploy targets");
     let tools = tempfile::tempdir().expect("tool tempdir");
     write_kubectl_stub(tools.path());
+    // Every cluster deploy reads the release values to learn whether an
+    // earlier layered runner image must be cleared (#3260).
+    write_helm_values_stub(tools.path(), "{}");
     let mut paths = vec![tools.path().to_path_buf()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
