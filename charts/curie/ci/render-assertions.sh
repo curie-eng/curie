@@ -67,7 +67,9 @@
 # platform PriorityClass, pre-install hooks must stay classless because Helm
 # runs them before normal resources exist. Every other hook uses that class.
 # Upgrades and installs with an operator-provided class cover pre-install
-# hooks too. Negative controls prove both pod spec shapes and the exception.
+# hooks too. A chart-created gVisor RuntimeClass moves its preflight to
+# post-install, so that hook also uses the configured platform class. Negative
+# controls prove both pod spec shapes and the exception.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
@@ -2437,6 +2439,49 @@ helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" --is-upgrade \
   > "$HOOK_PRIO_OPERATOR_UPGRADE"
 python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_OPERATOR_UPGRADE" operator-platform-class upgrade operator \
   || fail "operator class upgrade render has a hook Job or Pod without the named platform class."
+
+echo "=== Assertion 17: chart-created gVisor RuntimeClass moves its hook after install ==="
+HOOK_PRIO_GVISOR_CREATED="$TMP/hook-priority-gvisor-runtime-class.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" \
+  --set security.gvisor.installRuntimeClass=true \
+  --set priorityClasses.platform.name=gvisor-install-platform-class \
+  > "$HOOK_PRIO_GVISOR_CREATED"
+python3 - "$HOOK_PRIO_GVISOR_CREATED" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as stream:
+    documents = [doc for doc in yaml.safe_load_all(stream) if isinstance(doc, dict)]
+name = "curie-preflight-gvisor"
+expected_class = "gvisor-install-platform-class"
+hooks = [
+    doc for doc in documents
+    if doc.get("kind") == "Job" and (doc.get("metadata") or {}).get("name") == name
+]
+if len(hooks) != 1:
+    sys.exit(f"expected one {name} Job, found {len(hooks)}")
+hook = hooks[0]
+phases = {
+    phase.strip()
+    for phase in ((hook.get("metadata") or {}).get("annotations") or {}).get("helm.sh/hook", "").split(",")
+}
+expected_phases = {"post-install", "post-upgrade", "test"}
+if phases != expected_phases:
+    sys.exit(f"{name} has hook phases {phases!r}, expected {expected_phases!r}")
+spec = (((hook.get("spec") or {}).get("template") or {}).get("spec") or {})
+actual_class = spec.get("priorityClassName")
+if actual_class != expected_class:
+    sys.exit(f"{name} has priorityClassName={actual_class!r}, expected {expected_class!r}")
+created = [
+    doc for doc in documents
+    if doc.get("kind") == "PriorityClass"
+    and (doc.get("metadata") or {}).get("name") == expected_class
+]
+if len(created) != 1:
+    sys.exit(f"expected one chart-created PriorityClass {expected_class}, found {len(created)}")
+print(f"  ok: {name} runs after install and uses {expected_class}")
+PYEOF
 
 echo "=== Assertion 17 negative controls: classless hooks and classified pre-install hook FAIL ==="
 python3 - "$HOOK_PRIO_DEFAULT" "$HOOK_PRIO_UPGRADE" "$TMP" <<'PYEOF'
