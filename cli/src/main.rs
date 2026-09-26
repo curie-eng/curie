@@ -115,6 +115,24 @@ struct ClusterConn {
     release: String,
 }
 
+/// Same connection as [`ClusterConn`], but the flags are global so they parse
+/// after `cluster hook fire` as well as on `cluster hook`.
+#[derive(Args, Debug, Clone)]
+struct ClusterHookConn {
+    /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
+    #[arg(long, env = "CURIE_API_URL", global = true)]
+    api_url: Option<String>,
+    /// Platform API key. Omit to read the release's `api.apiKey` from its Secret.
+    #[arg(long, env = "CURIE_API_KEY", hide_env_values = true, global = true)]
+    api_key: Option<String>,
+    /// Kubernetes namespace of the release. Default: curie.
+    #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE", global = true)]
+    namespace: String,
+    /// Helm release name. Default: curie.
+    #[arg(long, default_value = "curie", global = true)]
+    release: String,
+}
+
 /// Local API connection flags shared by every observability query leaf. They
 /// intentionally live on the leaves: bare `local observability` remains the
 /// existing URL printer and does not grow a transport contract.
@@ -1688,8 +1706,6 @@ enum ClusterHookAction {
         /// How long to wait for the turn to settle, in seconds.
         #[arg(long, default_value_t = 120)]
         wait_secs: u64,
-        #[command(flatten)]
-        conn: ClusterConn,
         /// Print what would be requested and exit without making a request.
         #[arg(long)]
         dry_run: bool,
@@ -3310,6 +3326,8 @@ enum ClusterAction {
     Hook {
         #[command(subcommand)]
         action: ClusterHookAction,
+        #[command(flatten)]
+        conn: ClusterHookConn,
     },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
@@ -3484,11 +3502,9 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::Delete { conn, .. } => {
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
-        ClusterAction::Hook { action } => match action {
-            ClusterHookAction::Fire { conn, .. } => {
-                (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
-            }
-        },
+        ClusterAction::Hook { conn, .. } => {
+            (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
+        }
         ClusterAction::Versions { target }
         | ClusterAction::Memory { target, .. }
         | ClusterAction::Approvals { target, .. } => (
@@ -3589,12 +3605,10 @@ fn retarget_cluster_action(
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);
         }
-        ClusterAction::Hook { action } => match action {
-            ClusterHookAction::Fire { conn, .. } => {
-                replace(&mut conn.namespace, &namespace);
-                replace(&mut conn.release, &release);
-            }
-        },
+        ClusterAction::Hook { conn, .. } => {
+            replace(&mut conn.namespace, &namespace);
+            replace(&mut conn.release, &release);
+        }
         ClusterAction::Versions { target }
         | ClusterAction::Memory { target, .. }
         | ClusterAction::Approvals { target, .. } => {
@@ -6198,16 +6212,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-            ClusterAction::Hook { action } => {
+            ClusterAction::Hook { action, conn } => {
                 let ClusterHookAction::Fire {
                     agent,
                     name,
                     wait_secs,
-                    conn,
                     dry_run,
                 } = action;
-                let (api_url, api_key, _cluster_api_pf) =
-                    resolve_cluster_conn(conn, dry_run).await?;
+                let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
+                    ClusterConn {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        namespace: conn.namespace,
+                        release: conn.release,
+                    },
+                    dry_run,
+                )
+                .await?;
                 emit(
                     commands::hook_fire(commands::HookFireOpts {
                         api_url,

@@ -5631,6 +5631,49 @@ export const commandManifest = {
         },
         {
           "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "args": [
+            {
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": true,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": true,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
           "hidden": false,
           "name": "hook",
           "subcommands": [
@@ -5659,47 +5702,6 @@ export const commandManifest = {
                   "help": "How long to wait for the turn to settle, in seconds",
                   "id": "wait_secs",
                   "long": "wait-secs",
-                  "positional": false,
-                  "required": false
-                },
-                {
-                  "env": "CURIE_API_URL",
-                  "global": false,
-                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
-                  "id": "api_url",
-                  "long": "api-url",
-                  "positional": false,
-                  "required": false
-                },
-                {
-                  "env": "CURIE_API_KEY",
-                  "global": false,
-                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
-                  "id": "api_key",
-                  "long": "api-key",
-                  "positional": false,
-                  "required": false
-                },
-                {
-                  "default_values": [
-                    "curie"
-                  ],
-                  "env": "CURIE_NAMESPACE",
-                  "global": false,
-                  "help": "Kubernetes namespace of the release. Default: curie",
-                  "id": "namespace",
-                  "long": "namespace",
-                  "positional": false,
-                  "required": false
-                },
-                {
-                  "default_values": [
-                    "curie"
-                  ],
-                  "global": false,
-                  "help": "Helm release name. Default: curie",
-                  "id": "release",
-                  "long": "release",
                   "positional": false,
                   "required": false
                 },
