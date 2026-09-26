@@ -181,6 +181,31 @@ tests:
                 every minute for 15 minutes, whichever worker recorded it. A
                 queue that is draining reads 0.
 
+  # One undelivered entry is enough: the threshold is above 0, not a size.
+  - name: a queue lag of one entry for the window and for fires
+    interval: 30s
+    input_series:
+      - series: 'curie_queue_lag{job="curie/curie-worker",instance="worker-a",service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '0x19 1x60'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts:
+          - exp_labels:
+              component: curie-queue
+              job: curie/curie-worker
+              outcome: pending
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: Queued Curie messages have waited undelivered for 15 minutes
+              description: >-
+                curie_queue_lag, the entries in the run stream not yet
+                delivered to the worker consumer group, has been above 0 at
+                every minute for 15 minutes, whichever worker recorded it. A
+                queue that is draining reads 0.
+
   # The same series with one 0 at 21m, which the minute read sees: the 15
   # minutes read no 0 again only from 36m, so at 40m, eleven minutes after the
   # case above fires, `for` has not held.
