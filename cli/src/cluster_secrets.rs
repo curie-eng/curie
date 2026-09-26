@@ -265,12 +265,8 @@ pub async fn read_bind_need(
     runner_image: Option<&str>,
 ) -> Result<BindNeed> {
     validate_agent_resource_name(agent)?;
-    let desires_nothing = secrets.is_empty() && runner_image.is_none();
-    // Nothing desired only matters if an earlier runner image must be
-    // cleared, so a box without helm stays a no-op as it was before #3260.
-    if desires_nothing && require_on_path("helm").is_err() {
-        return Ok(BindNeed::Current);
-    }
+    // Even a deploy that wants nothing reads the release: an earlier runner
+    // image may still need clearing, and without helm that cannot be known.
     require_on_path("helm")?;
     let (ok, stdout, _stderr) = crate::ops::run_capture(&helm_values_command(common)).await?;
     let parsed = if ok {
