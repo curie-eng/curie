@@ -136,6 +136,7 @@ from .sandbox import SandboxSubstrate
 from .sandbox.quota import quota_rejection_is_valid
 from .sandbox.types import (
     CapacityExhaustedError,
+    MissingAgentPoolError,
     PressureCandidate,
     QuotaRejection,
     RouteChangedError,
@@ -4107,6 +4108,22 @@ class Kernel:
                 reason,
             )
             await self._reply_for(qevent, route, _UNAVAILABLE_ATTACHMENT_REPLY)
+            return TurnOutcome(terminal_ok=True)
+        except MissingAgentPoolError as exc:
+            # Before the SandboxError clause below, which would retry it. The
+            # pool appears only after an operator changes the release values,
+            # so a retry fails the same way; answer once, naming the fix
+            # (#2943).
+            record_reclaimed_retry()
+            release_order()
+            logger.warning(
+                "turn start refused for %s: %s", qevent.event_id, exc
+            )
+            await self._reply_for(
+                qevent,
+                route,
+                f"This agent cannot start: {exc}. An operator has to make that change.",
+            )
             return TurnOutcome(terminal_ok=True)
         except (
             RunnerError,

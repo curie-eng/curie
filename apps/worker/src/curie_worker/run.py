@@ -206,6 +206,10 @@ def _bounded_seconds(
     return value
 
 
+def _agent_names(env: Mapping[str, str], key: str) -> frozenset[str]:
+    return frozenset(name.strip() for name in env.get(key, "").split(",") if name.strip())
+
+
 def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # claim_timeout is overridable so a slow cluster can raise it; when unset the
     # authoritative default lives in SubstrateConfig. Keep any override below the
@@ -230,11 +234,8 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     return SubstrateConfig(
         namespace=env.get("CURIE_NAMESPACE", "default"),
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),
-        agent_pools=frozenset(
-            name.strip()
-            for name in env.get("CURIE_AGENT_SANDBOX_POOLS", "").split(",")
-            if name.strip()
-        ),
+        agent_pools=_agent_names(env, "CURIE_AGENT_SANDBOX_POOLS"),
+        connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
         runner_port=int(env.get("CURIE_RUNNER_PORT", "8080")),
         **overrides,
     )

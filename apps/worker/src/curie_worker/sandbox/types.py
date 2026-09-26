@@ -56,14 +56,33 @@ def claim_warm_pool(
     env: Mapping[str, str] | None,
     agent_name: str | None,
     agent_pools: frozenset[str],
+    connector_secret_pools: frozenset[str],
 ) -> str:
-    """Route connector-secret claims, and agents the chart gave their own pool
-    (``agentSandbox.registryEgress``, #3083), to the per-agent pool; otherwise
-    the generic pool."""
+    """Pick the warm pool a claim names.
 
+    The chart states which per-agent pools it rendered: ``agent_pools`` is
+    every one (CURIE_AGENT_SANDBOX_POOLS), ``connector_secret_pools`` those
+    whose template carries connector secretKeyRefs
+    (CURIE_AGENT_CONNECTOR_SECRET_POOLS). The ``connector_secret_keys`` marker
+    comes from the agent's own bundle and does not agree with either: an agent
+    deployed with ``curie cluster deploy`` can set it while no render produced
+    its pool (#2943). A secret claim with no secret-capable pool raises
+    MissingAgentPoolError at once instead of blocking on an object nothing
+    created, and is never sent to another pool: connector secret values are
+    stripped from the claim env and reach the pod only through that template.
+    """
+
+    if not agent_name:
+        return base_pool
+    pool = agent_warm_pool_name(base_pool, agent_name)
     marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
-    if agent_name and (marker or agent_name in agent_pools):
-        return agent_warm_pool_name(base_pool, agent_name)
+    if marker:
+        # A non-chart base pool yields no derivable per-agent name.
+        if agent_name in connector_secret_pools and pool != base_pool:
+            return pool
+        raise MissingAgentPoolError(agent_name, pool)
+    if agent_name in agent_pools:
+        return pool
     return base_pool
 
 HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
@@ -201,9 +220,12 @@ class SubstrateConfig:
 
     namespace: str
     warm_pool: str
-    # Agents the chart renders a per-agent pool for without connector secrets
-    # (agentSandbox.registryEgress, #3083), from CURIE_AGENT_SANDBOX_POOLS.
+    # Agents the chart renders a per-agent pool for (agentSandbox.connectorSecrets
+    # and agentSandbox.registryEgress, #3083, #2943), from CURIE_AGENT_SANDBOX_POOLS.
     agent_pools: frozenset[str] = frozenset()
+    # The subset whose pool template carries connector secrets
+    # (agentSandbox.connectorSecrets), from CURIE_AGENT_CONNECTOR_SECRET_POOLS.
+    connector_secret_pools: frozenset[str] = frozenset()
     runner_port: int = 8080
     # How long a live route stays bound with no touch. After expiry the claim
     # is an orphan and reap_orphans() deletes it.
@@ -388,6 +410,23 @@ class UnschedulableClaimError(ClaimTimeoutError):
     keeps doing so; only the factory work-item path treats it as capacity
     (#3169).
     """
+
+
+class MissingAgentPoolError(SandboxError):
+    """An agent declares connector secrets but the chart rendered no pool for it.
+
+    Retrying cannot help: the pool appears only after an operator sets
+    ``agentSandbox.connectorSecrets.<agent>`` and upgrades the release (#2943).
+    """
+
+    def __init__(self, agent_name: str, pool: str) -> None:
+        self.agent_name = agent_name
+        self.pool = pool
+        super().__init__(
+            f"agent {agent_name} declares connector secrets but SandboxWarmPool "
+            f"{pool} was not rendered; set agentSandbox.connectorSecrets.{agent_name} "
+            "in the release values and upgrade"
+        )
 
 
 class CapacityExhaustedError(SandboxError):

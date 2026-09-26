@@ -1923,6 +1923,9 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
         SubstrateConfig(
             namespace="test-ns",
             warm_pool="curie-runner-pool",
+            # The chart renders acme-a's pool (CURIE_AGENT_SANDBOX_POOLS, #2943).
+            agent_pools=frozenset({"acme-a"}),
+            connector_secret_pools=frozenset({"acme-a"}),
             claim_timeout_seconds=3.0,
             poll_interval_seconds=0.005,
             key_prefix=sandbox_prefix,

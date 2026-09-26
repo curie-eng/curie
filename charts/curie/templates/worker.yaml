@@ -1,5 +1,9 @@
 {{- if .Values.worker.deploy }}
 {{- $warmPool := .Values.worker.warmPool | default (printf "%s-runner-pool" (include "curie.fullname" .)) }}
+{{- /* The worker derives per-agent pool names from $warmPool; they match what
+       agent-sandbox.yaml renders only for the chart's own base name, and only
+       while agentSandbox.deploy renders pools at all (#2943). */}}
+{{- $perAgentPools := and .Values.agentSandbox.deploy (eq $warmPool (printf "%s-runner-pool" (include "curie.fullname" .))) }}
 {{- $workspaceStageBudget := add .Values.worker.workspace.cloneTimeoutSeconds .Values.worker.workspace.archiveTimeoutSeconds .Values.worker.workspace.uploadTimeoutSeconds }}
 {{- $publicationPullSecrets := list }}
 {{- range .Values.agentSandbox.runner.imagePullSecrets }}
@@ -360,11 +364,18 @@ spec:
                   key: langfuseInitProjectSecretKey
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
-            # Agents with a per-agent pool but no connector secrets
-            # (agentSandbox.registryEgress, #3083); the worker routes their
-            # claims to that pool so the registry NetworkPolicy selects them.
+            # Every agent agent-sandbox.yaml renders a per-agent pool for
+            # (connectorSecrets and registryEgress, #3083), or none when
+            # worker.warmPool is overridden and the names cannot match. The
+            # worker routes only to these, and refuses a connector-secret claim
+            # for any other agent instead of waiting on a pool nothing rendered
+            # (#2943).
             - name: CURIE_AGENT_SANDBOX_POOLS
-              value: {{ keys (.Values.agentSandbox.registryEgress | default dict) | sortAlpha | join "," | quote }}
+              value: {{ ternary (include "curie.agentSandboxPoolAgents" . | fromJsonArray | join ",") "" $perAgentPools | quote }}
+            # The subset whose pool template carries connector secretKeyRefs; a
+            # claim whose bundle declares connector secrets needs one (#2943).
+            - name: CURIE_AGENT_CONNECTOR_SECRET_POOLS
+              value: {{ ternary (keys (.Values.agentSandbox.connectorSecrets | default dict) | sortAlpha | join ",") "" $perAgentPools | quote }}
             - name: CURIE_RUNNER_PORT
               value: {{ .Values.agentSandbox.runner.port | quote }}
             # Heartbeat file the worker's asyncio loop touches each tick; the

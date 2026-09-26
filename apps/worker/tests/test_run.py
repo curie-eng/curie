@@ -1326,6 +1326,12 @@ def test_substrate_config_reads_agent_sandbox_pools() -> None:
     assert config.agent_pools == frozenset({"factory", "acme-a"})
 
 
+def test_substrate_config_reads_connector_secret_pools() -> None:
+    assert _substrate_config({}).connector_secret_pools == frozenset()
+    config = _substrate_config({"CURIE_AGENT_CONNECTOR_SECRET_POOLS": "acme-a, acme-b,"})
+    assert config.connector_secret_pools == frozenset({"acme-a", "acme-b"})
+
+
 # -- _supervise: quiet boot while dependencies come up (#3079) ---------------
 
 
