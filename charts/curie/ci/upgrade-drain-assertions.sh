@@ -81,7 +81,7 @@ helm template t "$CHART" \
 # rather than a constant.
 helm template t "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
-  --set worker.terminationGracePeriodSeconds=1860 > "$TMP/raised.yaml"
+  --set worker.terminationGracePeriodSeconds=2400 > "$TMP/raised.yaml"
 helm template t "$CHART" \
   --set worker.deliveryBudgetSeconds=60 \
   --set worker.runnerTotalTimeoutSeconds=60 \
@@ -276,9 +276,8 @@ if env is not None:
         f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}",
     )
 
-# Raising deliveryBudgetSeconds to its 1800s maximum, with the grace ADR-0131
-# requires, must still render -- and must carry the gate up with it rather than
-# leaving a 900s wait that would refuse every upgrade during ordinary traffic.
+# Raising deliveryBudgetSeconds to 1800s and raising the worker
+# grace must still render, with the gate raised to cover the delivery budget.
 # 1800 + 60 reserve = 1860; the roll hold is min(1800, 1860) = 1800.
 env = drain_env(raised_path, "raised-budget")
 if env is not None:
@@ -292,6 +291,54 @@ if env is not None:
         "the roll hold was not min(quiesceTtlSeconds, effective wait): "
         f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1800'",
     )
+
+
+# The published minimum includes the actual drain Job deadline, the rendered
+# worker grace, and 60 seconds for scheduling and Helm operations.
+for path, label, expected_wait, expected_grace, expected_minimum in (
+    (default_path, "default", 900, 1860, 2940),
+    (raised_path, "raised-budget-and-grace", 1860, 2400, 4440),
+):
+    docs = load(path)
+    jobs = jobs_by_component(docs)
+    workers = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Deployment"
+        and (doc.get("metadata") or {}).get("labels", {}).get("app.kubernetes.io/component")
+        == "worker"
+    ]
+    if len(jobs.get(DRAIN, [])) != 1 or len(workers) != 1:
+        failures.append(f"the {label} render lacks one drain Job or worker Deployment")
+        continue
+    job = jobs[DRAIN][0]
+    deadline = (job.get("spec") or {}).get("activeDeadlineSeconds")
+    grace = ((workers[0].get("spec") or {}).get("template") or {}).get("spec", {}).get(
+        "terminationGracePeriodSeconds"
+    )
+    minimum = (job.get("metadata") or {}).get("annotations", {}).get(
+        "curie.ai/minimum-helm-timeout-seconds"
+    )
+    check(
+        deadline == expected_wait + 120,
+        f"the {label} drain Job deadline is {deadline!r}, expected {expected_wait + 120}",
+    )
+    check(grace == expected_grace, f"the {label} worker grace is {grace!r}, expected {expected_grace}")
+    check(
+        isinstance(minimum, str) and minimum.isdecimal(),
+        f"the {label} minimum Helm timeout annotation is not a decimal string: {minimum!r}",
+    )
+    if isinstance(minimum, str) and minimum.isdecimal():
+        check(
+            int(minimum) == expected_minimum,
+            f"the {label} minimum Helm timeout is {minimum}, expected {expected_minimum}",
+        )
+        if isinstance(deadline, int) and isinstance(grace, int):
+            check(
+                int(minimum) == deadline + grace + 60,
+                f"the {label} minimum Helm timeout does not cover the drain Job deadline, "
+                "worker grace, and 60 second margin",
+            )
 
 # A configured hold below the wait renders and is kept; an equal one too.
 for path, label, expected in (

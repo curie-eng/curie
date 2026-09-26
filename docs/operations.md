@@ -1709,11 +1709,20 @@ re-supplied or the upgrade rotates them out from under a running database.
 
 ```bash
 helm get values <release> -n <ns> -o yaml > values.yaml
-helm upgrade <release> <chart> -n <ns> -f values.yaml
+helm upgrade <release> <chart> -n <ns> -f values.yaml --timeout <minimum>s
 ```
 
-`curie cluster up` and `curie apply` do this without asking the operator to
-choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
+Set `<minimum>` from the `curie.ai/minimum-helm-timeout-seconds` annotation on
+the chart's rendered pre-upgrade drain Job, using the same chart, values file,
+and overrides as the upgrade. That annotation accounts for the effective drain
+wait, the Job's 120 second allowance, the effective worker termination grace,
+and 60 seconds for scheduling and Helm operations. The default is 2940 seconds.
+Raising `worker.deliveryBudgetSeconds` raises the effective drain wait and
+termination grace automatically, so read the annotation for the customized
+values instead of reusing the default timeout.
+
+`curie cluster up` and `curie apply` preserve values without asking the operator
+to choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
 `config.schemaVersion` on the release, run pure migrations from supported
 v0.8.x user values onto the v0.9.0 schema (legacy extraEnv entries with a
 first-class successor, external Secret references), and overlay the result so
@@ -1747,7 +1756,7 @@ helm get values <release> -n <ns> -o yaml > values.yaml
 helm list -n <ns>                       # note the revision
 
 # 3. Upgrade
-helm upgrade <release> <chart> -n <ns> -f values.yaml
+helm upgrade <release> <chart> -n <ns> -f values.yaml --timeout <minimum>s
 
 # 4. Import into RustFS
 IP=$(kubectl get svc -n <ns> <release>-rustfs -o jsonpath='{.spec.clusterIP}')

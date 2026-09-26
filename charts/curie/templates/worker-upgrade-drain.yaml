@@ -61,13 +61,14 @@ metadata:
     "helm.sh/hook": pre-upgrade
     "helm.sh/hook-weight": "-10"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "curie.ai/minimum-helm-timeout-seconds": {{ include "curie.worker.minimumHelmTimeoutSeconds" . | quote }}
 spec:
   backoffLimit: 0
   # A hard ceiling above the gate's own wait, so a Job wedged on an unreachable
   # Valkey cannot hold `helm upgrade` open indefinitely. The gate returns on its
   # own timeout well before this; reaching it means the container never got as
   # far as waiting.
-  activeDeadlineSeconds: {{ add (int64 $drainTimeout) 120 }}
+  activeDeadlineSeconds: {{ include "curie.worker.upgradeDrain.jobDeadline" . }}
   template:
     metadata:
       labels:

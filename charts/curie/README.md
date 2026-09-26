@@ -62,7 +62,7 @@ which can render a required value as blank. Helm 3.14 and newer provide the
 safe merge directly:
 
 ```bash
-helm upgrade curie <new-chart> -n curie --reset-then-reuse-values
+helm upgrade curie <new-chart> -n curie --reset-then-reuse-values --timeout <minimum>s
 ```
 
 For an auditable values file instead, capture the release's user supplied
@@ -76,14 +76,22 @@ values privately and pass that file over the new defaults:
   chmod 600 "$upgrade_values"
   helm get values curie -n curie -o yaml > "$upgrade_values"
   test -s "$upgrade_values"
-  helm upgrade curie <new-chart> -n curie -f "$upgrade_values"
+  helm upgrade curie <new-chart> -n curie -f "$upgrade_values" --timeout <minimum>s
 )
 ```
 
 Keep the file private because retained values can contain credentials. Remove
 it after the upgrade even when Helm fails. The commands below use
 `--reuse-values` only for same chart configuration changes, not a chart version
-upgrade.
+upgrade. The pre-upgrade drain Job publishes the required minimum in the
+`curie.ai/minimum-helm-timeout-seconds` annotation. For customized worker or
+drain budgets, use the annotation rendered from the same chart and values as
+the upgrade, and pass that value with an `s` suffix to `helm upgrade --timeout`.
+The default minimum is 2940 seconds. The chart derives it from the effective
+drain wait, 120 seconds for the Job, the effective worker termination grace,
+and 60 seconds for scheduling and Helm operations. Raising
+`worker.deliveryBudgetSeconds` raises both the effective drain wait and worker
+grace automatically, so the Helm timeout must rise too.
 
 **Upgrade drain and claim state.** Before each upgrade, a hook pauses new worker
 claims and waits for accepted deliveries to finish. The chart stores an
@@ -107,6 +115,7 @@ model credential, upgrade in place (the exact command is also printed in
 
 ```bash
 helm upgrade curie charts/curie -n curie --reuse-values \
+  --timeout <minimum>s \
   --set dispatcher.slack.appToken=xapp-... \
   --set dispatcher.slack.botToken=xoxb-... \
   --set dispatcher.slack.signingSecret=... \
@@ -137,6 +146,7 @@ API Service (`http://<fullname>-api:<api.service.port>`, derived, so an overridd
 
 ```bash
 helm upgrade curie charts/curie -n curie --reuse-values \
+  --timeout <minimum>s \
   --set dispatcher.apiBaseUrl=https://your-api.example
 ```
 

@@ -98,14 +98,17 @@ Enable factory intake first (see "Admitting a labelled GitHub issue" in
 ```bash
 # The skill plans for a 3 hour run. The execution deadline defaults to 1800 s
 # and the worker budget to 600 s, so raise all three. The chart raises the
-# worker termination grace with the budget.
+# worker termination grace with the budget. At this budget, the drain Job
+# publishes a minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
+  --timeout 21900s \
   --set worker.deliveryBudgetSeconds=10800 \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
 
 # The factory's default model: GLM 5.3 Flash through OpenRouter.
 helm upgrade curie <chart> -n curie --reuse-values \
+  --timeout 21900s \
   --set agentSandbox.runner.fakeModel=false \
   --set agentSandbox.runner.model=z-ai/glm-5.3-flash \
   --set agentSandbox.runner.credentials=<openrouter-api-key>
@@ -113,6 +116,7 @@ helm upgrade curie <chart> -n curie --reuse-values \
 # Runner egress to the GitHub API for the MCP server, one entry per CIDR
 # from the "api" list at https://api.github.com/meta.
 helm upgrade curie <chart> -n curie --reuse-values \
+  --timeout 21900s \
   --set 'agentSandbox.connectorEgress.dark-factory[0].cidr=<github-api-cidr>' \
   --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].port=443' \
   --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].protocol=TCP'

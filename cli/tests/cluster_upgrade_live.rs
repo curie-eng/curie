@@ -970,7 +970,7 @@ fn release_channel_cached_dry_run_checks_target_without_version_flag() {
     assert!(
         plan.iter().filter_map(Value::as_str).any(|line| {
             line == format!(
-                "helm upgrade rel {target} -n ns --wait --timeout 15m -f <retained-values>"
+                "helm upgrade rel {target} -n ns --wait --timeout 2940s -f <retained-values>"
             ) && !line.contains("--version")
         }),
         "cached plan must use the exact local-archive command head: {plan:?}"
@@ -2820,6 +2820,88 @@ fn dry_run_helm_line_matches_the_recorded_upgrade_argv() {
             pinned,
             chart.starts_with("oci://"),
             "--version must show exactly when passed: {line}"
+        );
+    }
+}
+
+#[test]
+fn raised_drain_budget_uses_exact_overlay_in_plan_and_apply() {
+    let overlay = r#"{"worker":{"upgradeDrain":{"timeoutSeconds":2000},"terminationGracePeriodSeconds":4000}}"#;
+    let planned = Fixture::new(Some(overlay));
+    let dry = planned.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(dry.status.success(), "{}", visible(&dry));
+    let plan = json(&dry)["plan"].as_array().unwrap().clone();
+    let line = plan
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|line| line.starts_with("helm upgrade "))
+        .expect("Helm plan line");
+    assert!(line.contains("--timeout 6180s"), "{line}");
+    assert_eq!(planned.helm_upgrades().len(), 0);
+
+    let applied = Fixture::new(Some(overlay));
+    let output = applied.run("healthy", "0.9.0", "charts/curie");
+    assert!(output.status.success(), "{}", visible(&output));
+    let upgrades = applied.helm_upgrades();
+    assert_eq!(upgrades.len(), 1, "{:?}", applied.argv());
+    let mut executed = upgrades[0].clone();
+    let values_at = executed.iter().position(|arg| arg == "-f").unwrap();
+    executed[values_at + 1] = "<retained-values>".into();
+    assert_eq!(executed.join(" "), line);
+    assert_eq!(
+        fs::read_to_string(applied.0.path().join("render-values-1.json")).unwrap(),
+        applied.values(1),
+        "the timeout render and Apply must use the same migrated overlay"
+    );
+    assert!(
+        applied.argv().iter().any(|call| {
+            call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("template")
+                && call.iter().any(|arg| arg == "--is-upgrade")
+                && !call.iter().any(|arg| arg == "--show-only")
+        }),
+        "the timeout must come from a full upgrade render: {:?}",
+        applied.argv()
+    );
+}
+
+#[test]
+fn absent_drain_job_keeps_the_helm_timeout_floor() {
+    for overlay in [
+        r#"{"worker":{"deploy":false}}"#,
+        r#"{"worker":{"upgradeDrain":{"enabled":false}}}"#,
+    ] {
+        let fixture = Fixture::new(Some(overlay));
+        let output = fixture.run("healthy", "0.9.0", "charts/curie");
+        assert!(output.status.success(), "{}", visible(&output));
+        let upgrades = fixture.helm_upgrades();
+        assert_eq!(upgrades.len(), 1, "{:?}", fixture.argv());
+        assert!(upgrades[0]
+            .windows(2)
+            .any(|pair| pair == ["--timeout", "15m"]));
+    }
+}
+
+#[test]
+fn malformed_drain_timeout_metadata_refuses_before_apply() {
+    for scenario in [
+        "drain-annotation-missing",
+        "drain-annotation-invalid",
+        "drain-render-fails",
+    ] {
+        let fixture = Fixture::new(None);
+        let output = fixture.run(scenario, "0.9.0", "charts/curie");
+        assert!(!output.status.success(), "{scenario}: {}", visible(&output));
+        assert!(
+            fixture.helm_upgrades().is_empty(),
+            "{scenario}: {:?}",
+            fixture.argv()
+        );
+        assert!(
+            visible(&output).contains("target upgrade drain Job")
+                || visible(&output).contains("could not render target Helm timeout metadata"),
+            "{scenario}: {}",
+            visible(&output)
         );
     }
 }
