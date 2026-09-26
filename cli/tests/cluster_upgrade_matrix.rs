@@ -107,8 +107,8 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin exclusive_kind_tag untag-before-load\n{text}"
     );
     assert!(
-        text.contains("compatible rollback reloads exclusive 0.10.0 images"),
-        "self-test must pin compatible rollback reloading 0.10.0 images\n{text}"
+        text.contains("rollback refusal keeps candidate schema and serving release"),
+        "self-test must pin refusal at the candidate schema head\n{text}"
     );
     assert!(
         text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
@@ -312,11 +312,11 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         scenario.contains("status != 0")
             && scenario.contains("0.8.9")
             && scenario.contains("PUBLISHED_HEAD")
-            && scenario.contains("SUPPORTED_ROLLBACK_HEAD")
+            && scenario.contains("grep -F \"$TARGET_HEAD\"")
             && scenario.contains("outside its declared schema range")
             && scenario.contains("if echo \"$err\" | grep -F \"could not establish\"")
             && scenario.contains("failed identity classification"),
-        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and candidate head 0055 while rejecting identity failures"
+        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and the live candidate head while rejecting identity failures"
     );
     assert!(
         scenario.contains("helm_version") && scenario.contains("0.10.0"),
@@ -331,7 +331,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
     );
     assert!(
         scenario.contains("run_compatible_rollback"),
-        "the same scenario must prove one compatible rollback succeeds"
+        "the same scenario must prove the 0.10.0 rollback is refused"
     );
 
     let compatible = source
@@ -340,8 +340,9 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         .expect("run_compatible_rollback function");
     assert!(
         compatible.contains("assert_sentinel")
-            && compatible.contains("assert_alembic \"$SUPPORTED_ROLLBACK_HEAD\""),
-        "supported 0.10.1 to 0.10.0 rollback must retain the sentinel and catalogued Alembic head"
+            && compatible.contains("assert_alembic \"$TARGET_HEAD\"")
+            && compatible.contains("rollback to 0.10.0 unexpectedly succeeded"),
+        "refused 0.10.1 to 0.10.0 rollback must retain the sentinel and candidate Alembic head"
     );
 }
 
