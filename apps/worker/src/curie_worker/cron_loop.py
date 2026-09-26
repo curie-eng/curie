@@ -72,6 +72,7 @@ from aci_protocol import HookRunRef, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol import hook_conversation_id
 from cronsim import CronSim
+from curie_telemetry import record_metric
 from plugin_format import resolve_manifest
 from redis.asyncio import Redis
 from sqlalchemy import text
@@ -81,6 +82,17 @@ from .bundle_store import BundleReader, extract_bundle
 from .hook_runs import retry_event_id
 
 logger = logging.getLogger(__name__)
+
+
+def _record_fire(outcome: str) -> None:
+    try:
+        record_metric(
+            "curie.schedule.fire",
+            attributes={"service.name": "curie-worker", "trigger": "cron", "outcome": outcome},
+        )
+    except Exception:
+        logger.exception("hook run metric emission failed after outcome commit")
+
 
 # How far before the window's local start the cron iteration begins. It covers
 # the widest UTC offset change a zone makes in one transition, so a slot whose
@@ -304,6 +316,7 @@ SET outcome = 'reclaimed', ended_at = now()
 WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL
   AND slot_utc <> :slot
   AND COALESCE(lease_expires_at, started_at + make_interval(secs => :lease_s)) < now()
+RETURNING id
 """
 
 # Any other open row for this hook blocks, whichever slot it holds: a later
@@ -332,8 +345,11 @@ WHERE agent_id = :agent_id AND name = :name AND paused_at IS NULL
 _SKIP_SQL = """
 INSERT INTO {schema}.hook_runs
        (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at)
-VALUES (:id, :agent_id, :name, :slot, :version_id, 'skipped', now(), now())
+SELECT fire.id, :agent_id, :name, fire.slot, :version_id, 'skipped', now(), now()
+FROM unnest(CAST(:ids AS uuid[]), CAST(:slots AS timestamptz[])) AS fire(id, slot)
+WHERE true
 ON CONFLICT (agent_id, name, slot_utc) DO NOTHING
+RETURNING id
 """
 
 _DEFERRED_SQL = """
@@ -345,6 +361,7 @@ ORDER BY slot_utc
 _SETTLE_DEFERRED_SQL = """
 UPDATE {schema}.hook_runs SET outcome = CAST(:outcome AS text), ended_at = now()
 WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
+RETURNING outcome
 """
 
 # The reopen is a CAS on ``deferred``, so of two replicas retrying one slot
@@ -359,6 +376,7 @@ RETURNING id
 _FAIL_RUN_SQL = """
 UPDATE {schema}.hook_runs SET outcome = 'failed', ended_at = now()
 WHERE id = :id AND outcome IS NULL
+RETURNING id
 """
 
 
@@ -569,20 +587,22 @@ class CronSchedulerLoop:
             )
             slots = slots[-_MAX_SKIPPED_ROWS:]
         async with self._engine.begin() as conn:
-            await conn.execute(
-                self._skip_sql,
-                [
+            inserted = (
+                await conn.execute(
+                    self._skip_sql,
                     {
-                        "id": uuid.uuid4(),
+                        "ids": [uuid.uuid4() for _ in slots],
                         "agent_id": target.agent_id,
                         "name": name,
-                        "slot": slot,
+                        "slots": slots,
                         "version_id": target.version_id,
-                    }
-                    for slot in slots
-                ],
-            )
-        summary.skipped += len(slots)
+                    },
+                )
+            ).all()
+        for _ in inserted:
+            _record_fire("skipped")
+        summary.skipped += len(inserted)
+        summary.lost += len(slots) - len(inserted)
 
     async def _admit(
         self,
@@ -595,37 +615,53 @@ class CronSchedulerLoop:
         name = str(trigger["name"])
         if await self._is_killed(target.agent_id) or self._budget_spent(target):
             async with self._engine.begin() as conn:
-                await self._lock_and_reclaim(conn, target, name, slot, summary)
-                await self._insert(conn, target, name, slot, "blocked")
-            summary.blocked += 1
+                reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
+                run_id = await self._insert(conn, target, name, slot, "blocked")
+            for _ in range(reclaimed):
+                _record_fire("reclaimed")
+            if run_id is not None:
+                _record_fire("blocked")
+                summary.blocked += 1
+            else:
+                summary.lost += 1
             return
 
         try:
             handle = await self._reply_handle(target, trigger)
         except _UnboundTarget:
             async with self._engine.begin() as conn:
-                await self._lock_and_reclaim(conn, target, name, slot, summary)
-                await self._insert(conn, target, name, slot, "failed")
-            summary.failed += 1
+                reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
+                run_id = await self._insert(conn, target, name, slot, "failed")
+            for _ in range(reclaimed):
+                _record_fire("reclaimed")
+            if run_id is not None:
+                _record_fire("failed")
+                summary.failed += 1
+            else:
+                summary.lost += 1
             return
 
         async with self._engine.begin() as conn:
-            await self._lock_and_reclaim(conn, target, name, slot, summary)
+            reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
             paused_at, _, _ = await self._control(conn, target, name)
+            outcome: str | None
             if paused_at is not None:
-                await self._insert(conn, target, name, slot, "deferred")
-                return
-            if await self._blocked_by_in_flight(conn, target, name, slot):
-                await self._insert(
-                    conn, target, name, slot, "deferred" if defer_if_busy else "skipped"
-                )
-                if not defer_if_busy:
-                    summary.skipped += 1
-                return
-            run_id = await self._insert(conn, target, name, slot, None)
+                outcome = "deferred"
+            elif await self._blocked_by_in_flight(conn, target, name, slot):
+                outcome = "deferred" if defer_if_busy else "skipped"
+            else:
+                outcome = None
+            run_id = await self._insert(conn, target, name, slot, outcome)
+        for _ in range(reclaimed):
+            _record_fire("reclaimed")
         if run_id is None:
             # Another replica recorded this slot first.
             summary.lost += 1
+            return
+        if outcome is not None:
+            _record_fire(outcome)
+            if outcome == "skipped":
+                summary.skipped += 1
             return
 
         try:
@@ -642,7 +678,7 @@ class CronSchedulerLoop:
         name: str,
         slot: datetime,
         summary: CronPassSummary,
-    ) -> None:
+    ) -> int:
         """Take the hook's admission lock and reclaim its claims past their lease.
 
         Every fire of the hook does this, whatever it records for its own slot,
@@ -666,6 +702,7 @@ class CronSchedulerLoop:
                 reclaimed.rowcount,
             )
             summary.reclaimed += reclaimed.rowcount
+        return reclaimed.rowcount
 
     async def _blocked_by_in_flight(
         self,
@@ -754,7 +791,9 @@ class CronSchedulerLoop:
             await self._redis.xadd(self._stream, {STREAM_PAYLOAD_FIELD: turn.model_dump_json()})
         except Exception:
             async with self._engine.begin() as conn:
-                await conn.execute(self._fail_run_sql, {"id": run_id})
+                failed = (await conn.execute(self._fail_run_sql, {"id": run_id})).first()
+            if failed is not None:
+                _record_fire("failed")
             raise
 
     async def _retry_deferred(
@@ -783,35 +822,60 @@ class CronSchedulerLoop:
             expires_at = slot + catch_up_bound(schedule, zone, slot)
             if slot_is_stale(schedule, zone, slot, now):
                 async with self._engine.begin() as conn:
-                    await conn.execute(self._settle_deferred_sql, {**key, "outcome": "skipped"})
-                summary.skipped += 1
+                    settled = (
+                        await conn.execute(self._settle_deferred_sql, {**key, "outcome": "skipped"})
+                    ).first()
+                if settled is not None:
+                    _record_fire("skipped")
+                    summary.skipped += 1
+                else:
+                    summary.lost += 1
                 continue
             if await self._is_killed(target.agent_id) or self._budget_spent(target):
                 async with self._engine.begin() as conn:
-                    await conn.execute(self._settle_deferred_sql, {**key, "outcome": "blocked"})
-                summary.blocked += 1
+                    settled = (
+                        await conn.execute(self._settle_deferred_sql, {**key, "outcome": "blocked"})
+                    ).first()
+                if settled is not None:
+                    _record_fire("blocked")
+                    summary.blocked += 1
+                else:
+                    summary.lost += 1
                 continue
             try:
                 handle = await self._reply_handle(target, trigger)
             except _UnboundTarget:
                 async with self._engine.begin() as conn:
-                    await conn.execute(self._settle_deferred_sql, {**key, "outcome": "failed"})
-                summary.failed += 1
+                    settled = (
+                        await conn.execute(self._settle_deferred_sql, {**key, "outcome": "failed"})
+                    ).first()
+                if settled is not None:
+                    _record_fire("failed")
+                    summary.failed += 1
+                else:
+                    summary.lost += 1
                 continue
             async with self._engine.begin() as conn:
-                await self._lock_and_reclaim(conn, target, name, slot, summary)
+                reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
                 paused_at, _, _ = await self._control(conn, target, name)
-                if paused_at is not None:
-                    # The pause raced the pass. Leave the row deferred for a
-                    # later pass after resume.
-                    return
-                if await self._blocked_by_in_flight(conn, target, name, slot):
-                    # Another fire of this hook is live; stay deferred until it
-                    # settles or this slot ages out.
-                    continue
+                blocked = paused_at is not None or await self._blocked_by_in_flight(
+                    conn, target, name, slot
+                )
                 row = (
-                    await conn.execute(self._reopen_sql, {**key, "lease_s": self._claim_lease_s})
-                ).first()
+                    None
+                    if blocked
+                    else (
+                        await conn.execute(
+                            self._reopen_sql, {**key, "lease_s": self._claim_lease_s}
+                        )
+                    ).first()
+                )
+            for _ in range(reclaimed):
+                _record_fire("reclaimed")
+            if paused_at is not None:
+                return
+            if blocked:
+                continue
             if row is None:
                 # Another replica reopened or settled it first.
                 summary.lost += 1
@@ -865,9 +929,7 @@ class CronSchedulerLoop:
                     fire, skipped = plan_catch_up(str(schedule), zone, due, now)
                     await self._skip(target, str(name), skipped, summary)
                     if fire is not None:
-                        await self._admit(
-                            target, trigger, fire, summary, resume_from is not None
-                        )
+                        await self._admit(target, trigger, fire, summary, resume_from is not None)
                     if resume_from is not None:
                         async with self._engine.begin() as conn:
                             await conn.execute(

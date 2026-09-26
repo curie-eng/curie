@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -21,13 +22,35 @@ from aci_protocol import (
     TextDelta,
     TurnSource,
 )
+from curie_telemetry import record_metric
+from curie_worker import hook_runs as hook_runs_module
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.binding import BindingResolver
 from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore
-from curie_worker.hook_runs import HookRunRecorderError
+from curie_worker.hook_runs import HookRunRecorder, HookRunRecorderError
 from curie_worker.sandbox import QuotaRejection
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+def _capture_fire_metrics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    recorded: list[dict[str, str]] = []
+
+    def capture(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
+        record_metric(name, value, attributes=attributes)
+        if name == "curie.schedule.fire":
+            assert value == 1
+            assert attributes is not None
+            recorded.append(dict(attributes))
+
+    monkeypatch.setattr(hook_runs_module, "record_metric", capture)
+    return recorded
+
+
+def _fire_labels(outcome: str) -> dict[str, str]:
+    return {"service.name": "curie-worker", "outcome": outcome, "trigger": "cron"}
 
 
 def _event(
@@ -154,7 +177,10 @@ def test_completed_cron_turn_closes_the_run_as_ran(
     make_harness,
     make_hook_run,
     status: SessionStatus,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
+
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder()
@@ -168,6 +194,7 @@ def test_completed_cron_turn_closes_the_run_as_ran(
             assert outcome == "ran"
             assert ended_at is not None
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert fires == [_fire_labels(outcome)]
 
     asyncio.run(go())
 
@@ -175,11 +202,13 @@ def test_completed_cron_turn_closes_the_run_as_ran(
 def test_cron_turn_on_a_thread_with_a_live_session_records_deferred(
     make_harness,
     make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ADR-0099 Concurrency and idle (#2929): a cron fire whose thread holds a
     live interactive session neither steers it nor opens a second turn. The
     kernel's busy read runs under the per-thread lock, and the run is closed
     ``deferred`` so the scheduler, not stream reclaim, owns the retry."""
+    fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
@@ -205,6 +234,7 @@ def test_cron_turn_on_a_thread_with_a_live_session_records_deferred(
                 assert h.runner.steers == [], "a cron fire steered the live session"
                 assert h.runner.opened == [live.text], "a cron fire opened a second turn"
                 assert await h.async_redis.exists(h.config.done_key(cron.event_id))
+                assert fires == [_fire_labels(outcome)]
             finally:
                 hold.set()
                 await asyncio.gather(first, return_exceptions=True)
@@ -242,8 +272,10 @@ def test_cron_retry_past_its_catch_up_bound_records_skipped(
 def test_queued_cron_fire_is_rejected_after_operator_pause(
     make_harness,
     make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fire already in the stream must not start after pause commits."""
+    fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
@@ -263,6 +295,37 @@ def test_queued_cron_fire_is_rejected_after_operator_pause(
             assert outcome == "deferred"
             assert ended_at is not None
             assert h.runner.opened == []
+            assert fires == [_fire_labels("deferred")]
+
+    asyncio.run(go())
+
+
+def test_pause_after_runner_admission_does_not_defer_started_run(
+    make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later pause cannot turn an admitted fire into a retryable slot."""
+    fires = _capture_fire_metrics(monkeypatch)
+
+    async def go() -> None:
+        async with make_hook_run() as run:
+            recorder = HookRunRecorder(run.engine)
+            async with recorder.start_guard(run.ref) as allowed:
+                assert allowed
+            async with run.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.schedule_controls "
+                        "(agent_id, name, paused_at) VALUES (:agent_id, :name, now())"
+                    ),
+                    {"agent_id": run.agent_id, "name": run.ref.name},
+                )
+            state = await recorder.get(run.ref)
+            assert state is not None and state.outcome is None
+            assert await run.state() == (None, None)
+            await recorder.close(run.ref, "ran")
+            assert (await run.state() or (None, None))[0] == "ran"
+            assert fires == [_fire_labels("ran")]
 
     asyncio.run(go())
 
@@ -349,14 +412,34 @@ def test_cron_retry_whose_bound_runs_out_during_the_claim_records_skipped(
 def test_cron_retry_inside_its_catch_up_bound_runs(
     make_harness,
     make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The negative control: an unexpired retry runs and closes ``ran``."""
     from curie_worker.hook_runs import retry_event_id
+
+    fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder()
         ) as h:
+            await HookRunRecorder(run.engine).close(run.ref, "deferred")
+            deferred, ended_at = await run.state() or (None, None)
+            assert deferred == "deferred"
+            assert ended_at is not None
+            assert fires == [_fire_labels(deferred)]
+
+            async with run.engine.begin() as conn:
+                reopened = await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET outcome = NULL, ended_at = NULL "
+                        "WHERE id = :id AND outcome = 'deferred'"
+                    ),
+                    {"id": run.run_id},
+                )
+            assert reopened.rowcount == 1
+            assert await run.state() == (None, None)
+
             h.runner.default_script = [Final(text="done", status=SessionStatus.DONE)]
             later = datetime.now(UTC) + timedelta(minutes=5)
             event = _event(
@@ -367,6 +450,7 @@ def test_cron_retry_inside_its_catch_up_bound_runs(
 
             outcome, _ended_at = await run.state() or (None, None)
             assert outcome == "ran"
+            assert fires == [_fire_labels(deferred), _fire_labels(outcome)]
 
     asyncio.run(go())
 
@@ -374,7 +458,10 @@ def test_cron_retry_inside_its_catch_up_bound_runs(
 def test_classified_cron_failure_closes_failed_without_retry(
     make_harness,
     make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
+
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder(), max_attempts=3
@@ -393,6 +480,7 @@ def test_classified_cron_failure_closes_failed_without_retry(
             outcome, ended_at = await run.state() or (None, None)
             assert outcome == "failed"
             assert ended_at is not None
+            assert fires == [_fire_labels(outcome)]
 
     asyncio.run(go())
 
@@ -541,7 +629,10 @@ def test_noncron_turn_never_writes_a_supplied_hook_run(
     make_harness,
     make_hook_run,
     source: TurnSource,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
+
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder()
@@ -553,6 +644,7 @@ def test_noncron_turn_never_writes_a_supplied_hook_run(
             await h.kernel.process_event(_event(source=source, hook_run=run.ref))
 
             assert await run.state() == (None, None)
+            assert fires == []
 
     asyncio.run(go())
 
@@ -600,7 +692,10 @@ def test_cron_with_no_matching_row_refuses_before_runner_start(
 def test_terminal_hook_run_redelivery_never_starts_or_overwrites(
     make_harness,
     make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
+
     async def go() -> None:
         async with make_hook_run(outcome="failed") as run, make_harness(
             hook_runs=run.recorder()
@@ -611,6 +706,70 @@ def test_terminal_hook_run_redelivery_never_starts_or_overwrites(
 
             assert h.runner.opened == []
             assert await run.state() == before
+            assert fires == [], "redelivery cannot recount an existing result"
+
+    asyncio.run(go())
+
+
+def test_closing_the_same_run_twice_counts_one_durable_outcome(
+    make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
+
+    async def go() -> None:
+        async with make_hook_run() as run:
+            recorder = HookRunRecorder(run.engine)
+            await recorder.close(run.ref, "ran")
+            await recorder.close(run.ref, "ran")
+
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "ran"
+            assert ended_at is not None
+            assert fires == [_fire_labels(outcome)]
+
+    asyncio.run(go())
+
+
+def test_metric_failure_after_close_does_not_abort_kernel_completion(
+    make_harness,
+    make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[dict[str, str]] = []
+
+    def fail_metric(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
+        assert name == "curie.schedule.fire"
+        assert value == 1
+        assert attributes is not None
+        calls.append(dict(attributes))
+        raise RuntimeError("injected metric exporter failure")
+
+    monkeypatch.setattr(hook_runs_module, "record_metric", fail_metric)
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+            event = _event(hook_run=run.ref)
+
+            with caplog.at_level(logging.ERROR, logger="curie_worker.hook_runs"):
+                await h.kernel.process_event(event)
+
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "ran"
+            assert ended_at is not None
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert calls == [_fire_labels(outcome)]
+            assert any(
+                record.name == "curie_worker.hook_runs"
+                and "metric emission failed after outcome commit" in record.getMessage()
+                for record in caplog.records
+            )
 
     asyncio.run(go())
 
@@ -618,7 +777,10 @@ def test_terminal_hook_run_redelivery_never_starts_or_overwrites(
 def test_hook_run_database_failure_precedes_done_marker(
     make_harness,
     make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
+
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder()
@@ -630,6 +792,7 @@ def test_hook_run_database_failure_precedes_done_marker(
 
                 assert await run.state() == (None, None)
                 assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+                assert fires == [], "a failed commit cannot produce a result metric"
 
     asyncio.run(go())
 

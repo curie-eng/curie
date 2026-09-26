@@ -180,6 +180,45 @@ def test_every_metric_declares_a_finite_cardinality_contract() -> None:
         assert definition["cardinality_bound"] == calculated_bound, name
 
 
+def test_schedule_fire_counter_has_closed_run_outcome_and_trigger_domains() -> None:
+    definition = _read(_MANIFEST)["metrics"]["curie.schedule.fire"]
+    assert definition["type"] == "counter"
+    assert definition["monotonic"] is True
+    domains = definition["attributes"]
+    assert domains["service.name"] == ["curie-worker"]
+    assert set(domains["outcome"]) == {
+        "ran", "deferred", "skipped", "blocked", "reclaimed", "failed"
+    }
+    assert set(domains["trigger"]) == {"cron", "bind", "webhook", "test"}
+    assert set(domains) == {"service.name", "outcome", "trigger"}
+    assert definition["cardinality_bound"] == len(domains["outcome"]) * 4
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"agent.id": "agent-example"},
+        {"name": "nightly"},
+        {"slot_utc": "2026-09-22T03:00:00Z"},
+        {"outcome": "admitted"},
+        {"trigger": "other"},
+    ],
+)
+def test_schedule_fire_rejects_identity_and_uncommitted_labels(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+    extra: dict[str, str],
+) -> None:
+    del metrics
+    attributes = {
+        "service.name": "curie-worker",
+        "outcome": "ran",
+        "trigger": "cron",
+        **extra,
+    }
+    with pytest.raises(ValueError, match="undeclared attribute|outside its declared domain"):
+        record_metric("curie.schedule.fire", attributes=attributes)
+
+
 def test_sandbox_inventory_uses_one_aggregate_series_per_instrument() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     expected_attributes = {
