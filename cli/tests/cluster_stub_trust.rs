@@ -843,9 +843,9 @@ fn connected_dispatcher_uses_slack_placeholder_and_never_the_relay() {
     let state = fixture.state();
     assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
     let handle = &state["turns"][0]["payload"]["reply_handle"];
-    assert!(
-        handle["adapter"].is_null(),
-        "connected turn selected relay: {handle}"
+    assert_eq!(
+        handle["adapter"], "default",
+        "a connected turn speaks as the default identity, never the relay: {handle}"
     );
     assert!(
         handle["endpoint"].is_null(),
