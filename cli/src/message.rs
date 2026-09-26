@@ -837,8 +837,8 @@ pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String
     }
 }
 
-/// The Slack route a driver sends as when `--agent` names the agent
-/// (ADR-0168 decision 8).
+/// The Slack route a driver sends as when `--agent` names the agent.
+/// @spec ADR-0168 d8
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedRoute {
     pub channel: String,
@@ -4155,8 +4155,9 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Resolve the target agent's id for the trigger plane. Mirrors `select_channel`
 /// (explicit `--channel` matches an agent's channel, else the sole
 /// deployed agent), but returns the agent id the trigger endpoint keys on.
-/// An explicit `agent` (ADR-0168 decision 8) beats both: it names the agent
-/// directly, by name or id, the same match `select_agent_route` uses.
+/// An explicit `agent` beats both: it names the agent directly, by name or
+/// id, the same match `select_agent_route` uses.
+/// @spec ADR-0168 d8
 pub fn select_agent_id(
     agents: &[Agent],
     agent: Option<&str>,

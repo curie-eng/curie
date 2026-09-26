@@ -198,8 +198,9 @@ pub fn synthetic_turn(
     }
 }
 
-/// Stamp the identity a selected route speaks through (ADR-0168 decision 8).
-/// `None` leaves the turn exactly as minted.
+/// Stamp the identity a selected route speaks through. `None` leaves the turn
+/// exactly as minted.
+/// @spec ADR-0168 d8
 pub fn speak_as(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
     if let (Some(identity), Some(handle)) = (identity, turn.reply_handle.as_mut()) {
         handle.adapter = Some(identity.to_string());

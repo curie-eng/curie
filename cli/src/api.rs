@@ -1525,6 +1525,7 @@ fn agent_create_body(
 
 /// `adapter` as a request names it, with the default Slack identity dropped,
 /// the same reading [`ChannelBinding::named_adapter`] gives a stored binding.
+/// @spec ADR-0168 d8
 fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
     adapter.filter(|adapter| !(kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
 }
