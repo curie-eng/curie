@@ -200,10 +200,12 @@ def test_chunked_authenticated_body_is_rejected(
             f"status={status}"
         )
         if disconnect_attempts:
+            # stacklevel=1 attributes the warning to this warn call inside the
+            # test; stacklevel=2 would point one frame up, into pytest's runner.
             warnings.warn(
                 "chunked request received 400 only after RemoteDisconnected on "
                 f"attempt(s) {', '.join(str(number) for number in disconnect_attempts)}",
-                stacklevel=2,
+                stacklevel=1,
             )
         break
     else:
