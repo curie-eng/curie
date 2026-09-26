@@ -71,8 +71,9 @@ it slept through since the trigger's last recorded slot, it fires only the
 newest one and records every older one `skipped`. The newest is skipped as well
 when it is older than the schedule's own interval or 24 hours, whichever is
 shorter, so a weekly trigger that comes back two days late starts fresh. The
-scheduler looks back at most a year and records at most the newest 1000
-skipped slots per trigger, and a trigger with no recorded slot
+scheduler looks back at most 35 days and never past the agent's current
+deployment, records at most the newest 1000 skipped slots per trigger, and a
+trigger with no recorded slot
 never fires a slot from before the worker started.
 
 Approvals fail closed on targetless turns (#3007). A targetless turn has no

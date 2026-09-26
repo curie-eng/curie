@@ -52,6 +52,7 @@ class _Seed:
     engine: AsyncEngine
     agent_id: uuid.UUID
     version_id: uuid.UUID
+    deployment_id: uuid.UUID
     address: str
     slot: datetime
     bundle_ref: str
@@ -102,8 +103,7 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO curie.agents (id, name, max_usd_per_day) "
-                    "VALUES (:id, :name, :usd)"
+                    "INSERT INTO curie.agents (id, name, max_usd_per_day) VALUES (:id, :name, :usd)"
                 ),
                 {"id": agent_id, "name": f"cron_agent_{token}", "usd": max_usd_per_day},
             )
@@ -125,7 +125,7 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
                     "INSERT INTO curie.deployments "
                     "(id, agent_id, version_id, environment, status, deployed_at) "
                     "VALUES (:id, :agent_id, :version_id, "
-                    "CAST('prod' AS curie.environment), 'active', now())"
+                    "CAST('prod' AS curie.environment), 'active', now() - interval '30 days')"
                 ),
                 {"id": deployment_id, "agent_id": agent_id, "version_id": version_id},
             )
@@ -143,7 +143,15 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
                     "adapter": ADAPTER,
                 },
             )
-        yield _Seed(engine, agent_id, version_id, address, _slot(), f"bundles/cron_{token}.tar.gz")
+        yield _Seed(
+            engine,
+            agent_id,
+            version_id,
+            deployment_id,
+            address,
+            _slot(),
+            f"bundles/cron_{token}.tar.gz",
+        )
     finally:
         async with engine.begin() as conn:
             await conn.execute(
@@ -486,6 +494,7 @@ def test_bundle_attached_later_is_read_on_the_next_pass(
                     agent_name="doesnotmatter",
                     version_id=seed.version_id,
                     bundle_ref=bundle_ref,
+                    deployed_at=None,
                     max_usd_per_day=None,
                     max_output_tokens_per_run=None,
                 )
@@ -571,5 +580,39 @@ def test_restarted_loop_fires_nothing_for_a_slot_past_the_age_bound(
                 (missed + timedelta(weeks=1), "skipped"),
             ]
             assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+def test_catch_up_never_reaches_back_past_the_in_force_deployment(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A slot from before the deployment belonged to whatever schedule ran then."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            last = seed.slot - timedelta(hours=3)
+            await seed.add_run(last, last)
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET outcome = 'ran', ended_at = now() "
+                        "WHERE agent_id = :a"
+                    ),
+                    {"a": seed.agent_id},
+                )
+                await conn.execute(
+                    text("UPDATE curie.deployments SET deployed_at = :at WHERE id = :id"),
+                    {"at": seed.slot - timedelta(minutes=90), "id": seed.deployment_id},
+                )
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+            await _pass_once(seed, names["stream"], trigger)
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [
+                (last, "ran"),
+                (seed.slot - timedelta(hours=1), "skipped"),
+                (seed.slot, None),
+            ]
+            assert len(_entries(sync_redis, names["stream"])) == 1
 
     asyncio.run(body())

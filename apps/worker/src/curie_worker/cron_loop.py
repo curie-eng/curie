@@ -21,8 +21,9 @@ restarted worker still sees the slots it slept through. It fires only the
 newest due slot and records every older one ``skipped``. The newest is skipped
 too once it is older than the schedule's own interval or ``CATCH_UP_CEILING``,
 whichever is shorter. A hook with no recorded slot never fires a slot from
-before this worker started. The reach back stops at ``_CATCH_UP_LOOKBACK`` and
-one pass records at most ``_MAX_SKIPPED_ROWS`` skipped slots per hook.
+before this worker started, and no hook reaches back past its deployment. The
+reach back stops at ``_CATCH_UP_LOOKBACK`` and one pass records at most
+``_MAX_SKIPPED_ROWS`` skipped slots per hook.
 
 **One hook's failure ends with that hook.** An exception while reading one
 agent's triggers, or resolving or admitting one hook, is caught and logged, and
@@ -81,9 +82,10 @@ _STALE_SLACK_S = 60.0
 CATCH_UP_CEILING = timedelta(hours=24)
 
 # How far back a restarted worker looks for slots it slept through. It bounds
-# the slot enumeration, not the record: a monthly hook down four weeks still
-# gets its missed slot recorded.
-_CATCH_UP_LOOKBACK = timedelta(days=366)
+# the slot enumeration (a minute schedule enumerates about 50,000 slots at
+# most) while a monthly hook down four weeks still gets its missed slot
+# recorded.
+_CATCH_UP_LOOKBACK = timedelta(days=35)
 
 # The most skipped rows one pass writes for one hook, newest kept. A minute
 # schedule down for days would otherwise write thousands of rows in one pass.
@@ -237,6 +239,7 @@ SELECT DISTINCT ON (a.id)
        a.name AS agent_name,
        v.id AS version_id,
        v.bundle_ref AS bundle_ref,
+       d.deployed_at AS deployed_at,
        a.max_usd_per_day AS max_usd_per_day,
        a.max_output_tokens_per_run AS max_output_tokens_per_run
 FROM {schema}.agents a
@@ -305,6 +308,7 @@ class _Target:
     agent_name: str
     version_id: uuid.UUID
     bundle_ref: str | None
+    deployed_at: datetime | None
     max_usd_per_day: float | None
     max_output_tokens_per_run: int | None
 
@@ -376,6 +380,7 @@ class CronSchedulerLoop:
                 agent_name=row["agent_name"],
                 version_id=row["version_id"],
                 bundle_ref=row["bundle_ref"],
+                deployed_at=row["deployed_at"],
                 max_usd_per_day=row["max_usd_per_day"],
                 max_output_tokens_per_run=row["max_output_tokens_per_run"],
             )
@@ -434,7 +439,11 @@ class CronSchedulerLoop:
     async def _window_start(
         self, target: _Target, name: str, window_start: datetime, now: datetime
     ) -> datetime:
-        """The pass window's start, reaching back to the hook's last slot."""
+        """The pass window's start, reaching back to the hook's last slot.
+
+        The reach back never passes the in-force deployment: a slot from
+        before it belongs to whatever schedule was deployed then.
+        """
 
         async with self._engine.connect() as conn:
             last = (
@@ -442,7 +451,10 @@ class CronSchedulerLoop:
             ).scalar()
         if not isinstance(last, datetime) or last >= window_start:
             return window_start
-        return max(last, now - _CATCH_UP_LOOKBACK)
+        floor = now - _CATCH_UP_LOOKBACK
+        if target.deployed_at is not None:
+            floor = max(floor, target.deployed_at)
+        return min(window_start, max(last, floor))
 
     async def _skip(
         self, target: _Target, name: str, slots: list[datetime], summary: CronPassSummary
