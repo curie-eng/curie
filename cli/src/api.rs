@@ -1533,8 +1533,7 @@ fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
 /// A binding write the platform refused over the identity it names.
 ///
 /// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
-/// identity, or a database that cannot yet store one), so it is carried
-/// verbatim rather than restated.
+/// identity, for instance), so it is carried verbatim rather than restated.
 fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
     let detail = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1582,13 +1581,11 @@ fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
 /// it speaks through. Pure so the shape is testable without a live API. The
 /// kind is never inferred -- a channel-neutral binding carries it explicitly.
 ///
-/// `adapter` alone (no `endpoint`) names a Slack identity (ADR-0168 decision
-/// 3): Slack is an in-process ingress, so it has no transport to configure.
-/// `endpoint` and `adapter` together are the pre-ADR custom-transport form,
-/// still both-or-neither for a non-Slack ingress -- `ChannelChange::resolve`
-/// refuses a non-Slack `adapter` with no `endpoint` before this function ever
-/// sees the arguments, and clap's `--endpoint` `requires` `--adapter` covers
-/// the other direction.
+/// `adapter` alone names a Slack identity (ADR-0168 decision 3); a non-Slack
+/// route sends `endpoint` and `adapter` together. `ChannelChange::resolve`
+/// refuses a Slack `endpoint`, and a non-Slack `adapter` with no `endpoint`,
+/// before this function ever sees the arguments, and clap's `--endpoint`
+/// `requires` `--adapter` covers the other direction.
 fn add_channel_body(
     kind: &str,
     address: &str,
