@@ -35,7 +35,7 @@ from _support import (
     wait_for_healthz,
     wait_until,
 )
-from curie_mail_adapter.adapter import EVENT_MARKER, MailAdapter
+from curie_mail_adapter.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
 from curie_mail_adapter.agentmail import AgentMailClient
 from curie_mail_adapter.config import MailAdapterConfig
 
@@ -803,3 +803,48 @@ def test_version_one_state_migrates_without_losing_admitted_or_delivered_replies
         assert len(mail.replies) == 1
     finally:
         replacement.close()
+
+
+# --- a dropped turn with nothing to say sends nothing (ADR-0168 decision 6) ---
+
+
+def test_a_dropped_completion_with_no_text_sends_no_email(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """Mailing the empty-reply notice would be a new message to the sender.
+
+    When the sender is another of the installation's inboxes, that notice is the
+    next turn of the exchange the worker's sibling limit just ended.
+    """
+    seed(mail, adapter)
+
+    for _ in range(2):
+        status, _ = post_event(egress_url, completed("ev-drop", outcome="dropped"))
+        assert status == 200
+
+    assert mail.replies == []
+
+
+def test_a_dropped_completion_that_said_something_still_sends_it(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    post_event(egress_url, update("This agent is paused by an operator."))
+
+    status, _ = post_event(egress_url, completed("ev-paused", outcome="dropped"))
+
+    assert status == 200
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith("This agent is paused by an operator.")
+
+
+def test_a_delivered_completion_with_no_text_still_sends_the_empty_reply_notice(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+
+    status, _ = post_event(egress_url, completed("ev-empty"))
+
+    assert status == 200
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith(EMPTY_REPLY_TEXT)

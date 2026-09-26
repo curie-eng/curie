@@ -1765,6 +1765,13 @@ A worker holding no token for the identity a turn names drops the turn before
 it runs, logs the identity, and leaves the placeholder as the dispatcher posted
 it: it never answers as another bot.
 
+A second identity also puts a rate limit on fan-out between siblings (ADR-0168
+decision 6): 5 sibling-written turns per session key, and 5 conversations
+opened per ordered identity pair, both in a 600 s window. A bot fanning work
+out to a sibling across more than 5 threads in ten minutes is cut off past the
+fifth, and the drop is visible on Slack as the placeholder edited to a notice
+that names nobody, so the exchange cannot restart itself.
+
 ### The connector caller key pair
 
 The worker signs each sandbox's connector caller token (ADR-0168 decision 7)

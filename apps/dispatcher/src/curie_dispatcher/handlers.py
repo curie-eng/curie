@@ -14,7 +14,9 @@ silent, which is the defect that ticket closes.
     processed, at root or in a thread. A *bot*-authored mention is processed
     at root; one carrying ``thread_ts`` requires an exact sender/channel pair
     in ``CURIE_SLACK_THREADED_BOT_ALLOWLIST`` or is refused as
-    ``BOT_AUTHORED_THREAD_REPLY``, because Curie's own replies are always
+    ``BOT_AUTHORED_THREAD_REPLY``, unless it comes from another of this
+    installation's own identities, whose bot ids preflight's ``auth.test``
+    reported (ADR-0168 decision 6), because Curie's own replies are always
     threaded and two installations in one workspace could otherwise mention-loop
     each other -- a case Bolt's self filter cannot see, since the two bot
     identities differ.
@@ -44,7 +46,7 @@ not the dispatcher's.
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -314,6 +316,7 @@ def process_event(
     config: DispatcherConfig,
     slack_identity: str,
     bot_user_id: str | None = None,
+    identity_bots: Mapping[str, str] | None = None,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
 ) -> str | None:
@@ -327,6 +330,13 @@ def process_event(
     is fixed when the listener is registered, and nothing in ``body`` or
     ``event`` can change it. It has no default, so a lane that forgets to pass
     it fails instead of minting ``default``'s turn.
+
+    ``identity_bots`` maps the bot id of each identity this installation connects
+    to its bot user id, from preflight's ``auth.test`` (ADR-0168 decision 6). A
+    delivery from one of those bots is admitted in a thread, and its author is
+    that bot user, never the event's ``user``, so the worker's sibling limit can
+    recognise it. That bot user is what an approval this turn raises later
+    shows as "Requested by", and what the agent sees as the turn's ``user``.
 
     Returns the Valkey Stream id when a job was enqueued, or None when the event
     was refused. Every refusal is logged with its enumerated ``DropReason``.
@@ -359,8 +369,12 @@ def process_event(
         )
         return None
 
+    bots = identity_bots or {}
     reason = classify(
-        event, lane=lane, threaded_bot_allowlist=config.slack_threaded_bot_allowlist
+        event,
+        lane=lane,
+        threaded_bot_allowlist=config.slack_threaded_bot_allowlist,
+        identity_bot_ids=bots.keys(),
     )
     if reason is not None:
         drop(log, reason, event_id=slack_event_id, lane=lane)
@@ -371,6 +385,10 @@ def process_event(
         kind=SpanKind.CONSUMER,
         attributes={"service.name": "curie-dispatcher", "source": "dispatcher"},
     ):
+        sender_bot = event.get("bot_id")
+        author = (
+            bots.get(sender_bot, "") if isinstance(sender_bot, str) else ""
+        ) or str(event.get("user") or "")
         delivery_id = delivery_key(slack_event_id, slack_identity)
         if not claim_event(redis_client, config, delivery_id):
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
@@ -384,7 +402,7 @@ def process_event(
             clock=clock,
             slack_event_id=delivery_id,
             delivery_kind="slack event",
-            author=event.get("user", ""),
+            author=author,
             # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
             # carries an empty or fallback-only top-level `text` and its real body in
             # `blocks`/`attachments`, so that read emptied the turn while still
@@ -539,12 +557,13 @@ def register_handlers(
     logger: logging.Logger | None = None,
     resolver: ApprovalResolveClient | None = None,
     slack_identity: str = DEFAULT_IDENTITY,
+    identity_bots: Mapping[str, str] | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
     injectable for tests; None builds the production client from config.
     ``slack_identity`` is the identity this app is; every turn either lane
-    mints carries it."""
+    mints carries it. ``identity_bots`` is passed to both lanes' ``process_event``."""
 
     approval_resolver = resolver if resolver is not None else build_resolver(config)
     # Resolved once here rather than per listener: the lane filter below drops
@@ -565,6 +584,7 @@ def register_handlers(
             config=config,
             slack_identity=slack_identity,
             bot_user_id=context.get("bot_user_id"),
+            identity_bots=identity_bots,
             clock=clock,
             logger=logger,
         )
@@ -597,6 +617,7 @@ def register_handlers(
             config=config,
             slack_identity=slack_identity,
             bot_user_id=context.get("bot_user_id"),
+            identity_bots=identity_bots,
             clock=clock,
             logger=logger,
         )

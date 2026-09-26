@@ -148,6 +148,7 @@ from .sandbox.types import (
     SuspendedThreadError,
     UnschedulableClaimError,
 )
+from .sibling_turns import SIBLING_LIMIT_NOTICE, SiblingLimitReason, SiblingTurnLimit
 from .slack_tokens import token_identity
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .workitem_dispatch import (
@@ -1360,6 +1361,7 @@ class Kernel:
         route_ttl_seconds: int = 3600,
         suspended_route_ttl_seconds: int = 86400,
         work_items: WorkItemDispatchClient | None = None,
+        sibling_limit: SiblingTurnLimit | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -1408,6 +1410,10 @@ class Kernel:
         self._route_ttl_seconds = route_ttl_seconds
         self._suspended_route_ttl_seconds = suspended_route_ttl_seconds
         self._work_items = work_items
+        # ADR-0168 decision 6: counts turns the installation's own identities
+        # write to each other. None on an install with no sibling, which then
+        # makes no call for it at all.
+        self._sibling_limit = sibling_limit
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
@@ -2149,6 +2155,22 @@ class Kernel:
                     hook_outcome="failed",
                 )
                 return
+
+            # ADR-0168 decision 6: a turn one of this installation's own
+            # identities wrote counts against the sibling limit, and past it
+            # ends here, before a binding lookup, a shimmer, a claim or a model
+            # call. A job never counts: siblings speak through chat.
+            if self._sibling_limit is not None and not targetless and not qevent.source.is_job:
+                assert handle is not None
+                limited = await self._sibling_limit.check(
+                    kind=handle.kind,
+                    adapter=handle.adapter,
+                    author=qevent.author,
+                    session_key=thread_key,
+                )
+                if limited is not None:
+                    await self._drop_sibling_turn(qevent, route, limited, lease=lease)
+                    return
 
             # Deployment-to-runtime binding: resolve which agent/version this
             # channel runs, and refuse a killed agent. An unmapped channel is a
@@ -3248,6 +3270,45 @@ class Kernel:
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
         await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease)
+
+    async def _drop_sibling_turn(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        reason: SiblingLimitReason,
+        *,
+        lease: DeliveryLease | None = None,
+    ) -> None:
+        """Complete a turn the sibling limit refused (ADR-0168 decision 6).
+
+        The placeholder is edited only where an update edits a message the
+        reader already sees. On a buffered channel the text would go out as a
+        new message, which is the next turn of the exchange this ends. The
+        route is the handle's, so the edit is made by the identity that posted
+        the placeholder.
+        """
+        logger.warning(
+            "dropping event %s from a sibling identity: %s", qevent.event_id, reason.value
+        )
+        handle = qevent.reply_handle
+        if (
+            handle is not None
+            and handle.placeholder is not None
+            and self._sink.edits_in_place(handle.kind, route)
+        ):
+            try:
+                await self._reply_for(qevent, route, SIBLING_LIMIT_NOTICE)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "the sibling-limit notice for event %s could not be delivered",
+                    qevent.event_id,
+                    exc_info=True,
+                )
+        await self._complete(
+            qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease
+        )
 
     async def _reply(
         self,

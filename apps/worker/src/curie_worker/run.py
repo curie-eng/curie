@@ -79,6 +79,7 @@ from .sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
@@ -480,6 +481,12 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         client=eval_http,
     )
     sink = build_reply_sink(config, slack_tokens=slack_tokens)
+    # ADR-0168 decision 6. None unless a sibling identity can exist here, so a
+    # stock install asks no auth.test, reads no binding and makes no Valkey
+    # call for it.
+    sibling_limit = build_sibling_limit(
+        config, async_redis, slack_tokens=slack_tokens, channel=binding
+    )
     card_store = ApprovalCardStore(async_redis, config)
     work_items = (
         WorkItemDispatchClient(
@@ -539,6 +546,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
+        sibling_limit=sibling_limit,
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)

@@ -296,6 +296,18 @@ JOIN {schema}.agent_channels c ON c.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
 """
 
+# ADR-0168 decision 6: the identity bound at an address, if any. A channel-port
+# identity is one adapter deployment on one address and writes as that
+# address. Case-insensitive because the mail adapter lowercases a sender
+# (`curie_mail_adapter.adapter._bare_address`).
+_ADDRESS_IDENTITY_SQL = """
+SELECT c.adapter AS adapter
+FROM {schema}.agent_channels c
+WHERE c.kind = :kind AND lower(c.address) = lower(:address) AND c.adapter IS NOT NULL
+ORDER BY c.adapter
+LIMIT 1
+"""
+
 
 class ResolvedDeployment(BaseModel):
     """The agent binding for a channel: which version to run and its budget."""
@@ -451,6 +463,9 @@ class BindingResolver:
             _UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema)
         )
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
+        self._address_identity_sql = text(
+            _ADDRESS_IDENTITY_SQL.format(schema=config.db_schema)
+        )
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
@@ -512,6 +527,15 @@ class BindingResolver:
         if not matches:
             return None
         return BoundAgent.model_validate(dict(matches[0]._mapping))
+
+    async def identity_for_address(self, kind: str, address: str) -> str | None:
+        """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                self._address_identity_sql, {"kind": kind, "address": address}
+            )
+            value = result.scalar()
+        return value if isinstance(value, str) and value else None
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""

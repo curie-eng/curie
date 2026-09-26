@@ -34,7 +34,7 @@ lane and no subtype, and ``BindingResolver.resolve`` receives only
 """
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Literal
@@ -91,7 +91,8 @@ DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
             "a thread timestamp would let two Curie installations in one workspace "
             "mention-loop each other indefinitely, which Bolt's self filter cannot "
             "stop because the two bot identities differ. Only an explicitly trusted "
-            "sender/channel pair may bypass this refusal."
+            "sender/channel pair, or another of this installation's own identities, "
+            "whose exchange the worker rate limits, may bypass this refusal."
         ),
         DropReason.NON_CONTENT_SUBTYPE: (
             "The subtype marks something other than new user content: an edit, a "
@@ -199,6 +200,7 @@ def classify(
     *,
     lane: Lane,
     threaded_bot_allowlist: tuple[ThreadedBotAdmission, ...] = (),
+    identity_bot_ids: Collection[str] = (),
 ) -> DropReason | None:
     """The reason this event must not become a turn, or None to admit it.
 
@@ -206,6 +208,10 @@ def classify(
         event: The Slack event body as delivered.
         lane: Which subscribed lane it arrived on. The bot-authorship rule is
             lane-specific, so this cannot be inferred from the event alone.
+        identity_bot_ids: The bot ids of this installation's own Slack
+            identities (ADR-0168 decision 6). A thread mention from one of
+            them is admitted without an allowlist entry; the worker's
+            sibling limit bounds the exchange.
 
     Returns:
         A :class:`DropReason` when the event is refused, else None.
@@ -225,8 +231,10 @@ def classify(
     # Only an exact pair from operator configuration may bypass this refusal.
     # These identities come from the Slack event, never message text or a user
     # field. Bolt's self-event middleware has already run and remains mandatory.
+    # A sibling identity's bot (ADR-0168 decision 6) is admitted too; its id
+    # comes from preflight's auth.test, never the event.
     if lane == "mention" and event.get("bot_id") and event.get("thread_ts"):
-        if not any(
+        if event.get("bot_id") not in identity_bot_ids and not any(
             pair.channel_id == event.get("channel") and pair.bot_id == event.get("bot_id")
             for pair in threaded_bot_allowlist
         ):

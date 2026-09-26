@@ -254,6 +254,12 @@ class ObservedReplySink:
         reason: str | None = check(kind, route)
         return reason
 
+    def edits_in_place(self, kind: str, route: TargetRoute) -> bool:
+        """The wrapped sink's answer, or False when it cannot tell."""
+
+        check = getattr(self._sink, "edits_in_place", None)
+        return bool(check(kind, route)) if check is not None else False
+
 
 class HttpReplyAdapter:
     """Delivers neutral JSON events to a binding's server-controlled endpoint.
@@ -646,6 +652,19 @@ class ReplySinkRouter:
             return None
         reason: str | None = check(kind, route)
         return reason
+
+    def edits_in_place(self, kind: str, route: TargetRoute) -> bool:
+        """Whether an update on ``kind`` edits a visible message, not buffered text.
+
+        False for the relay and for any adapter without the hook: a buffered
+        adapter sends its text as a new message when the turn completes.
+        """
+
+        if route.adapter == CLUSTER_MESSAGE_ADAPTER:
+            return False
+        sink = self._adapters.get(kind, self._default)
+        check = getattr(sink, "edits_in_place", None)
+        return bool(check(kind, route)) if check is not None else False
 
     async def aclose(self) -> None:
         """Release every adapter that holds a connection of its own.
