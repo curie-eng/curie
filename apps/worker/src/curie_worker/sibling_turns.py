@@ -87,6 +87,12 @@ class SlackSenderIdentities:
     Asked lazily, on the first lookup, so a worker whose Slack is unreachable
     still boots; an identity that did not answer is asked again no sooner than
     ``retry_after_s`` later, and until then its turns are not counted.
+
+    ``identity_of`` never waits on ``auth.test``: a person's Slack turn must
+    not pay for a sibling's lookup (ADR-0168 decision 6, finding 4). While an
+    identity's bot user is not yet known, or a refresh is already in flight,
+    the answer is None -- fail open, treated as not-sibling -- and a refresh
+    runs in the background so a later turn is counted once it lands.
     """
 
     def __init__(
@@ -106,29 +112,33 @@ class SlackSenderIdentities:
         self._by_user: dict[str, str] = {}
         self._known: set[str] = set()
         self._next_try: dict[str, float] = {}
-        self._lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
 
     @property
     def identities(self) -> tuple[str, ...]:
         return tuple(self._tokens)
 
     async def identity_of(self, author: str) -> str | None:
-        if self._due():
-            async with self._lock:
-                due = self._due()
-                answers = await asyncio.gather(*(self._ask(name) for name in due))
-                for name, user_id in zip(due, answers, strict=True):
-                    if user_id is None:
-                        self._next_try[name] = self._clock() + self._retry_after_s
-                        logger.warning(
-                            "Slack identity %s: auth.test did not answer; turns its bot "
-                            "writes are not counted against the sibling limit yet",
-                            name,
-                        )
-                        continue
-                    self._known.add(name)
-                    self._by_user[user_id] = name
+        if self._due() and (self._refresh_task is None or self._refresh_task.done()):
+            self._refresh_task = asyncio.create_task(self._refresh())
         return self._by_user.get(author)
+
+    async def _refresh(self) -> None:
+        due = self._due()
+        if not due:
+            return
+        answers = await asyncio.gather(*(self._ask(name) for name in due))
+        for name, user_id in zip(due, answers, strict=True):
+            if user_id is None:
+                self._next_try[name] = self._clock() + self._retry_after_s
+                logger.warning(
+                    "Slack identity %s: auth.test did not answer; turns its bot "
+                    "writes are not counted against the sibling limit yet",
+                    name,
+                )
+                continue
+            self._known.add(name)
+            self._by_user[user_id] = name
 
     def _due(self) -> list[str]:
         now = self._clock()

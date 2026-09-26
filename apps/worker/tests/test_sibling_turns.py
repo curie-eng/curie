@@ -281,6 +281,18 @@ def test_the_channel_port_counts_a_bound_address_whatever_its_case(
     asyncio.run(go())
 
 
+async def _settle(senders: SlackSenderIdentities) -> None:
+    """Wait out a background ``auth.test`` refresh ``identity_of`` started.
+
+    ``identity_of`` never awaits the round trip itself (finding 4); a test
+    that wants the landed answer waits for the task it kicked off instead.
+    """
+
+    task = senders._refresh_task
+    if task is not None:
+        await task
+
+
 def test_each_identity_is_named_by_its_own_bot_user_and_asked_once() -> None:
     async def go() -> None:
         capture = _AuthTest(
@@ -294,6 +306,8 @@ def test_each_identity_is_named_by_its_own_bot_user_and_asked_once() -> None:
                 base_url=f"http://127.0.0.1:{server.port}/slack/api/",
             )
             assert senders.identities == ("default", "ops-bot")
+            assert await senders.identity_of(_DEFAULT_USER) is None
+            await _settle(senders)
             assert await senders.identity_of(_DEFAULT_USER) == "default"
             assert await senders.identity_of(_OPS_USER) == "ops-bot"
             assert await senders.identity_of(_PERSON) is None
@@ -323,14 +337,18 @@ def test_an_identity_auth_test_did_not_answer_is_asked_again_only_after_the_inte
             )
             with caplog.at_level(logging.WARNING, logger="curie_worker.sibling_turns"):
                 assert await senders.identity_of(_OPS_USER) is None
+                await _settle(senders)
             assert len(capture.calls) == 2
             text = "\n".join(caplog.messages)
             assert "ops-bot" in text and _OPS_TOKEN not in text
             now[0] += 299.0
             assert await senders.identity_of(_OPS_USER) is None
+            await _settle(senders)
             assert len(capture.calls) == 2
             capture.users[f"Bearer {_OPS_TOKEN}"] = _OPS_USER
             now[0] += 2.0
+            assert await senders.identity_of(_OPS_USER) is None
+            await _settle(senders)
             assert await senders.identity_of(_OPS_USER) == "ops-bot"
             assert len(capture.calls) == 3
         finally:

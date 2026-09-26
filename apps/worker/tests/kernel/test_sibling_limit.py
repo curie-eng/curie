@@ -249,6 +249,23 @@ async def _ran(h: Any, ev: QueuedTurn) -> bool:
     return len(h.runner.opened) > before
 
 
+async def _warm_slack_identities(h: Any, *authors: str) -> None:
+    """Resolve each bot user before a counted burst.
+
+    ``identity_of`` never blocks on ``auth.test`` (finding 4): a turn checked
+    while an identity is still unknown fails open and is not counted. Warming
+    the cache first mirrors a worker that has already seen this identity
+    resolve, so the burst below is counted from its first turn.
+    """
+
+    slack = h.kernel._sibling_limit.slack
+    for author in authors:
+        await slack.identity_of(author)
+    task = slack._refresh_task
+    if task is not None:
+        await task
+
+
 def test_only_the_slack_adapter_edits_in_place() -> None:
     router = _mail_sink()
     assert router.edits_in_place("slack", TargetRoute()) is True
@@ -278,6 +295,7 @@ def test_two_slack_identities_answering_each_other_in_one_thread_stop_at_the_lim
                 sibling_limit_factory=_slack_limit(port),
             ) as h:
                 h.runner.default_script = [Final(text="answer", status=DONE)]
+                await _warm_slack_identities(h, _DEFAULT_USER, _OPS_USER)
                 turns = [
                     _slack_turn(
                         f"hop {hop}",
@@ -325,6 +343,7 @@ def test_one_slack_identity_opening_conversation_after_conversation_stops_at_the
                 sibling_limit_factory=_slack_limit(port),
             ) as h:
                 h.runner.default_script = [Final(text="answer", status=DONE)]
+                await _warm_slack_identities(h, _DEFAULT_USER, _OPS_USER)
                 turns = [
                     _slack_turn(
                         f"new thread {n}",
