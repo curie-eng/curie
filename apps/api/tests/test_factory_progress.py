@@ -738,9 +738,11 @@ def test_a_ci_fix_keeps_diff_approved_while_ci_loop_is_live() -> None:
         _reports_of(
             ("implement", 1),
             ("review_diff", 1),
+            ("implement", 2),
+            ("review_diff", 2),
             ("publish", None),
             ("wait_ci", None),
-            ("implement", 2),
+            ("implement", 3),
         ),
         "running",
         None,
@@ -749,8 +751,9 @@ def test_a_ci_fix_keeps_diff_approved_while_ci_loop_is_live() -> None:
     ci = _loop(view, "implement", "wait_ci")
     labels = {stage.id: stage.round_label for stage in view.stages}
     assert view.current == "implement"
-    assert (diff.approved, diff.active, diff.kickbacks) == (True, False, 0)
-    assert labels["review_diff"] == "approved · 1 round"
+    assert (diff.approved, diff.active, diff.kickbacks) == (True, False, 1)
+    assert _stage_states(view)["review_diff"] == "done"
+    assert labels["review_diff"] == "approved · 2 rounds"
     assert (ci.active, ci.kickbacks, ci.round) == (True, 1, 2)
     assert labels["wait_ci"] == "round 2 of 3"
 
