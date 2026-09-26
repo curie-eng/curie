@@ -34,7 +34,7 @@ use crate::chat::{
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
-    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn,
+    self, connect, diagnostics, eval_case_turn, queue_thread_reset, speak_as, synthetic_turn,
     thread_key_for_turn, xadd,
 };
 use crate::state::{save_turn, TurnContext, TurnVerb};
@@ -148,6 +148,7 @@ fn resolve_supplied_credential(raw: &str, env_value: Option<String>) -> String {
 /// as a positional and the two-positional trap fires on a valid invocation.
 const MESSAGE_VALUE_FLAGS: &[&str] = &[
     "--channel",
+    "--agent",
     "--thread",
     "--namespace",
     "--release",
@@ -208,9 +209,9 @@ pub fn reject_agent_named_message(args: &[String]) -> Option<anyhow::Error> {
              <AGENT> <TEXT> is the shape of {siblings}, not this verb."
         ))
         .with_fix(format!(
-            "Pass only the message text. Route with `--channel <CHANNEL>`, or omit \
-             `--channel` when exactly one channel is bound. Example: `curie {verb} \
-             'Who are you?'`"
+            "Pass only the message text. Route with `--agent <AGENT>` or `--channel \
+             <CHANNEL>`, or omit both when exactly one channel is bound. Example: `curie \
+             {verb} 'Who are you?'`"
         )),
     ))
 }
@@ -396,6 +397,8 @@ pub const API_REMOTE_PORT: u16 = 8000;
 pub struct MessageOpts {
     pub text: String,
     pub channel: Option<String>,
+    /// `--agent`: send as this agent's binding (ADR-0168 decision 8).
+    pub agent: Option<String>,
     pub thread: Option<String>,
     pub namespace: String,
     pub release: String,
@@ -427,14 +430,16 @@ pub struct MessageOpts {
 /// sentinel comparison against [`DEFAULT_API_KEY`] in
 /// [`crate::state::apply_continue`] that issue #540 exists to protect.
 ///
-/// The genuinely-empty fields (`text`, `channel`, `thread`, `listen_host`,
-/// `user`, `stream`, `dry_run`, `local`, `api_url`) have no crate-level default:
+/// The genuinely-empty fields (`text`, `channel`, `agent`, `thread`,
+/// `listen_host`, `user`, `stream`, `dry_run`, `local`, `api_url`) have no
+/// crate-level default:
 /// they are per-invocation values a caller must supply.
 impl Default for MessageOpts {
     fn default() -> Self {
         Self {
             text: String::new(),
             channel: None,
+            agent: None,
             thread: None,
             namespace: "curie".to_string(),
             release: "curie".to_string(),
@@ -832,6 +837,142 @@ pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String
     }
 }
 
+/// The Slack route a driver sends as when `--agent` names the agent.
+/// @spec ADR-0168 d8
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedRoute {
+    pub channel: String,
+    /// The binding's identity when it is not the default.
+    pub identity: Option<String>,
+    pub agent: String,
+}
+
+/// Pick `agent` (name or id) and its one Slack binding, narrowed by `channel`.
+/// @spec ADR-0168 d8.
+pub fn select_agent_route(
+    agents: &[Agent],
+    agent: &str,
+    channel: Option<&str>,
+) -> Result<SelectedRoute> {
+    let Some(found) = agents.iter().find(|a| a.name == agent || a.id == agent) else {
+        let deployed = agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
+        return Err(crate::exit::usage(format!(
+            "no deployed agent is named {agent:?} (deployed: {})",
+            if deployed.is_empty() {
+                "none".to_string()
+            } else {
+                deployed.join(", ")
+            }
+        )));
+    };
+    let routes: Vec<&crate::api::ChannelBinding> = found
+        .channels
+        .iter()
+        .filter(|b| b.kind == "slack" && channel.is_none_or(|c| b.address == c))
+        .collect();
+    let describe = |b: &crate::api::ChannelBinding| match b.named_adapter() {
+        Some(identity) => format!("{} as {identity}", b.address),
+        None => b.address.clone(),
+    };
+    match routes.as_slice() {
+        [only] => Ok(SelectedRoute {
+            channel: only.address.clone(),
+            identity: only.named_adapter().map(str::to_string),
+            agent: found.name.clone(),
+        }),
+        [] => Err(crate::exit::usage(format!(
+            "agent {} has no Slack binding{}; it answers on: {}",
+            found.name,
+            channel.map(|c| format!(" on {c}")).unwrap_or_default(),
+            found
+                .channels
+                .iter()
+                .map(describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        many => Err(crate::exit::usage(format!(
+            "agent {} answers on several Slack routes; pass --channel <id> to pick one ({})",
+            found.name,
+            many.iter()
+                .map(|b| describe(b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Refuse a named route on a path whose turn speaks as the default bot.
+/// @spec ADR-0168 d8: sending anyway would reach the default binding's agent.
+fn refuse_named_route(
+    route_identity: Option<&str>,
+    agent: &str,
+    channel: &str,
+    path: &str,
+) -> Result<()> {
+    let Some(identity) = route_identity else {
+        return Ok(());
+    };
+    Err(crate::exit::CliError::usage(format!(
+        "agent {agent} answers on {channel} as `{identity}`, and a turn over {path} speaks as \
+         the installation's default bot, so it would reach a different binding"
+    ))
+    .with_fix(format!(
+        "drive this agent with `eval --agent {agent}`, which sends through the reply stub, or \
+         mention the `{identity}` bot in Slack"
+    ))
+    .into())
+}
+
+/// The named-route refusal for `message_local`'s connected-transport branch.
+/// Factored out of the caller so a test can reach it without a live connected
+/// workspace, and a mutant that drops the call site there goes red.
+/// @spec ADR-0168 d8.
+fn refuse_named_route_for_local_connected(route: &SelectedRoute) -> Result<()> {
+    refuse_named_route(
+        route.identity.as_deref(),
+        &route.agent,
+        &route.channel,
+        "the connected Slack transport",
+    )
+}
+
+/// The named-route refusal for `message_connected` (the cluster
+/// connected-transport path). Factored out so a test can reach it without a
+/// live dispatcher, and a mutant that drops the call site there goes red.
+/// @spec ADR-0168 d8.
+fn refuse_named_route_for_cluster_connected(
+    identity: Option<&str>,
+    agent: Option<&str>,
+    channel: &str,
+) -> Result<()> {
+    refuse_named_route(
+        identity,
+        agent.unwrap_or_default(),
+        channel,
+        "the connected Slack transport",
+    )
+}
+
+/// The named-route refusal for `message_cluster`'s disconnected relay lane
+/// (the missing-carrier compatibility control #1817 requires, which always
+/// speaks as the installation's default bot). Factored out so a test can reach
+/// it without a live cluster, and a mutant that drops the call site there goes
+/// red.
+/// @spec ADR-0168 d8.
+fn refuse_named_route_for_relay(
+    identity: Option<&str>,
+    agent: Option<&str>,
+    channel: &str,
+) -> Result<()> {
+    refuse_named_route(
+        identity,
+        agent.unwrap_or_default(),
+        channel,
+        "the disconnected cluster relay",
+    )
+}
+
 /// Parse a kubeconfig `cluster.server` URL into its host and optional raw port,
 /// stripping the scheme and any path and correctly handling bracketed IPv6
 /// authorities (`https://[::1]:6443` -> ("::1", Some("6443"))). Returns `None`
@@ -881,6 +1022,30 @@ pub fn server_host_and_port(server: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port))
 }
 
+/// The `--dry-run` line naming where a local-tier turn would land: a named
+/// `--agent` resolves its own Slack binding (channel AND identity) at send
+/// time via `api_base`, so the plan says that instead of guessing a channel it
+/// cannot see from here. Shared by `local message` and `local eval`, whose
+/// plans render this identically.
+/// @spec ADR-0168 d8.
+fn local_dry_run_channel_line(
+    agent: Option<&str>,
+    channel: Option<&str>,
+    api_base: &str,
+) -> String {
+    match agent {
+        Some(agent) => format!(
+            "the Slack binding of agent `{agent}` (channel and identity) via {api_base}/agents"
+        ),
+        None => match channel {
+            Some(channel) => format!("channel {channel}"),
+            None => format!(
+                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
+            ),
+        },
+    }
+}
+
 /// The ordered command lines (plus the stub URL and enqueue description) that a
 /// real run would execute, for `--dry-run`. Pure so the rendering is testable.
 /// The reply routes back to the stub via the per-turn endpoint on the queue
@@ -911,15 +1076,31 @@ pub fn dry_run_lines(opts: &MessageOpts, _advertise_host: &str) -> Vec<String> {
     );
     let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
     lines.push(format!("poll replies at {poll_url}"));
-    let channel = opts
-        .channel
-        .clone()
-        .unwrap_or_else(|| "<the sole bound (agent, Slack channel) pair>".to_string());
+    // @spec ADR-0168 d8. `--agent` resolves its own Slack binding (channel AND
+    // identity) at send time via the api port-forward this plan already
+    // renders, so the plan says that instead of guessing a channel it cannot
+    // see offline.
+    let channel = match opts.agent.as_deref() {
+        Some(agent) => {
+            format!("the Slack binding of agent `{agent}` (channel and identity) via .../agents")
+        }
+        None => opts
+            .channel
+            .clone()
+            .unwrap_or_else(|| "<the sole bound (agent, Slack channel) pair>".to_string()),
+    };
     lines.push(format!(
         "enqueue a synthetic QueuedTurn (adapter {CLUSTER_MESSAGE_RELAY_ADAPTER}, no reply \
          endpoint, UUIDv4 reply ref) for channel {channel} on stream {}",
         opts.stream
     ));
+    if opts.agent.is_some() {
+        lines.push(
+            "a named identity's route is refused here: both the disconnected relay and the \
+             connected Slack transport speak as the installation's default bot"
+                .to_string(),
+        );
+    }
     lines.push(connected_transport_dry_run_note());
     lines
 }
@@ -1875,12 +2056,8 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     if opts.dry_run {
         let reply_endpoint =
             local_stub_reply_endpoint(&local_stub_binding().advertise_host, resources.stub_port);
-        let channel_line = match opts.channel.as_deref() {
-            Some(channel) => format!("channel {channel}"),
-            None => format!(
-                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
-            ),
-        };
+        let channel_line =
+            local_dry_run_channel_line(opts.agent.as_deref(), opts.channel.as_deref(), &api_base);
         let human_lines = vec![
             "local mode (compose stack; no kubectl/helm)".to_string(),
             format!("enqueue onto redis {valkey_url}"),
@@ -1908,14 +2085,24 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // per-turn endpoint so the reply and any approval card ride that transport.
     // Resolving the channel first keeps the behavior identical to the stub path.
     if let Some(transport) = local_connected_transport().await {
-        let channel = match opts.channel.as_deref() {
-            Some(channel) => channel.to_string(),
-            None => {
-                let api = ApiClient::new(&api_base, &opts.api_key)?;
-                let agents = api.list_agents().await.with_context(|| {
-                    format!("listing agents via {api_base} (is `curie local up` running?)")
-                })?;
-                select_channel(&agents, None)?
+        let channel = if let Some(agent) = opts.agent.as_deref() {
+            let api = ApiClient::new(&api_base, &opts.api_key)?;
+            let agents = api.list_agents().await.with_context(|| {
+                format!("listing agents via {api_base} (is `curie local up` running?)")
+            })?;
+            let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+            refuse_named_route_for_local_connected(&route)?;
+            route.channel
+        } else {
+            match opts.channel.as_deref() {
+                Some(channel) => channel.to_string(),
+                None => {
+                    let api = ApiClient::new(&api_base, &opts.api_key)?;
+                    let agents = api.list_agents().await.with_context(|| {
+                        format!("listing agents via {api_base} (is `curie local up` running?)")
+                    })?;
+                    select_channel(&agents, None)?
+                }
             }
         };
         ui.plumbing(&format!(
@@ -1956,17 +2143,27 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // resolve hint is copy-paste runnable), and `None` for an explicit --channel
     // (we don't know which agent it binds) -- then the hint shows an `<AGENT>`
     // slot (#766).
-    let (channel, agent_hint): (String, Option<String>) = match opts.channel.as_deref() {
-        Some(channel) => (channel.to_string(), None),
-        None => {
+    let (channel, agent_hint, identity): (String, Option<String>, Option<String>) =
+        if let Some(agent) = opts.agent.as_deref() {
             let api = ApiClient::new(&api_base, &opts.api_key)?;
             let agents = api.list_agents().await.with_context(|| {
                 format!("listing agents via {api_base} (is `curie local up` running?)")
             })?;
-            let channel = select_channel(&agents, None)?;
-            (channel, agents.first().map(|a| a.name.clone()))
-        }
-    };
+            let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+            (route.channel, Some(route.agent), route.identity)
+        } else {
+            match opts.channel.as_deref() {
+                Some(channel) => (channel.to_string(), None, None),
+                None => {
+                    let api = ApiClient::new(&api_base, &opts.api_key)?;
+                    let agents = api.list_agents().await.with_context(|| {
+                        format!("listing agents via {api_base} (is `curie local up` running?)")
+                    })?;
+                    let channel = select_channel(&agents, None)?;
+                    (channel, agents.first().map(|a| a.name.clone()), None)
+                }
+            }
+        };
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // This turn carries its own reply endpoint (issue #19), so the compose worker
@@ -1974,14 +2171,17 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let reply_endpoint = stub.base_api_url().to_string();
     let (channel, thread_ts, placeholder_ts) =
         resolve_targets(Some(&channel), opts.thread.as_deref());
-    let event = synthetic_turn(
-        "slack",
-        &channel,
-        &opts.user,
-        &opts.text,
-        &thread_ts,
-        &placeholder_ts,
-        Some(reply_endpoint),
+    let event = speak_as(
+        synthetic_turn(
+            "slack",
+            &channel,
+            &opts.user,
+            &opts.text,
+            &thread_ts,
+            &placeholder_ts,
+            Some(reply_endpoint),
+        ),
+        identity.as_deref(),
     );
     let stream_id = enqueue_for_turn_verb(&opts, &mut conn, TurnVerb::Local, &event).await?;
     ui.plumbing(&format!(
@@ -3007,15 +3207,41 @@ fn connected_turn(
 }
 
 /// Resolve the target channel (and the sole-agent hint for resolve messages) for
-/// a cluster turn: an explicit `--channel`, else the sole bound Slack pair via a
-/// short-lived API port-forward (dropped once the lookup returns). Shared by the
-/// stub path and the connected-transport path.
+/// a cluster turn: `--agent`'s own Slack binding (channel and identity), else
+/// an explicit `--channel`, else the sole bound Slack pair via a short-lived
+/// API port-forward (dropped once the lookup returns). Shared by the stub path
+/// and the connected-transport path.
 async fn resolve_cluster_channel(
     opts: &MessageOpts,
     fullname: &crate::ops::ReleaseFullname,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, Option<String>)> {
+    // `--agent` (ADR-0168 decision 8) needs the agent listing even when
+    // `--channel` is also passed, to check the identity the named binding
+    // speaks through -- a plain `--channel` never has, so that branch below
+    // still skips the port-forward entirely.
+    if let Some(agent) = opts.agent.as_deref() {
+        let (_api_pf, api_local_port) = start_port_forward(
+            &port_forward_command(
+                &opts.namespace,
+                fullname,
+                "api",
+                opts.api_local_port,
+                API_REMOTE_PORT,
+            ),
+            opts.api_local_port,
+            "api",
+        )
+        .await?;
+        let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+        let agents = api
+            .list_agents()
+            .await
+            .context("listing agents through the api port-forward")?;
+        let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+        return Ok((route.channel, Some(route.agent), route.identity));
+    }
     match opts.channel.as_deref() {
-        Some(channel) => Ok((channel.to_string(), None)),
+        Some(channel) => Ok((channel.to_string(), None, None)),
         None => {
             let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
@@ -3035,7 +3261,7 @@ async fn resolve_cluster_channel(
                 .await
                 .context("listing agents through the api port-forward")?;
             let channel = select_channel(&agents, None)?;
-            Ok((channel, agents.first().map(|a| a.name.clone())))
+            Ok((channel, agents.first().map(|a| a.name.clone()), None))
         }
     }
 }
@@ -3068,7 +3294,8 @@ async fn message_connected(
     )
     .await?;
 
-    let (channel, _agent_hint) = resolve_cluster_channel(&opts, fullname).await?;
+    let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, fullname).await?;
+    refuse_named_route_for_cluster_connected(identity.as_deref(), agent_hint.as_deref(), &channel)?;
     ui.plumbing(&format!(
         "routing to channel {channel} over the connected Slack transport"
     ));
@@ -3201,9 +3428,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     )
     .await?;
 
-    // Channel: explicit --channel, else the sole deployed agent via a
-    // short-lived API port-forward (#766). Shared with the connected path.
-    let (channel, agent_hint) = resolve_cluster_channel(&opts, &fullname).await?;
+    // Channel: --agent's own binding, else explicit --channel, else the sole
+    // deployed agent via a short-lived API port-forward (#766). Shared with
+    // the connected path.
+    let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, &fullname).await?;
+    refuse_named_route_for_relay(identity.as_deref(), agent_hint.as_deref(), &channel)?;
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // The worker self-dials the in-cluster API; this distinct loopback tunnel is
@@ -3380,6 +3609,8 @@ pub struct EvalOpts {
     /// silently narrowing to nothing -- a mistyped selector fails the gate.
     pub case_ids: Vec<String>,
     pub channel: Option<String>,
+    /// `--agent`: send as this agent's binding (ADR-0168 decision 8).
+    pub agent: Option<String>,
     pub namespace: String,
     pub release: String,
     pub listen_host: Option<String>,
@@ -3529,9 +3760,13 @@ pub fn eval_dry_run_lines(
              (the deployed bundle's cases are graded server-side)",
             opts.models.len()
         )];
-        let target = match opts.channel.as_deref() {
-            Some(channel) => format!("channel {channel}"),
-            None => "the sole deployed agent".to_string(),
+        // @spec ADR-0168 d8. `--agent` beats `--channel` here exactly as the
+        // real sweep resolves it, so the plan names the agent rather than a
+        // channel two identities could share.
+        let target = match (opts.agent.as_deref(), opts.channel.as_deref()) {
+            (Some(agent), _) => format!("agent `{agent}`'s Slack binding"),
+            (None, Some(channel)) => format!("channel {channel}"),
+            (None, None) => "the sole deployed agent".to_string(),
         };
         for model in &opts.models {
             lines.push(format!(
@@ -3560,12 +3795,11 @@ pub fn eval_dry_run_lines(
             "stub advertised at http://localhost:{}/api/",
             resources.stub_port
         ));
-        match opts.channel.as_deref() {
-            Some(channel) => lines.push(format!("channel {channel}")),
-            None => lines.push(format!(
-                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
-            )),
-        }
+        lines.push(local_dry_run_channel_line(
+            opts.agent.as_deref(),
+            opts.channel.as_deref(),
+            &api_base,
+        ));
     } else {
         let host = opts
             .listen_host
@@ -3638,6 +3872,7 @@ fn resolve_eval(explicit: Option<PathBuf>) -> Result<LoadedEval> {
 async fn run_eval_turns(
     opts: &EvalOpts,
     channel: &str,
+    identity: Option<&str>,
     suite: &EvalSuite,
     conn: &mut MultiplexedConnection,
     stub: &mut SlackStub,
@@ -3665,14 +3900,17 @@ async fn run_eval_turns(
                 // worker claimed.
                 let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
                 let reply_endpoint = stub.base_api_url().to_string();
-                let event = eval_case_turn(
-                    "slack",
-                    &channel_id,
-                    &opts.user,
-                    &case.input,
-                    &thread_ts,
-                    &placeholder_ts,
-                    Some(reply_endpoint),
+                let event = speak_as(
+                    eval_case_turn(
+                        "slack",
+                        &channel_id,
+                        &opts.user,
+                        &case.input,
+                        &thread_ts,
+                        &placeholder_ts,
+                        Some(reply_endpoint),
+                    ),
+                    identity,
                 );
                 // The worker claims under quote(kind):quote(channel):quote(conversation_id),
                 // not the bare eval-prefixed conversation_id. SADD the scoped key
@@ -3917,7 +4155,31 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Resolve the target agent's id for the trigger plane. Mirrors `select_channel`
 /// (explicit `--channel` matches an agent's channel, else the sole
 /// deployed agent), but returns the agent id the trigger endpoint keys on.
-pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String> {
+/// An explicit `agent` beats both: it names the agent directly, by name or
+/// id, the same match `select_agent_route` uses.
+/// @spec ADR-0168 d8
+pub fn select_agent_id(
+    agents: &[Agent],
+    agent: Option<&str>,
+    channel: Option<&str>,
+) -> Result<String> {
+    if let Some(agent) = agent {
+        return agents
+            .iter()
+            .find(|a| a.name == agent || a.id == agent)
+            .map(|a| a.id.clone())
+            .ok_or_else(|| {
+                let deployed = agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
+                crate::exit::usage(format!(
+                    "no deployed agent is named {agent:?} (deployed: {})",
+                    if deployed.is_empty() {
+                        "none".to_string()
+                    } else {
+                        deployed.join(", ")
+                    }
+                ))
+            });
+    }
     if let Some(channel) = channel {
         return agents
             .iter()
@@ -4222,7 +4484,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         .list_agents()
         .await
         .context("listing agents to resolve the eval target")?;
-    let agent_id = select_agent_id(&agents, opts.channel.as_deref())?;
+    let agent_id = select_agent_id(&agents, opts.agent.as_deref(), opts.channel.as_deref())?;
 
     // The suite NAME is what the worker keys on; the cases it grades come from the
     // DEPLOYED bundle, not the local suite, so we do NOT present the local case
@@ -4374,7 +4636,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         .list_agents()
         .await
         .context("listing agents to resolve the trajectory eval target")?;
-    let agent_id = select_agent_id(&agents, opts.channel.as_deref())?;
+    let agent_id = select_agent_id(&agents, opts.agent.as_deref(), opts.channel.as_deref())?;
     let triggered = api
         .trigger_eval(&agent_id, Some(&suite.name), None)
         .await
@@ -4609,19 +4871,37 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         stub.base_api_url()
     ));
 
-    let channel = match opts.channel.as_deref() {
-        Some(channel) => channel.to_string(),
-        None => {
-            let api = ApiClient::new(&api_base, &opts.api_key)?;
-            let agents = api.list_agents().await.with_context(|| {
-                format!("listing agents via {api_base} (is `curie local up` running?)")
-            })?;
-            select_channel(&agents, None)?
-        }
+    let (channel, identity) = if let Some(agent) = opts.agent.as_deref() {
+        let api = ApiClient::new(&api_base, &opts.api_key)?;
+        let agents = api.list_agents().await.with_context(|| {
+            format!("listing agents via {api_base} (is `curie local up` running?)")
+        })?;
+        let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+        (route.channel, route.identity)
+    } else {
+        let channel = match opts.channel.as_deref() {
+            Some(channel) => channel.to_string(),
+            None => {
+                let api = ApiClient::new(&api_base, &opts.api_key)?;
+                let agents = api.list_agents().await.with_context(|| {
+                    format!("listing agents via {api_base} (is `curie local up` running?)")
+                })?;
+                select_channel(&agents, None)?
+            }
+        };
+        (channel, None)
     };
     ui.note(&format!("routing to channel {channel}"));
 
-    let results = run_eval_turns(&opts, &channel, &suite, &mut conn, &mut stub).await?;
+    let results = run_eval_turns(
+        &opts,
+        &channel,
+        identity.as_deref(),
+        &suite,
+        &mut conn,
+        &mut stub,
+    )
+    .await?;
     crate::commands::report_eval(&results, None, stub)
 }
 
@@ -4702,28 +4982,52 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     )
     .await?;
 
-    let channel = match opts.channel.as_deref() {
-        Some(channel) => channel.to_string(),
-        None => {
-            let (_api_pf, api_local_port) = start_port_forward(
-                &port_forward_command(
-                    &opts.namespace,
-                    &fullname,
-                    "api",
-                    opts.api_local_port,
-                    API_REMOTE_PORT,
-                ),
-                opts.api_local_port,
+    let (channel, identity) = if let Some(agent) = opts.agent.as_deref() {
+        let (_api_pf, api_local_port) = start_port_forward(
+            &port_forward_command(
+                &opts.namespace,
+                &fullname,
                 "api",
-            )
-            .await?;
-            let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
-            let agents = api
-                .list_agents()
-                .await
-                .context("listing agents through the api port-forward")?;
-            select_channel(&agents, None)?
-        }
+                opts.api_local_port,
+                API_REMOTE_PORT,
+            ),
+            opts.api_local_port,
+            "api",
+        )
+        .await?;
+        let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+        let agents = api
+            .list_agents()
+            .await
+            .context("listing agents through the api port-forward")?;
+        let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+        (route.channel, route.identity)
+    } else {
+        let channel = match opts.channel.as_deref() {
+            Some(channel) => channel.to_string(),
+            None => {
+                let (_api_pf, api_local_port) = start_port_forward(
+                    &port_forward_command(
+                        &opts.namespace,
+                        &fullname,
+                        "api",
+                        opts.api_local_port,
+                        API_REMOTE_PORT,
+                    ),
+                    opts.api_local_port,
+                    "api",
+                )
+                .await?;
+                let api =
+                    ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+                let agents = api
+                    .list_agents()
+                    .await
+                    .context("listing agents through the api port-forward")?;
+                select_channel(&agents, None)?
+            }
+        };
+        (channel, None)
     };
     ui.note(&format!("routing to channel {channel}"));
 
@@ -4733,7 +5037,16 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     );
     let mut conn = connect(&valkey_url).await?;
 
-    let results = match run_eval_turns(&opts, &channel, &suite, &mut conn, &mut stub).await {
+    let results = match run_eval_turns(
+        &opts,
+        &channel,
+        identity.as_deref(),
+        &suite,
+        &mut conn,
+        &mut stub,
+    )
+    .await
+    {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
@@ -6159,10 +6472,172 @@ mod tests {
         }
     }
 
+    fn agent_on(name: &str, routes: &[(&str, Option<&str>)]) -> Agent {
+        let mut agent = test_agent_bound_to(name, &[]);
+        agent.channels = routes
+            .iter()
+            .map(|(address, adapter)| crate::api::ChannelBinding {
+                kind: "slack".to_string(),
+                address: address.to_string(),
+                adapter: adapter.map(str::to_string),
+            })
+            .collect();
+        agent
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_selector_picks_that_agents_binding_and_identity() {
+        let agents = [
+            agent_on("sre-bot", &[("C0EXAMPLE1", Some("default"))]),
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+        ];
+        let route = select_agent_route(&agents, "ops", None).unwrap();
+        assert_eq!(route.channel, "C0EXAMPLE1");
+        assert_eq!(route.identity.as_deref(), Some("ops-bot"));
+        assert_eq!(route.agent, "ops");
+        let default = select_agent_route(&agents, "sre-bot", None).unwrap();
+        assert_eq!(
+            default.identity, None,
+            "the default identity stamps nothing"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_selector_accepts_the_agent_id() {
+        let agents = [agent_on("ops", &[("C0EXAMPLE1", None)])];
+        assert_eq!(
+            select_agent_route(&agents, "id-ops", None).unwrap().agent,
+            "ops"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_unknown_agent_is_a_usage_error_listing_the_deployed_ones() {
+        let agents = [agent_on("ops", &[("C0EXAMPLE1", None)])];
+        let err = select_agent_route(&agents, "opz", None).unwrap_err();
+        assert_eq!(crate::exit::classify(&err).0.code(), 2);
+        assert!(err.to_string().contains("ops"), "{err}");
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_on_several_routes_needs_a_channel_and_lists_them() {
+        let agents = [agent_on(
+            "ops",
+            &[("C0EXAMPLE1", Some("ops-bot")), ("C0EXAMPLE2", None)],
+        )];
+        let err = select_agent_route(&agents, "ops", None).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("C0EXAMPLE1") && text.contains("C0EXAMPLE2"),
+            "{text}"
+        );
+        assert!(text.contains("ops-bot"), "{text}");
+        let one = select_agent_route(&agents, "ops", Some("C0EXAMPLE2")).unwrap();
+        assert_eq!((one.channel.as_str(), one.identity), ("C0EXAMPLE2", None));
+        assert!(select_agent_route(&agents, "ops", Some("C0EXAMPLE9")).is_err());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn select_agent_id_prefers_the_agent_selector() {
+        let agents = [
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+        ];
+        assert_eq!(
+            select_agent_id(&agents, Some("ops"), Some("C0EXAMPLE1")).unwrap(),
+            "id-ops"
+        );
+        assert!(select_agent_id(&agents, Some("nobody"), None).is_err());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn a_named_route_is_refused_where_the_turn_cannot_speak_as_it() {
+        assert!(refuse_named_route(None, "ops", "C0EXAMPLE1", "the relay").is_ok());
+        let err =
+            refuse_named_route(Some("ops-bot"), "ops", "C0EXAMPLE1", "the relay").unwrap_err();
+        assert_eq!(crate::exit::classify(&err).0.code(), 2);
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the relay"),
+            "{text}"
+        );
+    }
+
+    // @spec ADR-0168 d8. Only `refuse_named_route` itself was pinned above; none
+    // of its three call sites (`message_local`'s connected branch,
+    // `message_connected`, and `message_cluster`'s disconnected relay) had a
+    // test that would go red if the call were simply dropped from the caller.
+    // Each call site is factored into its own named, pure wrapper so a test can
+    // reach it without a live dispatcher, connected workspace, or cluster.
+    #[test]
+    fn local_messages_connected_transport_branch_refuses_a_named_route() {
+        let named = SelectedRoute {
+            channel: "C0EXAMPLE1".to_string(),
+            identity: Some("ops-bot".to_string()),
+            agent: "ops".to_string(),
+        };
+        let err = refuse_named_route_for_local_connected(&named).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the connected Slack transport"),
+            "{text}"
+        );
+        let default = SelectedRoute {
+            channel: "C0EXAMPLE1".to_string(),
+            identity: None,
+            agent: "ops".to_string(),
+        };
+        assert!(refuse_named_route_for_local_connected(&default).is_ok());
+    }
+
+    #[test]
+    fn message_connected_refuses_a_named_route() {
+        let err =
+            refuse_named_route_for_cluster_connected(Some("ops-bot"), Some("ops"), "C0EXAMPLE1")
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the connected Slack transport"),
+            "{text}"
+        );
+        assert!(refuse_named_route_for_cluster_connected(None, Some("ops"), "C0EXAMPLE1").is_ok());
+    }
+
+    #[test]
+    fn message_clusters_disconnected_relay_refuses_a_named_route() {
+        // #1817's retained compatibility lane: it always speaks as the
+        // installation's default bot, so a named identity must refuse here too.
+        let err =
+            refuse_named_route_for_relay(Some("ops-bot"), Some("ops"), "C0EXAMPLE1").unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the disconnected cluster relay"),
+            "{text}"
+        );
+        assert!(refuse_named_route_for_relay(None, Some("ops"), "C0EXAMPLE1").is_ok());
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn an_agent_flag_is_not_counted_as_a_positional() {
+        let args: Vec<String> = ["local", "message", "--agent", "ops", "hi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(reject_agent_named_message(&args).is_none());
+    }
+
     fn opts(channel: Option<&str>) -> MessageOpts {
         MessageOpts {
             text: "hi".into(),
             channel: channel.map(str::to_string),
+            agent: None,
             thread: None,
             namespace: "curie".into(),
             release: "curie".into(),
@@ -6534,22 +7009,22 @@ mod tests {
             test_agent_bound_to("two", &["C0EXAMPLE3"]),
         ];
         assert_eq!(
-            select_agent_id(&agents, Some("C0EXAMPLE2")).unwrap(),
+            select_agent_id(&agents, None, Some("C0EXAMPLE2")).unwrap(),
             "id-one"
         );
         assert_eq!(
-            select_agent_id(&agents, Some("C0EXAMPLE3")).unwrap(),
+            select_agent_id(&agents, None, Some("C0EXAMPLE3")).unwrap(),
             "id-two"
         );
         // An address bound to nobody still errors, naming it.
-        assert!(select_agent_id(&agents, Some("C0EXAMPLE9"))
+        assert!(select_agent_id(&agents, None, Some("C0EXAMPLE9"))
             .unwrap_err()
             .to_string()
             .contains("C0EXAMPLE9"));
         // Agent selection still counts AGENTS, not pairs: a sole agent with
         // two bindings is one agent, so it resolves with no flag. This is the
         // deliberate asymmetry with `select_channel` above -- do not "fix" it.
-        assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "id-one");
+        assert_eq!(select_agent_id(&agents[..1], None, None).unwrap(), "id-one");
     }
 
     #[test]
@@ -6963,6 +7438,62 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn cluster_message_dry_run_shows_the_agents_binding_not_a_guessed_channel() {
+        // A plain --channel prints verbatim; a real run with --agent instead
+        // resolves that agent's own (channel, identity) pair, which the plan
+        // cannot see offline, so it must say so rather than reprinting whatever
+        // --channel happens to also carry.
+        let mut named = opts(Some("C123"));
+        named.agent = Some("ops".to_string());
+        let lines = dry_run_lines(&named, "10.1.2.3");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("the Slack binding of agent `ops`")
+                    && l.contains("channel and identity")),
+            "the plan must name the agent's binding, not channel C123: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("for channel C123")),
+            "a named agent must not be reported as channel C123: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("a named identity's route is refused")),
+            "the plan must say a named identity is refused on cluster message: {lines:?}"
+        );
+
+        // No --agent still prints the plain --channel line, unchanged.
+        let unnamed = dry_run_lines(&opts(Some("C123")), "10.1.2.3");
+        assert!(
+            unnamed.iter().any(|l| l.contains("for channel C123")),
+            "{unnamed:?}"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn local_dry_run_channel_line_prefers_the_agents_binding() {
+        // Shared by `local message` and `local eval`: an --agent beats a
+        // --channel that happens to also be set, since the real send resolves
+        // the agent's own binding rather than trusting the channel flag.
+        assert_eq!(
+            local_dry_run_channel_line(Some("ops"), Some("C123"), "http://localhost:8080"),
+            "the Slack binding of agent `ops` (channel and identity) via http://localhost:8080/agents"
+        );
+        assert_eq!(
+            local_dry_run_channel_line(None, Some("C123"), "http://localhost:8080"),
+            "channel C123"
+        );
+        assert_eq!(
+            local_dry_run_channel_line(None, None, "http://localhost:8080"),
+            "channel <the sole bound (agent, Slack channel) pair via http://localhost:8080/agents>"
+        );
+    }
+
     #[test]
     fn connected_turn_conversation_id_is_the_real_placeholder_ts() {
         // Issue #954: with no --thread the connected path posts a TOP-LEVEL
@@ -7226,6 +7757,7 @@ mod tests {
         EvalOpts {
             cases: None,
             channel: channel.map(str::to_string),
+            agent: None,
             namespace: "curie".into(),
             release: "curie".into(),
             listen_host: None,
@@ -7387,6 +7919,21 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn local_eval_dry_run_shows_the_agents_binding_when_named() {
+        let mut named = eval_opts(true, Some("C123"));
+        named.agent = Some("ops".to_string());
+        let lines = eval_dry_run_lines(&named, "smoke", 1).expect("eval dry-run plan");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("the Slack binding of agent `ops`")
+                    && l.contains("channel and identity")),
+            "the plan must name the agent's binding, not channel C123: {lines:?}"
+        );
+    }
+
     #[test]
     fn cluster_eval_dry_run_plan_lists_the_valkey_forward_and_stub() {
         let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2)
@@ -7460,6 +8007,21 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn model_sweep_dry_run_names_the_agent_over_a_channel_it_also_carries() {
+        let mut named = sweep_opts(true, Some("C7"), &["opus"]);
+        named.agent = Some("ops".to_string());
+        let lines = eval_dry_run_lines(&named, "smoke", 1).expect("eval dry-run plan");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("/evals/trigger") && l.contains("agent `ops`'s Slack binding")),
+            "the trigger line must name the agent, not channel C7: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("channel C7")), "{lines:?}");
+    }
+
     #[test]
     fn cluster_model_sweep_dry_run_reaches_the_api_via_port_forward() {
         let lines = eval_dry_run_lines(&sweep_opts(false, None, &["opus"]), "smoke", 1)
@@ -7519,16 +8081,16 @@ mod tests {
             },
         ];
         // Explicit channel picks the matching agent's id.
-        assert_eq!(select_agent_id(&agents, Some("C2")).unwrap(), "a2");
+        assert_eq!(select_agent_id(&agents, None, Some("C2")).unwrap(), "a2");
         // An unknown channel errors, naming the channel.
-        assert!(select_agent_id(&agents, Some("C9"))
+        assert!(select_agent_id(&agents, None, Some("C9"))
             .unwrap_err()
             .to_string()
             .contains("C9"));
         // Many agents + no channel is ambiguous.
-        assert!(select_agent_id(&agents, None).is_err());
+        assert!(select_agent_id(&agents, None, None).is_err());
         // A sole agent + no channel resolves without a flag.
-        assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "a1");
+        assert_eq!(select_agent_id(&agents[..1], None, None).unwrap(), "a1");
     }
 
     fn model_summary(

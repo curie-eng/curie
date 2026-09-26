@@ -12,6 +12,7 @@ from aci_protocol.turn import route_identity
 from fastapi import APIRouter, Depends, HTTPException, status
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
+from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -771,6 +772,12 @@ async def read_version_connectors(
                 # operator to the API logs instead of to `curie build
                 # --plugin-dir <dir> --registry <ref>`, which the message names.
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            # @spec ADR-0168 d8: the agent's targets decide which connectors
+            # run, and every consumer of this route applies and prunes it.
+            declared = restrict_connectors(
+                declared,
+                connectors_for_agent(bundles.read_deploy_targets(Path(tmp)), agent_name),
+            )
             # Per-agent too: a release-scoped Secret means deploying the prod
             # agent overwrites the dev agent's token in place (#1116).
             secret_name = f"{release}-{agent_name}-connector-secrets"

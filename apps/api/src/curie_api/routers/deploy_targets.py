@@ -46,7 +46,13 @@ async def resolve_deploy_target(body: ResolveTargetRequest) -> ResolvedTarget:
             status.HTTP_404_NOT_FOUND,
             f"no target named {body.target!r} in deploy.yaml. Declared: {known}",
         )
-    return ResolvedTarget(agent=target.agent, env=target.env, slack_channel=target.slack_channel)
+    return ResolvedTarget(
+        agent=target.agent,
+        env=target.env,
+        slack_channel=target.slack_channel,
+        identity=target.identity,
+        connectors=target.connectors,
+    )
 
 
 @router.post("/deploy-targets/list", response_model=ListedTargets)
@@ -69,7 +75,14 @@ async def list_deploy_targets(body: ResolveTargetRequest) -> ListedTargets:
     parsed = _parse(body.content)
     order = {"dev": 0, "prod": 1}
     named = [
-        NamedTarget(name=name, agent=t.agent, env=t.env, slack_channel=t.slack_channel)
+        NamedTarget(
+            name=name,
+            agent=t.agent,
+            env=t.env,
+            slack_channel=t.slack_channel,
+            identity=t.identity,
+            connectors=t.connectors,
+        )
         for name, t in parsed.targets.items()
     ]
     named.sort(key=lambda t: (order.get(t.env, 2), t.name))

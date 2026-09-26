@@ -54,6 +54,12 @@ from plugin_format.connectors import (
     ConnectorSpec,
     validate_connectors,
 )
+from plugin_format.deploy_targets import (
+    connectors_for_agent,
+    restrict_connectors,
+    validate_deploy_targets,
+)
+from plugin_format.validate import DEPLOY_FILE
 from plugin_format.yaml_loader import safe_load_unique
 
 logger = logging.getLogger(__name__)
@@ -82,6 +88,31 @@ def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
     return parsed
 
 
+def _allowlist(plugin_dir: str | Path, agent: str) -> frozenset[str] | None:
+    """The connectors ``agent`` runs, read from the bundle's deploy.yaml.
+
+    @spec ADR-0168 d8. Absent file: every connector. A file that no longer
+    parses mounts none, the direction `_read` takes for connectors.yaml.
+    """
+
+    path = Path(plugin_dir) / DEPLOY_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = safe_load_unique(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        logger.warning("deploy.yaml unreadable, mounting no connectors: %s", exc)
+        return frozenset()
+    parsed, errors = validate_deploy_targets(data)
+    if errors or parsed is None:
+        logger.warning(
+            "deploy.yaml did not validate, mounting no connectors: %s",
+            "; ".join(code for code, _ in errors),
+        )
+        return frozenset()
+    return connectors_for_agent(parsed, agent)
+
+
 def derive_mcp_servers(
     plugin_dir: str | Path | None,
     *,
@@ -104,6 +135,11 @@ def derive_mcp_servers(
     declared = _read(plugin_dir)
     if declared is None or not declared.connectors:
         return {}
+
+    if agent:
+        declared = restrict_connectors(declared, _allowlist(plugin_dir, agent))
+        if not declared.connectors:
+            return {}
 
     if not (release and agent and namespace):
         # The scope is emitted as a set or not at all (BootEnv, ACI 0.2.8), so

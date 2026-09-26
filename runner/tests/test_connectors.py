@@ -189,6 +189,79 @@ def test_no_plugin_dir_is_not_an_error(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The runner mounts only what the agent's targets allow (ADR-0168 decision 8)
+# --------------------------------------------------------------------------- #
+TWO_HOSTED = HOSTED + "  loki:\n    image: grafana/mcp-grafana:0.17.2\n    secrets: [L]\n"
+
+
+def _with_targets(root: Path, deploy_yaml: str) -> Path:
+    (root / "deploy.yaml").write_text(deploy_yaml, encoding="utf-8")
+    return root
+
+
+# @spec ADR-0168 d8
+def test_only_the_agents_allowlisted_connectors_are_mounted(tmp_path: Path) -> None:
+    root = _with_targets(
+        _bundle(tmp_path, TWO_HOSTED),
+        "targets:\n  dev:\n    agent: acme-dev\n    connectors: [grafana]\n",
+    )
+    assert sorted(derive_mcp_servers(root, **SCOPE)) == ["grafana"]
+
+
+# @spec ADR-0168 d8
+def test_two_agents_from_one_bundle_mount_different_connectors(tmp_path: Path) -> None:
+    root = _with_targets(
+        _bundle(tmp_path, TWO_HOSTED),
+        "targets:\n"
+        "  dev:\n    agent: acme-dev\n    connectors: [grafana]\n"
+        "  prod:\n    agent: acme-bot\n    env: prod\n    connectors: [loki]\n",
+    )
+    dev = derive_mcp_servers(root, release="curie", agent="acme-dev", namespace="curie")
+    prod = derive_mcp_servers(root, release="curie", agent="acme-bot", namespace="curie")
+    assert (sorted(dev), sorted(prod)) == (["grafana"], ["loki"])
+
+
+# @spec ADR-0168 d8
+def test_an_empty_allowlist_mounts_nothing(tmp_path: Path) -> None:
+    root = _with_targets(
+        _bundle(tmp_path, TWO_HOSTED), "targets:\n  dev:\n    agent: acme-dev\n    connectors: []\n"
+    )
+    assert derive_mcp_servers(root, **SCOPE) == {}
+
+
+# @spec ADR-0168 d8
+def test_an_agent_no_target_names_mounts_every_connector(tmp_path: Path) -> None:
+    root = _with_targets(
+        _bundle(tmp_path, TWO_HOSTED),
+        "targets:\n  prod:\n    agent: acme-bot\n    connectors: []\n",
+    )
+    assert sorted(derive_mcp_servers(root, **SCOPE)) == ["grafana", "loki"]
+
+
+# @spec ADR-0168 d8
+def test_an_invalid_deploy_yaml_at_boot_mounts_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = _with_targets(_bundle(tmp_path, TWO_HOSTED), "targets:\n  dev:\n    env: staging\n")
+    with caplog.at_level(logging.WARNING):
+        assert derive_mcp_servers(root, **SCOPE) == {}
+    assert "deploy.yaml" in caplog.text
+
+
+# @spec ADR-0168 d8
+def test_the_skill_tier_without_an_agent_keeps_every_remote_connector(tmp_path: Path) -> None:
+    both = REMOTE + "  other:\n    url: https://mcp.other.example.com/mcp\n"
+    root = _with_targets(
+        _bundle(tmp_path, both),
+        "targets:\n  dev:\n    agent: acme-dev\n    connectors: [internal]\n",
+    )
+    assert sorted(derive_mcp_servers(root, release=None, agent=None, namespace=None)) == [
+        "internal",
+        "other",
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # Reaching a hosted connector on a tier that cannot host it -- #1160
 # --------------------------------------------------------------------------- #
 HOSTED_WITH_FALLBACK = (

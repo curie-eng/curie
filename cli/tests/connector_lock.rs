@@ -324,6 +324,7 @@ fn deploy_opts_carries_an_explicit_tier() {
         delivery: None,
         agent: None,
         target: None,
+        identity: None,
         plugin_dir: plugin_dir(),
         api_url: "http://127.0.0.1:8000".to_string(),
         api_key: "curie-dev-key".to_string(),

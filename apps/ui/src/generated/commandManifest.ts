@@ -1279,6 +1279,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -1400,6 +1408,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
@@ -1603,6 +1619,14 @@ export const commandManifest = {
               "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
               "id": "slack_channel",
               "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
               "positional": false,
               "required": false
             },
@@ -3876,6 +3900,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Existing thread ts to continue a conversation; omit to start a new thread. Pair with --channel to keep multi-turn context",
               "id": "thread",
               "long": "thread",
@@ -4049,6 +4081,14 @@ export const commandManifest = {
               "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Send as this agent's Slack binding (ADR-0168 decision 8): the channel and the identity come from the binding. Pair with --channel when the agent answers on several",
+              "id": "agent",
+              "long": "agent",
               "positional": false,
               "required": false
             },
@@ -4339,6 +4379,14 @@ export const commandManifest = {
               "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
               "id": "slack_channel",
               "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Identity (bot) the Slack binding this deploy writes speaks through (ADR-0168 decision 8). Overrides the target's `identity`; omitted, the target's is used, else the installation's own. Needs a channel: --slack-channel, or the target's slack_channel",
+              "id": "identity",
+              "long": "identity",
               "positional": false,
               "required": false
             },
