@@ -142,6 +142,7 @@ def test_a_declared_identity_with_a_blank_token_is_named_and_left_out(
         # no Slack binding carries a transport since migration 0061, so the
         # custom-transport form this row used to pin no longer exists.
         ("slack", "default", "http://stub.example/api/", "default"),
+        ("slack", "ops-bot", "http://stub.example/api/", "ops-bot"),
         # A mail turn's card and its approvers are Slack's default app's.
         ("email", "agentmail-sandbox", "https://adapter.example/hook", "default"),
         (None, None, None, "default"),
