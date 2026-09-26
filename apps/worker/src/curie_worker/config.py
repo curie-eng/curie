@@ -148,7 +148,9 @@ class CallerSigningKeyError(RuntimeError):
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
 
-    model_config = SettingsConfigDict(frozen=True, populate_by_name=True, extra="ignore")
+    model_config = SettingsConfigDict(
+        frozen=True, populate_by_name=True, extra="ignore", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
