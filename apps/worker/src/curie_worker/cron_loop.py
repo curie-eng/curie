@@ -441,20 +441,22 @@ class CronSchedulerLoop:
     ) -> datetime:
         """The pass window's start, reaching back to the hook's last slot.
 
-        The reach back never passes the in-force deployment: a slot from
-        before it belongs to whatever schedule was deployed then.
+        Whatever the start, it never passes the in-force deployment (a slot
+        from before it belongs to whatever schedule was deployed then) or
+        ``_CATCH_UP_LOOKBACK``.
         """
 
         async with self._engine.connect() as conn:
             last = (
                 await conn.execute(self._last_slot_sql, {"agent_id": target.agent_id, "name": name})
             ).scalar()
-        if not isinstance(last, datetime) or last >= window_start:
-            return window_start
+        start = window_start
+        if isinstance(last, datetime) and last < start:
+            start = last
         floor = now - _CATCH_UP_LOOKBACK
         if target.deployed_at is not None:
             floor = max(floor, target.deployed_at)
-        return min(window_start, max(last, floor))
+        return max(start, floor)
 
     async def _skip(
         self, target: _Target, name: str, slots: list[datetime], summary: CronPassSummary

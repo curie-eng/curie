@@ -617,3 +617,22 @@ def test_catch_up_never_reaches_back_past_the_in_force_deployment(
             assert len(_entries(sync_redis, names["stream"])) == 1
 
     asyncio.run(body())
+
+
+def test_a_deployment_after_the_watermark_fires_no_slot_from_before_it(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """The deployment floor holds even for a hook with no recorded slot."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE curie.deployments SET deployed_at = :at WHERE id = :id"),
+                    {"at": seed.slot + timedelta(seconds=10), "id": seed.deployment_id},
+                )
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            assert await seed.runs() == []
+            assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
