@@ -281,6 +281,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the ambient ones by name. Renaming a BootEnv key cannot move these.
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        # The Claude SDK consumes this background model setting for session
+        # titles. The runner passes it to the SDK, outside the BootEnv contract.
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         # PR #663 operator-tunable Docker runner hardening knobs; the docker
         # substrate reads these from its OWN env, never injected into the runner
         # boot contract.

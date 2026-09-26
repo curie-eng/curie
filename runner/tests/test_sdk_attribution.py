@@ -14,7 +14,9 @@ entirely) -- no model, whatever it is, ever sees it.
 from __future__ import annotations
 
 import json
+import logging
 
+import pytest
 from curie_runner.adapter import build_options
 
 # The current CLI attribution setting: each text defaults to the standard
@@ -49,3 +51,49 @@ def test_build_options_disables_sdk_attribution_regardless_of_other_options() ->
         resume=None,
     )
     assert json.loads(check_tier.settings) == ATTRIBUTION_OFF
+
+
+@pytest.mark.parametrize(
+    ("inherited_model", "option_model", "title_enabled"),
+    [
+        (None, None, False),
+        ("haiku-inherited", None, True),
+        (None, "haiku-explicit", True),
+        ("haiku-inherited", "", False),
+    ],
+)
+def test_build_options_only_enables_sdk_title_with_configured_model(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    inherited_model: str | None,
+    option_model: str | None,
+    title_enabled: bool,
+) -> None:
+    # Claude Code documents that disabling terminal titles also skips the
+    # background title request, and that the Haiku override selects its model:
+    # https://code.claude.com/docs/en/env-vars
+    model_key = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+    disable_key = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
+    monkeypatch.delenv(model_key, raising=False)
+    monkeypatch.delenv(disable_key, raising=False)
+    if inherited_model is not None:
+        monkeypatch.setenv(model_key, inherited_model)
+    env = {model_key: option_model} if option_model is not None else {}
+
+    with caplog.at_level(logging.INFO, logger="curie_runner.adapter"):
+        options = build_options(
+            plugins=[],
+            model=None,
+            system_prompt=None,
+            max_turns=20,
+            max_budget_usd=1.0,
+            resume=None,
+            env=env,
+        )
+
+    if title_enabled:
+        assert disable_key not in options.env
+        assert "session title" not in caplog.text
+    else:
+        assert options.env[disable_key] == "1"
+        assert len([record for record in caplog.records if "session title" in record.message]) == 1
