@@ -270,16 +270,35 @@ serverFiles:
                 increased in the last 15 minutes, counting a series' first
                 sample as an increase from zero.
           - alert: CurieQueueMessageAgeHigh
-            expr: curie_queue_message_age_seconds > 900
-            for: 10m
+            # Reads the consumer group's lag, not the message-age histogram:
+            # that records a message's age only when a worker takes it, so a
+            # queue that has stopped delivering records nothing there at all.
+            # Every worker process records the same stream's lag, and a
+            # restarted worker is a new series, so the lag is read without
+            # `instance`: one series per stream however many workers run,
+            # unbroken across a restart. min_over_time reads only the samples
+            # it has, so the count requires all 15 minute reads, or a series
+            # younger than 15 minutes, a fresh Prometheus's included, would
+            # fire 5 minutes after its first sample above 0. The cost: the
+            # worker records the lag as 0 when Valkey cannot compute it, which
+            # happens once entries inside the group's range are deleted, so an
+            # installation that trims the run stream loses this rule. This
+            # chart does not trim it.
+            expr: |
+              min_over_time(max without (instance) (curie_queue_lag)[15m:1m]) > 0
+              and
+              count_over_time(max without (instance) (curie_queue_lag)[15m:1m]) >= 15
+            for: 5m
             labels:
               severity: page
               component: curie-queue
             annotations:
-              summary: Oldest queued Curie message is older than 15 minutes
+              summary: Queued Curie messages have waited undelivered for 15 minutes
               description: >-
-                curie_queue_message_age_seconds has stayed above 900 for 10
-                minutes.
+                curie_queue_lag, the entries in the run stream not yet
+                delivered to the worker consumer group, has been above 0 at
+                every minute for 15 minutes, whichever worker recorded it. A
+                queue that is draining reads 0.
           - alert: CurieCompletionOutboxAgeHigh
             expr: curie_completion_outbox_age_seconds > 300
             for: 10m
