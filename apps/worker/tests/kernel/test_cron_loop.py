@@ -102,8 +102,7 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO curie.agents (id, name, max_usd_per_day) "
-                    "VALUES (:id, :name, :usd)"
+                    "INSERT INTO curie.agents (id, name, max_usd_per_day) VALUES (:id, :name, :usd)"
                 ),
                 {"id": agent_id, "name": f"cron_agent_{token}", "usd": max_usd_per_day},
             )
@@ -502,5 +501,72 @@ def test_bundle_attached_later_is_read_on_the_next_pass(
                 assert triggers[0]["name"] == HOOK
             finally:
                 await client.aclose()
+
+    asyncio.run(body())
+
+
+def test_restarted_loop_fires_the_newest_missed_slot_once_and_skips_the_older_ones(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """#2930: a worker that slept through three hourly slots catches up one."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            last = seed.slot - timedelta(hours=3)
+            await seed.add_run(last, last)
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET outcome = 'ran', ended_at = now() "
+                        "WHERE agent_id = :a"
+                    ),
+                    {"a": seed.agent_id},
+                )
+            # A fresh process: its own watermark starts just before the newest slot.
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+            await _pass_once(seed, names["stream"], trigger)
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [
+                (last, "ran"),
+                (seed.slot - timedelta(hours=2), "skipped"),
+                (seed.slot - timedelta(hours=1), "skipped"),
+                (seed.slot, None),
+            ]
+            assert all(r.ended_at is not None for r in rows[1:3])
+            entries = _entries(sync_redis, names["stream"])
+            assert len(entries) == 1
+            assert entries[0].hook_run is not None
+            assert entries[0].hook_run.slot_utc == seed.slot.isoformat()
+
+    asyncio.run(body())
+
+
+def test_restarted_loop_fires_nothing_for_a_slot_past_the_age_bound(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A weekly hook whose newest missed slot is two days old starts fresh."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            missed = seed.slot - timedelta(days=2)
+            last = missed - timedelta(weeks=1)
+            await seed.add_run(last, last)
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET outcome = 'ran', ended_at = now() "
+                        "WHERE agent_id = :a"
+                    ),
+                    {"a": seed.agent_id},
+                )
+            dow = (missed.weekday() + 1) % 7  # cron: Sunday is 0
+            trigger = _trigger(seed, schedule=f"{missed.minute} {missed.hour} * * {dow}")
+            await _pass_once(seed, names["stream"], trigger)
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [
+                (last, "ran"),
+                (missed, "skipped"),
+            ]
+            assert _entries(sync_redis, names["stream"]) == []
 
     asyncio.run(body())

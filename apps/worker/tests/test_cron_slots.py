@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from curie_worker.cron_loop import resolve_slots
+from curie_worker.cron_loop import CATCH_UP_CEILING, plan_catch_up, resolve_slots, slot_is_stale
 
 NY = ZoneInfo("America/New_York")
 
@@ -25,9 +25,7 @@ def test_same_expression_differs_between_utc_and_an_explicit_zone() -> None:
 
     assert resolve_slots("0 9 * * *", "UTC", start, end) == [_utc(2026, 6, 1, 9, 0)]
     # June is EDT (UTC-4): 09:00 local is 13:00Z.
-    assert resolve_slots("0 9 * * *", "America/New_York", start, end) == [
-        _utc(2026, 6, 1, 13, 0)
-    ]
+    assert resolve_slots("0 9 * * *", "America/New_York", start, end) == [_utc(2026, 6, 1, 13, 0)]
 
 
 def test_slots_are_aware_utc_and_ascending() -> None:
@@ -79,3 +77,56 @@ def test_window_excludes_start_and_includes_end() -> None:
     slot = _utc(2026, 6, 1, 9, 0)
     assert resolve_slots("0 9 * * *", "UTC", slot, slot + timedelta(hours=1)) == []
     assert resolve_slots("0 9 * * *", "UTC", slot - timedelta(hours=1), slot) == [slot]
+
+
+# Bounded catch-up (ADR-0099, #2930): the newest missed slot fires once, every
+# older one is recorded skipped, and a newest slot past the age bound is
+# skipped too. The bound is the schedule's own interval, capped by a ceiling.
+
+
+def test_catch_up_fires_the_newest_slot_and_skips_every_older_one() -> None:
+    due = [_utc(2026, 6, 1, h, 0) for h in (6, 7, 8)]
+    fire, skipped = plan_catch_up("0 * * * *", "UTC", due, _utc(2026, 6, 1, 8, 20))
+    assert fire == _utc(2026, 6, 1, 8, 0)
+    assert skipped == due[:2]
+
+
+def test_catch_up_with_one_due_slot_fires_it_and_skips_nothing() -> None:
+    slot = _utc(2026, 6, 1, 9, 0)
+    assert plan_catch_up("0 9 * * *", "UTC", [slot], slot + timedelta(hours=2)) == (slot, [])
+
+
+def test_catch_up_with_nothing_due_does_nothing() -> None:
+    assert plan_catch_up("0 9 * * *", "UTC", [], _utc(2026, 6, 1, 9, 0)) == (None, [])
+
+
+def test_a_coarse_schedule_past_the_ceiling_fires_nothing() -> None:
+    # A monthly hook four weeks late starts fresh: its newest slot is skipped.
+    slot = _utc(2026, 6, 1, 9, 0)
+    now = slot + timedelta(weeks=4)
+    assert slot_is_stale("0 9 1 * *", "UTC", slot, now)
+    assert plan_catch_up("0 9 1 * *", "UTC", [slot], now) == (None, [slot])
+
+
+def test_a_coarse_schedule_inside_the_ceiling_still_fires() -> None:
+    slot = _utc(2026, 6, 1, 9, 0)
+    now = slot + CATCH_UP_CEILING - timedelta(minutes=1)
+    assert not slot_is_stale("0 9 1 * *", "UTC", slot, now)
+    assert plan_catch_up("0 9 1 * *", "UTC", [slot], now) == (slot, [])
+
+
+def test_a_slot_older_than_its_own_interval_is_stale() -> None:
+    # Hourly: the 08:00 slot is stale once 09:00 has come due, well under the ceiling.
+    slot = _utc(2026, 6, 1, 8, 0)
+    assert not slot_is_stale("0 * * * *", "UTC", slot, _utc(2026, 6, 1, 8, 59))
+    assert slot_is_stale("0 * * * *", "UTC", slot, _utc(2026, 6, 1, 9, 1))
+
+
+def test_the_interval_is_measured_in_the_hooks_zone_across_dst() -> None:
+    # 09:00 New York on 2026-03-07 (14:00Z); the next is 03-08 09:00 EDT (13:00Z),
+    # a 23 h interval across spring forward. 23.5 h later the slot is stale.
+    slot = _utc(2026, 3, 7, 14, 0)
+    assert not slot_is_stale("0 9 * * *", "America/New_York", slot, slot + timedelta(hours=22))
+    assert slot_is_stale(
+        "0 9 * * *", "America/New_York", slot, slot + timedelta(hours=23, minutes=30)
+    )
