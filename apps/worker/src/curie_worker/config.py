@@ -185,8 +185,8 @@ class WorkerConfig(BaseSettings):
     # Slack
     slack_bot_token: str = ""
     # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
-    # here so a malformed declaration refuses boot; nothing reads it until
-    # decision 5 picks a reply's bot token by the route identity.
+    # here so a malformed declaration refuses boot; `slack_tokens` reads each
+    # one's bot token for its replies and file downloads (decision 5).
     slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # The worker's DEFAULT Slack Web API base URL: the endpoint used to finalize a
     # turn whose reply handle carries no per-turn endpoint (issue #19). Unset = the

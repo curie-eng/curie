@@ -23,6 +23,7 @@ from typing import Any, TypedDict
 import httpx
 import redis
 from aci_protocol.s3 import build_s3_client
+from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry
@@ -34,7 +35,11 @@ from . import __version__
 from .actions import ActionClient
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
-from .attachments import AttachmentCoordinator, AttachmentLimits, SlackFileClient
+from .attachments import (
+    AttachmentCoordinator,
+    AttachmentLimits,
+    SlackFileClient,
+)
 from .binding import BindingResolver
 from .bundle_store import BundleStore
 from .config import WorkerConfig
@@ -74,6 +79,7 @@ from .sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from .slack_tokens import slack_bot_tokens
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
 from .workitem_dispatch import WorkItemDispatchClient
@@ -425,16 +431,35 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # ledger a sibling of ``_ownership/`` -- so an inbound file is reachable only
     # through a short-lived one-object presigned URL redeemed by the sandbox's
     # attachments-init container.
+    #
+    # Each Slack identity's bot token, read once from this process's env
+    # (ADR-0168 decision 5), so the lane and the sink serve the same set.
+    slack_tokens = slack_bot_tokens(config, environ=env)
     attachments = (
         AttachmentCoordinator(
-            files=SlackFileClient(
-                token=config.slack_bot_token,
-                read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+            # The lane is on when any identity holds a token, so `default`'s
+            # may be blank here; `_files_for` refuses that identity before any
+            # fetch rather than this module standing in a broken port for it.
+            files=(
+                SlackFileClient(
+                    token=config.slack_bot_token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.slack_bot_token
+                else None
             ),
+            identity_files={
+                name: SlackFileClient(
+                    token=token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                for name, token in slack_tokens.items()
+                if name != DEFAULT_IDENTITY
+            },
             objects=workspace_objects,
             limits=_attachment_limits(config),
         )
-        if config.attachment_enabled and config.slack_bot_token
+        if config.attachment_enabled and any(slack_tokens.values())
         else None
     )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
@@ -454,7 +479,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         api_key=config.api_key,
         client=eval_http,
     )
-    sink = build_reply_sink(config)
+    sink = build_reply_sink(config, slack_tokens=slack_tokens)
     card_store = ApprovalCardStore(async_redis, config)
     work_items = (
         WorkItemDispatchClient(

@@ -112,6 +112,23 @@ def route_identity(kind: str, adapter: str | None) -> str | None:
     return adapter
 
 
+def slack_speaking_identity(kind: str, adapter: str | None, endpoint: str | None) -> str:
+    """The identity whose bot token a route's Slack calls carry (ADR-0168 decision 5).
+
+    A Slack route with an endpoint is the pre-ADR custom-transport form, whose
+    ``adapter`` is a credential slug and not an identity (see
+    ``matching_routes``), so it keeps ``DEFAULT_IDENTITY``. So does any other
+    kind: its ``adapter`` names that kind's egress adapter, never a Slack app.
+    Every other Slack route speaks as ``route_identity`` resolves it. This is
+    not a wire field; the worker and the API each call it on the route they
+    already hold.
+    """
+
+    if kind != SLACK_KIND or endpoint:
+        return DEFAULT_IDENTITY
+    return route_identity(SLACK_KIND, adapter) or DEFAULT_IDENTITY
+
+
 class RouteRow(Protocol):
     """The four columns ``matching_routes`` reads off a candidate row.
 

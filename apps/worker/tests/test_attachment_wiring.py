@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import boto3
@@ -33,9 +33,11 @@ from curie_worker.attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
     AttachmentRef,
+    AttachmentResolutionError,
     encode_attachment_refs,
 )
 from curie_worker.config import WorkerConfig
+from curie_worker.reply_sink import TargetRoute
 from curie_worker.workspace import WorkspaceObjectStore
 
 # A non-secret placeholder. The lane only needs a bot token to be PRESENT --
@@ -60,6 +62,29 @@ class _NoS3Client:
     ``charts/curie/ci/worker-object-store-assertions.sh`` own that from both
     ends.
     """
+
+
+class _RecordingObjects:
+    """A ``WorkspaceObjectPort`` spy: records every key actually written.
+
+    Substituted for the real S3-backed store on a lane already built by
+    ``run.build``, so a refusal test can assert nothing reached the object
+    store without also standing up a working upload path.
+    """
+
+    def __init__(self) -> None:
+        self.put_stream_calls: list[str] = []
+
+    def put_stream(self, key: str, chunks: Iterator[bytes]) -> None:
+        self.put_stream_calls.append(key)
+        for _ in chunks:
+            pass
+
+    def presign_get(self, key: str, *, expires_seconds: int) -> str:
+        return f"https://example.invalid/{key}"
+
+    def delete(self, key: str) -> None:
+        pass
 
 
 class _KernelSpy:
@@ -109,12 +134,12 @@ def built(monkeypatch: pytest.MonkeyPatch) -> Any:
     # built from config and Slack credentials, never from the publication path.
     monkeypatch.setattr(run, "_build_publication_loop", lambda *_a, **_k: None)
 
-    def _build(**config_overrides: Any) -> dict[str, Any]:
+    def _build(env: Mapping[str, str] | None = None, **config_overrides: Any) -> dict[str, Any]:
         _KernelSpy.instances.clear()
 
         async def _drive() -> dict[str, Any]:
             config = WorkerConfig(**config_overrides)
-            runtime = run.build(config, {})
+            runtime = run.build(config, dict(env or {}))
             try:
                 assert len(_KernelSpy.instances) == 1
                 return _KernelSpy.instances[0].kwargs
@@ -331,3 +356,101 @@ def test_a_resolved_turn_delivers_the_capability_under_the_init_containers_key(
     )
 
     assert list(prepared.claim_env()) == ["CURIE_ATTACHMENTS_REF"]
+
+
+# --- ADR-0168 decision 5: each identity's own token, from the worker's env ---
+
+_DECLARED_OPS = json.dumps(
+    [
+        {
+            "name": "default",
+            "app_token_env": "SLACK_APP_TOKEN",
+            "bot_token_env": "SLACK_BOT_TOKEN",
+            "signing_secret_env": None,
+        },
+        {
+            "name": "ops-bot",
+            "app_token_env": "CURIE_SLACK_APP_TOKEN__1",
+            "bot_token_env": "CURIE_SLACK_BOT_TOKEN__1",
+            "signing_secret_env": None,
+        },
+    ]
+)
+_OPS_BOT_TOKEN = "xoxb-OPS-PLACEHOLDER"
+
+
+def test_a_declared_identity_gets_its_own_file_client_from_builds_env(built: Any) -> None:
+    lane = _lane(
+        built(
+            env={"CURIE_SLACK_BOT_TOKEN__1": _OPS_BOT_TOKEN},
+            attachment_enabled=True,
+            slack_bot_token=_FAKE_BOT_TOKEN,
+            slack_identities=_DECLARED_OPS,
+        )
+    )
+    assert set(lane._identity_files) == {"ops-bot"}  # noqa: SLF001
+    assert lane._identity_files["ops-bot"]._token == _OPS_BOT_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
+    assert lane.files._token == _FAKE_BOT_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+def test_build_hands_the_reply_sink_the_same_identities(built: Any) -> None:
+    kwargs = built(
+        env={"CURIE_SLACK_BOT_TOKEN__1": _OPS_BOT_TOKEN},
+        slack_bot_token=_FAKE_BOT_TOKEN,
+        slack_identities=_DECLARED_OPS,
+    )
+    sink = kwargs["sink"]
+    assert sink.undeliverable_reason("slack", TargetRoute(adapter="ops-bot")) is None
+    assert sink.undeliverable_reason("slack", TargetRoute(adapter="ghost")) is not None
+
+
+# --- ADR-0168 decision 5: the lane's switch reads every declared identity ---
+
+
+def test_a_named_only_token_enables_the_lane_with_no_default_token(built: Any) -> None:
+    # The lane's off switch is `attachment_enabled` AND at least one declared
+    # identity holding a bot token -- not `default`'s token alone. A worker
+    # whose only Slack presence is a named bot must still download files
+    # posted to that bot.
+    lane = _lane(
+        built(
+            env={"CURIE_SLACK_BOT_TOKEN__1": _OPS_BOT_TOKEN},
+            attachment_enabled=True,
+            slack_bot_token="",
+            slack_identities=_DECLARED_OPS,
+        )
+    )
+    assert lane._identity_files["ops-bot"]._token == _OPS_BOT_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
+
+    # `default` holds no token on this worker. Its own fetch must be refused
+    # before any object is written -- not answered with whatever an empty
+    # `fetch()` iterator would produce, which is a 0-byte "attachment" handed
+    # to the agent as though the file were really there.
+    objects = _RecordingObjects()
+    lane.objects = objects
+    with pytest.raises(AttachmentResolutionError) as excinfo:
+        lane.resolve(
+            thread_key="t1",
+            agent_id="agent-1",
+            attachments=[
+                Attachment(id="F1", name="report.csv", mime_type="text/csv", size_bytes=None)
+            ],
+            identity="default",
+        )
+    assert excinfo.value.stage == "credential"
+    assert "default" in str(excinfo.value)
+    assert objects.put_stream_calls == []
+
+
+def test_no_identity_token_at_all_leaves_the_lane_unwired(built: Any) -> None:
+    # Declaring a named identity changes nothing if none of them, `default`
+    # included, actually holds a token: the credential guard still applies.
+    assert (
+        built(
+            env={},
+            attachment_enabled=True,
+            slack_bot_token="",
+            slack_identities=_DECLARED_OPS,
+        ).get("attachments")
+        is None
+    )

@@ -55,7 +55,7 @@ from aci_protocol import (
     ToolNote,
     TurnSource,
 )
-from aci_protocol.turn import DEFAULT_IDENTITY, route_identity
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import (
     MESSAGE_VERSION,
     Action,
@@ -148,6 +148,7 @@ from .sandbox.types import (
     SuspendedThreadError,
     UnschedulableClaimError,
 )
+from .slack_tokens import token_identity
 from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .workitem_dispatch import (
     TerminationObservation,
@@ -2064,6 +2065,27 @@ class Kernel:
                     await self._markers.mark_done(event_id)
                     return
             _OWNED_WORK_ITEM.set(owned_work_item_id)
+
+            # ADR-0168 decision 5: a turn addressed to an identity this worker
+            # cannot speak as ends here, before a card, a claim or a model call.
+            # Nothing can answer it: only the addressed bot may edit its own
+            # placeholder, and a reply from any other bot is the defect.
+            if not targetless and not self._is_factory_work_item_turn(event_id):
+                assert handle is not None
+                refusal = self._sink.undeliverable_reason(handle.kind, route)
+                if refusal is not None:
+                    logger.error(
+                        "dropping event %s without a reply: %s", event_id, refusal
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="failed",
+                    )
+                    return
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
@@ -4689,11 +4711,18 @@ class Kernel:
         lane = self._attachments
         assert lane is not None  # guarded by the caller
         assert qevent.attachments
+        handle = qevent.reply_handle
+        identity = (
+            token_identity(handle.adapter, handle.endpoint)
+            if handle is not None
+            else DEFAULT_IDENTITY
+        )
         prepared = await asyncio.to_thread(
             lane.resolve,
             thread_key=_thread_key_for(qevent),
             agent_id=str(agent_id) if agent_id is not None else None,
             attachments=list(qevent.attachments),
+            identity=identity,
         )
         return {**(boot_env or {}), **prepared.claim_env()}, prepared
 
@@ -6338,8 +6367,8 @@ class Kernel:
         # channel it POSTS TO, never from the turn that requested it. In the
         # requesting channel the card joins the thread and rides the trigger's
         # own transport. A route-bound channel has no such thread and is policy,
-        # not a per-turn reply: it posts top-level over the worker's default
-        # Slack transport, because ``ApprovalRouteBinding.resolution`` is
+        # not a per-turn reply: it posts top-level over the worker's configured
+        # Slack origin, because ``ApprovalRouteBinding.resolution`` is
         # Slack-only by construction (``schemas.py`` validates the explicit
         # pair), and the authorizer proves membership of that channel through a
         # verified Slack card click. Notification transport never feeds this
@@ -6359,7 +6388,22 @@ class Kernel:
             handle.channel,
         )
         card_endpoint = handle.endpoint if in_requesting_channel else None
-        card_adapter = route.adapter if in_requesting_channel else None
+        # A policy-routed card (NOT in the requesting channel) carries no
+        # per-turn identity of its own -- ``ApprovalRouteBinding.resolution``
+        # names only a channel, never an adapter -- so it must borrow the
+        # TURN's, or a named identity's card posts as ``default`` in a channel
+        # where only that identity may be a member (ADR-0168 decision 5). That
+        # borrow applies only to a Slack turn in IDENTITY form (no endpoint): a
+        # Slack turn carrying its own endpoint is the pre-ADR custom-transport
+        # form, whose ``adapter`` is a credential slug rather than an identity
+        # (``aci_protocol.turn.slack_speaking_identity``), and any other kind's
+        # adapter is that kind's own egress credential -- neither belongs on a
+        # Slack policy card.
+        card_adapter = (
+            None
+            if not in_requesting_channel and (handle.kind != SLACK_KIND or handle.endpoint)
+            else route.adapter
+        )
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
         # Slack adapter renders it into the approval card's buttons below the
