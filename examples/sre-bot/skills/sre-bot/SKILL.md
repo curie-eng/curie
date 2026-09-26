@@ -206,6 +206,13 @@ not have -- skip it, and do not offer any of it.
   `rule_uid` for one rule, and `operation="versions"` for its history. The
   configured connector refuses alert creation, updates and deletion. Do not
   call the obsolete `list_alert_rules` name or report a refused read as calm.
+- **The alerts this bundle pages on are Prometheus rules.** They load from
+  `serverFiles`, so Grafana lists them as datasource-managed. When a name
+  search of Grafana-managed rules finds nothing, read the Prometheus
+  datasource's rules, or query `ALERTS{alertname="<name>"}` through
+  `query_prometheus`, which returns a series only while it is pending or
+  firing. Never report a rule as missing because Grafana-managed rules do not
+  list it.
 - **Listing a datasource is not reading it.** A datasource can appear in
   `list_datasources` with no tool that queries it, and it can point at a host
   that no longer exists. If a query against one fails, say plainly that you
