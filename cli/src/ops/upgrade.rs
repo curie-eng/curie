@@ -207,6 +207,12 @@ struct UpgradeRecord {
     from_version: Option<String>,
     known_good_version: Option<String>,
     completed: Vec<UpgradePhase>,
+    /// Phases passed over without executing: a same-version rerun's
+    /// DrainPreflight through Apply, a fresh install's DrainPreflight. Kept
+    /// apart from `completed` so the record never claims work that did not
+    /// run (#2861); absent from checkpoints older binaries persisted.
+    #[serde(default)]
+    skipped: Vec<UpgradePhase>,
     status: String,
     plan: Vec<String>,
     /// Whether the DrainPreflight worker-reachability check has already run
@@ -606,10 +612,10 @@ fn status_from_record(
     }
 }
 
-fn remaining_after(completed: &[UpgradePhase]) -> Vec<UpgradePhase> {
+fn remaining_after(record: &UpgradeRecord) -> Vec<UpgradePhase> {
     UpgradePhase::ALL
         .into_iter()
-        .filter(|p| !completed.contains(p))
+        .filter(|p| !record.completed.contains(p) && !record.skipped.contains(p))
         .collect()
 }
 
@@ -812,7 +818,9 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         bail!("--to requires a target version");
     }
     let from = host.current();
-    let plan = plan_lines(
+    let same_version = from.as_deref() == Some(opts.to.as_str())
+        && host.known_good().as_deref() == Some(opts.to.as_str());
+    let mut plan = plan_lines(
         &opts,
         from.as_deref(),
         host.secret(),
@@ -820,6 +828,22 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         host.retained_values(),
         host.helm_timeout_seconds(),
     );
+    if same_version {
+        // #2861: the rerun runs no Helm upgrade, so the plan must not show one.
+        plan.retain(|line| {
+            !line.starts_with("helm upgrade ")
+                && !line.starts_with("phase drain_preflight:")
+                && !line.starts_with("phase checkpoint:")
+                && !line.starts_with("phase migrate:")
+        });
+        plan.insert(
+            2,
+            format!(
+                "phases drain_preflight, checkpoint, migrate, apply skipped: {} is already installed and known-good, so no helm upgrade runs; converge, canary and commit re-verify it",
+                opts.to
+            ),
+        );
+    }
     let mut plan: Vec<String> = plan.into_iter().map(|l| host.redact(&l)).collect();
 
     if opts.common.dry_run {
@@ -868,6 +892,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             from_version: from.clone(),
             known_good_version: host.known_good(),
             completed: Vec::new(),
+            skipped: Vec::new(),
             status: "in_progress".into(),
             plan: plan.clone(),
             drain_completed: false,
@@ -878,16 +903,13 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         },
     };
 
-    let same_version = from.as_deref() == Some(opts.to.as_str())
-        && host.known_good().as_deref() == Some(opts.to.as_str());
-
     // Resume after Validate still honors a freshly computed refusal and
     // must not replay DrainPreflight to reach it.
     if host.validate_refusal().is_some() || host.refuse_config() || host.refuse_schema() {
         execute_phase(UpgradePhase::Validate, &opts, host, &mut record)?;
     }
 
-    for phase in remaining_after(&record.completed) {
+    for phase in remaining_after(&record) {
         if same_version
             && matches!(
                 phase,
@@ -897,12 +919,12 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
                     | UpgradePhase::Apply
             )
         {
-            record.completed.push(phase);
+            record.skipped.push(phase);
             host.store_record(record.clone())?;
             continue;
         }
         if phase == UpgradePhase::DrainPreflight && from.is_none() {
-            record.completed.push(phase);
+            record.skipped.push(phase);
             host.store_record(record.clone())?;
             continue;
         }
