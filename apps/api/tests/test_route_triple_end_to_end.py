@@ -3,7 +3,8 @@
 ADR-0168 decision 3: the route is `(kind, address, adapter)`, so one channel
 can be bound under two identities -- by two agents, or by one agent that
 appears as two bots -- and the worker answers each identity's turn with the
-agent bound under it.
+agent bound under it, and a publication raised under each keeps its own
+binding.
 """
 
 from __future__ import annotations
@@ -18,8 +19,16 @@ import pytest
 from curie_api.config import get_settings
 from curie_worker.binding import BindingResolver
 from curie_worker.config import WorkerConfig
+from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+
+from apps.api.tests.test_publications import (
+    _create_deployment,
+    _create_publication,
+    _publication_payload,
+)
+from apps.api.tests.test_publications import publication_stack as publication_stack
 
 CHANNEL = "C0EXAMPLE1"
 TWO_IDENTITIES = json.dumps(
@@ -162,3 +171,67 @@ def test_a_repost_of_the_same_route_is_idempotent(
     )
     assert again.status_code == 201, again.text
     assert again.json()["channels"] == [{"kind": "slack", "address": CHANNEL, "adapter": "second"}]
+
+
+def _binding_ids(agent_id: str) -> dict[str, str]:
+    async def go() -> dict[str, str]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                rows = await conn.execute(
+                    text("SELECT adapter, id FROM curie.agent_channels WHERE agent_id = :a"),
+                    {"a": agent_id},
+                )
+                return {adapter: str(row_id) for adapter, row_id in rows.all()}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+def _lineage_binding_id(publication_id: str) -> str | None:
+    async def go() -> str | None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT l.binding_id FROM curie.publications p "
+                        "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+                        "WHERE p.id = :id"
+                    ),
+                    {"id": publication_id},
+                )
+                value = result.scalar_one()
+                return None if value is None else str(value)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+def test_a_publication_under_each_identity_keeps_its_own_binding(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    two_identities: None,
+) -> None:
+    """One agent answering as two bots on one channel: the lineage a
+    publication opens captures the binding of the identity it was raised
+    under, which is what its publication identity and review lane read."""
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers, channel=CHANNEL)
+    added = client.post(
+        f"/agents/{deployment['agent_id']}/channels",
+        json={"kind": "slack", "address": CHANNEL, "adapter": "second"},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    bindings = _binding_ids(deployment["agent_id"])
+
+    for identity in ("default", "second"):
+        payload = _publication_payload(deployment["id"])
+        payload["reply_adapter"] = identity
+        _, publication = _create_publication(client, payload)
+        assert _lineage_binding_id(publication["id"]) == bindings[identity], identity
