@@ -1647,6 +1647,34 @@ esac
     path
 }
 
+/// Every cluster deploy reads the release values to learn whether an earlier
+/// layered runner image must be cleared (#3260). The fixture release has
+/// nothing bound, which is what a fresh install answers.
+fn write_helm_stub(dir: &Path) -> PathBuf {
+    let path = dir.join("helm");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+case "$*" in
+  "get values "*)
+    printf '%s' '{}'
+    ;;
+  *)
+    printf 'unexpected helm invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .expect("write helm stub");
+    let mut permissions = fs::metadata(&path)
+        .expect("read helm stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("make helm stub executable");
+    path
+}
+
 fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
     let mut paths = vec![bin_dir.to_path_buf()];
     paths.extend(std::env::split_paths(
@@ -1687,6 +1715,7 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
 
     let tools = tempfile::tempdir().expect("tool tempdir");
     write_kubectl_stub(tools.path());
+    write_helm_stub(tools.path());
     let deploy_failure = fixture.deploy_failure;
     let connectors = fixture.connectors;
     let target_channels = fixture.target_channels;
