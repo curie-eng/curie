@@ -640,12 +640,14 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -
     new_time = "2999-01-01T00:00:00Z"
     sink.ci_scripts = {
         HEAD_A: [
-            ci_entry(check_run("PR body", conclusion="failure", started_at=old_time)),
             ci_entry(
-                check_run("PR body", started_at=old_time),
+                check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
+            ),
+            ci_entry(
+                check_run("PR body (real newlines)", started_at=old_time),
                 check_run("unrelated", started_at=new_time),
             ),
-            ci_entry(check_run("PR body", started_at=new_time)),
+            ci_entry(check_run("PR body (real newlines)", started_at=new_time)),
         ]
     }
     published = _published(client, github, sink, number)
@@ -677,7 +679,7 @@ def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(admitted: Any
     number = 9790
     old_time = "2020-01-01T00:00:00Z"
     new_time = "2999-01-01T00:00:00Z"
-    old_failure = check_run("PR body", conclusion="failure", started_at=old_time)
+    old_failure = check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
     sink.ci_scripts = {
         HEAD_A: [
             ci_entry(old_failure),
@@ -717,7 +719,10 @@ def test_body_only_fix_reports_only_a_fresh_unrelated_failure(admitted: Any) -> 
     old_time = "2020-01-01T00:00:00Z"
     new_time = "2999-01-01T00:00:00Z"
     old_failure = check_run(
-        "PR body", conclusion="failure", summary="Old body failure", started_at=old_time
+        "PR body (real newlines)",
+        conclusion="failure",
+        summary="Old body failure",
+        started_at=old_time,
     )
     old_status = {
         "context": "ci/pr-body",

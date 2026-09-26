@@ -279,9 +279,9 @@ def test_metadata_revision_retains_a_stale_failing_commit_status() -> None:
 def test_metadata_revision_retains_unedited_passing_checks() -> None:
     suite = _run("Python suite")
     suite["started_at"] = "2026-09-24T11:00:00Z"
-    body_before = _run("PR body", conclusion="failure", run_id=2)
+    body_before = _run("PR body (real newlines)", conclusion="failure", run_id=2)
     body_before["started_at"] = "2026-09-24T11:00:00Z"
-    body_after = _run("PR body", run_id=3)
+    body_after = _run("PR body (real newlines)", run_id=3)
     body_after["started_at"] = "2026-09-24T12:00:02Z"
 
     verdict = _decide(
@@ -369,7 +369,7 @@ def test_fresh_unrelated_failure_does_not_revive_stale_red() -> None:
 
 
 def test_fresh_failure_after_metadata_revision_fails_without_grace() -> None:
-    failed = _run("PR body", conclusion="failure")
+    failed = _run("PR body (real newlines)", conclusion="failure")
     failed["started_at"] = "2026-09-24T12:00:01Z"
     verdict = _decide(_detail(failed), 10, fresh_after=PUBLISHED)
     assert verdict.kind == "failing"

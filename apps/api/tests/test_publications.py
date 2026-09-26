@@ -6103,7 +6103,7 @@ def test_metadata_only_lineage_advance_settles_status_and_update_time_atomically
             }
         ]
     else:
-        assert response.status_code == 409, response.text
+        assert response.status_code == 422, response.text
         assert _rows(snapshot, identity) == before
 
 

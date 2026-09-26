@@ -44,7 +44,7 @@ ACQUISITION_ACTIONS = frozenset(
 RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "python", "Install uv"),
-        ("ci.yaml", "fix-pin", "Install uv"),
+        ("fix-pin.yaml", "fix-pin", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Create the disposable kind cluster"),
         ("xdist-characterise.yaml", "attempt", "Install uv"),
@@ -177,7 +177,7 @@ RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
         # web has no compose healthcheck, so `--wait` returns while it is
         # merely running. A readiness poll for an external service, not a
         # retry of anything this repository builds or gates.
-        ("ci.yaml", "fix-pin", "Wait for Langfuse to serve"),
+        ("fix-pin.yaml", "fix-pin", "Wait for Langfuse to serve"),
         # The candidate API has already rolled out; this only waits for the
         # temporary local port-forward to expose its external health state.
         (

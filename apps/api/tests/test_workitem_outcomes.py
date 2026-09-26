@@ -429,6 +429,7 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
             "pr_number": PR_NUMBER,
             "pr_url": PR_URL,
             "head_sha": HEAD_SHA,
+            "metadata_updated_at": None,
         },
         headers=WORKER_HEADERS,
     )

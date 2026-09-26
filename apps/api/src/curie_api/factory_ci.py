@@ -131,6 +131,7 @@ def _fresh_ci_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
 
 
 _METADATA_EDIT_CHECKS = frozenset({"PR body (real newlines)", "Fix pin verification"})
+_METADATA_EDIT_STATUSES = frozenset({"ci/pr-body"})
 
 
 def _metadata_revision_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
@@ -147,6 +148,7 @@ def _metadata_revision_detail(detail: CiDetail, fresh_after: datetime) -> CiDeta
         statuses=fresh.statuses + [
             item for item in detail.statuses
             if item.get("context") not in fresh_contexts
+            and item.get("context") not in _METADATA_EDIT_STATUSES
         ],
     )
 
@@ -183,6 +185,12 @@ def decide(
             and run.get("name") not in fresh_names
             for run in check_runs
         )
+        fresh_contexts = {item.get("context") for item in fresh_statuses}
+        missing_rerun = missing_rerun or any(
+            item.get("context") in _METADATA_EDIT_STATUSES
+            and item.get("context") not in fresh_contexts
+            for item in statuses
+        )
         fresh_failure = any(
             run.get("status") == "completed"
             and run.get("conclusion") in _FAILING_CONCLUSIONS
@@ -193,7 +201,11 @@ def decide(
             and run.get("status") == "completed"
             and run.get("conclusion") in _FAILING_CONCLUSIONS
             for run in check_runs
-        ) or any(item.get("state") in _FAILING_STATES for item in statuses)
+        ) or any(
+            item.get("context") not in _METADATA_EDIT_STATUSES
+            and item.get("state") in _FAILING_STATES
+            for item in statuses
+        )
         if (
             not fresh_failure
             and not unchanged_failure
