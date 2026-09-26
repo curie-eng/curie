@@ -35,8 +35,9 @@ from .conftest import _DB_URL, _VALKEY_HOST, _VALKEY_PORT, _VALKEY_PW
 HOOK = "nightly"
 PROMPT = "Summarize.\n  Keep the  spacing verbatim."
 BUDGET_S = 300.0
-ENDPOINT = "http://curie-test-adapter:8080/"
-ADAPTER = "test-adapter"
+# A Slack route names its identity and carries no endpoint (ADR-0168
+# decision 3); a named one proves the handle copies it from the row.
+IDENTITY = "second-bot"
 
 
 def _slot() -> datetime:
@@ -145,8 +146,8 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
                     "id": channel_id,
                     "agent_id": agent_id,
                     "address": address,
-                    "endpoint": ENDPOINT,
-                    "adapter": ADAPTER,
+                    "endpoint": None,
+                    "adapter": IDENTITY,
                 },
             )
         yield _Seed(
@@ -430,8 +431,8 @@ def test_admitted_event_has_the_cron_turn_shape(
             assert (handle.kind, handle.channel, handle.endpoint, handle.adapter) == (
                 "slack",
                 seed.address,
-                ENDPOINT,
-                ADAPTER,
+                None,
+                IDENTITY,
             )
 
     asyncio.run(body())
@@ -461,6 +462,66 @@ def test_target_not_bound_to_the_agent_records_failed(
             rows = await seed.runs()
             assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "failed")]
             assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+def test_a_target_bound_under_several_identities_means_the_default_one(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """ADR-0168 decision 3: a trigger names an address, never an identity."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            extra = uuid.uuid4()
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                        "VALUES (:id, :agent, 'slack', :address, 'default')"
+                    ),
+                    {"id": extra, "agent": seed.agent_id, "address": seed.address},
+                )
+            try:
+                await _pass_once(seed, names["stream"], _trigger(seed))
+                [turn] = _entries(sync_redis, names["stream"])
+                assert turn.reply_handle is not None
+                assert turn.reply_handle.adapter == "default"
+            finally:
+                async with seed.engine.begin() as conn:
+                    await conn.execute(
+                        text("DELETE FROM curie.agent_channels WHERE id = :id"), {"id": extra}
+                    )
+
+    asyncio.run(body())
+
+
+def test_a_target_bound_under_several_identities_none_default_records_failed(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """Without the default identity among them, several routes are ambiguous."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            extra = uuid.uuid4()
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                        "VALUES (:id, :agent, 'slack', :address, 'third-bot')"
+                    ),
+                    {"id": extra, "agent": seed.agent_id, "address": seed.address},
+                )
+            try:
+                await _pass_once(seed, names["stream"], _trigger(seed))
+                rows = await seed.runs()
+                assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "failed")]
+                assert _entries(sync_redis, names["stream"]) == []
+            finally:
+                async with seed.engine.begin() as conn:
+                    await conn.execute(
+                        text("DELETE FROM curie.agent_channels WHERE id = :id"), {"id": extra}
+                    )
 
     asyncio.run(body())
 
