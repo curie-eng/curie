@@ -241,7 +241,7 @@ fn random_hex(n_bytes: usize) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("OS random number generator unavailable: {e}"))?;
     let mut out = String::with_capacity(n_bytes * 2);
     for b in buf {
-        let _ = write!(out, "{b:02x}");
+        write!(out, "{b:02x}").expect("writing to a String cannot fail");
     }
     Ok(out)
 }
@@ -3494,7 +3494,11 @@ impl RunningInstall {
         let status = match status {
             Ok(status) => status,
             Err(error) => {
-                let _ = terminate_process(&mut self.child).await;
+                if let Err(cleanup_error) = terminate_process(&mut self.child).await {
+                    crate::ui::ui().plumbing(&format!(
+                        "failed to stop Helm after status error: {cleanup_error}"
+                    ));
+                }
                 return Err(error).with_context(|| {
                     format!("failed to invoke `{}`; is it on PATH?", self.program)
                 });
@@ -3516,11 +3520,32 @@ impl RunningInstall {
     }
 
     async fn terminate(mut self) {
-        let _ = terminate_helm_process(&mut self.child).await;
+        let termination = terminate_helm_process(&mut self.child).await;
         self.stdout.abort();
         self.stderr.abort();
-        let _ = self.stdout.await;
-        let _ = self.stderr.await;
+        match self.stdout.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                crate::ui::ui().plumbing(&format!("failed to read Helm stdout: {error}"));
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                crate::ui::ui().plumbing(&format!("failed to join Helm stdout reader: {error}"));
+            }
+        }
+        match self.stderr.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                crate::ui::ui().plumbing(&format!("failed to read Helm stderr: {error}"));
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                crate::ui::ui().plumbing(&format!("failed to join Helm stderr reader: {error}"));
+            }
+        }
+        if let Err(error) = termination {
+            crate::ui::ui().plumbing(&format!("failed to stop Helm: {error}"));
+        }
     }
 }
 
@@ -3681,8 +3706,19 @@ async fn terminate_process(child: &mut Child) -> std::io::Result<std::process::E
     if let Ok(Some(status)) = child.try_wait() {
         return Ok(status);
     }
-    let _ = child.start_kill();
-    child.wait().await
+    match child.start_kill() {
+        Ok(()) => child.wait().await,
+        Err(error) => match child.try_wait()? {
+            Some(status) => Ok(status),
+            None => Err(error),
+        },
+    }
+}
+
+async fn stop_gvisor_event_watch(watch: &mut RunningGvisorEventWatch) {
+    if let Err(error) = terminate_process(&mut watch.child).await {
+        crate::ui::ui().plumbing(&format!("failed to stop gVisor event watch: {error}"));
+    }
 }
 
 /// Give Helm its interrupt path so it can mark the release failed before a
@@ -3749,7 +3785,7 @@ async fn run_install_with_gvisor_observer(
         Ok(install) => install,
         Err(error) => {
             if let Some(GvisorEventWatchStart::Watching(watch)) = &mut watch_start {
-                let _ = terminate_process(&mut watch.child).await;
+                stop_gvisor_event_watch(watch).await;
             }
             step.fail("failed");
             return Err(error);
@@ -3821,7 +3857,7 @@ async fn run_install_with_gvisor_observer(
                                     GvisorEventWatchLine::Ignore => None,
                                 },
                                 Ok(None) | Err(_) => {
-                                    let _ = terminate_process(&mut running_watch.child).await;
+                                    stop_gvisor_event_watch(running_watch).await;
                                     Some(GvisorInstallRace::Helm(install.child.wait().await))
                                 }
                             }
@@ -3841,7 +3877,7 @@ async fn run_install_with_gvisor_observer(
     match race {
         GvisorInstallRace::Helm(status) => {
             if let Some(watch) = watch.as_mut() {
-                let _ = terminate_process(&mut watch.child).await;
+                stop_gvisor_event_watch(watch).await;
             }
             let captured = install.finish(status).await;
             match captured {
@@ -3857,7 +3893,7 @@ async fn run_install_with_gvisor_observer(
         }
         GvisorInstallRace::RuntimeClassRejected(rejection) => {
             if let Some(watch) = watch.as_mut() {
-                let _ = terminate_process(&mut watch.child).await;
+                stop_gvisor_event_watch(watch).await;
             }
             install.terminate().await;
             Ok(GvisorInstallOutcome::RuntimeClassRejected { rejection, step })
@@ -3911,8 +3947,7 @@ impl crate::ui::CliOutput for ClusterUpOutput {
 /// specific regression this function exists to make visible. `dry_run` is the
 /// only thing that skips the read, since `--dry-run` stays fully offline and
 /// never touches helm.
-fn should_read_existing(dev: bool, dry_run: bool) -> bool {
-    let _ = dev;
+fn should_read_existing(_dev: bool, dry_run: bool) -> bool {
     !dry_run
 }
 
@@ -6206,8 +6241,12 @@ mod tests {
         // The whole generate/reuse path is a pure function: no stdin, no TTY, so
         // a non-interactive / CI `cluster up` resolves secrets without blocking.
         // (Exercising it here would hang the test run if it ever read a TTY.)
-        let _ = resolve_generated_secrets(None, &[]).unwrap();
-        let _ = resolve_generated_secrets(Some(&serde_json::Value::Null), &[]).unwrap();
+        assert!(!resolve_generated_secrets(None, &[]).unwrap().is_empty());
+        assert!(
+            resolve_generated_secrets(Some(&serde_json::Value::Null), &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

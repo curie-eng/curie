@@ -9,6 +9,8 @@
 //! them. That split keeps the argv construction unit-testable with no cluster
 //! and gives one place to mask secrets before anything is printed.
 
+#![deny(clippy::let_underscore_must_use, clippy::let_underscore_untyped)]
+
 mod command;
 mod convergence;
 mod providers;
