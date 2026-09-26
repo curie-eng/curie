@@ -2325,7 +2325,8 @@ echo "=== Assertion 17: rustfs-init caps Langfuse event-upload objects with a li
 # is about three inodes on the RustFS volume, and on 2026-09-21 they filled the
 # soak node's inode table while kubelet still reported DiskPressure=False. The
 # bucket init Job must install an expiration rule scoped to the events/ prefix,
-# and langfuse.eventUpload.retentionDays=0 must render no rule at all.
+# preserve any other lifecycle rule on the bucket, and
+# langfuse.eventUpload.retentionDays=0 must remove the managed rule.
 check_event_retention() {
   python3 - "$1" "$2" <<'PYEOF'
 import json, re, sys, yaml
@@ -2337,24 +2338,24 @@ with open(path) as fh:
             script = doc["spec"]["template"]["spec"]["containers"][0]["command"][-1]
 if script is None:
     sys.exit("rustfs-init Job not rendered")
-has_call = "put-bucket-lifecycle-configuration" in script
+m = re.search(r"managed_rule='(.*?)'\n", script)
 if want == "none":
-    sys.exit("retention disabled but a lifecycle rule still renders" if has_call else 0)
-if not has_call:
-    sys.exit("rustfs-init never installs a lifecycle rule on the Langfuse bucket")
-m = re.search(r"--lifecycle-configuration '(\{.*?\})'", script, re.S)
+    if m:
+        sys.exit("retention disabled but the managed rule still renders")
+    if "delete-bucket-lifecycle" not in script:
+        sys.exit("retentionDays=0 must remove a rule an earlier release installed")
+    sys.exit(0)
 if not m:
-    sys.exit("lifecycle configuration is not an inline JSON document")
-rules = json.loads(m.group(1))["Rules"]
-if len(rules) != 1:
-    sys.exit("expected exactly one lifecycle rule, got %r" % rules)
-rule = rules[0]
+    sys.exit("rustfs-init never installs a lifecycle rule on the Langfuse bucket")
+rule = json.loads(m.group(1).replace("'\"$rule_id\"'", "langfuse-event-upload-retention"))
 if rule.get("Status") != "Enabled" or rule.get("Filter") != {"Prefix": "events/"}:
     sys.exit("lifecycle rule must be Enabled and scoped to events/, got %r" % rule)
 if rule.get("Expiration") != {"Days": int(want)}:
     sys.exit("lifecycle rule expires after %r, expected %s days" % (rule.get("Expiration"), want))
-if '--bucket "langfuse"' not in script:
+if 'lifecycle_bucket="langfuse"' not in script:
     sys.exit("lifecycle rule is not applied to the Langfuse bucket")
+if "Rules[?ID!='$rule_id']" not in script:
+    sys.exit("other lifecycle rules on the bucket must be preserved")
 PYEOF
 }
 RETENTION_DEFAULT="$TMP/retention-default.yaml"

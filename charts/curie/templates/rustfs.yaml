@@ -175,13 +175,32 @@ spec:
                 aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$bucket"
                 echo "bucket $bucket ready"
               done
+              {{- /* Langfuse never deletes its event-upload objects (#2870). Reconcile
+                     only the chart's own rule, so other lifecycle rules on the bucket
+                     survive and retentionDays 0 removes a rule an earlier release put. */}}
               {{- $retentionDays := int .Values.langfuse.eventUpload.retentionDays }}
+              lifecycle_bucket={{ .Values.rustfs.bucket | quote }}
+              rule_id=langfuse-event-upload-retention
+              if ! other_rules="$(aws --endpoint-url "$endpoint" s3api get-bucket-lifecycle-configuration \
+                  --bucket "$lifecycle_bucket" --query "Rules[?ID!='$rule_id']" --output json 2>/tmp/aws/lifecycle.err)"; then
+                grep -q NoSuchLifecycleConfiguration /tmp/aws/lifecycle.err || { cat /tmp/aws/lifecycle.err >&2; exit 1; }
+                other_rules="[]"
+              fi
+              other_rules="$(printf '%s' "$other_rules" | tr -d '\n')"
               {{- if gt $retentionDays 0 }}
-              {{- /* Langfuse never deletes its event-upload objects (#2870). */}}
+              managed_rule='{"ID":"'"$rule_id"'","Status":"Enabled","Filter":{"Prefix":"events/"},"Expiration":{"Days":{{ $retentionDays }}}}'
+              if [ "$other_rules" = "[]" ]; then rules="[$managed_rule]"; else rules="${other_rules%]},$managed_rule]"; fi
               aws --endpoint-url "$endpoint" s3api put-bucket-lifecycle-configuration \
-                --bucket {{ .Values.rustfs.bucket | quote }} \
-                --lifecycle-configuration '{"Rules":[{"ID":"langfuse-event-upload-retention","Status":"Enabled","Filter":{"Prefix":"events/"},"Expiration":{"Days":{{ $retentionDays }}}}]}'
-              echo "events/ in bucket {{ .Values.rustfs.bucket }} expires after {{ $retentionDays }} days"
+                --bucket "$lifecycle_bucket" --lifecycle-configuration "{\"Rules\":$rules}"
+              echo "events/ in bucket $lifecycle_bucket expires after {{ $retentionDays }} days"
+              {{- else }}
+              if [ "$other_rules" = "[]" ]; then
+                aws --endpoint-url "$endpoint" s3api delete-bucket-lifecycle --bucket "$lifecycle_bucket"
+              else
+                aws --endpoint-url "$endpoint" s3api put-bucket-lifecycle-configuration \
+                  --bucket "$lifecycle_bucket" --lifecycle-configuration "{\"Rules\":$other_rules}"
+              fi
+              echo "events/ retention disabled for bucket $lifecycle_bucket"
               {{- end }}
           env:
             - name: AWS_ACCESS_KEY_ID
