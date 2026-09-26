@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
@@ -58,6 +59,50 @@ _NOT_FORWARDED = frozenset(
 )
 
 logger = logging.getLogger("curie_connector_proxy")
+
+# A caller token, and any run of base64url long enough to be a piece of one:
+# aiohttp's parse-error log quotes the bytes it refused, which can be a token
+# cut anywhere.
+_TOKEN_TEXT = re.compile(rf"{caller.PREFIX}\.[A-Za-z0-9_.-]*|[A-Za-z0-9_-]{{32,}}")
+_REDACTED = "<redacted>"
+
+
+def _redact(text: str) -> str:
+    return _TOKEN_TEXT.sub(_REDACTED, text)
+
+
+class _RedactCallerTokens(logging.Filter):
+    """Rewrite a record so nothing it prints carries a caller token."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact(record.getMessage())
+        record.args = None
+        if record.exc_info:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = _redact(record.exc_text)
+        if record.stack_info:
+            record.stack_info = _redact(record.stack_info)
+        return True
+
+
+def _redacting_logger(name: str) -> logging.Logger:
+    named = logging.getLogger(name)
+    if not any(isinstance(f, _RedactCallerTokens) for f in named.filters):
+        named.addFilter(_RedactCallerTokens())
+    return named
+
+
+# What every connection this app serves is handled with, whoever starts it: a
+# body is relayed as sent, never decoded, so the length and encoding forwarded
+# with it stay true; and aiohttp's own error and access logs, which can quote a
+# request's headers, go through loggers that redact a caller token.
+_HANDLER_ARGS = {
+    "auto_decompress": False,
+    "logger": _redacting_logger("curie_connector_proxy.server"),
+    "access_log": _redacting_logger("curie_connector_proxy.access"),
+}
 
 
 @dataclass(frozen=True)
@@ -161,8 +206,10 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # routing's result either way, so every request, matched or not, is
     # decided and never silently let through to the router's default.
     decision = _decide(request)
+    # The path is decoded, so it is quoted: an encoded newline in it stays
+    # `\n` inside this line rather than starting a line of its own.
     logger.info(
-        "caller=%s outcome=%s method=%s path=%s",
+        "caller=%s outcome=%s method=%s path=%r",
         decision.agent or "-",
         decision.refusal or "admitted",
         request.method,
@@ -220,7 +267,7 @@ def make_app(config: ProxyConfig, *, clock: Callable[[], float] = time.time) -> 
         yield
         await session.close()
 
-    app = web.Application(middlewares=[_handle])
+    app = web.Application(middlewares=[_handle], handler_args=_HANDLER_ARGS)
     app[_CONFIG] = config
     app[_CLOCK] = clock
     app.cleanup_ctx.append(upstream)

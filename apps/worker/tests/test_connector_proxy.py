@@ -97,10 +97,11 @@ async def _serving(
     upstream_port: int | None = None,
 ) -> AsyncIterator[tuple[_Upstream, TestServer]]:
     upstream = _Upstream()
+    upstream_server = TestServer(upstream.app, handler_cancellation=True)
     # The stand-in server keeps what it was sent as sent, so a body the proxy
-    # altered on the way cannot be decoded back into looking unchanged.
-    upstream_server = TestServer(upstream.app, handler_cancellation=True, auto_decompress=False)
-    await upstream_server.start_server()
+    # altered on the way cannot be decoded back into looking unchanged. Handler
+    # options reach aiohttp through start_server; TestServer() drops them.
+    await upstream_server.start_server(auto_decompress=False)
     proxy = TestServer(
         server.make_app(
             _config(upstream_port or upstream_server.port or 0, admits=admits), clock=lambda: clock
