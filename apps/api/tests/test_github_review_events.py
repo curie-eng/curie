@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+from typing import Any
 
 import httpx
 import pytest
@@ -670,6 +671,44 @@ def review_stack(
 
 
 @pytest.fixture
+def cluster_message_review_stack(
+    clean_db: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    review_app_key: str,
+) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
+    """A `curie cluster message` conversation whose agent is bound to its address."""
+    with _review_stack(
+        request,
+        monkeypatch,
+        review_app_key,
+        publish=True,
+        agent_channel="C0LOCALDEV",
+        cluster_message=True,
+    ) as stack:
+        yield stack
+
+
+@pytest.fixture
+def unbound_cluster_message_review_stack(
+    clean_db: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    review_app_key: str,
+) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
+    """The same relay conversation on an agent NOT bound to its address."""
+    with _review_stack(
+        request,
+        monkeypatch,
+        review_app_key,
+        publish=True,
+        agent_channel="C0EXAMPLE1",
+        cluster_message=True,
+    ) as stack:
+        yield stack
+
+
+@pytest.fixture
 def approved_review_producer(
     clean_db: None,
     request: pytest.FixtureRequest,
@@ -688,6 +727,8 @@ def _review_stack(
     review_app_key: str,
     *,
     publish: bool,
+    agent_channel: str = "C0EXAMPLE1",
+    cluster_message: bool = False,
 ) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
     """Real migrated Postgres/Valkey/API, with only GitHub HTTP replaced.
 
@@ -697,6 +738,18 @@ def _review_stack(
     """
     event = getattr(request, "param", "issue_comment")
     truth = GitHubTruth(event, review_app_key)
+    # `curie cluster message` replies through the built-in relay: a Slack-shaped
+    # address, no endpoint, the reserved adapter and a session reply ref (#2789).
+    reply_channel = "C0LOCALDEV" if cluster_message else "C0EXAMPLE1"
+    reply_route: dict[str, Any] = (
+        {
+            "reply_placeholder": str(uuid.uuid4()),
+            "reply_endpoint": None,
+            "reply_adapter": "curie-cluster-message",
+        }
+        if cluster_message
+        else {"reply_placeholder": "1700000000.000002"}
+    )
     stream = f"test:curie:github-review:{uuid.uuid4().hex}"
     for key, value in {
         "RUNS_STREAM": stream,
@@ -749,7 +802,7 @@ def _review_stack(
             json={
                 "name": f"acme-review-{uuid.uuid4().hex[:8]}",
                 "repo_full_name": REPO,
-                "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "channel": {"kind": "slack", "address": agent_channel},
             },
         )
         assert agent.status_code == 201, agent.text
@@ -775,7 +828,7 @@ def _review_stack(
             headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
             json={
                 "conversation_id": scoped_conversation_id(
-                    "slack", "C0EXAMPLE1", "1700000000.000001"
+                    "slack", reply_channel, "1700000000.000001"
                 ),
                 "author": "U0REQUEST1",
                 "repo_full_name": REPO,
@@ -794,13 +847,13 @@ def _review_stack(
                 "author": "U0REQUEST1",
                 "summary": "Fixture publication",
                 "reply_kind": "slack",
-                "reply_channel": "C0EXAMPLE1",
-                "reply_placeholder": "1700000000.000002",
+                "reply_channel": reply_channel,
                 "dedupe_key": f"fixture-{uuid.uuid4()}",
                 "base_sha": HEAD,
                 "patch_b64": base64.b64encode(b"diff --git a/a b/a\n").decode(),
                 "changed_paths": ["a"],
                 "expires_in_seconds": 600,
+                **reply_route,
             },
         )
         assert publication.status_code == 201, publication.text
@@ -810,7 +863,7 @@ def _review_stack(
             get_settings().approval_chat_attester_secret,
             subject="U0REQUEST1",
             kind="chat",
-            actor_channel="C0EXAMPLE1",
+            actor_channel=reply_channel,
             approval_id=publication.json()["approval_id"],
             scope=approval_principal.APPROVE_SCOPE,
             exp=int(time.time()) + 60,
@@ -833,6 +886,11 @@ def _review_stack(
         # Remove only this fixture's synthetic approval-resume input, before
         # admitting any review. This test does not execute that earlier turn.
         valkey.delete(stream)
+        if agent_channel != reply_channel:
+            # An unbound lineage never has GitHub identity stamped on it.
+            truth.calls.clear()
+            yield client, truth, valkey, stream
+            return
         assert review_rows(
             "SELECT github_repository_id, github_installation_id, github_pr_node_id, base_ref "
             "FROM curie.thread_publication_lineages"
@@ -909,6 +967,59 @@ def test_real_ingress_persists_and_enqueues_exactly_one_honest_bound_turn(review
     assert "fixture-app-token" not in entries[0][1]["payload"]
     rows = review_rows("SELECT status, stream_id, version FROM curie.github_review_feedback")
     assert rows == [{"status": "queued", "stream_id": entries[0][0], "version": 2}]
+
+
+def test_cluster_message_lineage_binds_its_channel_and_admits_real_review(
+    cluster_message_review_stack,
+) -> None:
+    """#2789: a relay-routed conversation gets a real binding, so review re-enters it."""
+    from aci_protocol import parse_queued_turn
+
+    client, truth, valkey, stream = cluster_message_review_stack
+    assert review_rows(
+        "SELECT c.address, c.endpoint, c.adapter, l.binding_generation = c.generation AS current "
+        "FROM curie.thread_publication_lineages l "
+        "JOIN curie.agent_channels c ON c.id = l.binding_id"
+    ) == [{"address": "C0LOCALDEV", "endpoint": None, "adapter": None, "current": True}]
+    response = post_review(client, truth)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "feedback_queued"
+    entries = valkey.xrange(stream)
+    assert len(entries) == 1
+    turn = parse_queued_turn(entries[0][1]["payload"])
+    assert turn.conversation_id == "1700000000.000001"
+    # The reply stays on the relay the conversation came from, never the Slack
+    # sink a bare binding would select, and carries the ref the relay requires.
+    handle = turn.reply_handle
+    assert (handle.kind, handle.channel, handle.endpoint, handle.adapter) == (
+        "slack",
+        "C0LOCALDEV",
+        None,
+        "curie-cluster-message",
+    )
+    assert handle.placeholder is not None
+    assert uuid.UUID(handle.placeholder).version == 4
+    assert str(uuid.UUID(handle.placeholder)) == handle.placeholder
+
+
+def test_unbound_cluster_message_lineage_is_still_refused(
+    unbound_cluster_message_review_stack,
+) -> None:
+    """#2789 negative: no agent binding at the relay address leaves no authority."""
+    client, truth, valkey, stream = unbound_cluster_message_review_stack
+    assert review_rows(
+        "SELECT binding_id, binding_generation FROM curie.thread_publication_lineages"
+    ) == [{"binding_id": None, "binding_generation": None}]
+    response = post_review(client, truth)
+    assert response.status_code == 200, response.text
+    # No binding means no GitHub identity is ever stamped, so the PR selects
+    # no lineage at all.
+    body = response.json()
+    assert (body["status"], body["errors"]) == (
+        "feedback_ignored",
+        [{"code": "lineage_absent_or_ambiguous"}],
+    )
+    assert valkey.xlen(stream) == 0
 
 
 def test_worker_publication_success_stamps_verified_identity_on_the_lineage(

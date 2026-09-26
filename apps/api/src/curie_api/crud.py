@@ -46,6 +46,7 @@ from .publication_policy import (
     publication_row_prefix,
 )
 from .schemas import (
+    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     ActionComplete,
     ActionRecord,
     AgentCreate,
@@ -1069,9 +1070,7 @@ async def create_publication(
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if binding is not None and (
-            binding.endpoint != data.reply_endpoint or binding.adapter != data.reply_adapter
-        ):
+        if binding is not None and (binding.endpoint, binding.adapter) != _binding_route(data):
             binding = None
         lineage_id = uuid.uuid4()
         lineage = ThreadPublicationLineage(
@@ -1168,8 +1167,7 @@ async def create_publication(
             if (
                 data.reply_kind != review_binding.kind
                 or data.reply_channel != review_binding.address
-                or data.reply_endpoint != review_binding.endpoint
-                or data.reply_adapter != review_binding.adapter
+                or _binding_route(data) != (review_binding.endpoint, review_binding.adapter)
                 or (data.reply_conversation_id or data.conversation_id)
                 != lineage.reply_conversation_id
             ):
@@ -1317,6 +1315,19 @@ async def create_publication(
     await session.refresh(publication)
     await session.refresh(publication, ["lineage"])
     return publication, True
+
+
+def _binding_route(data: PublicationCreate) -> tuple[str | None, str | None]:
+    """The channel route a publication's reply must be bound through.
+
+    The built-in cluster-message relay is not a configurable route: the channel
+    API reserves its adapter, so the binding it replies for is one with no
+    route of its own (#2789). Any configured route still differs.
+    """
+
+    if data.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+        return None, None
+    return data.reply_endpoint, data.reply_adapter
 
 
 async def _bind_running_work_item_lineage(

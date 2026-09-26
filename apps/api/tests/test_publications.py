@@ -5287,11 +5287,12 @@ def _verified_lineage(
     auth_headers: dict[str, str],
     *,
     conversation: str = "review-original",
+    route: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     deployment = _create_deployment(client, auth_headers)
-    _, publication = _create_publication(
-        client, _publication_payload(deployment["id"], conversation_id=conversation)
-    )
+    payload = _publication_payload(deployment["id"], conversation_id=conversation)
+    payload.update(route or {})
+    _, publication = _create_publication(client, payload)
     truth["branch"] = publication["branch"]
     resolved = _resolve(client, auth_headers, publication["approval_id"])
     assert resolved.status_code == 200, resolved.text
@@ -5587,6 +5588,54 @@ def test_scoped_review_consumption_cannot_redirect_the_fresh_approval(
     assert accepted.status_code == 201, accepted.text
     assert accepted.json()["id"] == reservation.json()["revision_id"]
     assert accepted.json()["reply_channel"] == "C0EXAMPLE1"
+
+
+def _relay_route() -> dict[str, Any]:
+    return {
+        "reply_placeholder": str(uuid.uuid4()),
+        "reply_endpoint": None,
+        "reply_adapter": CLUSTER_MESSAGE_ADAPTER,
+    }
+
+
+def test_cluster_message_review_revision_consumes_its_reservation(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    """#2789: the review turn's relay reply may publish its revised pull request."""
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers, route=_relay_route())
+    reservation = _reserve_review(client, lineage, "review:relay-origin")
+    assert reservation.status_code == 201, reservation.text
+    payload = _publication_payload(
+        deployment["id"], conversation_id="review-original", base_sha=FIRST_REVISION_SHA
+    )
+    payload.update(review_origin_key="review:relay-origin", **_relay_route())
+    accepted = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
+    assert accepted.status_code == 201, accepted.text
+    assert accepted.json()["id"] == reservation.json()["revision_id"]
+    assert (
+        _rows("SELECT status FROM curie.publication_review_reservations")[0]["status"] == "consumed"
+    )
+
+
+def test_cluster_message_review_revision_cannot_take_a_configured_route(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    """#2789 negative: the relay binding still refuses an operator-configured route."""
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers, route=_relay_route())
+    assert _reserve_review(client, lineage, "review:relay-routed").status_code == 201
+    payload = _publication_payload(
+        deployment["id"], conversation_id="review-original", base_sha=FIRST_REVISION_SHA
+    )
+    payload.update(
+        review_origin_key="review:relay-routed",
+        reply_endpoint="https://adapter.example.com/reply",
+        reply_adapter="agentmail-sandbox",
+    )
+    refused = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.review_ineligible"
 
 
 def test_cancelled_review_origin_remains_a_non_executing_tombstone(
