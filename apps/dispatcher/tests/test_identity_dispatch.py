@@ -345,15 +345,10 @@ def test_a_lane_must_be_told_which_identity_it_serves(lane: Any) -> None:
     assert parameter.default is inspect.Parameter.empty
 
 
-def test_the_default_identity_mints_exactly_the_handle_it_always_did(
+def test_the_default_identity_mints_its_name(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    """Both lanes, with `default` named explicitly.
-
-    `adapter` stays null on the wire until #3146 stores the name, so every
-    phase-1 reader resolves it as `default` and a worker from before the route
-    triple still resolves every default turn.
-    """
+    """Both lanes, with `default` named explicitly."""
 
     default = _default(config, redis_client)
 
@@ -369,7 +364,7 @@ def test_the_default_identity_mints_exactly_the_handle_it_always_did(
             "channel": CHANNEL,
             "placeholder": "100.0001",
             "endpoint": None,
-            "adapter": None,
+            "adapter": "default",
         }
 
 

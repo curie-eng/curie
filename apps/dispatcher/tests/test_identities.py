@@ -155,8 +155,8 @@ def test_credentials_never_print_their_tokens() -> None:
         assert secret not in printed
 
 
-def test_default_mints_no_adapter_and_any_other_identity_mints_its_name() -> None:
-    assert minted_adapter("default") is None
+def test_every_identity_mints_its_name() -> None:
+    assert minted_adapter("default") == "default"
     assert minted_adapter("ops-bot") == "ops-bot"
 
 
