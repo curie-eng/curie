@@ -117,8 +117,8 @@ async def _binding_scope(
     and an agent's rows on one pair share this one scope whichever identity
     holds them, so this checks for any row of THIS agent on the pair rather
     than resolving the default identity's route the way `crud.binding_for_route`
-    does for a turn (that identity-narrowed read is what 404'd every
-    named-identity binding's own state, #3147).
+    does for a turn (an identity-narrowed read would 404 every named-identity
+    binding's own state).
     """
 
     if not await crud.agent_holds_channel_pair(session, agent_id, kind, address):
