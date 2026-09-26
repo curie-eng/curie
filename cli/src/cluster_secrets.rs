@@ -388,11 +388,14 @@ mod tests {
             chart: "charts/curie".into(),
             agent: "acme-a".into(),
             secrets: secrets(),
+            runner_image: RunnerImageUpdate::Keep,
         })
         .unwrap();
         let helm = cmds[0].display();
         assert!(helm.contains("helm upgrade"), "{helm}");
-        assert!(helm.contains("--reuse-values"), "{helm}");
+        // #3260: a cleared runner image under plain --reuse-values keeps
+        // rendering the old key, so every bind resets then reuses.
+        assert!(helm.contains("--reset-then-reuse-values"), "{helm}");
         assert!(helm.contains("-f"), "{helm}");
         assert!(
             !helm.contains("ghp_agent_a"),
@@ -423,7 +426,10 @@ mod tests {
             "JIRA_TOKEN": "jira-a",
             "OTHER": "kept"
         }}}});
-        assert_eq!(bind_need(&values, "acme-a", &secrets()), BindNeed::Current);
+        assert_eq!(
+            bind_need(&values, "acme-a", &secrets(), None),
+            BindNeed::Current
+        );
     }
 
     #[test]
@@ -433,24 +439,28 @@ mod tests {
             "acme-b": {"JIRA_TOKEN": "jira-a"}
         }}});
         assert_eq!(
-            bind_need(&values, "acme-a", &secrets()),
-            BindNeed::Changed(vec![
-                "GITHUB_PERSONAL_ACCESS_TOKEN".into(),
-                "JIRA_TOKEN".into()
-            ])
+            bind_need(&values, "acme-a", &secrets(), None),
+            BindNeed::Changed {
+                secrets: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".into(), "JIRA_TOKEN".into()],
+                runner_image: false,
+            }
         );
         assert_eq!(
-            bind_need(&serde_json::json!({}), "acme-a", &secrets()),
-            BindNeed::Changed(secrets().keys().cloned().collect())
+            bind_need(&serde_json::json!({}), "acme-a", &secrets(), None),
+            BindNeed::Changed {
+                secrets: secrets().keys().cloned().collect(),
+                runner_image: false,
+            }
         );
     }
 
-    /// Fake `helm`: `get values` answers from a file, `upgrade` bumps a
-    /// revision counter the way a real upgrade bumps the release revision.
+    /// Fake `helm`: `get values` answers from a file, `upgrade` logs its argv
+    /// and bumps a revision counter the way a real upgrade bumps the release
+    /// revision.
     const HELM_STUB: &str = r#"#!/bin/sh
 case "$1 $2" in
   "get values") cat "$CURIE_TEST_BIND_DIR/values.json" ;;
-  upgrade*) r=$(cat "$CURIE_TEST_BIND_DIR/revision"); echo $((r + 1)) > "$CURIE_TEST_BIND_DIR/revision" ;;
+  upgrade*) echo "$*" >> "$CURIE_TEST_BIND_DIR/helm.log"; r=$(cat "$CURIE_TEST_BIND_DIR/revision"); echo $((r + 1)) > "$CURIE_TEST_BIND_DIR/revision" ;;
   *) echo "unexpected helm invocation: $*" >&2; exit 64 ;;
 esac
 "#;
@@ -503,6 +513,17 @@ esac
         }
     }
 
+    impl StubbedHelm {
+        /// Every `helm upgrade` argv, one per line; empty when none ran.
+        fn helm_log(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("helm.log")).unwrap_or_default()
+        }
+
+        fn kubectl_log(&self) -> Option<String> {
+            std::fs::read_to_string(self.dir.path().join("kubectl.log")).ok()
+        }
+    }
+
     impl Drop for StubbedHelm {
         fn drop(&mut self) {
             for (name, value) in &self.restore {
@@ -531,7 +552,7 @@ esac
                 "JIRA_TOKEN": "jira-a"
             }}
         }}));
-        let need = bind_if_changed(common(), "acme-a".into(), secrets(), async {
+        let need = bind_if_changed(common(), "acme-a".into(), secrets(), None, async {
             panic!("an unchanged bind must not resolve a chart")
         })
         .await
@@ -554,15 +575,279 @@ esac
                 "JIRA_TOKEN": "jira-a"
             }}
         }}));
-        let need = bind_if_changed(common(), "acme-a".into(), secrets(), async {
+        let need = bind_if_changed(common(), "acme-a".into(), secrets(), None, async {
             Ok("charts/curie".to_string())
         })
         .await
         .unwrap();
         assert_eq!(
             need,
-            BindNeed::Changed(vec!["GITHUB_PERSONAL_ACCESS_TOKEN".into()])
+            BindNeed::Changed {
+                secrets: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".into()],
+                runner_image: false,
+            }
         );
         assert_eq!(helm.revision(), 8);
+    }
+
+    const DIGEST: &str = "ghcr.io/acme-corp/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EARLIER: &str = "ghcr.io/acme-corp/acme-bot-runner@sha256:9999999999999999999999999999999999999999999999999999999999999999";
+
+    fn opts(secrets: BTreeMap<String, String>, runner_image: RunnerImageUpdate) -> BindOpts {
+        BindOpts {
+            common: common(),
+            chart: "charts/curie".into(),
+            agent: "acme-a".into(),
+            secrets,
+            runner_image,
+        }
+    }
+
+    #[test]
+    fn bind_need_sees_a_new_or_differing_runner_image() {
+        let none = serde_json::json!({});
+        assert_eq!(
+            bind_need(&none, "acme-a", &BTreeMap::new(), Some(DIGEST)),
+            BindNeed::Changed {
+                secrets: vec![],
+                runner_image: true
+            }
+        );
+        let earlier = serde_json::json!({"agentSandbox": {"runnerImages": {"acme-a": EARLIER}}});
+        assert_eq!(
+            bind_need(&earlier, "acme-a", &BTreeMap::new(), Some(DIGEST)),
+            BindNeed::Changed {
+                secrets: vec![],
+                runner_image: true
+            }
+        );
+        let same = serde_json::json!({"agentSandbox": {"runnerImages": {"acme-a": DIGEST}}});
+        assert_eq!(
+            bind_need(&same, "acme-a", &BTreeMap::new(), Some(DIGEST)),
+            BindNeed::Current
+        );
+    }
+
+    #[test]
+    fn bind_need_clears_an_earlier_runner_image_when_none_is_locked() {
+        // #3260 AC2: a bundle with no runner entry clears the agent's value.
+        let earlier = serde_json::json!({"agentSandbox": {"runnerImages": {"acme-a": EARLIER}}});
+        assert_eq!(
+            bind_need(&earlier, "acme-a", &BTreeMap::new(), None),
+            BindNeed::Changed {
+                secrets: vec![],
+                runner_image: true
+            }
+        );
+        let nulled = serde_json::json!({"agentSandbox": {"runnerImages": {"acme-a": null}}});
+        assert_eq!(
+            bind_need(&nulled, "acme-a", &BTreeMap::new(), None),
+            BindNeed::Current
+        );
+    }
+
+    #[test]
+    fn bind_need_ignores_another_agents_runner_image() {
+        let values = serde_json::json!({"agentSandbox": {"runnerImages": {"acme-b": EARLIER}}});
+        assert_eq!(
+            bind_need(&values, "acme-a", &BTreeMap::new(), None),
+            BindNeed::Current
+        );
+        let values = serde_json::json!({"agentSandbox": {"runnerImages": {
+            "acme-a": DIGEST,
+            "acme-b": EARLIER
+        }}});
+        assert_eq!(
+            bind_need(&values, "acme-a", &BTreeMap::new(), Some(DIGEST)),
+            BindNeed::Current
+        );
+    }
+
+    #[test]
+    fn bind_commands_set_the_runner_digest_without_a_secret_file() {
+        let cmds = bind_commands(&opts(
+            BTreeMap::new(),
+            RunnerImageUpdate::Set(DIGEST.into()),
+        ))
+        .unwrap();
+        let helm = cmds[0].display();
+        assert!(
+            helm.contains("helm upgrade curie charts/curie -n curie"),
+            "{helm}"
+        );
+        assert!(helm.contains("--reset-then-reuse-values"), "{helm}");
+        assert!(!helm.contains(" --reuse-values"), "{helm}");
+        assert!(
+            helm.contains(&format!("--set agentSandbox.runnerImages.acme-a={DIGEST}")),
+            "{helm}"
+        );
+        assert!(
+            !helm.contains("-f "),
+            "no secrets means no values file: {helm}"
+        );
+        let delete = cmds.last().unwrap().display();
+        assert!(delete.contains("delete sandboxclaim"), "{delete}");
+        assert!(
+            delete.contains(&format!("{CONNECTOR_AGENT_LABEL_KEY}=acme-a")),
+            "{delete}"
+        );
+    }
+
+    #[test]
+    fn bind_commands_clear_the_runner_image_with_null() {
+        let cmds = bind_commands(&opts(secrets(), RunnerImageUpdate::Clear)).unwrap();
+        let helm = cmds[0].display();
+        assert!(helm.contains("--reset-then-reuse-values"), "{helm}");
+        assert!(helm.contains("-f"), "{helm}");
+        assert!(
+            helm.contains("--set agentSandbox.runnerImages.acme-a=null"),
+            "{helm}"
+        );
+        assert!(
+            !helm.contains("ghp_agent_a"),
+            "secret leaked into argv: {helm}"
+        );
+        assert!(cmds
+            .last()
+            .unwrap()
+            .display()
+            .contains("delete sandboxclaim"));
+    }
+
+    #[test]
+    fn bind_commands_are_empty_with_no_secrets_and_the_runner_kept() {
+        assert!(
+            bind_commands(&opts(BTreeMap::new(), RunnerImageUpdate::Keep))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_runner_digest_upgrades_the_release_and_retires_claims() {
+        // #3260 AC1: the recorded digest reaches the release and the agent's
+        // claimed sandboxes are rolled onto it.
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"agentSandbox": {
+            "runnerImages": {"acme-a": EARLIER}
+        }}));
+        let need = bind_if_changed(
+            common(),
+            "acme-a".into(),
+            BTreeMap::new(),
+            Some(DIGEST.to_string()),
+            async { Ok("charts/curie".to_string()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            need,
+            BindNeed::Changed {
+                secrets: vec![],
+                runner_image: true
+            }
+        );
+        assert_eq!(helm.revision(), 8);
+        let log = helm.helm_log();
+        assert!(
+            log.contains(&format!("agentSandbox.runnerImages.acme-a={DIGEST}")),
+            "{log}"
+        );
+        assert!(log.contains("@sha256:"), "{log}");
+        assert!(log.contains("--reset-then-reuse-values"), "{log}");
+        let kubectl = helm.kubectl_log().expect("claims must be retired");
+        assert!(kubectl.contains("delete sandboxclaim"), "{kubectl}");
+        assert!(
+            kubectl.contains(&format!("{CONNECTOR_AGENT_LABEL_KEY}=acme-a")),
+            "{kubectl}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_runner_entry_clears_an_earlier_runner_image() {
+        // #3260 AC2.
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"agentSandbox": {
+            "runnerImages": {"acme-a": EARLIER}
+        }}));
+        let need = bind_if_changed(common(), "acme-a".into(), BTreeMap::new(), None, async {
+            Ok("charts/curie".to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            need,
+            BindNeed::Changed {
+                secrets: vec![],
+                runner_image: true
+            }
+        );
+        assert_eq!(helm.revision(), 8);
+        let log = helm.helm_log();
+        assert!(
+            log.contains("agentSandbox.runnerImages.acme-a=null"),
+            "{log}"
+        );
+        assert!(log.contains("--reset-then-reuse-values"), "{log}");
+        let kubectl = helm.kubectl_log().expect("claims must be retired");
+        assert!(kubectl.contains("delete sandboxclaim"), "{kubectl}");
+    }
+
+    #[tokio::test]
+    async fn unchanged_runner_digest_leaves_the_release_but_retires_claims() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"agentSandbox": {
+            "runnerImages": {"acme-a": DIGEST}
+        }}));
+        let need = bind_if_changed(
+            common(),
+            "acme-a".into(),
+            BTreeMap::new(),
+            Some(DIGEST.to_string()),
+            async { panic!("an unchanged bind must not resolve a chart") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(need, BindNeed::Current);
+        assert_eq!(helm.revision(), 7, "release was upgraded for a no-op bind");
+        assert_eq!(helm.helm_log(), "");
+        let kubectl = helm.kubectl_log().expect("claims must be retired");
+        assert!(
+            kubectl.contains("delete sandboxclaim"),
+            "claims must still be retired so the runner layer loads: {kubectl}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_runner_no_secrets_and_no_earlier_value_does_nothing() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"agentSandbox": {
+            "runnerImages": {"acme-b": EARLIER}
+        }}));
+        let need = bind_if_changed(common(), "acme-a".into(), BTreeMap::new(), None, async {
+            panic!("a no-op bind must not resolve a chart")
+        })
+        .await
+        .unwrap();
+        assert_eq!(need, BindNeed::Current);
+        assert_eq!(helm.revision(), 7);
+        assert_eq!(helm.helm_log(), "");
+        assert_eq!(helm.kubectl_log(), None, "no sandbox should be touched");
+    }
+
+    #[tokio::test]
+    async fn failed_values_read_with_no_runner_and_no_secrets_does_nothing() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({}));
+        // `cat` of a missing file fails, so `helm get values` exits non-zero.
+        std::fs::remove_file(helm.dir.path().join("values.json")).unwrap();
+        let need = bind_if_changed(common(), "acme-a".into(), BTreeMap::new(), None, async {
+            panic!("a no-op bind must not resolve a chart")
+        })
+        .await
+        .unwrap();
+        assert_eq!(need, BindNeed::Current);
+        assert_eq!(helm.helm_log(), "");
+        assert_eq!(helm.kubectl_log(), None);
     }
 }
