@@ -434,6 +434,11 @@ class BootEnv(_AciModel):
     model_env_key: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MODEL_ENV_KEY", "worker")
     )
+    # The chart sets this on runner sandboxes for push metrics exporters.
+    metrics_temporality_preference: str | None = Field(
+        default=None,
+        json_schema_extra=_env("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "substrate"),
+    )
     # Operator-owned bounds, reachable through the chart's ``runner.extraEnv``
     # and docker ``-e``. No code producer emits them, and they hold no default
     # here: a non-None default would render keys nobody sends and move the wire.
@@ -689,6 +694,10 @@ class BootEnv(_AciModel):
             env[self.env_key("deployment_environment")] = self.deployment_environment
         if self.model_env_key is not None:
             env[self.env_key("model_env_key")] = self.model_env_key
+        if self.metrics_temporality_preference is not None:
+            env[self.env_key("metrics_temporality_preference")] = (
+                self.metrics_temporality_preference
+            )
         if self.max_turns is not None:
             env[self.env_key("max_turns")] = str(self.max_turns)
         if self.history_max_turns is not None:
@@ -745,6 +754,9 @@ class BootEnv(_AciModel):
             thinking=_str_or_none(env.get("CURIE_THINKING")),
             deployment_environment=_str_or_none(env.get("CURIE_DEPLOYMENT_ENVIRONMENT")),
             model_env_key=_str_or_none(env.get("CURIE_MODEL_ENV_KEY")),
+            metrics_temporality_preference=_str_or_none(
+                env.get("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")
+            ),
             max_turns=_required_int(env.get("CURIE_MAX_TURNS")),
             history_max_turns=_tolerant_int(env.get("CURIE_HISTORY_MAX_TURNS")),
             history_max_bytes=_tolerant_int(env.get("CURIE_HISTORY_MAX_BYTES")),
