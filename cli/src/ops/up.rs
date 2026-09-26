@@ -752,6 +752,27 @@ fn connector_caller_key_disposition(
     }
 }
 
+/// Refuse a `--set` of only one half of the connector caller key pair. The
+/// recorded other half would come back beside it, so the worker would sign
+/// with one key while every caller proxy verifies with the other, and every
+/// hosted connector would refuse every caller.
+fn refuse_half_a_caller_key_pair(operator_sets: &[String]) -> Result<()> {
+    use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+    let set = operator_set_keys(operator_sets);
+    if set.contains(CONNECTOR_CALLER_SIGNING_KEY) == set.contains(CONNECTOR_CALLER_VERIFY_KEY) {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "refusing to set only one half of the connector caller key pair: set both \
+         {CONNECTOR_CALLER_SIGNING_KEY} and {CONNECTOR_CALLER_VERIFY_KEY}, or neither"
+    ))
+    .with_fix(format!(
+        "pass {CONNECTOR_CALLER_VERIFY_KEY} as the public key of the \
+         {CONNECTOR_CALLER_SIGNING_KEY} you set, in the same run"
+    ))
+    .into())
+}
+
 /// The connector caller key pair to add to the values file: a new pair only
 /// when the release records none, names no Secret, and the operator set none.
 /// A recorded pair already rides [`resolve_preserved_values`].
@@ -2137,6 +2158,7 @@ fn complete_up_opts_without_runner_egress(
     overlay_live: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    refuse_half_a_caller_key_pair(&operator_sets)?;
     let sealing_source = format!("{}ExistingSecret", crate::sealing::SEALING_PRIVATE_KEY);
     if preserved_value(existing, &sealing_source).is_some()
         && final_operator_value(&opts, &sealing_source).is_some_and(str::is_empty)
