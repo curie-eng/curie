@@ -3722,9 +3722,8 @@ mod tests {
     }
 
     #[test]
-    fn add_channel_body_keeps_the_custom_transport_form() {
-        // The pre-ADR non-Slack form is unchanged: endpoint and adapter still
-        // travel together.
+    fn add_channel_body_sends_a_non_slack_route_whole() {
+        // A non-Slack route's endpoint and adapter travel together.
         assert_eq!(
             add_channel_body(
                 "discord",
