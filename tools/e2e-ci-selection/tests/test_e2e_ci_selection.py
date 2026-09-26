@@ -411,12 +411,13 @@ def test_matrix_input_guard_classifies_each_reference(
 def test_e2e_ladder_script_stays_off_released_upgrade(tmp_path: Path) -> None:
     """A recorded gap, not an oversight.
 
-    e2e-released-upgrade runs the ladder's cluster rung against the upgraded
+    e2e-released-upgrade runs the ladder's cluster rung against an upgraded
     install. e2e-ladder-cluster runs the same invocation against a fresh one,
-    and the cli prefix already selects it for every ladder edit. Selecting
-    released-upgrade as well would boot the negative control and every matrix
-    shard, none of which read the ladder. Push to main and a dispatch still
-    run the smoke on the upgraded install.
+    and the cli prefix selects it for a ladder edit wherever kind runs (next
+    omits both). Selecting released-upgrade as well would boot the negative
+    control and every matrix shard, none of which read the ladder. A ladder
+    edit that breaks only on the upgraded install first fails on push to main
+    or a dispatch, both of which select every tier.
     """
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
 
