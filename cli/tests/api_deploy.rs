@@ -1532,10 +1532,9 @@ async fn a_conflict_is_success_only_when_this_agent_holds_the_same_identity() {
 
 // @spec ADR-0168 d8
 #[tokio::test]
-async fn a_named_identity_the_database_cannot_store_is_a_usage_error_naming_it() {
-    const REFUSAL: &str = "a Slack binding naming an identity other than 'default' cannot be \
-        stored until the database admits it (https://github.com/curie-eng/curie/issues/3146). \
-        The identity is declared; bind the channel under 'default' instead";
+async fn a_named_identity_the_platform_refuses_is_a_usage_error_naming_it() {
+    const REFUSAL: &str =
+        "slack identity 'ops-bot' is not declared by this installation, which declares 'default'.";
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agents") => existing_agents(&agent_json_routes(
             AGENT_ID,

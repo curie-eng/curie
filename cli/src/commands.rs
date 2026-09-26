@@ -3536,8 +3536,8 @@ mod channels_tests {
         )
         .is_ok());
 
-        // Both endpoint and adapter together on a non-Slack kind is the
-        // pre-ADR custom-transport form and must still succeed.
+        // Both endpoint and adapter together on a non-Slack kind is that
+        // kind's reply route and must still succeed.
         assert!(ChannelChange::resolve(
             Some("discord=111111111111111111".into()),
             None,
@@ -3545,6 +3545,21 @@ mod channels_tests {
             Some("discord-main".into()),
         )
         .is_ok());
+    }
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_binding_takes_no_endpoint() {
+        let err = ChannelChange::resolve(
+            Some("slack=C0EXAMPLE1".into()),
+            None,
+            Some("http://127.0.0.1:1".into()),
+            Some("proof-offline".into()),
+        )
+        .unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("--endpoint"), "{err}");
     }
 
     #[test]
@@ -9141,12 +9156,30 @@ mod tests {
         report_sweep, resolve_cases_path, resolve_env_file_credentials, route_write_refusal,
         routing_warning, seed_env_if_missing, select_in_force_deployment, select_passthrough_env,
         sweep_json_row, sweep_table_row, unbound_approval_routes, validate_channel_binding,
-        ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan, EnvSeed, RecordedStatePlan,
-        RecordedStateQuery, RecordedTeardown, SweepRow,
+        validate_notification_target, ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan,
+        EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    // @spec ADR-0168 d3
+    #[test]
+    fn a_slack_notification_names_an_identity_and_no_transport() {
+        let named = crate::api::NotificationTargetWrite {
+            kind: "slack".into(),
+            address: "C0EXAMPLE2".into(),
+            endpoint: None,
+            adapter: Some("ops-bot".into()),
+        };
+        validate_notification_target("finance", &named).expect("an identity alone is complete");
+        let transport = crate::api::NotificationTargetWrite {
+            endpoint: Some("https://adapter.example.com/replies".into()),
+            ..named
+        };
+        let err = validate_notification_target("finance", &transport).unwrap_err();
+        assert!(err.to_string().contains("no endpoint"), "{err}");
+    }
 
     #[test]
     fn github_repo_allowlist_is_empty_for_missing_null_and_empty_values() {
