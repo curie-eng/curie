@@ -23,7 +23,7 @@ import pytest
 from alembic import command
 from curie_api import crud
 from curie_api.config import get_settings
-from curie_api.migration_fence import DECLARATIONS_ENV, load_declarations
+from curie_api.migration_fence import DECLARATIONS_ENV, HONORED_ACTION, load_declarations
 from curie_api.routers import approval_recovery
 from curie_api.schemas import PublicationCreate
 from fastapi.testclient import TestClient
@@ -46,7 +46,9 @@ from apps.api.tests.test_channels import channels_client as channels_client
 from apps.api.tests.test_channels import valkey as valkey
 from apps.api.tests.test_migration_fence import (
     BELOW_0022,
+    REVISION_0022,
     _at,
+    _audit_rows,
     _declaration,
     _reply_identity,
     _seed_approval,
@@ -392,10 +394,30 @@ def test_fence_accepts_wire_default_on_a_slack_declaration_and_refuses_other_nam
     )
     monkeypatch.setenv(DECLARATIONS_ENV, str(accepted_path))
     accepted = load_declarations()
-    # Accepted as a NAME, but the stored form does not move: the loaded
-    # `Declaration` normalizes back to NULL, the same value every other
-    # reader's `route_identity` already treats as the default Slack identity.
-    assert accepted[str(approval_id)].reply_adapter is None
+    # Normalized to the stored form, with the operator's own spelling kept.
+    assert accepted[str(approval_id)].reply_adapter == "default"
+    assert accepted[str(approval_id)].reply_adapter_as_written == "default"
+
+    null_path = tmp_path / "null.json"
+    null_path.write_text(
+        json.dumps(
+            {
+                "declarations": [
+                    {
+                        "approval_id": str(approval_id),
+                        "reply_kind": "slack",
+                        "reply_adapter": None,
+                        "actor": "U0OPERATOR",
+                        "reason": "raised on the default Slack identity",
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv(DECLARATIONS_ENV, str(null_path))
+    from_null = load_declarations()
+    assert from_null[str(approval_id)].reply_adapter == "default"
+    assert from_null[str(approval_id)].reply_adapter_as_written is None
 
     refused_path = tmp_path / "refused.json"
     refused_path.write_text(
@@ -420,16 +442,13 @@ def test_fence_accepts_wire_default_on_a_slack_declaration_and_refuses_other_nam
     assert "'second'" in message, message
 
 
-def test_honor_declarations_stores_a_wire_default_slack_declaration_as_null(
+def test_honor_declarations_stores_a_slack_declaration_as_the_default_identity(
     isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A Slack declaration may NAME the default identity as `'default'`, but
-    honoring it must not WRITE that literal into `approvals.reply_adapter` --
-    the stored form is unchanged (NULL),
-    and `crud.py`'s raw `approval.reply_adapter != data.reply_adapter`
-    replay-conflict check compares this column directly, never through
-    `route_identity`.
-    """
+    """A Slack declaration names the default identity, and honoring it writes
+    that name into `approvals.reply_adapter` at the revision that honors it --
+    the stored form 0061 backfills everywhere else. The audit keeps the
+    normalized value and the operator's own spelling."""
 
     cfg = _at(BELOW_0022)
     orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
@@ -446,6 +465,32 @@ def test_honor_declarations_stores_a_wire_default_slack_declaration_as_null(
         ],
     )
 
+    command.upgrade(cfg, REVISION_0022)
+
+    assert _reply_identity(orphan) == ("slack", "default")
+    (honored,) = [r for r in _audit_rows(orphan) if r.action == HONORED_ACTION]
+    assert honored.evidence["declared_reply_adapter"] == "default"
+    assert honored.evidence["declared_reply_adapter_as_written"] == "default"
+
     command.upgrade(cfg, "head")
 
-    assert _reply_identity(orphan) == ("slack", None)
+    assert _reply_identity(orphan) == ("slack", "default")
+
+
+def test_honor_declarations_admits_a_non_slack_adapter_named_default(
+    isolated_migration_db: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`default` is an ordinary adapter slug for any kind but Slack, and 0022
+    honored one before the Slack identity had a name."""
+
+    cfg = _at(BELOW_0022)
+    orphan = _seed_approval(reply_channel="nobody@example.test", summary="no binding")
+    _write_declarations(
+        tmp_path,
+        monkeypatch,
+        [_declaration(orphan, reply_kind="email", reply_adapter="default")],
+    )
+
+    command.upgrade(cfg, REVISION_0022)
+
+    assert _reply_identity(orphan) == ("email", "default")
