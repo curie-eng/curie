@@ -370,8 +370,12 @@ class CronSchedulerLoop:
         name = str(trigger["name"])
         if await self._is_killed(target.agent_id) or self._budget_spent(target):
             async with self._engine.begin() as conn:
-                await self._insert(conn, target, name, slot, "blocked")
-            summary.blocked += 1
+                run_id = await self._insert(conn, target, name, slot, "blocked")
+            if run_id is None:
+                # Another replica recorded this slot first.
+                summary.lost += 1
+            else:
+                summary.blocked += 1
             return
 
         handle: ReplyHandle | None = None
@@ -398,8 +402,11 @@ class CronSchedulerLoop:
                     len(bindings),
                 )
                 async with self._engine.begin() as conn:
-                    await self._insert(conn, target, name, slot, "failed")
-                summary.failed += 1
+                    run_id = await self._insert(conn, target, name, slot, "failed")
+                if run_id is None:
+                    summary.lost += 1
+                else:
+                    summary.failed += 1
                 return
             binding = bindings[0]
             handle = ReplyHandle(
