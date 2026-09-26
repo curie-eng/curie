@@ -144,7 +144,8 @@ async def _adopt_publication_replay(
         or approval.reply_channel != data.reply_channel
         or approval.reply_placeholder != data.reply_placeholder
         or approval.reply_endpoint != data.reply_endpoint
-        or approval.reply_adapter != data.reply_adapter
+        or route_identity(approval.reply_kind, approval.reply_adapter)
+        != route_identity(data.reply_kind, data.reply_adapter)
         or publication.deployment_id != data.deployment_id
         or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
@@ -156,7 +157,8 @@ async def _adopt_publication_replay(
         or publication.reply_channel != data.reply_channel
         or publication.reply_placeholder != data.reply_placeholder
         or publication.reply_endpoint != data.reply_endpoint
-        or publication.reply_adapter != data.reply_adapter
+        or route_identity(publication.reply_kind, publication.reply_adapter)
+        != route_identity(data.reply_kind, data.reply_adapter)
         or publication.lineage is None
         or publication.lineage.agent_id != deployment.agent_id
         or publication.lineage.conversation_id != workspace_conversation_id
