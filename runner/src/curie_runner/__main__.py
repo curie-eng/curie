@@ -202,8 +202,9 @@ def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
         "Run only the repository's documented check command.\n"
         "Do not write a substitute test runner or shim.\n"
         "If those checks cannot be installed from files already in the checkout, say that "
-        "in-sandbox verification is unavailable and that the published pull request's CI "
-        "is the only check."
+        "in-sandbox verification is unavailable. Do not request publication. "
+        "The published pull request's CI is the only repository check, and it runs only "
+        "after a person publishes the change."
     )
 
 

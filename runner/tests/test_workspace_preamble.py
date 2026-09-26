@@ -115,7 +115,8 @@ def test_workspace_preamble_forbids_a_substitute_test_runner() -> None:
     ), preamble
     assert "--no-index" in preamble
     assert "in-sandbox verification is unavailable" in preamble
-    assert "published pull request's CI is the only check" in preamble
+    assert "Do not request publication." in preamble
+    assert "only after a person publishes" in preamble
     assert "/workspace" in preamble
 
 
