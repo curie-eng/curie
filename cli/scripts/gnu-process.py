@@ -58,7 +58,12 @@ def _die_like(signum: int) -> int:
         resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
     except (OSError, ValueError):
         return 128 + signum
-    signal.signal(signum, signal.SIG_DFL)
+    # signal() refuses SIGKILL, whose disposition cannot change, and GNU
+    # ignores that refusal too: the kill below still ends this process by it.
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+    except OSError:
+        pass
     # timeout() keeps the signals it holds blocked once the command has
     # exited, and a blocked one would only be left pending.
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signum})
