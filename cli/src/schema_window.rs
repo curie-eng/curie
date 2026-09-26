@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         let candidate = &catalog().candidate;
-        assert_eq!(candidate.schema_min, "0045");
+        assert_eq!(candidate.schema_min, "0060");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()

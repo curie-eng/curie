@@ -1817,133 +1817,57 @@ def test_append_reserve_refusal_is_413_unchanged_and_not_a_persistence_failure(
         get_settings.cache_clear()
 
 
-def _legacy_transcript(aid: str, key: str, value: Any, *, ago_seconds: int = 0) -> None:
-    """A transcript row an older API instance wrote to the state store (pre-0053)."""
-
-    async def write() -> None:
+def _transcript_storage(aid: str) -> tuple[list[tuple[str, Any, int]], list[str]]:
+    async def read() -> tuple[list[tuple[str, Any, int]], list[str]]:
         connection = await asyncpg.connect(_asyncpg_dsn())
         try:
-            await connection.execute(
-                """
-                INSERT INTO curie.workflow_state_entries
-                    (id, agent_id, namespace, key, value, version, updated_at)
-                VALUES ($1, $2, 'transcript', $3, $4::jsonb, 7,
-                        now() - make_interval(secs => $5))
-                """,
-                uuid.uuid4(),
+            transcripts = await connection.fetch(
+                "SELECT thread_key, value::text AS value, version "
+                "FROM curie.thread_transcripts WHERE agent_id = $1 ORDER BY thread_key",
                 uuid.UUID(aid),
-                key,
-                json.dumps(value),
-                ago_seconds,
             )
-        finally:
-            await connection.close()
-
-    asyncio.run(write())
-
-
-def _legacy_keys(aid: str) -> list[str]:
-    async def read() -> list[str]:
-        connection = await asyncpg.connect(_asyncpg_dsn())
-        try:
-            rows = await connection.fetch(
+            legacy = await connection.fetch(
                 "SELECT key FROM curie.workflow_state_entries "
                 "WHERE agent_id = $1 AND namespace = 'transcript' ORDER BY key",
                 uuid.UUID(aid),
             )
-            return [row["key"] for row in rows]
+            return (
+                [
+                    (row["thread_key"], json.loads(row["value"]), row["version"])
+                    for row in transcripts
+                ],
+                [row["key"] for row in legacy],
+            )
         finally:
             await connection.close()
 
     return asyncio.run(read())
 
 
-def test_a_legacy_transcript_row_is_adopted_on_first_access(
+def test_runtime_reads_lists_and_appends_from_the_transcript_table(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """ADR-0170 upgrade: rows an older API wrote during a rollout are not lost."""
     aid = _agent(client, auth_headers)
     base = f"/agents/{aid}/state/transcript"
-    _legacy_transcript(aid, "thread-read", [{"text": "old"}])
-    _legacy_transcript(aid, "thread-append", [{"text": "old"}])
-    _legacy_transcript(aid, "thread-listed", [{"text": "listed"}])
+    first = client.post(
+        f"{base}/thread-one/append", json={"item": {"text": "first"}}, headers=auth_headers
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        f"{base}/thread-one/append", json={"item": {"text": "second"}}, headers=auth_headers
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["version"] == first.json()["version"] + 1
+    expected = [{"text": "first"}, {"text": "second"}]
+    assert second.json()["value"] == expected
 
-    read = client.get(f"{base}/thread-read", headers=auth_headers)
+    read = client.get(f"{base}/thread-one", headers=auth_headers)
     assert read.status_code == 200, read.text
-    assert read.json()["value"] == [{"text": "old"}]
-    assert read.json()["version"] == 7
-
-    appended = client.post(
-        f"{base}/thread-append/append", json={"item": {"text": "new"}}, headers=auth_headers
-    )
-    assert appended.status_code == 200, appended.text
-    assert appended.json()["value"] == [{"text": "old"}, {"text": "new"}]
-    assert appended.json()["version"] == 8
-
-    listed = client.get(base, headers=auth_headers).json()
-    assert {row["key"] for row in listed} == {"thread-read", "thread-append", "thread-listed"}
-    # An older API instance still serving mid-rollout keeps every legacy row.
-    assert _legacy_keys(aid) == ["thread-append", "thread-listed", "thread-read"]
-    # The new API's own append is not undone by re-reading the older legacy row.
-    again = client.get(f"{base}/thread-append", headers=auth_headers).json()
-    assert again["value"] == [{"text": "old"}, {"text": "new"}]
-
-
-def test_a_legacy_row_newer_than_the_copy_wins_and_an_older_one_does_not(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    aid = _agent(client, auth_headers)
-    base = f"/agents/{aid}/state/transcript"
-    for key in ("thread-newer", "thread-older"):
-        seeded = client.post(
-            f"{base}/{key}/append", json={"item": {"text": "copy"}}, headers=auth_headers
-        )
-        assert seeded.status_code == 200, seeded.text
-    # An older API instance appended after the copy (newer), or wrote a stale row.
-    _legacy_transcript(aid, "thread-newer", [{"text": "copy"}, {"text": "later"}])
-    _legacy_transcript(aid, "thread-older", [{"text": "stale"}], ago_seconds=3600)
-
-    newer = client.get(f"{base}/thread-newer", headers=auth_headers).json()
-    assert newer["value"] == [{"text": "copy"}, {"text": "later"}]
-    assert newer["version"] == 8
-    older = client.get(f"{base}/thread-older", headers=auth_headers).json()
-    assert older["value"] == [{"text": "copy"}]
-
-
-def test_ending_a_thread_deletes_its_legacy_row_so_it_is_not_adopted_back(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    aid = _agent(client, auth_headers)
-    base = f"/agents/{aid}/state/transcript"
-    _legacy_transcript(aid, "thread-deleted", [{"text": "old"}])
-    _legacy_transcript(aid, "thread-versioned", [{"text": "old"}])
-    _legacy_transcript(aid, "thread-idle", [{"text": "old"}])
-    _legacy_transcript(aid, "thread-kept", [{"text": "old"}])
-
-    assert client.delete(f"{base}/thread-deleted", headers=auth_headers).status_code == 204
-    assert client.get(f"{base}/thread-deleted", headers=auth_headers).status_code == 404
-
-    stored = client.get(f"{base}/thread-versioned", headers=auth_headers).json()
-    versioned = client.delete(
-        f"{base}/thread-versioned",
-        params={"expected_version": stored["version"]},
-        headers=auth_headers,
-    )
-    assert versioned.status_code == 204, versioned.text
-    assert client.get(f"{base}/thread-versioned", headers=auth_headers).status_code == 404
-
-    settings = get_settings()
-    settings.transcript_idle_ttl_seconds = 0
-    try:
-        # Adopted with a zero idle window, the thread is already expired.
-        idle = client.get(f"{base}/thread-idle", headers=auth_headers)
-        assert idle.status_code == 404, idle.text
-    finally:
-        get_settings.cache_clear()
-    # Any later write for the agent sweeps the expired thread and its legacy row.
-    swept = client.post(
-        f"{base}/thread-other/append", json={"item": {"text": "x"}}, headers=auth_headers
-    )
-    assert swept.status_code == 200, swept.text
-    assert client.get(f"{base}/thread-idle", headers=auth_headers).status_code == 404
-    assert _legacy_keys(aid) == ["thread-kept"]
+    assert read.json()["value"] == expected
+    assert read.json()["version"] == second.json()["version"]
+    listed = client.get(base, headers=auth_headers)
+    assert listed.status_code == 200, listed.text
+    assert {row["key"] for row in listed.json()} == {"thread-one"}
+    transcripts, legacy = _transcript_storage(aid)
+    assert transcripts == [("thread-one", expected, second.json()["version"])]
+    assert legacy == []
