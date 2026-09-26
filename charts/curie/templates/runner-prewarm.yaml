@@ -17,6 +17,10 @@ bundleFetch.enabled is true this DaemonSet therefore also sleeps one extra
 container per bundle-fetch image, sourced from the same values keys the
 sandbox init pair uses.
 
+An agent that layers its own runner image (agentSandbox.runnerImages,
+ADR-0173) boots from that digest instead, so this DaemonSet also sleeps one
+container per distinct layered digest that differs from the platform image.
+
 It is a long-idle DaemonSet, not a one-shot Job, on purpose:
   - DaemonSet covers every node (single-node clusters get exactly one pod).
   - The kubelet treats the image as in-use, so image GC never evicts it between
@@ -92,6 +96,23 @@ spec:
           command: ["sleep", "infinity"]
           resources:
             {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        {{- /* One container per distinct layered runner digest, named for the
+               first agent (sorted) that carries it. */}}
+        {{- $platformImage := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" $.Chart.AppVersion) }}
+        {{- $runnerImages := .Values.agentSandbox.runnerImages | default dict }}
+        {{- $seen := list $platformImage }}
+        {{- range $agent := keys $runnerImages | sortAlpha }}
+        {{- $ref := toString (index $runnerImages $agent) }}
+        {{- if not (has $ref $seen) }}
+        {{- $seen = append $seen $ref }}
+        - name: prewarm-agent-{{ $agent }}
+          image: {{ $ref | quote }}
+          imagePullPolicy: {{ $runner.prewarm.imagePullPolicy }}
+          command: ["sleep", "infinity"]
+          resources:
+            {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        {{- end }}
+        {{- end }}
         {{- if $runner.bundleFetch.enabled }}
         # Same values keys as the sandbox init pair in agent-sandbox.yaml -- a
         # hardcoded ref here would drift from the claim path the first time an

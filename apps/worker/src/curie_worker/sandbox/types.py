@@ -59,7 +59,8 @@ def claim_warm_pool(
     agent_pools: frozenset[str],
 ) -> str:
     """Route connector-secret claims, and agents the chart gave their own pool
-    (``agentSandbox.registryEgress``, #3083), to the per-agent pool; otherwise
+    (``agentSandbox.registryEgress``, #3083, or ``agentSandbox.runnerImages``,
+    ADR-0173), to the per-agent pool; otherwise
     the generic pool."""
 
     marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
@@ -214,7 +215,8 @@ class SubstrateConfig:
     namespace: str
     warm_pool: str
     # Agents the chart renders a per-agent pool for without connector secrets
-    # (agentSandbox.registryEgress, #3083), from CURIE_AGENT_SANDBOX_POOLS.
+    # (agentSandbox.registryEgress, #3083, or agentSandbox.runnerImages,
+    # ADR-0173), from CURIE_AGENT_SANDBOX_POOLS.
     agent_pools: frozenset[str] = frozenset()
     runner_port: int = 8080
     # How long a live route stays bound with no touch. After expiry the claim
