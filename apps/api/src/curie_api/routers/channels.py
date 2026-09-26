@@ -126,8 +126,8 @@ class ChannelTokenRequest(ChannelBinding):
     # The route's IDENTITY half (ADR-0168 decision 3), optional so every
     # caller that predates it -- CLI, UI, the e2e proof -- keeps minting
     # exactly as before: an omission resolves through `route_identity` to the
-    # default Slack identity, or the single row migration 0023's pair
-    # constraint lets a non-Slack pair hold. Not validated as a slug here the
+    # default Slack identity, or to a non-Slack pair's one route; a pair
+    # holding several answers 409 (`crud.AmbiguousRoute`). Not validated as a slug here the
     # way `ChannelBindingWrite.adapter` is: this field NAMES a route to look
     # up, it never gets written to one, so there is no config-map-key shape
     # for a caller-supplied value to violate.

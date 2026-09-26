@@ -419,7 +419,7 @@ def _conflict_message(
 _DEADLOCK_DETECTED = "40P01"
 
 # The 409 a broken deadlock earns. Deliberately the same STATUS as a taken
-# pair: from the caller's side both mean "the binding set moved under you, the
+# route: from the caller's side both mean "the binding set moved under you, the
 # write did not land, retry" -- and a deadlock victim is the one caller for
 # whom a retry is near-certain to succeed, since its opponent has by then
 # committed. Left as a 500 it reads as a server fault and an operator stops
@@ -441,12 +441,12 @@ def _is_deadlock(exc: DBAPIError) -> bool:
 async def _deadlock_as_conflict() -> AsyncIterator[None]:
     """Turn a broken lock cycle into a retryable 409 instead of a 500.
 
-    `lock_agent_bindings` locks ONE agent's rows, but a `(kind, address)` pair
-    is globally unique: two callers swapping their agents' pairs in opposite
-    directions each hold their own agent's rows and then wait on the other's
-    uncommitted index entry. That is a genuine cycle, Postgres aborts one side
-    with `40P01`, and without this the victim gets an unexplained 500 for a
-    race it can simply retry.
+    `lock_agent_bindings` locks ONE agent's rows, but a route is globally
+    unique (`agent_channels_route_key`): two callers swapping their agents'
+    routes in opposite directions each hold their own agent's rows and then
+    wait on the other's uncommitted index entry. That is a genuine cycle,
+    Postgres aborts one side with `40P01`, and without this the victim gets an
+    unexplained 500 for a race it can simply retry.
 
     Wraps the WHOLE handler body rather than the savepoint alone: the cycle can
     close on the locking read, on the flush, or on the commit, and all three are
@@ -565,7 +565,7 @@ async def move_agent_channel(
             async with session.begin_nested():  # SAVEPOINT
                 await crud.update_channel_binding(session, binding, data)
         except IntegrityError as exc:
-            # The same recovery as the add: a move onto a pair another agent (or
+            # The same recovery as the add: a move onto a route another agent (or
             # this one) already holds raises the identical violation and needs the
             # identical owner recheck, inside the same still-live transaction.
             await _raise_binding_conflict(exc, session, agent_id, data)

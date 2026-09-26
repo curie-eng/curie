@@ -596,10 +596,11 @@ def test_both_resume_flavors_replay_the_adapter_from_the_record(
 def test_a_slack_resume_replays_no_adapter(
     clean_db: None, valkey: redis.Redis, runs_stream: str
 ) -> None:
-    """T-A18, the sibling lane. A Slack approval persists NULL and must replay
-    NULL: fabricating a slug here would make the worker look up a credential for
-    an adapter that does not own this turn, and D4.4 already says Slack's route
-    is the worker's configured origin.
+    """T-A18, the sibling lane. A Slack approval an older writer stored with no
+    adapter replays none: the reconciler copies the stored route and never
+    fabricates one, and the worker reads a missing Slack adapter as the default
+    identity (`aci_protocol.turn.route_identity`). D4.4 already says Slack's
+    route is the worker's configured origin.
     """
 
     async def steps(

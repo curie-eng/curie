@@ -76,11 +76,9 @@ def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
     channels_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     """`crud.binding_for_route(session, "slack", None, address)` -- what
-    `routers/channels.py:_resolve_binding` now delegates to for the ingress
-    (`POST /channels/turns`, whose body never carries an adapter, plan D4.1) --
-    resolves the pair's one stored row, exactly as the raw
-    `select(...).where(kind==, address==)` `_resolve_binding` ran before this
-    task.
+    `routers/channels.py:_resolve_binding` delegates to for a platform-key
+    ingress (`POST /channels/turns`, whose body never carries an adapter) --
+    resolves the default identity's row, stored as `'default'`.
     """
 
     agent_id = _bind(
