@@ -19,6 +19,7 @@ knows which mistakes it can take back.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # A connector's summary is not a size this platform controls, and a receipt is
@@ -35,6 +36,16 @@ _MAX_LINES = 10
 # explained itself are both not-undoable, and flattening them to one line would
 # hide which happened.
 _UNDECLARED = "cannot be undone: nothing reported a prior state"
+_GENERIC_BASH_DETAILS = {None, "non-idempotent tool completed", "non-idempotent tool executed"}
+_READ_ONLY_COMMANDS = (
+    r"pwd",
+    r"ls(?: -[alh]+)?(?: [\w./-]+)*",
+    r"cat [\w./-]+(?: [\w./-]+)*",
+    r"rg(?: -[nSi]+)? [\w./:-]+(?: [\w./-]+)*",
+    r"sed -n '[0-9,$]+p' [\w./-]+",
+    r"git status(?: --short)?",
+    r"git diff(?: --stat)?",
+)
 
 
 def _clamp(text: str) -> str:
@@ -65,6 +76,28 @@ def _verdict(action: dict[str, Any]) -> str:
     return _UNDECLARED
 
 
+def _generic_bash(action: dict[str, Any]) -> bool:
+    if action.get("tool") != "Bash" or action.get("status") != "succeeded":
+        return False
+    if action.get("undoable") or action.get("detail") not in _GENERIC_BASH_DETAILS:
+        return False
+    result = action.get("result")
+    summary = result.get("summary") if isinstance(result, dict) else None
+    return not (isinstance(summary, str) and summary.strip())
+
+
+def _read_only_bash(action: dict[str, Any]) -> bool:
+    """Suppress only plain commands whose stored arguments show a read."""
+
+    if not _generic_bash(action):
+        return False
+    arguments = action.get("arguments")
+    command = arguments.get("command") if isinstance(arguments, dict) else None
+    if not isinstance(command, str) or not command.strip():
+        return False
+    return any(re.fullmatch(pattern, command.strip()) for pattern in _READ_ONLY_COMMANDS)
+
+
 def render_receipt(actions: list[dict[str, Any]]) -> str | None:
     """One line per action, or None when the turn changed nothing.
 
@@ -78,17 +111,43 @@ def render_receipt(actions: list[dict[str, Any]]) -> str | None:
     that an operator sees the system knows the difference.
     """
 
-    if not actions:
+    visible = [action for action in actions if not _read_only_bash(action)]
+    if not visible:
         return None
-    lines = [f"• {_described(action)} — {_verdict(action)}" for action in actions]
+    lines: list[str] = []
+    counts: list[int] = []
+    failures: list[int] = []
+    grouped: dict[str, int] = {}
+    for action in visible:
+        generic_bash = _generic_bash(action)
+        line = (
+            "• Bash calls; changes not described"
+            if generic_bash
+            else f"• {_described(action)} — {_verdict(action)}"
+        )
+        if action.get("status") == "failed":
+            failures.append(len(lines))
+        elif line in grouped:
+            counts[grouped[line]] += 1
+            continue
+        else:
+            grouped[line] = len(lines)
+        lines.append(line)
+        counts.append(1)
+
+    for i, line in enumerate(lines):
+        if line == "• Bash calls; changes not described":
+            noun = "call" if counts[i] == 1 else "calls"
+            lines[i] = f"• {counts[i]} Bash {noun}; changes not described"
+        elif counts[i] > 1:
+            lines[i] = f"{line} ({counts[i]} calls)"
     if len(lines) > _MAX_LINES:
         # A turn with a hundred calls used to end with a hundred lines, and the
         # reply plus receipt passed the channel's size limit, so the answer
         # itself was lost (#3064). A failed call is the line a person most needs,
         # so failures are kept first, then the rest in the order they ran.
-        failed = [i for i, a in enumerate(actions) if a.get("status") == "failed"]
-        order = failed + [i for i in range(len(lines)) if i not in failed]
+        order = failures + [i for i in range(len(lines)) if i not in failures]
         kept = sorted(order[:_MAX_LINES])
-        omitted = len(lines) - len(kept)
+        omitted = sum(counts) - sum(counts[i] for i in kept)
         lines = [lines[i] for i in kept] + [f"• …and {omitted} more actions not listed"]
     return "\n".join([_HEADER, *lines])

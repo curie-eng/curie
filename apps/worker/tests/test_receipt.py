@@ -41,6 +41,88 @@ def test_a_turn_that_changed_nothing_has_no_receipt() -> None:
     assert render_receipt([]) is None
 
 
+def test_read_only_bash_calls_do_not_add_a_receipt() -> None:
+    actions = [
+        _action(tool="Bash", arguments={"command": command}, undoable=False, result=None)
+        for command in (
+            "pwd",
+            "rg -n receipt apps/worker",
+            "sed -n '1,40p' apps/worker/src/curie_worker/receipt.py",
+            "git status --short",
+            "git diff --stat",
+        )
+    ]
+
+    assert render_receipt(actions) is None
+
+
+def test_uncertain_bash_calls_are_counted_without_guessing_their_effects() -> None:
+    actions = [
+        _action(tool="Bash", arguments=arguments, undoable=False, result=None)
+        for arguments in (
+            None,
+            {"command": "cat file; rm file"},
+            {"command": "sed -i 's/a/b/' file"},
+            {"command": "git diff --output=report.txt"},
+            {"command": "cat $(touch marker)"},
+        )
+    ]
+
+    receipt = render_receipt(actions)
+
+    assert receipt is not None
+    assert receipt.count("Bash") == 1
+    assert "5 Bash calls" in receipt
+    assert "changes not described" in receipt
+
+
+def test_repeated_bash_noise_keeps_meaningful_summary_and_failure() -> None:
+    generic = _action(tool="Bash", arguments={"command": "make build"}, undoable=False, result=None)
+    actions = [generic.copy() for _ in range(25)]
+    actions.extend(
+        [
+            _action(
+                tool="Bash",
+                arguments={"command": "make deploy"},
+                undoable=False,
+                result={"summary": "deployed acme service"},
+            ),
+            _action(
+                tool="Bash",
+                arguments={"command": "make deploy"},
+                status="failed",
+                undoable=False,
+                result=None,
+            ),
+        ]
+    )
+
+    receipt = render_receipt(actions)
+
+    assert receipt is not None
+    assert len(receipt.splitlines()) == 4
+    assert "25 Bash calls" in receipt
+    assert "deployed acme service" in receipt
+    assert "failed" in receipt
+
+
+def test_repeated_named_actions_keep_the_count_and_distinct_verdicts() -> None:
+    actions = [
+        _action(),
+        _action(),
+        _action(status="failed", undoable=False),
+        _action(result={"summary": "scaled public/web from 2 to 4"}),
+    ]
+
+    receipt = render_receipt(actions)
+
+    assert receipt is not None
+    assert receipt.count("scaled public/api from 3 to 10") == 2
+    assert "2 calls" in receipt
+    assert "failed" in receipt
+    assert "scaled public/web from 2 to 4" in receipt
+
+
 def test_an_undoable_action_says_it_can_be_put_back() -> None:
     receipt = render_receipt([_action()])
 
