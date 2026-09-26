@@ -2446,7 +2446,8 @@ helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" \
   --set security.gvisor.installRuntimeClass=true \
   --set priorityClasses.platform.name=gvisor-install-platform-class \
   > "$HOOK_PRIO_GVISOR_CREATED"
-python3 - "$HOOK_PRIO_GVISOR_CREATED" <<'PYEOF'
+HOOK_PRIO_GVISOR_CHECK="$TMP/check_gvisor_hook_priority.py"
+cat > "$HOOK_PRIO_GVISOR_CHECK" <<'PYEOF'
 import sys
 
 import yaml
@@ -2482,19 +2483,23 @@ if len(created) != 1:
     sys.exit(f"expected one chart-created PriorityClass {expected_class}, found {len(created)}")
 print(f"  ok: {name} runs after install and uses {expected_class}")
 PYEOF
+python3 "$HOOK_PRIO_GVISOR_CHECK" "$HOOK_PRIO_GVISOR_CREATED" \
+  || fail "chart-created gVisor RuntimeClass render has an invalid preflight phase or platform class."
 
 echo "=== Assertion 17 negative controls: classless hooks and classified pre-install hook FAIL ==="
-python3 - "$HOOK_PRIO_DEFAULT" "$HOOK_PRIO_UPGRADE" "$TMP" <<'PYEOF'
+python3 - "$HOOK_PRIO_DEFAULT" "$HOOK_PRIO_UPGRADE" "$HOOK_PRIO_OPERATOR" "$HOOK_PRIO_GVISOR_CREATED" "$TMP" <<'PYEOF'
 import copy
 import sys
 
 import yaml
 
-for source, label, kind, preinstall, classified in (
-    (sys.argv[1], "job", "Job", False, False),
-    (sys.argv[1], "pod", "Pod", False, False),
-    (sys.argv[1], "exempt", "Job", True, True),
-    (sys.argv[2], "upgrade", "Job", True, False),
+for source, label, kind, preinstall, classified, class_name, target in (
+    (sys.argv[1], "job", "Job", False, False, "curie-platform", None),
+    (sys.argv[1], "pod", "Pod", False, False, "curie-platform", None),
+    (sys.argv[1], "exempt", "Job", True, True, "curie-platform", "curie-preflight-avx"),
+    (sys.argv[2], "upgrade", "Job", True, False, "curie-platform", "curie-preflight-avx"),
+    (sys.argv[3], "operator", "Job", True, False, "operator-platform-class", "curie-preflight-avx"),
+    (sys.argv[4], "gvisor", "Job", False, False, "gvisor-install-platform-class", "curie-preflight-gvisor"),
 ):
     with open(source) as stream:
         documents = list(yaml.safe_load_all(stream))
@@ -2506,7 +2511,7 @@ for source, label, kind, preinstall, classified in (
         hook = (metadata.get("annotations") or {}).get("helm.sh/hook", "")
         if not hook or ("pre-install" in hook.split(",")) != preinstall:
             continue
-        if preinstall and metadata.get("name") != "curie-preflight-avx":
+        if target is not None and metadata.get("name") != target:
             continue
         spec = doc["spec"]
         if kind == "Job":
@@ -2514,37 +2519,49 @@ for source, label, kind, preinstall, classified in (
         if classified:
             if spec.get("priorityClassName") is not None:
                 sys.exit(f"expected classless pre-install hook in {source}")
-            spec["priorityClassName"] = "curie-platform"
+            spec["priorityClassName"] = class_name
         else:
-            if spec.get("priorityClassName") != "curie-platform":
+            if spec.get("priorityClassName") != class_name:
                 sys.exit(f"expected classified hook in {source}")
             del spec["priorityClassName"]
-        with open(f"{sys.argv[3]}/hook-priority-mutant-{label}.yaml", "w") as stream:
+        with open(f"{sys.argv[5]}/hook-priority-mutant-{label}.yaml", "w") as stream:
             yaml.safe_dump_all(mutant, stream)
         break
     else:
         sys.exit(f"negative control found no eligible Helm hook {kind} for {label}")
 PYEOF
-for case_name in job pod exempt upgrade; do
+for case_name in job pod exempt upgrade operator gvisor; do
   case "$case_name" in
     job) expected_error="hook Job "*"has priorityClassName=None" ;;
     pod) expected_error="hook Pod "*"has priorityClassName=None" ;;
     exempt) expected_error="hook Job curie-preflight-avx has priorityClassName='curie-platform', expected None" ;;
     upgrade) expected_error="hook Job curie-preflight-avx has priorityClassName=None, expected 'curie-platform'" ;;
+    operator) expected_error="hook Job curie-preflight-avx has priorityClassName=None, expected 'operator-platform-class'" ;;
+    gvisor) expected_error="curie-preflight-gvisor has priorityClassName=None, expected 'gvisor-install-platform-class'" ;;
   esac
   negative_output=""
   check_operation=install
   if [[ "$case_name" == upgrade ]]; then
     check_operation=upgrade
   fi
-  if negative_output="$(python3 "$HOOK_PRIO_CHECK" "$TMP/hook-priority-mutant-$case_name.yaml" curie-platform "$check_operation" chart 2>&1)"; then
+  check_provider=chart
+  check_class=curie-platform
+  if [[ "$case_name" == operator ]]; then
+    check_provider=operator
+    check_class=operator-platform-class
+  fi
+  if [[ "$case_name" == gvisor ]]; then
+    if negative_output="$(python3 "$HOOK_PRIO_GVISOR_CHECK" "$TMP/hook-priority-mutant-gvisor.yaml" 2>&1)"; then
+      fail "hook gvisor negative control passed the priority class assertion."
+    fi
+  elif negative_output="$(python3 "$HOOK_PRIO_CHECK" "$TMP/hook-priority-mutant-$case_name.yaml" "$check_class" "$check_operation" "$check_provider" 2>&1)"; then
     fail "hook $case_name negative control passed the priority class assertion."
   fi
   if [[ "$negative_output" != *$expected_error* ]]; then
     fail "hook $case_name negative control failed unexpectedly: $negative_output"
   fi
 done
-echo "  ok: classless Job and Pod hooks, a classified install pre-install hook, and a classless upgrade pre-install hook are rejected"
+echo "  ok: classless Job and Pod hooks, a classified install pre-install hook, classless upgrade and operator pre-install hooks, and a classless gVisor post-install hook are rejected"
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; fresh chart-created class installs leave only pre-install hooks classless, while upgrades and operator-class installs classify every rendered hook Job and Pod, including both Grafana hooks, with four negative controls proven to fail."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; fresh chart-created class installs leave only pre-install hooks classless, while upgrades and operator-class installs classify every rendered hook Job and Pod, including both Grafana hooks, with six negative controls proven to fail."
