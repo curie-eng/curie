@@ -27,6 +27,47 @@ spec:
     requests:
       storage: {{ .Values.otelCollector.persistence.size }}
 {{- end }}
+{{- if .Values.otelCollector.kubernetesEvents.enabled }}
+---
+# Identity for the k8sobjects/events receiver (#2954): read-only access to
+# Events in this release's namespace and nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "curie.fullname" . }}-otel-collector
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "curie.fullname" . }}-otel-collector-events
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+rules:
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "curie.fullname" . }}-otel-collector-events
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "curie.fullname" . }}-otel-collector-events
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-otel-collector
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -82,6 +123,9 @@ spec:
       {{- end }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
+      {{- end }}
+      {{- if .Values.otelCollector.kubernetesEvents.enabled }}
+      serviceAccountName: {{ include "curie.fullname" . }}-otel-collector
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.otelCollector.terminationGracePeriodSeconds }}
       {{- with .Values.otelCollector.podSecurityContext }}

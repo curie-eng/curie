@@ -518,6 +518,10 @@ http
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- $eventsEnabled := .Values.otelCollector.kubernetesEvents.enabled -}}
+{{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
+{{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
+{{- end -}}
 {{- range $name, $config := .Values.otelCollector.extraExporters -}}
 {{- if hasKey $reservedExporterNames $name -}}
 {{- fail (printf "otelCollector.extraExporters[%q] must not replace built-in exporter %q." $name $name) -}}
@@ -584,6 +588,17 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+{{- if $eventsEnabled }}
+  # Kubernetes Events for the release namespace (#2954), watched so each new
+  # or updated Event becomes one log record in the logs pipeline.
+  k8sobjects/events:
+    auth_type: serviceAccount
+    objects:
+      - name: events
+        group: events.k8s.io
+        mode: watch
+        namespaces: [{{ .Release.Namespace | quote }}]
+{{- end }}
 processors:
   memory_limiter:
     check_interval: {{ .Values.otelCollector.memoryLimiter.checkInterval }}
@@ -639,7 +654,7 @@ service:
       processors: [memory_limiter, batch]
       exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
     logs:
-      receivers: [otlp]
+      receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]
       processors: [memory_limiter, batch]
       exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
     metrics:

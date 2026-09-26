@@ -948,6 +948,18 @@ otelCollector:
   extraMetricPipelineExporters: []
   debugExporter:
     enabled: false
+  # Kubernetes Events for this release's namespace (#2954). Kubernetes keeps
+  # events for about an hour, so without a durable copy the Warning events that
+  # explain an OOMKill, eviction, failed schedule or probe failure are gone by
+  # the time an incident review asks. When enabled, a k8sobjects receiver
+  # watches events.k8s.io Events in the release namespace and feeds them into
+  # the logs pipeline, and the chart creates a collector ServiceAccount with a
+  # namespaced Role limited to get/list/watch on events. The logs pipeline
+  # exports only to nop until an operator adds extraLogPipelineExporters, so
+  # the render is refused unless one is set (or debugExporter is enabled):
+  # watching events into nop would look enabled while recording nothing.
+  kubernetesEvents:
+    enabled: false
   # The built-in Langfuse hop retains at most 1000 queued export requests and
   # retries each request for at most 5 minutes. Queue overflow or retry expiry is
   # explicit loss; the finite PVC/emptyDir size below is the outer disk bound.
