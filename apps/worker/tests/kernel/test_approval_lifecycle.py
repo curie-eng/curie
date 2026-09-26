@@ -3122,27 +3122,12 @@ _MALFORMED_NOTIFICATION_OVERRIDES = [
     ("endpoint-needs-host", {"endpoint": "https:///replies"}),
     ("endpoint-no-userinfo", {"endpoint": "https://user@adapter.example.com/replies"}),
     (
-        # ADR-0168 decision 3 keeps both-or-neither for a Slack notification
-        # WITH an endpoint (the pre-ADR custom-transport form): an endpoint
-        # with no adapter is still half-configured, exactly as any other
-        # kind's would be.
-        "slack-custom-transport-half-configured",
+        # ADR-0168 decision 3: a Slack notification names its identity and
+        # carries no transport; an endpoint is the retired custom-transport form.
+        "slack-notification-with-an-endpoint",
         {
             "kind": "slack",
             "address": "C0EXAMPLE2",
-            "endpoint": "https://adapter.example.com/replies",
-            "adapter": None,
-        },
-    ),
-    (
-        # A Slack notification WITH an endpoint (custom transport) still
-        # duplicates the resolution on the raw `(kind, address)` pair: its
-        # `adapter` is a credential slug, not an identity, so a different
-        # slug here must not let it past as a distinct target.
-        "slack-custom-transport-same-as-resolution",
-        {
-            "kind": "slack",
-            "address": "C0EXAMPLE1",
             "endpoint": "https://adapter.example.com/replies",
             "adapter": "some-slug",
         },
