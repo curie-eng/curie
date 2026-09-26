@@ -236,19 +236,17 @@ def test_ordinary_publication_adapters_still_require_both_route_halves(
     assert ordinary.reply_adapter == "agentmail-sandbox"
 
 
-def test_publication_schema_accepts_a_slack_identity_with_no_endpoint() -> None:
-    """No endpoint: this reply route names its IDENTITY (ADR-0168 decision 3),
-    checked against the identities this installation declares. Omitted and the
-    explicit `"default"` spelling both normalize to the pre-ADR-0168 stored
-    form (None), which is unchanged until the contract migration for that
-    decision (#3100)."""
+def test_publication_schema_stores_the_default_slack_identity_by_name() -> None:
+    """A Slack reply route names its identity (ADR-0168 decision 3), checked
+    against the identities this installation declares; the omitted and the
+    explicit spelling both store `default`."""
 
     omitted = _publication_payload(str(uuid.uuid4()))
-    assert PublicationCreate.model_validate(omitted).reply_adapter is None
+    assert PublicationCreate.model_validate(omitted).reply_adapter == "default"
 
     explicit = _publication_payload(str(uuid.uuid4()))
     explicit["reply_adapter"] = "default"
-    assert PublicationCreate.model_validate(explicit).reply_adapter is None
+    assert PublicationCreate.model_validate(explicit).reply_adapter == "default"
 
 
 def test_publication_schema_refuses_an_undeclared_slack_identity_with_no_endpoint() -> None:
@@ -259,20 +257,19 @@ def test_publication_schema_refuses_an_undeclared_slack_identity_with_no_endpoin
         PublicationCreate.model_validate(payload)
 
 
-def test_publication_schema_accepts_a_slack_endpoint_with_a_credential_adapter() -> None:
-    """The old custom-transport form is kept: a Slack reply route WITH an
-    endpoint carries a CREDENTIAL in `reply_adapter`, not an identity -- the
-    hook-approval-proof rig's shape (`charts/curie/ci/hook-approval-proof.py`),
-    which must not 422. The contract migration for ADR-0168 decision 3 (#3100)
-    is what refuses a Slack endpoint outright."""
+def test_a_slack_reply_endpoint_is_a_per_turn_origin_and_the_adapter_an_identity() -> None:
+    """A CLI stub turn carries its Slack Web API base in `reply_endpoint` (issue
+    #19); `reply_adapter` is still the identity, checked like any other."""
 
-    payload = _publication_payload(str(uuid.uuid4()))
-    payload["reply_endpoint"] = "http://127.0.0.1:1"
-    payload["reply_adapter"] = "proof-offline"
+    stub = _publication_payload(str(uuid.uuid4()))
+    stub["reply_endpoint"] = "http://cli-stub.test/api/"
+    assert PublicationCreate.model_validate(stub).reply_adapter == "default"
 
-    publication = PublicationCreate.model_validate(payload)
-    assert publication.reply_endpoint == "http://127.0.0.1:1"
-    assert publication.reply_adapter == "proof-offline"
+    credential = _publication_payload(str(uuid.uuid4()))
+    credential["reply_endpoint"] = "http://127.0.0.1:1"
+    credential["reply_adapter"] = "proof-offline"
+    with pytest.raises(ValidationError, match="'proof-offline'"):
+        PublicationCreate.model_validate(credential)
 
 
 def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
