@@ -103,7 +103,8 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO curie.agents (id, name, max_usd_per_day) VALUES (:id, :name, :usd)"
+                    "INSERT INTO curie.agents (id, name, max_usd_per_day) "
+                    "VALUES (:id, :name, :usd)"
                 ),
                 {"id": agent_id, "name": f"cron_agent_{token}", "usd": max_usd_per_day},
             )
