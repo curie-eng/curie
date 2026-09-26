@@ -1090,9 +1090,10 @@ def test_old_pass_cannot_clear_a_newer_resume_gap() -> None:
 
 
 def test_pause_during_first_admission_keeps_slot_for_resume(
-    names: dict[str, str]
+    names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A pause after the scheduler snapshot retains its first due slot."""
+    fires = _capture_fire_metrics(monkeypatch)
 
     async def body() -> None:
         async with _seed() as seed:
@@ -1115,6 +1116,7 @@ def test_pause_during_first_admission_keeps_slot_for_resume(
                 assert [(row.slot_utc, row.outcome) for row in await seed.runs()] == [
                     (seed.slot, "deferred")
                 ]
+                assert fires == [_fire_labels("deferred")]
             finally:
                 await client.aclose()
 
@@ -1154,9 +1156,10 @@ def test_paused_queued_slot_retries_once_after_resume(
 
 
 def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
-    sync_redis: redis.Redis, names: dict[str, str]
+    sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An earlier running fire cannot consume the resume catch-up slot."""
+    fires = _capture_fire_metrics(monkeypatch)
 
     async def body() -> None:
         async with _seed() as seed:
@@ -1173,6 +1176,7 @@ def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
                 (earlier, None),
                 (seed.slot, "deferred"),
             ]
+            assert fires == [_fire_labels("deferred")]
             async with seed.engine.begin() as conn:
                 await conn.execute(
                     text("UPDATE curie.hook_runs SET outcome = 'ran' WHERE id = :id"),
@@ -1183,5 +1187,6 @@ def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
             )
             assert (await seed.runs())[-1].outcome is None
             assert len(_entries(sync_redis, names["stream"])) == 1
+            assert fires == [_fire_labels("deferred")]
 
     asyncio.run(body())

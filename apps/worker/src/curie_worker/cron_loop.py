@@ -644,6 +644,7 @@ class CronSchedulerLoop:
         async with self._engine.begin() as conn:
             reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
             paused_at, _, _ = await self._control(conn, target, name)
+            outcome: str | None
             if paused_at is not None:
                 outcome = "deferred"
             elif await self._blocked_by_in_flight(conn, target, name, slot):
