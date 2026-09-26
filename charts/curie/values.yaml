@@ -2251,6 +2251,16 @@ agentSandbox:
   #         ports:
   #           - { protocol: TCP, port: 443 }
   registryEgress: {}
+  # Per-agent layered runner image (ADR-0173): agent name -> the runner image
+  # that agent's bundle layers on the platform runner, as the digest reference
+  # `<repository>@sha256:<64 hex>` that `curie build` records in the bundle's
+  # connectors.lock.yaml. A tag is refused at render time. Each listed agent
+  # gets its own SandboxTemplate and warm pool rendering that digest, every
+  # other template keeps runner.image, and the runner prewarm DaemonSet also
+  # pulls each distinct digest so a cold boot never pulls an image.
+  #   runnerImages:
+  #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
+  runnerImages: {}
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with
