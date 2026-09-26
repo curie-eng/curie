@@ -1070,6 +1070,15 @@ pub struct LocalInstallationPlan {
     github_token: Option<String>,
 }
 
+impl LocalInstallationPlan {
+    /// Append typed `--set` values the file cannot express: `set:` renders as
+    /// `--set-string`, which would turn a NetworkPolicy port into a named port.
+    pub(crate) fn with_typed_sets(mut self, sets: impl IntoIterator<Item = String>) -> Self {
+        self.up.set.extend(sets);
+        self
+    }
+}
+
 struct EffectiveInstallationPlan {
     cfg: Installation,
     up: crate::ops::UpOpts,

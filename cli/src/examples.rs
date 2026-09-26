@@ -672,7 +672,7 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     if model.declared.is_none() {
         refuse_to_drop_a_recorded_model_credential(&identity).await?;
     } else {
-        keep_recorded_runner_egress(&identity, &mut model).await?;
+        carry_recorded_runner_egress(&identity, &mut model).await?;
     }
     apply_curie_platform(&chart, false, &identity, &opts.workspace_repo, &model).await?;
     run_install_command(&integration_command, &workspace, &chart).await?;
@@ -978,6 +978,10 @@ async fn refuse_to_drop_a_recorded_model_credential(identity: &InstallIdentity) 
 struct ModelCredential {
     declared: Option<crate::installation::Credentials>,
     egress: Vec<crate::installation::Egress>,
+    /// Explicit runner egress values that stand in for `egress` on a rerun
+    /// over a release that already records its own (see
+    /// [`carry_recorded_runner_egress`]).
+    egress_sets: BTreeMap<String, String>,
 }
 
 const MODEL_CREDENTIAL_ENV: &str = "CURIE_CREDENTIALS";
@@ -995,6 +999,7 @@ impl ModelCredential {
             return Self {
                 declared: None,
                 egress: Vec::new(),
+                egress_sets: BTreeMap::new(),
             };
         };
         Self {
@@ -1008,23 +1013,66 @@ impl ModelCredential {
                 })
                 .into_iter()
                 .collect(),
+            egress_sets: BTreeMap::new(),
         }
     }
 }
 
-/// Does this release's recorded values carry runner egress of its own?
-fn records_runner_egress(existing: &serde_json::Value) -> bool {
-    existing
-        .pointer("/security/networkPolicy/allowedEgress")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|entries| !entries.is_empty())
+const RUNNER_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
+
+/// The release's recorded runner egress, flattened to `--set` keys.
+fn recorded_runner_egress(existing: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut flat = BTreeMap::new();
+    crate::installation::flatten_values(existing, "", &mut flat);
+    flat.into_iter()
+        .filter(|(key, _)| key.starts_with(&format!("{RUNNER_EGRESS_KEY}[")))
+        .collect()
+}
+
+/// The recorded entries kept verbatim, then one TCP 443 entry per provider
+/// CIDR not already recorded, the shape `cluster up` appends for an inferred
+/// provider.
+fn carried_runner_egress_sets(
+    recorded: BTreeMap<String, String>,
+    provider_cidrs: &[String],
+) -> BTreeMap<String, String> {
+    let next_index = recorded
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(RUNNER_EGRESS_KEY)?
+                .strip_prefix('[')?
+                .split_once(']')?
+                .0
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map_or(0, |index| index + 1);
+    let recorded_cidrs: Vec<String> = recorded
+        .iter()
+        .filter(|(key, _)| key.ends_with("].cidr"))
+        .map(|(_, cidr)| cidr.clone())
+        .collect();
+    let mut sets = recorded;
+    for (offset, cidr) in provider_cidrs
+        .iter()
+        .filter(|cidr| !recorded_cidrs.contains(cidr))
+        .enumerate()
+    {
+        let entry = format!("{RUNNER_EGRESS_KEY}[{}]", next_index + offset);
+        sets.insert(format!("{entry}.cidr"), cidr.clone());
+        sets.insert(format!("{entry}.ports[0].protocol"), "TCP".to_string());
+        sets.insert(format!("{entry}.ports[0].port"), "443".to_string());
+    }
+    sets
 }
 
 /// A declared egress host REPLACES the release's recorded runner egress on the
-/// declarative path, so on a rerun the inferred provider route would drop
-/// entries an operator recorded with `cluster up`. When the release already
-/// records egress, declare none and let the path preserve what is there.
-async fn keep_recorded_runner_egress(
+/// declarative path, so on a rerun the provider route would drop entries an
+/// operator recorded with `cluster up`, and simply not declaring it would leave
+/// a newly selected provider unreachable. When the release records egress,
+/// carry it forward explicitly and append the provider's resolved routes.
+async fn carry_recorded_runner_egress(
     identity: &InstallIdentity,
     model: &mut ModelCredential,
 ) -> Result<()> {
@@ -1036,13 +1084,30 @@ async fn keep_recorded_runner_egress(
         release: identity.release.clone(),
         dry_run: false,
     };
-    if crate::ops::fetch_release_values(&opts)
-        .await?
-        .is_some_and(|existing| records_runner_egress(&existing))
-    {
-        model.egress.clear();
+    let Some(existing) = crate::ops::fetch_release_values(&opts).await? else {
+        return Ok(());
+    };
+    let recorded = recorded_runner_egress(&existing);
+    if recorded.is_empty() {
+        return Ok(());
     }
+    let providers: Vec<String> = model.egress.iter().map(|e| e.host.clone()).collect();
+    let provider_cidrs =
+        crate::ops::resolve_provider_egress_cidrs_for_current_environment(&providers)
+            .context("resolving the model provider's egress hosts")?;
+    model.egress_sets = carried_runner_egress_sets(recorded, &provider_cidrs);
+    model.egress.clear();
     Ok(())
+}
+
+impl ModelCredential {
+    /// `egress_sets` as typed `--set` arguments, so a port stays an integer.
+    fn typed_egress_sets(&self) -> Vec<String> {
+        self.egress_sets
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    }
 }
 
 fn github_repo_allowlist_sets(repos: &[String]) -> BTreeMap<String, String> {
@@ -1083,7 +1148,8 @@ async fn apply_curie_platform(
     model: &ModelCredential,
 ) -> Result<Vec<String>> {
     let installation = platform_installation(identity, workspace_repo, model);
-    let local = crate::installation::plan_installation(installation, dry_run)?;
+    let local = crate::installation::plan_installation(installation, dry_run)?
+        .with_typed_sets(model.typed_egress_sets());
     match crate::installation::apply(crate::installation::ApplyOpts {
         local,
         chart: chart.display().to_string(),
@@ -3111,16 +3177,49 @@ mod tests {
     }
 
     #[test]
-    fn recorded_runner_egress_is_detected_so_a_rerun_preserves_it() {
+    fn a_rerun_keeps_recorded_egress_and_adds_the_provider_route() {
         let existing = serde_json::json!({"security": {"networkPolicy": {"allowedEgress": [
-            {"cidr": "203.0.113.7/32", "ports": [{"protocol": "TCP", "port": 443}]}
-        ]}}});
-        assert!(records_runner_egress(&existing));
+            {"cidr": "203.0.113.7/32", "ports": [{"protocol": "TCP", "port": 5432}]}
+        ]}}, "api": {"logLevel": "info"}});
+        let recorded = recorded_runner_egress(&existing);
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
+        let sets = carried_runner_egress_sets(
+            recorded,
+            &["198.51.100.9/32".to_string(), "203.0.113.7/32".to_string()],
+        );
+        let key = |k: &str| {
+            sets.get(&format!("{RUNNER_EGRESS_KEY}{k}"))
+                .map(String::as_str)
+        };
+        assert_eq!(key("[0].cidr"), Some("203.0.113.7/32"));
+        assert_eq!(key("[0].ports[0].port"), Some("5432"));
+        assert_eq!(key("[1].cidr"), Some("198.51.100.9/32"));
+        assert_eq!(key("[1].ports[0].port"), Some("443"));
+        assert_eq!(key("[1].ports[0].protocol"), Some("TCP"));
+        assert_eq!(
+            key("[2].cidr"),
+            None,
+            "an already recorded CIDR is not added twice"
+        );
+
+        let mut model = ModelCredential::from_value(Some("sk-or-EXAMPLE"));
+        model.egress_sets = sets;
+        model.egress.clear();
+        let installation = platform_installation(&test_identity(), &[], &model);
+        assert!(installation.egress_hosts().is_empty());
+        assert!(installation.set.is_empty(), "never through --set-string");
+        assert!(model
+            .typed_egress_sets()
+            .contains(&format!("{RUNNER_EGRESS_KEY}[1].ports[0].port=443")));
+    }
+
+    #[test]
+    fn a_release_without_runner_egress_records_none() {
         for existing in [
             serde_json::json!({}),
             serde_json::json!({"security": {"networkPolicy": {"allowedEgress": []}}}),
         ] {
-            assert!(!records_runner_egress(&existing), "{existing}");
+            assert!(recorded_runner_egress(&existing).is_empty(), "{existing}");
         }
     }
 
