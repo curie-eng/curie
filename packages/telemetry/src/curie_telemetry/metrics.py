@@ -289,6 +289,8 @@ _HTTP_OPERATIONS = [
     "/v1/work-item-progress/{request_id}",
     "/v1/factory/cards/{token}.svg",
     "/schedules",
+    "/schedules/{agent}/{name}/pause",
+    "/schedules/{agent}/{name}/resume",
     "/work-items",
     "/work-items/{work_item_id}",
     "unmatched",

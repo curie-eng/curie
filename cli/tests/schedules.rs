@@ -117,7 +117,8 @@ fn schedules_body() -> Value {
                         "schedule": "0 9 * * *",
                         "zone": "UTC",
                         "last_fire_at": "2026-09-25T09:00:00Z",
-                        "last_outcome": "failed"
+                        "last_outcome": "failed",
+                        "paused": false
                     },
                     {
                         "name": "weekly-report",
@@ -125,7 +126,8 @@ fn schedules_body() -> Value {
                         "schedule": "0 9 * * 1",
                         "zone": "UTC",
                         "last_fire_at": "2026-09-21T09:00:00Z",
-                        "last_outcome": "ran"
+                        "last_outcome": "ran",
+                        "paused": false
                     }
                 ]
             }
@@ -358,12 +360,14 @@ fn missing_agent_is_exit_one() {
 #[test]
 fn pause_and_resume_one_named_hook_through_local_and_cluster() {
     let server = serve(|req| match (req.method.as_str(), route(&req.path)) {
-        ("POST", "/schedules/acme-bot/nightly-cleanup/pause") => {
-            Response::json(200, r#"{"agent":"acme-bot","name":"nightly-cleanup","paused":true}"#)
-        }
-        ("POST", "/schedules/acme-bot/nightly-cleanup/resume") => {
-            Response::json(200, r#"{"agent":"acme-bot","name":"nightly-cleanup","paused":false}"#)
-        }
+        ("POST", "/schedules/acme-bot/nightly-cleanup/pause") => Response::json(
+            200,
+            r#"{"agent":"acme-bot","name":"nightly-cleanup","paused":true}"#,
+        ),
+        ("POST", "/schedules/acme-bot/nightly-cleanup/resume") => Response::json(
+            200,
+            r#"{"agent":"acme-bot","name":"nightly-cleanup","paused":false}"#,
+        ),
         _ => Response::json(500, r#"{"detail":"unexpected"}"#),
     });
 
@@ -377,8 +381,17 @@ fn pause_and_resume_one_named_hook_through_local_and_cluster() {
 
     let resumed = run_in(
         &[
-            "cluster", "schedules", "--agent", "acme-bot", "--resume", "nightly-cleanup",
-            "--api-url", &server.base_url, "--api-key", TEST_API_KEY, "--json",
+            "cluster",
+            "schedules",
+            "--agent",
+            "acme-bot",
+            "--resume",
+            "nightly-cleanup",
+            "--api-url",
+            &server.base_url,
+            "--api-key",
+            TEST_API_KEY,
+            "--json",
         ],
         &[("KUBECONFIG", MISSING_KUBECONFIG)],
     );

@@ -896,3 +896,145 @@ def test_resumed_hook_catches_up_one_slot_after_a_worker_restart(
             assert entries[0].hook_run.slot_utc == seed.slot.isoformat()
 
     asyncio.run(body())
+
+
+def test_old_pass_cannot_clear_a_newer_resume_gap() -> None:
+    """A repeated pause and resume preserves work missed after a pass snapshot."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            floor = seed.slot - timedelta(hours=2)
+            await seed.set_control(HOOK, paused_at=None, resume_from=floor)
+            async with seed.engine.begin() as conn:
+                old_generation = (
+                    await conn.execute(
+                        text(
+                            "SELECT generation FROM curie.schedule_controls "
+                            "WHERE agent_id = :agent_id AND name = :name"
+                        ),
+                        {"agent_id": seed.agent_id, "name": HOOK},
+                    )
+                ).scalar_one()
+                await conn.execute(
+                    text(
+                        "UPDATE curie.schedule_controls "
+                            "SET generation = generation + 2 "
+                            "WHERE agent_id = :agent_id AND name = :name"
+                    ),
+                    {"agent_id": seed.agent_id, "name": HOOK},
+                )
+            loop = _loop(seed.engine, _async_redis(), _Triggers(seed), "unused", seed.slot)
+            try:
+                async with seed.engine.begin() as conn:
+                    result = await conn.execute(
+                        loop._clear_resume_sql,
+                        {
+                            "agent_id": seed.agent_id,
+                            "name": HOOK,
+                            "resume_from": floor,
+                            "generation": old_generation,
+                        },
+                    )
+                assert result.rowcount == 0
+            finally:
+                await loop._redis.aclose()
+
+    asyncio.run(body())
+
+
+def test_pause_during_first_admission_keeps_slot_for_resume(
+    names: dict[str, str]
+) -> None:
+    """A pause after the scheduler snapshot retains its first due slot."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            client = _async_redis()
+            try:
+                trigger = _trigger(seed)
+                loop = _loop(
+                    seed.engine, client, _Triggers(seed, trigger), names["stream"], seed.slot
+                )
+                original = loop._admit
+
+                async def pause_before_admit(*args: Any, **kwargs: Any) -> None:
+                    await seed.set_control(
+                        HOOK, paused_at=seed.slot + timedelta(seconds=1), resume_from=None
+                    )
+                    await original(*args, **kwargs)
+
+                loop._admit = pause_before_admit
+                await loop.one_pass(now=seed.slot + timedelta(seconds=30))
+                assert [(row.slot_utc, row.outcome) for row in await seed.runs()] == [
+                    (seed.slot, "deferred")
+                ]
+            finally:
+                await client.aclose()
+
+    asyncio.run(body())
+
+
+def test_paused_queued_slot_retries_once_after_resume(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A queued fire held by pause is retried within its catch-up bound."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+            await seed.set_control(
+                HOOK, paused_at=seed.slot + timedelta(seconds=1), resume_from=None
+            )
+            trigger = _trigger(seed)
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=20)
+            )
+            assert (await seed.runs())[0].outcome == "deferred"
+
+            await seed.set_control(
+                HOOK, paused_at=None, resume_from=seed.slot + timedelta(seconds=1)
+            )
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=30)
+            )
+            assert (await seed.runs())[0].outcome is None
+            entries = _entries(sync_redis, names["stream"])
+            assert len(entries) == 1
+            assert entries[0].hook_run is not None
+            assert entries[0].hook_run.slot_utc == seed.slot.isoformat()
+
+    asyncio.run(body())
+
+
+def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """An earlier running fire cannot consume the resume catch-up slot."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            earlier = seed.slot - timedelta(hours=1)
+            earlier_id = await seed.add_run(earlier, seed.slot)
+            await seed.set_control(
+                HOOK, paused_at=None, resume_from=seed.slot - timedelta(minutes=30)
+            )
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=30)
+            )
+            assert [(row.slot_utc, row.outcome) for row in await seed.runs()] == [
+                (earlier, None),
+                (seed.slot, "deferred"),
+            ]
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE curie.hook_runs SET outcome = 'ran' WHERE id = :id"),
+                    {"id": earlier_id},
+                )
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=40)
+            )
+            assert (await seed.runs())[-1].outcome is None
+            assert len(_entries(sync_redis, names["stream"])) == 1
+
+    asyncio.run(body())

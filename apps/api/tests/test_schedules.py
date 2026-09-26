@@ -194,6 +194,26 @@ def _control_resume_from(agent_id: str, name: str) -> datetime | None:
     return asyncio.run(read())
 
 
+def _control_generation(agent_id: str, name: str) -> int:
+    async def read() -> int:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as connection:
+                return (
+                    await connection.execute(
+                        text(
+                            "SELECT generation FROM curie.schedule_controls "
+                            "WHERE agent_id = :agent_id AND name = :name"
+                        ),
+                        {"agent_id": uuid.UUID(agent_id), "name": name},
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
 def _schedules(client: Any, headers: dict[str, str], agent: str | None = None) -> Any:
     params = {} if agent is None else {"agent": agent}
     return client.get("/schedules", params=params, headers=headers)
@@ -486,6 +506,7 @@ def test_pause_and_resume_only_change_the_named_hook_for_the_named_agent(
     assert resumed.json()["paused"] is False
     first_resume_floor = _control_resume_from(owner_id, "nightly-cleanup")
     assert first_resume_floor is not None
+    first_generation = _control_generation(owner_id, "nightly-cleanup")
     assert _schedule_action(
         client, auth_headers, owner_id, "nightly-cleanup", "pause"
     ).json()["paused"] is True
@@ -493,9 +514,11 @@ def test_pause_and_resume_only_change_the_named_hook_for_the_named_agent(
         client, auth_headers, owner_id, "nightly-cleanup", "resume"
     ).json()["paused"] is False
     assert _control_resume_from(owner_id, "nightly-cleanup") == first_resume_floor
+    assert _control_generation(owner_id, "nightly-cleanup") == first_generation + 2
     assert _schedule_action(
         client, auth_headers, owner_id, "nightly-cleanup", "resume"
     ).json()["paused"] is False
+    assert _control_generation(owner_id, "nightly-cleanup") == first_generation + 2
 
     body = _body(_schedules(client, auth_headers))
     owner = _agent(body, "acme-pause-owner")

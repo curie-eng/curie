@@ -19,6 +19,11 @@
       "omissions": []
     },
     {
+      "struct": "ScheduleControl",
+      "schema": "ScheduleControlOut",
+      "omissions": []
+    },
+    {
       "struct": "AgentSchedules",
       "schema": "AgentSchedulesOut",
       "omissions": []

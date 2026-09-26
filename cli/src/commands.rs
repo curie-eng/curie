@@ -8788,6 +8788,8 @@ pub struct SchedulesOpts {
     pub api_url: String,
     pub api_key: String,
     pub agent: Option<String>,
+    pub pause: Option<String>,
+    pub resume: Option<String>,
     pub dry_run: bool,
 }
 
@@ -8795,6 +8797,7 @@ pub struct SchedulesOpts {
 pub enum SchedulesOutput {
     DryRun(crate::ui::DryRunPlan),
     List(crate::api::ScheduleList),
+    Control(crate::api::ScheduleControl),
 }
 
 impl crate::ui::CliOutput for SchedulesOutput {
@@ -8802,12 +8805,19 @@ impl crate::ui::CliOutput for SchedulesOutput {
         match self {
             SchedulesOutput::DryRun(plan) => plan.to_json(),
             SchedulesOutput::List(list) => serde_json::to_value(list).unwrap_or_default(),
+            SchedulesOutput::Control(control) => serde_json::to_value(control).unwrap_or_default(),
         }
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             SchedulesOutput::DryRun(plan) => plan.render(ui),
+            SchedulesOutput::Control(control) => ui.payload(&format!(
+                "{} {} {}",
+                control.agent,
+                control.name,
+                if control.paused { "paused" } else { "resumed" }
+            )),
             SchedulesOutput::List(list) => {
                 if list.schedules.is_empty() {
                     ui.payload("no schedules");
@@ -8822,8 +8832,14 @@ impl crate::ui::CliOutput for SchedulesOutput {
                         let fire = hook.last_fire_at.as_deref().unwrap_or("-");
                         let outcome = hook.last_outcome.as_deref().unwrap_or("-");
                         ui.payload(&format!(
-                            "{} {} {} {} {} {}",
-                            hook.name, hook.trigger, hook.schedule, hook.zone, fire, outcome
+                            "{} {} {} {} {} {} {}",
+                            hook.name,
+                            hook.trigger,
+                            hook.schedule,
+                            hook.zone,
+                            fire,
+                            outcome,
+                            if hook.paused { "paused" } else { "active" }
                         ));
                     }
                 }
@@ -8834,20 +8850,47 @@ impl crate::ui::CliOutput for SchedulesOutput {
 
 /// `<tier> schedules`: list cron hooks and the newest recorded slot (`GET /schedules`).
 pub async fn schedules(opts: SchedulesOpts) -> Result<SchedulesOutput> {
+    let action = match (opts.pause.as_deref(), opts.resume.as_deref()) {
+        (Some(name), None) => Some((name, true)),
+        (None, Some(name)) => Some((name, false)),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err(crate::exit::usage("choose pause or resume")),
+    };
+    if action.is_some() && opts.agent.is_none() {
+        return Err(crate::exit::usage("schedule control requires --agent"));
+    }
     let agent_query = opts
         .agent
         .as_ref()
         .map(|agent| format!("?agent={agent}"))
         .unwrap_or_default();
     if opts.dry_run {
-        return Ok(SchedulesOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
+        let line = if let Some((name, pause)) = action {
+            format!(
+                "POST {}/schedules/{}/{}/{}",
+                opts.api_url.trim_end_matches('/'),
+                opts.agent.as_deref().unwrap_or_default(),
+                name,
+                if pause { "pause" } else { "resume" }
+            )
+        } else {
+            format!(
                 "GET {}/schedules{agent_query}",
                 opts.api_url.trim_end_matches('/')
-            )],
+            )
+        };
+        return Ok(SchedulesOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![line],
         }));
     }
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    if let Some((name, pause)) = action {
+        return Ok(SchedulesOutput::Control(
+            client
+                .control_schedule(opts.agent.as_deref().unwrap_or_default(), name, pause)
+                .await?,
+        ));
+    }
     Ok(SchedulesOutput::List(
         client.list_schedules(opts.agent.as_deref()).await?,
     ))

@@ -2868,6 +2868,15 @@ class ScheduleHookOut(BaseModel):
     zone: str
     last_fire_at: datetime | None
     last_outcome: ScheduleOutcome | None
+    paused: bool
+
+
+class ScheduleControlOut(BaseModel):
+    """Current operator pause state for a named cron hook."""
+
+    agent: str
+    name: str
+    paused: bool
 
 
 class AgentSchedulesOut(BaseModel):

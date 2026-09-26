@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -103,17 +105,57 @@ class HookRunRecorder:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
 
+    @asynccontextmanager
+    async def start_guard(self, ref: HookRunRef) -> AsyncIterator[bool]:
+        """Serialize runner admission with an operator pause of this hook."""
+
+        key = _parse_ref(ref)
+        try:
+            async with self._engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended(CAST(:agent_id AS text) || ':' || :name, 0))"
+                    ),
+                    {"agent_id": str(key.agent_id), "name": key.name},
+                )
+                allowed = (
+                    await connection.execute(
+                        text(
+                            "SELECT r.outcome IS NULL AND c.paused_at IS NULL "
+                            "FROM curie.hook_runs r "
+                            "LEFT JOIN curie.schedule_controls c "
+                            "ON c.agent_id = r.agent_id AND c.name = r.name "
+                            "WHERE r.agent_id = :agent_id AND r.name = :name "
+                            "AND r.slot_utc = :slot_utc"
+                        ),
+                        {
+                            "agent_id": key.agent_id,
+                            "name": key.name,
+                            "slot_utc": key.slot_utc,
+                        },
+                    )
+                ).scalar_one_or_none()
+                yield allowed is True
+        except SQLAlchemyError as exc:
+            raise HookRunRecorderError(
+                "hook run start control could not be read", code="backend"
+            ) from exc
+
     async def get(self, ref: HookRunRef) -> HookRunState | None:
         """Return the exact run row, or None when the key is absent."""
         key = _parse_ref(ref)
         try:
-            async with self._engine.connect() as connection:
+            async with self._engine.begin() as connection:
                 row = (
                     await connection.execute(
                         text(
-                            "SELECT outcome FROM curie.hook_runs "
-                            "WHERE agent_id = :agent_id "
-                            "AND name = :name AND slot_utc = :slot_utc"
+                            "SELECT r.outcome, c.paused_at IS NOT NULL AS paused "
+                            "FROM curie.hook_runs r "
+                            "LEFT JOIN curie.schedule_controls c "
+                            "ON c.agent_id = r.agent_id AND c.name = r.name "
+                            "WHERE r.agent_id = :agent_id "
+                            "AND r.name = :name AND r.slot_utc = :slot_utc"
                         ),
                         {
                             "agent_id": key.agent_id,
@@ -122,6 +164,39 @@ class HookRunRecorder:
                         },
                     )
                 ).one_or_none()
+                outcome = None if row is None else row.outcome
+                if row is not None and row.paused and outcome is None:
+                    settled = (
+                        await connection.execute(
+                            text(
+                                "UPDATE curie.hook_runs SET outcome = 'deferred', ended_at = now() "
+                                "WHERE agent_id = :agent_id AND name = :name "
+                                "AND slot_utc = :slot_utc AND outcome IS NULL RETURNING outcome"
+                            ),
+                            {
+                                "agent_id": key.agent_id,
+                                "name": key.name,
+                                "slot_utc": key.slot_utc,
+                            },
+                        )
+                    ).scalar_one_or_none()
+                    if settled is not None:
+                        outcome = settled
+                    else:
+                        outcome = (
+                            await connection.execute(
+                                text(
+                                    "SELECT outcome FROM curie.hook_runs "
+                                    "WHERE agent_id = :agent_id AND name = :name "
+                                    "AND slot_utc = :slot_utc"
+                                ),
+                                {
+                                    "agent_id": key.agent_id,
+                                    "name": key.name,
+                                    "slot_utc": key.slot_utc,
+                                },
+                            )
+                        ).scalar_one()
         except SQLAlchemyError as exc:
             raise HookRunRecorderError(
                 "hook run state could not be read",
@@ -133,7 +208,7 @@ class HookRunRecorder:
             agent_id=key.agent_id,
             name=key.name,
             slot_utc=key.slot_utc,
-            outcome=row.outcome,
+            outcome=outcome,
         )
 
     async def close(self, ref: HookRunRef, outcome: HookRunOutcome) -> None:

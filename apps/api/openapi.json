@@ -6053,6 +6053,30 @@
         "title": "RunningWorkItemRequest",
         "type": "object"
       },
+      "ScheduleControlOut": {
+        "description": "Current operator pause state for a named cron hook.",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "agent",
+          "name",
+          "paused"
+        ],
+        "title": "ScheduleControlOut",
+        "type": "object"
+      },
       "ScheduleHookOut": {
         "description": "One cron hook on the in-force bundle, with its newest slot.",
         "properties": {
@@ -6091,6 +6115,10 @@
             "title": "Name",
             "type": "string"
           },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          },
           "schedule": {
             "title": "Schedule",
             "type": "string"
@@ -6110,7 +6138,8 @@
           "schedule",
           "zone",
           "last_fire_at",
-          "last_outcome"
+          "last_outcome",
+          "paused"
         ],
         "title": "ScheduleHookOut",
         "type": "object"
@@ -13669,6 +13698,142 @@
           }
         },
         "summary": "List Schedules",
+        "tags": [
+          "schedules"
+        ]
+      }
+    },
+    "/schedules/{agent}/{name}/pause": {
+      "post": {
+        "description": "Pause a named cron hook without changing its in force bundle.",
+        "operationId": "pause_schedule_schedules__agent___name__pause_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "title": "Agent",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleControlOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pause Schedule",
+        "tags": [
+          "schedules"
+        ]
+      }
+    },
+    "/schedules/{agent}/{name}/resume": {
+      "post": {
+        "description": "Resume a named cron hook with one bounded catch up opportunity.",
+        "operationId": "resume_schedule_schedules__agent___name__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "title": "Agent",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleControlOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Schedule",
         "tags": [
           "schedules"
         ]

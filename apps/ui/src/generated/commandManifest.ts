@@ -2811,6 +2811,22 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pause one named cron hook on the selected agent",
+              "id": "pause",
+              "long": "pause",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Resume one named cron hook on the selected agent",
+              "id": "resume",
+              "long": "resume",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -5414,6 +5430,22 @@ export const commandManifest = {
               "help": "Scope to one agent (name or id). Omit to list every deployed agent",
               "id": "agent",
               "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pause one named cron hook on the selected agent",
+              "id": "pause",
+              "long": "pause",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Resume one named cron hook on the selected agent",
+              "id": "resume",
+              "long": "resume",
               "positional": false,
               "required": false
             },

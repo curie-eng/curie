@@ -260,7 +260,7 @@ def test_queued_cron_fire_is_rejected_after_operator_pause(
             await h.kernel.process_event(_event(hook_run=run.ref))
 
             outcome, ended_at = await run.state() or (None, None)
-            assert outcome == "skipped"
+            assert outcome == "deferred"
             assert ended_at is not None
             assert h.runner.opened == []
 
@@ -303,7 +303,7 @@ def test_pause_during_claim_rejects_the_cron_turn_before_runner_start(
             await task
 
             outcome, ended_at = await run.state() or (None, None)
-            assert outcome == "skipped"
+            assert outcome == "deferred"
             assert ended_at is not None
             assert h.runner.opened == []
 
