@@ -974,3 +974,73 @@ def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
             assert h.kernel.owns_work_item(uuid.uuid4()) is False
 
     asyncio.run(exercise())
+
+
+# --- ADR-0168 decision 7: a runner booted without a caller token -----------
+
+
+class _CallerKeyBinding(_Binding):
+    """Boots carry a caller token once the install holds a caller key."""
+
+    def __init__(self, *, keyed: bool) -> None:
+        self.keyed = keyed
+
+    def boot_env(self, resolved: object, thread_key: str, **kwargs: object) -> dict[str, str]:
+        env = super().boot_env(resolved, thread_key, **kwargs)
+        if self.keyed:
+            env["CURIE_CONNECTOR_CALLER_TOKEN"] = "cct.payload.signature"
+        return env
+
+
+# @spec ADR-0168 d7
+def test_a_runner_booted_before_the_caller_key_is_replaced_on_its_next_turn(
+    make_harness,
+) -> None:
+    """Every hosted connector's proxy refuses a runner with no caller token,
+    and the route TTL slides on every turn, so waiting it out is no bound."""
+
+    async def exercise() -> None:
+        binding = _CallerKeyBinding(keyed=False)
+        async with make_harness(
+            binding=binding,
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+            binding.keyed = True
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "and again"))
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 2
+            assert "CURIE_CONNECTOR_CALLER_TOKEN" not in (envs[0] or {})
+            assert (envs[1] or {}).get("CURIE_CONNECTOR_CALLER_TOKEN") == "cct.payload.signature"
+
+    asyncio.run(exercise())
+
+
+# @spec ADR-0168 d7
+@pytest.mark.parametrize(("first", "then"), [(True, True), (True, False), (False, False)])
+def test_a_runner_whose_caller_token_still_fits_is_adopted(
+    make_harness, first: bool, then: bool
+) -> None:
+    """Only a missing token forces a fresh runner. A runner that carries one
+    keeps working after the key is removed, because no proxy is rendered then."""
+
+    async def exercise() -> None:
+        binding = _CallerKeyBinding(keyed=first)
+        async with make_harness(
+            binding=binding,
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+            binding.keyed = then
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "and again"))
+
+            assert len(h.fake_k8s.claim_envs) == 1
+
+    asyncio.run(exercise())
