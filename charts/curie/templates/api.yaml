@@ -253,7 +253,7 @@ spec:
             - name: LANGFUSE_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
                   key: langfuseInitProjectSecretKey
             - name: S3_ENDPOINT_URL
               value: {{ include "curie.rustfs.endpoint" . }}
@@ -263,7 +263,7 @@ spec:
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
                   key: rustfsSecretKey
             {{- end }}
             # Immutable plugin-bundle bucket. Single source of truth with the

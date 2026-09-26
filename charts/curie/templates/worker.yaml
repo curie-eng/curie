@@ -356,7 +356,7 @@ spec:
             - name: LANGFUSE_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
                   key: langfuseInitProjectSecretKey
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
@@ -499,7 +499,7 @@ spec:
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
                   key: rustfsSecretKey
             {{- end }}
             - name: BUNDLE_BUCKET

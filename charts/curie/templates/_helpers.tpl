@@ -128,6 +128,11 @@ affinity:
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Resolve a store credential Secret, defaulting to the chart Secret. */}}
+{{- define "curie.storeSecretName" -}}
+{{- .store.existingSecret | default (include "curie.secretName" .root) -}}
+{{- end -}}
+
 {{/* Dedicated namespace for short-lived publication resources. */}}
 {{- define "curie.publicationNamespace" -}}
 {{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
@@ -481,7 +486,7 @@ http
 {{- if .Values.otelCollector.otlpAuthHeader -}}
 {{- include "curie.secretName" . -}}
 {{- else -}}
-{{- .Values.langfuse.existingSecret | default (include "curie.secretName" .) -}}
+{{- include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) -}}
 {{- end -}}
 {{- end -}}
 
@@ -773,7 +778,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
      (hence the general name) once its design pass lands. */}}
 {{- define "curie.checkDefaultCredentials" -}}
 {{- if .Values.security.checkDefaultCredentials -}}
-{{- if eq (.Values.langfuse.existingSecret | default (include "curie.secretName" .)) (include "curie.secretName" .) -}}
+{{- if eq (include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse)) (include "curie.secretName" .) -}}
 {{- if eq .Values.langfuse.init.projectSecretKey "sk-lf-curie-dev" -}}
 {{- fail "security.checkDefaultCredentials is on but langfuse.init.projectSecretKey is still the published dev default \"sk-lf-curie-dev\". Override it (or set langfuse.existingSecret) before installing on a shared/production cluster -- this key also feeds the OTel Collector auth header." -}}
 {{- end -}}
@@ -987,7 +992,7 @@ before contacting Valkey.
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.postgres) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql+asyncpg://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "asyncpg") }}
@@ -1009,7 +1014,7 @@ before contacting Valkey.
 - name: VALKEY_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
       key: valkeyPassword
 - name: VALKEY_TLS
   value: {{ include "curie.valkey.tls" . | quote }}
@@ -1421,19 +1426,19 @@ livenessProbe:
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.postgres) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "prisma") }}
 - name: SALT
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
       key: langfuseSalt
 - name: ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
       key: langfuseEncryptionKey
 - name: TELEMETRY_ENABLED
   value: {{ .Values.langfuse.telemetryEnabled | quote }}
@@ -1464,7 +1469,7 @@ livenessProbe:
 - name: CLICKHOUSE_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.clickhouse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.clickhouse) }}
       key: clickhousePassword
 - name: CLICKHOUSE_CLUSTER_ENABLED
   value: {{ .Values.clickhouse.clusterEnabled | quote }}
@@ -1475,7 +1480,7 @@ livenessProbe:
 - name: REDIS_AUTH
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
       key: valkeyPassword
 {{- /* Same helper as curie.env.valkey, so the two Langfuse Deployments and the
        first-party apps cannot disagree about the transport of the one store
@@ -1504,7 +1509,7 @@ livenessProbe:
 - name: LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
       key: rustfsSecretKey
 {{- end }}
 {{- /* Both endpoints go through curie.rustfs.endpoint, never a literal
@@ -1528,7 +1533,7 @@ livenessProbe:
 - name: LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
       key: rustfsSecretKey
 {{- end }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT
