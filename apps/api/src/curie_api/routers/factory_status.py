@@ -143,7 +143,7 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             terminal_at=request.terminal_at,
             now=datetime.now(UTC),
             activity=row.activity,
-            note=reports[-1].note if reports else None,
+            note=next((report.note for report in reversed(reports) if report.note), None),
             phase_view=phase_view(
                 row.declaration or {"phases": [], "loops": []},
                 reports,
@@ -153,6 +153,8 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             cause_text=(
                 cause_text(terminal) if terminal and terminal != "completed" else None
             ),
+            needs_human=request.status == "failed"
+            and terminal in {"runner_escalated", "ci_failed"},
         )
     )
     return Response(

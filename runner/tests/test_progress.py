@@ -81,13 +81,21 @@ class _Recorder:
 # --- the phase declaration ---------------------------------------------------
 
 
-def test_the_dark_factory_bundle_declares_nine_phases_and_two_loops() -> None:
+def test_the_dark_factory_bundle_declares_nine_phases_and_three_loops() -> None:
     declared = load_phase_declaration(BUNDLE)
     assert declared is not None
     assert [phase["id"] for phase in declared["phases"]] == BUNDLE_PHASES
     assert [(loop["start"], loop["review"], loop["cap"]) for loop in declared["loops"]] == [
         ("plan", "plan_review", 3),
         ("implement", "review_diff", 3),
+        ("implement", "wait_ci", 3),
+    ]
+    assert [(stage["id"], stage["phases"]) for stage in declared["stages"]] == [
+        ("plan", ["read_issue", "pin_criteria", "plan"]),
+        ("plan_review", ["plan_review"]),
+        ("implement", ["failing_test", "implement"]),
+        ("review_diff", ["review_diff", "publish"]),
+        ("wait_ci", ["wait_ci"]),
     ]
 
 
@@ -115,6 +123,18 @@ def test_a_bundle_without_a_phase_file_declares_nothing(tmp_path: Path) -> None:
         {
             "phases": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
             "loops": [{"start": "a", "review": "b", "cap": 6}],
+        },
+        {
+            "phases": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+            "stages": [{"id": "only", "label": "Only", "phases": ["a"]}],
+        },
+        {
+            "phases": [{"id": "a", "label": "A"}],
+            "stages": [{"id": "only", "label": "Only", "phases": ["a", "a"]}],
+        },
+        {
+            "phases": [{"id": "a", "label": "A"}],
+            "stages": [{"id": "only", "label": "Only", "phases": ["missing"]}],
         },
     ],
 )

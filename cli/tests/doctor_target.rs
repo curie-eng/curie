@@ -8,12 +8,24 @@
 //! `DoctorOutput::to_json()` cannot observe which stream a line was written to.
 //! So these run the real binary.
 //!
-//! Offline by construction: `PATH` is emptied, so docker, kubectl and helm are
-//! all absent and every cluster check reports the laptop rung.
+//! The targeting cases empty `PATH` so they need no cluster. The model remedy
+//! case uses temporary command stubs to expose a floating release model.
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+
+#[cfg(unix)]
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, body).expect("write tool stub");
+    let mut permissions = fs::metadata(path)
+        .expect("read tool stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("make tool stub executable");
+}
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -133,5 +145,103 @@ fn an_inferred_target_keeps_json_stdout_clean() {
     assert!(
         stderr.contains("acme"),
         "the announcement must name the target it resolved: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_context_keeps_the_file_model_remedy_on_curie_apply() {
+    let temp = tempfile::tempdir().expect("create temporary directory");
+    let tools = temp.path().join("tools");
+    fs::create_dir_all(&tools).expect("create tool directory");
+    write_executable(&tools.join("docker"), "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &tools.join("kubectl"),
+        r#"#!/bin/sh
+case "$*" in
+  "config current-context") printf '%s\n' 'explicit-context' ;;
+  *"get deployments,statefulsets"*) printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}' ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    write_executable(
+        &tools.join("helm"),
+        r#"#!/bin/sh
+case "$*" in
+  version*) printf '%s\n' 'v3.14.0+gstub' ;;
+  list*) printf '%s\n' '[{"name":"acme-bot","chart":"curie-0.10.2","status":"deployed"}]' ;;
+  *"--all"*) printf '%s\n' '{"agentSandbox":{"runner":{"model":"claude-sonnet-5","fakeModel":false}}}' ;;
+  *"get values"*) printf '%s\n' '{}' ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+
+    fs::write(
+        temp.path().join("curie.yaml"),
+        "version: 1\ninstall:\n  namespace: acme\n  release: acme-bot\n  context: file-context\n",
+    )
+    .expect("write curie.yaml");
+    let kubeconfig = temp.path().join("kubeconfig");
+    fs::write(
+        &kubeconfig,
+        "apiVersion: v1\nkind: Config\ncurrent-context: file-context\ncontexts:\n- name: file-context\n  context:\n    cluster: file-cluster\n- name: explicit-context\n  context:\n    cluster: explicit-cluster\n",
+    )
+    .expect("write kubeconfig");
+
+    let output = Command::new(bin())
+        .current_dir(temp.path())
+        .args([
+            "--color=never",
+            "--json",
+            "doctor",
+            "--namespace",
+            "acme",
+            "--release",
+            "acme-bot",
+            "--context",
+            "explicit-context",
+        ])
+        .env("PATH", &tools)
+        .env("HOME", temp.path())
+        .env("KUBECONFIG", &kubeconfig)
+        .env("CURIE_CONFIG_DIR", temp.path().join("config"))
+        .env("LC_ALL", "C")
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .env_remove("CURIE_MODEL")
+        .env_remove("CURIE_CREDENTIALS")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("run curie doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("doctor output must be JSON: {error}; stderr: {stderr}"));
+    let fix = report["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["id"] == "model-pin")
+        .and_then(|check| check["fix"].as_str())
+        .expect("floating release model must carry a fix");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        fix.contains("curie apply --context")
+            && fix.contains("explicit-context")
+            && fix.contains("agentSandbox.runner.model")
+            && fix.contains("set:"),
+        "the fix must preserve the selected context and name the file key: {fix}"
+    );
+    assert!(
+        !fix.contains("cluster up --set"),
+        "the fix must not return to a cluster up override: {fix}"
     );
 }

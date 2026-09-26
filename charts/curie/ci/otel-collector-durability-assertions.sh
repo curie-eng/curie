@@ -287,6 +287,16 @@ render "$TMP/workload-wiring.yaml" \
   --set dispatcher.deploy=true \
   --set dispatcher.slack.appToken=placeholder-app-token \
   --set dispatcher.slack.botToken=placeholder-bot-token
+render "$TMP/metrics-temporality-override.yaml" \
+  --set otelCollector.metricsTemporalityPreference=cumulative \
+  --set dispatcher.deploy=true \
+  --set dispatcher.slack.appToken=placeholder-app-token \
+  --set dispatcher.slack.botToken=placeholder-bot-token \
+  --set mailAdapter.deploy=true \
+  --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24' \
+  --set mailAdapter.channelToken=chn-assert-token \
+  --set mailAdapter.egressSecret=egress-assert-secret \
+  --set mailAdapter.agentmail.apiKey=am-assert-key
 render "$TMP/dev.yaml" -f "$CHART/values-dev.yaml"
 render "$TMP/ephemeral.yaml" --set otelCollector.persistence.enabled=false
 render "$TMP/storage-class.yaml" --set otelCollector.persistence.storageClass=acme-storage
@@ -511,6 +521,7 @@ python3 - \
   "$TMP/default.yaml" "$TMP/dev.yaml" "$TMP/ephemeral.yaml" \
   "$TMP/storage-class.yaml" "$TMP/external.yaml" "$TMP/extra.yaml" \
   "$TMP/workload-wiring.yaml" "$TMP/external-workload-wiring.yaml" \
+  "$TMP/metrics-temporality-override.yaml" \
   "$TMP/metrics-ingress.yaml.out" "$TMP/custom-metrics-port.yaml" \
   "$TMP/network-policy-disabled.yaml" \
   "$TMP/external-otel-workload-env.yaml.out" \
@@ -646,6 +657,7 @@ def quantity_is_finite(value):
     extra_path,
     workload_wiring_path,
     external_workload_wiring_path,
+    metrics_temporality_override_path,
     metrics_ingress_path,
     custom_metrics_port_path,
     network_policy_disabled_path,
@@ -701,8 +713,32 @@ def environment(container):
     return {entry.get("name"): entry.get("value") for entry in container.get("env", [])}
 
 
+def assert_metrics_temporality(container, role, expected):
+    matches = [
+        entry for entry in container.get("env", [])
+        if entry.get("name") == "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"
+    ]
+    assert len(matches) == 1 and matches[0].get("value") == expected, (
+        f"{role}: expected one metrics temporality preference {expected!r}, got {matches!r}"
+    )
+
+
+def mail_adapter_container(path):
+    matches = [
+        container
+        for doc in documents(path)
+        if doc.get("kind") == "Deployment"
+        and (doc.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/component") == "mail-adapter"
+        for container in doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+        if container.get("name") == "mail-adapter"
+    ]
+    assert len(matches) == 1, f"{path}: expected one mail adapter container, found {len(matches)}"
+    return matches[0]
+
+
 in_chart_endpoint = "http://curie-otel-collector:4318"
 for role, container in workload_containers(workload_wiring_path).items():
+    assert_metrics_temporality(container, role, "delta")
     env = environment(container)
     assert env.get("OTEL_EXPORTER_OTLP_ENDPOINT") == in_chart_endpoint, (
         f"{role}: chart-owned Collector is enabled but endpoint is "
@@ -716,6 +752,12 @@ for role, container in workload_containers(workload_wiring_path).items():
         assert sum(entry.get("name") == name for entry in container.get("env", [])) == 1, (
             f"{role}: chart-owned {name} must render exactly once"
         )
+
+for role, container in workload_containers(metrics_temporality_override_path).items():
+    assert_metrics_temporality(container, role, "cumulative")
+assert_metrics_temporality(
+    mail_adapter_container(metrics_temporality_override_path), "mail adapter", "cumulative"
+)
 
 runner_override = workload_containers(internal_runner_otel_override_path)["runner"]
 runner_override_entries = runner_override.get("env", [])
@@ -859,6 +901,27 @@ default_docs = collector_documents(default_path)
 default_config = collector_config(default_path, "default")
 storage_directory = assert_pipeline_graph(default_config, "default", expect_debug=False)
 assert_network_exporters(default_config, "default")
+pipelines = default_config["service"]["pipelines"]
+metric_transforms = [
+    name for name in pipelines["metrics"]["processors"]
+    if name.startswith("transform/")
+]
+assert len(metric_transforms) == 1, (
+    f"default: expected one runner identity metrics transform, got {metric_transforms!r}"
+)
+transform_name = metric_transforms[0]
+assert all(
+    transform_name not in pipelines[signal]["processors"] for signal in ("traces", "logs")
+), "default: runner metric identity transform must not affect traces or logs"
+metric_statements = default_config["processors"][transform_name]["metric_statements"]
+assert len(metric_statements) == 1 and metric_statements[0]["context"] == "datapoint", (
+    f"default: runner identity transform must act on metric datapoints: {metric_statements!r}"
+)
+statements = metric_statements[0]["statements"]
+assert statements == [
+    'set(attributes["service.instance.id"], resource.attributes["service.instance.id"]) '
+    'where resource.attributes["service.name"] == "curie-runner"'
+], f"default: identity promotion must be limited to runner metrics: {statements!r}"
 
 dev_config = collector_config(dev_path, "values-dev")
 assert_pipeline_graph(dev_config, "values-dev", expect_debug=True)

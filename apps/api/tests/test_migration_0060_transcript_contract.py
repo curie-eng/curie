@@ -1,4 +1,4 @@
-"""Migration 0059 reconciles and removes legacy transcript state rows."""
+"""Migration 0060 reconciles and removes legacy transcript state rows."""
 
 from __future__ import annotations
 
@@ -96,17 +96,17 @@ def _seed_copy(
     )
 
 
-def test_0059_contract_requires_forward_only() -> None:
+def test_0060_contract_requires_forward_only() -> None:
     window = load_window()
     kinds = load_kinds()
-    assert window.schema_min == "0059"
-    assert kinds["0059"] == KIND_CONTRACT
+    assert window.schema_min == "0060"
+    assert kinds["0060"] == KIND_CONTRACT
 
     refused = plan_upgrade(
-        current_revision="0058",
+        current_revision="0059",
         window=window,
         kinds=kinds,
-        pending=("0059",),
+        pending=("0060",),
         forward_only=False,
     )
     assert refused.action == "refuse"
@@ -114,10 +114,10 @@ def test_0059_contract_requires_forward_only() -> None:
     assert refused.pending[0].kind == KIND_CONTRACT
 
     allowed = plan_upgrade(
-        current_revision="0058",
+        current_revision="0059",
         window=window,
         kinds=kinds,
-        pending=("0059",),
+        pending=("0060",),
         forward_only=True,
     )
     assert allowed.action == "apply"
@@ -125,11 +125,11 @@ def test_0059_contract_requires_forward_only() -> None:
     assert allowed.pending[0].kind == KIND_CONTRACT
 
 
-def test_0059_reconciles_by_scope_and_removes_only_legacy_transcripts(
+def test_0060_reconciles_by_scope_and_removes_only_legacy_transcripts(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
-    command.upgrade(config, "0058")
+    command.upgrade(config, "0059")
     agent_id = uuid.uuid4()
     try:
         _sql(
@@ -176,7 +176,7 @@ def test_0059_reconciles_by_scope_and_removes_only_legacy_transcripts(
         _seed_state(agent_id, None, "memory", "facts", {"source": "memory"}, 2, 1)
         _seed_state(agent_id, SCOPE, "workflow", "step", {"source": "workflow"}, 3, 1)
 
-        command.upgrade(config, "0059")
+        command.upgrade(config, "0060")
 
         transcripts = _sql(
             "SELECT binding_scope, thread_key, value, version, "

@@ -24,7 +24,12 @@ workloads = {
     "agentSandbox.runner": ("agent-sandbox.yaml", "runner"),
     "otelCollector": ("otel-collector.yaml", "otel-collector"),
 }
-overrides = {"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_PROTOCOL", "OTEL_EXPORTER_OTLP_HEADERS"}
+overrides = {
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+}
 
 def envs(output, filename, container):
     docs = yaml.safe_load_all((output / "curie/templates" / filename).read_text())

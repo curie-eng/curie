@@ -36,6 +36,7 @@ from apps.api.tests.test_publications import (
     WORKER_HEADERS,
     _execute,
     _open_lineage,
+    _publication_payload,
     _rows,
 )
 from apps.api.tests.test_publications import publication_stack as publication_stack
@@ -224,6 +225,7 @@ def precheck_case(
             "lineage_id": lineage_id,
             "lineage": lineage,
             "publication_id": first["id"],
+            "reply_conversation_id": conversation,
             "truth": truth,
             "provider_status": provider_status,
             "calls": calls,
@@ -371,6 +373,54 @@ def test_mint_binds_running_request_and_comparison_reads_fresh_truth_without_wri
     assert len(_pull_reads(case)) == 3
     assert all(request.extensions.get("timeout") is not None for request in _pull_reads(case))
     assert _durable_snapshot() == before
+
+
+@pytest.mark.parametrize("case_kind", ["changed", "unchanged", "external_edit"])
+def test_metadata_only_admission_rechecks_current_pull_request(
+    precheck_case: dict[str, Any], case_kind: str
+) -> None:
+    case = precheck_case
+    context = _mint(case)
+    _execute(
+        "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(case["publication_id"])},
+    )
+    payload = _publication_payload(
+        case["deployment"]["id"],
+        patch=b"",
+        base_sha=FIRST_REVISION_SHA,
+        conversation_id=context["conversation_id"],
+    )
+    payload.update(
+        changed_paths=[],
+        reply_conversation_id=case["reply_conversation_id"],
+        title=OBSERVED_TITLE,
+        body=(
+            OBSERVED_BODY
+            if case_kind == "unchanged"
+            else "Corrected body for the pull request check.\n"
+        ),
+        work_item_request_id=str(case["request_id"]),
+        work_item_runtime_epoch=7,
+        observed_title=context["observed_title"],
+        observed_body_sha256=context["observed_body_sha256"],
+        observed_lineage_id=context["lineage_id"],
+        observed_lineage_version=context["lineage_version"],
+    )
+    if case_kind == "external_edit":
+        case["truth"]["body"] = "A human edited this body after the model saw it.\n"
+    response = case["client"].post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+    if case_kind == "changed":
+        assert response.status_code == 201, response.text
+        assert response.json()["changed_paths"] == []
+    else:
+        assert response.status_code == 409, response.text
+        assert _rows(
+            "SELECT id FROM curie.publications WHERE id <> :id",
+            {"id": uuid.UUID(case["publication_id"])},
+        ) == []
 
 
 def test_running_factory_request_without_existing_pr_gets_authenticated_absence(

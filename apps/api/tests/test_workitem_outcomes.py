@@ -429,6 +429,7 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
             "pr_number": PR_NUMBER,
             "pr_url": PR_URL,
             "head_sha": HEAD_SHA,
+            "metadata_updated_at": None,
         },
         headers=WORKER_HEADERS,
     )
@@ -882,6 +883,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
                 pr_number=PR_NUMBER,
                 pr_url=PR_URL,
                 head_sha=HEAD_SHA,
+                metadata_updated_at=None,
             ),
             identity=VerifiedPublicationIdentity(
                 repository_id=101,

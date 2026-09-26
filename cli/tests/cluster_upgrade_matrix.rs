@@ -107,8 +107,8 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin exclusive_kind_tag untag-before-load\n{text}"
     );
     assert!(
-        text.contains("rollback refusal keeps candidate schema and serving release"),
-        "self-test must pin refusal at the candidate schema head\n{text}"
+        text.contains("guarded rollback reloads exclusive 0.10.0 images"),
+        "self-test must pin guarded rollback reloading 0.10.0 images\n{text}"
     );
     assert!(
         text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
@@ -212,7 +212,7 @@ fn candidate_image_setup_derives_every_n1_tag_from_local_n_before_exclusive_load
 }
 
 #[test]
-fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
+fn published_v089_rollback_scenario_is_strict_and_keeps_guarded_rollback() {
     let source = fs::read_to_string(script()).expect("read cluster upgrade matrix");
     let catalog: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(repo_root().join("cli/src/application_schema_windows.json"))
@@ -312,7 +312,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         scenario.contains("status != 0")
             && scenario.contains("0.8.9")
             && scenario.contains("PUBLISHED_HEAD")
-            && scenario.contains("grep -F \"$TARGET_HEAD\"")
+            && scenario.contains("TARGET_HEAD")
             && scenario.contains("outside its declared schema range")
             && scenario.contains("if echo \"$err\" | grep -F \"could not establish\"")
             && scenario.contains("failed identity classification"),
@@ -330,19 +330,19 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         "refusal must retain the sentinel, candidate Alembic head, and a ready API"
     );
     assert!(
-        scenario.contains("run_compatible_rollback"),
-        "the same scenario must prove the 0.10.0 rollback is refused"
+        scenario.contains("run_guarded_rollback"),
+        "the same scenario must prove one guarded rollback refusal"
     );
 
-    let compatible = source
-        .split_once("run_compatible_rollback() {")
+    let guarded = source
+        .split_once("run_guarded_rollback() {")
         .map(|(_, rest)| rest.split_once("\n}\n").map_or(rest, |(body, _)| body))
-        .expect("run_compatible_rollback function");
+        .expect("run_guarded_rollback function");
     assert!(
-        compatible.contains("assert_sentinel")
-            && compatible.contains("assert_alembic \"$TARGET_HEAD\"")
-            && compatible.contains("rollback to 0.10.0 unexpectedly succeeded"),
-        "refused 0.10.1 to 0.10.0 rollback must retain the sentinel and candidate Alembic head"
+        guarded.contains("assert_sentinel")
+            && guarded.contains("assert_alembic \"$TARGET_HEAD\"")
+            && guarded.contains("outside its declared schema range"),
+        "guarded rollback must refuse the older release and retain the sentinel and live Alembic head"
     );
 }
 
@@ -498,7 +498,7 @@ s05 setup fail-every-phase:canary
 s06 setup fail-every-phase:commit
 s07 setup interrupt-resume:checkpoint+migrate
 s08 setup interrupt-resume:apply+commit
-s09 setup n-to-n1 compatible-rollback
+s09 setup n-to-n1 guarded-rollback
 s10 setup rollback-published-088
 s11 nosetup rollback-published-089
 s12 nosetup migration-crash

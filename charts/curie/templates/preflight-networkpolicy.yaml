@@ -96,6 +96,9 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "curie.fullname" . }}-netpol-probe
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       containers:
         - name: netpol-probe
           image: {{ .Values.preflights.networkPolicyProbe.image }}

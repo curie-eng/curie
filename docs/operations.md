@@ -840,7 +840,9 @@ so Curie can re-read the issue, keep its one status comment, and set the
 `curie-factory:*` state labels. **Metadata: Read** is already implied by repository
 installation discovery.
 
-Give the App **Checks: Read**, **Commit statuses: Read**, and **Actions: Read**.
+Give the App **Checks: Read** and **Commit statuses: Read** (the factory
+preflight names whichever of those two the installation does not grant), and
+**Actions: Read**.
 The Actions permission lets repair rounds include the failing job's log tail.
 Without it, CI verdicts still use checks and commit statuses; the repair prompt
 keeps the check summary and says `Job log unavailable.` After a factory

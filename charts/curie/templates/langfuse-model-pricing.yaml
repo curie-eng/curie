@@ -40,6 +40,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       containers:
         - name: model-pricing
           image: {{ .Values.langfuse.modelPricing.image }}

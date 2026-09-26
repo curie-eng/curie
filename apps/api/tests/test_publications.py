@@ -364,6 +364,7 @@ def _advance_lineage(
             "pr_number": pr_number,
             "pr_url": pr_url,
             "head_sha": head_sha,
+            "metadata_updated_at": None,
         },
         headers=WORKER_HEADERS,
     )
@@ -841,6 +842,7 @@ def test_publication_splits_scoped_thread_identity_from_slack_reply_identity(
                 outcome="failed",
                 pr_url=None,
                 error="safe terminal fixture",
+                metadata_updated_at=None,
             )
             cleanup = await store.claim_pending_cleanup()
             assert cleanup is not None
@@ -1523,6 +1525,7 @@ def test_publication_card_and_result_claims_survive_process_replacement(
                 outcome="failed",
                 pr_url=None,
                 error="safe terminal fixture",
+                metadata_updated_at=None,
             )
             cleanup = await replacement.claim_pending_cleanup()
             assert cleanup is not None
@@ -1631,6 +1634,7 @@ def test_publication_cleanup_outbox_retries_beyond_result_delivery_cap(
                 outcome="failed",
                 pr_url=None,
                 error="terminal fixture",
+                metadata_updated_at=None,
             )
             for attempt in range(6):
                 cleanup = await store.claim_pending_cleanup()
@@ -1840,8 +1844,10 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
+                async def metadata_check() -> None:
+                    return
                 publication, _ = await crud.create_publication(
-                    session, data, patch=data.decoded_patch()
+                    session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )
                 return CreatedPublication(
                     id=str(publication.id),
@@ -6026,6 +6032,81 @@ def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
     ) == [{"status": "succeeded", "lease_owner": None, "cleared": True}]
 
 
+@pytest.mark.parametrize("include_timestamp", [True, False])
+def test_metadata_only_lineage_advance_settles_status_and_update_time_atomically(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    include_timestamp: bool,
+) -> None:
+    client, truth, _ = review_lineage_app
+    conversation = f"metadata-lineage-{include_timestamp}"
+    deployment, _, lineage = _verified_lineage(
+        client, truth, auth_headers, conversation=conversation
+    )
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation,
+            dedupe_key=f"metadata-lineage-revision-{include_timestamp}",
+            base_sha=FIRST_REVISION_SHA,
+        ),
+    )
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    _execute(
+        "UPDATE curie.publications SET patch_bytes = decode('', 'hex'), "
+        "changed_paths = '[]'::jsonb WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    owner = "metadata-lineage-worker"
+    version = _claim_publication_lease(publication["id"], owner)
+    snapshot = (
+        "SELECT p.status, p.metadata_updated_at, p.version AS publication_version, "
+        "p.lease_owner, l.head_sha, l.version AS lineage_version "
+        "FROM curie.publications p JOIN curie.thread_publication_lineages l "
+        "ON l.id = p.lineage_id WHERE p.id = :id"
+    )
+    identity = {"id": uuid.UUID(publication["id"])}
+    before = _rows(snapshot, identity)
+    assert before[0]["status"] == "approved"
+    assert before[0]["metadata_updated_at"] is None
+    assert before[0]["head_sha"] == FIRST_REVISION_SHA
+    marker_time = datetime.fromisoformat("2026-09-25T12:34:56+00:00")
+
+    response = client.patch(
+        f"/v1/internal/publications/{publication['id']}/lineage",
+        headers=WORKER_HEADERS,
+        json={
+            "expected_version": lineage["version"],
+            "expected_head_sha": FIRST_REVISION_SHA,
+            "expected_publication_version": version,
+            "lease_owner": owner,
+            "state": "open",
+            "pr_number": PR_NUMBER,
+            "pr_url": PR_URL,
+            "head_sha": FIRST_REVISION_SHA,
+            **({"metadata_updated_at": marker_time.isoformat()} if include_timestamp else {}),
+        },
+    )
+
+    if include_timestamp:
+        assert response.status_code == 200, response.text
+        assert _rows(snapshot, identity) == [
+            {
+                "status": "succeeded",
+                "metadata_updated_at": marker_time,
+                "publication_version": version + 1,
+                "lease_owner": None,
+                "head_sha": FIRST_REVISION_SHA,
+                "lineage_version": lineage["version"] + 1,
+            }
+        ]
+    else:
+        assert response.status_code == 422, response.text
+        assert _rows(snapshot, identity) == before
+
+
 def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unchanged(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
@@ -6089,6 +6170,7 @@ def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unc
                     pr_number=PR_NUMBER,
                     pr_url=PR_URL,
                     head_sha=FIRST_REVISION_SHA,
+                    metadata_updated_at=None,
                 )
 
     client.portal.call(stale_advance)

@@ -108,6 +108,10 @@ priorityClasses:
     # and UI; the full inventory is pinned by ci/render-assertions.sh
     # Assertion 8). Set false (and repoint `name` at an existing class) if
     # the cluster/another release already defines an equivalent one.
+    # Preinstall and preupgrade hooks omit this class when create is true,
+    # because the class can be absent until normal resources are applied.
+    # Postinstall and postupgrade hooks use it. When create is false, create
+    # the named class before installing so hooks can use it.
     create: true
     name: curie-platform
     value: 1000000
@@ -901,6 +905,11 @@ otelCollector:
   #  - cidr: 192.0.2.10/32
   #    ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
+  # SDK metrics use delta aggregation so each export carries the measurements
+  # made since the prior collection. Override to cumulative or lowmemory when
+  # the receiving backend requires that preference. A workload extraEnv entry
+  # with the same OTEL variable takes precedence.
+  metricsTemporalityPreference: delta
   # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
   # credentials so they never enter Helm values. The two sources are mutually
   # exclusive; a literal is only for non-sensitive values such as a tenant id.

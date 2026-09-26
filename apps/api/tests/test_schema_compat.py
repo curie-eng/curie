@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
-REVIEW_SCHEMA_MIN = "0059"
+REVIEW_SCHEMA_MIN = "0060"
 PREV = "0040"
 
 

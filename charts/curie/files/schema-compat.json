@@ -463,14 +463,22 @@
       "sha256": "efead818bd6ca09233e265335d622677a84fdf2f5d2bc90800de2844b1f8c159"
     },
     {
-      "kind": "contract",
+      "kind": "expand",
       "parents": [
         "0058"
       ],
       "revision": "0059",
-      "sha256": "3b198c0d6ddf893afa28d6a10a60281b9222f19e122c6db4bc66ba050c036bd6"
+      "sha256": "60a6c7c41ea2c98c58985d086beaea3f628d01fbcf75d08a5e5c1828cd7fc903"
+    },
+    {
+      "kind": "contract",
+      "parents": [
+        "0059"
+      ],
+      "revision": "0060",
+      "sha256": "bd1d2357326ae9e442d732e1cd65e36209de3db59e1862c62425ef04b8ef4dab"
     }
   ],
-  "schema_head": "0059",
-  "schema_min": "0059"
+  "schema_head": "0060",
+  "schema_min": "0060"
 }

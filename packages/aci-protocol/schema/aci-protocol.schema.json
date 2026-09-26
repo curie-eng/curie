@@ -529,6 +529,22 @@
           ],
           "title": "Memory Token"
         },
+        "metrics_temporality_preference": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+          "producer": [
+            "substrate"
+          ],
+          "title": "Metrics Temporality Preference"
+        },
         "model": {
           "anyOf": [
             {
@@ -1659,6 +1675,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.3",
-  "title": "ACI Protocol v0.5.3"
+  "protocolVersion": "0.5.4",
+  "title": "ACI Protocol v0.5.4"
 }

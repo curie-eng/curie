@@ -33,6 +33,7 @@ PROGRESS_TOOL = "report_progress"
 _PHASE_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MAX_PHASES = 12
 _MAX_LOOPS = 4
+_MAX_STAGES = 12
 _MAX_LABEL = 40
 _MAX_CAP = 5
 _MAX_NOTE = 280
@@ -46,8 +47,8 @@ _DESCRIPTION = (
 
 
 def _validate(raw: object) -> dict[str, Any]:
-    if not isinstance(raw, dict) or set(raw) - {"phases", "loops"}:
-        raise ValueError("phases.json must be an object with phases and optional loops")
+    if not isinstance(raw, dict) or set(raw) - {"phases", "loops", "stages", "reviewer_model"}:
+        raise ValueError("phases.json must be an object with phases and optional layout")
     phases = raw.get("phases")
     if not isinstance(phases, list) or not 1 <= len(phases) <= _MAX_PHASES:
         raise ValueError(f"phases must list 1 to {_MAX_PHASES} entries")
@@ -80,7 +81,44 @@ def _validate(raw: object) -> dict[str, Any]:
         if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= _MAX_CAP:
             raise ValueError(f"loop cap must be 1 to {_MAX_CAP}")
         clean_loops.append({"start": start, "review": review, "cap": cap})
-    return {"phases": clean_phases, "loops": clean_loops}
+    declaration: dict[str, Any] = {"phases": clean_phases, "loops": clean_loops}
+    if "stages" in raw:
+        stages = raw["stages"]
+        if not isinstance(stages, list) or not 1 <= len(stages) <= _MAX_STAGES:
+            raise ValueError(f"stages must list 1 to {_MAX_STAGES} entries")
+        stage_ids: set[str] = set()
+        grouped: list[str] = []
+        clean_stages: list[dict[str, Any]] = []
+        for stage in stages:
+            if not isinstance(stage, dict) or set(stage) != {"id", "label", "phases"}:
+                raise ValueError("each stage needs exactly id, label and phases")
+            sid, label, phase_ids = stage["id"], stage["label"], stage["phases"]
+            if not isinstance(sid, str) or not _PHASE_ID.fullmatch(sid) or sid in stage_ids:
+                raise ValueError(f"invalid or duplicate stage id {sid!r}")
+            if not isinstance(label, str) or not 1 <= len(label) <= _MAX_LABEL:
+                raise ValueError(f"stage {sid!r} label must be 1 to {_MAX_LABEL} chars")
+            if (
+                not isinstance(phase_ids, list)
+                or not 1 <= len(phase_ids) <= _MAX_PHASES
+                or any(not isinstance(pid, str) for pid in phase_ids)
+            ):
+                raise ValueError(f"stage {sid!r} needs declared phase ids")
+            stage_ids.add(sid)
+            grouped.extend(phase_ids)
+            clean_stages.append({"id": sid, "label": label, "phases": phase_ids})
+        if grouped != ids:
+            raise ValueError("stages must cover each declared phase once in order")
+        declaration["stages"] = clean_stages
+    if "reviewer_model" in raw:
+        reviewer_model = raw["reviewer_model"]
+        if (
+            not isinstance(reviewer_model, str)
+            or not reviewer_model.strip()
+            or len(reviewer_model) > 120
+        ):
+            raise ValueError("reviewer_model must be a nonempty string of at most 120 chars")
+        declaration["reviewer_model"] = reviewer_model
+    return declaration
 
 
 def load_phase_declaration(plugin_dir: Path) -> dict[str, Any] | None:

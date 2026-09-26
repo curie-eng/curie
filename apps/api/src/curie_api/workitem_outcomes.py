@@ -931,7 +931,8 @@ async def _observe_ci_detail(
                 return None, "malformed_response"
 
         runs_payload, reason = await get(
-            f"/commits/{head_sha}/check-runs", {"per_page": CHECK_RUNS_PAGE}
+            f"/commits/{head_sha}/check-runs",
+            {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
         )
         if reason is None:
             reason = _check_runs_reason(runs_payload)

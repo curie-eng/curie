@@ -190,6 +190,7 @@ def _full_boot_env() -> BootEnv:
         thinking="disabled",
         deployment_environment="prod",
         model_env_key="MY_PROVIDER_KEY",
+        metrics_temporality_preference="delta",
         max_turns=50,
         history_max_turns=10,
         history_max_bytes=2048,
@@ -799,6 +800,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_THINKING",
         "CURIE_DEPLOYMENT_ENVIRONMENT",
         "CURIE_MODEL_ENV_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
@@ -881,6 +883,7 @@ def test_the_substrate_writes_identity_otel_and_the_warm_pool_defaults() -> None
         "CURIE_RUNNER_PORT",
         "OTEL_EXPORTER_OTLP_ENDPOINT",  # agent-sandbox.yaml:433
         "OTEL_EXPORTER_OTLP_PROTOCOL",  # agent-sandbox.yaml:435
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         # Worker-authoritative with a substrate fallback: the chart bakes a
         # warm-pool default into the runner container so an unclaimed pod boots
         # resolvable, and the worker's per-claim value legitimately wins under

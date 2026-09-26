@@ -63,6 +63,13 @@
 # (priority 0, below curie-sandbox). Negative controls A and B prove both
 # halves can fail.
 #
+# Issue #3206, Assertion 17. With a chart-created platform PriorityClass,
+# pre-install hooks on install and pre-upgrade hooks on upgrade stay classless:
+# the class may not exist yet. Later hooks use it. An operator-provided class
+# is available to every hook. A chart-created gVisor RuntimeClass moves its
+# preflight to post-install, so that hook uses the platform class too. Negative
+# controls prove both pod spec shapes and both phase exceptions.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -567,8 +574,8 @@ echo "=== Assertion 8: priorityClassName on every long-running platform workload
 # EVERY rendered Deployment/StatefulSet/DaemonSet must appear in EXPECTED_PLATFORM
 # below (or be the prewarm DaemonSet) and carry the class the inventory names, so
 # a new template that forgets priorityClassName fails the render instead of
-# shipping at priority 0. Jobs and hook Pods are out of scope: they are not
-# long-running. Exact (kind, name) keys, never suffix matching:
+# shipping at priority 0. Jobs and hook Pods are covered by Assertion 17
+# below. Exact (kind, name) keys, never suffix matching:
 # `curie-langfuse-worker` also ends in `-worker`, so the old suffix table would
 # have recorded the langfuse worker's pod under the `-worker` key and clobbered
 # the control-plane entry -- the same trap the controller exact-name lookup
@@ -2319,7 +2326,6 @@ sys.exit(1 if errors else 0)
 PYEOF
 echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
 
-echo
 echo "=== Assertion 17: rustfs-init caps Langfuse event-upload objects with a lifecycle rule (issue #2870) ==="
 # Langfuse never deletes its S3 event-upload objects after ingest. Each trace
 # is about three inodes on the RustFS volume, and on 2026-09-21 they filled the
@@ -2370,4 +2376,256 @@ check_event_retention "$RETENTION_OFF" none || fail "retentionDays=0 must render
 echo "  ok: rustfs-init expires events/ after retentionDays (default 2), and 0 disables it"
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); and the dispatcher rolls out with Recreate while every other workload keeps its strategy; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays."
+echo "=== Assertion 18: hook priority classes respect pre-install and pre-upgrade exceptions (#3206) ==="
+HOOK_PRIO_CHECK="$TMP/check_hook_priority.py"
+cat > "$HOOK_PRIO_CHECK" <<'PYEOF'
+"""Check every rendered Helm hook Job template and Pod spec by Helm phase."""
+import sys
+
+import yaml
+
+render, expected, operation, provider = sys.argv[1:]
+if operation not in ("install", "upgrade") or provider not in ("chart", "operator"):
+    sys.exit("hook priority checker needs install/upgrade and chart/operator")
+
+expected_preinstall = {
+    ("Job", "curie-preflight-avx"): {"pre-install", "pre-upgrade", "test"},
+    ("Job", "curie-preflight-gvisor"): {"pre-install", "pre-upgrade", "test"},
+    ("Job", "curie-mail-persistence-preflight"): {"pre-install", "pre-upgrade", "test"},
+}
+expected_preupgrade = {
+    **expected_preinstall,
+    ("Job", "curie-schema-migrate"): {"post-install", "pre-upgrade"},
+    ("Job", "curie-upgrade-drain"): {"pre-upgrade"},
+}
+expected_grafana = {
+    ("Job", "curie-grafana-token-updater"): {"post-install", "post-upgrade"},
+    ("Job", "curie-grafana-token-cleanup"): {"pre-delete"},
+}
+counts = {"Job": 0, "Pod": 0}
+errors = []
+preinstall = {}
+preupgrade = {}
+grafana = {}
+exempt = 0
+platform_created = False
+with open(render) as stream:
+    for doc in yaml.safe_load_all(stream):
+        if not isinstance(doc, dict):
+            continue
+        metadata = doc.get("metadata") or {}
+        if doc.get("kind") == "PriorityClass" and metadata.get("name") == expected:
+            platform_created = True
+        if doc.get("kind") not in counts:
+            continue
+        hook = (metadata.get("annotations") or {}).get("helm.sh/hook")
+        if not hook:
+            continue
+        kind = doc["kind"]
+        name = metadata.get("name", "<unnamed>")
+        key = kind, name
+        phases = {phase.strip() for phase in hook.split(",")}
+        counts[kind] += 1
+        if "pre-install" in phases:
+            preinstall[key] = phases
+        if "pre-upgrade" in phases:
+            preupgrade[key] = phases
+        if key in expected_grafana:
+            grafana[key] = phases
+        spec = doc.get("spec") or {}
+        if kind == "Job":
+            spec = ((spec.get("template") or {}).get("spec") or {})
+        actual = spec.get("priorityClassName")
+        # Chart-managed class creation follows pre-install hooks. An upgrade
+        # can also begin without that class after a failed install or rename.
+        omit = provider == "chart" and (
+            (operation == "install" and "pre-install" in phases)
+            or (operation == "upgrade" and "pre-upgrade" in phases)
+        )
+        required = None if omit else expected
+        if omit:
+            exempt += 1
+        if actual != required:
+            errors.append(
+                f"hook {kind} {name} has priorityClassName={actual!r}, "
+                f"expected {required!r} for {operation} with {provider} class"
+            )
+if platform_created != (provider == "chart"):
+    errors.append(f"platform PriorityClass creation differs from {provider} mode")
+if preinstall != expected_preinstall:
+    errors.append(f"pre-install hook inventory {preinstall!r} differs from {expected_preinstall!r}")
+if preupgrade != expected_preupgrade:
+    errors.append(f"pre-upgrade hook inventory {preupgrade!r} differs from {expected_preupgrade!r}")
+if grafana != expected_grafana:
+    errors.append(f"Grafana hook inventory {grafana!r} differs from {expected_grafana!r}")
+for kind, count in counts.items():
+    if count == 0:
+        errors.append(f"render contains no Helm hook {kind}; check would pass vacuously")
+for error in errors:
+    sys.stderr.write(error + "\n")
+if errors:
+    sys.exit(1)
+print(
+    f"  ok: {counts['Job']} hook Jobs and {counts['Pod']} hook Pods checked; "
+    f"{exempt} early hooks omit the class in {operation} with {provider} class"
+)
+PYEOF
+
+HOOK_PRIO_HELM_ARGS=(
+  "${PRIO_HELM_ARGS[@]}"
+  --set security.gvisor.mode=require
+  --set grafanaConnector.enabled=true
+)
+HOOK_PRIO_DEFAULT="$TMP/hook-priority-default.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" > "$HOOK_PRIO_DEFAULT"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_DEFAULT" curie-platform install chart \
+  || fail "chart-created class install render violates the pre-install hook priority exception."
+
+HOOK_PRIO_UPGRADE="$TMP/hook-priority-upgrade.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" --is-upgrade > "$HOOK_PRIO_UPGRADE"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_UPGRADE" curie-platform upgrade chart \
+  || fail "chart-created class upgrade render violates the pre-upgrade hook priority exception."
+
+HOOK_PRIO_OPERATOR="$TMP/hook-priority-operator.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" \
+  --set priorityClasses.platform.create=false \
+  --set priorityClasses.platform.name=operator-platform-class \
+  > "$HOOK_PRIO_OPERATOR"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_OPERATOR" operator-platform-class install operator \
+  || fail "operator class install render has a hook Job or Pod without the named platform class."
+
+HOOK_PRIO_OPERATOR_UPGRADE="$TMP/hook-priority-operator-upgrade.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" --is-upgrade \
+  --set priorityClasses.platform.create=false \
+  --set priorityClasses.platform.name=operator-platform-class \
+  > "$HOOK_PRIO_OPERATOR_UPGRADE"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_OPERATOR_UPGRADE" operator-platform-class upgrade operator \
+  || fail "operator class upgrade render has a hook Job or Pod without the named platform class."
+
+echo "=== Assertion 18: chart-created gVisor RuntimeClass moves its hook after install ==="
+HOOK_PRIO_GVISOR_CREATED="$TMP/hook-priority-gvisor-runtime-class.yaml"
+helm template curie "$CHART" "${HOOK_PRIO_HELM_ARGS[@]}" \
+  --set security.gvisor.installRuntimeClass=true \
+  --set priorityClasses.platform.name=gvisor-install-platform-class \
+  > "$HOOK_PRIO_GVISOR_CREATED"
+HOOK_PRIO_GVISOR_CHECK="$TMP/check_gvisor_hook_priority.py"
+cat > "$HOOK_PRIO_GVISOR_CHECK" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as stream:
+    documents = [doc for doc in yaml.safe_load_all(stream) if isinstance(doc, dict)]
+name = "curie-preflight-gvisor"
+expected_class = "gvisor-install-platform-class"
+hooks = [
+    doc for doc in documents
+    if doc.get("kind") == "Job" and (doc.get("metadata") or {}).get("name") == name
+]
+if len(hooks) != 1:
+    sys.exit(f"expected one {name} Job, found {len(hooks)}")
+hook = hooks[0]
+phases = {
+    phase.strip()
+    for phase in ((hook.get("metadata") or {}).get("annotations") or {}).get("helm.sh/hook", "").split(",")
+}
+expected_phases = {"post-install", "post-upgrade", "test"}
+if phases != expected_phases:
+    sys.exit(f"{name} has hook phases {phases!r}, expected {expected_phases!r}")
+spec = (((hook.get("spec") or {}).get("template") or {}).get("spec") or {})
+actual_class = spec.get("priorityClassName")
+if actual_class != expected_class:
+    sys.exit(f"{name} has priorityClassName={actual_class!r}, expected {expected_class!r}")
+created = [
+    doc for doc in documents
+    if doc.get("kind") == "PriorityClass"
+    and (doc.get("metadata") or {}).get("name") == expected_class
+]
+if len(created) != 1:
+    sys.exit(f"expected one chart-created PriorityClass {expected_class}, found {len(created)}")
+print(f"  ok: {name} runs after install and uses {expected_class}")
+PYEOF
+python3 "$HOOK_PRIO_GVISOR_CHECK" "$HOOK_PRIO_GVISOR_CREATED" \
+  || fail "chart-created gVisor RuntimeClass render has an invalid preflight phase or platform class."
+
+echo "=== Assertion 18 negative controls: classless hooks and classified pre-install hook FAIL ==="
+python3 - "$HOOK_PRIO_DEFAULT" "$HOOK_PRIO_UPGRADE" "$HOOK_PRIO_OPERATOR" "$HOOK_PRIO_OPERATOR_UPGRADE" "$HOOK_PRIO_GVISOR_CREATED" "$TMP" <<'PYEOF'
+import copy
+import sys
+
+import yaml
+
+for source, label, kind, preinstall, classified, class_name, target in (
+    (sys.argv[1], "job", "Job", False, False, "curie-platform", None),
+    (sys.argv[1], "pod", "Pod", False, False, "curie-platform", None),
+    (sys.argv[1], "exempt", "Job", True, True, "curie-platform", "curie-preflight-avx"),
+    (sys.argv[2], "upgrade", "Job", False, True, "curie-platform", "curie-schema-migrate"),
+    (sys.argv[3], "operator", "Job", True, False, "operator-platform-class", "curie-preflight-avx"),
+    (sys.argv[4], "operator_upgrade", "Job", False, False, "operator-platform-class", "curie-schema-migrate"),
+    (sys.argv[5], "gvisor", "Job", False, False, "gvisor-install-platform-class", "curie-preflight-gvisor"),
+):
+    with open(source) as stream:
+        documents = list(yaml.safe_load_all(stream))
+    mutant = copy.deepcopy(documents)
+    for doc in mutant:
+        if not isinstance(doc, dict) or doc.get("kind") != kind:
+            continue
+        metadata = doc.get("metadata") or {}
+        hook = (metadata.get("annotations") or {}).get("helm.sh/hook", "")
+        if not hook or ("pre-install" in hook.split(",")) != preinstall:
+            continue
+        if target is not None and metadata.get("name") != target:
+            continue
+        spec = doc["spec"]
+        if kind == "Job":
+            spec = spec["template"]["spec"]
+        if classified:
+            if spec.get("priorityClassName") is not None:
+                sys.exit(f"expected classless early hook in {source}")
+            spec["priorityClassName"] = class_name
+        else:
+            if spec.get("priorityClassName") != class_name:
+                sys.exit(f"expected classified hook in {source}")
+            del spec["priorityClassName"]
+        with open(f"{sys.argv[6]}/hook-priority-mutant-{label}.yaml", "w") as stream:
+            yaml.safe_dump_all(mutant, stream)
+        break
+    else:
+        sys.exit(f"negative control found no eligible Helm hook {kind} for {label}")
+PYEOF
+for case_name in job pod exempt upgrade operator operator_upgrade gvisor; do
+  case "$case_name" in
+    job) expected_error="hook Job "*"has priorityClassName=None" ;;
+    pod) expected_error="hook Pod "*"has priorityClassName=None" ;;
+    exempt) expected_error="hook Job curie-preflight-avx has priorityClassName='curie-platform', expected None" ;;
+    upgrade) expected_error="hook Job curie-schema-migrate has priorityClassName='curie-platform', expected None" ;;
+    operator) expected_error="hook Job curie-preflight-avx has priorityClassName=None, expected 'operator-platform-class'" ;;
+    operator_upgrade) expected_error="hook Job curie-schema-migrate has priorityClassName=None, expected 'operator-platform-class'" ;;
+    gvisor) expected_error="curie-preflight-gvisor has priorityClassName=None, expected 'gvisor-install-platform-class'" ;;
+  esac
+  negative_output=""
+  check_operation=install
+  if [[ "$case_name" == upgrade || "$case_name" == operator_upgrade ]]; then
+    check_operation=upgrade
+  fi
+  check_provider=chart
+  check_class=curie-platform
+  if [[ "$case_name" == operator || "$case_name" == operator_upgrade ]]; then
+    check_provider=operator
+    check_class=operator-platform-class
+  fi
+  if [[ "$case_name" == gvisor ]]; then
+    if negative_output="$(python3 "$HOOK_PRIO_GVISOR_CHECK" "$TMP/hook-priority-mutant-gvisor.yaml" 2>&1)"; then
+      fail "hook gvisor negative control passed the priority class assertion."
+    fi
+  elif negative_output="$(python3 "$HOOK_PRIO_CHECK" "$TMP/hook-priority-mutant-$case_name.yaml" "$check_class" "$check_operation" "$check_provider" 2>&1)"; then
+    fail "hook $case_name negative control passed the priority class assertion."
+  fi
+  if [[ "$negative_output" != *$expected_error* ]]; then
+    fail "hook $case_name negative control failed unexpectedly: $negative_output"
+  fi
+done
+echo "  ok: classless Job and Pod hooks, classified chart-managed early hooks, classless operator-provided early hooks, and a classless gVisor post-install hook are rejected"
+
+echo
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays."

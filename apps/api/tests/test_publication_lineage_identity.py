@@ -416,6 +416,7 @@ def _advance_lineage(
             "pr_number": pr_number,
             "pr_url": pr_url,
             "head_sha": head_sha,
+            "metadata_updated_at": None,
         },
         headers=dict(headers or {}),
     )

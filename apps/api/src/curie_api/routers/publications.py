@@ -24,7 +24,7 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import PublicationReviewReservation, ThreadPublicationLineage
+from ..models import ExecutionRequest, PublicationReviewReservation, ThreadPublicationLineage
 from ..publication_authority import (
     AuthorityRefused,
     AuthorityUnavailable,
@@ -377,13 +377,91 @@ async def create_publication(
             f"publication patch exceeds the {patch_limit_bytes}-byte limit",
         )
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
+
+    async def metadata_check() -> None:
+        if patch:
+            return
+        if (
+            data.work_item_request_id is None
+            or data.work_item_runtime_epoch is None
+            or data.observed_title is None
+            or data.observed_body_sha256 is None
+            or data.observed_lineage_id is None
+            or data.observed_lineage_version is None
+            or data.title is None
+            or data.body is None
+        ):
+            raise crud.PublicationLineageConflict(
+                "publication.metadata_context_required",
+                "metadata-only publication requires a current factory observation",
+            )
+        execution = await session.get(ExecutionRequest, data.work_item_request_id)
+        if execution is None:
+            raise PublicationPrecheckRefused
+        authority = await read_publication_authority(
+            session,
+            deployment_id=data.deployment_id,
+            work_item_id=execution.work_item_id,
+            execution_request_id=data.work_item_request_id,
+            runtime_epoch=data.work_item_runtime_epoch,
+        )
+        if (
+            authority is None
+            or authority.has_inflight_push
+            or authority.conversation_id != data.conversation_id
+            or authority.repo_full_name.casefold() != data.repo_full_name.casefold()
+            or authority.lineage_id != data.observed_lineage_id
+            or authority.lineage_version != data.observed_lineage_version
+            or authority.expected_head != data.base_sha
+        ):
+            raise PublicationPrecheckRefused
+        metadata = await read_publication_metadata(
+            authority, settings=get_settings(), client=request.app.state.http_client
+        )
+        current = await read_publication_authority(
+            session,
+            deployment_id=data.deployment_id,
+            work_item_id=execution.work_item_id,
+            execution_request_id=data.work_item_request_id,
+            runtime_epoch=data.work_item_runtime_epoch,
+        )
+        if current != authority:
+            raise PublicationPrecheckRefused
+        if (
+            metadata_digest(metadata.title) != metadata_digest(data.observed_title)
+            or metadata_digest(metadata.body) != data.observed_body_sha256
+        ):
+            raise PublicationPrecheckRefused
+        if (metadata.title, metadata.body) == (data.title, data.body):
+            raise crud.PublicationLineageConflict(
+                "publication.no_change",
+                "neither files nor pull request metadata changed",
+            )
+
     try:
         publication, created = await crud.create_publication(
             session,
             data,
             patch=patch,
+            metadata_check=metadata_check,
             traceparent=traceparent,
         )
+    except PublicationPrecheckRefused as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.metadata_stale",
+                "message": "pull request metadata or execution authority changed",
+            },
+        ) from exc
+    except (PublicationPrecheckUnavailable, TimeoutError) as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            {
+                "code": "publication.metadata_unavailable",
+                "message": "current pull request metadata could not be verified",
+            },
+        ) from exc
     except crud.PublicationReplayConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except crud.PublicationLineageConflict as exc:

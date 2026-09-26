@@ -301,6 +301,18 @@ log/metrics backend. The in-chart collector receives gRPC on
 `OTEL_EXPORTER_OTLP_*` settings. The chart owns one destination for every
 instrumented workload:
 
+`otelCollector.metricsTemporalityPreference` defaults to `delta` for push
+exporters. It sets `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` on every
+instrumented workload, including runner sandboxes. Set it to `cumulative` for
+a backend that requires cumulative counters and histograms. Prometheus remote
+write requires cumulative points, so the supplied SRE observability overlay
+sets this value to `cumulative`. The collector
+copies each runner's anonymous `service.instance.id` resource value onto its
+metric points so concurrent sandboxes retain separate series; it does not add
+an instance label to other services. For a release wide served turn count, use
+`curie.turn.completed` with `source=worker` and `outcome=done`. Runner
+completions count sandbox results and can differ from served turns.
+
 - `otelCollector.deploy: true` (default) wires the in-cluster collector.
 - `otelCollector.deploy: false` plus `otelCollector.endpoint` wires an
   external collector, with optional `protocol`, `headers`, or
@@ -1270,6 +1282,13 @@ the inventory exhaustive, so a new template that forgets its class fails the
 render. The runner-prewarm DaemonSet deliberately stays unclassed (priority
 0, below the sandbox class): the image-cache pod is the designated sacrifice
 a full node evicts first.
+
+**Priority class on hooks (#3206).** When
+`priorityClasses.platform.create: true`, preinstall and preupgrade hooks omit
+the platform priority class because it can be absent until normal resources
+are applied. Postinstall and postupgrade hooks use the configured class. When
+`priorityClasses.platform.create: false`, hooks use the configured class, so
+operators must create the named class before installing the chart.
 
 **Verifying the rails.** The security-boundary probe suite re-runs as a `helm test`:
 

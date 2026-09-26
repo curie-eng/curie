@@ -100,6 +100,9 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "curie.fullname" . }}-preflight-controller
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       containers:
         - name: controller-ready
           image: {{ .Values.preflights.controllerReady.image }}

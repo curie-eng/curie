@@ -1088,6 +1088,9 @@ _HOOK_RUN_CARRY: ContextVar[_HookRunCarry | None] = ContextVar(
 _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
     "curie_worker_owned_work_item", default=None
 )
+_PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(
+    "curie_worker_publication_context", default=None
+)
 
 
 def _hook_success_outcome() -> HookRunOutcome | None:
@@ -1874,6 +1877,7 @@ class Kernel:
 
         owned_work_item_id: uuid.UUID | None = None
         owned_token = _OWNED_WORK_ITEM.set(None)
+        publication_token = _PUBLICATION_CONTEXT.set(None)
         try:
             if await self._markers.is_terminal(event_id):
                 # ``is_terminal``, not ``is_done``: a DONE outbox record proves
@@ -2487,7 +2491,7 @@ class Kernel:
                     # A gate fired (ADR-0010): persist the durable record, then
                     # suspend the session until a human resolves it. The event
                     # is done -- the resolution arrives as its own queued turn.
-                    await self._pause_for_approval(
+                    approval_created = await self._pause_for_approval(
                         qevent,
                         route,
                         outcome,
@@ -2495,11 +2499,26 @@ class Kernel:
                         approval_routes,
                         deployment_id=workspace_deployment_id,
                     )
+                    if not approval_created:
+                        run = self._run_for_event(qevent.event_id)
+                        if run is not None:
+                            try:
+                                await run.finish(
+                                    outcome="failed",
+                                    cause="approval_create_failed",
+                                    detail=None,
+                                )
+                            except WorkItemConflict as exc:
+                                if exc.code != "publication_pending":
+                                    raise
+                                run.finished = True
                     await self._complete(
                         qevent,
                         route,
-                        "awaiting-approval",
-                        telemetry_outcome="awaiting_approval",
+                        "awaiting-approval" if approval_created else "escalated",
+                        telemetry_outcome=(
+                            "awaiting_approval" if approval_created else "classified_failure"
+                        ),
                         lease=lease,
                         hook_outcome=_hook_success_outcome(),
                     )
@@ -2631,6 +2650,7 @@ class Kernel:
                             # nothing on this thread needs the sandbox (#3075).
                             await self._release_work_item_sandbox(owned_run.thread_key)
             _OWNED_WORK_ITEM.reset(owned_token)
+            _PUBLICATION_CONTEXT.reset(publication_token)
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
             # path (success, escalate, drop, or error). Best-effort and
@@ -5260,6 +5280,7 @@ class Kernel:
             context = context.model_copy(
                 update={"precheck_url": f"{base}/publications/precheck"}
             )
+        _PUBLICATION_CONTEXT.set(context)
         remaining_s = run.bound_remaining_s(
             None if remaining_s is None else remaining_s - (time.monotonic() - started)
         )
@@ -6020,7 +6041,7 @@ class Kernel:
         approval_routes: dict[str, Any] | None = None,
         *,
         deployment_id: uuid.UUID | None = None,
-    ) -> None:
+    ) -> bool:
         """Persist the approval, suspend the session, and leave the pending notice.
 
         Ordering is deliberate: the durable record exists before the sandbox is
@@ -6091,7 +6112,7 @@ class Kernel:
                     "agent; flagging for a human instead of widening the request "
                     "to this channel.",
                 )
-                return
+                return False
             (card_kind, card_channel), notification_target = targets
 
         if not is_publication and self._approvals is None:
@@ -6101,7 +6122,7 @@ class Kernel:
                 "The run requested an approval, but no approval backend is "
                 "configured on this worker; flagging for a human instead of pausing.",
             )
-            return
+            return False
 
         if is_publication and self._publication_creator is None:
             await self._escalate(
@@ -6110,7 +6131,7 @@ class Kernel:
                 "Repository publication is unavailable on this installation; nothing was "
                 "published and no approval was created.",
             )
-            return
+            return False
 
         base = outcome.text.strip()
         # #2659: the inferred repository is a reply block only. It is composed
@@ -6137,6 +6158,17 @@ class Kernel:
                 if deployment_id is None or snapshot is None:
                     raise ApprovalBackendError(
                         "publication requires a deployment-managed repository workspace"
+                    )
+                observation = _PUBLICATION_CONTEXT.get() if not snapshot.patch else None
+                if not snapshot.patch and (
+                    observation is None
+                    or observation.expected_head != snapshot.base_sha
+                    or publication_run is None
+                    or observation.execution_request_id != publication_run.request_id
+                    or observation.runtime_epoch != publication_run.runtime_epoch
+                ):
+                    raise ApprovalBackendError(
+                        "metadata-only publication requires current factory observation"
                     )
                 summary = _publication_approval_summary(snapshot)
                 display_summary = summary
@@ -6175,6 +6207,18 @@ class Kernel:
                             publication_run.runtime_epoch
                             if publication_run is not None and publication_run.started
                             else None
+                        ),
+                        observed_title=(
+                            observation.observed_title if observation is not None else None
+                        ),
+                        observed_body_sha256=(
+                            observation.observed_body_sha256 if observation is not None else None
+                        ),
+                        observed_lineage_id=(
+                            observation.lineage_id if observation is not None else None
+                        ),
+                        observed_lineage_version=(
+                            observation.lineage_version if observation is not None else None
                         ),
                     )
                 )
@@ -6231,7 +6275,7 @@ class Kernel:
                 exc.public_detail,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return
+            return False
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty
@@ -6246,7 +6290,7 @@ class Kernel:
                 "The run requested an approval, but the approval record could "
                 "not be created; flagging for a human instead of pausing.",
             )
-            return
+            return False
 
         if self._workspace is not None:
             async with self._lock.hold(self._config.lock_key(thread_key)):
@@ -6381,7 +6425,7 @@ class Kernel:
                 thread_key,
                 created.id,
             )
-            return
+            return True
 
         # The card's destination -- kind AND route -- is selected from the
         # channel it POSTS TO, never from the turn that requested it. In the
@@ -6552,6 +6596,7 @@ class Kernel:
             except Exception as exc:  # noqa: BLE001 - the durable pause stands
                 logger.warning("approval notification post failed for %s: %s", created.id, exc)
         logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
+        return True
 
     @contextlib.asynccontextmanager
     async def _keep_route_alive(self, thread_key: str, claim_name: str) -> AsyncIterator[None]:

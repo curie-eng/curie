@@ -939,6 +939,19 @@ async def _terminalize_execution(
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
+    if status == "failed" and cause.strip() == "approval_create_failed":
+        pending = await session.scalar(
+            select(Publication.id)
+            .where(
+                Publication.execution_request_id == request.id,
+                Publication.status.in_(_IN_FLIGHT_PUBLICATION),
+            )
+            .limit(1)
+        )
+        if pending is not None:
+            return await _conflict(
+                session, "publication_pending", work_item=work_item, request=request
+            )
     # The Python check above allows a pull request that already opened to
     # complete after the deadline. The UPDATE has to use the same exception,
     # or the deadline predicate rejects the row and the next pass cancels it.

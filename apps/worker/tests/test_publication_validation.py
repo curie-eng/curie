@@ -117,3 +117,33 @@ def test_derived_workflow_path_cannot_hide_behind_a_safe_declared_path(
             snapshot=snapshot,
             scratch_root=tmp_path,
         )
+
+
+def test_empty_snapshot_requires_matching_base_and_empty_patch() -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
+    prepared = SimpleNamespace(repo_full_name="acme-corp/acme-bot", base_sha="a" * 40)
+    coordinator = SimpleNamespace(current=lambda _thread: prepared)
+    snapshot = RunnerWorkspaceSnapshot(
+        repo_full_name=prepared.repo_full_name,
+        base_sha=prepared.base_sha,
+        patch=b"",
+        changed_paths=(),
+        contains_workflow_files=False,
+        publication_title="Correct the pull request",
+        publication_body="Correct the body for CI.",
+    )
+    validation.validate_snapshot_against_base(
+        coordinator, thread_key="example-thread", snapshot=snapshot
+    )
+    for changed in (
+        {"patch": b"diff --git a/a b/a\n"},
+        {"base_sha": "b" * 40},
+    ):
+        with pytest.raises(validation.WorkspacePreparationError):
+            validation.validate_snapshot_against_base(
+                coordinator,
+                thread_key="example-thread",
+                snapshot=RunnerWorkspaceSnapshot(
+                    **{**snapshot.__dict__, **changed}
+                ),
+            )
