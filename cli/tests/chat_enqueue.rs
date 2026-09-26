@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use curie::api::DEFAULT_SLACK_IDENTITY;
 use curie::chat::{resolve_targets, SlackStub};
 use curie::message::{enqueue_over_connected_transport, MessageOpts};
 use curie::queue::{diagnostics, entry_acked, synthetic_turn, xadd, WORKER_GROUP};
@@ -597,8 +598,10 @@ async fn connected_transport_enqueues_the_real_placeholder_as_the_conversation_i
          workspace transport"
     );
     assert_eq!(
-        reply_handle.adapter, None,
-        "connected mode must not opt into the built-in disconnected cluster-message relay"
+        reply_handle.adapter.as_deref(),
+        Some(DEFAULT_SLACK_IDENTITY),
+        "connected mode speaks as the default identity, never the built-in \
+         disconnected cluster-message relay"
     );
     assert_eq!(posts.len(), 1, "exactly one placeholder posted");
     let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
@@ -649,8 +652,10 @@ async fn connected_transport_enqueues_the_real_placeholder_as_the_conversation_i
         "connected replies keep using the workspace transport, never a per-turn endpoint"
     );
     assert_eq!(
-        reply_handle.adapter, None,
-        "--continue coordinates in connected mode must not acquire the disconnected relay adapter"
+        reply_handle.adapter.as_deref(),
+        Some(DEFAULT_SLACK_IDENTITY),
+        "--continue coordinates in connected mode keep the default identity, never the \
+         disconnected relay adapter"
     );
     assert_eq!(posts.len(), 1, "exactly one placeholder posted");
     let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
