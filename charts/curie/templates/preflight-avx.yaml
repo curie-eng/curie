@@ -43,6 +43,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       containers:
         - name: avx-check
           image: {{ .Values.preflights.avxCheck.image }}

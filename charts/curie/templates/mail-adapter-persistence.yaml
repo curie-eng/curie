@@ -107,6 +107,9 @@ spec:
       serviceAccountName: {{ include "curie.fullname" . }}-mail-persistence-preflight
       automountServiceAccountToken: false
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

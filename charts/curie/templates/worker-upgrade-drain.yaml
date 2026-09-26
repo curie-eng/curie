@@ -85,6 +85,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.worker.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -163,6 +166,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.worker.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}

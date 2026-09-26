@@ -58,6 +58,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       runtimeClassName: {{ $gvisorClass }}
       containers:
         - name: gvisor-check

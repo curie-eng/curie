@@ -146,6 +146,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: OnFailure
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       containers:
         - name: aws-cli
           image: {{ .Values.rustfs.awsCliImage }}
