@@ -61,6 +61,12 @@ deriving cannot serve: a PriorityClass managed outside this chart
 `priorityClasses.sandbox.name`. Left unset -- the default -- it derives, which is
 what every in-chart install wants. Setting it is now a deliberate act rather than
 a silent prerequisite nobody knew about.
+
+Not a scheduling guarantee (#2949): this object is rendered from values alone
+and bounds admission, not placement. A ceiling above node allocatable admits
+sandboxes that stay Pending. See the arithmetic and the two refusal signatures
+at `resourceQuota` in values.yaml; NOTES.txt (curie.sandboxCapacity in
+_capacity.tpl) compares the ceiling to live node capacity at install time.
 */}}
 {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
 {{- $rq := .Values.resourceQuota }}
