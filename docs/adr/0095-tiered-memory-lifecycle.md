@@ -4,6 +4,15 @@ Date: 2026-08-04
 
 Status: Draft
 
+**Folded into [ADR-0167](0167-agent-and-channel-memory-are-written-by-the-agent-and-limited-by-an-inclusion-list.md). Not proposed for acceptance on its own.** ADR-0167
+carries forward agent and channel memory, the hard cap enforced at the API,
+and the trust posture, and decides them there. It drops the backlog bootstrap and the
+operator instructions layer, leaves the escape valve with
+[ADR-0100](0100-agents-search-their-own-surface-through-the-channel-port.md),
+and sequences compaction behind the cap. When ADR-0167 is Accepted, this line
+becomes `Status: Superseded by ADR-0167` and the body below stays as the record
+of the earlier thinking.
+
 Partially superseded by [ADR-0111](0111-the-default-memory-compaction-algorithm.md)
 for the incremental compaction mechanism only. This ADR remains current for
 durable storage and session injection.

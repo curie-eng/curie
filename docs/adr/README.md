@@ -191,6 +191,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
 | 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 | 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
+| 0167 | [Agent and channel memory are written by the agent and limited by an inclusion list](0167-agent-and-channel-memory-are-written-by-the-agent-and-limited-by-an-inclusion-list.md) | Draft |
 | 0168 | [One installation hosts several bot identities](0168-one-installation-hosts-several-bot-identities.md) | Accepted |
 | 0169 | [A mean tester tests an agent the way a person does, from any installation](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md) | Accepted |
 | 0170 | [Conversation transcripts live in their own per-thread table](0170-conversation-transcripts-live-in-their-own-per-thread-table.md) | Accepted |

@@ -4,6 +4,13 @@ Date: 2026-08-17
 
 Status: Draft
 
+**Folded into [ADR-0167](0167-agent-and-channel-memory-are-written-by-the-agent-and-limited-by-an-inclusion-list.md). Not proposed for acceptance on its own.** ADR-0167
+decides the write path this document assumed was unnecessary (clause 2) and
+leaves compaction to an optional memory package an operator can choose
+([#3113](https://github.com/curie-eng/curie/issues/3113)), whose design can
+start from this document. When ADR-0167 is Accepted, this line becomes
+`Status: Superseded by ADR-0167`.
+
 Supersedes in part [ADR-0095](0095-tiered-memory-lifecycle.md) only for its
 incremental compaction mechanism, as narrowed on 2026 08 17. ADR-0095 remains
 current for durable storage and session injection.
