@@ -8,13 +8,8 @@ capped per thread by ``transcript_max_thread_bytes``, with no agent-wide cap.
 
 The state router still serves ``/state/transcript/<thread_key>`` from here, so
 the runner's ``CURIE_HISTORY_REF`` and the worker's publication outcome append
-are unchanged on the wire.
-
-Upgrade: revision 0053 copies the legacy rows but leaves them in place, so an
-older API instance still serving during a rolling upgrade keeps its history.
-Any access here adopts a legacy row newer than this table's copy
-(``_adopt_legacy``) without touching it. A legacy row is deleted only when its
-thread's history ends, and a later contract migration (#3088) removes the rest.
+are unchanged on the wire. Revision 0059 reconciles and removes legacy rows;
+this table is the only runtime transcript store.
 
 Lifetime: a WorkItem's transcript is deleted in the transaction that makes the
 WorkItem terminal (``expire_for_work_item``). Every write also moves
@@ -36,7 +31,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
-from .models import ThreadTranscript, WorkflowStateEntry, WorkItem
+from .models import ThreadTranscript, WorkItem
 
 TRANSCRIPT_NAMESPACE = "transcript"
 
@@ -93,29 +88,6 @@ def enforce_thread_cap(key: str, value: Any, *, reserve_bytes: int | None = None
         )
 
 
-def _legacy_where(agent_id: uuid.UUID, scope: str | None) -> tuple[Any, ...]:
-    return (
-        WorkflowStateEntry.agent_id == agent_id,
-        WorkflowStateEntry.binding_scope == scope,
-        WorkflowStateEntry.namespace == TRANSCRIPT_NAMESPACE,
-    )
-
-
-async def _delete_legacy(
-    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, keys: list[str]
-) -> None:
-    """Delete legacy rows for threads whose history is over, so they are not
-    adopted back. SKIP LOCKED: an older API instance holding one is left alone."""
-    if not keys:
-        return
-    locked = (
-        select(WorkflowStateEntry.id)
-        .where(*_legacy_where(agent_id, scope), WorkflowStateEntry.key.in_(keys))
-        .with_for_update(skip_locked=True)
-    )
-    await session.execute(delete(WorkflowStateEntry).where(WorkflowStateEntry.id.in_(locked)))
-
-
 async def _sweep_expired(session: AsyncSession, agent_id: uuid.UUID) -> None:
     """Delete this agent's expired transcripts.
 
@@ -128,64 +100,12 @@ async def _sweep_expired(session: AsyncSession, agent_id: uuid.UUID) -> None:
         .where(ThreadTranscript.agent_id == agent_id, ThreadTranscript.expires_at <= func.now())
         .with_for_update(skip_locked=True)
     )
-    swept = await session.execute(
-        delete(ThreadTranscript)
-        .where(ThreadTranscript.id.in_(expired))
-        .returning(ThreadTranscript.binding_scope, ThreadTranscript.thread_key)
-    )
-    by_scope: dict[str | None, list[str]] = {}
-    for scope, key in swept:
-        by_scope.setdefault(scope, []).append(key)
-    for scope, keys in by_scope.items():
-        await _delete_legacy(session, agent_id, scope, keys)
-
-
-async def _adopt_legacy(
-    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str | None
-) -> bool:
-    """Copy pre-0053 transcript rows that are newer than this table's copy.
-
-    ``key=None`` covers every thread of the scope. The legacy row is only read,
-    never locked or deleted: an older API instance still serving during a
-    rolling upgrade keeps using it, and #3088 removes the rest later. Does not
-    commit. Returns whether anything was copied.
-    """
-    query = select(WorkflowStateEntry).where(*_legacy_where(agent_id, scope))
-    if key is not None:
-        query = query.where(WorkflowStateEntry.key == key)
-    copied = False
-    for legacy in await session.scalars(query.order_by(WorkflowStateEntry.key)):
-        current: ThreadTranscript | None = await session.scalar(
-            select(ThreadTranscript).where(*_where(agent_id, scope, legacy.key)).with_for_update()
-        )
-        if current is None:
-            copied = True
-            session.add(
-                ThreadTranscript(
-                    agent_id=agent_id,
-                    binding_scope=scope,
-                    thread_key=legacy.key,
-                    value=legacy.value,
-                    version=legacy.version,
-                    expires_at=_expiry(),
-                )
-            )
-        elif legacy.updated_at > current.updated_at:
-            # An older API instance wrote after the 0053 copy or the last adoption.
-            copied = True
-            current.value = legacy.value
-            current.version = max(current.version, legacy.version) + 1
-            current.expires_at = _expiry()
-    if copied:
-        await session.flush()
-    return copied
+    await session.execute(delete(ThreadTranscript).where(ThreadTranscript.id.in_(expired)))
 
 
 async def get(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
 ) -> ThreadTranscript | None:
-    if await _adopt_legacy(session, agent_id, scope, key):
-        await session.commit()
     row: ThreadTranscript | None = await session.scalar(
         select(ThreadTranscript).where(*_where(agent_id, scope, key), _live())
     )
@@ -195,7 +115,6 @@ async def get(
 async def _get_locked(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
 ) -> ThreadTranscript | None:
-    await _adopt_legacy(session, agent_id, scope, key)
     await _sweep_expired(session, agent_id)
     row: ThreadTranscript | None = await session.scalar(
         select(ThreadTranscript).where(*_where(agent_id, scope, key)).with_for_update()
@@ -290,7 +209,6 @@ async def remove(
     if expected_version is None:
         if row is not None:
             await session.delete(row)
-        await _delete_legacy(session, agent_id, scope, [key])
         await session.commit()
         return
     stored = row.version if row is not None else None
@@ -301,8 +219,6 @@ async def remove(
             .where(ThreadTranscript.id == row.id, ThreadTranscript.version == expected_version)
             .returning(ThreadTranscript.id)
         )
-        if deleted is not None:
-            await _delete_legacy(session, agent_id, scope, [key])
         await session.commit()
     if deleted is None:
         if stored is None:
@@ -319,8 +235,6 @@ async def remove(
 async def list_threads(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None
 ) -> list[ThreadTranscript]:
-    if await _adopt_legacy(session, agent_id, scope, None):
-        await session.commit()
     rows = await session.scalars(
         select(ThreadTranscript)
         .where(
@@ -337,8 +251,6 @@ async def summary(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None
 ) -> tuple[int, Any] | None:
     """The thread count and latest write, for the namespace listing."""
-    if await _adopt_legacy(session, agent_id, scope, None):
-        await session.commit()
     count, last = (
         await session.execute(
             select(func.count(), func.max(ThreadTranscript.updated_at)).where(
@@ -360,12 +272,6 @@ async def expire_for_work_item(session: AsyncSession, work_item: WorkItem) -> No
     the terminal transition itself. ``WorkItem.conversation_id`` is the worker's
     scoped thread key, the same key the runner's history ref names.
     """
-    await session.execute(
-        delete(WorkflowStateEntry).where(
-            *_legacy_where(work_item.agent_id, None),
-            WorkflowStateEntry.key == work_item.conversation_id,
-        )
-    )
     await session.execute(
         delete(ThreadTranscript).where(
             ThreadTranscript.agent_id == work_item.agent_id,

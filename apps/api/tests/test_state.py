@@ -1817,64 +1817,57 @@ def test_append_reserve_refusal_is_413_unchanged_and_not_a_persistence_failure(
         get_settings.cache_clear()
 
 
-def _legacy_transcript(aid: str, key: str, value: Any) -> None:
-    """A transcript row in the retired state namespace."""
-
-    async def write() -> None:
+def _transcript_storage(aid: str) -> tuple[list[tuple[str, Any, int]], list[str]]:
+    async def read() -> tuple[list[tuple[str, Any, int]], list[str]]:
         connection = await asyncpg.connect(_asyncpg_dsn())
         try:
-            await connection.execute(
-                """
-                INSERT INTO curie.workflow_state_entries
-                    (id, agent_id, namespace, key, value, version)
-                VALUES ($1, $2, 'transcript', $3, $4::jsonb, 7)
-                """,
-                uuid.uuid4(),
+            transcripts = await connection.fetch(
+                "SELECT thread_key, value::text AS value, version "
+                "FROM curie.thread_transcripts WHERE agent_id = $1 ORDER BY thread_key",
                 uuid.UUID(aid),
-                key,
-                json.dumps(value),
             )
-        finally:
-            await connection.close()
-
-    asyncio.run(write())
-
-
-def _legacy_keys(aid: str) -> list[str]:
-    async def read() -> list[str]:
-        connection = await asyncpg.connect(_asyncpg_dsn())
-        try:
-            rows = await connection.fetch(
+            legacy = await connection.fetch(
                 "SELECT key FROM curie.workflow_state_entries "
                 "WHERE agent_id = $1 AND namespace = 'transcript' ORDER BY key",
                 uuid.UUID(aid),
             )
-            return [row["key"] for row in rows]
+            return (
+                [
+                    (row["thread_key"], json.loads(row["value"]), row["version"])
+                    for row in transcripts
+                ],
+                [row["key"] for row in legacy],
+            )
         finally:
             await connection.close()
 
     return asyncio.run(read())
 
 
-def test_runtime_ignores_legacy_transcript_rows_after_contract(
+def test_runtime_reads_lists_and_appends_from_the_transcript_table(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     aid = _agent(client, auth_headers)
     base = f"/agents/{aid}/state/transcript"
-    copy = client.post(
-        f"{base}/thread-copy/append", json={"item": {"text": "copy"}}, headers=auth_headers
+    first = client.post(
+        f"{base}/thread-one/append", json={"item": {"text": "first"}}, headers=auth_headers
     )
-    assert copy.status_code == 200, copy.text
-    _legacy_transcript(aid, "thread-copy", [{"text": "later legacy write"}])
-    _legacy_transcript(aid, "thread-only", [{"text": "legacy only"}])
+    assert first.status_code == 200, first.text
+    second = client.post(
+        f"{base}/thread-one/append", json={"item": {"text": "second"}}, headers=auth_headers
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["version"] == first.json()["version"] + 1
+    expected = [{"text": "first"}, {"text": "second"}]
+    assert second.json()["value"] == expected
 
-    missing = client.get(f"{base}/thread-only", headers=auth_headers)
-    assert missing.status_code == 404, missing.text
-    read = client.get(f"{base}/thread-copy", headers=auth_headers)
+    read = client.get(f"{base}/thread-one", headers=auth_headers)
     assert read.status_code == 200, read.text
-    assert read.json()["value"] == [{"text": "copy"}]
-    assert read.json()["version"] == copy.json()["version"]
+    assert read.json()["value"] == expected
+    assert read.json()["version"] == second.json()["version"]
     listed = client.get(base, headers=auth_headers)
     assert listed.status_code == 200, listed.text
-    assert {row["key"] for row in listed.json()} == {"thread-copy"}
-    assert _legacy_keys(aid) == ["thread-copy", "thread-only"]
+    assert {row["key"] for row in listed.json()} == {"thread-one"}
+    transcripts, legacy = _transcript_storage(aid)
+    assert transcripts == [("thread-one", expected, second.json()["version"])]
+    assert legacy == []

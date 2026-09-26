@@ -159,7 +159,7 @@ def test_0058_downgrade_refuses_a_stored_new_state_label(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
-    command.upgrade(config, "head")
+    command.upgrade(config, "0058")
     try:
         work_item_id, request_id = _seed_request(9103)
         _seed_notice(work_item_id, request_id, NEW)
