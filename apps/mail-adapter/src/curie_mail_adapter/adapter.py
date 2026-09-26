@@ -622,7 +622,14 @@ class MailAdapter:
                     return True
         return False
 
-    def send_reply(self, event_id: str, conversation_id: str, reply_ref: str | None) -> int:
+    def send_reply(
+        self,
+        event_id: str,
+        conversation_id: str,
+        reply_ref: str | None,
+        *,
+        outcome: str = "delivered",
+    ) -> int:
         """Apply the provider-witness four-way recovery decision."""
         if not reply_ref:
             logger.info(
@@ -638,6 +645,21 @@ class MailAdapter:
         if claim == "busy":
             return 503
         try:
+            if outcome == "dropped":
+                exists, text = self.state.reply_text(conversation_id, reply_ref)
+                if not text:
+                    # A turn dropped before it said anything owes its sender no
+                    # mail; the empty-reply notice would be a new message, and
+                    # from a sibling inbox the next turn of the exchange the
+                    # drop ended (ADR-0168 decision 6).
+                    self.state.finish_event(event_id)
+                    if exists:
+                        self.state.finish_reply(conversation_id, reply_ref)
+                    logger.info(
+                        "reply skipped: dropped correlation=%s recorded no text",
+                        _correlation(event_id),
+                    )
+                    return 200
             try:
                 carries = self.thread_carries(conversation_id, event_id)
             except ProviderThreadDeletedError:
