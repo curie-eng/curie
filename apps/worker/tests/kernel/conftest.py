@@ -864,7 +864,9 @@ def make_harness(
     ledger recorder), ``with_killswitch``
     (build a real KillSwitch wired to the kernel) and ``sink`` (any ``ReplySink``
     -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
-    the rest are config overrides. ``runner_total_timeout_s`` is an ordinary
+    ``sibling_limit_factory`` builds the kernel's sibling limit from the
+    harness's own Valkey client and config; the rest are config overrides.
+    ``runner_total_timeout_s`` is an ordinary
     config override: it drives BOTH the ``WorkerConfig`` and the
     ``RunnerClient``'s streaming budget (mirroring ``run.py``), so a test that
     expires the stream mid-flight (#2011) passes a fractional value and the
@@ -902,6 +904,7 @@ async def kernel_harness(
     claim_timeout_seconds: float = 3.0,
     per_sandbox_runners: int = 0,
     hook_runs: object | None = None,
+    sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -1012,6 +1015,11 @@ async def kernel_harness(
         ),  # type: ignore[arg-type]
         card_store=card_store,
         **({"hook_runs": hook_runs} if hook_runs is not None else {}),
+        **(
+            {"sibling_limit": sibling_limit_factory(async_redis, config)}
+            if sibling_limit_factory is not None
+            else {}
+        ),
     )
     killswitch = None
     if with_killswitch:
