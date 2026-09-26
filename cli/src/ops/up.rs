@@ -895,6 +895,124 @@ mod sealing_preservation_tests {
     }
 }
 
+#[cfg(test)]
+mod connector_caller_preservation_tests {
+    use super::*;
+    use crate::connector_caller::{
+        verify_key_of, CONNECTOR_CALLER_EXISTING_SECRET, CONNECTOR_CALLER_MANAGED_KEYS,
+        CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY, CONNECTOR_CALLER_SIGNING_KEY,
+        CONNECTOR_CALLER_VERIFY_KEY,
+    };
+
+    // The first frozen seed and its public key
+    // (tests/vectors/connector-caller-token.json).
+    const SEED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const PUBLIC: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
+
+    fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn recorded() -> serde_json::Value {
+        serde_json::json!({"connectorCaller": {"signingKey": SEED, "verifyKey": PUBLIC}})
+    }
+
+    /// A plain `cluster up` drops anything it does not re-pass, and a new pair
+    /// makes every live sandbox's token unverifiable.
+    #[test]
+    fn an_upgrade_re_supplies_the_recorded_pair_unchanged() {
+        let all = resolve_preserved_values(Some(&recorded()), &[]);
+        assert_eq!(get(&all, CONNECTOR_CALLER_SIGNING_KEY), Some(SEED));
+        assert_eq!(get(&all, CONNECTOR_CALLER_VERIFY_KEY), Some(PUBLIC));
+        assert!(
+            generate_connector_caller_values(Some(&recorded()), &[], false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_generates_a_real_pair() {
+        let generated = generate_connector_caller_values(None, &[], false).unwrap();
+        let seed = get(&generated, CONNECTOR_CALLER_SIGNING_KEY).expect("generated");
+        let public = get(&generated, CONNECTOR_CALLER_VERIFY_KEY).expect("generated");
+        assert_eq!(verify_key_of(seed).unwrap(), public);
+    }
+
+    /// How an install that predates the caller proxy starts enforcing.
+    #[test]
+    fn an_existing_release_without_a_pair_gains_one() {
+        let existing = serde_json::json!({"ui": {"deploy": false}});
+        let generated = generate_connector_caller_values(Some(&existing), &[], false).unwrap();
+        assert_eq!(generated.len(), 2);
+    }
+
+    #[test]
+    fn a_named_secret_is_never_shadowed_by_a_generated_pair() {
+        let existing = serde_json::json!({"connectorCaller": {"existingSecret": "acme-caller"}});
+        assert!(
+            generate_connector_caller_values(Some(&existing), &[], false)
+                .unwrap()
+                .is_empty()
+        );
+        let sets = vec![format!("{CONNECTOR_CALLER_EXISTING_SECRET}=acme-caller")];
+        assert!(generate_connector_caller_values(None, &sets, false)
+            .unwrap()
+            .is_empty());
+        let all = resolve_preserved_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&all, CONNECTOR_CALLER_EXISTING_SECRET),
+            Some("acme-caller")
+        );
+    }
+
+    #[test]
+    fn an_operator_set_wins() {
+        let sets = vec![format!("{CONNECTOR_CALLER_SIGNING_KEY}={SEED}")];
+        assert!(generate_connector_caller_values(None, &sets, false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            get(
+                &resolve_preserved_values(Some(&recorded()), &sets),
+                CONNECTOR_CALLER_SIGNING_KEY
+            ),
+            None
+        );
+    }
+
+    /// An offline preview has no evidence the release lacks a pair.
+    #[test]
+    fn a_dry_run_generates_nothing() {
+        assert!(generate_connector_caller_values(None, &[], true)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Preserved while a rotation overlaps, and never invented.
+    #[test]
+    fn a_previous_key_is_preserved_and_never_generated() {
+        let existing = serde_json::json!({"connectorCaller": {
+            "signingKey": SEED, "verifyKey": PUBLIC, "previousVerifyKey": "OLD"
+        }});
+        let all = resolve_preserved_values(Some(&existing), &[]);
+        assert_eq!(get(&all, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY), Some("OLD"));
+        let generated = generate_connector_caller_values(None, &[], false).unwrap();
+        assert!(get(&generated, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY).is_none());
+    }
+
+    /// `curie diff` must not report a reset of a key `up` hands straight back.
+    #[test]
+    fn diff_agrees_with_every_caller_key_up_re_supplies() {
+        for key in CONNECTOR_CALLER_MANAGED_KEYS {
+            assert!(is_preserved_by_up(key), "{key}");
+        }
+    }
+}
+
 /// The chart value holding the model credential. Named here so the secret
 /// classifier below cannot drift from the key `up_commands` actually masks.
 pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
@@ -6411,6 +6529,66 @@ mod tests {
             opts.secrets.is_empty(),
             "a --dev rerun with nothing recorded must not invent secrets: {:?}",
             opts.secrets
+        );
+    }
+
+    fn completed_sealed_up(existing: Option<&serde_json::Value>, set: Vec<String>) -> UpOpts {
+        let mut opts = completed_dev_up(None, vec![]);
+        opts.dev = false;
+        opts.secrets = vec![];
+        opts.set = set;
+        complete_up_opts_without_runner_egress(opts, existing, None, false, true).unwrap()
+    }
+
+    /// ADR-0168 decision 7, through the wiring rather than the helper: a sealed
+    /// `up` on a release with no caller pair hands the chart a real one, and
+    /// the next `up` hands back exactly that pair.
+    #[test]
+    fn a_sealed_up_gains_a_caller_pair_and_the_next_up_keeps_it() {
+        let existing = serde_json::json!({"ui": {"deploy": false}});
+        let first = completed_sealed_up(Some(&existing), vec![]);
+        let seed = secret_for(
+            &first,
+            crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY,
+        )
+        .expect("generated")
+        .to_string();
+        let public = secret_for(&first, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY)
+            .expect("generated")
+            .to_string();
+        assert_eq!(
+            crate::connector_caller::verify_key_of(&seed).unwrap(),
+            public
+        );
+        let recorded =
+            serde_json::json!({"connectorCaller": {"signingKey": seed, "verifyKey": public}});
+        let next = completed_sealed_up(Some(&recorded), vec![]);
+        assert_eq!(
+            secret_for(&next, crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY),
+            Some(seed.as_str())
+        );
+        assert_eq!(
+            secret_for(&next, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY),
+            Some(public.as_str())
+        );
+    }
+
+    /// `--dev` mints no pair (the no-invented-secrets rule above), but it is a
+    /// full upgrade, so a recorded pair must still come back.
+    #[test]
+    fn a_dev_upgrade_re_supplies_a_recorded_caller_pair() {
+        let existing = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "connectorCaller": {"signingKey": "SEED-RECORDED", "verifyKey": "PUBLIC-RECORDED"}
+        });
+        let opts = completed_dev_up(Some(&existing), vec![]);
+        assert_eq!(
+            secret_for(&opts, crate::connector_caller::CONNECTOR_CALLER_SIGNING_KEY),
+            Some("SEED-RECORDED")
+        );
+        assert_eq!(
+            secret_for(&opts, crate::connector_caller::CONNECTOR_CALLER_VERIFY_KEY),
+            Some("PUBLIC-RECORDED")
         );
     }
 
