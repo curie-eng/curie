@@ -15,10 +15,15 @@ whose watermarks differ can resolve different slots of one hook, so admission
 also takes a transaction-scoped advisory lock per ``(agent, name)`` and treats
 any other open row for that hook as in flight.
 
-**Missed slots are slept through, not replayed.** A pass covers (watermark,
-now] and considers only the latest due slot per hook. A worker that was down
-for a day fires once when it returns, not once per missed slot, and a fresh
-worker never fires a slot from before it started.
+**Catch-up is bounded to one slot (#2930).** A pass covers (watermark, now],
+reaching back to the hook's last recorded slot when that is earlier, so a
+restarted worker still sees the slots it slept through. It fires only the
+newest due slot and records every older one ``skipped``. The newest is skipped
+too once it is older than the schedule's own interval or ``CATCH_UP_CEILING``,
+whichever is shorter. A hook with no recorded slot never fires a slot from
+before this worker started, and no hook reaches back past its deployment. The
+reach back stops at ``_CATCH_UP_LOOKBACK`` and one pass records at most
+``_MAX_SKIPPED_ROWS`` skipped slots per hook.
 
 **One hook's failure ends with that hook.** An exception while reading one
 agent's triggers, or resolving or admitting one hook, is caught and logged, and
@@ -72,6 +77,20 @@ _ITERATION_MARGIN = timedelta(hours=3)
 # plus this slack; the kernel should have closed it long ago.
 _STALE_SLACK_S = 60.0
 
+# A missed slot older than this is skipped rather than fired, however coarse the
+# schedule: a monthly hook four weeks late starts fresh.
+CATCH_UP_CEILING = timedelta(hours=24)
+
+# How far back a restarted worker looks for slots it slept through. It bounds
+# the slot enumeration (a minute schedule enumerates about 50,000 slots at
+# most) while a monthly hook down four weeks still gets its missed slot
+# recorded.
+_CATCH_UP_LOOKBACK = timedelta(days=35)
+
+# The most skipped rows one pass writes for one hook, newest kept. A minute
+# schedule down for days would otherwise write thousands of rows in one pass.
+_MAX_SKIPPED_ROWS = 1000
+
 
 def resolve_slots(
     schedule: str, zone: str, window_start: datetime, window_end: datetime
@@ -105,6 +124,48 @@ def resolve_slots(
             slots.append(utc)
     slots.sort()
     return slots
+
+
+def slot_is_stale(
+    schedule: str,
+    zone: str,
+    slot: datetime,
+    now: datetime,
+    ceiling: timedelta = CATCH_UP_CEILING,
+) -> bool:
+    """Whether ``slot`` is past the catch-up age bound at ``now``.
+
+    The bound is the schedule's own interval at ``slot`` (the gap to the next
+    slot, in the hook's zone), capped by ``ceiling`` for a coarse schedule.
+    """
+
+    following = resolve_slots(schedule, zone, slot, slot + ceiling)
+    bound = following[0] - slot if following else ceiling
+    return now - slot > bound
+
+
+def plan_catch_up(
+    schedule: str, zone: str, due: list[datetime], now: datetime
+) -> tuple[datetime | None, list[datetime]]:
+    """The one slot to fire and the slots to record skipped.
+
+    Args:
+        schedule: The hook's cron expression.
+        zone: The hook's IANA zone.
+        due: Ascending unrecorded slots, as ``resolve_slots`` returns them.
+        now: The pass instant.
+
+    Returns:
+        The newest due slot, or None when nothing is due or it is stale, and
+        every other due slot, ascending.
+    """
+
+    if not due:
+        return None, []
+    newest = due[-1]
+    if slot_is_stale(schedule, zone, newest, now):
+        return None, list(due)
+    return newest, list(due[:-1])
 
 
 class TriggerSource(Protocol):
@@ -178,6 +239,7 @@ SELECT DISTINCT ON (a.id)
        a.name AS agent_name,
        v.id AS version_id,
        v.bundle_ref AS bundle_ref,
+       d.deployed_at AS deployed_at,
        a.max_usd_per_day AS max_usd_per_day,
        a.max_output_tokens_per_run AS max_output_tokens_per_run
 FROM {schema}.agents a
@@ -223,6 +285,17 @@ WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL AND slot_utc <> 
 LIMIT 1
 """
 
+_LAST_SLOT_SQL = """
+SELECT max(slot_utc) FROM {schema}.hook_runs WHERE agent_id = :agent_id AND name = :name
+"""
+
+_SKIP_SQL = """
+INSERT INTO {schema}.hook_runs
+       (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at)
+VALUES (:id, :agent_id, :name, :slot, :version_id, 'skipped', now(), now())
+ON CONFLICT (agent_id, name, slot_utc) DO NOTHING
+"""
+
 _FAIL_RUN_SQL = """
 UPDATE {schema}.hook_runs SET outcome = 'failed', ended_at = now()
 WHERE id = :id AND outcome IS NULL
@@ -235,6 +308,7 @@ class _Target:
     agent_name: str
     version_id: uuid.UUID
     bundle_ref: str | None
+    deployed_at: datetime | None
     max_usd_per_day: float | None
     max_output_tokens_per_run: int | None
 
@@ -294,6 +368,8 @@ class CronSchedulerLoop:
         self._lock_sql = text(_LOCK_SQL)
         self._in_flight_sql = text(_IN_FLIGHT_SQL.format(schema=db_schema))
         self._fail_run_sql = text(_FAIL_RUN_SQL.format(schema=db_schema))
+        self._last_slot_sql = text(_LAST_SLOT_SQL.format(schema=db_schema))
+        self._skip_sql = text(_SKIP_SQL.format(schema=db_schema))
 
     async def _targets(self) -> list[_Target]:
         async with self._engine.connect() as conn:
@@ -304,6 +380,7 @@ class CronSchedulerLoop:
                 agent_name=row["agent_name"],
                 version_id=row["version_id"],
                 bundle_ref=row["bundle_ref"],
+                deployed_at=row["deployed_at"],
                 max_usd_per_day=row["max_usd_per_day"],
                 max_output_tokens_per_run=row["max_output_tokens_per_run"],
             )
@@ -358,6 +435,58 @@ class CronSchedulerLoop:
             )
         ).first()
         return None if row is None else row[0]
+
+    async def _window_start(
+        self, target: _Target, name: str, window_start: datetime, now: datetime
+    ) -> datetime:
+        """The pass window's start, reaching back to the hook's last slot.
+
+        Whatever the start, it never passes the in-force deployment (a slot
+        from before it belongs to whatever schedule was deployed then) or
+        ``_CATCH_UP_LOOKBACK``.
+        """
+
+        async with self._engine.connect() as conn:
+            last = (
+                await conn.execute(self._last_slot_sql, {"agent_id": target.agent_id, "name": name})
+            ).scalar()
+        start = window_start
+        if isinstance(last, datetime) and last < start:
+            start = last
+        floor = now - _CATCH_UP_LOOKBACK
+        if target.deployed_at is not None:
+            floor = max(floor, target.deployed_at)
+        return max(start, floor)
+
+    async def _skip(
+        self, target: _Target, name: str, slots: list[datetime], summary: CronPassSummary
+    ) -> None:
+        if not slots:
+            return
+        if len(slots) > _MAX_SKIPPED_ROWS:
+            logger.warning(
+                "cron hook %s for agent=%s missed %d slots; recording the newest %d skipped",
+                name,
+                target.agent_name,
+                len(slots),
+                _MAX_SKIPPED_ROWS,
+            )
+            slots = slots[-_MAX_SKIPPED_ROWS:]
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                self._skip_sql,
+                [
+                    {
+                        "id": uuid.uuid4(),
+                        "agent_id": target.agent_id,
+                        "name": name,
+                        "slot": slot,
+                        "version_id": target.version_id,
+                    }
+                    for slot in slots
+                ],
+            )
+        summary.skipped += len(slots)
 
     async def _admit(
         self,
@@ -484,10 +613,13 @@ class CronSchedulerLoop:
                 if not name or not schedule or not prompt:
                     continue
                 try:
-                    zone = trigger.get("timezone") or "UTC"
-                    slots = resolve_slots(str(schedule), str(zone), window_start, now)
-                    if slots:
-                        await self._admit(target, trigger, slots[-1], now, summary)
+                    zone = str(trigger.get("timezone") or "UTC")
+                    start = await self._window_start(target, str(name), window_start, now)
+                    due = resolve_slots(str(schedule), zone, start, now)
+                    fire, skipped = plan_catch_up(str(schedule), zone, due, now)
+                    await self._skip(target, str(name), skipped, summary)
+                    if fire is not None:
+                        await self._admit(target, trigger, fire, now, summary)
                 except Exception:
                     # Ends with this hook. The agent's other hooks, and every
                     # later agent, still run: the order is arbitrary.
