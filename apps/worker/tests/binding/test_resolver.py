@@ -1440,7 +1440,11 @@ def test_reads_model_settings_for_eval_boots_by_agent_id() -> None:
                     )
 
                 resolver = _resolver(engine)
-                assert await resolver.model_settings_for(agent_id) == ("agent_model", "high")
+                assert await resolver.model_settings_for(agent_id) == (
+                    "agent_model",
+                    "high",
+                    None,
+                )
 
                 async with engine.begin() as conn:
                     await conn.execute(
@@ -1451,8 +1455,8 @@ def test_reads_model_settings_for_eval_boots_by_agent_id() -> None:
                         {"id": agent_id},
                     )
 
-                assert await resolver.model_settings_for(agent_id) == (None, None)
-                assert await resolver.model_settings_for(uuid.uuid4()) == (None, None)
+                assert await resolver.model_settings_for(agent_id) == (None, None, None)
+                assert await resolver.model_settings_for(uuid.uuid4()) == (None, None, None)
             finally:
                 await _cleanup(engine, [agent_id])
         finally:

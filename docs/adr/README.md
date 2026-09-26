@@ -197,5 +197,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0171 | [A factory run may take three hours and is bounded by time, not turns](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md) | Accepted |
 | 0172 | [The mean tester is one bundle on off-the-shelf MCP servers, and it only reports](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md) | Accepted |
 | 0173 | [A bundle may layer its own runner image on the platform's](0173-a-bundle-may-layer-its-own-runner-image.md) | Accepted |
+| 0174 | [Publication prechecks use an execution scoped capability](0174-publication-prechecks-use-an-execution-scoped-capability.md) | Accepted |
 | 0175 | [A bot may limit who can talk to it](0175-a-bot-may-limit-who-can-talk-to-it.md) | Accepted |
+| 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
 <!-- END GENERATED: adr-index -->

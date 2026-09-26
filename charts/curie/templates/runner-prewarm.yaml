@@ -17,6 +17,10 @@ bundleFetch.enabled is true this DaemonSet therefore also sleeps one extra
 container per bundle-fetch image, sourced from the same values keys the
 sandbox init pair uses.
 
+An agent that layers its own runner image (agentSandbox.runnerImages,
+ADR-0173) boots from that digest instead, so this DaemonSet also sleeps one
+container per distinct layered digest that differs from the platform image.
+
 It is a long-idle DaemonSet, not a one-shot Job, on purpose:
   - DaemonSet covers every node (single-node clusters get exactly one pod).
   - The kubelet treats the image as in-use, so image GC never evicts it between
@@ -63,6 +67,17 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "sandbox")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      # Deliberately NO priorityClassName (#3182): unclassed means priority 0,
+      # below curie-sandbox (100000), so this sleeping image-cache pod is the
+      # chart's designated sacrifice -- a node full of sandbox CPU requests
+      # evicts the prewarm pod before anything the platform needs (Langfuse,
+      # the OTel collector, the UI, the control plane), and the DaemonSet
+      # controller recreates it when capacity returns. Do not "fix" this by
+      # promoting it to curie-platform or curie-sandbox: an explicit class of
+      # its own would also change the chart-rendered cluster-singleton
+      # inventory (ADR-0129) and the CLI's cluster-up PriorityClass preflight,
+      # which is a separate maintainer decision. Pinned by
+      # ci/render-assertions.sh Assertion 8.
       {{- with $runner.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -81,6 +96,23 @@ spec:
           command: ["sleep", "infinity"]
           resources:
             {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        {{- /* One container per distinct layered runner digest, named for the
+               first agent (sorted) that carries it. */}}
+        {{- $platformImage := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" $.Chart.AppVersion) }}
+        {{- $runnerImages := .Values.agentSandbox.runnerImages | default dict }}
+        {{- $seen := list $platformImage }}
+        {{- range $agent := keys $runnerImages | sortAlpha }}
+        {{- $ref := toString (index $runnerImages $agent) }}
+        {{- if not (has $ref $seen) }}
+        {{- $seen = append $seen $ref }}
+        - name: prewarm-agent-{{ $agent }}
+          image: {{ $ref | quote }}
+          imagePullPolicy: {{ $runner.prewarm.imagePullPolicy }}
+          command: ["sleep", "infinity"]
+          resources:
+            {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        {{- end }}
+        {{- end }}
         {{- if $runner.bundleFetch.enabled }}
         # Same values keys as the sandbox init pair in agent-sandbox.yaml -- a
         # hardcoded ref here would drift from the claim path the first time an

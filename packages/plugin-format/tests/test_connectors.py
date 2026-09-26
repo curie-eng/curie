@@ -364,11 +364,7 @@ def test_a_reserved_name_cannot_be_declared_as_a_secret_file_key() -> None:
     # Same name, same resolution, same per-agent Secret -- only the delivery
     # differs, so the fence has to cover this key too.
     assert "connectors.secret_name_reserved" in _codes(
-        {
-            "connectors": {
-                "g": {"image": "x:1", "secret_files": {"HTTPS_PROXY": "/secrets/proxy"}}
-            }
-        }
+        {"connectors": {"g": {"image": "x:1", "secret_files": {"HTTPS_PROXY": "/secrets/proxy"}}}}
     )
 
 
@@ -636,7 +632,11 @@ def test_build_beside_another_form_is_ambiguous(second: str) -> None:
     # Two image sources, or an image source plus a claim that the process is
     # already running elsewhere. Picking either silently ignores the other, and
     # the one ignored is the one the author edited last.
-    value = "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1" if second == "image" else "https://mcp.acme.example.com/mcp"
+    value = (
+        "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1"
+        if second == "image"
+        else "https://mcp.acme.example.com/mcp"
+    )
     codes = _codes(
         {
             "connectors": {
@@ -759,6 +759,35 @@ def test_connector_declaration_field_names_match_the_frozen_vector() -> None:
     fields = _vector_file("connector-fields.json")["models"]
     assert set(ConnectorSpec.model_fields) == set(fields["ConnectorSpec"])
     assert set(ConnectorBuild.model_fields) == set(fields["ConnectorBuild"])
+
+
+def test_runner_declaration_field_names_match_the_frozen_vector() -> None:
+    # ADR 0173: the optional top-level `runner:` block rides connectors.yaml.
+    from plugin_format.connectors import ConnectorsFile, RunnerSpec
+
+    fields = _vector_file("connector-fields.json")["models"]
+    assert set(ConnectorsFile.model_fields) == set(fields["ConnectorsFile"])
+    assert set(RunnerSpec.model_fields) == set(fields["RunnerSpec"])
+
+
+def test_a_runner_build_block_is_carried_not_dropped() -> None:
+    # The corpus proves accept/reject parity; this proves an accepted block is
+    # actually on the parsed model with its defaults resolved.
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {},
+            "runner": {"build": {"context": "runner", "platforms": ["linux/amd64"]}},
+        }
+    )
+    assert errors == [], errors
+    assert parsed is not None
+    assert parsed.runner is not None
+    assert parsed.runner.build.context == "runner"
+    assert parsed.runner.build.dockerfile == "Dockerfile"
+
+    parsed, errors = validate_connectors({"connectors": {}})
+    assert errors == [] and parsed is not None
+    assert parsed.runner is None
 
 
 # --------------------------------------------------------------------------- #
@@ -884,11 +913,7 @@ def test_a_forging_hosted_connector_with_an_unhosted_url_stays_refused() -> None
     # shape most likely to be mis-gated by a later edit that broadens the
     # `url`-only exemption to "anything with a URL on it."
     assert _codes(
-        {
-            "connectors": {
-                "mcp-grafana": {"image": "x:1", "unhosted_url": "${GRAFANA_MCP_URL}"}
-            }
-        }
+        {"connectors": {"mcp-grafana": {"image": "x:1", "unhosted_url": "${GRAFANA_MCP_URL}"}}}
     ) == ["connectors.ambiguous_name"]
 
 

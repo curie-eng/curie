@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/overrides/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/overrides/v1.2.json",
   "title": "curie <tier> overrides --json",
-  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking` and `execution_deadline_seconds` are null when no override is pinned, which is the same fact the API returns: the platform default applies. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
+  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when no override is pinned, which is the same fact the API returns: the platform default applies. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -54,6 +54,12 @@
           ],
           "minimum": 60,
           "maximum": 10800
+        },
+        "runner_resources": {
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "changed": {
           "type": "boolean"

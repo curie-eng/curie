@@ -119,3 +119,24 @@ def test_a_long_summary_is_clamped() -> None:
 
     assert receipt is not None
     assert len(receipt) < 1000
+
+
+def test_a_long_turn_lists_a_bounded_receipt_and_counts_the_rest() -> None:
+    """A receipt is read beneath an answer, and must not crowd it out (#3064).
+
+    A turn that made a hundred calls used to end with a hundred lines, and the
+    reply plus receipt passed the channel's size limit, so the answer was lost.
+    The failed call sits last here: it is the line a person most needs, so it
+    must survive the cut.
+    """
+
+    actions = [_action(result={"summary": f"read thread {i}"}) for i in range(40)]
+    actions.append(_action(status="failed", undoable=False, result={"summary": "posted probe"}))
+
+    receipt = render_receipt(actions)
+
+    assert receipt is not None
+    lines = receipt.splitlines()
+    assert len(lines) <= 12
+    assert "posted probe" in receipt and "failed" in receipt
+    assert lines[-1].endswith("31 more actions not listed")

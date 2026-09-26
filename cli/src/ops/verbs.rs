@@ -940,7 +940,7 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
             }
         }
         crate::worker_claims::ClaimsState::Quiescing { .. }
-        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => {
+        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable { .. } => {
             unhealthy.push(worker_claims.state.status_diagnosis());
         }
         crate::worker_claims::ClaimsState::Unknown => {

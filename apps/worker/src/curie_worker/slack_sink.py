@@ -211,6 +211,31 @@ def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
     return configured
 
 
+# chat.update refuses an edit over 4,000 bytes of UTF-8 with msg_too_long, while
+# chat.postMessage takes far more (measured, see test_slack_sink.py). A streamed
+# reply reaches Slack by editing its placeholder, so this is the limit it meets,
+# and a refused final edit used to lose the whole turn (#3064).
+_EDIT_MAX_BYTES = 4000
+_CUT_NOTE = "\n…\n_(Cut here: Slack refuses a longer edit.)_"
+
+
+def _fit_edit(text: str) -> str:
+    """The edit Slack accepts: ``text`` cut to the limit, saying where it was cut.
+
+    Cut by bytes, not characters, because the limit is bytes. The cut falls on
+    the last line break when there is one in the second half, so a reader gets
+    whole lines.
+    """
+    if len(text.encode("utf-8")) <= _EDIT_MAX_BYTES:
+        return text
+    budget = _EDIT_MAX_BYTES - len(_CUT_NOTE.encode("utf-8"))
+    head = text.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    line_end = head.rfind("\n")
+    if line_end > len(head) // 2:
+        head = head[:line_end]
+    return head + _CUT_NOTE
+
+
 def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
     """The wire affordance in the renderer's own vocabulary.
 
@@ -582,6 +607,7 @@ class SlackReplyAdapter:
         # ``nav`` (the agent's hub-button pack, threaded from the kernel) appends
         # the no-dead-ends hub button to a structured reply; None leaves it be.
         rendered_text, blocks = render(text, _nav_pack(nav))
+        rendered_text = _fit_edit(rendered_text)
 
         async def op(client: AsyncWebClient) -> None:
             if blocks is not None:

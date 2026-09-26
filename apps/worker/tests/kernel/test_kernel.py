@@ -3548,12 +3548,13 @@ def test_quota_capacity_waits_for_external_headroom_before_retry(
                 pool: str,
                 env: dict[str, str] | None = None,
                 labels: dict[str, str] | None = None,
+                **kwargs: object,
             ) -> None:
                 capacity = h.fake_k8s.quota_claim_capacity
                 if not headroom_proved:
                     h.fake_k8s.quota_claim_capacity = None
                 try:
-                    original_create(name, pool=pool, env=env, labels=labels)
+                    original_create(name, pool=pool, env=env, labels=labels, **kwargs)
                 finally:
                     h.fake_k8s.quota_claim_capacity = capacity
 
@@ -6111,6 +6112,16 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
     asyncio.run(go())
 
 
+def test_history_persistence_error_has_dedicated_factory_cause() -> None:
+    failure = kernel_module.TurnOutcome(
+        terminal_ok=False,
+        classification="history-persistence-error",
+        error_message="conversation history capacity exceeded",
+    )
+
+    assert kernel_module._escalation_cause(failure) == "history_capacity"
+
+
 @pytest.mark.parametrize(
     ("with_side_effect", "event_id"),
     [
@@ -6131,7 +6142,7 @@ def test_history_persistence_error_never_retries_and_settles_once(
             h.runner.default_script = [
                 *prefix,
                 ErrorEvent(
-                    message="Transcript history could not be saved.",
+                    message="conversation history capacity exceeded",
                     classification="history-persistence-error",
                 ),
                 Final(text="failed", status=FAIL),
@@ -6142,6 +6153,8 @@ def test_history_persistence_error_never_retries_and_settles_once(
             assert h.runner.opened == ["go"]
             assert h.sink.last_text is not None
             assert "(history-persistence-error)" in h.sink.last_text
+            assert "history capacity exceeded" in h.sink.last_text.lower()
+            assert "can be retried" in h.sink.last_text.lower()
             assert len(h.sink.completions) == 1
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
 
@@ -6341,5 +6354,63 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
             message = dropped[-1]
             reason = message.rsplit(":", 1)[1].strip()
             assert reason, f"the drop reason is empty: {message!r}"
+
+    asyncio.run(go())
+
+
+
+@pytest.mark.parametrize("keepalive", [True, False], ids=["refreshed", "control"])
+def test_streaming_turn_route_survives_the_reaper_past_its_ttl(
+    make_harness, keepalive: bool
+) -> None:
+    # #3188: a turn streaming past route_ttl_seconds must keep its route, or
+    # reap_orphans deletes the claim under the live runner. The control
+    # disables the refresh and must see the claim reaped, proving the TTL
+    # really expires inside this test.
+    async def go() -> None:
+        async with make_harness() as h:
+            h.substrate._config = replace(h.substrate._config, route_ttl_seconds=1)
+            h.kernel._route_ttl_seconds = 1
+            calls: list[tuple[str, str]] = []
+            inner = h.substrate.touch_live
+
+            def spy(thread_key: str, claim_name: str) -> bool:
+                calls.append((thread_key, claim_name))
+                return inner(thread_key, claim_name) if keepalive else False
+
+            h.substrate.touch_live = spy  # type: ignore[method-assign]
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working ")]
+            h.runner.tail = [Final(text="working done", status=DONE)]
+            thread_key = _thread_key("th-1")
+            reaped: list[str] = []
+
+            async def reap_mid_turn() -> None:
+                # Well past the 1 s route TTL while the turn is held open.
+                await asyncio.sleep(2.5)
+                # Age every claim past the bind grace so only the route can
+                # spare it: grace = claim_timeout_seconds + 30 s margin.
+                h.substrate._config = replace(
+                    h.substrate._config, claim_timeout_seconds=-60.0
+                )
+                reaped.extend(await asyncio.to_thread(h.substrate.reap_orphans))
+                hold.set()
+
+            reaper = asyncio.create_task(reap_mid_turn())
+            await asyncio.wait_for(h.kernel.process_event(_qevent("long turn")), timeout=10.0)
+            await reaper
+            assert calls, "the route was never refreshed while the turn streamed"
+            if keepalive:
+                assert reaped == []
+                assert h.sink.last_text == "working done"
+                handle = h.substrate.lookup(thread_key)
+                assert handle is not None
+                assert set(calls) == {(thread_key, handle.claim_name)}
+                during = len(calls)
+                await asyncio.sleep(1.0)
+                assert len(calls) == during, "keepalive outlived the turn"
+            else:
+                assert len(reaped) == 1
 
     asyncio.run(go())

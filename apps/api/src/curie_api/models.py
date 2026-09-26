@@ -146,6 +146,10 @@ class Agent(Base):
     # Per-agent work-item execution deadline in seconds (#3071). Operator-owned
     # like `model`/`thinking`; NULL means DEFAULT_EXECUTION_DEADLINE_SECONDS.
     execution_deadline_seconds: Mapped[int | None] = mapped_column(default=None)
+    # Per-agent runner cpu, memory, and ephemeral-storage (#3209). NULL means
+    # the chart agentSandbox.runner.resources block. A set value is applied on
+    # the next sandbox claim, not by resizing a sandbox that is already running.
+    runner_resources: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent behavior packs: declarative, opt-in UX touches the worker applies
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;
@@ -947,9 +951,13 @@ class FactoryStatusComment(Base):
             "subject_title IS NULL OR length(subject_title) <= 256",
             name="factory_terminal_notices_subject_title_ck",
         ),
+        # The four curie:* values are legacy, accepted so application N-1 can
+        # still write them, and are not the labels the reconciler applies.
         CheckConstraint(
             "applied_label IS NULL OR applied_label IN "
-            "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human')",
+            "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human', "
+            "'curie-factory:queued', 'curie-factory:running', 'curie-factory:pr-open', "
+            "'curie-factory:needs-human')",
             name="factory_terminal_notices_applied_label_ck",
         ),
         # Application N-1's delivery scan still reads this one.

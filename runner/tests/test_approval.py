@@ -1207,7 +1207,9 @@ def test_observe_publication_records_the_pending_approval_without_a_halt() -> No
     # exact runner-stamped provenance.
     gate = _managed_publish_gate()
 
-    recorded = gate.observe_publication({"title": "  Ship changes  ", "body": "Full body"})
+    recorded = anyio.run(
+        gate.observe_publication, "publish-1", {"title": "  Ship changes  ", "body": "Full body"}
+    )
 
     assert recorded is True
     assert gate.pending_summary is not None
@@ -1230,10 +1232,14 @@ def test_observe_publication_is_idempotent_for_a_duplicate_call() -> None:
     # publish_changes twice in one turn creates two approvals for one action, and
     # the human resolves against the second while the first stays pending.
     gate = _managed_publish_gate()
-    assert gate.observe_publication({"title": "First proposal", "body": "one"}) is True
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "First proposal", "body": "one"}
+    ) is True
     first_summary = gate.pending_summary
 
-    second = gate.observe_publication({"title": "Second proposal", "body": "two"})
+    second = anyio.run(
+        gate.observe_publication, "publish-2", {"title": "Second proposal", "body": "two"}
+    )
 
     assert second is False
     assert gate.pending_summary == first_summary
@@ -1250,7 +1256,7 @@ def test_observe_publication_rejects_a_malformed_title_and_records_nothing() -> 
     gate = _managed_publish_gate()
 
     with pytest.raises(ValueError):
-        gate.observe_publication({"title": "   ", "body": "ignored"})
+        anyio.run(gate.observe_publication, "publish-1", {"title": "   ", "body": "ignored"})
 
     assert gate.pending_summary is None
     assert gate.pending_granted_tool is None
@@ -1267,7 +1273,9 @@ def test_observe_publication_never_overwrites_a_hook_recorded_block() -> None:
     gate.block(PLATFORM_PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
     hook_summary = gate.pending_summary
 
-    assert gate.observe_publication({"title": "Stream observed", "body": "stream body"}) is False
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "Stream observed", "body": "stream body"}
+    ) is False
 
     assert gate.pending_summary == hook_summary
     assert gate.publication_title == "Hook recorded"
@@ -1295,13 +1303,17 @@ def test_observe_publication_never_mints_a_grant() -> None:
     # build_approval_gate already refuses to carry a publish grant (safe_grant_tool).
     assert gate.grant_tool is None
 
-    assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is True
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "Ship changes", "body": "body"}
+    ) is True
 
     assert gate.grant_tool is None
     assert gate.consume_grant(PLATFORM_PUBLISH_TOOL_NAME) is False
     # And the record it wrote is still the one-per-turn record: a second call
     # blocks again rather than being waved through.
-    assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is False
+    assert anyio.run(
+        gate.observe_publication, "publish-2", {"title": "Ship changes", "body": "body"}
+    ) is False
     assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
 

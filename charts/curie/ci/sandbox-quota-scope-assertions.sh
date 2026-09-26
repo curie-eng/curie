@@ -178,5 +178,9 @@ if "resourceNames" in rule:
 PY
 echo "  ok: one namespaced get rule"
 
+# Per-agent runner resources (#3209) share this quota. The assertions live in
+# their own script so the quota scope file stays about the scope selector.
+bash "$(dirname "${BASH_SOURCE[0]}")/runtime/runner-resources-assertions.sh"
+
 echo
 echo "All sandbox quota scope assertions passed."

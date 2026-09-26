@@ -758,6 +758,10 @@ enum Command {
         /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
         #[arg(long, value_name = "REF", requires = "plugin_dir")]
         registry: Option<String>,
+        /// The platform runner a declared runner layer builds on (default: the
+        /// runner `curie skill up` uses). Resolved to a digest before building.
+        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        runner_image: Option<String>,
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
         force: bool,
@@ -1022,6 +1026,26 @@ enum SreBotAction {
         /// install.
         #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
         workspace_repo: Vec<String>,
+    },
+    /// Provision the observability stack on an existing Curie release and
+    /// require the Grafana connector token. Does not install the platform
+    /// and does not deploy the SRE bot.
+    ProvisionObservability {
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
+        /// Chart directory. When omitted, use the same chart resolution as install.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the ordered plan without calling kubectl or helm.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -2097,6 +2121,13 @@ enum LocalAction {
         /// Clear the execution-deadline override back to the platform default.
         #[arg(long)]
         clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -2961,6 +2992,13 @@ enum ClusterAction {
         /// Clear the execution-deadline override back to the platform default.
         #[arg(long)]
         clear_execution_deadline: bool,
+        /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
+        /// requests and limits. Null on the API means the chart block.
+        #[arg(long)]
+        runner_resources: Option<String>,
+        /// Clear the runner resource override back to the chart block.
+        #[arg(long)]
+        clear_runner_resources: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -3598,25 +3636,31 @@ async fn bind_cluster_connector_secrets(
     if secrets.is_empty() {
         return Ok(());
     }
-    let resolved = artifacts::resolve_chart(
-        chart,
-        artifacts::Channel::current(),
-        artifacts::version(),
-        artifacts::cache_root,
-        std::path::Path::new("charts/curie").is_dir(),
-    )?;
-    let chart = materialize_artifact(resolved, false, "chart").await?;
-    curie::cluster_secrets::bind(curie::cluster_secrets::BindOpts {
-        common: CommonOpts {
+    // #3082: a bundle deploy whose connector secrets already match the
+    // release must not helm-upgrade the platform, so the chart is resolved
+    // only when the bind actually changes something.
+    let chart = async {
+        let resolved = artifacts::resolve_chart(
+            chart,
+            artifacts::Channel::current(),
+            artifacts::version(),
+            artifacts::cache_root,
+            std::path::Path::new("charts/curie").is_dir(),
+        )?;
+        materialize_artifact(resolved, false, "chart").await
+    };
+    curie::cluster_secrets::bind_if_changed(
+        CommonOpts {
             namespace: namespace.to_string(),
             release: release.to_string(),
             dry_run: false,
         },
-        chart,
-        agent: agent_name.to_string(),
+        agent_name.to_string(),
         secrets,
-    })
-    .await
+        chart,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Bind the sandbox connector secrets for one deployed agent and then apply its
@@ -3786,47 +3830,67 @@ async fn run(command: Option<Command>) -> Result<()> {
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
-            action:
-                ExampleAction::SreBot {
-                    action:
-                        SreBotAction::Install {
-                            observability,
-                            dry_run,
-                            slack_channel,
-                            platform_upgrade,
-                            namespace,
-                            release,
-                            observability_namespace,
-                            workspace_repo,
-                            approvers,
-                        },
+            action: ExampleAction::SreBot { action },
+        }) => match action {
+            SreBotAction::Install {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+                observability,
+                dry_run,
+                slack_channel,
+                platform_upgrade,
+                namespace,
+                release,
+                observability_namespace,
+                workspace_repo,
+                approvers,
+            })
+            .await?
+            {
+                curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+                curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            },
+            SreBotAction::ProvisionObservability {
+                namespace,
+                release,
+                observability_namespace,
+                chart,
+                dry_run,
+            } => match curie::examples::provision_observability(
+                curie::examples::ObservabilityProvisionOpts {
+                    namespace,
+                    release,
+                    observability_namespace,
+                    chart,
+                    dry_run,
                 },
-        }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
-            observability,
-            dry_run,
-            slack_channel,
-            platform_upgrade,
-            namespace,
-            release,
-            observability_namespace,
-            workspace_repo,
-            approvers,
-        })
-        .await?
-        {
-            curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
-            curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+            )
+            .await?
+            {
+                curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
+                curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
+            },
         },
         Some(Command::Build {
             tag,
             plugin_dir,
             registry,
+            runner_image,
             force,
         }) => match plugin_dir {
             Some(plugin_dir) => emit(
                 commands::build_connectors(commands::ConnectorBuildOpts {
                     plugin_dir,
                     registry,
+                    runner_image,
                     force,
                 })
                 .await?,
@@ -4565,6 +4629,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_thinking,
                 execution_deadline,
                 clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
                 api_url,
                 api_key,
                 dry_run,
@@ -4581,6 +4647,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     commands::OverrideChange::resolve_execution_deadline(
                         execution_deadline,
                         clear_execution_deadline,
+                    )?,
+                    commands::OverrideChange::resolve_runner_resources(
+                        runner_resources,
+                        clear_runner_resources,
                     )?,
                 )
                 .await?,
@@ -5669,6 +5739,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_thinking,
                 execution_deadline,
                 clear_execution_deadline,
+                runner_resources,
+                clear_runner_resources,
                 conn,
                 dry_run,
             } => {
@@ -5683,6 +5755,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     execution_deadline,
                     clear_execution_deadline,
                 )?;
+                let runner_resources = commands::OverrideChange::resolve_runner_resources(
+                    runner_resources,
+                    clear_runner_resources,
+                )?;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
@@ -5696,6 +5772,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model,
                         thinking,
                         execution_deadline,
+                        runner_resources,
                     )
                     .await?,
                 )

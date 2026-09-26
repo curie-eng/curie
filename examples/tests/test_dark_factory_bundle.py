@@ -242,6 +242,11 @@ def test_every_step_reports_its_own_phase_through_report_progress() -> None:
     sections = _step_sections(body)
     assert list(sections) == PHASES
     for phase, text in sections.items():
+        if phase == "wait_ci":
+            # The agent's turn ends at publication; the platform reports it (#3179).
+            assert "report_progress" not in text
+            assert re.search(r"platform reports `wait_ci`", text)
+            continue
         assert "report_progress" in text, phase
         assert re.search(rf"report_progress[^\n]*\b{phase}\b", text), phase
         if phase in LOOPED_PHASES:
@@ -253,6 +258,35 @@ def test_phases_section_names_the_platform_progress_tool() -> None:
     phases = body.split("## Phases", 1)[1].split("\n## ", 1)[0]
     assert "mcp__curie__report_progress" in phases
     assert re.search(r"never blocks|continue the work", phases, re.IGNORECASE)
+
+
+# --- #3195: report each phase once; never end a message without a tool call ---------
+
+
+def _phases_section() -> str:
+    """The `## Phases` section, whitespace-normalized so line wrapping cannot
+    break a sentence-level assertion (#3195)."""
+    _, body = _skill_parts()
+    return re.sub(r"\s+", " ", body.split("## Phases", 1)[1].split("\n## ", 1)[0])
+
+
+def test_phases_section_reports_each_phase_once_on_entry() -> None:
+    """One report_progress per phase entry, not one per turn while working (#3195)."""
+    assert re.search(
+        r"report_progress`? once when you enter a phase, not while you work in it",
+        _phases_section(),
+    )
+
+
+def test_phases_section_bars_a_message_without_a_tool_call() -> None:
+    """A message without a tool call ends the run; only the stop may be all text (#3195)."""
+    assert re.search(
+        r"Every message you send must include a tool call"
+        r".{0,220}publish_changes"
+        r".{0,220}Could not complete:"
+        r".{0,220}A message without a tool call ends the run",
+        _phases_section(),
+    )
 
 
 def test_untrusted_covers_issue_and_repository_and_instructions() -> None:
@@ -283,6 +317,29 @@ def test_evals_are_falsifiable() -> None:
         elif grader["kind"] == "regex":
             flags = 0 if grader.get("case_sensitive") else re.IGNORECASE
             assert re.search(grader["expected"], text, flags) is None, case["id"]
+
+
+# --- #3196: approve with non-blocking notes ---------------------------------------
+
+
+def test_skill_carries_approved_notes_into_implement() -> None:
+    _, body = _skill_parts()
+    assert "## Reviewer notes" in body
+    section = body.split("## Reviewer notes", 1)[1].split("\n## ", 1)[0]
+    assert "NOTES:" in section
+    assert "approval ends that review loop" in section
+    # Plan notes ride into implement; diff notes never edit approved code.
+    assert re.search(r"plan review.{0,120}?`implement`", section, re.IGNORECASE | re.DOTALL)
+    assert "Never apply diff-review notes to the code" in section
+    assert re.search(r"List\s+diff-review notes in the pull request body", section)
+    assert "Never start another review round only to address notes" in section
+
+
+def test_evals_cover_an_approve_with_notes_verdict() -> None:
+    cases = json.loads((BUNDLE / "evals" / "cases.json").read_text())["cases"]
+    assert any(
+        "approve" in case["input"].lower() and "notes" in case["input"].lower() for case in cases
+    ), "no eval case covers an approve-with-notes verdict"
 
 
 FORBIDDEN = [
@@ -348,6 +405,30 @@ def test_wait_ci_section_loops_a_failed_check_back_to_implement() -> None:
     assert "Could not complete:" in section
     assert "1800" in section
     assert "does not act on them yet" not in section
+
+
+# --- #3194: publish reads the repository's PR conventions ---------------------------
+
+
+def test_publish_section_reads_repository_pr_conventions() -> None:
+    _, body = _skill_parts()
+    section = _section(body, 8)
+    assert "(phase `publish`)" in section.splitlines()[0]
+    # The conventions are read before the publication is requested.
+    assert section.index("AGENTS.md") < section.index("mcp__curie__publish_changes")
+    assert "CONTRIBUTING.md" in section
+    assert re.search(r"pull\s+request\s+template", section)
+    assert "CI job" in section
+    assert re.search(r"pull\s+request\s+bod", section)
+    # ...and followed, including required trailers and selectors.
+    assert re.search(
+        r"follow (them|those conventions).{0,80}(trailer|selector)",
+        section,
+        re.IGNORECASE | re.DOTALL,
+    )
+    # The skill stays repository-agnostic: it names where conventions live,
+    # never a specific repository's rules (#3194).
+    assert "Fix pin" not in body
 
 
 def test_skill_names_three_review_loops_including_wait_ci() -> None:

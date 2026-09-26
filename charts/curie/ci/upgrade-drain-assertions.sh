@@ -13,8 +13,10 @@
 #     cluster that is not claiming;
 #   * `hook-failed` in the delete policy would destroy the only log naming which
 #     deliveries held the upgrade back;
-#   * a quiesce TTL that does not outlast the wait lapses mid-drain, so the
-#     replicas resume claiming into the roll AND the gate still reports success;
+#   * a roll-hold quiesce TTL longer than the drain wait strands a paused
+#     fleet for longer than the upgrade could ever have waited (#3127): the
+#     marker is a renewed lease while waiting, and the hold written after a
+#     clean drain is capped at the effective wait;
 #   * a wait shorter than the delivery budget refuses upgrades over turns that
 #     are still inside the budget ADR-0131 already promised them, which is a
 #     gate that gets switched off in its first week.
@@ -63,11 +65,14 @@ assert_render_fails() {
   echo "OK: $label is refused at render time"
 }
 
-assert_render_fails \
-  "a quiesce TTL that does not outlast the drain wait" \
-  "must be strictly greater than worker.upgradeDrain.timeoutSeconds" \
+# #3127: a quiesce TTL at or below the wait is no longer refused. The wait is
+# held by a renewed lease, so the roll hold may be shorter than the wait.
+helm template t "$CHART" \
   --set worker.upgradeDrain.timeoutSeconds=900 \
-  --set worker.upgradeDrain.quiesceTtlSeconds=900
+  --set worker.upgradeDrain.quiesceTtlSeconds=900 > "$TMP/equal-ttl.yaml"
+helm template t "$CHART" \
+  --set worker.upgradeDrain.timeoutSeconds=900 \
+  --set worker.upgradeDrain.quiesceTtlSeconds=600 > "$TMP/short-ttl.yaml"
 
 # The cross-family relationship is DERIVED, not refused: raising the delivery
 # budget is a decision made for unrelated reasons, and failing the render for a
@@ -84,12 +89,13 @@ helm template t "$CHART" \
   --set worker.upgradeDrain.timeoutSeconds=120 \
   --set worker.upgradeDrain.quiesceTtlSeconds=300 > "$TMP/small.yaml"
 
-python3 - "$TMP/default.yaml" "$TMP/disabled.yaml" "$TMP/no-worker.yaml" "$TMP/small.yaml" "$TMP/raised.yaml" <<'PY'
+python3 - "$TMP/default.yaml" "$TMP/disabled.yaml" "$TMP/no-worker.yaml" "$TMP/small.yaml" "$TMP/raised.yaml" "$TMP/equal-ttl.yaml" "$TMP/short-ttl.yaml" <<'PY'
 import sys
 
 import yaml
 
 default_path, disabled_path, no_worker_path, small_path, raised_path = sys.argv[1:6]
+equal_ttl_path, short_ttl_path = sys.argv[6:8]
 
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
@@ -216,18 +222,18 @@ if not failures:
         env = {e["name"]: e for e in container.get("env", []) if isinstance(e, dict)}
         for required in ("VALKEY_HOST", "VALKEY_PORT", "VALKEY_PASSWORD"):
             check(required in env, f"{component} is missing {required}")
-        # Both Jobs build the same WorkerConfig, whose validator refuses a
-        # quiesce TTL that does not outlast the wait. A release Job missing
-        # these would construct a config the gate could not.
+        # Both Jobs build the same WorkerConfig. The roll hold is capped at the
+        # effective wait (#3127): min(quiesceTtlSeconds 1800, wait 900) = 900.
         check(
             env.get("CURIE_UPGRADE_DRAIN_TIMEOUT_S", {}).get("value") == "900",
             f"{component} CURIE_UPGRADE_DRAIN_TIMEOUT_S is "
             f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}, expected '900'",
         )
         check(
-            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "1800",
+            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "900",
             f"{component} CURIE_UPGRADE_QUIESCE_TTL_S is "
-            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1800'",
+            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '900' "
+            "(min of quiesceTtlSeconds and the effective drain wait)",
         )
 
     drain_env = {
@@ -265,15 +271,15 @@ if env is not None:
         f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}",
     )
     check(
-        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "300",
-        "a quiesce TTL already above the wait was not left at the configured value: "
+        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "120",
+        "a quiesce TTL above the wait was not capped at the wait (expected '120'): "
         f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}",
     )
 
 # Raising deliveryBudgetSeconds to its 1800s maximum, with the grace ADR-0131
 # requires, must still render -- and must carry the gate up with it rather than
 # leaving a 900s wait that would refuse every upgrade during ordinary traffic.
-# 1800 + 60 reserve = 1860, and the quiesce TTL is derived above that.
+# 1800 + 60 reserve = 1860; the roll hold is min(1800, 1860) = 1800.
 env = drain_env(raised_path, "raised-budget")
 if env is not None:
     check(
@@ -282,10 +288,45 @@ if env is not None:
         f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}, expected '1860'",
     )
     check(
-        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "1920",
-        "the quiesce TTL was not derived above the raised wait, so the worker "
-        "would refuse it at boot: "
-        f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1920'",
+        env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "1800",
+        "the roll hold was not min(quiesceTtlSeconds, effective wait): "
+        f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1800'",
+    )
+
+# A configured hold below the wait renders and is kept; an equal one too.
+for path, label, expected in (
+    (short_ttl_path, "short-ttl", "600"),
+    (equal_ttl_path, "equal-ttl", "900"),
+):
+    env = drain_env(path, label)
+    if env is not None:
+        check(
+            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == expected,
+            f"the {label} render's CURIE_UPGRADE_QUIESCE_TTL_S is "
+            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, "
+            f"expected {expected!r}",
+        )
+
+# The invariant on every render: the hold never outlasts the drain wait.
+for path, label in (
+    (default_path, "default"),
+    (small_path, "smaller-budget"),
+    (raised_path, "raised-budget"),
+    (equal_ttl_path, "equal-ttl"),
+    (short_ttl_path, "short-ttl"),
+):
+    env = drain_env(path, label)
+    if env is None:
+        continue
+    try:
+        ttl = float(env["CURIE_UPGRADE_QUIESCE_TTL_S"]["value"])
+        wait = float(env["CURIE_UPGRADE_DRAIN_TIMEOUT_S"]["value"])
+    except (KeyError, TypeError, ValueError):
+        failures.append(f"the {label} render lacks a numeric quiesce TTL or wait")
+        continue
+    check(
+        ttl <= wait,
+        f"the {label} render holds the marker {ttl}s, longer than the {wait}s wait",
     )
 
 if failures:

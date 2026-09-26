@@ -252,6 +252,10 @@ pub struct Agent {
     /// semantics as `model`.
     #[serde(default)]
     pub execution_deadline_seconds: Option<u32>,
+    /// Per-agent runner cpu, memory, and ephemeral-storage (#3209). `None`
+    /// means the chart block. Same three-way PATCH semantics as `model`.
+    #[serde(default)]
+    pub runner_resources: Option<serde_json::Value>,
     /// Whether this agent's bindings share one workflow-state namespace
     /// (`true`) or each get their own (`false`, the default) (#1525 follow-up,
     /// ADR-0118). Cardinality alone opts an agent into multiple surfaces; this

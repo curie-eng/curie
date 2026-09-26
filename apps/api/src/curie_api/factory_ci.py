@@ -32,13 +32,12 @@ from curie_telemetry.redact import redact_text
 from sqlalchemy import TIMESTAMP, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import workitem_outcomes, workitems
+from . import factory_progress, workitem_outcomes, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
 from .workitem_outcomes import CiDetail
 
 CI_GRACE_SECONDS = 120
-CI_WAIT_SECONDS = 1200
 CI_POLL_SECONDS = 20
 CI_MAX_ROUNDS = 3
 CI_OBSERVATIONS_PER_PASS = 4
@@ -117,11 +116,12 @@ def decide(
     now: datetime,
     published_at: datetime,
     execution_deadline: datetime,
+    ci_wait_seconds: int,
     prior_round_had_checks: bool = False,
 ) -> Verdict:
     """The CI verdict for one observation. Pure: time is an argument."""
 
-    ci_deadline = min(published_at + timedelta(seconds=CI_WAIT_SECONDS), execution_deadline)
+    ci_deadline = min(published_at + timedelta(seconds=ci_wait_seconds), execution_deadline)
     expired = now >= ci_deadline
     if detail.state != "observed" or detail.reason is not None:
         reason = detail.reason or "github_error"
@@ -178,6 +178,12 @@ def _clean(value: Any, limit: int) -> str | None:
     return _clip(redact_text(value), limit)
 
 
+def _job_log_tail(value: str) -> str:
+    redacted = redact_text(value)
+    lines = redacted.splitlines()[-workitem_outcomes.CI_JOB_LOG_MAX_LINES:]
+    return "\n".join(lines)[-workitem_outcomes.CI_JOB_LOG_MAX_CHARS:]
+
+
 def continuation_text(
     issue_url: str, pr_url: str, head_sha: str, round_: int, detail: CiDetail
 ) -> str:
@@ -199,6 +205,7 @@ def continuation_text(
     report: dict[str, list[dict[str, Any]]] = {"failing_checks": [], "failing_statuses": []}
     annotations_left = _ANNOTATIONS_MAX
     entries: list[tuple[str, dict[str, Any]]] = []
+    available_logs: list[tuple[dict[str, Any], str]] = []
     for run in detail.check_runs:
         if run.get("status") != "completed" or run.get("conclusion") not in _FAILING_CONCLUSIONS:
             continue
@@ -219,18 +226,20 @@ def continuation_text(
                 }
             )
             annotations_left -= 1
-        entries.append(
-            (
-                "failing_checks",
-                {
-                    "name": _clean(run.get("name"), 200),
-                    "conclusion": _clean(run.get("conclusion"), 50),
-                    "title": _clean(output.get("title"), 300),
-                    "summary": _clean(output.get("summary"), _SUMMARY_MAX),
-                    "annotations": notes,
-                },
-            )
-        )
+        entry: dict[str, Any] = {
+            "name": _clean(run.get("name"), 200),
+            "conclusion": _clean(run.get("conclusion"), 50),
+            "title": _clean(output.get("title"), 300),
+            "summary": _clean(output.get("summary"), _SUMMARY_MAX),
+            "annotations": notes,
+        }
+        if isinstance(run_id, int) and not isinstance(run_id, bool):
+            log = detail.job_logs.get(run_id)
+            if isinstance(log, str):
+                available_logs.append((entry, _job_log_tail(log)))
+            elif run_id in detail.job_log_unavailable:
+                entry["job_log"] = "Job log unavailable."
+        entries.append(("failing_checks", entry))
     for status_item in detail.statuses:
         if status_item.get("state") not in _FAILING_STATES:
             continue
@@ -244,13 +253,35 @@ def continuation_text(
                 },
             )
         )
-    # Keep the report valid JSON within the bound: drop whole entries, never
-    # cut through one.
+    # Reserve the check details before spending the report budget on logs.
     for key, entry in entries:
         report[key].append(entry)
         if len(json.dumps(report)) > _REPORT_MAX:
             report[key].pop()
             break
+    included = {id(entry) for entry in report["failing_checks"]}
+    logs = [(entry, log) for entry, log in available_logs if id(entry) in included]
+    for index, (entry, log) in enumerate(logs):
+        # Share the remaining space among logs. A suffix keeps the diagnostic
+        # tail and cannot make a marker into a separate prompt line.
+        current_size = len(json.dumps(report))
+        allowance = (_REPORT_MAX - current_size) // (len(logs) - index)
+        target_size = current_size + allowance
+        low, high = 1, len(log)
+        best: str | None = None
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate = log[-midpoint:]
+            entry["job_log"] = candidate
+            if len(json.dumps(report)) <= target_size:
+                best = candidate
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        if best is None:
+            entry.pop("job_log", None)
+        else:
+            entry["job_log"] = best
     return f"{header}\n{json.dumps(report)}"
 
 
@@ -412,6 +443,8 @@ async def gate(
     round_ = len(facts.publications)
     if await valkey.exists(ci_key(request.id, round_ + 1)):
         return "fixing"
+    async with sessionmaker() as session:
+        await factory_progress.record_wait_ci(session, request.id)
     due = next_poll.get(request.id)
     if due is not None and now < due:
         return "waiting"
@@ -429,6 +462,7 @@ async def gate(
         now=now,
         published_at=facts.published_at,
         execution_deadline=request.execution_deadline,
+        ci_wait_seconds=settings.github_factory_ci_wait_s,
         prior_round_had_checks=round_ > 1,
     )
     if verdict.kind == "pending":

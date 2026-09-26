@@ -666,6 +666,15 @@ async def update_agent_execution_deadline(
     return agent
 
 
+async def update_agent_runner_resources(
+    session: AsyncSession, agent: Agent, resources: dict[str, Any] | None
+) -> Agent:
+    agent.runner_resources = resources
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_publication_policy(
     session: AsyncSession,
     agent: Agent,
@@ -2343,9 +2352,7 @@ def _same_approval(prior: Approval, data: "ApprovalRequest") -> bool:
     )
 
 
-async def find_rejected_reraise(
-    session: AsyncSession, data: "ApprovalRequest"
-) -> Approval | None:
+async def find_rejected_reraise(session: AsyncSession, data: "ApprovalRequest") -> Approval | None:
     """The rejected approval ``data`` would re-raise with nobody asking, or None.
 
     The worker stamps each request with the event id of the turn that raised

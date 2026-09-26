@@ -64,8 +64,9 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 **Inbound** — a discriminated union on `kind` (`parse_inbound` decodes it):
 
 - `Event` = `{kind: "event", type: "message"|"job"|"eval_case", text, user, ts,
-  session_id?, history_ref?}`. The optional fields are nullable strings; either
-  may be omitted independently.
+  session_id?, history_ref?, publication_context?}`. The session and history
+  fields are nullable strings. The platform may attach a publication context
+  to a managed factory turn; other producers omit it.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound** — a discriminated union on `type`, each carrying `version`
@@ -81,7 +82,7 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
   made and once when its result arrives, joined on `call_id` (ADR-0117)
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
-**exact build `PROTOCOL_VERSION`** (currently `0.5.0`) on every outbound event and
+**exact build `PROTOCOL_VERSION`** (currently `0.5.2`) on every outbound event and
 constructs strictly -- an unknown field is an error at construction, catching your
 mistakes at the source. A **consumer** decoding the wire is tolerant the other way:
 it accepts any version compatible with its own build (`major.minor` match under

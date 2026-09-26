@@ -80,6 +80,9 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.otelCollector.terminationGracePeriodSeconds }}
       {{- with .Values.otelCollector.podSecurityContext }}
       securityContext:

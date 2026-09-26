@@ -2256,6 +2256,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             if let Err(err) = build_connectors(ConnectorBuildOpts {
                 plugin_dir: plugin_dir.clone(),
                 registry: None,
+                runner_image: None,
                 force: false,
             })
             .await
@@ -4972,7 +4973,7 @@ async fn prepare_deploy_with_commit_sha(
     }
     {
         let decl = &connector_decl;
-        if decl.connectors.values().any(|spec| spec.build.is_some()) {
+        if decl.runner.is_some() || decl.connectors.values().any(|spec| spec.build.is_some()) {
             let recomputed = recompute_source_digests(&plugin_dir, decl)?;
             let lock = crate::connector_build::load_lock(&plugin_dir)?;
             lock_preflight(
@@ -5456,6 +5457,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             crate::connector_build::ConnectorLockFileDecl {
                 version: crate::connector_build::LOCK_VERSION,
                 connectors: std::collections::BTreeMap::new(),
+                runner: None,
             }
         });
         let identity = crate::connector_build::ConnectorScope {
@@ -12121,6 +12123,56 @@ impl OverrideChange {
             (None, false) => Ok(OverrideChange::Unchanged),
         }
     }
+
+    /// Resolve `--runner-resources` / `--clear-runner-resources`.
+    ///
+    /// A set value is a JSON object, stored as text and emitted as that object.
+    /// Blank text and malformed JSON are usage errors and never reach the API.
+    pub fn resolve_runner_resources(value: Option<String>, clear: bool) -> Result<Self> {
+        match (value, clear) {
+            (Some(_), true) => Err(crate::exit::usage(
+                "--runner-resources and --clear-runner-resources contradict each other; \
+                 pass one. --clear-runner-resources restores the platform default"
+                    .to_string(),
+            )),
+            (Some(raw), false) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(crate::exit::usage(
+                        "--runner-resources must not be blank; use --clear-runner-resources \
+                         to restore the platform default"
+                            .to_string(),
+                    ));
+                }
+                let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| {
+                    crate::exit::usage(format!(
+                        "--runner-resources must be a JSON object of requests and limits, got {raw:?}"
+                    ))
+                })?;
+                if !parsed.is_object() {
+                    return Err(crate::exit::usage(format!(
+                        "--runner-resources must be a JSON object of requests and limits, got {raw:?}"
+                    )));
+                }
+                Ok(OverrideChange::Set(parsed.to_string()))
+            }
+            (None, true) => Ok(OverrideChange::Clear),
+            (None, false) => Ok(OverrideChange::Unchanged),
+        }
+    }
+
+    /// Same as [`patch_value`](Self::patch_value), but `Set` is a JSON value
+    /// rather than a JSON string. Used for `runner_resources`.
+    fn patch_value_as_json(&self) -> Option<serde_json::Value> {
+        match self {
+            OverrideChange::Unchanged => None,
+            OverrideChange::Clear => Some(serde_json::Value::Null),
+            OverrideChange::Set(v) => Some(
+                serde_json::from_str(v)
+                    .expect("runner resources Set must already be a JSON object"),
+            ),
+        }
+    }
 }
 
 /// The `PATCH /agents/{id}` body for a `<tier> overrides` write, or `None` when
@@ -12141,6 +12193,7 @@ pub fn overrides_patch_body(
     model: &OverrideChange,
     thinking: &OverrideChange,
     execution_deadline: &OverrideChange,
+    runner_resources: &OverrideChange,
 ) -> Option<serde_json::Value> {
     let mut body = serde_json::Map::new();
     if let Some(v) = model.patch_value() {
@@ -12151,6 +12204,9 @@ pub fn overrides_patch_body(
     }
     if let Some(v) = execution_deadline.patch_value_as_number() {
         body.insert("execution_deadline_seconds".to_string(), v);
+    }
+    if let Some(v) = runner_resources.patch_value_as_json() {
+        body.insert("runner_resources".to_string(), v);
     }
     if body.is_empty() {
         return None;
@@ -12183,17 +12239,22 @@ pub fn overrides_summary(
     model: &Option<String>,
     thinking: &Option<String>,
     execution_deadline_seconds: &Option<u32>,
+    runner_resources: &Option<serde_json::Value>,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
     let deadline = execution_deadline_seconds
         .map(|s| format!("{s} s"))
         .unwrap_or_else(|| "platform default".to_string());
+    let resources = runner_resources
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "platform default".to_string());
     // The verb carries its own leading space, so an inspect closes straight
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}",
+        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}",
         show(model),
         show(thinking)
     )
@@ -12215,6 +12276,7 @@ pub enum OverridesOutput {
         model: Option<String>,
         thinking: Option<String>,
         execution_deadline_seconds: Option<u32>,
+        runner_resources: Option<serde_json::Value>,
         changed: bool,
     },
 }
@@ -12228,12 +12290,14 @@ impl crate::ui::CliOutput for OverridesOutput {
                 model,
                 thinking,
                 execution_deadline_seconds,
+                runner_resources,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
                 "model": model,
                 "thinking": thinking,
                 "execution_deadline_seconds": execution_deadline_seconds,
+                "runner_resources": runner_resources,
                 "changed": changed,
             }),
         }
@@ -12247,6 +12311,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 model,
                 thinking,
                 execution_deadline_seconds,
+                runner_resources,
                 changed,
             } => {
                 ui.payload(&overrides_summary(
@@ -12254,6 +12319,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                     model,
                     thinking,
                     execution_deadline_seconds,
+                    runner_resources,
                     *changed,
                 ));
             }
@@ -12287,9 +12353,10 @@ pub async fn overrides(
     model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
+    runner_resources: OverrideChange,
 ) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let body = overrides_patch_body(&model, &thinking, &execution_deadline);
+    let body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(
@@ -12315,6 +12382,7 @@ pub async fn overrides(
             model: agent.model,
             thinking: agent.thinking,
             execution_deadline_seconds: agent.execution_deadline_seconds,
+            runner_resources: agent.runner_resources,
             changed: false,
         });
     };
@@ -12335,6 +12403,7 @@ pub async fn overrides(
         model: saved.model,
         thinking: saved.thinking,
         execution_deadline_seconds: saved.execution_deadline_seconds,
+        runner_resources: saved.runner_resources,
         changed: true,
     })
 }
@@ -12539,6 +12608,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Clear,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .expect("a clear is a write");
         let obj = body.as_object().expect("an object");
@@ -12554,7 +12624,8 @@ mod overrides_tests {
         assert!(overrides_patch_body(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
-            &OverrideChange::Unchanged
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .is_none());
     }
@@ -12564,6 +12635,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
@@ -12601,10 +12673,11 @@ mod overrides_tests {
     // verb was interpolated as an empty string before the colon.
     #[test]
     fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
-        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, false);
+        let line =
+            super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, &None, false);
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default"
+            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -12612,8 +12685,8 @@ mod overrides_tests {
     #[test]
     fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
         assert_eq!(
-            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), true),
-            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s"
+            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), &None, true),
+            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default"
         );
     }
 
@@ -12639,6 +12712,7 @@ mod overrides_tests {
     fn the_dry_run_body_carries_the_trimmed_value() {
         let body = overrides_patch_body(
             &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
         )
@@ -12675,6 +12749,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::resolve_execution_deadline(Some("120".into()), false).unwrap(),
+            &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
         assert_eq!(body["execution_deadline_seconds"], 120);
@@ -12688,6 +12763,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Clear,
+            &OverrideChange::Unchanged,
         )
         .expect("a clear is a write");
         assert!(body["execution_deadline_seconds"].is_null());
@@ -12698,6 +12774,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
         )
         .expect("a set is a write");
@@ -12804,6 +12881,9 @@ pub struct ConnectorBuildOpts {
     /// `Some(ref)` pushes a multi-platform index there; `None` builds the host
     /// platform into the local Docker daemon.
     pub registry: Option<String>,
+    /// The platform runner a declared runner layer builds on; `None` is the
+    /// same default `curie skill up` runs.
+    pub runner_image: Option<String>,
     /// Replace a registry lock with a local-daemon one deliberately.
     pub force: bool,
 }
@@ -12827,10 +12907,15 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         .iter()
         .filter(|(_, spec)| spec.build.is_some())
         .collect();
-    if buildable.is_empty() {
+    if buildable.is_empty() && decl.runner.is_none() {
         return Ok(ConnectorBuildOutput {
             connectors: Vec::new(),
         });
+    }
+    // The runner Dockerfile's base rule is checked before anything is resolved
+    // or built: a literal base builds on something the lock would not record.
+    if let Some(runner) = &decl.runner {
+        cb::check_runner_source(&plugin_dir, runner)?;
     }
     if !on_path("docker") {
         bail!(
@@ -12853,6 +12938,26 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     let mut records = Vec::new();
     let mut entries = std::collections::BTreeMap::new();
     let mut failure = None;
+    let mut runner_entry = None;
+    // Resolve the platform runner to an immutable identity before any build, so
+    // a base that cannot be resolved fails before minutes of connector builds.
+    let runner_base = match &decl.runner {
+        Some(_) => {
+            let image = crate::artifacts::resolve_image(
+                opts.runner_image.as_deref(),
+                crate::artifacts::Channel::current(),
+                crate::artifacts::version(),
+            );
+            match resolve_runner_base(&image, opts.registry.is_some()).await {
+                Ok(base) => Some(base),
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&metadata_dir);
+                    return Err(err);
+                }
+            }
+        }
+        None => None,
+    };
     for (connector, spec) in buildable {
         let plan = match cb::build_plan(
             &plugin_dir,
@@ -12894,6 +12999,71 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
             }
         }
     }
+    if let (None, Some(runner), Some((base_arg, base))) = (&failure, &decl.runner, &runner_base) {
+        let built = match cb::runner_build_plan(
+            &plugin_dir,
+            &bundle_name,
+            runner,
+            opts.registry.as_deref(),
+            base_arg,
+            &host,
+            &metadata_dir,
+        ) {
+            Ok(plan) => run_one_connector_build(&plan, ui)
+                .await
+                .map(|image| (plan, image)),
+            Err(err) => Err(err),
+        };
+        match built {
+            Ok((plan, image)) => {
+                // Local-daemon delivery builds on a mutable tag, not a digest
+                // pin: if `base_arg` was retagged between the pre-build
+                // inspect above and this build finishing, the layer was built
+                // on a base other than the one `base` records. Re-inspect and
+                // refuse to write a lock that would misrecord it.
+                let mut mismatch = None;
+                if plan.delivery == cb::Delivery::LocalDaemon {
+                    match crate::docker::docker(&cb::image_inspect_argv(base_arg).argv()).await {
+                        Ok(current_id) => {
+                            let current_id = current_id.trim();
+                            if current_id != base {
+                                mismatch = Some(anyhow::anyhow!(
+                                    "runner: the platform runner {base_arg} changed during the \
+                                     build (inspected {base}, now {current_id}); refusing to \
+                                     record a lock for a base the layer was not built on"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            mismatch = Some(err.context(format!(
+                                "runner: re-inspect the platform runner {base_arg} after build"
+                            )))
+                        }
+                    }
+                }
+                match mismatch {
+                    Some(err) => failure = Some(err),
+                    None => {
+                        runner_entry = Some(cb::RunnerLockEntryDecl {
+                            image: image.clone(),
+                            base: base.clone(),
+                            delivery: plan.delivery,
+                            platforms: plan.platforms.clone(),
+                            source_digest: plan.source_digest.clone(),
+                        });
+                        records.push(ConnectorBuildRecord {
+                            name: "runner".to_string(),
+                            image,
+                            delivery: plan.delivery,
+                            platforms: plan.platforms,
+                            source_digest: plan.source_digest,
+                        });
+                    }
+                }
+            }
+            Err(err) => failure = Some(err),
+        }
+    }
     let _ = std::fs::remove_dir_all(&metadata_dir);
     if let Some(err) = failure {
         // A build that could not run writes no lock: a partial lock would claim
@@ -12906,12 +13076,59 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         &cb::ConnectorLockFileDecl {
             version: cb::LOCK_VERSION,
             connectors: entries,
+            runner: runner_entry,
         },
         opts.force,
     )?;
     Ok(ConnectorBuildOutput {
         connectors: records,
     })
+}
+
+/// Pin the platform runner a runner layer builds on (ADR 0173).
+///
+/// Returns `(build_arg, recorded_base)`. Registry delivery records and builds
+/// on `<repo>@sha256:<manifest digest>`, asked of the registry unless the
+/// reference already carries one. Local-daemon delivery builds on the
+/// reference it inspected and records the daemon's image id for it.
+async fn resolve_runner_base(image: &str, registry: bool) -> Result<(String, String)> {
+    use crate::connector_build as cb;
+
+    if !registry {
+        let id = crate::docker::docker(&cb::image_inspect_argv(image).argv())
+            .await
+            .with_context(|| format!("runner: inspect the platform runner {image}"))?;
+        return Ok((image.to_string(), id.trim().to_string()));
+    }
+    if image.contains("@sha256:") {
+        return Ok((image.to_string(), image.to_string()));
+    }
+    let inspect = cb::plain_command(
+        "docker",
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+            "--format".into(),
+            "{{json .Manifest}}".into(),
+        ],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&inspect).await?;
+    if !ok {
+        bail!(
+            "runner: could not resolve the platform runner {image} in its registry: {}",
+            stderr.trim()
+        );
+    }
+    let manifest: serde_json::Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("runner: parse the manifest of {image}"))?;
+    let digest = manifest
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow::anyhow!("runner: the manifest of {image} names no digest"))?;
+    let base = cb::digest_pinned_ref(image, digest);
+    Ok((base.clone(), base))
 }
 
 /// Create a directory only its owner can enter, in one step.
@@ -13039,6 +13256,41 @@ pub fn lock_preflight(
                     "connectors.{connector} is locked to an image in your local Docker daemon, \
                      which no cluster node can pull. Push it to a registry first."
                 ))
+                .with_fix(rebuild_hint(plugin_dir, true)),
+            ));
+        }
+    }
+    if decl.runner.is_some() {
+        let Some(entry) = lock.and_then(|lock| lock.runner.as_ref()) else {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{} declares a runner layer, but {} records no runner image for it. Build \
+                     it before deploying.",
+                    crate::connector_build::CONNECTORS_FILE,
+                    crate::connector_build::CONNECTOR_LOCK_FILE
+                ))
+                .with_fix(rebuild_hint(plugin_dir, false)),
+            ));
+        };
+        if let Some(fresh) = recomputed.get(crate::connector_build::RUNNER_DIGEST_KEY) {
+            if &entry.source_digest != fresh {
+                return Err(anyhow::Error::from(
+                    crate::exit::CliError::usage(format!(
+                        "the runner layer has changed since {} was written, so the locked \
+                         runner image no longer matches this source.",
+                        crate::connector_build::CONNECTOR_LOCK_FILE
+                    ))
+                    .with_fix(rebuild_hint(plugin_dir, false)),
+                ));
+            }
+        }
+        if tier == DeployTier::Cluster && entry.delivery == Delivery::LocalDaemon {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(
+                    "the runner layer is locked to an image in your local Docker daemon, which \
+                     no cluster node can pull. Push it to a registry first."
+                        .to_string(),
+                )
                 .with_fix(rebuild_hint(plugin_dir, true)),
             ));
         }
@@ -13236,6 +13488,14 @@ pub fn recompute_source_digests(
             connector.clone(),
             crate::connector_build::source_digest_of(&context, build)
                 .with_context(|| format!("connectors.{connector}"))?,
+        );
+    }
+    if let Some(runner) = &decl.runner {
+        let context = crate::connector_build::resolve_context(plugin_dir, &runner.build.context)
+            .context("runner")?;
+        digests.insert(
+            crate::connector_build::RUNNER_DIGEST_KEY.to_string(),
+            crate::connector_build::source_digest_of(&context, &runner.build).context("runner")?,
         );
     }
     Ok(digests)
@@ -13631,6 +13891,7 @@ async fn start_skill_connectors(
     let lock = cb::load_lock(plugin_dir)?.unwrap_or_else(|| cb::ConnectorLockFileDecl {
         version: cb::LOCK_VERSION,
         connectors: std::collections::BTreeMap::new(),
+        runner: None,
     });
     let mut started = Vec::new();
     let mut readiness_targets = Vec::new();

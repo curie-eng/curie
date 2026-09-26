@@ -17,11 +17,13 @@ from urllib.parse import urlsplit
 # ``ApprovalCreate``; ``EvalReport`` kept its name.
 from aci_protocol import ApprovalRequest as ApprovalRequest
 from aci_protocol import EvalReport as EvalReport
+from aci_protocol import PublicationContext as PublicationContext
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
 from plugin_format.connector_render import agent_forges_join
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -43,6 +45,7 @@ from .models import (
 )
 from .publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from .repo_full_name import RepoFullName
+from .runner_resources import RunnerResourcesError, validate_runner_resources
 from .source_binding import (
     validate_revision,
     validate_source_binding_keys,
@@ -162,6 +165,13 @@ _validate_thinking_override = _nullable_override_validator(
 _validate_model_override = _nullable_override_validator(
     "model", "a model id like 'claude-sonnet-5' or 'kimi-k2'"
 )
+
+
+def _validate_runner_resources(value: Any) -> Any:
+    try:
+        return validate_runner_resources(value)
+    except RunnerResourcesError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _slack_shape_error(value: str) -> str:
@@ -1266,6 +1276,10 @@ class AgentUpdate(BaseModel):
         ]
         | None
     ) = None
+    # Per-agent runner resources (#3209). Same three-way semantics as `model`:
+    # omitted is unchanged, explicit null clears to the chart block, and an
+    # object sets requests and limits.
+    runner_resources: dict[str, Any] | None = None
     # New permission gates (#245). Omitted (None) leaves the current gates
     # unchanged; an explicit empty list clears them.
     approval_required_tools: list[str] | None = None
@@ -1301,6 +1315,7 @@ class AgentUpdate(BaseModel):
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
+    _check_runner_resources = field_validator("runner_resources")(_validate_runner_resources)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
@@ -1337,6 +1352,8 @@ class AgentOut(BaseModel):
     thinking: str | None
     # Null means the platform default execution deadline (1800 s) (#3071).
     execution_deadline_seconds: int | None = None
+    # Null means the chart runner resource block (#3209).
+    runner_resources: dict[str, Any] | None = None
     approval_required_tools: list[str] | None
     approval_routes: dict[str, ApprovalRouteBindingOut] | None
     # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
@@ -1675,8 +1692,7 @@ class PublicationCreate(BaseModel):
         if builtin_relay:
             if self.reply_endpoint is not None:
                 raise ValueError(
-                    "the built-in cluster-message publication reply route must not "
-                    "set an endpoint"
+                    "the built-in cluster-message publication reply route must not set an endpoint"
                 )
         elif slack and self.reply_endpoint is not None:
             # ADR-0168 decision 3 keeps the old custom-transport form for
@@ -1769,6 +1785,47 @@ class ReviewRevisionOut(BaseModel):
 class ReviewRevisionCancel(BaseModel):
     origin_key: str = Field(min_length=1, max_length=180)
     expected_version: int = Field(ge=1, strict=True)
+
+
+class PublicationContextMint(BaseModel):
+    """Trusted worker identity for a running factory execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: uuid.UUID
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    runtime_epoch: int = Field(gt=0, strict=True)
+    queued_event_id: str = Field(min_length=1, max_length=1024)
+
+
+class PublicationPrecheck(BaseModel):
+    """Observed metadata and a proposal, with no caller selected resource."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_title: str = Field(max_length=256)
+    observed_body_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: AwareDatetime
+    proposed_title: str = Field(min_length=1, max_length=256)
+    proposed_body: str = Field(min_length=1, max_length=65_536)
+
+    @field_validator("observed_title", "proposed_title", "proposed_body")
+    @classmethod
+    def _utf8_metadata(cls, value: str) -> str:
+        value.encode("utf-8")
+        return value
+
+    @field_validator("proposed_title", "proposed_body")
+    @classmethod
+    def _nonblank_metadata(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("publication title and body must be nonblank")
+        return value
+
+
+class PublicationPrecheckResult(BaseModel):
+    result: Literal["unchanged", "metadata_changed"]
 
 
 class PublicationLineageAdvance(BaseModel):
@@ -1877,9 +1934,7 @@ WorkItemOutcomeState = Literal[
     "published",
     "completed_unpublished",
 ]
-WorkItemCiState = Literal[
-    "passing", "failing", "pending", "none", "unavailable", "not_applicable"
-]
+WorkItemCiState = Literal["passing", "failing", "pending", "none", "unavailable", "not_applicable"]
 
 
 class WorkItemRequestOut(BaseModel):
