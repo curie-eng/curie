@@ -61,8 +61,9 @@ bound to an explicit user list`. To approve from the CLI, declare the gate in
 }
 ```
 
-The route must be bound with an explicit user list before a deploy can succeed.
-A deploy whose bundle declares a route the agent has not bound is refused with
+The route must be bound before a deploy can succeed, and for CLI approval it must
+be bound with an explicit user list: deploy accepts a binding without
+`--route-approvers`, but an operator principal then still gets the 403. A deploy whose bundle declares a route the agent has not bound is refused with
 no version, bundle, or deployment created; for a new agent, that first deploy
 still creates the agent so the route can be bound. Its error prints the bind
 command. Bind, then deploy again:
