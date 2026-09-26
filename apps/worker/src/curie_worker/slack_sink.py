@@ -322,6 +322,11 @@ class SlackReplyAdapter:
         identity = token_identity(route.adapter, route.endpoint)
         return None if identity in self._tokens else _missing_token(identity)
 
+    def edits_in_place(self, kind: str, route: TargetRoute) -> bool:
+        """Slack's update edits a message its reader already sees (ADR-0168 decision 6)."""
+
+        return True
+
     async def emit(
         self,
         event: ReplyEvent,

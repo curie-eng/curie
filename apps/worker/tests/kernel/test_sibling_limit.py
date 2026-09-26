@@ -363,7 +363,16 @@ def test_two_inboxes_answering_each_other_in_one_thread_stop_at_the_limit(
             port = server.port
             assert port is not None
             async with make_harness(
-                binding=_mail_binding(port), sink=_mail_sink(), sibling_limit_factory=_mail_limit
+                binding=_mail_binding(port),
+                sink=_mail_sink(),
+                sibling_limit_factory=_mail_limit,
+                # The shimmer clear in the kernel's exit path is unconditional
+                # on every path, including a pre-binding drop (EB-B6(a)); on
+                # Slack that is a no-op, but on this raw capture it would show
+                # up as a spurious ``turn.status`` beside the drop's own
+                # completion. Off here so the assertion below reads only what
+                # ADR-0168 decision 6 is actually responsible for.
+                shimmer=False,
             ) as h:
                 h.runner.default_script = [Final(text="answer", status=DONE)]
                 turns = [
