@@ -73,14 +73,16 @@ class _Seed:
                 ).all()
             )
 
-    async def add_run(self, slot: datetime, started_at: datetime) -> uuid.UUID:
+    async def add_run(
+        self, slot: datetime, started_at: datetime, outcome: str | None = None
+    ) -> uuid.UUID:
         run_id = uuid.uuid4()
         async with self.engine.begin() as conn:
             await conn.execute(
                 text(
                     "INSERT INTO curie.hook_runs "
                     "(id, agent_id, name, slot_utc, version_id, outcome, started_at) "
-                    "VALUES (:id, :a, :n, :slot, :v, NULL, :started)"
+                    "VALUES (:id, :a, :n, :slot, :v, :outcome, :started)"
                 ),
                 {
                     "id": run_id,
@@ -89,6 +91,7 @@ class _Seed:
                     "slot": slot,
                     "v": self.version_id,
                     "started": started_at,
+                    "outcome": outcome,
                 },
             )
         return run_id
@@ -217,6 +220,7 @@ def _loop(
     slot: datetime,
     *,
     is_killed: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
+    started_at: datetime | None = None,
 ) -> CronSchedulerLoop:
     return CronSchedulerLoop(
         engine=engine,
@@ -229,7 +233,7 @@ def _loop(
         delivery_budget_s=BUDGET_S,
         default_max_usd_per_day=10.0,
         default_max_output_tokens_per_run=100_000,
-        started_at=slot - timedelta(seconds=30),
+        started_at=started_at or slot - timedelta(seconds=30),
     )
 
 
@@ -686,5 +690,97 @@ def test_a_deployment_after_the_watermark_fires_no_slot_from_before_it(
             await _pass_once(seed, names["stream"], _trigger(seed))
             assert await seed.runs() == []
             assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+async def _later_pass(seed: _Seed, stream: str, trigger: dict[str, Any], now: datetime) -> None:
+    """A pass whose window starts after the deferred slot, so only the retry
+    path, never first admission, can put that slot back on the stream."""
+    client = _async_redis()
+    try:
+        loop = _loop(
+            seed.engine,
+            client,
+            _Triggers(seed, trigger),
+            stream,
+            seed.slot,
+            started_at=now - timedelta(seconds=30),
+        )
+        await loop.one_pass(now=now)
+    finally:
+        await client.aclose()
+
+
+def test_deferred_fire_is_retried_on_the_next_tick(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """#2929: a slot the kernel recorded ``deferred`` fires again on a later
+    tick, as the same slot, once more in flight and under a fresh event id so
+    the done marker of the deferred delivery cannot swallow it."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            now = seed.slot + timedelta(minutes=5)
+            await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+            await _later_pass(seed, names["stream"], _trigger(seed), now)
+
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, None)]
+            assert rows[0].ended_at is None
+            entries = _entries(sync_redis, names["stream"])
+            assert len(entries) == 1
+            turn = entries[0]
+            assert turn.source is TurnSource.CRON
+            assert turn.hook_run is not None
+            assert turn.hook_run.slot_utc == seed.slot.isoformat()
+            assert turn.event_id != f"cron:{seed.agent_id}:{HOOK}:{seed.slot.isoformat()}"
+            assert turn.reply_handle is not None
+            assert turn.reply_handle.channel == seed.address
+
+    asyncio.run(body())
+
+
+def test_deferred_fire_past_the_catch_up_ceiling_records_skipped(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A weekly hook whose thread stayed busy past the 24 h ceiling is not
+    fired late: its slot is recorded ``skipped`` and nothing is enqueued."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            now = seed.slot + timedelta(hours=25)
+            dow = (seed.slot.weekday() + 1) % 7  # cron: Sunday is 0
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} {seed.slot.hour} * * {dow}")
+            await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+            await _later_pass(seed, names["stream"], trigger, now)
+
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "skipped")]
+            assert rows[0].ended_at is not None
+            assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+def test_deferred_fire_past_its_own_interval_records_skipped(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A fine-grained schedule ages out at its own interval, well inside the
+    ceiling: a five-minute hook deferred six minutes is superseded."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            now = seed.slot + timedelta(minutes=6)
+            await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+            trigger = _trigger(seed, schedule="*/5 * * * *")
+            await _later_pass(seed, names["stream"], trigger, now)
+
+            rows = await seed.runs()
+            assert (seed.slot, "skipped") in [(r.slot_utc, r.outcome) for r in rows]
+            assert all(
+                t.hook_run is None or t.hook_run.slot_utc != seed.slot.isoformat()
+                for t in _entries(sync_redis, names["stream"])
+            )
 
     asyncio.run(body())

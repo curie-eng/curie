@@ -2439,14 +2439,15 @@ def test_a_job_never_steers_a_live_session(make_harness, make_hook_run) -> None:
                 hook_run=run.ref,
             )
 
-            for _ in range(5):
-                with pytest.raises(ThreadBusyError):
-                    await h.kernel.process_event(event)
+            # #2929: the fire is recorded deferred and the delivery settles;
+            # the scheduler, not stream reclaim, owns the retry.
+            await h.kernel.process_event(event)
 
             assert h.sink.text_posts == [], "a deferred job left a booting notice"
             assert h.runner.steers == [], "a job steered a live session"
             assert h.runner.opened == [], "a job opened a turn beside a live one"
-            assert await run.state() == (None, None)
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
 
     asyncio.run(go())
 
@@ -2496,18 +2497,18 @@ def test_an_unreadable_session_defers_the_job(make_harness, make_hook_run) -> No
             h.runner.turn_active = False
             h.runner.status_fails = True
 
-            with pytest.raises(ThreadBusyError):
-                await h.kernel.process_event(
-                    _qevent(
-                        "digest",
-                        placeholder=None,
-                        source=TurnSource.CRON,
-                        hook_run=run.ref,
-                    )
+            await h.kernel.process_event(
+                _qevent(
+                    "digest",
+                    placeholder=None,
+                    source=TurnSource.CRON,
+                    hook_run=run.ref,
                 )
+            )
 
             assert h.runner.opened == [], "an unreadable session let a job open a turn"
-            assert await run.state() == (None, None)
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
 
     asyncio.run(go())
 
@@ -2527,18 +2528,18 @@ def test_a_status_without_turn_active_defers_the_job(make_harness, make_hook_run
             h.runner.turn_active = False
             h.runner.status_malformed = True
 
-            with pytest.raises(ThreadBusyError):
-                await h.kernel.process_event(
-                    _qevent(
-                        "digest",
-                        placeholder=None,
-                        source=TurnSource.CRON,
-                        hook_run=run.ref,
-                    )
+            await h.kernel.process_event(
+                _qevent(
+                    "digest",
+                    placeholder=None,
+                    source=TurnSource.CRON,
+                    hook_run=run.ref,
                 )
+            )
 
             assert h.runner.opened == []
-            assert await run.state() == (None, None)
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "deferred"
 
     asyncio.run(go())
 

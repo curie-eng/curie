@@ -719,3 +719,78 @@ def test_the_returned_entry_carries_the_connector_credential(tmp_path: Path) -> 
     assert entries["github"]["headers"] == {
         "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
     }
+
+
+# --------------------------------------------------------------------------- #
+# The route renders only what the agent's targets allow (ADR-0168 decision 8).
+# Both appliers of this route, `curie cluster deploy` and the worker's reconcile
+# loop, prune what they own and no longer see, so narrowing here is what keeps
+# an unlisted connector out of the agent's pods.
+# --------------------------------------------------------------------------- #
+_TWO_HOSTED = HOSTED + (
+    "  loki:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    args: [-t, streamable-http]\n"
+    "    env: {GRAFANA_URL: 'https://g.example.com'}\n"
+    "    secrets: [LOKI_TOKEN]\n"
+)
+
+
+def _allowlisted_bundle(root: Path, deploy_yaml: str) -> Path:
+    _bundle(root, _TWO_HOSTED)
+    (root / "b" / "deploy.yaml").write_text(deploy_yaml, encoding="utf-8")
+    return root
+
+
+def _rendered(client: Any, headers: dict[str, str], root: Path) -> dict[str, Any]:
+    agent_id, version_id = _version_with_bundle(client, headers, _archive(root))
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={"release": RELEASE, "namespace": NAMESPACE, "app_name": APP_NAME},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _connector_of(obj: dict[str, Any]) -> str:
+    return obj["metadata"]["labels"]["app.kubernetes.io/name"].rsplit("-mcp-", 1)[1]
+
+
+# @spec ADR-0168 d8
+def test_the_route_renders_only_the_connectors_the_agents_target_lists(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _allowlisted_bundle(
+        tmp_path,
+        "targets:\n  prod:\n    agent: acme-bot\n    env: prod\n    connectors: [grafana]\n",
+    )
+    body = _rendered(client, auth_headers, root)
+    assert {_connector_of(o) for o in body["manifests"]} == {"grafana"}
+    assert sorted(body["mcp_entries"]) == ["grafana"]
+    assert body["owned_secret_keys"] == ["GRAFANA_TOKEN"]
+
+
+# @spec ADR-0168 d8
+def test_an_empty_allowlist_renders_nothing_so_the_appliers_prune_everything(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _allowlisted_bundle(
+        tmp_path, "targets:\n  prod:\n    agent: acme-bot\n    env: prod\n    connectors: []\n"
+    )
+    body = _rendered(client, auth_headers, root)
+    assert body["manifests"] == []
+    assert body["mcp_entries"] == {}
+    assert body["owned_secret_keys"] == []
+
+
+# @spec ADR-0168 d8
+def test_an_agent_no_target_names_still_renders_every_connector(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _allowlisted_bundle(
+        tmp_path, "targets:\n  dev:\n    agent: acme-dev\n    connectors: []\n"
+    )
+    body = _rendered(client, auth_headers, root)
+    assert {_connector_of(o) for o in body["manifests"]} == {"grafana", "loki"}
+    assert body["owned_secret_keys"] == ["GRAFANA_TOKEN", "LOKI_TOKEN"]

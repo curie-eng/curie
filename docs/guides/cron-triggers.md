@@ -92,9 +92,16 @@ platform API and no run record.
 
 A hook that failed on its newest slot is visible in that one response,
 including when the three newest slots all failed. A slot that has not ended
-yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, and
-`skipped`. `deferred` and `reclaimed` are part of the run record vocabulary
-and are not written by the current scheduler.
+yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, `deferred`,
+and `skipped`. `reclaimed` is part of the run record vocabulary and is not
+written by the current scheduler.
+
+A fire aimed at a thread that holds a live session does not steer that
+session or open a second one. It records `deferred`, and the scheduler fires
+it again on each later tick until the thread is idle. A deferred slot that
+waits longer than the schedule's interval, or longer than six hours for a
+coarser schedule, records `skipped` instead. A hook with no `target` is never
+deferred.
 
 Webhook triggers validate at deploy but are not yet wired to a live wake-up;
 see the [triggers seam](../interfaces/triggers/INTERFACE.md).

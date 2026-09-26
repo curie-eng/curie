@@ -90,6 +90,7 @@ fn deploy_opts(
         tier,
         agent: agent.map(str::to_string),
         target: None,
+        identity: None,
         plugin_dir: dir.to_path_buf(),
         api_url: server.base_url.clone(),
         api_key: TEST_API_KEY.to_string(),

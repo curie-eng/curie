@@ -2017,6 +2017,25 @@ pub fn hosted_env_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// `decl` narrowed to a target's connector allowlist; `None` keeps every one.
+/// @spec ADR-0168 d8. The API's `connectors_for_agent` decides the list; this
+/// only applies the answer a resolved target carried.
+pub fn restrict_to(decl: &ConnectorsFileDecl, allowlist: Option<&[String]>) -> ConnectorsFileDecl {
+    match allowlist {
+        None => decl.clone(),
+        Some(allowed) => ConnectorsFileDecl {
+            connectors: decl
+                .connectors
+                .iter()
+                .filter(|(name, _)| allowed.contains(name))
+                .map(|(name, spec)| (name.clone(), spec.clone()))
+                .collect(),
+            // The runner layer is not a connector, so no allowlist narrows it.
+            runner: decl.runner.clone(),
+        },
+    }
+}
+
 /// The non-`CURIE_`-prefixed names a connector secret must never claim.
 ///
 /// The twin of `_CREDENTIAL_KEYS | _REDIRECT_CAPTURE_KEYS` in
@@ -2257,5 +2276,30 @@ connectors:
 "#,
         );
         assert_eq!(hosted_env_secret_names(&decl), vec!["PAT".to_string()]);
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn restrict_to_keeps_only_the_allowlist() {
+        let decl = parse_connectors(
+            "connectors:\n  grafana:\n    image: g:1\n    secrets: [GRAFANA_TOKEN]\n  \
+             loki:\n    image: g:1\n    secrets: [LOKI_TOKEN]\n",
+        )
+        .unwrap();
+        let only = restrict_to(&decl, Some(&["grafana".to_string()]));
+        assert_eq!(only.connectors.keys().collect::<Vec<_>>(), ["grafana"]);
+        assert_eq!(hosted_env_secret_names(&only), ["GRAFANA_TOKEN"]);
+        assert!(restrict_to(&decl, Some(&[])).connectors.is_empty());
+        assert_eq!(restrict_to(&decl, None).connectors.len(), 2);
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn restrict_to_keeps_the_runner_layer() {
+        let decl = ConnectorsFileDecl {
+            connectors: BTreeMap::new(),
+            runner: Some(RunnerSpecDecl::default()),
+        };
+        assert!(restrict_to(&decl, Some(&[])).runner.is_some());
     }
 }
