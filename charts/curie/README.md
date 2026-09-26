@@ -1748,13 +1748,9 @@ on a later `up`. The one shape `up` refuses outright is a list explicitly
 recorded as empty (`[]`, as opposed to the key being absent); leave the key out
 rather than clearing it to an empty list.
 
-The API validates a Slack binding's identity against this declared list, but
-the database refuses to store a Slack binding naming any identity other than
-`default` until
-[#3146](https://github.com/curie-eng/curie/issues/3146). Such a binding is
-answered with a 422 that says so, on create, add and move alike. Declaring an
-identity readies the chart and the services for it; no binding can route to
-it.
+The API validates a Slack binding's identity against this declared list and
+stores it on the binding, so a declared identity can be bound to any channel,
+including one another identity already answers in (ADR-0168 decision 3).
 
 Each identity's bot token is also the one its turns are answered with. The
 worker sets the assistant status, edits the reply, posts and settles approval

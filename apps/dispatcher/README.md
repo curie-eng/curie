@@ -168,18 +168,17 @@ before. Several dispatcher replicas serving one identity remain out of scope
 (#2248).
 
 A turn carries the identity of the app it arrived on, never a field of the
-delivery. `default` still mints a null `reply_handle.adapter` until #3146;
-every other identity mints its name, and its deliveries are claimed under
-`<slack id>:<identity>`. The enqueue log line names both: the existing
+delivery. Every identity, `default` included, mints its name in
+`reply_handle.adapter`, and every identity but `default` has its deliveries
+claimed under `<slack id>:<identity>`. The enqueue log line names both: the existing
 `identity=` field is the release identity, unchanged, and a new
 `slack_identity=` field is the identity whose app the delivery arrived on.
 Every placeholder, card stamp, ephemeral and dialog is made with the token of
 the app the delivery arrived on, which for a card click is the app that posted
 the card.
 
-A named identity's app connects and preflights like any other, but the
-database refuses to store a binding naming it until #3146; until that lands,
-a named identity is declared and connected, not yet usable for routing a turn.
+A named identity's app connects and preflights like any other, and a binding
+naming it routes its turns.
 
 Preflight runs per identity. An identity with a blank token, a missing
 `channels:read` scope, or one the shared preflight deadline left unattempted is
