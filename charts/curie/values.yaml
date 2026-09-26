@@ -1960,6 +1960,11 @@ worker:
     # promised it would postpone upgrades during ordinary traffic. Raising the
     # delivery budget therefore raises this automatically rather than breaking
     # the render for a value you never touched.
+    # Helm needs a timeout of at least the effective drain wait plus the 120
+    # second drain Job allowance, the effective worker termination grace, and
+    # 60 seconds for scheduling and Helm operations. The pre upgrade drain Job
+    # publishes this minimum in curie.ai/minimum-helm-timeout-seconds. With the
+    # default values it is 900 + 120 + 1860 + 60 = 2940 seconds.
     timeoutSeconds: 900
     # How often the gate re-reads the in-flight set while waiting.
     pollIntervalSeconds: 5

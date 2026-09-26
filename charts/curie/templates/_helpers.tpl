@@ -1822,6 +1822,17 @@ securityContext:
 {{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
 {{- end -}}
 
+{{/* The drain Job may run for 120 seconds beyond its effective wait. */}}
+{{- define "curie.worker.upgradeDrain.jobDeadline" -}}
+{{- add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 120 -}}
+{{- end -}}
+
+{{/* The upgrade timeout covers the complete drain Job deadline, one worker
+     termination grace, and 60 seconds for scheduling and Helm operations. */}}
+{{- define "curie.worker.minimumHelmTimeoutSeconds" -}}
+{{- add (int64 (include "curie.worker.upgradeDrain.jobDeadline" .)) (int64 (include "curie.worker.terminationGrace" .)) 60 -}}
+{{- end -}}
+
 {{/* The roll hold: min(quiesceTtlSeconds, effective wait). */}}
 {{- define "curie.worker.upgradeDrain.quiesceTtl" -}}
 {{- min (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (int64 (include "curie.worker.upgradeDrain.timeout" .)) -}}
