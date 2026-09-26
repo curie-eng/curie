@@ -760,6 +760,35 @@ serverFiles:
               description: >-
                 A curie_source=curie-sre-bot root filesystem has stayed below
                 20 percent free for 15 minutes.
+          # Kubelet eviction watches bytes, not inodes. A full inode table on
+          # the root filesystem (which backs host /tmp) breaks runc exec state,
+          # so every exec probe fails while DiskPressure stays False (#2870).
+          - alert: CurieRootInodesLow
+            expr: |
+              (
+                node_filesystem_files_free{
+                  curie_source="curie-sre-bot",
+                  mountpoint="/",
+                  fstype!~"rootfs|tmpfs|overlay"
+                }
+                /
+                node_filesystem_files{
+                  curie_source="curie-sre-bot",
+                  mountpoint="/",
+                  fstype!~"rootfs|tmpfs|overlay"
+                }
+              ) < 0.05
+            for: 15m
+            labels:
+              severity: page
+              component: curie-node
+            annotations:
+              summary: Root filesystem has less than 5 percent of inodes free
+              description: >-
+                A curie_source=curie-sre-bot root filesystem has stayed below
+                5 percent free inodes for 15 minutes. Exec probes and kubectl
+                exec fail with no space left on device even while kubelet
+                reports DiskPressure=False.
           - alert: CurieDuplicateNodeExporter
             expr: |
               count(

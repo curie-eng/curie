@@ -564,6 +564,51 @@ tests:
         alertname: CurieRootDiskPressure
         exp_alerts: []
 
+  # Issue #2870: the soak node's root inode table hit 100 percent with bytes
+  # only 84 percent used. runc could not create /tmp exec state, every exec
+  # probe failed, and kubelet still said DiskPressure=False.
+  - name: root inode exhaustion fires while bytes are healthy
+    interval: 5m
+    input_series:
+      - series: 'node_filesystem_files_free{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '4+0x6'
+      - series: 'node_filesystem_files{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '100+0x6'
+      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '16+0x6'
+      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '100+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieRootInodesLow
+        exp_alerts:
+          - exp_labels:
+              component: curie-node
+              curie_source: curie-sre-bot
+              fstype: ext4
+              instance: k8:9101
+              mountpoint: /
+              severity: page
+            exp_annotations:
+              summary: Root filesystem has less than 5 percent of inodes free
+              description: >-
+                A curie_source=curie-sre-bot root filesystem has stayed below
+                5 percent free inodes for 15 minutes. Exec probes and kubectl
+                exec fail with no space left on device even while kubelet
+                reports DiskPressure=False.
+
+  - name: healthy root inodes stay quiet
+    interval: 5m
+    input_series:
+      - series: 'node_filesystem_files_free{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '84+0x6'
+      - series: 'node_filesystem_files{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '100+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieRootInodesLow
+        exp_alerts: []
+
   - name: duplicate node exporter fires
     interval: 5m
     input_series:

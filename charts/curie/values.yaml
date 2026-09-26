@@ -125,6 +125,16 @@ priorityClasses:
 # ---------------------------------------------------------------------------
 langfuse:
   deploy: true
+  # Langfuse writes every ingested event to <rustfs.bucket>/events/ and never
+  # deletes it after ingest; ClickHouse keeps the trace. Each trace costs about
+  # three inodes on the RustFS volume, and on a long-lived install those
+  # objects filled the node's inode table while kubelet still reported
+  # DiskPressure=False (#2870). The in-chart RustFS init Job installs an S3
+  # lifecycle rule that expires events/ after this many days. 0 disables the
+  # rule. A BYO store (rustfs.deploy false) is not touched: put the same
+  # expiration rule on its bucket yourself.
+  eventUpload:
+    retentionDays: 2
   # Bare external hostname required only when deploy is false. Consumers build
   # the URL as <langfuse.scheme>://<host>:<langfuse.web.service.port>, with the
   # scheme coming from `langfuse.scheme` below; do not include a scheme or port

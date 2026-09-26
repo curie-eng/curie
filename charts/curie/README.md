@@ -961,7 +961,10 @@ Scope each role to the bucket it actually uses:
   still consumes `rustfs.auth` static keys for that bucket; the key-free path
   only omits credentials from the API, the worker, and the sandbox bundle-fetch
   init container. Scope those keys (or a Langfuse-specific IAM user) to
-  `rustfs.bucket`.
+  `rustfs.bucket`. Langfuse never deletes `events/` objects after ingest. The
+  in-chart RustFS gets an expiration rule for that prefix
+  (`langfuse.eventUpload.retentionDays`, default 2), but a BYO bucket is not
+  touched, so add the same lifecycle rule to it yourself.
 
 Two constraints are worth stating plainly.
 
