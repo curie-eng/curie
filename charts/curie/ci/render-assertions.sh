@@ -2320,4 +2320,53 @@ PYEOF
 echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); and the dispatcher rolls out with Recreate while every other workload keeps its strategy."
+echo "=== Assertion 17: rustfs-init caps Langfuse event-upload objects with a lifecycle rule (issue #2870) ==="
+# Langfuse never deletes its S3 event-upload objects after ingest. Each trace
+# is about three inodes on the RustFS volume, and on 2026-09-21 they filled the
+# soak node's inode table while kubelet still reported DiskPressure=False. The
+# bucket init Job must install an expiration rule scoped to the events/ prefix,
+# and langfuse.eventUpload.retentionDays=0 must render no rule at all.
+check_event_retention() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json, re, sys, yaml
+path, want = sys.argv[1], sys.argv[2]
+script = None
+with open(path) as fh:
+    for doc in yaml.safe_load_all(fh):
+        if isinstance(doc, dict) and doc.get("kind") == "Job" and doc["metadata"]["name"].endswith("-rustfs-init"):
+            script = doc["spec"]["template"]["spec"]["containers"][0]["command"][-1]
+if script is None:
+    sys.exit("rustfs-init Job not rendered")
+has_call = "put-bucket-lifecycle-configuration" in script
+if want == "none":
+    sys.exit("retention disabled but a lifecycle rule still renders" if has_call else 0)
+if not has_call:
+    sys.exit("rustfs-init never installs a lifecycle rule on the Langfuse bucket")
+m = re.search(r"--lifecycle-configuration '(\{.*?\})'", script, re.S)
+if not m:
+    sys.exit("lifecycle configuration is not an inline JSON document")
+rules = json.loads(m.group(1))["Rules"]
+if len(rules) != 1:
+    sys.exit("expected exactly one lifecycle rule, got %r" % rules)
+rule = rules[0]
+if rule.get("Status") != "Enabled" or rule.get("Filter") != {"Prefix": "events/"}:
+    sys.exit("lifecycle rule must be Enabled and scoped to events/, got %r" % rule)
+if rule.get("Expiration") != {"Days": int(want)}:
+    sys.exit("lifecycle rule expires after %r, expected %s days" % (rule.get("Expiration"), want))
+if '--bucket "langfuse"' not in script:
+    sys.exit("lifecycle rule is not applied to the Langfuse bucket")
+PYEOF
+}
+RETENTION_DEFAULT="$TMP/retention-default.yaml"
+helm template curie "$CHART" --show-only templates/rustfs.yaml > "$RETENTION_DEFAULT"
+check_event_retention "$RETENTION_DEFAULT" 2 || fail "default render must expire Langfuse event uploads after 2 days"
+RETENTION_SET="$TMP/retention-set.yaml"
+helm template curie "$CHART" --show-only templates/rustfs.yaml --set langfuse.eventUpload.retentionDays=7 > "$RETENTION_SET"
+check_event_retention "$RETENTION_SET" 7 || fail "an explicit retentionDays must set the expiration"
+RETENTION_OFF="$TMP/retention-off.yaml"
+helm template curie "$CHART" --show-only templates/rustfs.yaml --set langfuse.eventUpload.retentionDays=0 > "$RETENTION_OFF"
+check_event_retention "$RETENTION_OFF" none || fail "retentionDays=0 must render no lifecycle rule"
+echo "  ok: rustfs-init expires events/ after retentionDays (default 2), and 0 disables it"
+
+echo
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); and the dispatcher rolls out with Recreate while every other workload keeps its strategy; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays."
