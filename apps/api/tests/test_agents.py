@@ -1646,3 +1646,23 @@ def test_an_agent_name_that_only_looks_like_the_join_still_creates(
     ok = _create(client, auth_headers, name=name, channel=_slack("C0EXAMPLE2"))
     assert ok.status_code == 201, ok.text
     assert ok.json()["name"] == name
+
+
+# --- `self` is reserved as an agent name (ADR-0168 decision 7) --------------
+#
+# `admits` uses the reserved entry `self` to mean the agent a bundle is
+# deployed as, and both other name-shape gates already refuse a target
+# genuinely named that: `deploy.yaml`'s `target.agent`
+# (`deploy.bad_agent_name`) and the CLI's per-agent secret binding. `POST
+# /agents` is the remaining hole -- `AgentCreate.name` reached the database
+# with no check for the sentinel -- and it is the same write seam #1446 closed
+# for the `-mcp-` join.
+
+
+def test_agent_name_self_is_422(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    bad = _create(client, auth_headers, name="self", channel=_slack("C0EXAMPLE3"))
+    assert bad.status_code == 422, bad.text
+    assert any("name" in err["loc"] for err in bad.json()["detail"]), bad.text
+    assert "reserved" in bad.text, bad.text
