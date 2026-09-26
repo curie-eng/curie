@@ -13,8 +13,31 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 # "blocked" is the kill-switch outcome for a targetless run (#2963, ADR-0099);
-# migration 0048 already allows it.
-HookRunOutcome = Literal["ran", "failed", "blocked"]
+# migration 0048 already allows it. "deferred" is a fire that met a live session
+# on its thread (#2929); the scheduler reopens it on a later tick.
+HookRunOutcome = Literal["ran", "failed", "blocked", "deferred", "skipped"]
+
+_RETRY_MARK = "retry"
+
+
+def retry_event_id(base: str, expires_at: datetime) -> str:
+    """A deferred slot's retry id: fresh per retry, carrying its catch-up expiry.
+
+    The deferred delivery is marked done under its own id, so a retry needs one
+    that marker cannot match. The expiry lets the kernel refuse a retry that sat
+    in the stream past the slot's catch-up bound (#2929).
+    """
+
+    return f"{base}:{_RETRY_MARK}:{int(expires_at.timestamp())}:{uuid.uuid4().hex}"
+
+
+def retry_expiry(event_id: str) -> datetime | None:
+    """The catch-up expiry a retry id carries, or None for a first fire."""
+
+    parts = event_id.rsplit(":", 3)
+    if len(parts) != 4 or parts[1] != _RETRY_MARK or not parts[2].isdigit():
+        return None
+    return datetime.fromtimestamp(int(parts[2]), UTC)
 
 
 class HookRunRecorderError(RuntimeError):

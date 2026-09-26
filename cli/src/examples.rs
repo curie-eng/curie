@@ -1811,6 +1811,7 @@ async fn deploy_embedded_sre_bot(
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: bundle_dir.to_path_buf(),
             api_url: connection.api_url.clone(),
             api_key: connection.api_key.clone(),

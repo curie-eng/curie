@@ -175,10 +175,16 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   identities and this validator never sees it), `deploy.bad_connector_name` (the `connectors.yaml` name
   rule), `deploy.duplicate_connector`, `deploy.null_connectors` (an explicit null allowlist,
   such as a bare `connectors:`, is refused rather than read as all; omit the key or write `[]`),
-  `deploy.unknown_connector` (an allowlist entry `connectors.yaml` does not declare)). Authored
+  `deploy.unknown_connector` (an allowlist entry `connectors.yaml` does not declare),
+  `deploy.conflicting_connectors` (two targets that bind the same agent with different
+  `connectors`, compared as sets)). Authored
   mapping keys are
   checked for duplicates before validation, so a repeated target name fails closed instead of
-  silently selecting the last YAML value.
+  silently selecting the last YAML value. The allowlist is a property of the agent, not of the
+  target that states it (ADR-0168 decision 8): every target naming that agent must carry the same
+  `connectors`, since the connector objects it narrows are named per agent
+  (`<release>-<agent>-mcp-<connector>`), and it narrows both the connectors route's render and the
+  runner's mount for that agent.
 
 The overlay files are not independent of the manifest, which is the part a second consumer is
 most likely to miss: `connectors.yaml` feeds manifest validation. The set of gate names

@@ -354,6 +354,7 @@ fn eval_dry_run_plan_names_sequential_concurrency() {
         cases: None,
         case_ids: Vec::new(),
         channel: None,
+        agent: None,
         namespace: "curie".into(),
         release: "curie".into(),
         listen_host: None,

@@ -106,6 +106,7 @@ async fn run_command_deploy(server: &MockServer, plugin_dir: &Path) -> commands:
         tier: commands::DeployTier::Local,
         agent: None,
         target: None,
+        identity: None,
         plugin_dir: plugin_dir.to_path_buf(),
         api_url: server.base_url.clone(),
         api_key: "test-key".to_string(),
@@ -1368,4 +1369,463 @@ async fn routing_check_swallows_a_body_it_cannot_decode() {
         .await
         .unwrap()
         .is_none());
+}
+
+// --------------------------------------------------------------------------- //
+// A deploy's binding carries the target's identity (ADR-0168 decision 8)
+// --------------------------------------------------------------------------- //
+const IDENTITY: &str = "ops-bot";
+
+/// An agent whose Slack bindings each carry an identity, as the API reads them
+/// back: a default binding reads `"default"`, never an absent key.
+fn agent_json_routes(id: &str, name: &str, routes: &[(&str, &str)]) -> String {
+    let bindings = routes
+        .iter()
+        .map(|(address, identity)| {
+            format!(r#"{{"kind":"slack","address":"{address}","adapter":"{identity}"}}"#)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"id":"{id}","name":"{name}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+    )
+}
+
+fn create_body(server: &MockServer) -> serde_json::Value {
+    server
+        .recorded()
+        .into_iter()
+        .find(|r| r.method == "POST" && r.path == "/agents")
+        .map(|r| serde_json::from_slice(&r.body).expect("create body is JSON"))
+        .expect("one POST /agents")
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_new_agent_is_created_on_the_named_identity() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(
+            201,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, IDENTITY)]),
+        ),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap();
+    assert_eq!(
+        create_body(&server)["channel"],
+        serde_json::json!({"kind": "slack", "address": BOUND, "adapter": IDENTITY})
+    );
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn the_default_identity_is_written_exactly_as_before() {
+    for identity in [None, Some("default")] {
+        let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/agents") => Response::json(200, "[]"),
+            ("POST", "/agents") => {
+                Response::json(201, &agent_json(AGENT_ID, AGENT_NAME, BOUND, None))
+            }
+            (m, p) => panic!("unexpected request: {m} {p}"),
+        });
+        let client = ApiClient::new(&server.base_url, "k").unwrap();
+        client
+            .resolve_agent_as(AGENT_NAME, Some(BOUND), None, identity)
+            .await
+            .unwrap();
+        assert_eq!(
+            create_body(&server)["channel"],
+            serde_json::json!({"kind": "slack", "address": BOUND}),
+            "{identity:?} must send no adapter"
+        );
+    }
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_default_binding_on_the_channel_does_not_hold_a_named_identity() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, "default")],
+        )),
+        ("POST", p) if *p == channels_path() => Response::json(
+            201,
+            &agent_json_routes(
+                AGENT_ID,
+                AGENT_NAME,
+                &[(BOUND, "default"), (BOUND, IDENTITY)],
+            ),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap();
+    assert_eq!(
+        channel_post_bodies(&server),
+        vec![serde_json::json!({"kind": "slack", "address": BOUND, "adapter": IDENTITY})]
+    );
+    assert_no_patch(&server);
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_binding_already_on_the_named_identity_writes_nothing() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, IDENTITY)],
+        )),
+        // Answered, never panicked, so a needless write is RECORDED.
+        ("POST", p) if *p == channels_path() => Response::json(
+            201,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, IDENTITY)]),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap();
+    assert_no_binding_write(&server);
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_conflict_is_success_only_when_this_agent_holds_the_same_identity() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, "default")],
+        )),
+        ("POST", p) if *p == channels_path() => Response::json(
+            409,
+            r#"{"detail":"another agent is already bound to that channel kind and address"}"#,
+        ),
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, "default")]),
+        ),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let err = client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .expect_err("holding the default route is not holding the named one");
+    assert!(format!("{err:#}").contains("409"), "{err:#}");
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_named_identity_the_database_cannot_store_is_a_usage_error_naming_it() {
+    const REFUSAL: &str = "a Slack binding naming an identity other than 'default' cannot be \
+        stored until the database admits it (https://github.com/curie-eng/curie/issues/3146). \
+        The identity is declared; bind the channel under 'default' instead";
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_routes(
+            AGENT_ID,
+            AGENT_NAME,
+            &[(BOUND, "default")],
+        )),
+        ("POST", p) if *p == channels_path() => {
+            Response::json(422, &serde_json::json!({ "detail": REFUSAL }).to_string())
+        }
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let err = client
+        .resolve_agent_as(AGENT_NAME, Some(OTHER), None, Some(IDENTITY))
+        .await
+        .unwrap_err();
+    let (class, fix) = curie::exit::classify(&err);
+    assert_eq!(class.code(), 2, "a usage error, not a generic failure");
+    let message = err.to_string();
+    assert!(message.contains(IDENTITY), "{message}");
+    assert!(
+        message.contains(REFUSAL),
+        "the platform's own reason, verbatim: {message}"
+    );
+    assert!(!message.contains("failed with 422"), "{message}");
+    assert!(fix.expect("a fix").contains("--identity"));
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn an_undeclared_identity_is_a_usage_error_carrying_the_platform_reason() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(
+            422,
+            r#"{"detail":[{"type":"value_error","loc":["body","channel"],"msg":"Value error, slack identity 'ops-bot' is not declared by this installation, which declares 'default'.","input":{}}]}"#,
+        ),
+        (m, p) => panic!("unexpected request: {m} {p}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let err = client
+        .resolve_agent_as(AGENT_NAME, Some(BOUND), None, Some(IDENTITY))
+        .await
+        .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2);
+    assert!(
+        err.to_string()
+            .contains("is not declared by this installation, which declares 'default'"),
+        "{err}"
+    );
+}
+
+// --------------------------------------------------------------------------- //
+// A deploy names its identity, from --identity or a resolved target
+// --------------------------------------------------------------------------- //
+
+fn identity_deploy_opts(
+    server: &MockServer,
+    plugin_dir: &std::path::Path,
+    identity: Option<&str>,
+    target: Option<&str>,
+    slack_channel: Option<&str>,
+) -> DeployOpts {
+    DeployOpts {
+        delivery: None,
+        tier: commands::DeployTier::Local,
+        agent: None,
+        target: target.map(str::to_string),
+        identity: identity.map(str::to_string),
+        plugin_dir: plugin_dir.to_path_buf(),
+        api_url: server.base_url.clone(),
+        api_key: "k".to_string(),
+        slack_channel: slack_channel.map(str::to_string),
+        repo: None,
+        workspace: WorkspaceIntent::Preserve,
+        env: None,
+        label: Some("0.1.0-1".to_string()),
+        secret: vec![],
+        secret_binding_supported: true,
+        connect_hint: "mock API should be reachable".to_string(),
+    }
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_malformed_identity_is_refused_before_any_request() {
+    let server = serve(|req| panic!("no request expected: {} {}", req.method, req.path));
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let err = commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        Some("Ops_Bot"),
+        None,
+        Some(BOUND),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2, "{err:#}");
+    assert!(server.recorded().is_empty());
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_named_identity_with_no_channel_is_refused_before_any_write() {
+    let server = serve(|req| panic!("no request expected: {} {}", req.method, req.path));
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let err = commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        Some(IDENTITY),
+        None,
+        None,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2, "{err:#}");
+    assert!(err.to_string().contains(IDENTITY), "{err}");
+    assert!(server.recorded().is_empty());
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_targets_identity_with_no_channel_is_refused_before_any_write() {
+    // No --identity flag: the name comes only from the resolved target. A
+    // check that reads `opts.identity` alone (ignoring `resolved.identity`)
+    // would see `None` here and let this deploy through to a write.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"ops-bot","connectors":null}"#,
+        ),
+        (m, p) => panic!("no write expected before the no-channel refusal: {m} {p}"),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let err = commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        None,
+        Some("dev"),
+        None,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(curie::exit::classify(&err).0.code(), 2, "{err:#}");
+    assert!(err.to_string().contains(IDENTITY), "{err}");
+    let recorded = server.recorded();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "only the target resolve, no write: {recorded:?}"
+    );
+    assert_eq!(recorded[0].path, "/deploy-targets/resolve");
+}
+
+fn named_identity_route(req: &support::Request) -> Response {
+    match (req.method.as_str(), req.path.as_str()) {
+        // The target names the identity; its channel comes from the flag,
+        // because the only committable Slack id is a placeholder a target refuses.
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"ops-bot","connectors":null}"#,
+        ),
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(
+            201,
+            &agent_json_routes(AGENT_ID, AGENT_NAME, &[(BOUND, IDENTITY)]),
+        ),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    }
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_targets_identity_reaches_the_binding() {
+    let server = serve(named_identity_route);
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        None,
+        Some("dev"),
+        Some(BOUND),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(create_body(&server)["channel"]["adapter"], IDENTITY);
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn the_flag_beats_the_targets_identity() {
+    let server = serve(named_identity_route);
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    commands::deploy(identity_deploy_opts(
+        &server,
+        dir.path(),
+        Some("default"),
+        Some("dev"),
+        Some(BOUND),
+    ))
+    .await
+    .unwrap();
+    assert!(create_body(&server)["channel"].get("adapter").is_none());
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_targeted_cluster_deploy_binds_only_its_connectors_secret_names() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"default","connectors":["grafana"]}"#,
+        ),
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(201, &agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    std::fs::write(
+        dir.path().join("connectors.yaml"),
+        "connectors:\n  grafana:\n    image: ghcr.io/example/g:1\n    secrets: [GRAFANA_TOKEN]\n  \
+         loki:\n    image: ghcr.io/example/g:1\n    secrets: [LOKI_TOKEN]\n",
+    )
+    .unwrap();
+    let mut opts = identity_deploy_opts(&server, dir.path(), None, Some("dev"), Some(BOUND));
+    opts.tier = commands::DeployTier::Cluster;
+    opts.secret_binding_supported = false;
+    commands::deploy(opts).await.unwrap();
+
+    let secrets: Vec<String> = patch_bodies(&server)
+        .iter()
+        .filter_map(|body| body["secrets"].as_object())
+        .flat_map(|map| map.keys().cloned())
+        .collect();
+    assert_eq!(
+        secrets,
+        ["GRAFANA_TOKEN"],
+        "loki is not this target's connector"
+    );
+}
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_local_deploy_narrows_the_bring_up_to_the_targets_connectors() {
+    // Only `restrict_to` and `bring_up_local`'s own refusal are unit-tested
+    // elsewhere; nothing pins that `deploy`'s local-tier branch actually hands
+    // `bring_up_local` the NARROWED decl rather than the bundle's full one. Two
+    // connectors, each declaring a secret nothing here provides: the bring-up
+    // refuses before touching docker (the same fail-fast `bring_up_local`
+    // performs), and which secret name it names is the proof. If the wiring
+    // regressed to the unnarrowed decl, the excluded connector's secret would
+    // be reported too.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"default","connectors":["kept"]}"#,
+        ),
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(201, &agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    std::fs::write(
+        dir.path().join("connectors.yaml"),
+        "connectors:\n  excluded:\n    image: ghcr.io/example/e:1\n    \
+         secrets: [CURIE_TEST_D8_EXCLUDED_TOKEN]\n  kept:\n    image: ghcr.io/example/k:1\n    \
+         secrets: [CURIE_TEST_D8_KEPT_TOKEN]\n",
+    )
+    .unwrap();
+    std::env::remove_var("CURIE_TEST_D8_EXCLUDED_TOKEN");
+    std::env::remove_var("CURIE_TEST_D8_KEPT_TOKEN");
+
+    let opts = identity_deploy_opts(&server, dir.path(), None, Some("dev"), Some(BOUND));
+    let err = commands::deploy(opts).await.unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("CURIE_TEST_D8_KEPT_TOKEN"),
+        "the kept connector's own missing secret is named: {message}"
+    );
+    assert!(
+        !message.contains("CURIE_TEST_D8_EXCLUDED_TOKEN"),
+        "excluded is not this target's connector and must never reach bring_up_local: {message}"
+    );
 }

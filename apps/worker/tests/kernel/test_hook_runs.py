@@ -7,6 +7,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import pytest
@@ -34,10 +35,11 @@ def _event(
     source: TurnSource = TurnSource.CRON,
     hook_run: HookRunRef | None,
     event_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id=event_id or uuid.uuid4().hex,
-        conversation_id=f"thread-{uuid.uuid4().hex}",
+        conversation_id=conversation_id or f"thread-{uuid.uuid4().hex}",
         author="U1",
         text="run the scheduled hook",
         reply_handle=ReplyHandle(
@@ -166,6 +168,134 @@ def test_completed_cron_turn_closes_the_run_as_ran(
             assert outcome == "ran"
             assert ended_at is not None
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_cron_turn_on_a_thread_with_a_live_session_records_deferred(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """ADR-0099 Concurrency and idle (#2929): a cron fire whose thread holds a
+    live interactive session neither steers it nor opens a second turn. The
+    kernel's busy read runs under the per-thread lock, and the run is closed
+    ``deferred`` so the scheduler, not stream reclaim, owns the retry."""
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            conversation = f"thread-{uuid.uuid4().hex}"
+            live = _event(
+                source=TurnSource.SLACK, hook_run=None, conversation_id=conversation
+            )
+            first = asyncio.create_task(h.kernel.process_event(live))
+            try:
+                async with asyncio.timeout(5):
+                    while not h.runner.turn_active:
+                        await asyncio.sleep(0.01)
+                cron = _event(hook_run=run.ref, conversation_id=conversation)
+                await h.kernel.process_event(cron)
+
+                outcome, ended_at = await run.state() or (None, None)
+                assert outcome == "deferred"
+                assert ended_at is not None
+                assert h.runner.steers == [], "a cron fire steered the live session"
+                assert h.runner.opened == [live.text], "a cron fire opened a second turn"
+                assert await h.async_redis.exists(h.config.done_key(cron.event_id))
+            finally:
+                hold.set()
+                await asyncio.gather(first, return_exceptions=True)
+
+    asyncio.run(go())
+
+
+def test_cron_retry_past_its_catch_up_bound_records_skipped(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """#2929 review: a deferred slot's retry that sat in the stream past its
+    catch-up expiry is recorded ``skipped`` and never opens a turn, even on an
+    idle thread."""
+    from curie_worker.hook_runs import retry_event_id
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            expired = datetime.now(UTC) - timedelta(seconds=1)
+            event = _event(
+                hook_run=run.ref,
+                event_id=retry_event_id(f"cron:{run.ref.agent_id}:{run.ref.name}", expired),
+            )
+            await h.kernel.process_event(event)
+
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "skipped"
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_cron_retry_whose_bound_runs_out_during_the_claim_records_skipped(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """#2929 review round 2: a retry that passes the entry check with little of
+    its bound left must not start once a slow claim has used it up. The expiry
+    is read again at the busy check, after the claim."""
+    from curie_worker.hook_runs import retry_event_id
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            original = h.kernel._claim_or_resume
+
+            async def slow_claim(*args: object, **kwargs: object) -> object:
+                await asyncio.sleep(3)
+                return await original(*args, **kwargs)
+
+            h.kernel._claim_or_resume = slow_claim
+            # Whole seconds on the wire: at least one second of bound remains
+            # at entry, and none after the 3 s claim.
+            soon = datetime.now(UTC) + timedelta(seconds=2)
+            event = _event(
+                hook_run=run.ref,
+                event_id=retry_event_id(f"cron:{run.ref.agent_id}:{run.ref.name}", soon),
+            )
+            await h.kernel.process_event(event)
+
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "skipped"
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_cron_retry_inside_its_catch_up_bound_runs(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """The negative control: an unexpired retry runs and closes ``ran``."""
+    from curie_worker.hook_runs import retry_event_id
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            h.runner.default_script = [Final(text="done", status=SessionStatus.DONE)]
+            later = datetime.now(UTC) + timedelta(minutes=5)
+            event = _event(
+                hook_run=run.ref,
+                event_id=retry_event_id(f"cron:{run.ref.agent_id}:{run.ref.name}", later),
+            )
+            await h.kernel.process_event(event)
+
+            outcome, _ended_at = await run.state() or (None, None)
+            assert outcome == "ran"
 
     asyncio.run(go())
 

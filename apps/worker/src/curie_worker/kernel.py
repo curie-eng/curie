@@ -121,7 +121,7 @@ from .binding import (
 )
 from .config import WorkerConfig
 from .delivery_lease import DeliveryLease, LeaseLostError
-from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError
+from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, retry_expiry
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
@@ -1041,9 +1041,22 @@ class ThreadBusyError(RuntimeError):
     point is ``max_delivery``, which is a coarse instrument borrowed from crash
     recovery rather than a scheduling policy: a deferred turn behind a
     conversation longer than that budget dead-letters instead of running late.
-    That is a visible, bounded outcome rather than a silent one, and issue #268
-    owns replacing it with a real idle-aware policy when cron schedules land.
+    That is a visible, bounded outcome rather than a silent one. A targeted
+    cron turn does not take this path: the kernel records its hook run
+    ``deferred`` and the scheduler retries it within the catch-up bound (#2929).
     """
+
+
+class LiveSessionBusy(ThreadBusyError):
+    """The busy read under the per-thread lock found a live session.
+
+    The one ``ThreadBusyError`` a cron fire records as ``deferred`` (#2929): the
+    others (a pending publication, a failed handoff) are not a live session.
+    """
+
+
+class CatchUpExpired(ThreadBusyError):
+    """A deferred cron slot's retry reached its start after its catch-up bound."""
 
 
 class PendingPublicationError(ThreadBusyError):
@@ -1094,6 +1107,8 @@ class _HookRunCarry:
     recorder: HookRunRecorder | None = None
     ref: HookRunRef | None = None
     agent_id: uuid.UUID | None = None
+    # A deferred slot's retry must start before this (#2929).
+    retry_expires_at: datetime | None = None
     this_attempt_started: bool = False
     any_attempt_started: bool = False
 
@@ -1962,6 +1977,21 @@ class Kernel:
                 hook_carry.recorder = self._hook_runs
                 hook_carry.ref = qevent.hook_run
                 hook_carry.agent_id = hook_state.agent_id
+                expiry = retry_expiry(event_id)
+                hook_carry.retry_expires_at = expiry
+                if expiry is not None and datetime.now(UTC) >= expiry:
+                    # A deferred slot's retry that waited in the stream past its
+                    # catch-up bound does not run late (#2929).
+                    logger.info("cron retry %s is past its catch-up bound; skipped", event_id)
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="skipped",
+                    )
+                    return
 
             parsed_work_item = parse_work_item_event_id(event_id)
             if parsed_work_item is not None and parsed_work_item.kind in {"terminate"}:
@@ -2478,7 +2508,7 @@ class Kernel:
                         exc.code,
                     )
                     return
-                except ThreadBusyError:
+                except ThreadBusyError as busy:
                     run = (
                         self._work_item_runs.get(owned_work_item_id)
                         if owned_work_item_id is not None
@@ -2493,6 +2523,36 @@ class Kernel:
                                 event_id,
                                 exc.code,
                             )
+                        return
+                    if (
+                        qevent.source is TurnSource.CRON
+                        and not targetless
+                        and isinstance(busy, (LiveSessionBusy, CatchUpExpired))
+                    ):
+                        # ADR-0099 Concurrency and idle (#2929): the busy read ran
+                        # under the per-thread lock. Record the fire deferred and
+                        # settle this delivery; the scheduler reopens the slot on
+                        # a later tick or ages it out, so stream reclaim never
+                        # holds a cron turn. A targetless hook is never deferred.
+                        # A retry past its catch-up bound, busy or not, is
+                        # skipped rather than deferred again.
+                        expiry = retry_expiry(event_id)
+                        expired = isinstance(busy, CatchUpExpired) or (
+                            expiry is not None and datetime.now(UTC) >= expiry
+                        )
+                        logger.info(
+                            "cron event %s met a live session or its bound; %s",
+                            event_id,
+                            "skipped" if expired else "deferred",
+                        )
+                        await self._complete(
+                            qevent,
+                            route,
+                            "dropped",
+                            telemetry_outcome="interrupted",
+                            lease=lease,
+                            hook_outcome="skipped" if expired else "deferred",
+                        )
                         return
                     raise
 
@@ -4989,9 +5049,15 @@ class Kernel:
             # guarding: the per-thread lock held across this critical section is
             # what stops another turn on this thread from opening between the read
             # and the start.
+            hook_carry = _HOOK_RUN_CARRY.get()
+            expiry = hook_carry.retry_expires_at if hook_carry is not None else None
+            if expiry is not None and datetime.now(UTC) >= expiry:
+                # The claim can outlast what was left of a retry's catch-up
+                # bound; checked again here, right before the start (#2929).
+                raise CatchUpExpired(f"cron retry on {thread_key} passed its catch-up bound")
             if await self._turn_active(handle, remaining_s=remaining_s):
                 deferred_kind = "review" if verified_review is not None else str(source)
-                raise ThreadBusyError(
+                raise LiveSessionBusy(
                     f"thread {thread_key} has a live session; deferring the {deferred_kind} turn"
                 )
         else:

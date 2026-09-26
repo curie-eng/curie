@@ -1697,7 +1697,7 @@ class HookRun(Base):
             name="hook_runs_agent_name_slot_key",
         ),
         CheckConstraint(
-            "outcome IS NULL OR outcome IN ('ran', 'skipped', 'blocked', 'failed')",
+            "outcome IS NULL OR outcome IN ('ran', 'deferred', 'skipped', 'blocked', 'failed')",
             name="hook_runs_outcome_ck",
         ),
     )

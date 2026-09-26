@@ -199,7 +199,14 @@ const DEPLOY_YAML: &str = r#"# Where this bundle gets deployed. `curie cluster d
 # Left empty, a push deploys to the single agent this repository binds.
 # Declare targets once the repository binds more than one.
 #
-# Uncomment and edit. Use Slack channel IDs (starting with C), not #names:
+# Uncomment and edit. Use Slack channel IDs (starting with C), not #names.
+# `identity` (optional) names the bot a target speaks through when the
+# installation runs more than one; it defaults to the installation's own.
+# A named identity is refused until the installation's database admits one
+# (github.com/curie-eng/curie/issues/3146) -- leave it out until then.
+# `connectors` (optional) lists which connectors.yaml connectors run for a
+# target; left out, all of them run, and `[]` runs none; two targets for one
+# agent list the same connectors:
 #
 # targets:
 #   dev:
@@ -210,6 +217,7 @@ const DEPLOY_YAML: &str = r#"# Where this bundle gets deployed. `curie cluster d
 #     agent: my-agent
 #     env: prod
 #     slack_channel: C0EXAMPLE2
+#     connectors: [grafana]
 targets: {}
 "#;
 const GITIGNORE: &str = ".curie/\n";

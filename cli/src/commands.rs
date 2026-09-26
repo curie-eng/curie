@@ -1326,6 +1326,7 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         // identity there, so there is nothing to override.
         agent: None,
         target: None,
+        identity: None,
         api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
@@ -4679,6 +4680,10 @@ pub struct DeployOpts {
     pub agent: Option<String>,
     /// Resolve agent/env/channel from a `deploy.yaml` target (ADR-0089).
     pub target: Option<String>,
+    /// The identity the Slack binding this deploy writes speaks through
+    /// (ADR-0168 decision 8). `None` takes the target's, else `default`, which
+    /// is written exactly as before.
+    pub identity: Option<String>,
     pub plugin_dir: PathBuf,
     pub api_url: String,
     pub api_key: String,
@@ -4896,12 +4901,35 @@ pub struct PreparedDeploy {
     step: crate::ui::Step,
     tier: DeployTier,
     plugin_dir: PathBuf,
+    /// The resolved target's connector allowlist (ADR-0168 decision 8); `None`
+    /// when no target was resolved or it lists none, which runs every one.
+    connector_allowlist: Option<Vec<String>>,
 }
 
 fn is_documentation_placeholder_channel(channel: &str) -> bool {
     channel.strip_prefix("C0EXAMPLE").is_some_and(|suffix| {
         !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+/// Refuse an `--identity` that is not a deploy.yaml identity name, before any
+/// request. @spec ADR-0168 d8. The rule is `plugin_format.deploy_targets`'
+/// target-name rule; which names exist is the platform's to say.
+pub fn validate_identity_name(name: &str) -> Result<()> {
+    let bytes = name.as_bytes();
+    let alnum = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let valid = matches!((bytes.first(), bytes.last()), (Some(first), Some(last)) if alnum(first) && alnum(last))
+        && bytes.len() <= 40
+        && bytes.iter().all(|byte| alnum(byte) || *byte == b'-');
+    if valid {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "--identity `{name}` is not an identity name: lowercase letters, digits and dashes, \
+         starting and ending with a letter or digit, at most 40 characters"
+    ))
+    .with_fix("pass the identity name the installation declares, for example --identity ops-bot")
+    .into())
 }
 
 fn reject_documentation_placeholder_target(
@@ -5044,6 +5072,9 @@ async fn prepare_deploy_with_commit_sha(
     let ui = crate::ui::ui();
     if let Some(channel) = opts.slack_channel.as_deref() {
         validate_channel_binding("slack", channel)?;
+    }
+    if let Some(identity) = opts.identity.as_deref() {
+        validate_identity_name(identity)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
     let packed_manifest = read_packed_bundle_manifest(&archive);
@@ -5206,6 +5237,34 @@ async fn prepare_deploy_with_commit_sha(
         .slack_channel
         .as_deref()
         .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref()));
+    // @spec ADR-0168 d8. An explicit flag beats the target, as every field does.
+    let identity = opts
+        .identity
+        .as_deref()
+        .or_else(|| resolved.as_ref().map(|r| r.identity.as_str()))
+        .filter(|name| *name != crate::api::DEFAULT_SLACK_IDENTITY);
+    if let (Some(identity), None) = (identity, slack_channel) {
+        return Err(crate::exit::CliError::usage(format!(
+            "identity `{identity}` names the Slack binding this deploy writes, and this deploy \
+             writes none: no --slack-channel was passed and no target slack_channel applies"
+        ))
+        .with_fix("pass --slack-channel <id>, or add slack_channel to the deploy.yaml target")
+        .into());
+    }
+    // @spec ADR-0168 d8. Only a resolved target narrows the CLI's own work; the
+    // API render and the runner narrow every deploy's pods regardless.
+    let connector_allowlist = resolved.as_ref().and_then(|r| r.connectors.clone());
+    let record_secret_names = if opts.tier == DeployTier::Cluster {
+        merge_secret_env(
+            opts.secret.clone(),
+            &crate::connector_build::hosted_env_secret_names(&crate::connector_build::restrict_to(
+                &connector_decl,
+                connector_allowlist.as_deref(),
+            )),
+        )
+    } else {
+        opts.secret.clone()
+    };
     let record_secrets = match opts.tier {
         DeployTier::Local => secrets.clone(),
         // Names-only placeholders over the EFFECTIVE set, not just
@@ -5217,7 +5276,7 @@ async fn prepare_deploy_with_commit_sha(
         // resolved cluster-scoped later (#1913) and reaches the pod
         // through the per-agent Helm Secret, never through the record.
         DeployTier::Cluster => {
-            crate::cluster_secrets::agent_record_secret_names(&effective_secret_names)
+            crate::cluster_secrets::agent_record_secret_names(&record_secret_names)
         }
     };
     let cl = ui.checklist();
@@ -5228,7 +5287,7 @@ async fn prepare_deploy_with_commit_sha(
     // error arm below.
     let prepared = async {
         let (agent, channel, repo_note) = client
-            .resolve_agent(&agent_name, slack_channel, opts.repo.as_deref())
+            .resolve_agent_as(&agent_name, slack_channel, opts.repo.as_deref(), identity)
             .await?;
         check_deploy_routes_bound(
             declared_routes.as_ref(),
@@ -5276,6 +5335,7 @@ async fn prepare_deploy_with_commit_sha(
         step,
         tier: opts.tier,
         plugin_dir,
+        connector_allowlist,
     })
 }
 
@@ -5361,6 +5421,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         step,
         tier,
         plugin_dir,
+        connector_allowlist,
     } = prepared;
     let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
@@ -5466,7 +5527,11 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             namespace: "default".to_string(),
         };
         let project = crate::local::current_resources()?.project;
-        bring_up_local(&plugin_dir, &lock, &identity, &project).await?;
+        let decl = crate::connector_build::restrict_to(
+            &crate::connector_build::load(&plugin_dir)?,
+            connector_allowlist.as_deref(),
+        );
+        bring_up_local(&plugin_dir, &decl, &lock, &identity, &project).await?;
     }
 
     Ok(DeployOutput {
@@ -10180,6 +10245,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
@@ -10302,6 +10368,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10348,6 +10415,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10391,6 +10459,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -10426,6 +10495,7 @@ mod tests {
             delivery: None,
             agent: None,
             target: None,
+            identity: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
@@ -11991,6 +12061,32 @@ mod tests {
             !root.exists(),
             "a resolved credential must not outlive the boot that staged it"
         );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn identity_names_follow_the_deploy_yaml_rule() {
+        let longest = "a".repeat(40);
+        for ok in ["default", "ops-bot", "a", "b2", longest.as_str()] {
+            assert!(
+                super::validate_identity_name(ok).is_ok(),
+                "{ok:?} is a valid name"
+            );
+        }
+        let too_long = "a".repeat(41);
+        for bad in [
+            "",
+            "Ops",
+            "ops_bot",
+            "-ops",
+            "ops-",
+            "ops bot",
+            too_long.as_str(),
+        ] {
+            let err = super::validate_identity_name(bad).unwrap_err();
+            assert_eq!(crate::exit::classify(&err).0.code(), 2, "{bad:?}");
+            assert!(err.to_string().contains("--identity"), "{err}");
+        }
     }
 }
 
@@ -13651,13 +13747,13 @@ async fn compose_connector_readiness_targets(
 /// dialed another.
 pub async fn bring_up_local(
     plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
     lock: &crate::connector_build::ConnectorLockFileDecl,
     identity: &crate::connector_build::ConnectorScope,
     project: &str,
 ) -> Result<()> {
     use crate::connector_build as cb;
 
-    let decl = cb::load(plugin_dir)?;
     let hosted: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
         .connectors
         .iter()
@@ -13676,7 +13772,7 @@ pub async fn bring_up_local(
     // connector comes up authenticating with nothing. It runs above the reap so
     // a bundle that cannot come up does not first tear down the connectors that
     // are serving.
-    refuse_missing_connector_secrets(&decl)?;
+    refuse_missing_connector_secrets(decl)?;
 
     // Reconcile before starting: compose only ADDS the services the overlay
     // names, so a connector this bundle version dropped or renamed would keep
@@ -13730,7 +13826,7 @@ pub async fn bring_up_local(
         }
     }
 
-    let overlay = cb::compose_overlay(lock, &decl, identity, project, plugin_dir)?;
+    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir)?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(
