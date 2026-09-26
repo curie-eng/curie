@@ -212,7 +212,12 @@ cd /workspace && /workspace/.venv/bin/python -m unittest discover -s tests -t . 
 ```
 
 Use the command the repository documents, not one you invented for it. That is
-also what the publication contract requires of the coder.
+also what the publication contract requires of the coder. Do not write a
+substitute test runner or shim. If the repository's checks cannot be installed
+from files already in the checkout, say that in-sandbox verification is
+unavailable and do not request publication. The published pull request's CI is
+the only repository check, and it runs only after a person publishes the change.
+The mounted workspace system prompt tells the agent the same limit.
 
 ### Live registry dependencies
 
