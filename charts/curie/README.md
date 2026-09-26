@@ -377,6 +377,16 @@ ephemeral queue for disposable development. Use the same explicit persistence
 override for any short-lived test installation; production installs retain the
 PVC by default.
 
+Kubernetes keeps Events for about an hour, so the Warning events behind an
+OOMKill, eviction, failed schedule or probe failure are usually gone before an
+incident review. Set `otelCollector.kubernetesEvents.enabled=true` to add a
+`k8sobjects/events` receiver that watches `events.k8s.io` Events in the release
+namespace and feeds them into the logs pipeline. The chart then runs the
+collector as its own ServiceAccount bound to a namespaced Role with only
+get/list/watch on events. The logs pipeline exports to `nop/logs` by default,
+so Helm refuses the setting unless `extraLogPipelineExporters` names a durable
+log exporter (or the development `debug` exporter is enabled).
+
 Additional trace destinations are configured through
 `otelCollector.extraExporters`, a map of exporter names to collector exporter
 configuration, and `otelCollector.extraPipelineExporters`, an ordered list of

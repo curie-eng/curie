@@ -256,6 +256,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
 
+      # Opt-in Kubernetes Events receiver for the collector (#2954): off by
+      # default, namespace-scoped read-only RBAC, refused into nop-only logs.
+      - name: helm render assertions (otel collector kubernetes events)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-k8s-events-assertions.sh
+
       # Prove every first-party chart workload carries the shared OTLP env
       # (#2360). Membership is derived from rendered chart-owned images, not a
       # named allowlist, so a sixth Deployment is rejected rather than skipped.
