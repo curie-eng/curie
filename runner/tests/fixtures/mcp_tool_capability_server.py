@@ -52,6 +52,19 @@ async def list_tools(
                 ),
             ]
         )
+    if mode == "invalid-name":
+        # A server that answers but violates the MCP tool-name contract
+        # (#2945): the probe must classify it as a deterministic
+        # misconfiguration, not retry it like a rollout-window connector.
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name="not a valid name!",
+                    description="Test-only MCP tool.",
+                    inputSchema={"type": "object"},
+                )
+            ]
+        )
     annotations = None
     if mode in {"read-only", "paginated"}:
         annotations = ToolAnnotations(readOnlyHint=True)
