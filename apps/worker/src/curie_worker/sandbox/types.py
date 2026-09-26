@@ -167,6 +167,10 @@ class SandboxHandle:
     # runner reads it once at boot, so a delivery wanting a different budget
     # must not adopt this route.
     max_turns: str | None = None
+    # Whether this runner booted with a connector caller token (ADR-0168
+    # decision 7). False for a record written before the field existed, which
+    # is what makes the one replacement after an install gains a caller key.
+    carries_caller_token: bool = False
 
     @property
     def sandbox_id(self) -> str:
