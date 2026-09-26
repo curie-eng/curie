@@ -272,8 +272,10 @@ def test_cron_retry_past_its_catch_up_bound_records_skipped(
 def test_queued_cron_fire_is_rejected_after_operator_pause(
     make_harness,
     make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fire already in the stream must not start after pause commits."""
+    fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
@@ -293,6 +295,37 @@ def test_queued_cron_fire_is_rejected_after_operator_pause(
             assert outcome == "deferred"
             assert ended_at is not None
             assert h.runner.opened == []
+            assert fires == [_fire_labels("deferred")]
+
+    asyncio.run(go())
+
+
+def test_pause_after_runner_admission_does_not_defer_started_run(
+    make_hook_run,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later pause cannot turn an admitted fire into a retryable slot."""
+    fires = _capture_fire_metrics(monkeypatch)
+
+    async def go() -> None:
+        async with make_hook_run() as run:
+            recorder = HookRunRecorder(run.engine)
+            async with recorder.start_guard(run.ref) as allowed:
+                assert allowed
+            async with run.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.schedule_controls "
+                        "(agent_id, name, paused_at) VALUES (:agent_id, :name, now())"
+                    ),
+                    {"agent_id": run.agent_id, "name": run.ref.name},
+                )
+            state = await recorder.get(run.ref)
+            assert state is not None and state.outcome is None
+            assert await run.state() == (None, None)
+            await recorder.close(run.ref, "ran")
+            assert (await run.state() or (None, None))[0] == "ran"
+            assert fires == [_fire_labels("ran")]
 
     asyncio.run(go())
 

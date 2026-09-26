@@ -154,12 +154,9 @@ class HookRunRecorder:
                 row = (
                     await connection.execute(
                         text(
-                            "SELECT r.outcome, c.paused_at IS NOT NULL AS paused "
-                            "FROM curie.hook_runs r "
-                            "LEFT JOIN curie.schedule_controls c "
-                            "ON c.agent_id = r.agent_id AND c.name = r.name "
-                            "WHERE r.agent_id = :agent_id "
-                            "AND r.name = :name AND r.slot_utc = :slot_utc"
+                            "SELECT outcome FROM curie.hook_runs "
+                            "WHERE agent_id = :agent_id "
+                            "AND name = :name AND slot_utc = :slot_utc"
                         ),
                         {
                             "agent_id": key.agent_id,
@@ -168,39 +165,6 @@ class HookRunRecorder:
                         },
                     )
                 ).one_or_none()
-                outcome = None if row is None else row.outcome
-                if row is not None and row.paused and outcome is None:
-                    settled = (
-                        await connection.execute(
-                            text(
-                                "UPDATE curie.hook_runs SET outcome = 'deferred', ended_at = now() "
-                                "WHERE agent_id = :agent_id AND name = :name "
-                                "AND slot_utc = :slot_utc AND outcome IS NULL RETURNING outcome"
-                            ),
-                            {
-                                "agent_id": key.agent_id,
-                                "name": key.name,
-                                "slot_utc": key.slot_utc,
-                            },
-                        )
-                    ).scalar_one_or_none()
-                    if settled is not None:
-                        outcome = settled
-                    else:
-                        outcome = (
-                            await connection.execute(
-                                text(
-                                    "SELECT outcome FROM curie.hook_runs "
-                                    "WHERE agent_id = :agent_id AND name = :name "
-                                    "AND slot_utc = :slot_utc"
-                                ),
-                                {
-                                    "agent_id": key.agent_id,
-                                    "name": key.name,
-                                    "slot_utc": key.slot_utc,
-                                },
-                            )
-                        ).scalar_one()
         except SQLAlchemyError as exc:
             raise HookRunRecorderError(
                 "hook run state could not be read",
@@ -212,7 +176,7 @@ class HookRunRecorder:
             agent_id=key.agent_id,
             name=key.name,
             slot_utc=key.slot_utc,
-            outcome=outcome,
+            outcome=row.outcome,
         )
 
     async def renew(self, ref: HookRunRef, lease_s: float) -> bool:
