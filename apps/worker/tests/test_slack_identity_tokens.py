@@ -188,20 +188,21 @@ def test_a_route_naming_default_or_no_identity_keeps_the_default_token(
     assert capture.tokens() == {f"Bearer {_DEFAULT_TOKEN}"}
 
 
-def test_the_custom_transport_form_keeps_the_default_token() -> None:
-    # Its adapter is a credential slug, not an identity: refusing it would
-    # break every pre-ADR custom-transport binding.
+def test_a_per_turn_slack_origin_still_speaks_as_the_routes_identity() -> None:
+    # A CLI stub turn's endpoint is a per-turn Slack origin (#19), never a
+    # credential selector (ADR-0168 decision 3): the identity picks the token,
+    # and an undeclared one is refused before any request, endpoint or not.
     async def body(sink: ReplySinkRouter, port: int) -> None:
-        await sink.emit(
-            _update(),
-            route=TargetRoute(
-                endpoint=f"http://127.0.0.1:{port}/slack/api/", adapter="agentmail-sandbox"
-            ),
-        )
+        origin = f"http://127.0.0.1:{port}/slack/api/"
+        await sink.emit(_update(), route=TargetRoute(endpoint=origin, adapter="ops-bot"))
+        with pytest.raises(UnconfiguredSlackIdentityError, match="'agentmail-sandbox'"):
+            await sink.emit(
+                _update(), route=TargetRoute(endpoint=origin, adapter="agentmail-sandbox")
+            )
 
     capture = _run(body)
 
-    assert capture.requests == [("chat.update", f"Bearer {_DEFAULT_TOKEN}")]
+    assert capture.requests == [("chat.update", f"Bearer {_OPS_TOKEN}")]
 
 
 def test_an_identity_with_no_token_is_refused_before_any_request() -> None:
@@ -244,13 +245,17 @@ def test_the_router_names_the_routes_it_cannot_deliver() -> None:
         ("slack", TargetRoute(adapter="default")),
         ("slack", TargetRoute(adapter="ops-bot")),
         ("slack", TargetRoute(adapter=CLUSTER_MESSAGE_ADAPTER)),
-        ("slack", TargetRoute(endpoint="https://slack.com/api/", adapter="agentmail-sandbox")),
+        ("slack", TargetRoute(endpoint="https://slack.com/api/", adapter="ops-bot")),
         ("email", TargetRoute(endpoint="https://adapter.example/hook", adapter="ghost")),
     ]:
         assert sink.undeliverable_reason(kind, route) is None, (kind, route)
 
     reason = sink.undeliverable_reason("slack", TargetRoute(adapter="ghost"))
     assert reason is not None and "'ghost'" in reason
+    # An endpoint does not exempt a Slack route from naming a declared identity.
+    with_origin = TargetRoute(endpoint="https://slack.com/api/", adapter="agentmail-sandbox")
+    stub_reason = sink.undeliverable_reason("slack", with_origin)
+    assert stub_reason is not None and "'agentmail-sandbox'" in stub_reason
     assert _DEFAULT_TOKEN not in reason and _OPS_TOKEN not in reason
     # The kernel holds the sink behind ObservedReplySink, which must forward.
     assert ObservedReplySink(sink).undeliverable_reason(
