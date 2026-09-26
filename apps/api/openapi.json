@@ -2914,6 +2914,35 @@
             "minItems": 1,
             "title": "Phases",
             "type": "array"
+          },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
+          "stages": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/StageDeclaration"
+                },
+                "maxItems": 12,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stages"
           }
         },
         "required": [
@@ -6056,6 +6085,38 @@
           "trace_url"
         ],
         "title": "SourceTraceOut",
+        "type": "object"
+      },
+      "StageDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "phases": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "minItems": 1,
+            "title": "Phases",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "phases"
+        ],
+        "title": "StageDeclaration",
         "type": "object"
       },
       "StartBody": {
