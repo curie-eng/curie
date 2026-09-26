@@ -796,6 +796,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
         ApprovalsOutput::Pending {
             agent: "weather".to_string(),
             records: vec![record()],
+            routes: Default::default(),
             truncated: false,
         }
         .to_json(),
@@ -817,6 +818,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
                 // key by key, so a field the API carries and the CLI drops is
                 // visible in the diff rather than inferred.
                 "card_channel": "CFINANCE01",
+                "current_route_approvers": null,
             }],
             "count": 1,
             "truncated": false,
