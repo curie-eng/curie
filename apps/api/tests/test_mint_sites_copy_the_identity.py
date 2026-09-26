@@ -2,11 +2,9 @@
 approval row (ADR-0168 decision 3).
 
 Pinned here: the channel ingress, the hook ingress, resumes, GitHub reviews,
-the work-item execute wake and the work-item terminate wake. One first-party
-site still mints `adapter=None` and is not pinned: the CLI's stub turn
-(`cli/src/queue.rs`), whose route is the configured Slack dev origin. The Slack
-dispatcher also still mints `adapter=None`; ADR-0168 decision 3 names it as
-the one mint site that changes.
+the work-item execute wake and the work-item terminate wake. The sites that
+mint an identity rather than copy one -- the Slack dispatcher and the CLI's
+stub turn (`cli/src/queue.rs`) -- are pinned where they live.
 
 The terminate wake is a narrower case than the others: `ExecutionRequest`
 carries no `reply_adapter` column, and the owning agent's channel may already
@@ -20,15 +18,16 @@ the exact key the worker used for this thread, not just that some adapter
 made it onto the wake.
 
 Each case seeds a row whose `adapter` is a distinctive, non-default value on a
-non-Slack kind (0024's `agent_channels_route_pair_ck` and the approval-side
-equivalent both need an `endpoint` alongside a non-NULL `adapter`), drives the
+non-Slack kind (`agent_channels_route_ck` and the approval-side equivalent
+both need an `endpoint` alongside a non-NULL `adapter` there), drives the
 real mint site, and asserts the minted `ReplyHandle.adapter` -- and `endpoint`,
 where the site carries one -- equals the row's value exactly. Addresses are
-per-test so 0023's `(kind, address)` unique key never collides across cases.
+per-test so the route key never collides across cases.
 
 Scheduled fires are a worker-side copier and already pinned by
 `apps/worker/tests/kernel/test_cron_loop.py::test_admitted_event_has_the_cron_turn_shape`,
-which asserts `handle.adapter == "test-adapter"`; not duplicated here.
+which asserts the minted handle's adapter is its binding's; not duplicated
+here.
 """
 
 from __future__ import annotations
