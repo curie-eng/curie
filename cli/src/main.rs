@@ -758,6 +758,10 @@ enum Command {
         /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
         #[arg(long, value_name = "REF", requires = "plugin_dir")]
         registry: Option<String>,
+        /// The platform runner a declared runner layer builds on (default: the
+        /// runner `curie skill up` uses). Resolved to a digest before building.
+        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        runner_image: Option<String>,
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
         force: bool,
@@ -3879,12 +3883,14 @@ async fn run(command: Option<Command>) -> Result<()> {
             tag,
             plugin_dir,
             registry,
+            runner_image,
             force,
         }) => match plugin_dir {
             Some(plugin_dir) => emit(
                 commands::build_connectors(commands::ConnectorBuildOpts {
                     plugin_dir,
                     registry,
+                    runner_image,
                     force,
                 })
                 .await?,

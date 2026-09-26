@@ -288,6 +288,9 @@ const SHAPE_REFUSALS: &[&str] = &[
     "a_truncated_digest_is_refused",
     "an_uppercase_digest_is_refused",
     "a_bare_digest_is_refused_for_registry_delivery",
+    // ADR 0173: the runner entry's image AND base obey the same rule.
+    "a_tag_shaped_runner_image_is_refused",
+    "a_tag_shaped_runner_base_is_refused",
 ];
 
 #[test]
@@ -472,6 +475,19 @@ fn the_mirror_structs_carry_exactly_the_frozen_field_names() {
     assert_eq!(
         connector_build::lock_entry_field_names(),
         expect("ConnectorLockEntry")
+    );
+    // ADR 0173: the layered runner rides the same two files.
+    assert_eq!(
+        connector_build::connectors_file_field_names(),
+        expect("ConnectorsFile")
+    );
+    assert_eq!(
+        connector_build::runner_spec_field_names(),
+        expect("RunnerSpec")
+    );
+    assert_eq!(
+        connector_build::runner_lock_entry_field_names(),
+        expect("RunnerLockEntry")
     );
 }
 
@@ -678,4 +694,91 @@ fn derived_bearer_name_matches_the_frozen_vector() {
             name_of(&vector)
         );
     }
+}
+
+// ─── The layered runner (ADR 0173 decisions 1 and 2) ─────────────────────────
+
+#[test]
+fn a_runner_build_block_is_read_with_its_resolved_dockerfile() {
+    // The vector corpus proves accept/reject parity; this proves the accepted
+    // block is actually carried rather than parsed and dropped, which is the
+    // failure a missing field on the mirror struct produces.
+    let file = connector_build::parse_connectors(
+        "connectors: {}\nrunner:\n  build:\n    context: runner\n    \
+         platforms: [linux/amd64, linux/arm64]\n",
+    )
+    .expect("a runner build block is a valid declaration");
+    let runner = file.runner.as_ref().expect("the runner block is carried");
+    assert_eq!(runner.build.context, "runner");
+    assert_eq!(runner.build.dockerfile, "Dockerfile", "the default applies");
+    assert_eq!(runner.build.platforms, vec!["linux/amd64", "linux/arm64"]);
+
+    let none = connector_build::parse_connectors("connectors: {}\n").expect("no runner");
+    assert!(
+        none.runner.is_none(),
+        "a bundle declaring no runner has none"
+    );
+}
+
+const RUNNER_DOCKERFILE_KEYS: &[&str] = &["name", "why", "dockerfile", "expect"];
+
+#[test]
+fn the_runner_dockerfile_base_rule_agrees_with_python_on_every_vector() {
+    // `curie build` refuses a runner Dockerfile whose first FROM is not the
+    // CURIE_RUNNER_IMAGE build argument BEFORE any docker call; the platform
+    // refuses the same file at intake (`connectors.runner_base_not_arg`). Both
+    // read tests/vectors/runner-dockerfile-base.json.
+    for vector in vectors("runner-dockerfile-base.json") {
+        let keys: BTreeSet<&str> = vector
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            RUNNER_DOCKERFILE_KEYS.iter().copied().collect(),
+            "{}",
+            name_of(&vector)
+        );
+        let body = vector["dockerfile"].as_str().expect("dockerfile");
+        let result = connector_build::check_runner_dockerfile(body);
+        match vector["expect"].as_str().expect("expect") {
+            "accept" => result.unwrap_or_else(|error| {
+                panic!("{} must be accepted, got {error:#}", name_of(&vector))
+            }),
+            "reject" => {
+                let error = result.expect_err(name_of(&vector));
+                assert!(
+                    format!("{error:#}").contains("CURIE_RUNNER_IMAGE"),
+                    "{}: the refusal must name the build argument to use, got {error:#}",
+                    name_of(&vector)
+                );
+            }
+            other => panic!("unknown expect {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_runner_lock_entry_is_read_with_both_digests() {
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let document = format!(
+        "version: 1\nconnectors: {{}}\nrunner:\n  image: ghcr.io/acme-corp/acme-bot-runner@sha256:{a}\n  \
+         base: ghcr.io/curie-eng/curie-runner@sha256:{b}\n  delivery: registry\n  \
+         platforms: [linux/amd64]\n  source_digest: sha256:{}\n",
+        "2".repeat(64)
+    );
+    let lock = connector_build::parse_lock(&document).expect("a digest-pinned runner entry");
+    let runner = lock.runner.as_ref().expect("the runner entry is carried");
+    assert_eq!(
+        runner.image,
+        format!("ghcr.io/acme-corp/acme-bot-runner@sha256:{a}")
+    );
+    assert_eq!(
+        runner.base,
+        format!("ghcr.io/curie-eng/curie-runner@sha256:{b}")
+    );
+    assert_eq!(runner.delivery, connector_build::Delivery::Registry);
 }

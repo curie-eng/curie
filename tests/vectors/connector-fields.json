@@ -1,5 +1,5 @@
 {
-  "comment": "The exact field-name set of every connector model that exists in two languages. Python owns the models in packages/plugin-format/src/plugin_format/connectors.py and connector_lock.py; the Rust CLI hand mirrors them in cli/src/connector_build.rs.\n\nThis file exists because the ordinary field-parity gate cannot see this seam. `curie dev field-parity` compares a Rust struct against packages/plugin-format/schema/plugin-format.schema.json, and schema_export.py imports only from .models, so the committed schema carries no Connector* $defs at all. The connector structs are therefore declared in cli/plugin-format-mirrors.json's non_mirrors array and the field-by-field comparison is a no-op for them today. Without this file, adding a field to the Python ConnectorSpec and touching nothing else leaves every gate green while the Rust reader silently drops it.\n\nThe loop is closed in one direction by each half of the pair. packages/plugin-format/tests/test_connectors.py asserts set(Model.model_fields) equals the list here, so adding a Python field without editing this file fails the Python suite. cli/tests/connector_build_decl_vectors.rs asserts each mirror struct's serde field names equal the same list, so editing this file to make Python pass then fails the Rust suite until the mirror gains the field. Neither half can be satisfied by touching one language.\n\nWhen the follow-up that exports these models into plugin-format.schema.json lands, the non_mirrors entries move to mirrors, `curie dev field-parity` subsumes this file, and it can be deleted. Until then it is the only thing standing.\n\nNames are the model's own field names, not their serialized aliases; both lanes compare against the same list, so a rename in one language fails there. The list for each model is sorted.",
+  "comment": "The exact field-name set of every connector model that exists in two languages. Python owns the models in packages/plugin-format/src/plugin_format/connectors.py and connector_lock.py; the Rust CLI hand mirrors them in cli/src/connector_build.rs.\n\nThis file exists because the ordinary field-parity gate cannot see this seam. `curie dev field-parity` compares a Rust struct against packages/plugin-format/schema/plugin-format.schema.json, and schema_export.py imports only from .models, so the committed schema carries no Connector* $defs at all. The connector structs are therefore declared in cli/plugin-format-mirrors.json's non_mirrors array and the field-by-field comparison is a no-op for them today. Without this file, adding a field to the Python ConnectorSpec and touching nothing else leaves every gate green while the Rust reader silently drops it.\n\nThe loop is closed in one direction by each half of the pair. packages/plugin-format/tests/test_connectors.py asserts set(Model.model_fields) equals the list here, so adding a Python field without editing this file fails the Python suite. cli/tests/connector_build_decl_vectors.rs asserts each mirror struct's serde field names equal the same list, so editing this file to make Python pass then fails the Rust suite until the mirror gains the field. Neither half can be satisfied by touching one language.\n\nWhen the follow-up that exports these models into plugin-format.schema.json lands, the non_mirrors entries move to mirrors, `curie dev field-parity` subsumes this file, and it can be deleted. Until then it is the only thing standing.\n\nNames are the model's own field names, not their serialized aliases; both lanes compare against the same list, so a rename in one language fails there. The list for each model is sorted.\n\nConnectorsFile / RunnerSpec / RunnerLockEntry carry the bundle's layered runner image (ADR 0173 decisions 1 and 2): an optional top-level `runner:` block in connectors.yaml and its resolved entry in connectors.lock.yaml.",
   "models": {
     "ConnectorSpec": [
       "args",
@@ -15,8 +15,35 @@
       "unhosted_url",
       "url"
     ],
-    "ConnectorBuild": ["context", "dockerfile", "platforms"],
-    "ConnectorLockFile": ["connectors", "version"],
-    "ConnectorLockEntry": ["delivery", "image", "platforms", "source_digest"]
+    "ConnectorBuild": [
+      "context",
+      "dockerfile",
+      "platforms"
+    ],
+    "ConnectorLockFile": [
+      "connectors",
+      "runner",
+      "version"
+    ],
+    "ConnectorLockEntry": [
+      "delivery",
+      "image",
+      "platforms",
+      "source_digest"
+    ],
+    "ConnectorsFile": [
+      "connectors",
+      "runner"
+    ],
+    "RunnerSpec": [
+      "build"
+    ],
+    "RunnerLockEntry": [
+      "base",
+      "delivery",
+      "image",
+      "platforms",
+      "source_digest"
+    ]
   }
 }
