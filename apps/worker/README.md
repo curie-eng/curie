@@ -253,6 +253,20 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   transport, and any non-resume turn, still raises on an unreachable
   endpoint and follows the normal retry/dead-letter path above.
 
+### Turns between sibling identities
+
+A turn whose author is one of this installation's own identities counts against
+two fixed-window Valkey counters (ADR-0168 decision 6), under
+`<key_prefix>:sibling:`. On Slack, that author is an identity's bot user from
+`auth.test`. On the channel port, it is the address a binding is bound at. One
+counter is kept per session key and one per ordered identity pair for the
+conversations the pair opens. The limits are `curie_worker.sibling_turns`
+constants. Past them the kernel logs
+`dropping event <id> from a sibling identity: sibling_conversation_limit` (or
+`sibling_pair_limit`). On Slack it edits the placeholder with a notice that
+mentions nobody, and on every kind it completes the turn as dropped. An install
+with one Slack identity and at most one adapter builds none of this.
+
 ### The dead-letter graveyard
 
 The dead-letter stream is `CURIE_DEAD_LETTER_STREAM`, or `<stream>:dead`

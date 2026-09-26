@@ -88,6 +88,14 @@ installation: allowlisting such a bot removes the cross-installation loop guard
 for that pair. All unlisted bot/channel pairs retain the default refusal.
 Remove the pair and restart the dispatcher to revoke threaded admission.
 
+An installation's own identities need no pair. When several Slack identities
+are declared, preflight asks `auth.test` for each one's bot id and bot user,
+and every identity's app admits the others' threaded mentions. A turn one of
+them wrote carries that identity's bot user as its author, from `auth.test`,
+not from the event, and the worker rate limits the exchange (ADR-0168
+decision 6). An identity whose `auth.test` did not answer at boot is not
+admitted this way.
+
 Compose forwards this variable in both dev and generated release stacks. Helm
 operators should prefer the first-class `dispatcher.threadedBotAllowlist` chart
 value; `dispatcher.extraEnv` still works as well. Runtime Slack proof requires

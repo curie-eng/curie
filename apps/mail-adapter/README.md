@@ -110,6 +110,21 @@ nothing is deleted, labeled or bounced. So after widening the list, use the
 durable state and provider mailbox under the operator's PII controls, and ask the
 correspondent to resend. There is no replay or reprocess-on-widen mechanism.
 
+**Another inbox of this installation is admitted like any sender.** A second
+mail adapter is a second identity (ADR-0168), and one inbox answers another only
+if its address, or a domain entry that covers it, is on this list. The
+prerequisites above apply to its domain as to any other. The worker rate limits
+an exchange between two inboxes and drops the turn that passes the limit.
+
+**A dropped completion that recorded no text sends no mail, for any drop
+reason.** A dropped turn was never processed, so there is nothing of its own
+to reply with, and mailing the empty-reply notice would be a new message —
+from a sibling inbox, the next turn of the exchange the drop just ended. A
+dropped completion that did record text (an undeployed or paused agent's
+notice, say) still sends it, and a delivered completion with no text still
+sends the empty-reply notice as before; only a drop with nothing recorded is
+silent.
+
 ## Config surface (env vars)
 
 Read from the environment by `MailAdapterConfig()` (a

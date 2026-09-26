@@ -226,7 +226,10 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   `apps/dispatcher/src/curie_dispatcher/inbound_text.py::derive_text` rather than read off
   an empty top-level `text`. A bot-authored mention carrying `thread_ts` is refused as
   `BOT_AUTHORED_THREAD_REPLY` for the cross-installation loop above, unless the event's
-  exact channel/bot pair is in `CURIE_SLACK_THREADED_BOT_ALLOWLIST`; on the DM lane bot
+  exact channel/bot pair is in `CURIE_SLACK_THREADED_BOT_ALLOWLIST` or its `bot_id`
+  belongs to another of this installation's own identities (ADR-0168 decision 6), whose
+  bot user then becomes the turn's `author` so the worker's sibling limit can count it;
+  exercised in `apps/dispatcher/tests/test_sibling_admission.py`; on the DM lane bot
   authorship is not consulted at all. The allowlist defaults to empty and malformed
   entries fail dispatcher configuration. Only trust a dedicated sender that does not
   automatically respond to Curie: an allowlisted second Curie installation could loop.
