@@ -22,12 +22,15 @@ It is deliberately not an extension of SessionConfig -- see ADR-0049 and the
 class docstring.
 """
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
-from pydantic import Field
+from pydantic import Field, TypeAdapter
 
 from .events import _AciModel
+
+_JSON_OBJECT = TypeAdapter(dict[str, Any])
 
 
 class Budget(_AciModel):
@@ -346,11 +349,16 @@ class BootEnv(_AciModel):
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
     )
-    # One-shot post-approval allowance (#430, ADR-0035) and the authority-free
-    # turn-end reconciliation marker (#544). Both are the kernel resume overlay's:
-    # the binding never writes them, only the resume path does.
+    # One use grant after approval (#430, ADR-0035), canonical arguments of
+    # the denied call (#3255), and the authority free turn end reconciliation
+    # marker (#544). All are the kernel resume overlay's: the binding never
+    # writes them, only the resume path does. The arguments remain an object,
+    # including an empty object, and are never reconstructed from the summary.
     approval_grant_tool: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_GRANT_TOOL", "kernel")
+    )
+    approval_grant_arguments: dict[str, Any] | None = Field(
+        default=None, json_schema_extra=_env("CURIE_APPROVAL_GRANT_ARGUMENTS", "kernel")
     )
     approval_resumed_kind: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_RESUMED_KIND", "kernel")
@@ -676,6 +684,13 @@ class BootEnv(_AciModel):
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
             env[self.env_key("approval_grant_tool")] = self.approval_grant_tool
+        if self.approval_grant_arguments is not None:
+            env[self.env_key("approval_grant_arguments")] = json.dumps(
+                self.approval_grant_arguments,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
         if self.approval_resumed_kind is not None:
             env[self.env_key("approval_resumed_kind")] = self.approval_resumed_kind
         if self.approval_decision is not None:
@@ -737,6 +752,11 @@ class BootEnv(_AciModel):
             progress_token=_str_or_none(env.get("CURIE_PROGRESS_TOKEN")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
+            approval_grant_arguments=(
+                _JSON_OBJECT.validate_json(env["CURIE_APPROVAL_GRANT_ARGUMENTS"])
+                if "CURIE_APPROVAL_GRANT_ARGUMENTS" in env
+                else None
+            ),
             approval_resumed_kind=_stripped_or_none(env.get("CURIE_APPROVAL_RESUMED_KIND")),
             approval_decision=_stripped_or_none(env.get("CURIE_APPROVAL_DECISION")),
             connector_secret_keys=_list_or_none(env.get("CURIE_CONNECTOR_SECRET_KEYS")),

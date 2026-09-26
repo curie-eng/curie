@@ -2089,6 +2089,7 @@ def test_permission_gate_grants_the_denied_tool_name() -> None:
         assert final["status"] == "awaiting-approval"
         assert final["approval_gate_kind"] == "permission"
         assert final["approval_granted_tool"] == "Bash"
+        assert final["approval_granted_arguments"] == {"command": "echo hi"}
 
     anyio.run(go)
 
@@ -2101,10 +2102,12 @@ def test_reset_clears_gate_kind_and_granted_tool() -> None:
     gate.block("Bash", {"command": "x"})
     assert gate.pending_gate_kind == "permission"
     assert gate.pending_granted_tool == "Bash"
+    assert gate.pending_granted_arguments == {"command": "x"}
 
     gate.reset()
     assert gate.pending_gate_kind is None
     assert gate.pending_granted_tool is None
+    assert gate.pending_granted_arguments is None
     # The existing fields still reset alongside them.
     assert gate.pending_summary is None
     assert gate.pending_route is None

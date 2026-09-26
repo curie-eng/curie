@@ -2040,7 +2040,7 @@
         "type": "object"
       },
       "ApprovalRequest": {
-        "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
+        "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``granted_arguments`` is the canonical JSON object of the denied permission\ngated call (#3255), carried independently of the human summary. It is\noptional for older producers, while an empty object remains a real value.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
         "properties": {
           "agent_id": {
             "anyOf": [
@@ -2101,6 +2101,18 @@
                 "type": "null"
               }
             ]
+          },
+          "granted_arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Arguments"
           },
           "granted_tool": {
             "anyOf": [

@@ -204,6 +204,7 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
             approval_route=state.approval_route,
             approval_gate_kind=state.approval_gate_kind,
             approval_granted_tool=state.approval_granted_tool,
+            approval_granted_arguments=state.approval_granted_arguments,
             approval_display=state.approval_display,
         )
     return final
@@ -529,6 +530,7 @@ class SessionRunner:
                 state.approval_route = None
                 state.approval_gate_kind = None
                 state.approval_granted_tool = None
+                state.approval_granted_arguments = None
                 state.approval_display = None
                 state.approval_halt_requested = False
                 self._status = SessionStatus.CLASSIFIED_FAILURE
@@ -1643,6 +1645,7 @@ class SessionRunner:
             state.approval_route = gate.pending_route
             state.approval_gate_kind = gate.pending_gate_kind
             state.approval_granted_tool = gate.pending_granted_tool
+            state.approval_granted_arguments = gate.pending_granted_arguments
         elif gate.policy_requested:
             if gate.policy_rejected:
                 # The route could not be resolved: no approval exists, so the
@@ -1651,6 +1654,7 @@ class SessionRunner:
                 state.approval_display = None
                 state.approval_route = None
                 state.approval_gate_kind = None
+                state.approval_granted_arguments = None
             else:
                 state.approval_route = gate.policy_route
                 # #558: an operator-opted grantable gate mints the one-shot grant; the tool
@@ -1658,6 +1662,7 @@ class SessionRunner:
                 # non-grantable route resolves to None -> no grant, preserving #544's default.
                 # gate_kind stays 'policy' (stamped in translate.py).
                 state.approval_granted_tool = gate.grantable_tool_for_route(gate.policy_route)
+                state.approval_granted_arguments = None
 
         if gate.pending_summary and not state.approval_summary:
             state.approval_summary = gate.pending_summary
@@ -1665,6 +1670,7 @@ class SessionRunner:
             state.approval_route = gate.pending_route
             state.approval_gate_kind = gate.pending_gate_kind
             state.approval_granted_tool = gate.pending_granted_tool
+            state.approval_granted_arguments = gate.pending_granted_arguments
 
         # See the "Approval halt" bullet above: an operator interrupt outranks a
         # runner-requested one, so the marker is copied only in its absence.

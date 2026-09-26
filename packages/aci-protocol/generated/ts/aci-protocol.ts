@@ -24,6 +24,9 @@ export type ExpiresInSeconds = number | null;
  * via the `definition` "GateKind".
  */
 export type GateKind = "permission" | "policy";
+export type GrantedArguments = {
+  [k: string]: unknown;
+} | null;
 export type GrantedTool = string | null;
 export type ReplyAdapter = string | null;
 export type ReplyChannel = string;
@@ -38,6 +41,9 @@ export type Name = string;
 export type SizeBytes = number | null;
 export type ApiBackend = string | null;
 export type ApprovalDecision = string | null;
+export type ApprovalGrantArguments = {
+  [k: string]: unknown;
+} | null;
 export type ApprovalGrantTool = string | null;
 export type ApprovalRequiredTools = string[] | null;
 export type ApprovalResumedKind = string | null;
@@ -118,6 +124,9 @@ export type Type1 = "message" | "job" | "eval_case";
 export type User = string;
 export type ApprovalDisplay = string | null;
 export type ApprovalGateKind = string | null;
+export type ApprovalGrantedArguments = {
+  [k: string]: unknown;
+} | null;
 export type ApprovalGrantedTool = string | null;
 export type ApprovalRoute = string | null;
 export type ApprovalSummary = string | null;
@@ -257,6 +266,10 @@ export interface ACIProtocolV054 {
  * provenance (#544, Decision C) written by the runner; both stay optional for
  * the rolling-deploy window.
  *
+ * ``granted_arguments`` is the canonical JSON object of the denied permission
+ * gated call (#3255), carried independently of the human summary. It is
+ * optional for older producers, while an empty object remains a real value.
+ *
  * ``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s
  * routing pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress
  * selector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:
@@ -277,6 +290,7 @@ export interface ApprovalRequest {
   dedupe_key: DedupeKey;
   expires_in_seconds?: ExpiresInSeconds;
   gate_kind?: GateKind | null;
+  granted_arguments?: GrantedArguments;
   granted_tool?: GrantedTool;
   reply_adapter?: ReplyAdapter;
   reply_channel: ReplyChannel;
@@ -363,6 +377,7 @@ export interface Attachment {
 export interface BootEnv {
   api_backend?: ApiBackend;
   approval_decision?: ApprovalDecision;
+  approval_grant_arguments?: ApprovalGrantArguments;
   approval_grant_tool?: ApprovalGrantTool;
   approval_required_tools?: ApprovalRequiredTools;
   approval_resumed_kind?: ApprovalResumedKind;
@@ -578,6 +593,13 @@ export interface PublicationContext {
  * ``approval_granted_tool``. Additive optional scalar: a tolerant consumer
  * decoding an older producer's ``final`` simply sees it absent.
  *
+ * ``approval_granted_arguments`` carries the canonical JSON object passed to
+ * the permission gate for the denied call (#3255). It is set only with a
+ * permission gate's ``approval_granted_tool``; a policy gate carries no tool
+ * arguments. An older producer omits it, and an empty object is distinct from
+ * an absent argument carrier. The worker persists this object with the
+ * approval so the resume boot can bind a later grant to the same call.
+ *
  * ``input_tokens``/``output_tokens`` carry the turn's model token usage when
  * the harness reported it (#390): the runner stamps them from the SDK result's
  * ``usage`` so a consumer can attribute a dollar cost to the turn (model
@@ -594,6 +616,7 @@ export interface PublicationContext {
 export interface Final {
   approval_display?: ApprovalDisplay;
   approval_gate_kind?: ApprovalGateKind;
+  approval_granted_arguments?: ApprovalGrantedArguments;
   approval_granted_tool?: ApprovalGrantedTool;
   approval_route?: ApprovalRoute;
   approval_summary?: ApprovalSummary;

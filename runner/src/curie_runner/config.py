@@ -61,6 +61,9 @@ class RunnerConfig:
     # boots the resume claim for a genuinely-approved permission-gate block;
     # None/empty means no grant and the ordinary deny-and-pause posture holds.
     approval_grant_tool: str | None
+    # Trusted resume input parsed by BootEnv for the later argument matching
+    # gate. This contract change does not spend or compare the value.
+    approval_grant_arguments: dict[str, Any] | None
     # Turn-end reconciliation marker (#544, Decision A2), authority-free. The
     # worker injects CURIE_APPROVAL_RESUMED_KIND='policy' at resume boot to
     # record that the approval being resumed from was a POLICY gate. Unlike
@@ -152,6 +155,7 @@ class RunnerConfig:
             history_ref=boot.history_ref,
             approval_required_tools=boot.approval_required_tools,
             approval_grant_tool=boot.approval_grant_tool,
+            approval_grant_arguments=boot.approval_grant_arguments,
             approval_resumed_kind=boot.approval_resumed_kind,
             approval_decision=boot.approval_decision,
             false_completion_check=false_completion_check,

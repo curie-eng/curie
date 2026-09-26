@@ -178,6 +178,7 @@ def _full_boot_env() -> BootEnv:
         progress_token="sbx-progress-token",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
+        approval_grant_arguments={"command": "printf ok"},
         approval_resumed_kind="policy",
         approval_decision="approved",
         connector_secret_keys=["GITHUB_TOKEN", "LINEAR_API_KEY"],
@@ -572,6 +573,7 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS",
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
         "CURIE_PROGRESS_URL",
@@ -629,6 +631,7 @@ def test_from_env_on_the_worker_subset_alone_raises() -> None:
 def test_from_env_parses_the_resume_overlay() -> None:
     overlay = {
         "CURIE_APPROVAL_GRANT_TOOL": "Bash",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS": '{"command":"printf ok","options":{"flags":["a"]}}',
         "CURIE_APPROVAL_RESUMED_KIND": "policy",
     }
     boot = BootEnv.from_env(
@@ -638,6 +641,7 @@ def test_from_env_parses_the_resume_overlay() -> None:
     )
     assert boot.approval_required_tools == ["Bash", "mcp__github__create_pr"]
     assert boot.approval_grant_tool == "Bash"
+    assert boot.approval_grant_arguments == {"command": "printf ok", "options": {"flags": ["a"]}}
     assert boot.approval_resumed_kind == "policy"
 
 
@@ -788,6 +792,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_PROGRESS_TOKEN",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS",
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
         "CURIE_CONNECTOR_SECRET_KEYS",

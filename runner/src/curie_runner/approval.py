@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -679,6 +680,7 @@ class ApprovalGate:
     # decision, never a tool); its provenance is stamped in translate.py.
     pending_gate_kind: str | None = None
     pending_granted_tool: str | None = None
+    pending_granted_arguments: dict[str, Any] | None = None
     # Policy-gate route reconciliation (#544, Decision B), set by the
     # request_approval tool when the model calls it: whether a request was made
     # this turn, whether it was refused (ambiguous/unknown route -> no approval
@@ -738,6 +740,7 @@ class ApprovalGate:
         self.pending_route = None
         self.pending_gate_kind = None
         self.pending_granted_tool = None
+        self.pending_granted_arguments = None
         self.policy_requested = False
         self.policy_rejected = False
         self.policy_route = None
@@ -791,6 +794,7 @@ class ApprovalGate:
             self.pending_route = None
             self.pending_gate_kind = None
             self.pending_granted_tool = None
+            self.pending_granted_arguments = None
             self.pending_halt = False
             self.publication_title = None
             self.publication_body = None
@@ -851,6 +855,7 @@ class ApprovalGate:
         # trusted grant target, never derived from the summary string.
         self.pending_gate_kind = "permission"
         self.pending_granted_tool = tool_name
+        self.pending_granted_arguments = deepcopy(tool_input)
         return True
 
     async def observe_publication(

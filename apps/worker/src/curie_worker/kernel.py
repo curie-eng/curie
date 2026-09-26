@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
@@ -109,6 +110,7 @@ from .behaviorpacks import (
 )
 from .binding import (
     DECISION_ENV,
+    GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
     MAX_TURNS_ENV,
     PROGRESS_TOKEN_ENV,
@@ -985,6 +987,7 @@ class TurnOutcome:
     # Threaded onto the durable record. None from an older runner.
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_granted_arguments: dict[str, Any] | None = None
     approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
@@ -1129,6 +1132,7 @@ class _StreamAccumulator:
     approval_route: str | None = None
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_granted_arguments: dict[str, Any] | None = None
     approval_display: str | None = None
     # Call id -> the ledger record it opened. One CALL produces two ACI frames
     # (ADR-0117): the first opens a record, the second closes THAT record rather
@@ -2289,6 +2293,13 @@ class Kernel:
                 )
                 if grant_tool:
                     boot_env[GRANT_TOOL_ENV] = grant_tool
+                    grant_arguments = await self._binding.approval_grant_arguments(
+                        qevent.event_id, resolved.agent_id
+                    )
+                    if grant_arguments is not None:
+                        boot_env[GRANT_ARGUMENTS_ENV] = json.dumps(
+                            grant_arguments, sort_keys=True, separators=(",", ":")
+                        )
                 # A factory execution may report its phases for the live status
                 # card (#3077). The token is bound to this request and to the
                 # work_item.progress scope only; no other turn carries it.
@@ -6220,6 +6231,7 @@ class Kernel:
                         # validation; ValidationError below is the rejection path.
                         gate_kind=cast("GateKind | None", outcome.approval_gate_kind),
                         granted_tool=outcome.approval_granted_tool,
+                        granted_arguments=outcome.approval_granted_arguments,
                     )
                 )
         except WorkspaceSelectionRefused as exc:
@@ -6848,6 +6860,7 @@ class Kernel:
             acc.approval_route = frame.approval_route
             acc.approval_gate_kind = frame.approval_gate_kind
             acc.approval_granted_tool = frame.approval_granted_tool
+            acc.approval_granted_arguments = frame.approval_granted_arguments
             acc.approval_display = frame.approval_display
 
     async def _record_action(
@@ -6917,6 +6930,7 @@ class Kernel:
                 approval_route=acc.approval_route,
                 approval_gate_kind=acc.approval_gate_kind,
                 approval_granted_tool=acc.approval_granted_tool,
+                approval_granted_arguments=acc.approval_granted_arguments,
                 approval_display=acc.approval_display,
                 tools_called=frozenset(acc.tools_called),
                 assistant_text=acc.rendered(),

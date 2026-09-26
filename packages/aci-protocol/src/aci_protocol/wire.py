@@ -61,6 +61,7 @@ the live bug stranding the durable-approval path. Resolved strict:
 
 import uuid
 from enum import StrEnum
+from typing import Any
 
 from pydantic import Field
 
@@ -125,6 +126,10 @@ class ApprovalRequest(_AciModel):
     provenance (#544, Decision C) written by the runner; both stay optional for
     the rolling-deploy window.
 
+    ``granted_arguments`` is the canonical JSON object of the denied permission
+    gated call (#3255), carried independently of the human summary. It is
+    optional for older producers, while an empty object remains a real value.
+
     ``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s
     routing pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress
     selector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:
@@ -149,6 +154,7 @@ class ApprovalRequest(_AciModel):
     card_channel: str | None = None
     gate_kind: GateKind | None = None
     granted_tool: str | None = None
+    granted_arguments: dict[str, Any] | None = None
     # Optional SLA: seconds from creation after which the record can only
     # expire, never be approved or rejected.
     expires_in_seconds: int | None = Field(default=None, gt=0)

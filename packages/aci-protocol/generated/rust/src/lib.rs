@@ -177,6 +177,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub approval_grant_tool: Option<String>,
     #[serde(default)]
+    pub approval_grant_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
     pub approval_resumed_kind: Option<String>,
     #[serde(default)]
     pub approval_decision: Option<String>,
@@ -216,6 +218,7 @@ pub struct BootEnv {
 pub mod env_keys {
     pub const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
     pub const CURIE_APPROVAL_DECISION: &str = "CURIE_APPROVAL_DECISION";
+    pub const CURIE_APPROVAL_GRANT_ARGUMENTS: &str = "CURIE_APPROVAL_GRANT_ARGUMENTS";
     pub const CURIE_APPROVAL_GRANT_TOOL: &str = "CURIE_APPROVAL_GRANT_TOOL";
     pub const CURIE_APPROVAL_REQUIRED_TOOLS: &str = "CURIE_APPROVAL_REQUIRED_TOOLS";
     pub const CURIE_APPROVAL_RESUMED_KIND: &str = "CURIE_APPROVAL_RESUMED_KIND";
@@ -351,6 +354,8 @@ pub struct ApprovalRequest {
     #[serde(default)]
     pub granted_tool: Option<String>,
     #[serde(default)]
+    pub granted_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
     pub expires_in_seconds: Option<i64>,
 }
 
@@ -428,6 +433,8 @@ pub enum OutboundEvent {
         #[serde(default)]
         approval_granted_tool: Option<String>,
         #[serde(default)]
+        approval_granted_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        #[serde(default)]
         approval_display: Option<String>,
         #[serde(default)]
         input_tokens: Option<i64>,
@@ -475,6 +482,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -494,6 +502,7 @@ mod tests {
             approval_route: Some("managers".to_string()),
             approval_gate_kind: Some("policy".to_string()),
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
