@@ -789,6 +789,9 @@ async def read_version_connectors(
                     namespace=namespace,
                     app_name=app_name,
                     secret_name=secret_name,
+                    # ADR-0168 decision 7: every hosted connector this install
+                    # renders gets the caller proxy once a key is configured.
+                    proxy=settings.connector_proxy(),
                 ),
                 mcp_entries=bundles.connector_mcp_entries(
                     declared, release=release, agent=agent_name, namespace=namespace
