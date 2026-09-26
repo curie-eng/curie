@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,12 @@ NOT_FOUND = "/nonexistent/acme-command"
 SIGPIPE_PROBE = ["bash", "-c", 'yes | head -n 1 >/dev/null; exit "${PIPESTATUS[0]}"']
 # The lock as the drill scripts take it, on a descriptor the shell opened.
 TAKE_THE_LOCK = 'exec 9>"$1"; shift; "$@" -n 9'
+# The first GNU timeout that blocks its signals across fork() (coreutils commit
+# ab4ffc8503, https://github.com/coreutils/coreutils/issues/82). An earlier one
+# that takes a TERM before its parent has stored the child's pid runs the
+# handler's branch for a child that has not exec'd yet, _exit (128 + SIGTERM),
+# so it exits 143 and never signals the command.
+GNU_TIMEOUT_HOLDS_SIGNALS_ACROSS_FORK = (9, 5)
 
 
 def _is_gnu(tool: str) -> bool:
@@ -53,6 +60,15 @@ def _is_gnu(tool: str) -> bool:
         [path, "--version"], capture_output=True, text=True, check=False
     ).stdout
     return GNU_VERSION_MARKERS[tool] in version
+
+
+def _gnu_version(tool: str) -> tuple[int, ...]:
+    version = subprocess.run(
+        [tool, "--version"], capture_output=True, text=True, check=False
+    ).stdout
+    match = re.search(r"(\d+)\.(\d+)", version.splitlines()[0])
+    assert match is not None, version
+    return tuple(int(part) for part in match.groups())
 
 
 def _implementations(tool: str) -> list[object]:
@@ -256,8 +272,8 @@ def test_timeout_on_expiry_reaches_the_command_group_unless_foreground(
 @pytest.mark.parametrize(
     ("command", "shell_status"),
     [
-        (["sh", "-c", "echo ready; exec sleep 30"], 128 + 15),
-        (["sh", "-c", "trap 'exit 7' TERM; echo ready; sleep 30 & wait"], 7),
+        (["sh", "-c", 'echo "$$"; exec sleep 30'], 128 + 15),
+        (["sh", "-c", "trap 'exit 7' TERM; echo \"$$\"; sleep 30 & wait"], 7),
     ],
     ids=["the-command-dies-of-it", "the-command-traps-it"],
 )
@@ -267,10 +283,19 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
     """Every caller is a shell, so this is the status a shell reads.
 
     When the command dies of the TERM passed to it, GNU coreutils 9.1 and 9.7
-    in Debian images re-raise it (a returncode of -15). GNU timeout on a loaded
-    ubuntu-24.04 Actions runner once exited 143 instead, without a warning (CI
-    run 36041307028), for a reason not established: timeout.c is the same
-    there in 9.1 and 9.4. A shell reads 143 from both.
+    in Debian images re-raise it (a returncode of -15). A shell reads 143 from
+    that and from an exit status of 143 alike, so the command must be gone too.
+
+    GNU timeout before 9.5 exits 143 without signalling the command when the
+    TERM lands before its parent has returned from fork(), and a command that
+    prints as soon as it starts leaves that window open on a loaded machine:
+    GNU timeout 9.4 took it on ubuntu-24.04 Actions runners (CI runs
+    36041307028 and 36211729964). Against those versions the TERM waits until
+    timeout sleeps, since past fork() its only interruptible sleep is the wait
+    on its command, which it reaches after storing the pid. The helper holds
+    the signal across its fork instead, and
+    test_timeout_passes_on_a_term_that_arrives_while_the_command_starts sends
+    one into that fork.
     """
 
     _require_a_group_of_its_own(implementation)
@@ -279,13 +304,21 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
     )
     try:
         assert process.stdout is not None
-        assert process.stdout.readline() == "ready\n"
+        command_pid = int(process.stdout.readline())
+        if (
+            implementation == ["timeout"]
+            and _gnu_version("timeout") < GNU_TIMEOUT_HOLDS_SIGNALS_ACROSS_FORK
+        ):
+            _wait_until_asleep(process.pid)
         process.terminate()
         returncode = process.wait(timeout=10)
+        assert not _alive(command_pid), "the TERM never reached the command"
         assert (128 - returncode if returncode < 0 else returncode) == shell_status
     finally:
         process.kill()
         process.wait()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, 9)
 
 
 # gnu-process.py with its Popen slowed down, so a signal is sure to arrive after
