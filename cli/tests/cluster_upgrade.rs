@@ -451,3 +451,55 @@ async fn dry_run_apply_line_carries_install_and_retained_values_only_when_passed
         "helm upgrade curie charts/curie -n curie --wait --timeout 15m"
     );
 }
+
+/// #3218: an upgrade that changes the platform runner names every layered
+/// agent before it upgrades and clears each one's runner image in the same
+/// `helm upgrade`, after the retained values so the clear wins.
+#[tokio::test]
+async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
+    let mut host = FakeUpgradeHost::installed("0.10.0")
+        .with_retained_values()
+        .with_runner_layer_clears(&["factory", "sre-bot"]);
+    let out = run_lifecycle(dry_opts("0.11.0"), &mut host)
+        .await
+        .expect("dry-run plan");
+    let ClusterUpgradeOutput::DryRun(plan) = &out else {
+        panic!("dry-run must not mutate: {out:?}");
+    };
+    let apply = plan
+        .lines
+        .iter()
+        .find(|l| l.starts_with("helm upgrade "))
+        .expect("plan has an apply line");
+    assert_eq!(
+        apply,
+        "helm upgrade curie charts/curie -n curie --wait --timeout 15m -f <retained-values> \
+         --set agentSandbox.runnerImages.factory=null --set agentSandbox.runnerImages.sre-bot=null"
+    );
+    let notice = plan
+        .lines
+        .iter()
+        .find(|l| l.starts_with("runner layers:"))
+        .expect("plan names the stale runner layers");
+    assert!(notice.contains("factory, sre-bot"), "{notice}");
+    assert!(notice.contains("WITHOUT their layer"), "{notice}");
+    assert!(notice.contains("curie build --plugin-dir"), "{notice}");
+    let json = output_json(&out).to_string();
+    assert!(
+        json.contains("agentSandbox.runnerImages.sre-bot=null"),
+        "{json}"
+    );
+    assert_eq!(host.mutate_calls, 0);
+
+    let mut untouched = FakeUpgradeHost::installed("0.10.0").with_retained_values();
+    let ClusterUpgradeOutput::DryRun(plan) = run_lifecycle(dry_opts("0.11.0"), &mut untouched)
+        .await
+        .unwrap()
+    else {
+        panic!("dry-run must not mutate");
+    };
+    assert!(plan
+        .lines
+        .iter()
+        .all(|l| !l.contains("runnerImages") && !l.starts_with("runner layers:")));
+}

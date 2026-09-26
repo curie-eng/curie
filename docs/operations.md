@@ -900,6 +900,20 @@ clears that agent's earlier value. That agent gets its own
 SandboxTemplate rendering the digest, and the runner prewarm DaemonSet pulls it
 on every node. A tag is refused at render time.
 
+A layer only runs on the platform runner it was built on. `curie cluster deploy`
+compares the lock's `runner.base` digest with the installation's runner (the
+release's `agentSandbox.runner` digest, else its tag or the chart appVersion
+resolved in the registry) and refuses a mismatch, or a runner it cannot
+determine, with the fix `curie build --plugin-dir <dir> --registry <ref>
+--runner-image <installed runner>`. `curie cluster upgrade` compares the current
+runner with the one the target release renders. When they differ, or either
+cannot be determined, it names every agent in `agentSandbox.runnerImages` before
+upgrading, in the plan and `--dry-run` output too, and clears those entries in
+the same `helm upgrade`. Those agents run the new platform runner without their
+layer until their owners rebuild with `curie build` and redeploy. Both checks need
+docker buildx and registry access to resolve runner digests: without it, `curie
+cluster deploy` refuses and `curie cluster upgrade` clears every layer.
+
 For a run that can last three hours, set an illustrative $100 USD cap after
 deploying the agent:
 

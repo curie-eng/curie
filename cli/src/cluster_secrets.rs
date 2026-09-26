@@ -391,6 +391,260 @@ pub async fn bind(opts: BindOpts) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The installation's runner and a layered runner's base (#3218, ADR 0173 d5)
+// ---------------------------------------------------------------------------
+//
+// A layered runner is built on one exact platform runner, recorded in the
+// bundle's lock as `runner.base`. The worker serves the runner its own release
+// ships, so a layer on any other base is a runner the worker may not serve.
+// Two checks keep them together, and both compare by the sha256 digest only,
+// because the same image can be spelled with different repositories:
+//
+// - `curie cluster deploy` refuses a bundle whose recorded base is not the
+//   installation's runner ([`check_layered_runner_base`]).
+// - `curie cluster upgrade` names every agent in
+//   `agentSandbox.runnerImages` whose layer will stop matching, and in the
+//   same `helm upgrade` clears those entries (`=null`, as
+//   [`RunnerImageUpdate::Clear`] does) so the agent runs the new platform
+//   runner the worker serves until its owner rebuilds and redeploys
+//   ([`layers_stopping_to_match`]). Leaving the old layer bound would run an
+//   old runner under a new worker; refusing the upgrade would let one bundle
+//   owner block every platform upgrade.
+//
+// When the installation's runner cannot be determined, deploy refuses and
+// upgrade treats every layered agent as affected: neither passes silently.
+
+/// The runner reference `agentSandbox.runner` renders, from the release's
+/// computed values (`helm get values --all`) and the release chart's
+/// appVersion. A digest wins over a tag, and an empty tag means the chart
+/// appVersion, exactly as the chart's helper renders it. `None` when the
+/// values name no image, or no tag and no appVersion is known.
+pub fn effective_runner_ref(
+    values: &serde_json::Value,
+    app_version: Option<&str>,
+) -> Option<String> {
+    let runner = values.pointer("/agentSandbox/runner")?;
+    let field = |name: &str| {
+        runner
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let image = field("image")?;
+    if let Some(digest) = field("digest") {
+        return Some(format!("{image}@{digest}"));
+    }
+    let tag = field("tag").or(app_version.map(str::trim).filter(|v| !v.is_empty()))?;
+    Some(format!("{image}:{tag}"))
+}
+
+/// The `sha256:<hex>` a digest-pinned reference carries, if any.
+pub fn reference_digest(reference: &str) -> Option<&str> {
+    reference
+        .split_once('@')
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.starts_with("sha256:"))
+}
+
+/// Whether two digest-pinned references name the same image. The repository
+/// is ignored on purpose: a mirror or a renamed repo serves the same bytes.
+/// A reference with no digest never matches, since it proves nothing.
+pub fn same_runner(a: &str, b: &str) -> bool {
+    matches!((reference_digest(a), reference_digest(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The agents the release binds a layered runner to: every non-null
+/// `agentSandbox.runnerImages.<agent>`, in name order.
+pub fn layered_agents(values: &serde_json::Value) -> Vec<String> {
+    values
+        .pointer("/agentSandbox/runnerImages")
+        .and_then(|all| all.as_object())
+        .map(|all| {
+            let mut agents: Vec<String> = all
+                .iter()
+                .filter(|(_, image)| image.as_str().is_some_and(|s| !s.trim().is_empty()))
+                .map(|(agent, _)| agent.clone())
+                .collect();
+            agents.sort();
+            agents
+        })
+        .unwrap_or_default()
+}
+
+/// The layered agents an upgrade from `current` to `target` leaves on a base
+/// that is no longer the installation's runner. Both are digest-pinned
+/// runner references, `None` when they could not be determined. Only a proven
+/// digest match spares them: an unknown on either side affects every layer.
+pub fn layers_stopping_to_match(
+    layered: &[String],
+    current: Option<&str>,
+    target: Option<&str>,
+) -> Vec<String> {
+    match (current, target) {
+        (Some(current), Some(target)) if same_runner(current, target) => Vec::new(),
+        _ => layered.to_vec(),
+    }
+}
+
+/// The `--set` pairs that clear each affected agent's layered runner.
+pub fn runner_image_clears(agents: &[String]) -> Vec<String> {
+    agents
+        .iter()
+        .map(|agent| format!("agentSandbox.runnerImages.{agent}=null"))
+        .collect()
+}
+
+/// The deploy-time decision: `Ok` when the lock's recorded base is the
+/// installation's runner, else the refusal naming the `curie build` that
+/// rebuilds the layer on it. `installed` is `(reference, pinned)`: the
+/// reference an operator passes to `--runner-image`, and its digest-pinned
+/// form, or the reason it could not be determined.
+pub fn runner_base_verdict(
+    plugin_dir: &std::path::Path,
+    recorded_base: &str,
+    installed: std::result::Result<(String, String), String>,
+) -> Result<()> {
+    let (reference, pinned) = match installed {
+        Ok(found) => found,
+        Err(reason) => {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "this bundle's runner layer was built on {recorded_base}, but the \
+                     installation's runner could not be determined ({reason}), so the deploy \
+                     cannot prove the worker serves that base. Refusing rather than risk an \
+                     old runner under a new worker."
+                ))
+                .with_fix(
+                    "confirm the release is healthy with `curie cluster status` and that its \
+                     runner image resolves in its registry, then redeploy",
+                ),
+            ));
+        }
+    };
+    if same_runner(recorded_base, &pinned) {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::usage(format!(
+            "this bundle's runner layer was built on {recorded_base}, but the installation \
+             runs {pinned}. A layer on another base is a runner this worker may not serve."
+        ))
+        .with_fix(format!(
+            "run `curie build --plugin-dir {} --registry <ref> --runner-image {reference}` and \
+             redeploy",
+            plugin_dir.display()
+        )),
+    ))
+}
+
+fn helm_get_json(common: &CommonOpts, what: &str, all: bool) -> OpsCommand {
+    let mut args = vec![
+        plain("get"),
+        plain(what),
+        plain(&common.release),
+        plain("-n"),
+        plain(&common.namespace),
+    ];
+    if all {
+        args.push(plain("--all"));
+    }
+    args.push(plain("-o"));
+    args.push(plain("json"));
+    OpsCommand::new("helm", args)
+}
+
+/// Pin a runner reference to its registry manifest digest. A reference that
+/// already carries one is returned as it is.
+pub async fn pin_runner_reference(reference: &str) -> Result<String> {
+    if reference_digest(reference).is_some() {
+        return Ok(reference.to_string());
+    }
+    let inspect = OpsCommand::new(
+        "docker",
+        vec![
+            plain("buildx"),
+            plain("imagetools"),
+            plain("inspect"),
+            plain(reference),
+            plain("--format"),
+            plain("{{json .Manifest}}"),
+        ],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&inspect).await?;
+    if !ok {
+        bail!(
+            "could not resolve {reference} in its registry: {}",
+            stderr.trim()
+        );
+    }
+    let manifest: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|err| anyhow::anyhow!("the manifest of {reference} is malformed: {err}"))?;
+    let digest = manifest
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow::anyhow!("the manifest of {reference} names no digest"))?;
+    Ok(crate::connector_build::digest_pinned_ref(reference, digest))
+}
+
+/// The installation's runner as `(reference, pinned)`, read from the
+/// release's computed values and chart metadata, or why it could not be.
+pub async fn installed_runner(
+    common: &CommonOpts,
+) -> std::result::Result<(String, String), String> {
+    let read = |cmd: OpsCommand| async move {
+        match crate::ops::run_capture(&cmd).await {
+            Ok((true, out, _)) => serde_json::from_str::<serde_json::Value>(&out)
+                .map_err(|err| format!("`{}` returned malformed JSON: {err}", cmd.display())),
+            Ok((false, _, err)) => Err(format!("`{}` failed: {}", cmd.display(), err.trim())),
+            Err(err) => Err(format!("{err:#}")),
+        }
+    };
+    let values = read(helm_get_json(common, "values", true)).await?;
+    let app_version = read(helm_get_json(common, "metadata", false))
+        .await
+        .ok()
+        .and_then(|m| {
+            m.get("appVersion")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+    let reference = effective_runner_ref(&values, app_version.as_deref()).ok_or_else(|| {
+        format!(
+            "release {} names no agentSandbox.runner image and tag",
+            common.release
+        )
+    })?;
+    let pinned = pin_runner_reference(&reference)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    Ok((reference, pinned))
+}
+
+/// Refuse a cluster deploy whose layered runner was built on anything but the
+/// installation's runner (#3218). A bundle without a locked runner layer is
+/// untouched and costs no helm read.
+pub async fn check_layered_runner_base(
+    common: &CommonOpts,
+    plugin_dir: &std::path::Path,
+) -> Result<()> {
+    if crate::connector_build::load(plugin_dir)?.runner.is_none() {
+        return Ok(());
+    }
+    let Some(entry) = crate::connector_build::load_lock(plugin_dir)?.and_then(|lock| lock.runner)
+    else {
+        return Ok(());
+    };
+    // A missing runner entry or a local-daemon one is `lock_preflight`'s to
+    // refuse, with its own message; this check is about a registry base.
+    if entry.delivery != crate::connector_build::Delivery::Registry {
+        return Ok(());
+    }
+    require_on_path("helm")?;
+    runner_base_verdict(plugin_dir, &entry.base, installed_runner(common).await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,6 +1213,147 @@ esac
                 .contains("agentSandbox.runnerImages.acme-a=null"),
             "{}",
             helm.helm_log()
+        );
+    }
+
+    // --- #3218: the installation's runner and a layered runner's base ---
+
+    const RUNNER_A: &str =
+        "ghcr.io/curie-eng/curie-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RUNNER_A_MIRROR: &str =
+        "mirror.example/curie-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RUNNER_B: &str =
+        "ghcr.io/curie-eng/curie-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn runner_values(image: &str, tag: &str, digest: &str) -> serde_json::Value {
+        serde_json::json!({"agentSandbox": {"runner": {"image": image, "tag": tag, "digest": digest}}})
+    }
+
+    #[test]
+    fn effective_runner_ref_prefers_digest_then_tag_then_app_version() {
+        let img = "ghcr.io/curie-eng/curie-runner";
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "0.9.0", "sha256:abc"), Some("0.10.0")),
+            Some(format!("{img}@sha256:abc"))
+        );
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "0.9.0", ""), Some("0.10.0")),
+            Some(format!("{img}:0.9.0"))
+        );
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "", ""), Some("0.10.0")),
+            Some(format!("{img}:0.10.0"))
+        );
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "", ""), None),
+            None
+        );
+        assert_eq!(
+            effective_runner_ref(&serde_json::json!({}), Some("0.10.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn same_runner_compares_digests_only() {
+        assert!(same_runner(RUNNER_A, RUNNER_A_MIRROR));
+        assert!(!same_runner(RUNNER_A, RUNNER_B));
+        assert!(!same_runner(
+            "ghcr.io/curie-eng/curie-runner:0.10.0",
+            "ghcr.io/curie-eng/curie-runner:0.10.0"
+        ));
+    }
+
+    #[test]
+    fn layered_agents_skip_null_and_empty_entries() {
+        let values = serde_json::json!({"agentSandbox": {"runnerImages": {
+            "zeta": RUNNER_B, "alpha": RUNNER_A, "gone": null, "blank": ""
+        }}});
+        assert_eq!(layered_agents(&values), vec!["alpha", "zeta"]);
+        assert!(layered_agents(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn layers_stop_matching_unless_the_digest_is_proven_equal() {
+        let layered = vec!["factory".to_string()];
+        assert!(
+            layers_stopping_to_match(&layered, Some(RUNNER_A), Some(RUNNER_A_MIRROR)).is_empty()
+        );
+        assert_eq!(
+            layers_stopping_to_match(&layered, Some(RUNNER_A), Some(RUNNER_B)),
+            layered
+        );
+        assert_eq!(
+            layers_stopping_to_match(&layered, None, Some(RUNNER_B)),
+            layered
+        );
+        assert_eq!(
+            layers_stopping_to_match(&layered, Some(RUNNER_A), None),
+            layered
+        );
+        assert!(layers_stopping_to_match(&[], Some(RUNNER_A), Some(RUNNER_B)).is_empty());
+        assert_eq!(
+            runner_image_clears(&layered),
+            vec!["agentSandbox.runnerImages.factory=null"]
+        );
+    }
+
+    #[test]
+    fn runner_base_verdict_passes_a_matching_base_across_repo_spellings() {
+        let dir = std::path::Path::new("/bundles/sre-bot");
+        runner_base_verdict(
+            dir,
+            RUNNER_A_MIRROR,
+            Ok((
+                "ghcr.io/curie-eng/curie-runner:0.10.0".into(),
+                RUNNER_A.into(),
+            )),
+        )
+        .expect("same digest");
+    }
+
+    #[test]
+    fn runner_base_verdict_refuses_another_base_with_the_build_command() {
+        let dir = std::path::Path::new("/bundles/sre-bot");
+        let err = runner_base_verdict(
+            dir,
+            RUNNER_B,
+            Ok((
+                "ghcr.io/curie-eng/curie-runner:0.10.0".into(),
+                RUNNER_A.into(),
+            )),
+        )
+        .expect_err("another base is refused");
+        let cli = err
+            .downcast_ref::<crate::exit::CliError>()
+            .expect("a CliError");
+        assert_eq!(cli.class, crate::exit::ExitClass::Usage);
+        let (message, fix) = (cli.message.clone(), cli.fix.clone());
+        assert!(
+            message.contains(RUNNER_B) && message.contains(RUNNER_A),
+            "{message}"
+        );
+        assert_eq!(
+            fix.as_deref(),
+            Some(
+                "run `curie build --plugin-dir /bundles/sre-bot --registry <ref> --runner-image \
+                 ghcr.io/curie-eng/curie-runner:0.10.0` and redeploy"
+            )
+        );
+    }
+
+    #[test]
+    fn runner_base_verdict_refuses_when_the_installation_runner_is_unknown() {
+        let err = runner_base_verdict(
+            std::path::Path::new("/b"),
+            RUNNER_A,
+            Err("`helm get values` failed: boom".into()),
+        )
+        .expect_err("an unknown installation runner never passes");
+        let (message, _) = crate::exit::present_error(&err);
+        assert!(
+            message.contains("could not be determined") && message.contains("boom"),
+            "{message}"
         );
     }
 }

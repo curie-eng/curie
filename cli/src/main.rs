@@ -5678,6 +5678,20 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // The runner layer digest the lock records (#3260); None
                 // clears an earlier value on the release.
                 let runner_image = curie::connector_build::locked_runner_image(&plugin_dir)?;
+                // A layer built on another platform runner is one the worker
+                // may not serve (#3218, ADR 0173 decision 5): refuse it before
+                // anything is posted, naming the `curie build` that fixes it.
+                if runner_image.is_some() {
+                    curie::cluster_secrets::check_layered_runner_base(
+                        &ops::CommonOpts {
+                            namespace: namespace.clone(),
+                            release: release.clone(),
+                            dry_run: false,
+                        },
+                        &plugin_dir,
+                    )
+                    .await?;
+                }
 
                 let targets: Vec<Option<String>> = if all_targets {
                     let path = plugin_dir.join("deploy.yaml");
