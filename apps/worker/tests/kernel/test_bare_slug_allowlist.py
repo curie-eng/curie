@@ -12,13 +12,20 @@ import asyncio
 import uuid
 from types import SimpleNamespace
 
-from curie_worker.workspace import WorkspaceRepositoryNotAllowed
+from curie_worker import workspace as workspace_module
 
 from .test_approval_lifecycle import GrantBinding, _qevent
 
 _ALLOWLIST_REFUSAL = (
     "That repository is not in api.githubRepoAllowlist for this installation; "
     "allow `owner/repo` or `owner/*` in the chart values."
+)
+# Looked up at call time, not imported, so the fix pin can run this test
+# against the base, where the base refusal type is what a 403 raised.
+_NOT_ALLOWED = getattr(
+    workspace_module,
+    "WorkspaceRepositoryNotAllowed",
+    workspace_module.WorkspaceSelectionRefused,
 )
 _DEPLOYMENT_ID = uuid.UUID("33333333-3333-4333-8333-333333332947")
 
@@ -51,7 +58,7 @@ class _AllowlistWorkspace:
         repo = kwargs["repo_full_name"]
         self.selections.append(repo)
         if repo is not None:
-            raise WorkspaceRepositoryNotAllowed(_ALLOWLIST_REFUSAL)
+            raise _NOT_ALLOWED(_ALLOWLIST_REFUSAL)
         return None
 
     def claim_or_resume_with_handle(self, **kwargs: object) -> object:
