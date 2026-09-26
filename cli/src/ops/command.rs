@@ -272,15 +272,28 @@ fn terminate_after_secret_cleanup(signal: i32) -> ! {
         let mut registry = lock_secret_file_registry();
         registry.terminating = true;
         for path in std::mem::take(&mut registry.paths) {
-            let _ = std::fs::remove_file(path);
+            remove_secret_values_file(&path);
         }
     }
 
     test_mark_coordination("CURIE_TEST_SECRET_SIGNAL_CLEANED");
     test_wait_for_coordination("CURIE_TEST_SECRET_RESUME_SIGNAL");
 
-    let _ = signal_hook::low_level::emulate_default_handler(signal);
+    if let Err(error) = signal_hook::low_level::emulate_default_handler(signal) {
+        eprintln!("failed to invoke default signal handler: {error}");
+    }
     signal_hook::low_level::exit(128 + signal);
+}
+
+fn remove_secret_values_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "failed to remove secret values file {}: {error}",
+            path.display()
+        ),
+    }
 }
 
 #[cfg(unix)]
@@ -294,7 +307,7 @@ fn park_terminating_secret_writer() -> ! {
 #[cfg(debug_assertions)]
 fn test_mark_coordination(env_name: &str) {
     if let Some(path) = std::env::var_os(env_name).map(std::path::PathBuf::from) {
-        let _ = std::fs::write(path, b"ready");
+        std::fs::write(path, b"ready").expect("marking secret cleanup coordination");
     }
 }
 
@@ -366,7 +379,7 @@ impl SecretValuesFileGuard {
                 );
             }
             if let Err(error) = create_secret_values_file(&path, &body) {
-                let _ = std::fs::remove_file(&path);
+                remove_secret_values_file(&path);
                 registry.paths.remove(&path);
                 return Err(error);
             }
@@ -374,7 +387,7 @@ impl SecretValuesFileGuard {
 
         #[cfg(not(unix))]
         if let Err(error) = create_secret_values_file(&path, &body) {
-            let _ = std::fs::remove_file(&path);
+            remove_secret_values_file(&path);
             return Err(error);
         }
 
@@ -414,12 +427,12 @@ impl Drop for SecretValuesFileGuard {
         #[cfg(unix)]
         {
             let mut registry = lock_secret_file_registry();
-            let _ = std::fs::remove_file(&self.path);
+            remove_secret_values_file(&self.path);
             registry.paths.remove(&self.path);
         }
         #[cfg(not(unix))]
         {
-            let _ = std::fs::remove_file(&self.path);
+            remove_secret_values_file(&self.path);
         }
     }
 }
@@ -568,8 +581,18 @@ pub(crate) async fn run_capture_with_stdin(
         None => Err(std::io::Error::other("child stdin pipe was unavailable")),
     };
     if let Err(error) = write_result {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        if let Err(cleanup_error) = child.kill().await {
+            eprintln!(
+                "failed to stop `{}` after input error: {cleanup_error}",
+                cmd.program
+            );
+        }
+        if let Err(cleanup_error) = child.wait().await {
+            eprintln!(
+                "failed to reap `{}` after input error: {cleanup_error}",
+                cmd.program
+            );
+        }
         return Err(error).with_context(|| format!("writing input to `{}`", cmd.program));
     }
     let output = child

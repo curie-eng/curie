@@ -5565,7 +5565,10 @@ mod tests {
     fn pod_summary_does_not_panic_on_empty() {
         // No items: empty items array.
         let items: Vec<serde_json::Value> = Vec::new();
-        let _ = collect_pod_summary(&items);
+        let (rows, ready, total, unhealthy) = collect_pod_summary(&items);
+        assert!(rows.is_empty());
+        assert_eq!((ready, total), (0, 0));
+        assert!(unhealthy.is_empty());
     }
 
     #[test]

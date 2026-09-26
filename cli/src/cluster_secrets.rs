@@ -7,6 +7,8 @@
 //! pods are not Deployments, so there is no `rollout restart` of claimed
 //! sandboxes.
 
+#![deny(clippy::let_underscore_must_use, clippy::let_underscore_untyped)]
+
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
