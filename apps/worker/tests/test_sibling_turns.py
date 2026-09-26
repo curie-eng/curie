@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import socket
+import time
 from collections.abc import Mapping
 
 import pytest
@@ -82,15 +83,18 @@ class _KnownSenders:
 class _AuthTest:
     """A Slack capture answering ``auth.test`` by the token it was sent."""
 
-    def __init__(self, users: Mapping[str, str]) -> None:
+    def __init__(self, users: Mapping[str, str], *, delay_s: float = 0.0) -> None:
         self.users = dict(users)
         self.calls: list[str | None] = []
+        self._delay_s = delay_s
         self.app = web.Application()
         self.app.add_routes([web.post("/slack/api/auth.test", self._auth_test)])
 
     async def _auth_test(self, request: web.Request) -> web.Response:
         auth = request.headers.get("Authorization")
         self.calls.append(auth)
+        if self._delay_s:
+            await asyncio.sleep(self._delay_s)
         user = self.users.get(auth or "")
         if user is None:
             return web.json_response({"ok": False, "error": "invalid_auth"})
@@ -329,6 +333,34 @@ def test_an_identity_auth_test_did_not_answer_is_asked_again_only_after_the_inte
             now[0] += 2.0
             assert await senders.identity_of(_OPS_USER) == "ops-bot"
             assert len(capture.calls) == 3
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_identity_of_answers_at_once_while_auth_test_is_slow() -> None:
+    # A person's turn must not wait on a sibling's auth.test (ADR-0168
+    # decision 6, finding 4). A due identity's lookup is fetched in the
+    # background; the caller gets the cache's answer -- None, fail open --
+    # without waiting on the slow round trip.
+    async def go() -> None:
+        capture = _AuthTest({f"Bearer {_DEFAULT_TOKEN}": _DEFAULT_USER}, delay_s=1.0)
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            senders = SlackSenderIdentities(
+                {"default": _DEFAULT_TOKEN},
+                base_url=f"http://127.0.0.1:{server.port}/slack/api/",
+            )
+            start = time.monotonic()
+            answer = await senders.identity_of(_PERSON)
+            elapsed = time.monotonic() - start
+            assert answer is None
+            assert elapsed < 0.2, f"identity_of blocked for {elapsed}s on a slow auth.test"
+            # The background lookup still lands, so a later turn is counted.
+            await asyncio.sleep(1.5)
+            assert await senders.identity_of(_DEFAULT_USER) == "default"
         finally:
             await server.close()
 
