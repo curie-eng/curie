@@ -893,8 +893,10 @@ and run those checks, declare its package registry CIDRs under
 agent gets its own `<release>-agent-<agent>-allow-registry-egress` policy, and
 since NetworkPolicy cannot name a host, list the registry CDN ranges or a
 mirror's address. When the bundle layers its own runner image
-(ADR-0173), set `agentSandbox.runnerImages.<agent>` to the digest reference
-`curie build` recorded in its connectors.lock.yaml. That agent gets its own
+(ADR-0173), `curie cluster deploy` sets `agentSandbox.runnerImages.<agent>` to
+the digest reference `curie build` recorded in its connectors.lock.yaml and
+replaces the agent's claimed sandboxes. Deploying a bundle with no runner entry
+clears that agent's earlier value. That agent gets its own
 SandboxTemplate rendering the digest, and the runner prewarm DaemonSet pulls it
 on every node. A tag is refused at render time.
 
