@@ -244,9 +244,8 @@ class Agent(Base):
     # `order_by` is load-bearing, not cosmetic: `agent_channels` has no
     # `created_at` to fall back on, so without an explicit order the serialized
     # list's element order is whatever Postgres happens to return, and two
-    # identical GETs could differ. `(kind, address)` is used because it is the
-    # pair every other layer already treats as the binding's identity
-    # (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`).
+    # identical GETs could differ. `(kind, address, adapter)` is used because it
+    # is the route every other layer keys by (`agent_channels_route_key`).
     #
     # `lazy="selectin"` is load-bearing, not a preference: every read path builds
     # `AgentOut` from this attribute after its session has been handed back, and
@@ -256,7 +255,7 @@ class Agent(Base):
     channels: Mapped[list[AgentChannel]] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
-        order_by="(AgentChannel.kind, AgentChannel.address)",
+        order_by="(AgentChannel.kind, AgentChannel.address, AgentChannel.adapter)",
         lazy="selectin",
     )
 
@@ -275,7 +274,8 @@ class AgentChannel(Base):
     pair-unique constraint under an address-only lookup would let two agents hold
     one address while the resolver could not tell them apart, which is #38's
     silent misrouting wearing a different hat. That ordering is why 0023 lands
-    after the cutover proves no old worker is running.
+    after the cutover proves no old worker is running. Migration 0061 widens the
+    key to `(kind, address, adapter)` (ADR-0168 decision 3).
 
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
     replies go back through, and which egress credential authenticates them. They
@@ -288,23 +288,30 @@ class AgentChannel(Base):
 
     __tablename__ = "agent_channels"
     __table_args__ = (
-        # One agent per ROUTE, the `(kind, address)` pair (#38, widened from
-        # migration 0021's address-only `agent_channels_address_key` by 0023).
-        # The worker resolves a pair to an agent, so a second agent bound to the
-        # same pair could never respond -- it would be silently shadowed.
-        # Enforced here so it fails at create time.
-        #
-        # The pair, not the address alone, ONLY because the resolver now sees the
-        # pair too (`binding._RESOLVE_SQL`). Widening this while any address-only
-        # consumer can still run re-opens the exact ambiguity the constraint
-        # exists to close, which is why the cutover proves no old worker pod is
-        # running before migration 0023 applies.
-        UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
+        # One agent per ROUTE, the `(kind, address, adapter)` triple (ADR-0168
+        # decision 3, migration 0061; 0023 keyed the pair, 0021 the address).
+        # A second agent bound to the same route could never respond -- it
+        # would be silently shadowed (#38). Enforced here so it fails at create
+        # time. The pair leads so `(kind, address)` lookups keep the index
+        # prefix, and NULLS NOT DISTINCT keeps two route-less non-Slack rows
+        # colliding on the pair.
+        UniqueConstraint(
+            "kind",
+            "address",
+            "adapter",
+            name="agent_channels_route_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(
+            "(kind = 'slack' AND adapter IS NOT NULL AND endpoint IS NULL) "
+            "OR (kind <> 'slack' AND (endpoint IS NULL) = (adapter IS NULL))",
+            name="agent_channels_route_ck",
+        ),
         # No agent_id uniqueness here (ADR-0118, migration 0030): an agent may
         # hold more than one binding now. ADR-0089's "one agent still binds one
-        # channel" is amended in part -- the (kind, address) constraint above is
-        # still what stops two agents claiming the same channel; nothing stops
-        # one agent from claiming several.
+        # channel" is amended in part -- the route key above is what stops two
+        # agents claiming the same route; nothing stops one agent from claiming
+        # several.
         #
         # PLAIN index on agent_id, because dropping that uniqueness dropped the
         # column's only index with it (migration 0030 recreates it as this).
@@ -320,10 +327,11 @@ class AgentChannel(Base):
     )
     kind: Mapped[str]
     address: Mapped[str]
-    # The server-controlled reply route (migration 0024). Both NULL for `slack`,
-    # whose route is the worker's configured Slack origin; both set together for
-    # any other kind -- `agent_channels_route_pair_ck` states that invariant at
-    # the database so a half-configured route cannot be written out of band.
+    # The reply route (migration 0024) and, for `slack`, the bot identity
+    # (ADR-0168 decision 3): a Slack row names its identity in `adapter` and has
+    # no `endpoint`; any other kind sets both or neither.
+    # `agent_channels_route_ck` states it at the database so a half-configured
+    # route cannot be written out of band.
     endpoint: Mapped[str | None] = mapped_column(default=None)
     adapter: Mapped[str | None] = mapped_column(default=None)
     # Rotation counter (ADR-0096 D5, #2379). Bumped on every binding write,
