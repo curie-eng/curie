@@ -174,7 +174,10 @@ async fn same_version_rerun_records_skipped_phases_not_completed_ones() {
         "the plan must say the apply is skipped: {plan:?}"
     );
     assert!(
-        !plan.iter().any(|l| l.starts_with("helm upgrade")),
+        !plan.iter().any(|l| l.starts_with("helm upgrade")
+            || l.starts_with("phase drain_preflight:")
+            || l.starts_with("phase checkpoint:")
+            || l.starts_with("phase migrate:")),
         "a skipped apply must not be planned as a helm upgrade: {plan:?}"
     );
 }
@@ -193,7 +196,11 @@ async fn fresh_install_records_drain_preflight_as_skipped_across_resume() {
         .expect("resume");
     let record: serde_json::Value =
         serde_json::from_str(&host.persisted_json()).expect("persisted record");
-    assert_eq!(record["skipped"], serde_json::json!(["drain_preflight"]), "{record}");
+    assert_eq!(
+        record["skipped"],
+        serde_json::json!(["drain_preflight"]),
+        "{record}"
+    );
     assert!(
         !record["completed"]
             .as_array()
@@ -201,7 +208,10 @@ async fn fresh_install_records_drain_preflight_as_skipped_across_resume() {
             .contains(&serde_json::json!("drain_preflight")),
         "{record}"
     );
-    assert_eq!(host.drain_calls, 0, "resume must not replay a skipped preflight");
+    assert_eq!(
+        host.drain_calls, 0,
+        "resume must not replay a skipped preflight"
+    );
 }
 
 // Schema refusal at Validate must not begin mutation. `--forward-only` is a
