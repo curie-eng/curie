@@ -2207,7 +2207,9 @@ agentSandbox:
   # (<fullname>-agent-<name>-connector-secrets), kept off the shared chart
   # Secret and off the value-only SandboxClaim CR. The runner sandbox reads a
   # value via a per-agent SandboxTemplate `secretKeyRef`. Worker claims route
-  # to that agent's pool (#1488). Empty by default; supply per agent,
+  # to that agent's pool (#1488). An agent whose bundle declares connector
+  # secrets but has no entry here gets no pool, and its turns are refused
+  # with a reply naming this value (#2943). Empty by default; supply per agent,
   # e.g.:
   #   connectorSecrets:
   #     github-issues:

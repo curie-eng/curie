@@ -1103,7 +1103,13 @@ class SandboxSubstrate:
 
         self._k8s.create_claim(
             name,
-            pool=claim_warm_pool(config.warm_pool, env, agent_name, config.agent_pools),
+            pool=claim_warm_pool(
+                config.warm_pool,
+                env,
+                agent_name,
+                config.agent_pools,
+                config.connector_secret_pools,
+            ),
             env=env,
             labels=labels,
         )

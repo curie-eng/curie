@@ -43,7 +43,12 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError, TurnStream
-from curie_worker.sandbox import QuotaRejection, RouteRecord, SandboxHandle
+from curie_worker.sandbox import (
+    MissingAgentPoolError,
+    QuotaRejection,
+    RouteRecord,
+    SandboxHandle,
+)
 from curie_worker.workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
@@ -6403,5 +6408,39 @@ def test_streaming_turn_route_survives_the_reaper_past_its_ttl(
                 assert len(calls) == during, "keepalive outlived the turn"
             else:
                 assert len(reaped) == 1
+
+    asyncio.run(go())
+
+
+def test_missing_agent_pool_is_terminal_and_names_the_fix(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#2943: a claim for a pool no render produced cannot succeed on retry.
+
+    It used to wait out ClaimTimeoutError three times and end as runner-error.
+    The turn now ends at once with a reply naming the missing pool and value.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            attempts: list[str] = []
+
+            def refuse(thread_key: str, **_kwargs: object) -> SandboxHandle:
+                attempts.append(thread_key)
+                raise MissingAgentPoolError(
+                    "cli-bot", "curie-agent-cli-bot-runner-pool"
+                )
+
+            monkeypatch.setattr(h.substrate, "claim", refuse)
+            with caplog.at_level(logging.WARNING):
+                await h.kernel.process_event(_qevent("hello", thread="tNoPool"))
+
+            assert len(attempts) == 1
+            assert h.runner.opened == []
+            assert h.sink.last_text is not None
+            assert "curie-agent-cli-bot-runner-pool" in h.sink.last_text
+            assert "agentSandbox.connectorSecrets.cli-bot" in h.sink.last_text
+            assert "runner-error" not in h.sink.last_text
+            assert "curie-agent-cli-bot-runner-pool" in caplog.text
 
     asyncio.run(go())
