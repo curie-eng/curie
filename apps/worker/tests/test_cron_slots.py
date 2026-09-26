@@ -25,7 +25,9 @@ def test_same_expression_differs_between_utc_and_an_explicit_zone() -> None:
 
     assert resolve_slots("0 9 * * *", "UTC", start, end) == [_utc(2026, 6, 1, 9, 0)]
     # June is EDT (UTC-4): 09:00 local is 13:00Z.
-    assert resolve_slots("0 9 * * *", "America/New_York", start, end) == [_utc(2026, 6, 1, 13, 0)]
+    assert resolve_slots("0 9 * * *", "America/New_York", start, end) == [
+        _utc(2026, 6, 1, 13, 0)
+    ]
 
 
 def test_slots_are_aware_utc_and_ascending() -> None:

@@ -21,7 +21,8 @@ restarted worker still sees the slots it slept through. It fires only the
 newest due slot and records every older one ``skipped``. The newest is skipped
 too once it is older than the schedule's own interval or ``CATCH_UP_CEILING``,
 whichever is shorter. A hook with no recorded slot never fires a slot from
-before this worker started, and the reach back stops at ``_CATCH_UP_LOOKBACK``.
+before this worker started. The reach back stops at ``_CATCH_UP_LOOKBACK`` and
+one pass records at most ``_MAX_SKIPPED_ROWS`` skipped slots per hook.
 
 **One hook's failure ends with that hook.** An exception while reading one
 agent's triggers, or resolving or admitting one hook, is caught and logged, and
@@ -79,9 +80,14 @@ _STALE_SLACK_S = 60.0
 # schedule: a monthly hook four weeks late starts fresh.
 CATCH_UP_CEILING = timedelta(hours=24)
 
-# How far back a restarted worker looks for slots it slept through. Older slots
-# get no row at all; this keeps a minute schedule's skipped rows bounded.
-_CATCH_UP_LOOKBACK = timedelta(days=7)
+# How far back a restarted worker looks for slots it slept through. It bounds
+# the slot enumeration, not the record: a monthly hook down four weeks still
+# gets its missed slot recorded.
+_CATCH_UP_LOOKBACK = timedelta(days=366)
+
+# The most skipped rows one pass writes for one hook, newest kept. A minute
+# schedule down for days would otherwise write thousands of rows in one pass.
+_MAX_SKIPPED_ROWS = 1000
 
 
 def resolve_slots(
@@ -443,6 +449,15 @@ class CronSchedulerLoop:
     ) -> None:
         if not slots:
             return
+        if len(slots) > _MAX_SKIPPED_ROWS:
+            logger.warning(
+                "cron hook %s for agent=%s missed %d slots; recording the newest %d skipped",
+                name,
+                target.agent_name,
+                len(slots),
+                _MAX_SKIPPED_ROWS,
+            )
+            slots = slots[-_MAX_SKIPPED_ROWS:]
         async with self._engine.begin() as conn:
             await conn.execute(
                 self._skip_sql,

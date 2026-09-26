@@ -102,7 +102,8 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO curie.agents (id, name, max_usd_per_day) VALUES (:id, :name, :usd)"
+                    "INSERT INTO curie.agents (id, name, max_usd_per_day) "
+                    "VALUES (:id, :name, :usd)"
                 ),
                 {"id": agent_id, "name": f"cron_agent_{token}", "usd": max_usd_per_day},
             )
@@ -544,11 +545,12 @@ def test_restarted_loop_fires_the_newest_missed_slot_once_and_skips_the_older_on
 def test_restarted_loop_fires_nothing_for_a_slot_past_the_age_bound(
     sync_redis: redis.Redis, names: dict[str, str]
 ) -> None:
-    """A weekly hook whose newest missed slot is two days old starts fresh."""
+    """A weekly hook down ten days: its newest missed slot is three days old,
+    past the 24 h ceiling, so nothing fires and both missed slots are recorded."""
 
     async def body() -> None:
         async with _seed() as seed:
-            missed = seed.slot - timedelta(days=2)
+            missed = seed.slot - timedelta(days=10)
             last = missed - timedelta(weeks=1)
             await seed.add_run(last, last)
             async with seed.engine.begin() as conn:
@@ -566,6 +568,7 @@ def test_restarted_loop_fires_nothing_for_a_slot_past_the_age_bound(
             assert [(r.slot_utc, r.outcome) for r in rows] == [
                 (last, "ran"),
                 (missed, "skipped"),
+                (missed + timedelta(weeks=1), "skipped"),
             ]
             assert _entries(sync_redis, names["stream"]) == []
 
