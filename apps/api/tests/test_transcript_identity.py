@@ -17,7 +17,6 @@ from urllib.parse import quote
 
 from channel_protocol import scoped_conversation_id
 from curie_api.config import get_settings
-from curie_api.threadkeys import pre_identity_thread_key_for
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -154,10 +153,8 @@ def test_a_stale_expected_version_after_readoption_is_refused(
 def test_an_unbound_identity_on_the_pair_never_adopts_it(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """This covers an identity with NO binding on the pair. A second BOUND
-    identity on the pair cannot exist until #3100 (migration 0023 holds the
-    pair to one row); that path is pinned instead by the stub unit test on
-    ``pre_identity_thread_key_for`` below."""
+    """This covers an identity with NO binding on the pair; a second BOUND
+    identity is the test below."""
     aid = _mail_agent(client, auth_headers)
     _seed(client, auth_headers, aid, OLD_KEY, HISTORY)
     other = scoped_conversation_id("email", ADDRESS, THREAD, identity="other-inbox")
@@ -251,19 +248,23 @@ def test_a_pre_0053_row_under_the_old_key_is_adopted(
     assert read.json()["value"] == HISTORY
 
 
-def test_pre_identity_thread_key_for_refuses_a_second_binding_on_the_pair() -> None:
-    """Pins the ``==`` (not ``in``) in ``pre_identity_thread_key_for``.
-    Migration 0023 holds ``(kind, address)`` to one row per agent until
-    #3100, so a second BOUND identity on the pair cannot be seeded through
-    the HTTP API today -- a stub session is enough here, because only the
-    list comparison is under test."""
-
-    class _StubAdapters:
-        async def scalars(self, query: Any) -> list[str | None]:
-            del query
-            return [ADAPTER, "other-inbox"]
-
-    result = asyncio.run(
-        pre_identity_thread_key_for(_StubAdapters(), uuid.uuid4(), NEW_KEY)  # type: ignore[arg-type]
+def test_a_second_bound_identity_on_the_pair_keeps_the_old_key_unadopted(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """With two of this agent's routes on one pair, the pre-identity key could be
+    either's, so neither adopts it (`pre_identity_thread_key_for`'s `==`)."""
+    aid = _mail_agent(client, auth_headers)
+    second = client.post(
+        f"/agents/{aid}/channels",
+        json={
+            "kind": "email",
+            "address": ADDRESS,
+            "endpoint": "http://other-inbox.test/",
+            "adapter": "other-inbox",
+        },
+        headers=auth_headers,
     )
-    assert result is None
+    assert second.status_code == 201, second.text
+    _seed(client, auth_headers, aid, OLD_KEY, HISTORY)
+
+    assert client.get(_url(aid, NEW_KEY), headers=auth_headers).status_code == 404
