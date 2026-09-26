@@ -18,10 +18,10 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
-from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+from typing import Any
 
 import httpx
 import pytest
@@ -1001,9 +1001,14 @@ def test_unbound_cluster_message_lineage_is_still_refused(
     ) == [{"binding_id": None, "binding_generation": None}]
     response = post_review(client, truth)
     assert response.status_code == 200, response.text
-    assert response.json()["status"] != "feedback_queued"
+    # No binding means no GitHub identity is ever stamped, so the PR selects
+    # no lineage at all.
+    body = response.json()
+    assert (body["status"], body["errors"]) == (
+        "feedback_ignored",
+        [{"code": "lineage_absent_or_ambiguous"}],
+    )
     assert valkey.xlen(stream) == 0
-    assert review_rows("SELECT status FROM curie.github_review_feedback") in ([], [{"status": "ignored"}])
 
 
 def test_worker_publication_success_stamps_verified_identity_on_the_lineage(

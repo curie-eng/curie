@@ -46,6 +46,7 @@ from .publication_policy import (
     publication_row_prefix,
 )
 from .schemas import (
+    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     ActionComplete,
     ActionRecord,
     AgentCreate,
@@ -1069,9 +1070,15 @@ async def create_publication(
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if binding is not None and (
-            binding.endpoint != data.reply_endpoint or binding.adapter != data.reply_adapter
-        ):
+        # The built-in cluster-message relay is not a configurable route: the
+        # channel API reserves its adapter, so the binding it replies for is
+        # one with no route of its own (#2789). Any configured route refuses.
+        route = (
+            (None, None)
+            if data.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
+            else (data.reply_endpoint, data.reply_adapter)
+        )
+        if binding is not None and (binding.endpoint, binding.adapter) != route:
             binding = None
         lineage_id = uuid.uuid4()
         lineage = ThreadPublicationLineage(
