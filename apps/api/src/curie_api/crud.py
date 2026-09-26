@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from .config import get_settings
 from .models import (
@@ -1270,12 +1271,6 @@ async def create_publication(
     if owned_request is not None:
         publication.execution_request_id = owned_request.id
     session.add(publication)
-    await _bind_running_work_item_lineage(
-        session,
-        agent_id=deployment.agent_id,
-        conversation_id=workspace_conversation_id,
-        lineage_id=lineage.id,
-    )
     if auto:
         session.add(
             ApprovalAuditEntry(
@@ -1333,33 +1328,46 @@ def _binding_route(data: PublicationCreate) -> tuple[str | None, str | None]:
 async def _bind_running_work_item_lineage(
     session: AsyncSession,
     *,
-    agent_id: uuid.UUID,
-    conversation_id: str,
-    lineage_id: uuid.UUID,
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    identity: VerifiedPublicationIdentity | None,
 ) -> None:
-    """Point the running factory request at this publication before commit.
+    """Bind only the running request that created the successful publication."""
 
-    The publication transaction already holds the work item. A conversation
-    with no running request is left alone.
-    """
-
+    if publication.execution_request_id is None:
+        return
+    request_owns_item = (
+        select(ExecutionRequest.id)
+        .where(
+            ExecutionRequest.id == publication.execution_request_id,
+            ExecutionRequest.work_item_id == WorkItem.id,
+            ExecutionRequest.status == "running",
+        )
+        .exists()
+    )
+    predicates: list[ColumnElement[bool]] = [
+        WorkItem.agent_id == lineage.agent_id,
+        WorkItem.conversation_id == lineage.conversation_id,
+        func.lower(WorkItem.repo_full_name) == lineage.repo_full_name.casefold(),
+        WorkItem.cancelled_at.is_(None),
+        WorkItem.publication_lineage_id.is_(None),
+        request_owns_item,
+    ]
+    repository_id = (
+        identity.repository_id if identity is not None else lineage.github_repository_id
+    )
+    installation_id = (
+        identity.installation_id if identity is not None else lineage.github_installation_id
+    )
+    if repository_id is not None:
+        predicates.append(WorkItem.github_repository_id == repository_id)
+    if installation_id is not None:
+        predicates.append(WorkItem.github_installation_id == installation_id)
     await session.execute(
         update(WorkItem)
-        .where(
-            WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id == conversation_id,
-            WorkItem.cancelled_at.is_(None),
-            WorkItem.publication_lineage_id.is_(None),
-            select(ExecutionRequest.id)
-            .where(
-                ExecutionRequest.work_item_id == WorkItem.id,
-                ExecutionRequest.status == "running",
-                ExecutionRequest.execution_deadline > func.clock_timestamp(),
-            )
-            .exists(),
-        )
+        .where(*predicates)
         .values(
-            publication_lineage_id=lineage_id,
+            publication_lineage_id=lineage.id,
             version=WorkItem.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1727,6 +1735,13 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication has no thread pull request lineage",
         )
+    if publication.execution_request_id is not None:
+        await session.scalar(
+            select(WorkItem.id)
+            .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
+            .where(ExecutionRequest.id == publication.execution_request_id)
+            .with_for_update(of=WorkItem)
+        )
     lineage = await session.scalar(
         select(ThreadPublicationLineage)
         .where(ThreadPublicationLineage.id == publication.lineage_id)
@@ -1850,6 +1865,13 @@ async def advance_publication_lineage(
         raise PublicationLineageConflict(
             "publication.lineage_stale",
             "publication revision changed before its lineage could advance",
+        )
+    if not terminal_state:
+        await _bind_running_work_item_lineage(
+            session,
+            publication=publication,
+            lineage=lineage,
+            identity=identity,
         )
     await session.commit()
     refreshed = await session.get(ThreadPublicationLineage, lineage.id)

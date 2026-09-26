@@ -30,7 +30,8 @@ from curie_api.github_app import (
     GitHubInstallationRefused,
 )
 from curie_api.main import create_app
-from curie_api.schemas import ApprovalRequest
+from curie_api.publication_authority import VerifiedPublicationIdentity
+from curie_api.schemas import ApprovalRequest, PublicationLineageAdvance
 from curie_api.workitem_dispatch import (
     acquire,
     admit,
@@ -290,6 +291,18 @@ def _versions(request_id: uuid.UUID) -> tuple[int, int]:
             )
         ).mappings().one()
         return int(row["wv"]), int(row["rv"])
+
+    return with_session(body)
+
+
+def _bound_lineage(work_item_id: uuid.UUID) -> uuid.UUID | None:
+    async def body(session: AsyncSession) -> uuid.UUID | None:
+        return await session.scalar(
+            text(
+                "SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"
+            ),
+            {"id": work_item_id},
+        )
 
     return with_session(body)
 
@@ -664,6 +677,7 @@ def test_pending_publication_approval_is_awaiting_approval(
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
     _publish(stack, agent["deployment_id"])
+    assert _bound_lineage(seeded.work_item_id) is None
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
@@ -743,16 +757,16 @@ def test_denied_publication_is_completed_unpublished(
     assert "denied" in body["actionable_cause"]
 
 
-def test_opened_pr_is_published_found_by_conversation_and_ci_is_unavailable(
+def test_opened_pr_binds_lineage_and_ci_is_unavailable(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
-    # The WorkItem's publication_lineage_id stays NULL (nothing links it in
-    # production); the lineage must be found by agent + conversation + repo.
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
     publication = _publish(stack, agent["deployment_id"])
+    assert _bound_lineage(seeded.work_item_id) is None
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
+    assert _bound_lineage(seeded.work_item_id) == uuid.UUID(publication["lineage_id"])
     _complete(seeded)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
@@ -764,6 +778,154 @@ def test_opened_pr_is_published_found_by_conversation_and_ci_is_unavailable(
     assert body["ci"]["state"] == "unavailable"
     assert body["ci"]["reason"] == "app_not_configured"
     _assert_common(body)
+
+
+def test_pr_opened_after_execution_deadline_binds_and_completes(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+
+    async def elapse_deadline() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET "
+                        "started_at = now() - interval '1860 seconds', "
+                        "execution_deadline = now() - interval '60 seconds' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": seeded.request_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(elapse_deadline())
+    _open_pr(stack, publication["id"])
+    assert _bound_lineage(seeded.work_item_id) == uuid.UUID(publication["lineage_id"])
+
+    work_item_version, request_version = _versions(seeded.request_id)
+
+    async def complete(session: AsyncSession) -> None:
+        result = await workitems.complete_execution(
+            session,
+            work_item_id=seeded.work_item_id,
+            request_id=seeded.request_id,
+            expected_work_item_version=work_item_version,
+            expected_request_version=request_version,
+        )
+        assert isinstance(result, workitems.WorkItemOutcome), result
+
+    with_session(complete)
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    assert body["state"] == "published"
+    assert body["requests"][-1]["status"] == "completed"
+    assert body["pr"] == {"number": PR_NUMBER, "url": PR_URL, "status": "open"}
+
+
+def test_opened_pr_binds_only_the_publication_request(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    owner = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    other_facts = _facts(agent["agent_id"], github_issue_number=2578)
+    other = _admit(other_facts)
+    _start(other_facts.request_id)
+    assert _bound_lineage(owner.work_item_id) is None
+    assert _bound_lineage(other.work_item_id) is None
+
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+
+    assert _bound_lineage(owner.work_item_id) == uuid.UUID(publication["lineage_id"])
+    assert _bound_lineage(other.work_item_id) is None
+
+
+def test_verified_repository_identity_must_match_work_item_to_bind(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"], github_repository_id=102)
+    seeded = _admit(facts)
+    _start(facts.request_id)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    lease_owner = "outcomes-test-worker"
+    _execute(
+        "UPDATE curie.publications SET lease_owner = :owner, "
+        "lease_expires_at = now() + interval '1 minute', "
+        "version = version + 1 WHERE id = :id",
+        {"id": uuid.UUID(publication["id"]), "owner": lease_owner},
+    )
+
+    async def advance(session: AsyncSession) -> None:
+        version = await session.scalar(
+            text("SELECT version FROM curie.publications WHERE id = :id"),
+            {"id": uuid.UUID(publication["id"])},
+        )
+        assert version is not None
+        await crud.advance_publication_lineage(
+            session,
+            uuid.UUID(publication["id"]),
+            PublicationLineageAdvance(
+                expected_version=1,
+                expected_head_sha=None,
+                expected_publication_version=int(version),
+                lease_owner=lease_owner,
+                state="open",
+                pr_number=PR_NUMBER,
+                pr_url=PR_URL,
+                head_sha=HEAD_SHA,
+            ),
+            identity=VerifiedPublicationIdentity(
+                repository_id=101,
+                installation_id=202,
+                pr_node_id="PR_example_123",
+                base_ref="main",
+            ),
+        )
+        opened = await session.execute(
+            text(
+                "SELECT github_repository_id, pr_url FROM "
+                "curie.thread_publication_lineages WHERE id = :id"
+            ),
+            {"id": uuid.UUID(publication["lineage_id"])},
+        )
+        assert opened.one() == (101, PR_URL)
+
+    async def run_advance() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                await advance(session)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run_advance())
+    assert _bound_lineage(seeded.work_item_id) is None
+
+
+def test_opened_pr_after_cancellation_keeps_outcome_fallback(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _cancel(seeded.work_item_id, seeded.request_id)
+
+    _open_pr(stack, publication["id"])
+
+    assert _bound_lineage(seeded.work_item_id) is None
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    assert body["state"] == "cancellation_requested"
+    assert body["pr"] == {"number": PR_NUMBER, "url": PR_URL, "status": "open"}
 
 
 def test_readmitted_item_running_again_reports_running_and_keeps_the_pr(
