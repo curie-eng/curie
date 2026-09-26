@@ -11,9 +11,11 @@
 #   (c) With the Secret named, the signing key reaches exactly one workload,
 #       the worker, by secretKeyRef to that Secret and key. A sandbox holding
 #       it could mint a token naming any agent.
-#   (d) No workload is handed the public key yet. Nothing verifies a token in
-#       this release, and a reference to a key nobody reads is one more thing
-#       to keep in step.
+#   (d) The named Secret is referenced exactly once in the whole render: the
+#       worker's signing-key env entry from (c). A second reference would mean
+#       another workload, an envFrom, a volume, or the public key reached
+#       something -- nothing verifies a token in this release, and a reference
+#       to a key nobody reads is one more thing to keep in step.
 #
 # Pass a second chart directory to also prove the stock render matches it,
 # ignoring the per-render random secrets:
@@ -111,10 +113,11 @@ else
 fi
 
 # -- (d) ----------------------------------------------------------------------
-if grep -q 'key: "verifyKey"' <<<"$SUPPLIED"; then
-    fail "a workload was handed the caller public key before anything verifies"
+NAME_COUNT="$(grep -o 'acme-connector-caller' <<<"$SUPPLIED" | wc -l | tr -d ' ')"
+if [[ "$NAME_COUNT" != "1" ]]; then
+    fail "the Secret name acme-connector-caller appeared $NAME_COUNT times in the render, not exactly once"
 else
-    echo "ok: no workload is handed the public key"
+    echo "ok: the Secret name appears exactly once in the render"
 fi
 
 # -- baseline -----------------------------------------------------------------

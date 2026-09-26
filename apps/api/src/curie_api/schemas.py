@@ -21,6 +21,7 @@ from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
 from plugin_format.connector_render import agent_forges_join
+from plugin_format.connectors import ADMITS_SELF
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -455,7 +456,16 @@ def _validate_secret_map(value: dict[str, str] | None) -> dict[str, str] | None:
 
 
 def _validate_agent_name(value: str) -> str:
-    """Reject an agent name that would forge the connector object-name join.
+    """Reject an agent name that forges the connector join, or is the sentinel.
+
+    Two independent refusals share this validator:
+
+    ``self`` is reserved (ADR-0168 decision 7): ``admits`` uses it to mean the
+    agent a bundle is deployed as, and ``deploy.yaml``'s ``target.agent``
+    (``deploy.bad_agent_name``) and the CLI's per-agent secret binding already
+    refuse a target genuinely named that, since it would be indistinguishable
+    from the sentinel. ``POST /agents`` was the remaining hole, closed here the
+    same way #1446 closed the ``-mcp-`` join below.
 
     A connector's Kubernetes objects are named
     ``{release}-{agent}-mcp-{connector}``
@@ -495,6 +505,13 @@ def _validate_agent_name(value: str) -> str:
     exists to protect.
     """
 
+    if value == ADMITS_SELF:
+        raise ValueError(
+            f"agent name {value!r} is reserved: `admits` (ADR-0168 decision 7) "
+            "uses it to mean the agent a bundle is deployed as, so a target "
+            "genuinely named `self` would be indistinguishable from that "
+            "sentinel. Pick a different name."
+        )
     if agent_forges_join(value):
         raise ValueError(
             f"agent name {value!r} collides with the connector object-name "

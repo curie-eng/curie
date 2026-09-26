@@ -1519,11 +1519,12 @@ def test_the_caller_signing_key_is_unset_by_default(monkeypatch: pytest.MonkeyPa
 def test_a_whitespace_only_signing_key_counts_as_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A Secret mounted as a file can end up all-newline (an empty value plus
-    # the trailing newline `echo` adds). The boot check strips before judging
-    # "is anything configured at all", so this constructs cleanly rather than
+    # A Secret value written with `echo` ends in a newline: an empty value
+    # arrives as all-newline. The boot check strips before judging "is
+    # anything configured at all", so this constructs cleanly rather than
     # tripping ``CallerSigningKeyError`` -- the same ``.strip()`` gate minting
-    # uses (Task 5), so the two agree on what "unset" means.
+    # uses (`BindingResolver.boot_env`), so the two agree on what "unset"
+    # means.
     _clear_all_config_env(monkeypatch)
     monkeypatch.setenv("CURIE_CONNECTOR_CALLER_SIGNING_KEY", "\n")
     assert WorkerConfig().connector_caller_signing_key == "\n"
