@@ -194,7 +194,16 @@ def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
         "Do not git clone, git fetch, or git pull this repository over the network.\n"
         "General network egress is unavailable in this sandbox; git hosts including "
         "github.com are unreachable by design.\n"
-        "Do not git push; use publish_changes when ready."
+        "Do not git push; use publish_changes when ready.\n"
+        "Python, pip, and venv are already in the image. "
+        "Create a virtualenv only under /workspace.\n"
+        "Install dependencies only from files already in the checkout, with pip --no-index. "
+        "Do not contact a package index.\n"
+        "Run only the repository's documented check command.\n"
+        "Do not write a substitute test runner or shim.\n"
+        "If those checks cannot be installed from files already in the checkout, say that "
+        "in-sandbox verification is unavailable and that the published pull request's CI "
+        "is the only check."
     )
 
 

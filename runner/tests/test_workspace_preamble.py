@@ -101,6 +101,24 @@ def test_workspace_preamble_forbids_clone_and_fetch_in_one_sentence() -> None:
     assert str(dummy) not in preamble
 
 
+def test_workspace_preamble_forbids_a_substitute_test_runner() -> None:
+    # Issue #2901: an agent with no index and no preinstalled pytest wrote its
+    # own shim and treated that as the repository's checks.
+    from curie_runner.__main__ import format_workspace_preamble
+
+    preamble = format_workspace_preamble(Path("dummy-workspace"))
+    assert preamble is not None
+    assert re.search(
+        r"do\s+not\s+write\s+a\s+substitute\s+test\s+runner\s+or\s+shim",
+        preamble,
+        flags=re.IGNORECASE,
+    ), preamble
+    assert "--no-index" in preamble
+    assert "in-sandbox verification is unavailable" in preamble
+    assert "published pull request's CI is the only check" in preamble
+    assert "/workspace" in preamble
+
+
 def test_compose_system_prompt_joins_workspace_between_memory_and_bundle() -> None:
     from curie_runner.__main__ import _compose_system_prompt
 
