@@ -2437,6 +2437,19 @@ enum LocalAction {
 
 #[derive(Subcommand)]
 enum ClusterAction {
+    /// Report value paths that differ between a release and pending Helm files.
+    /// A nonempty report is advisory and exits successfully.
+    LintValues {
+        /// Pending Helm values files in application order.
+        #[arg(short = 'f', long = "values", required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+    },
     /// Install or upgrade the Curie release via Helm (helm upgrade --install).
     /// By default it puts the UI and Langfuse on node ports for tailnet/LAN
     /// access; pass --no-expose to keep them ClusterIP-only. Set
@@ -3453,7 +3466,10 @@ impl ClusterTargetSources {
 
 fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>) {
     match action {
-        ClusterAction::Up {
+        ClusterAction::LintValues {
+            namespace, release, ..
+        }
+        | ClusterAction::Up {
             namespace, release, ..
         }
         | ClusterAction::Down {
@@ -3525,7 +3541,12 @@ fn retarget_cluster_action(
         }
     };
     match action {
-        ClusterAction::Up {
+        ClusterAction::LintValues {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Up {
             namespace: current_namespace,
             release: current_release,
             ..
@@ -5038,6 +5059,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                 ));
             }
             match action {
+            ClusterAction::LintValues {
+                files,
+                namespace,
+                release,
+            } => emit(
+                ops::lint_values(
+                    CommonOpts {
+                        namespace,
+                        release,
+                        dry_run: false,
+                    },
+                    files,
+                )
+                .await?,
+            ),
             ClusterAction::Up {
                 namespace,
                 release,

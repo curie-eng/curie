@@ -25,6 +25,10 @@ struct ClusterCase {
 fn cluster_cases() -> Vec<ClusterCase> {
     vec![
         ClusterCase {
+            name: "lint-values",
+            args: &["lint-values", "-f", "values.yaml"],
+        },
+        ClusterCase {
             name: "up",
             args: &["up", "--fake-model", "--dry-run"],
         },

@@ -11,12 +11,14 @@
 
 mod command;
 mod convergence;
+mod lint_values;
 mod providers;
 mod up;
 mod upgrade;
 mod verbs;
 
 pub use command::*;
+pub use lint_values::*;
 pub use providers::*;
 pub use up::*;
 pub use upgrade::*;
