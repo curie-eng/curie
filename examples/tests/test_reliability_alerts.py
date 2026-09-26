@@ -8,8 +8,9 @@ in the cluster-tier script; this file is the local consumer-path gate.
 
 from __future__ import annotations
 
-import ast
+import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,9 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 OBSERVABILITY = REPO_ROOT / "examples" / "sre-bot" / "observability"
 README = REPO_ROOT / "examples" / "sre-bot" / "README.md"
 ROLLOUT = REPO_ROOT / "examples" / "sre-bot" / "docs" / "METRICS-ROLLOUT.md"
-METRICS_CATALOG = (
-    REPO_ROOT / "packages" / "telemetry" / "src" / "curie_telemetry" / "metrics.py"
-)
+METRICS_MANIFEST = REPO_ROOT / "packages" / "telemetry" / "schema" / "metrics.json"
 RUNTIME_PROOF = REPO_ROOT / "charts" / "curie" / "ci" / "runtime" / "metrics-alerts-runtime.sh"
 
 REQUIRED_ALERTS = {
@@ -116,6 +115,36 @@ APPLICATION_GAUGES = {
     "curie_queue_depth": "curie-worker",
     "curie_approval_pending": "curie-api",
 }
+
+# The gauge CurieQueueMessageAgeHigh reads, and the service that records it.
+QUEUE_LAG = ("curie_queue_lag", "curie-worker")
+
+# How the Collector's prometheusremotewrite exporter names a catalog metric:
+# dots become underscores, then the unit's suffix, then the kind's. A `{...}`
+# unit is an annotation and adds nothing; a unit missing here has no measured
+# suffix, so the catalog claims no stored name for it.
+_UNIT_SUFFIXES = {"s": "_seconds"}
+_KIND_SUFFIXES = {
+    "counter": ("_total",),
+    "gauge": ("",),
+    "up_down_counter": ("",),
+    "histogram": ("_bucket", "_count", "_sum"),
+}
+
+# Names Prometheus holds on an installation of this chart's Collector, each
+# with the kind its catalog metric declares. They pin both unit suffixes and
+# the histogram's series; the rules' own names pin a counter's.
+OBSERVED_STORED_NAMES = {
+    "curie_queue_lag": "gauge",
+    "curie_queue_pending": "gauge",
+    "curie_queue_depth": "gauge",
+    "curie_queue_message_age_seconds_bucket": "histogram",
+    "curie_queue_message_age_seconds_count": "histogram",
+    "curie_queue_message_age_seconds_sum": "histogram",
+}
+
+# Label lists after these keywords name labels, not metrics.
+_GROUPING = re.compile(r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)")
 
 _DURATION_UNITS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
@@ -492,32 +521,110 @@ def test_turn_accepted_stale_reads_a_label_set_missing_from_90m_as_zero() -> Non
     )
 
 
-def _catalog_kinds() -> dict[str, str]:
-    """Each catalog metric's instrument kind, by name with dots as underscores.
+def _catalog() -> dict[str, dict]:
+    """The telemetry metric catalog, which a telemetry test keeps equal to the code's."""
+    return json.loads(METRICS_MANIFEST.read_text())["metrics"]
 
-    A counter's name gains `_total`. No unit suffix is applied, so the name is
-    the one Prometheus stores only for a `{...}` unit, which it drops. Read
-    through the parser, so a comment in the catalog cannot count.
+
+def _stored_names(catalog: dict[str, dict]) -> dict[str, tuple[str, str]]:
+    """Each name Prometheus stores for a catalog metric, with that metric and its kind."""
+    stored: dict[str, tuple[str, str]] = {}
+    for metric, definition in catalog.items():
+        kind, unit = definition["type"], definition["unit"]
+        if re.fullmatch(r"\{[^{}]*\}", unit):
+            unit_suffix = ""
+        elif unit in _UNIT_SUFFIXES:
+            unit_suffix = _UNIT_SUFFIXES[unit]
+        else:
+            continue
+        base = metric.replace(".", "_") + unit_suffix
+        for suffix in _KIND_SUFFIXES[kind]:
+            stored[base + suffix] = (metric, kind)
+    return stored
+
+
+def _catalog_kinds() -> dict[str, str]:
+    """Each stored name's catalog kind."""
+    return {name: kind for name, (_, kind) in _stored_names(_catalog()).items()}
+
+
+def _curie_reads(expr: str) -> set[str]:
+    """Each Curie metric name the expression selects.
+
+    Comments go first, so a rationale naming a metric does not count; then
+    string contents, matcher bodies and grouping label lists, so a label such
+    as `curie_source` does not either.
     """
-    tree = ast.parse(METRICS_CATALOG.read_text())
-    catalog = next(
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        and any(
-            isinstance(target, ast.Name) and target.id == "_METRICS"
-            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+    out: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(expr):
+        char = expr[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+                out.append(char)
+        elif char in "\"'`":
+            quote = char
+            out.append(char)
+        elif char == "#":
+            while index < len(expr) and expr[index] != "\n":
+                index += 1
+            continue
+        else:
+            out.append(char)
+        index += 1
+    selectors = _GROUPING.sub(" ", re.sub(r"\{[^}]*\}", " ", "".join(out)))
+    return {
+        name
+        for name in re.findall(r"(?<![\w:.])[a-zA-Z_:][\w:]*", selectors)
+        if name.startswith("curie_")
+    }
+
+
+def _curie_rules() -> dict[str, str]:
+    """Each rule in any rule file of prometheus-values.yaml that reads a Curie metric."""
+    rules: dict[str, str] = {}
+    for content in (_load("prometheus-values.yaml").get("serverFiles") or {}).values():
+        groups = content.get("groups") if isinstance(content, dict) else None
+        for group in groups or []:
+            for rule in group.get("rules") or []:
+                if _curie_reads(rule["expr"]):
+                    rules[rule.get("alert") or rule["record"]] = rule["expr"]
+    return rules
+
+
+def _implied_kind(name: str) -> str:
+    if name.endswith("_total"):
+        return "counter"
+    if name.endswith(("_bucket", "_count", "_sum")):
+        return "histogram"
+    return "gauge"
+
+
+def _misreads(expr: str) -> list[str]:
+    """Each Curie metric the expression reads under a name no catalog metric is stored as."""
+    catalog = _catalog()
+    stored = _stored_names(catalog)
+    names_of: dict[str, list[str]] = {}
+    for stored_name, (metric, _) in sorted(stored.items()):
+        names_of.setdefault(metric, []).append(stored_name)
+    found: list[str] = []
+    for name in sorted(_curie_reads(expr) - set(stored)):
+        declared = "".join(
+            f"; {metric} is a {definition['type']} with unit {definition['unit']!r}, stored as "
+            + (", ".join(names_of.get(metric, [])) or "no measured name")
+            for metric, definition in sorted(catalog.items())
+            if f"{name}_".startswith(metric.replace(".", "_") + "_")
         )
-    )
-    assert isinstance(catalog, ast.Dict)
-    kinds: dict[str, str] = {}
-    for key, value in zip(catalog.keys, catalog.values, strict=True):
-        assert isinstance(key, ast.Constant) and isinstance(value, ast.Call)
-        kind = value.args[0]
-        assert isinstance(kind, ast.Constant)
-        name = key.value.replace(".", "_")
-        kinds[name + "_total" if kind.value == "counter" else name] = kind.value
-    return kinds
+        found.append(
+            f"{name} reads as a {_implied_kind(name)}, a name no catalog metric is stored as"
+            + declared
+        )
+    return found
 
 
 def test_application_metrics_absent_reads_gauges_every_process_records() -> None:
@@ -545,14 +652,18 @@ def test_application_metrics_absent_reads_gauges_every_process_records() -> None
     assert rule.get("for") == "10m"
 
 
-def test_runtime_proof_emits_and_waits_on_the_gauges_the_absent_rule_reads() -> None:
-    # The runtime proof breaks export to show absent-data detection, which it
-    # can show only for gauges it emits, under the names Prometheus stores.
-    script = "\n".join(
+def _runtime_proof_script() -> str:
+    return "\n".join(
         line
         for line in RUNTIME_PROOF.read_text().splitlines()
         if not line.lstrip().startswith("#")
     )
+
+
+def test_runtime_proof_emits_and_waits_on_the_gauges_the_absent_rule_reads() -> None:
+    # The runtime proof breaks export to show absent-data detection, which it
+    # can show only for gauges it emits, under the names Prometheus stores.
+    script = _runtime_proof_script()
     for metric, service in APPLICATION_GAUGES.items():
         otel = re.escape(metric.replace("_", "."))
         call = re.search(rf'gauge_metric\(\s*"{otel}"[^)]*\)', script)
@@ -563,6 +674,176 @@ def test_runtime_proof_emits_and_waits_on_the_gauges_the_absent_rule_reads() -> 
         assert f'{metric}{{service_name="{service}"}}' in script, (
             f"the runtime proof does not wait on {metric} from {service}"
         )
+
+
+def test_runtime_proof_emits_and_waits_on_the_gauge_the_queue_rule_reads() -> None:
+    # The proof shows the export path stores what the rule reads only if it
+    # sends that gauge and waits for Prometheus to hold it under that name.
+    name, service = QUEUE_LAG
+    reads = _curie_reads(_rule("CurieQueueMessageAgeHigh")["expr"])
+    assert reads == {name}, f"CurieQueueMessageAgeHigh reads {sorted(reads)}, not {name}"
+    metric, kind = _stored_names(_catalog())[name]
+    assert kind == "gauge", f"{metric} is a {kind} in the telemetry catalog, not a gauge"
+    script = _runtime_proof_script()
+    call = re.search(rf'gauge_metric\(\s*"{re.escape(metric)}"[^)]*\)', script)
+    assert call, f"the runtime proof does not emit {metric}"
+    assert re.search(rf'"service\.name":\s*"{re.escape(service)}"', call.group(0))
+    assert f'{name}{{service_name="{service}"}}' in script, (
+        f"the runtime proof does not wait on {name} from {service}"
+    )
+
+
+def test_queue_rule_reads_the_lag_with_the_instance_dropped() -> None:
+    # Every worker process records the whole stream's lag and a restart starts
+    # a new series, so only the lag without its instance is one continuous
+    # series per stream. promtool sees the alert's labels, not which were dropped.
+    name, _ = QUEUE_LAG
+    compact = _compact(_rule("CurieQueueMessageAgeHigh")["expr"])
+    joined = re.findall(
+        rf"maxwithout\(instance\)\({name}\)|max\({name}\)without\(instance\)", compact
+    )
+    assert joined and len(joined) == compact.count(name), (
+        f"CurieQueueMessageAgeHigh must read {name} only as "
+        f"`max without (instance) ({name})`, got {compact!r}"
+    )
+
+
+def test_queue_rule_reads_the_lag_every_minute() -> None:
+    # A subquery with no step takes the evaluation interval, which promtool
+    # cannot tell from 1m here and an installation can change.
+    compact = _compact(_rule("CurieQueueMessageAgeHigh")["expr"])
+    ranges = re.findall(r"\[(\w+)(?::(\w*))?\]", compact)
+    assert ranges and all(step and _seconds(step) == 60 for _, step in ranges), (
+        f"every range in CurieQueueMessageAgeHigh must be a subquery stepping 1m, got {ranges}"
+    )
+
+
+def test_runtime_proof_emits_each_gauge_point_as_the_catalog_declares_it() -> None:
+    # A gauge point for a histogram, or with another unit, is stored under a
+    # name the product never writes, so waiting on it proves nothing a rule reads.
+    catalog = _catalog()
+    calls = list(
+        re.finditer(
+            r'gauge_metric\(\s*"(?P<metric>[^"]+)"(?P<rest>[^)]*)\)', _runtime_proof_script()
+        )
+    )
+    assert calls, "the runtime proof emits no gauge point"
+    for call in calls:
+        metric = call["metric"]
+        declared = catalog.get(metric, {})
+        assert declared.get("type") == "gauge", (
+            f"the runtime proof emits {metric} as a gauge; "
+            f"the catalog says {declared.get('type')!r}"
+        )
+        unit = re.search(r'unit="([^"]*)"', call["rest"])
+        assert unit and unit.group(1) == declared["unit"], (
+            f"the runtime proof emits {metric} with unit "
+            f"{unit.group(1) if unit else 'default'!r}; the catalog says {declared['unit']!r}"
+        )
+
+
+def test_catalog_derivation_gives_the_names_prometheus_stores() -> None:
+    # The guard below is only as good as this derivation, so it must give every
+    # name already observed or already read, under its catalog kind.
+    expected = dict(OBSERVED_STORED_NAMES)
+    expected[TURN_ACCEPTED] = "counter"
+    for selector, _, _ in FIRST_SAMPLE_RULES.values():
+        expected[selector.partition("{")[0]] = "counter"
+    for metric in APPLICATION_GAUGES:
+        expected[metric] = "gauge"
+    stored = _stored_names(_catalog())
+    assert {name: stored.get(name, ("", None))[1] for name in expected} == expected
+
+
+def test_catalog_guard_finds_the_rules_that_read_curie_metrics() -> None:
+    # A reader that finds nothing would pass every rule below.
+    found = set(_curie_rules())
+    expected = set(FIRST_SAMPLE_RULES) | {
+        "CurieTurnAcceptedStale",
+        "CurieApplicationMetricsAbsent",
+        "CurieQueueMessageAgeHigh",
+    }
+    assert expected <= found, f"the guard does not read {sorted(expected - found)}"
+    assert "CurieNodeMemoryHeadroomLow" not in found, (
+        "a curie_source label matcher is not a Curie metric"
+    )
+
+
+@pytest.mark.parametrize("rule", sorted(_curie_rules()))
+def test_rule_reads_curie_metrics_by_the_names_their_catalog_kind_stores(rule: str) -> None:
+    # Prometheus holds a counter only as `_total` and a histogram only as its
+    # `_bucket`, `_count` and `_sum` series, each after its unit's suffix, so a
+    # rule reading any other name selects nothing and can never fire.
+    misreads = _misreads(_curie_rules()[rule])
+    assert not misreads, f"{rule}: " + " | ".join(misreads)
+
+
+def _values_with_rule(expr: str) -> dict:
+    rule = {"alert": "CuriePlanted", "expr": expr}
+    return {"serverFiles": {"alerting_rules.yml": {"groups": [{"name": "p", "rules": [rule]}]}}}
+
+
+@pytest.mark.parametrize(
+    ("expr", "read", "declared"),
+    [
+        pytest.param(
+            "curie_turn_duration_seconds > 60",
+            "curie_turn_duration_seconds",
+            "curie.turn.duration is a histogram",
+            id="gauge-read-of-a-histogram",
+        ),
+        pytest.param(
+            "increase(curie_turn_accepted[15m]) > 0",
+            "curie_turn_accepted",
+            "curie.turn.accepted is a counter",
+            id="counter-read-without-total",
+        ),
+    ],
+)
+def test_catalog_guard_rejects_a_planted_misread(
+    monkeypatch: pytest.MonkeyPatch, expr: str, read: str, declared: str
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "_load", lambda name: _values_with_rule(expr))
+    rules = _curie_rules()
+    assert rules == {"CuriePlanted": expr}
+    misreads = _misreads(rules["CuriePlanted"])
+    assert len(misreads) == 1, misreads
+    assert misreads[0].startswith(f"{read} reads as a gauge"), misreads
+    assert declared in misreads[0], misreads
+
+
+@pytest.mark.parametrize(
+    ("expr", "reads"),
+    [
+        pytest.param(
+            "histogram_quantile(0.9, sum by (le) (rate(curie_turn_duration_seconds_bucket[5m])))"
+            " > 60",
+            {"curie_turn_duration_seconds_bucket"},
+            id="histogram-bucket",
+        ),
+        pytest.param(
+            "increase(curie_turn_accepted_total[15m]) > 0",
+            {"curie_turn_accepted_total"},
+            id="counter-total",
+        ),
+        pytest.param(
+            "max by (curie_source) (\n"
+            '  curie_queue_lag{curie_source="curie_queue_message_age_seconds"}\n'
+            ") > 0\n"
+            "# not curie_queue_message_age_seconds > 900, which is a histogram\n",
+            {"curie_queue_lag"},
+            id="labels-strings-and-comments",
+        ),
+    ],
+)
+def test_catalog_guard_accepts_a_planted_read_the_catalog_stores(
+    monkeypatch: pytest.MonkeyPatch, expr: str, reads: set[str]
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "_load", lambda name: _values_with_rule(expr))
+    rules = _curie_rules()
+    assert rules == {"CuriePlanted": expr}
+    assert _curie_reads(expr) == reads
+    assert _misreads(expr) == []
 
 
 def test_duplicate_node_exporter_alert_counts_series_not_sum() -> None:
