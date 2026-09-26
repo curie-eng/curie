@@ -128,6 +128,32 @@
       },
       "cardinality_bound": 272
     },
+    "curie.schedule.fire": {
+      "type": "counter",
+      "unit": "{fire}",
+      "description": "Durably settled hook fires.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "trigger": [
+          "cron",
+          "bind",
+          "webhook",
+          "test"
+        ],
+        "outcome": [
+          "ran",
+          "deferred",
+          "skipped",
+          "blocked",
+          "reclaimed",
+          "failed"
+        ]
+      },
+      "cardinality_bound": 24
+    },
     "curie.history.resume.cache_read": {
       "type": "histogram",
       "unit": "{token}",

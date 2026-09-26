@@ -111,6 +111,11 @@ _AGENT_TURN_ATTRIBUTES = {
     "outcome": _TURN_OUTCOMES,
     "agent": _bounded_agent_label(),
 }
+_SCHEDULE_FIRE_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "trigger": ["cron", "bind", "webhook", "test"],
+    "outcome": ["ran", "deferred", "skipped", "blocked", "reclaimed", "failed"],
+}
 _HISTORY_CACHE_ATTRIBUTES = {
     "service.name": ["curie-runner"],
     "source": ["runner"],
@@ -406,6 +411,9 @@ _METRICS: dict[str, dict[str, Any]] = {
         "process, so a fleet query can still fold a slug into other on one worker.",
         True,
         _AGENT_TURN_ATTRIBUTES,
+    ),
+    "curie.schedule.fire": _definition(
+        "counter", "{fire}", "Durably settled hook fires.", True, _SCHEDULE_FIRE_ATTRIBUTES
     ),
     "curie.history.resume.cache_read": _definition(
         "histogram",

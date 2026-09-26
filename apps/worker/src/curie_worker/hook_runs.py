@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from aci_protocol import HookRunRef
+from curie_telemetry import record_metric
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -18,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 # migration 0048 already allows it. "deferred" is a fire that met a live session
 # on its thread (#2929); the scheduler reopens it on a later tick.
 HookRunOutcome = Literal["ran", "failed", "blocked", "deferred", "skipped"]
+
+logger = logging.getLogger(__name__)
 
 _RETRY_MARK = "retry"
 
@@ -247,6 +251,7 @@ class HookRunRecorder:
     async def close(self, ref: HookRunRef, outcome: HookRunOutcome) -> None:
         """Set one open run terminally without overwriting an earlier outcome."""
         key = _parse_ref(ref)
+        closed = False
         try:
             async with self._engine.begin() as connection:
                 updated = (
@@ -267,26 +272,27 @@ class HookRunRecorder:
                     )
                 ).one_or_none()
                 if updated is not None:
-                    return
-                existing = (
-                    await connection.execute(
-                        text(
-                            "SELECT outcome FROM curie.hook_runs "
-                            "WHERE agent_id = :agent_id "
-                            "AND name = :name AND slot_utc = :slot_utc"
-                        ),
-                        {
-                            "agent_id": key.agent_id,
-                            "name": key.name,
-                            "slot_utc": key.slot_utc,
-                        },
-                    )
-                ).one_or_none()
-                if existing is None:
-                    raise HookRunRecorderError(
-                        "hook run row does not exist",
-                        code="missing",
-                    )
+                    closed = True
+                else:
+                    existing = (
+                        await connection.execute(
+                            text(
+                                "SELECT outcome FROM curie.hook_runs "
+                                "WHERE agent_id = :agent_id "
+                                "AND name = :name AND slot_utc = :slot_utc"
+                            ),
+                            {
+                                "agent_id": key.agent_id,
+                                "name": key.name,
+                                "slot_utc": key.slot_utc,
+                            },
+                        )
+                    ).one_or_none()
+                    if existing is None:
+                        raise HookRunRecorderError(
+                            "hook run row does not exist",
+                            code="missing",
+                        )
         except HookRunRecorderError:
             raise
         except SQLAlchemyError as exc:
@@ -294,3 +300,15 @@ class HookRunRecorder:
                 "hook run outcome could not be stored",
                 code="backend",
             ) from exc
+        if closed:
+            try:
+                record_metric(
+                    "curie.schedule.fire",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "trigger": "cron",
+                        "outcome": outcome,
+                    },
+                )
+            except Exception:
+                logger.exception("hook run metric emission failed after outcome commit")
