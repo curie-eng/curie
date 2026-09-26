@@ -63,35 +63,29 @@ def _live_command_index(text: str, prefix: str) -> int:
     raise AssertionError(f"missing live command beginning with {prefix!r}")
 
 
-def test_demo_fresh_install_prepares_the_example_before_cluster_up() -> None:
-    text = (BUNDLE / "DEMO.md").read_text(encoding="utf-8")
-    fresh_install = _markdown_section(text, "## Fresh install")
-
-    installer = _live_command_index(fresh_install, "curie example sre-bot install")
-    cluster_up = _live_command_index(fresh_install, "curie cluster up")
-
-    assert installer < cluster_up, (
-        "examples/sre-bot/DEMO.md must run the example installer before "
-        "credentialed cluster up on a fresh install"
+def _assert_credential_exported_before_installer(block: str, where: str) -> None:
+    # The installer reads CURIE_CREDENTIALS itself (#2920). Exported after
+    # it, the install lands on the fake model.
+    export = _live_command_index(block, "export CURIE_CREDENTIALS")
+    installer = _live_command_index(block, "curie example sre-bot install")
+    assert export < installer, (
+        f"{where} must export CURIE_CREDENTIALS before the example installer "
+        "so the fresh install records the real model"
     )
 
 
-def test_readme_first_install_block_names_the_safe_fresh_install_sequence() -> None:
+def test_demo_fresh_install_exports_the_credential_before_the_installer() -> None:
+    text = (BUNDLE / "DEMO.md").read_text(encoding="utf-8")
+    fresh_install = _markdown_section(text, "## Fresh install")
+    _assert_credential_exported_before_installer(fresh_install, "examples/sre-bot/DEMO.md")
+
+
+def test_readme_first_install_block_exports_the_credential_before_the_installer() -> None:
     text = (BUNDLE / "README.md").read_text(encoding="utf-8")
     install = _markdown_section(text, "## Install")
-    first_block = _first_bash_block(install)
-
-    if "curie cluster up" in first_block:
-        installer = _live_command_index(first_block, "curie example sre-bot install")
-        cluster_up = _live_command_index(first_block, "curie cluster up")
-        assert installer < cluster_up, (
-            "the first README install block must prepare the example before credentialed cluster up"
-        )
-    else:
-        assert "(DEMO.md#fresh-install)" in install, (
-            "the first README install block must show the safe command order "
-            "or link to DEMO.md#fresh-install"
-        )
+    _assert_credential_exported_before_installer(
+        _first_bash_block(install), "the first README install block"
+    )
 
 
 def test_staging_deploy_doc_names_what_the_tree_installs_today() -> None:

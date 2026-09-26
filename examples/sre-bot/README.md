@@ -54,20 +54,20 @@ The CLI does not apply it.
 
 ## Install
 
-Use this order for a fresh cluster. The example installer creates the platform
-on its fake model default, installs the observability stack, applies the
-Kubernetes identity, builds its kubeconfig in memory, binds the approval route,
-and deploys the bundle. Enter the model credential only after that command
-succeeds, then run `curie cluster up` to record it outside bundle content.
+Use this order for a fresh cluster. Enter the model credential first. The
+example installer reads `CURIE_CREDENTIALS` the way `curie cluster up` does,
+records it in the release, and opens egress to the provider its prefix names.
+It then installs the observability stack, applies the Kubernetes identity,
+builds its kubeconfig in memory, binds the approval route, and deploys the
+bundle. Without `CURIE_CREDENTIALS` the platform comes up on the fake model.
 
 ```bash
-curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
-  --approvers U0EXAMPLE1,U0EXAMPLE2 \
-  --workspace-repo acme-corp/acme-bot
 read -rsp 'Model credential: ' CURIE_CREDENTIALS
 printf '\n'
 export CURIE_CREDENTIALS
-curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
+curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
+  --approvers U0EXAMPLE1,U0EXAMPLE2 \
+  --workspace-repo acme-corp/acme-bot
 ```
 
 These commands use the current Kubernetes context and the default `curie`
@@ -76,10 +76,10 @@ Persistent volumes use the cluster's default storage class, including the
 default supplied by a stock kind cluster. See the complete executable sequence
 in [DEMO.md](DEMO.md#fresh-install).
 
-The installer is a fresh install command. If the selected release already
-records a model credential, it refuses before platform mutation because its
-declarative platform step would clear the credential and restore the fake model
-default. Use the normal cluster lifecycle for an existing release.
+If the selected release already records a model credential and
+`CURIE_CREDENTIALS` is not exported, the installer refuses before platform
+mutation because its declarative platform step would clear the credential and
+restore the fake model default.
 
 The installer binds the `sre-approvals` route that gates the six Kubernetes
 mutations and platform publication before it deploys. Terminal resolution

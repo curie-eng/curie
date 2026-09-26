@@ -628,6 +628,12 @@ exit 64
             .env("CURIE_TEST_CONNECTOR_STDIN", &self.connector_stdin)
             .env("CURIE_TEST_APPLIED_DIR", &self.applied_dir)
             .env("CURIE_TEST_HELM_VALUES_DIR", &self.helm_values_dir)
+            // The installer reads CURIE_CREDENTIALS from the secret store too
+            // (#2920); never let the host's store decide the model.
+            .env(
+                "CURIE_CONFIG_DIR",
+                self.helm_values_dir.join("curie-config"),
+            )
             .env("CURIE_TEST_NODES_JSON", &self.nodes)
             .env("CURIE_TEST_PODS_JSON", &self.pods)
             .env("CURIE_TEST_NODES_MODE", self.nodes_mode)
@@ -1701,7 +1707,7 @@ fn released_binary_path_uses_cached_chart_and_embedded_assets_outside_checkout()
 }
 
 #[test]
-fn recorded_model_credential_refusal_explains_the_fresh_install_order() {
+fn recorded_model_credential_refusal_names_the_credential_to_export() {
     const MODEL_CREDENTIAL: &str = "fixture_model_credential_value";
 
     let fixture = Fixture::with_modes(
@@ -1735,17 +1741,14 @@ fn recorded_model_credential_refusal_explains_the_fresh_install_order() {
     }
 
     let guidance = text.to_ascii_lowercase();
-    let fresh_install = guidance
-        .find("fresh install")
-        .unwrap_or_else(|| panic!("refusal must explain fresh install ordering: {text}"));
-    let fresh_install_guidance = &guidance[fresh_install..];
-    let before = fresh_install_guidance.find("before");
-    let model_credential = fresh_install_guidance.find("model credential");
+    // #2920: the installer declares CURIE_CREDENTIALS when it is exported, so
+    // the way through is to export it and re-run, not a second command after.
+    let export = guidance
+        .find("export curie_credentials")
+        .unwrap_or_else(|| panic!("refusal must name the credential to export: {text}"));
     assert!(
-        before
-            .zip(model_credential)
-            .is_some_and(|(before, model_credential)| before < model_credential),
-        "fresh install guidance must place this installer before model credential configuration: {text}"
+        guidance[export..].contains("re-running"),
+        "refusal must say exporting it and re-running keeps the credential: {text}"
     );
     for stale_advice in ["preserve it first", "helm get values", "helm upgrade"] {
         assert!(
