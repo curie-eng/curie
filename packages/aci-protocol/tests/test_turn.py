@@ -611,9 +611,9 @@ def test_another_kind_keeps_its_adapter_or_its_absence() -> None:
         # An empty endpoint is no endpoint: the route is the configured Slack.
         ("support-bot", "", "support-bot"),
         (CLUSTER_MESSAGE_ADAPTER, None, DEFAULT_IDENTITY),
-        # The pre-ADR custom-transport form stores a credential slug in
-        # `adapter`, not an identity, so its calls keep the default app's token.
-        ("proof-offline", "http://127.0.0.1:1", DEFAULT_IDENTITY),
+        # A CLI stub turn carries a per-turn Slack origin (#19); it still
+        # speaks as its identity.
+        ("ops-bot", "http://cli-stub.test/api/", "ops-bot"),
         (None, "http://127.0.0.1:1", DEFAULT_IDENTITY),
     ],
 )
