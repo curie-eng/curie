@@ -1718,6 +1718,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.4",
-  "title": "ACI Protocol v0.5.4"
+  "protocolVersion": "0.5.5",
+  "title": "ACI Protocol v0.5.5"
 }
