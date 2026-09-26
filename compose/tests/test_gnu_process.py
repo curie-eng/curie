@@ -209,6 +209,7 @@ def test_timeout_runs_the_command_in_a_group_it_leads_unless_foreground(
         ),
         pytest.param(["0", "sh", "-c", "sleep 0.3; exit 4"], 4, id="zero-never-expires"),
         pytest.param(["5", "sh", "-c", "kill -TERM $$"], -15, id="killed-by-a-signal"),
+        pytest.param(["5", "sh", "-c", "kill -KILL $$"], -9, id="killed-outright"),
         pytest.param(["5", NOT_FOUND], 127, id="not-found"),
         pytest.param(["5", NOT_EXECUTABLE], 126, id="not-executable"),
         pytest.param(["bogus", "true"], 125, id="bad-duration"),
