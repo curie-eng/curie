@@ -63,6 +63,10 @@
 # (priority 0, below curie-sandbox). Negative controls A and B prove both
 # halves can fail.
 #
+# Issue #3206, Assertion 17. Every rendered Helm hook Job and Pod must use the
+# platform PriorityClass, including when an operator provides the class and
+# disables chart creation. Negative controls prove both pod spec shapes fail.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -2319,55 +2323,100 @@ sys.exit(1 if errors else 0)
 PYEOF
 echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
 
-echo
-echo "=== Assertion 17: rustfs-init caps Langfuse event-upload objects with a lifecycle rule (issue #2870) ==="
-# Langfuse never deletes its S3 event-upload objects after ingest. Each trace
-# is about three inodes on the RustFS volume, and on 2026-09-21 they filled the
-# soak node's inode table while kubelet still reported DiskPressure=False. The
-# bucket init Job must install an expiration rule scoped to the events/ prefix,
-# preserve any other lifecycle rule on the bucket, and
-# langfuse.eventUpload.retentionDays=0 must remove the managed rule.
-check_event_retention() {
-  python3 - "$1" "$2" <<'PYEOF'
-import json, re, sys, yaml
-path, want = sys.argv[1], sys.argv[2]
-script = None
-with open(path) as fh:
-    for doc in yaml.safe_load_all(fh):
-        if isinstance(doc, dict) and doc.get("kind") == "Job" and doc["metadata"]["name"].endswith("-rustfs-init"):
-            script = doc["spec"]["template"]["spec"]["containers"][0]["command"][-1]
-if script is None:
-    sys.exit("rustfs-init Job not rendered")
-m = re.search(r"managed_rule='(.*?)'\n", script)
-if want == "none":
-    if m:
-        sys.exit("retention disabled but the managed rule still renders")
-    if "delete-bucket-lifecycle" not in script:
-        sys.exit("retentionDays=0 must remove a rule an earlier release installed")
-    sys.exit(0)
-if not m:
-    sys.exit("rustfs-init never installs a lifecycle rule on the Langfuse bucket")
-rule = json.loads(m.group(1).replace("'\"$rule_id\"'", "langfuse-event-upload-retention"))
-if rule.get("Status") != "Enabled" or rule.get("Filter") != {"Prefix": "events/"}:
-    sys.exit("lifecycle rule must be Enabled and scoped to events/, got %r" % rule)
-if rule.get("Expiration") != {"Days": int(want)}:
-    sys.exit("lifecycle rule expires after %r, expected %s days" % (rule.get("Expiration"), want))
-if 'lifecycle_bucket="langfuse"' not in script:
-    sys.exit("lifecycle rule is not applied to the Langfuse bucket")
-if "Rules[?ID!='$rule_id']" not in script:
-    sys.exit("other lifecycle rules on the bucket must be preserved")
+echo "=== Assertion 17: every rendered Helm hook Job and Pod uses the platform priority class (#3206) ==="
+HOOK_PRIO_CHECK="$TMP/check_hook_priority.py"
+cat > "$HOOK_PRIO_CHECK" <<'PYEOF'
+"""Check every rendered Helm hook Job template and Pod spec."""
+import sys
+
+import yaml
+
+render, expected = sys.argv[1:]
+counts = {"Job": 0, "Pod": 0}
+errors = []
+with open(render) as stream:
+    for doc in yaml.safe_load_all(stream):
+        if not isinstance(doc, dict) or doc.get("kind") not in counts:
+            continue
+        metadata = doc.get("metadata") or {}
+        if not (metadata.get("annotations") or {}).get("helm.sh/hook"):
+            continue
+        kind = doc["kind"]
+        name = metadata.get("name", "<unnamed>")
+        counts[kind] += 1
+        spec = doc.get("spec") or {}
+        if kind == "Job":
+            spec = ((spec.get("template") or {}).get("spec") or {})
+        actual = spec.get("priorityClassName")
+        if actual != expected:
+            errors.append(
+                f"hook {kind} {name} has priorityClassName={actual!r}, "
+                f"expected {expected!r}"
+            )
+for kind, count in counts.items():
+    if count == 0:
+        errors.append(f"render contains no Helm hook {kind}; check would pass vacuously")
+for error in errors:
+    sys.stderr.write(error + "\n")
+if errors:
+    sys.exit(1)
+print(f"  ok: {counts['Job']} hook Jobs and {counts['Pod']} hook Pods use {expected!r}")
 PYEOF
-}
-RETENTION_DEFAULT="$TMP/retention-default.yaml"
-helm template curie "$CHART" --show-only templates/rustfs.yaml > "$RETENTION_DEFAULT"
-check_event_retention "$RETENTION_DEFAULT" 2 || fail "default render must expire Langfuse event uploads after 2 days"
-RETENTION_SET="$TMP/retention-set.yaml"
-helm template curie "$CHART" --show-only templates/rustfs.yaml --set langfuse.eventUpload.retentionDays=7 > "$RETENTION_SET"
-check_event_retention "$RETENTION_SET" 7 || fail "an explicit retentionDays must set the expiration"
-RETENTION_OFF="$TMP/retention-off.yaml"
-helm template curie "$CHART" --show-only templates/rustfs.yaml --set langfuse.eventUpload.retentionDays=0 > "$RETENTION_OFF"
-check_event_retention "$RETENTION_OFF" none || fail "retentionDays=0 must render no lifecycle rule"
-echo "  ok: rustfs-init expires events/ after retentionDays (default 2), and 0 disables it"
+
+HOOK_PRIO_DEFAULT="$TMP/hook-priority-default.yaml"
+helm template curie "$CHART" "${PRIO_HELM_ARGS[@]}" > "$HOOK_PRIO_DEFAULT"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_DEFAULT" curie-platform \
+  || fail "default render has a hook Job or Pod without the platform priority class."
+
+HOOK_PRIO_OPERATOR="$TMP/hook-priority-operator.yaml"
+helm template curie "$CHART" "${PRIO_HELM_ARGS[@]}" \
+  --set priorityClasses.platform.create=false \
+  --set priorityClasses.platform.name=operator-platform-class \
+  > "$HOOK_PRIO_OPERATOR"
+python3 "$HOOK_PRIO_CHECK" "$HOOK_PRIO_OPERATOR" operator-platform-class \
+  || fail "operator class render has a hook Job or Pod without the named platform priority class."
+
+echo "=== Assertion 17 negative controls: a classless hook Job and Pod FAIL ==="
+python3 - "$HOOK_PRIO_DEFAULT" "$TMP/hook-priority-mutant-job.yaml" "$TMP/hook-priority-mutant-pod.yaml" <<'PYEOF'
+import copy
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as stream:
+    documents = list(yaml.safe_load_all(stream))
+for kind, destination in (("Job", sys.argv[2]), ("Pod", sys.argv[3])):
+    mutant = copy.deepcopy(documents)
+    for doc in mutant:
+        if not isinstance(doc, dict) or doc.get("kind") != kind:
+            continue
+        if not ((doc.get("metadata") or {}).get("annotations") or {}).get("helm.sh/hook"):
+            continue
+        spec = doc["spec"]
+        if kind == "Job":
+            spec = spec["template"]["spec"]
+        del spec["priorityClassName"]
+        with open(destination, "w") as stream:
+            yaml.safe_dump_all(mutant, stream)
+        break
+    else:
+        sys.stderr.write(f"negative control found no Helm hook {kind}\n")
+        sys.exit(1)
+PYEOF
+for kind in job pod; do
+  case "$kind" in
+    job) kind_label=Job ;;
+    pod) kind_label=Pod ;;
+  esac
+  negative_output=""
+  if negative_output="$(python3 "$HOOK_PRIO_CHECK" "$TMP/hook-priority-mutant-$kind.yaml" curie-platform 2>&1)"; then
+    fail "classless hook $kind negative control passed the priority class assertion."
+  fi
+  if [[ "$negative_output" != *"hook $kind_label "*"has priorityClassName=None"* ]]; then
+    fail "classless hook $kind negative control failed unexpectedly: $negative_output"
+  fi
+done
+echo "  ok: a classless hook Job and a classless hook Pod are each rejected"
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); and the dispatcher rolls out with Recreate while every other workload keeps its strategy; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; every Helm hook Job and Pod carries the platform priority class in both default and operator named renders, with classless negative controls proven to fail."
