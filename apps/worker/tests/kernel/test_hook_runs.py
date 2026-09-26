@@ -847,8 +847,8 @@ def test_bound_agent_mismatch_refuses_cron_before_runner_start(
                 await conn.execute(
                     text(
                         "INSERT INTO curie.agent_channels "
-                        "(id, agent_id, kind, address) "
-                        "VALUES (:id, :agent_id, 'slack', 'C1')"
+                        "(id, agent_id, kind, address, adapter) "
+                        "VALUES (:id, :agent_id, 'slack', 'C1', 'default')"
                     ),
                     {"id": channel_id, "agent_id": agent_id},
                 )
