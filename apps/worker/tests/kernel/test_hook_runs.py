@@ -239,6 +239,34 @@ def test_cron_retry_past_its_catch_up_bound_records_skipped(
     asyncio.run(go())
 
 
+def test_queued_cron_fire_is_rejected_after_operator_pause(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """A fire already in the stream must not start after pause commits."""
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            async with run.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.schedule_controls "
+                        "(agent_id, name, paused_at) VALUES (:agent_id, :name, now())"
+                    ),
+                    {"agent_id": run.agent_id, "name": run.ref.name},
+                )
+            await h.kernel.process_event(_event(hook_run=run.ref))
+
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "skipped"
+            assert ended_at is not None
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
 def test_cron_retry_whose_bound_runs_out_during_the_claim_records_skipped(
     make_harness,
     make_hook_run,
