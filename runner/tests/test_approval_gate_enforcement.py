@@ -600,6 +600,46 @@ def test_gated_turn_that_also_hit_a_model_error_ends_classified_failure() -> Non
     ), "the raw token must survive in the ErrorEvent message"
 
 
+def test_gated_turn_with_model_error_and_no_result_ends_classified_failure() -> None:
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "echo x"})],
+            model="m",
+        ),
+        AssistantMessage(content=[], model="m", error="unknown"),
+    ]
+    runner, _session = _runner_over(
+        script,
+        gate=gate,
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    assert gate.pending_summary is not None
+    assert gate.pending_halt is True
+    assert any(
+        event.type == "error" and event.classification == "unclassified"
+        for event in events
+    )
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE
+    assert final.status != SessionStatus.AWAITING_APPROVAL
+    assert not final.approval_summary
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
 def test_a_done_gated_turn_still_flips_even_after_a_model_error_frame() -> None:
     # negative control for the guard above: the new error_classification check
     # must ride the HALT branch only. revert: apply it to the DONE branch too ->
