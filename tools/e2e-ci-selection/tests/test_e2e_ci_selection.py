@@ -23,16 +23,11 @@ REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 UPGRADE_MUTANT_BUILDER = REPO_ROOT / "charts" / "curie" / "ci" / "make-upgrade-mutants.py"
 UPGRADE_MATRIX = REPO_ROOT / "cli" / "scripts" / "cluster-upgrade-matrix.sh"
-# Directories the upgrade matrix reads whole, each with the files that stand
-# for it. The matrix runs `helm package` on charts/curie, and .helmignore
-# leaves charts/curie/ci out of that package.
+# Directories the upgrade matrix reads whole, each with the subdirectories it
+# leaves out. The matrix runs `helm package` on charts/curie, and .helmignore
+# drops charts/curie/ci from that package.
 UPGRADE_MATRIX_DIRECTORY_INPUTS = {
-    "charts/curie": (
-        "charts/curie/Chart.yaml",
-        "charts/curie/values.yaml",
-        "charts/curie/values.schema.json",
-        "charts/curie/templates/_helpers.tpl",
-    ),
+    "charts/curie": ("charts/curie/ci",),
 }
 
 TIERS = ("skill", "local", "local-release", "cluster", "released-upgrade")
@@ -275,6 +270,25 @@ def _git_ignored(path: str) -> bool:
     return completed.returncode == 0
 
 
+def _directory_files(directory: str, excluded: tuple[str, ...]) -> tuple[str, ...]:
+    completed = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", directory],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return tuple(
+        path
+        for path in sorted(set(completed.stdout.split("\0")))
+        if path and not any(_matches(path, prefix) for prefix in excluded)
+    )
+
+
+def _matches(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(f"{prefix}/")
+
+
 def _unselected_matrix_inputs(
     tmp_path: Path,
     script: str,
@@ -290,18 +304,18 @@ def _unselected_matrix_inputs(
         paths: tuple[str, ...]
         if target.is_dir():
             if reference not in UPGRADE_MATRIX_DIRECTORY_INPUTS:
-                problems.append(f"{reference}: directory with no listed files")
+                problems.append(f"{reference}: unlisted directory")
                 continue
-            paths = UPGRADE_MATRIX_DIRECTORY_INPUTS[reference]
+            paths = _directory_files(reference, UPGRADE_MATRIX_DIRECTORY_INPUTS[reference])
+            if not paths:
+                problems.append(f"{reference}: directory with no files to check")
+                continue
         elif target.is_file():
             paths = (reference,)
         else:
             problems.append(f"{reference}: neither in the checkout nor ignored")
             continue
         for path in paths:
-            if not (REPO_ROOT / path).is_file():
-                problems.append(f"{path}: listed for {reference} but missing")
-                continue
             completed, output = _invoke_selector(tmp_path, path, registry=registry)
             assert completed.returncode == 0, completed.stderr
             outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
@@ -322,6 +336,23 @@ def test_released_upgrade_selects_every_repo_file_the_upgrade_matrix_reads(
         "cli/src/application_schema_windows.json",
     } <= set(_repo_root_references(script))
     assert _unselected_matrix_inputs(tmp_path, script) == []
+
+
+def test_matrix_input_guard_checks_every_packaged_chart_file(tmp_path: Path) -> None:
+    # The selector allows an ignored child under a selected prefix, so a hole
+    # can open inside charts/curie without touching the prefix itself.
+    text = REGISTRY.read_text()
+    anchor = "    docs: []\n"
+    assert anchor in text
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(text.replace(anchor, f"{anchor}    charts/curie/files: []\n"))
+    assert _unselected_matrix_inputs(
+        tmp_path, 'helm package "$REPO_ROOT/charts/curie"\n', registry
+    ) == [
+        "charts/curie/files/agent-sandbox/controller.yaml: does not select released-upgrade",
+        "charts/curie/files/reserved-env.yaml: does not select released-upgrade",
+        "charts/curie/files/schema-compat.json: does not select released-upgrade",
+    ]
 
 
 def test_matrix_input_guard_names_each_read_the_registry_drops(tmp_path: Path) -> None:
@@ -351,7 +382,7 @@ def test_matrix_input_guard_names_each_read_the_registry_drops(tmp_path: Path) -
         ),
         (
             'DIR="${REPO_ROOT}/cli/scripts"\n',
-            ["cli/scripts: directory with no listed files"],
+            ["cli/scripts: unlisted directory"],
         ),
         (
             'HELPER="$REPO_ROOT/cli/scripts/no-such-helper.py"\n',
