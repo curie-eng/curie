@@ -130,6 +130,10 @@ class PublicationCreateRequest:
     route: str | None = None
     work_item_request_id: uuid.UUID | None = None
     work_item_runtime_epoch: int | None = None
+    observed_title: str | None = None
+    observed_body_sha256: str | None = None
+    observed_lineage_id: uuid.UUID | None = None
+    observed_lineage_version: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         if len(self.patch) > self.max_patch_bytes:
@@ -165,6 +169,14 @@ class PublicationCreateRequest:
             payload["work_item_request_id"] = str(self.work_item_request_id)
         if self.work_item_runtime_epoch is not None:
             payload["work_item_runtime_epoch"] = self.work_item_runtime_epoch
+        if self.observed_title is not None:
+            payload["observed_title"] = self.observed_title
+        if self.observed_body_sha256 is not None:
+            payload["observed_body_sha256"] = self.observed_body_sha256
+        if self.observed_lineage_id is not None:
+            payload["observed_lineage_id"] = str(self.observed_lineage_id)
+        if self.observed_lineage_version is not None:
+            payload["observed_lineage_version"] = self.observed_lineage_version
         return payload
 
 

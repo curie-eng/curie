@@ -3,6 +3,7 @@
 import hashlib
 import secrets
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -128,6 +129,13 @@ async def _adopt_publication_replay(
         or publication.base_sha != data.base_sha
         or publication.patch_bytes != patch
         or publication.changed_paths != data.changed_paths
+        or publication.observed_title_sha256
+        != (
+            hashlib.sha256(data.observed_title.encode()).hexdigest()
+            if data.observed_title is not None
+            else None
+        )
+        or publication.observed_body_sha256 != data.observed_body_sha256
         or publication.title != (data.title or data.summary)
         or publication.body != (data.body or "Approved platform publication.")
         or publication.reply_kind != data.reply_kind
@@ -1007,6 +1015,7 @@ async def create_publication(
     data: PublicationCreate,
     *,
     patch: bytes,
+    metadata_check: Callable[[], Awaitable[None]],
     traceparent: str | None = None,
 ) -> tuple[Publication, bool]:
     """Atomically create the durable approval and its private publication.
@@ -1020,6 +1029,12 @@ async def create_publication(
     if existing is not None:
         await session.refresh(existing, ["lineage"])
         return existing, False
+    await metadata_check()
+    if bool(patch) != bool(data.changed_paths):
+        raise PublicationLineageConflict(
+            "publication.invalid_snapshot",
+            "publication patch and changed paths must both be present or both be empty",
+        )
 
     workspace_conversation_id = (
         data.conversation_id
@@ -1054,6 +1069,11 @@ async def create_publication(
         repo_full_name=thread_workspace.repo_full_name,
         for_update=True,
     )
+    if not patch and (lineage is None or lineage.pr_number is None):
+        raise PublicationLineageConflict(
+            "publication.metadata_requires_pull",
+            "a metadata-only revision requires an existing pull request",
+        )
     reservation: PublicationReviewReservation | None = None
     if lineage is None:
         if data.review_origin_key is not None:
@@ -1260,6 +1280,12 @@ async def create_publication(
         base_sha=data.base_sha,
         patch_bytes=patch,
         changed_paths=data.changed_paths,
+        observed_title_sha256=(
+            hashlib.sha256(data.observed_title.encode()).hexdigest()
+            if data.observed_title is not None
+            else None
+        ),
+        observed_body_sha256=data.observed_body_sha256,
         title=data.title or data.summary,
         body=data.body or "Approved platform publication.",
         reply_kind=data.reply_kind,
@@ -1710,6 +1736,12 @@ def publication_lineage_outcome_conflict(
             "publication.revision_not_approved",
             "publication revision must be approved before advancing its lineage",
         )
+    needs_metadata_timestamp = data.state == "open" and not publication.patch_bytes
+    if needs_metadata_timestamp != (data.metadata_updated_at is not None):
+        return PublicationLineageConflict(
+            "publication.metadata_timestamp_invalid",
+            "a GitHub update time is required only for metadata only success",
+        )
     return None
 
 
@@ -1842,6 +1874,7 @@ async def advance_publication_lineage(
         "terminal_at": func.now(),
         "updated_at": func.now(),
         "result_url": data.pr_url,
+        "metadata_updated_at": data.metadata_updated_at,
         # Success replaces an earlier attempt's error, as the worker CAS did.
         "error": None,
     }

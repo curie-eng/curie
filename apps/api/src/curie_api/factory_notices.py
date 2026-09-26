@@ -101,6 +101,10 @@ _CAUSE_TEXT = {
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
     "runner_failed": "the run ended without a result.",
+    "approval_create_failed": (
+        "the requested approval could not be created. Check the publication "
+        "request or approval service, then retry."
+    ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
     "execution_deadline": "the run did not finish before its deadline.",

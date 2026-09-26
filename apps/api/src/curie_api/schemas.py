@@ -1555,8 +1555,12 @@ class PublicationCreate(BaseModel):
     base_sha: str
     work_item_request_id: uuid.UUID | None = None
     work_item_runtime_epoch: int | None = Field(default=None, ge=1)
-    patch_b64: str = Field(min_length=1)
-    changed_paths: list[str] = Field(min_length=1, max_length=4096)
+    observed_title: str | None = Field(default=None, max_length=256)
+    observed_body_sha256: str | None = Field(default=None, pattern=r"[0-9a-f]{64}")
+    observed_lineage_id: uuid.UUID | None = None
+    observed_lineage_version: int | None = Field(default=None, ge=1)
+    patch_b64: str
+    changed_paths: list[str] = Field(max_length=4096)
     expires_in_seconds: int | None = Field(default=None, ge=1)
     title: str | None = Field(default=None, max_length=256)
     body: str | None = Field(default=None, max_length=65_536)
@@ -1706,6 +1710,7 @@ class PublicationLineageAdvance(BaseModel):
     pr_number: int = Field(gt=0)
     pr_url: str = Field(min_length=1, max_length=2048)
     head_sha: str
+    metadata_updated_at: AwareDatetime | None
 
     @field_validator("expected_head_sha", "head_sha")
     @classmethod

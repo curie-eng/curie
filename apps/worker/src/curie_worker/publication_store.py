@@ -6,7 +6,7 @@ import re
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from channel_protocol.reply import ReplyTarget
 from sqlalchemy import text
@@ -338,10 +338,12 @@ class PostgresPublicationStore:
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
                    p.lineage_id, p.revision_number, p.expected_prior_head,
                    p.base_sha, p.patch_bytes, p.changed_paths, p.title, p.body,
+                   p.observed_title_sha256, p.observed_body_sha256,
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
                    l.pr_url, l.head_sha,
+                   l.github_repository_id, l.github_pr_node_id,
                    a.conversation_id,
                    (
                      p.execution_request_id IS NULL
@@ -436,6 +438,14 @@ class PostgresPublicationStore:
             branch=str(row["branch"]),
             pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
             pr_url=str(row["pr_url"]) if row["pr_url"] is not None else None,
+            github_repository_id=(
+                int(row["github_repository_id"])
+                if row["github_repository_id"] is not None else None
+            ),
+            github_pr_node_id=(
+                str(row["github_pr_node_id"])
+                if row["github_pr_node_id"] is not None else None
+            ),
             expected_prior_head=str(row["expected_prior_head"]),
             expected_remote_head=(
                 str(row["head_sha"])
@@ -445,6 +455,8 @@ class PostgresPublicationStore:
             base_sha=str(row["base_sha"]),
             patch=patch,
             changed_paths=tuple(str(path) for path in paths),
+            observed_title_sha256=row["observed_title_sha256"],
+            observed_body_sha256=row["observed_body_sha256"],
             title=str(row["title"]),
             body=str(row["body"]),
             target=ReplyTarget(
@@ -588,12 +600,14 @@ class PostgresPublicationStore:
         self, publication_id: uuid.UUID, *, outcome: str, pr_url: str | None
     ) -> None:
         await self.persist_result(
-            publication_id, outcome=outcome, pr_url=pr_url, error=None
+            publication_id, outcome=outcome, pr_url=pr_url, error=None,
+            metadata_updated_at=None,
         )
 
     async def fail(self, publication_id: uuid.UUID, *, error: str) -> None:
         await self.persist_result(
-            publication_id, outcome="failed", pr_url=None, error=error
+            publication_id, outcome="failed", pr_url=None, error=error,
+            metadata_updated_at=None,
         )
 
     async def persist_result(
@@ -603,6 +617,7 @@ class PostgresPublicationStore:
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         """Persist the outcome and clear private work before any reply attempt.
 
@@ -625,6 +640,7 @@ class PostgresPublicationStore:
             status=status,
             result_url=pr_url,
             error=error[:2000] if error else None,
+            metadata_updated_at=metadata_updated_at,
         )
 
     async def pending_result(
@@ -1058,6 +1074,7 @@ class PostgresPublicationStore:
         status: str,
         result_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         version = self._versions.get(publication_id)
         if version is None:
@@ -1071,6 +1088,7 @@ class PostgresPublicationStore:
                            SET status = :status,
                                result_url = :result_url,
                                error = :error,
+                               metadata_updated_at = :metadata_updated_at,
                                patch_bytes = NULL,
                                lease_owner = NULL,
                                lease_expires_at = NULL,
@@ -1087,6 +1105,7 @@ class PostgresPublicationStore:
                         "status": status,
                         "result_url": result_url,
                         "error": error,
+                        "metadata_updated_at": metadata_updated_at,
                         "id": publication_id,
                         "version": version,
                         "owner": self._lease_owner,

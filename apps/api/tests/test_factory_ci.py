@@ -213,6 +213,168 @@ def test_a_failure_fails_fast_while_other_checks_are_pending() -> None:
     assert "lint" in _names(verdict.failing)
 
 
+def test_metadata_revision_waits_for_each_stale_nonpassing_check() -> None:
+    old_failure = _run("PR body (real newlines)", conclusion="failure")
+    old_failure["started_at"] = "2026-09-24T11:00:00Z"
+    old_pending = _run("security", status="in_progress", run_id=2)
+    old_pending["started_at"] = "2026-09-24T11:00:00Z"
+    unrelated = _run("unrelated", run_id=3)
+    unrelated["started_at"] = "2026-09-24T12:00:01Z"
+
+    verdict = _decide(
+        _detail(old_failure, old_pending, unrelated),
+        10,
+        fresh_after=PUBLISHED,
+    )
+    assert verdict.kind == "pending"
+    assert verdict.reason == "checks_awaiting_metadata_rerun"
+
+    detail = _detail(old_failure, old_pending, unrelated)
+    for seconds in (120, 1199):
+        verdict = _decide(detail, seconds, fresh_after=PUBLISHED)
+        assert verdict.kind == "pending"
+        assert verdict.reason == "checks_awaiting_metadata_rerun"
+        assert verdict.failing == []
+    verdict = _decide(detail, 1200, fresh_after=PUBLISHED)
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "checks_not_rerun"
+    assert verdict.failing == []
+
+    refreshed_failure = _run("PR body (real newlines)", run_id=4)
+    refreshed_failure["started_at"] = "2026-09-24T12:00:02Z"
+    refreshed_pending = _run("security", run_id=5)
+    refreshed_pending["started_at"] = "2026-09-24T12:00:03Z"
+    verdict = _decide(
+        _detail(old_failure, old_pending, unrelated, refreshed_failure),
+        120,
+        fresh_after=PUBLISHED,
+    )
+    assert verdict.kind == "pending"
+    assert verdict.pending == [{"name": "security", "status": "in_progress"}]
+    verdict = _decide(
+        _detail(old_failure, old_pending, unrelated, refreshed_failure, refreshed_pending),
+        10,
+        fresh_after=PUBLISHED,
+    )
+    assert verdict.kind == "green"
+
+
+def test_metadata_revision_retains_a_stale_failing_commit_status() -> None:
+    unrelated = _run("unrelated")
+    unrelated["started_at"] = "2026-09-24T12:00:01Z"
+    old_status = _status("ci/jenkins", "failure")
+    old_status["created_at"] = "2026-09-24T11:00:00Z"
+    detail = _detail(unrelated, statuses=(old_status,))
+    verdict = _decide(detail, 10, fresh_after=PUBLISHED)
+    assert verdict.kind == "failing"
+    assert _names(verdict.failing) == {"ci/jenkins"}
+
+    fresh_status = _status("ci/jenkins", "success")
+    fresh_status["created_at"] = "2026-09-24T12:00:02Z"
+    detail = _detail(unrelated, statuses=(old_status, fresh_status))
+    verdict = _decide(detail, 10, fresh_after=PUBLISHED)
+    assert verdict.kind == "green"
+
+
+def test_metadata_revision_retains_unedited_passing_checks() -> None:
+    suite = _run("Python suite")
+    suite["started_at"] = "2026-09-24T11:00:00Z"
+    body_before = _run("PR body (real newlines)", conclusion="failure", run_id=2)
+    body_before["started_at"] = "2026-09-24T11:00:00Z"
+    body_after = _run("PR body (real newlines)", run_id=3)
+    body_after["started_at"] = "2026-09-24T12:00:02Z"
+
+    verdict = _decide(
+        _detail(suite, body_before, body_after), 30, fresh_after=PUBLISHED
+    )
+
+    assert verdict.kind == "green"
+
+
+def test_metadata_revision_waits_for_body_guard_even_when_it_was_green() -> None:
+    suite = _run("Python suite")
+    suite["started_at"] = "2026-09-24T11:00:00Z"
+    body_before = _run("PR body (real newlines)", run_id=2)
+    body_before["started_at"] = "2026-09-24T11:00:00Z"
+    unrelated = _run("unrelated", run_id=3)
+    unrelated["started_at"] = "2026-09-24T12:00:02Z"
+
+    verdict = _decide(
+        _detail(suite, body_before, unrelated), 30, fresh_after=PUBLISHED
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "checks_awaiting_metadata_rerun"
+
+
+def test_metadata_revision_keeps_a_red_commit_check_for_next_fix_round() -> None:
+    python = _run("Python suite", conclusion="failure")
+    python["started_at"] = "2026-09-24T11:00:00Z"
+    body_before = _run("PR body (real newlines)", conclusion="failure", run_id=2)
+    body_before["started_at"] = "2026-09-24T11:00:00Z"
+    body_after = _run("PR body (real newlines)", run_id=3)
+    body_after["started_at"] = "2026-09-24T12:00:02Z"
+
+    verdict = _decide(
+        _detail(python, body_before, body_after), 30, fresh_after=PUBLISHED
+    )
+
+    assert verdict.kind == "failing"
+    assert _names(verdict.failing) == {"Python suite"}
+    effective = factory_ci._metadata_revision_detail(
+        _detail(python, body_before, body_after), PUBLISHED
+    )
+    assert _names(effective.check_runs) == {"Python suite", "PR body (real newlines)"}
+    assert len(effective.check_runs) == 2
+    failing_names = [
+        run.get("name") for run in effective.check_runs
+        if run.get("conclusion") == "failure"
+    ]
+    assert failing_names == ["Python suite"]
+
+
+def test_metadata_revision_needs_fresh_green_evidence_after_grace() -> None:
+    existing = _run("build")
+    existing["started_at"] = "2026-09-24T11:00:00Z"
+    detail = _detail(existing)
+    assert _decide(detail, 119, fresh_after=PUBLISHED).kind == "pending"
+    assert _decide(detail, 120, fresh_after=PUBLISHED).kind == "pending"
+    verdict = _decide(detail, 1200, fresh_after=PUBLISHED)
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "checks_not_rerun"
+
+
+def test_metadata_revision_does_not_accept_same_second_checks() -> None:
+    run = _run("build")
+    run["started_at"] = "2026-09-24T12:00:00Z"
+    status = _status("ci/jenkins", "success")
+    status["created_at"] = "2026-09-24T12:00:00Z"
+
+    verdict = _decide(_detail(run, statuses=(status,)), 1200, fresh_after=PUBLISHED)
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "checks_not_rerun"
+
+
+def test_fresh_unrelated_failure_does_not_revive_stale_red() -> None:
+    stale = _run("PR body (real newlines)", conclusion="failure", summary="old body failure")
+    stale["started_at"] = "2026-09-24T11:00:00Z"
+    fresh = _run("unit-tests", conclusion="failure", run_id=2)
+    fresh["started_at"] = "2026-09-24T12:00:01Z"
+
+    verdict = _decide(_detail(stale, fresh), 120, fresh_after=PUBLISHED)
+
+    assert verdict.kind == "failing"
+    assert _names(verdict.failing) == {"unit-tests"}
+
+
+def test_fresh_failure_after_metadata_revision_fails_without_grace() -> None:
+    failed = _run("PR body (real newlines)", conclusion="failure")
+    failed["started_at"] = "2026-09-24T12:00:01Z"
+    verdict = _decide(_detail(failed), 10, fresh_after=PUBLISHED)
+    assert verdict.kind == "failing"
+
+
 @pytest.mark.parametrize("conclusion", ["failure", "timed_out", "cancelled", "action_required"])
 def test_failing_conclusions_fail(conclusion: str) -> None:
     verdict = _decide(_detail(_run("build"), _run("tests", conclusion=conclusion, run_id=2)), 30)

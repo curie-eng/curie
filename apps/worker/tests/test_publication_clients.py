@@ -722,6 +722,7 @@ async def _advance_lineage(handler: object) -> None:
             pr_number=123,
             pr_url=PR_URL,
             head_sha=REVISION_HEAD,
+            metadata_updated_at=None,
         )
 
 
@@ -752,6 +753,7 @@ async def test_lineage_advance_is_requested_with_worker_auth_and_no_github_secre
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": REVISION_HEAD,
+            "metadata_updated_at": None,
         }
     ]
 
