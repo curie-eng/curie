@@ -21,7 +21,8 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    to `implement` (never to `plan`).
 8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
-9. `wait_ci`: the pull request's checks run and the platform waits on them.
+9. `wait_ci`: the pull request's checks run and the platform waits on them
+   and reports this phase.
    A failure sends a new message in the same run with the failing checks, and
    the run loops back to `implement` to fix them, then republishes to the
    same pull request. A green result, or no checks at all, ends the run
@@ -39,6 +40,14 @@ Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
 `wait_ci` back to `implement`) runs at most 3 rounds. When a reviewer still asks for changes on round 3, or a review
 call fails, the run publishes nothing. It posts the reviewer's unresolved
 findings and open questions on the issue and ends with `Could not complete:`.
+
+A reviewer tags every finding `blocking` (the change would be incorrect or
+unverifiable, or misses a criterion) or `note` (an improvement that does not
+change correctness). It returns `VERDICT: APPROVE`, listing the notes under
+`NOTES:`, when only notes remain, so refinements stop costing rounds. The
+agent carries plan-review notes into `implement`, and lists diff-review notes
+in the pull request body instead of editing code the diff reviewer already
+approved. Notes never start another review round.
 
 [`hooks/review_gate.py`](hooks/review_gate.py) enforces this, because the main
 model does not follow the protocol reliably. It routes every sub-agent call to
@@ -114,11 +123,27 @@ export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
 curie cluster deploy --plugin-dir examples/dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot \
   --secret GITHUB_PERSONAL_ACCESS_TOKEN
+# Illustrative USD cap for a run that can last 3 hours. Tune it for your model.
+curie cluster budget dark-factory --limit 100
 curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+The $100 cap is an example for this three hour recipe. Tune it to the model
+and expected workload. The SDK applies it to each session; it does not meter
+daily spend across runs. It does not guarantee a $100 bill. On OpenRouter's
+Anthropic Messages route, the
+[documented response](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message)
+contains token usage but no billed cost field. The conclusion that the SDK
+cost used for Curie's USD cap is an estimate is an inference from those
+documented response fields, not a live billing measurement. OpenRouter reports
+cost through its separate [generation metadata endpoint](https://openrouter.ai/docs/api/api-reference/generations/get-generation).
+Check OpenRouter Activity or the cost of each generation for actual billing.
+The [SDK budget example](https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py)
+checks the cap after each API call, so the estimate can exceed the limit by
+one API call.
 
 Label an issue in `acme-corp/acme-bot` with the configured factory label. The
 run ends as one pull request or one comment on the issue that names the cause.
@@ -138,7 +163,9 @@ stops the run.
 
 `evals/cases.json` checks the parts of the workflow a single turn can show: the
 issue tool it reads with, the execution bound, refusing an injected credential
-request, stopping on an ambiguous request, and never pushing. With a
+request, stopping on an ambiguous request, never pushing, reporting each phase
+once, never ending a message without a tool call, and approvals with notes
+ending the review loop. With a
 live-model runner up from this directory:
 
 ```bash

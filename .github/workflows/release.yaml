@@ -159,10 +159,20 @@ jobs:
       # build, test, or gate, so a retry there cannot hide a defect in our
       # code. Never wrap a step that builds, tests, or gates that code.
       # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
+      # Base image pulls from docker.io go through Google's public pull
+      # through mirror first (#3080). A connection reset on auth.docker.io
+      # inside the build step failed a whole release run, and the build step
+      # itself may not be retried (rule above). BuildKit falls back to
+      # docker.io when the mirror misses or errors, so a persistent failure
+      # of both still fails the build step with the registry error.
       - name: Set up Buildx
         id: setup_buildx
         continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Back off before retrying Set up Buildx
         if: steps.setup_buildx.outcome == 'failure'
         run: |
@@ -171,6 +181,10 @@ jobs:
       - name: Set up Buildx (retry)
         if: steps.setup_buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
@@ -342,10 +356,20 @@ jobs:
           else
             echo "v=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           fi
+      # Base image pulls from docker.io go through Google's public pull
+      # through mirror first (#3080). A connection reset on auth.docker.io
+      # inside the build step failed a whole release run, and the build step
+      # itself may not be retried (rule above). BuildKit falls back to
+      # docker.io when the mirror misses or errors, so a persistent failure
+      # of both still fails the build step with the registry error.
       - name: Set up Buildx
         id: setup_buildx
         continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Back off before retrying Set up Buildx
         if: steps.setup_buildx.outcome == 'failure'
         run: |
@@ -354,6 +378,10 @@ jobs:
       - name: Set up Buildx (retry)
         if: steps.setup_buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true

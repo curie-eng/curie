@@ -269,6 +269,12 @@ def test_a_publishing_run_shows_the_publishing_pill_live() -> None:
     assert _with_class(root, "live")
 
 
+def test_the_card_is_as_wide_as_a_desktop_issue_comment() -> None:
+    root = _parse(_card())
+    assert (root.get("width"), root.get("height")) == ("878", "300")
+    assert root.get("viewBox") == "0 0 878 300"
+
+
 def test_both_themes_ride_one_style_block() -> None:
     style = _style(_parse(_card()))
     assert re.search(r"@media\s*\(\s*prefers-color-scheme\s*:\s*dark\s*\)", style)

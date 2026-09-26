@@ -630,7 +630,7 @@ fn cluster_status_selects_the_running_labeled_worker_and_annotates_claims_enable
         .argv
         .iter()
         .any(|arg| arg == OLD_COMPLETED_HOOK || arg == OLD_STUCK_HOOK));
-    assert!(execs[0].argv.windows(6).any(|args| args
+    assert!(execs[0].argv.windows(7).any(|args| args
         == [
             "python",
             "-m",
@@ -638,6 +638,7 @@ fn cluster_status_selects_the_running_labeled_worker_and_annotates_claims_enable
             "--mode",
             "status",
             "--json",
+            "--with-ttl",
         ]));
 }
 
@@ -658,6 +659,54 @@ fn current_quiesce_uses_authored_metadata_in_existing_cluster_status_fields() {
         "a known current marker must affect the verdict with authored text: {value}"
     );
     assert!(value["warnings"].as_array().unwrap().is_empty(), "{value}");
+}
+
+/// A mixed-version worker (older image than this CLI) rejects the new
+/// `--with-ttl` flag with a non-zero argparse exit. The CLI must retry once
+/// with the pre-#3127 legacy argv, within the same observation, and still
+/// report the claim state (#3127).
+#[test]
+fn mixed_version_worker_rejects_with_ttl_and_the_legacy_retry_reports_quiescing() {
+    let rejects_with_ttl = serde_json::json!({
+        "stdout": "",
+        "stderr": format!("upgrade_drain.py: error: unrecognized arguments: --with-ttl {PRIVATE_SENTINEL}"),
+        "exit": 2,
+        "sleep": 0,
+    });
+    let fixture = Fixture::new(&[rejects_with_ttl, quiescing(SINCE_17, 17)]);
+    let output = cluster_status(&fixture);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let value = json_output(&output);
+    assert_existing_cluster_status_shape(&value);
+    assert_eq!(value["healthy"], false, "{value}");
+    assert!(
+        value["pods"]["unhealthy"]
+            .as_array()
+            .expect("unhealthy list")
+            .iter()
+            .any(|item| item == STATUS_WAITING_17),
+        "the legacy-argv retry must still surface authored quiescing text: {value}"
+    );
+    assert!(value["warnings"].as_array().unwrap().is_empty(), "{value}");
+    assert!(
+        !format!("{value}").contains(PRIVATE_SENTINEL),
+        "the rejected primary attempt's stderr must never escape to the report: {value}"
+    );
+
+    let execs = fixture.claim_execs();
+    assert_eq!(
+        execs.len(),
+        2,
+        "a mixed-version worker costs exactly one legacy-argv retry: {execs:#?}"
+    );
+    assert!(
+        execs[0].argv.iter().any(|arg| arg == "--with-ttl"),
+        "the primary attempt uses the new argv: {execs:#?}"
+    );
+    assert!(
+        !execs[1].argv.iter().any(|arg| arg == "--with-ttl"),
+        "the retry uses the legacy argv with no --with-ttl: {execs:#?}"
+    );
 }
 
 #[test]

@@ -589,6 +589,11 @@ phase_run() {
   export K8S_KUBECONFIG="$kubeconfig"
   export SELF_UPGRADE_KUBECONFIG="$upgrade_kubeconfig"
 
+  "$bin" example sre-bot provision-observability \
+    --namespace "$NAMESPACE" \
+    --release "$RELEASE" \
+    --chart "$ROOT/charts/curie"
+
   set +e
   "$bin" cluster deploy \
     --plugin-dir "$ROOT/examples/sre-bot" \

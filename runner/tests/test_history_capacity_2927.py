@@ -45,6 +45,7 @@ from curie_runner.history import (
     HarnessReplayState,
     HistoryAppendError,
     HistoryCapacityError,
+    HistoryError,
     StateApiTranscriptStore,
     SummaryRecord,
     TurnRecord,
@@ -73,8 +74,12 @@ class _CappedCasState:
     - every request recorded as ``(method, body, status)``.
     """
 
-    def __init__(self, seed: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self, seed: list[dict[str, Any]] | None = None, *, max_bytes: int = _CAP
+    ) -> None:
         self.value: list[dict[str, Any]] | None = list(seed) if seed else None
+        self.max_bytes = max_bytes
+        self.cap_header: str | None = str(max_bytes)
         self.version = 1 if seed else 0
         self.requests: list[tuple[str, Any, int]] = []
         # Test hooks for interleavings and forced statuses.
@@ -105,16 +110,21 @@ class _CappedCasState:
 
         async def get_key(_request: web.Request) -> web.Response:
             self._gets += 1
+            headers = (
+                {"X-Curie-Transcript-Max-Bytes": self.cap_header}
+                if self.cap_header is not None
+                else {}
+            )
             if self.value is None:
                 self.requests.append(("GET", None, 404))
-                return web.json_response({"detail": "not found"}, status=404)
+                return web.json_response({"detail": "not found"}, status=404, headers=headers)
             response = self._entry()
             self.requests.append(("GET", None, 200))
             if self._gets == 1 and self.inject_after_first_get is not None:
                 # A concurrent writer lands right after this reader's load.
                 self._write([*(self.value or []), self.inject_after_first_get])
                 self.inject_after_first_get = None
-            return web.json_response(response)
+            return web.json_response(response, headers=headers)
 
         async def append_key(request: web.Request) -> web.Response:
             body = await request.json()
@@ -124,13 +134,13 @@ class _CappedCasState:
             candidate = [*(self.value or []), body["item"]]
             size = _size(candidate)
             reserve = body.get("reserve_bytes")
-            if size > _CAP:
+            if size > self.max_bytes:
                 self.requests.append(("POST", body, 413))
                 return web.json_response(
-                    {"detail": f"value is {size} bytes, over the {_CAP}-byte cap"},
+                    {"detail": f"value is {size} bytes, over the {self.max_bytes}-byte cap"},
                     status=413,
                 )
-            if reserve is not None and _CAP - size < int(reserve):
+            if reserve is not None and self.max_bytes - size < int(reserve):
                 self.requests.append(("POST", body, 413))
                 return web.json_response(
                     {"detail": f"value is {size} bytes, leaves under the {reserve}-byte reserve"},
@@ -159,10 +169,10 @@ class _CappedCasState:
                 )
             value = body["value"]
             size = _size(value)
-            if size > _CAP:
+            if size > self.max_bytes:
                 self.requests.append(("PUT", body, 413))
                 return web.json_response(
-                    {"detail": f"value is {size} bytes, over the {_CAP}-byte cap"},
+                    {"detail": f"value is {size} bytes, over the {self.max_bytes}-byte cap"},
                     status=413,
                 )
             self._write(list(value))
@@ -355,6 +365,9 @@ class _CheckpointingFake(FakeModelSession):
             ),
         )
 
+    def request_full_checkpoint(self) -> None:
+        self._kind = "checkpoint"
+
 
 def _runner(
     store: StateApiTranscriptStore,
@@ -438,8 +451,10 @@ def test_one_turn_coding_thread_resumes_review_turn_without_capacity_refusal(
             url = str(server.make_url(_KEY))
 
             # Turn 1: a real coding turn through the runner and the HTTP store.
+            first_store = StateApiTranscriptStore(url, token=None)
+            assert await first_store.load() == []
             first = _runner(
-                StateApiTranscriptStore(url, token=None),
+                first_store,
                 _CheckpointingFake(lambda: _coding_turn_script("coding"), kind="checkpoint"),
             )
             first_final = await _run_turn(first, coding_text, "1")
@@ -595,6 +610,7 @@ def test_turn_append_413_compacts_with_cas_and_retries_a_put_conflict_with_a_fre
     async def go() -> None:
         async with TestServer(state.app()) as server:
             store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            await store.load()
             await store.append(_new_turn())
 
     anyio.run(go)
@@ -625,6 +641,7 @@ def test_turn_append_compaction_put_413_raises_history_capacity_error() -> None:
     async def go() -> None:
         async with TestServer(state.app()) as server:
             store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            await store.load()
             with pytest.raises(HistoryCapacityError) as caught:
                 await store.append(_new_turn())
             assert caught.value.status == 413
@@ -643,13 +660,14 @@ def test_non_capacity_append_failure_does_not_compact() -> None:
     async def go() -> None:
         async with TestServer(state.app()) as server:
             store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            await store.load()
             with pytest.raises(HistoryAppendError) as caught:
                 await store.append(_new_turn())
             assert not isinstance(caught.value, HistoryCapacityError)
             assert caught.value.status == 500
 
     anyio.run(go)
-    assert [method for method, _status in state.methods()] == ["POST"]
+    assert [method for method, _status in state.methods()] == ["GET", "POST"]
     assert state.value == seed
 
 
@@ -666,11 +684,12 @@ def test_summary_record_append_413_raises_capacity_error_without_a_put() -> None
     async def go() -> None:
         async with TestServer(state.app()) as server:
             store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            await store.load()
             with pytest.raises(HistoryCapacityError):
                 await store.append(summary)
 
     anyio.run(go)
-    assert [method for method, _status in state.methods()] == ["POST"]
+    assert [method for method, _status in state.methods()] == ["GET", "POST"]
     assert state.value == seed
 
 
@@ -708,15 +727,11 @@ def test_boot_compaction_conflict_reloads_and_replays_the_intervening_record(
     assert "INJECTED-2927" in json.dumps(state.value)
 
 
-# --- Review P1: a turn irreducible past the reserve bound is a capacity refusal ---
+# A factory sized turn must persist even when tool call structure exceeds the cap.
 
 
-def _tiny_tool_calls_script(calls: int) -> list[Any]:
-    """A turn of many tiny tool calls: almost all of it is irreducible structure.
-
-    Every string here is shorter than a digest marker, so bounding cannot shrink
-    it; only roles, ids, and block order remain, and those are never dropped.
-    """
+def _tiny_tool_calls_script(calls: int, *, final: str | None = None) -> list[Any]:
+    """A factory sized turn whose tool call structure outweighs its tool output."""
 
     script: list[Any] = []
     for i in range(calls):
@@ -731,68 +746,127 @@ def _tiny_tool_calls_script(calls: int) -> list[Any]:
                 content=[ToolResultBlock(tool_use_id=f"u{i}", content="ok", is_error=False)]
             )
         )
-    script.append(AssistantMessage(content=[TextBlock(text="done")], model="fake-model"))
-    script.append(_result("done"))
+    final = _FACTORY_FINAL if final is None else final
+    script.append(AssistantMessage(content=[TextBlock(text=final)], model="fake-model"))
+    script.append(_result(final))
     return script
 
 
-class _CapturingStore:
-    """Records the turn the runner hands its store; used only to size the fixture."""
-
-    def __init__(self) -> None:
-        self.records: list[Any] = []
-
-    async def load(self) -> list[Any]:
-        return []
-
-    async def append(self, record: Any) -> None:
-        self.records.append(record)
+_FACTORY_CALLS = 400
+_FACTORY_FINAL = "The implementation passed review and the pull request was published."
 
 
-_TINY_CALLS = 290
-
-
-def test_turn_irreducible_past_the_reserve_bound_ends_with_the_capacity_final() -> None:
-    """A turn whose irreducible structure fits 64 KiB but not 64 KiB minus the
-    8 KiB reserve passes the runner's own bound, cannot be stored under the
-    reserve, and must end with the loud capacity refusal rather than DONE."""
-
-    from curie_runner.history import HistoryError, bound_turn_record
-
-    async def probe() -> TurnRecord:
-        capture = _CapturingStore()
-        runner = _runner(
-            capture,  # type: ignore[arg-type]
-            FakeModelSession(lambda: _tiny_tool_calls_script(_TINY_CALLS)),
-        )
-        final = await _run_turn(runner, "TINY-2927: run ls many times", "1")
-        assert final.status is SessionStatus.DONE
-        assert len(capture.records) == 1
-        record = capture.records[0]
-        assert isinstance(record, TurnRecord)
-        return record
-
-    record = anyio.run(probe)
-    # Fixture precondition: the runner-bounded turn fits the whole cap, but its
-    # irreducible structure cannot fit the cap minus the reserve.
-    assert _CAP - _RESERVE < _size([record.to_dict()]) <= _CAP, _size([record.to_dict()])
-    with pytest.raises(HistoryError):
-        bound_turn_record(record, max_value_bytes=_CAP - _RESERVE)
-
+def test_factory_sized_turn_persists_with_old_tool_calls_compacted() -> None:
+    """The HTTP store persists hundreds of tool calls and the exact final answer."""
     state = _CappedCasState()
 
-    async def go() -> Final:
+    async def go() -> None:
         async with TestServer(state.app()) as server:
+            store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            assert await store.load() == []
             runner = _runner(
-                StateApiTranscriptStore(str(server.make_url(_KEY)), token=None),
-                FakeModelSession(lambda: _tiny_tool_calls_script(_TINY_CALLS)),
+                store,
+                FakeModelSession(lambda: _tiny_tool_calls_script(_FACTORY_CALLS)),
             )
-            final = await _run_turn(runner, "TINY-2927: run ls many times", "1")
-            assert runner.history_durable is False
-            return final
+            final = await _run_turn(runner, "Complete factory issue 3211", "1")
+            assert final.status is SessionStatus.DONE, final
+            assert final.text == _FACTORY_FINAL
+            assert runner.history_durable is True
 
-    final = anyio.run(go)
-    assert final.status is SessionStatus.CLASSIFIED_FAILURE, final
-    assert final.text == "run failed: conversation history could not be persisted"
-    # Nothing was stored.
+    anyio.run(go)
+    assert state.value is not None
+    assert _size(state.value) <= _CAP - _RESERVE
+    stored = TurnRecord.from_dict(state.value[-1])
+    assert stored.assistant == _FACTORY_FINAL
+    stored_text = json.dumps(stored.to_dict())
+    assert '"id": "u0"' not in stored_text
+    assert f'"id": "u{_FACTORY_CALLS - 1}"' in stored_text
+    assert "tool" in stored_text.lower() and "omitted" in stored_text.lower()
+    seen_uses: set[str] = set()
+    marker_positions: list[int] = []
+    for index, message in enumerate(stored.messages):
+        if not isinstance(message.content, list):
+            continue
+        for block in message.content:
+            if block.get("type") == "tool_use":
+                seen_uses.add(block["id"])
+            elif block.get("type") == "tool_result":
+                assert block["tool_use_id"] in seen_uses
+            elif block.get("type") == "text" and "tool groups omitted" in block.get("text", ""):
+                marker_positions.append(index)
+    assert marker_positions
+    assert marker_positions[0] < len(stored.messages) - 1
+    assert stored.messages[-1].role == "assistant"
+    assert stored.messages[-1].content == [{"type": "text", "text": _FACTORY_FINAL}]
+
+
+def test_factory_sized_turn_preserves_long_final_answer_and_first_user() -> None:
+    first_user = "Complete factory issue 3211 with its original requirements"
+    final_answer = "Review complete. " + ("The requested behavior is verified. " * 100)
+    assert len(final_answer) > 3_000
+    state = _CappedCasState()
+
+    async def go() -> None:
+        async with TestServer(state.app()) as server:
+            store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            assert await store.load() == []
+            runner = _runner(
+                store,
+                FakeModelSession(
+                    lambda: _tiny_tool_calls_script(_FACTORY_CALLS, final=final_answer)
+                ),
+            )
+            final = await _run_turn(runner, first_user, "1")
+            assert final.status is SessionStatus.DONE, final
+            assert final.text == final_answer
+            assert runner.history_durable is True
+
+    anyio.run(go)
+    assert state.value is not None
+    assert _size(state.value) <= _CAP - _RESERVE
+    stored = TurnRecord.from_dict(state.value[-1])
+    assert stored.user == first_user
+    assert stored.messages[0].content == first_user
+    assert stored.assistant == final_answer
+    assert stored.messages[-1].content == [{"type": "text", "text": final_answer}]
+
+
+def test_runner_uses_the_cap_advertised_by_the_state_api() -> None:
+    state = _CappedCasState(max_bytes=128 * 1024)
+
+    async def go() -> None:
+        async with TestServer(state.app()) as server:
+            store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            assert await store.load() == []
+            runner = _runner(
+                store,
+                FakeModelSession(lambda: _tiny_tool_calls_script(_FACTORY_CALLS)),
+            )
+            final = await _run_turn(runner, "Complete factory issue 3211", "1")
+            assert final.status is SessionStatus.DONE, final
+            assert runner.history_durable is True
+
+    anyio.run(go)
+    assert state.value is not None
+    assert _CAP - _RESERVE < _size(state.value) <= state.max_bytes - _RESERVE
+    stored = TurnRecord.from_dict(state.value[-1])
+    assert stored.assistant == _FACTORY_FINAL
+    stored_text = json.dumps(stored.to_dict())
+    assert '"id": "u0"' in stored_text
+    assert f'"id": "u{_FACTORY_CALLS - 1}"' in stored_text
+
+
+@pytest.mark.parametrize("cap_header", [None, "invalid", "0", "8000", "8192"])
+def test_store_refuses_missing_or_invalid_api_capacity(cap_header: str | None) -> None:
+    state = _CappedCasState()
+    state.cap_header = cap_header
+
+    async def go() -> None:
+        async with TestServer(state.app()) as server:
+            store = StateApiTranscriptStore(str(server.make_url(_KEY)), token=None)
+            with pytest.raises(HistoryError):
+                await store.load()
+
+    anyio.run(go)
     assert state.value is None
+    assert state.methods() == [("GET", 404)]

@@ -120,10 +120,41 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         _placeholder("channel_token"),
     ),
     RedactionRule(
+        "secret_json_field",
+        re.compile(
+            r'(?<![A-Za-z0-9])("(?:[A-Za-z0-9]+_)*(?:secret_access_key|private_key|credential|secret|password|'
+            r'passwd|pwd|api_key|apikey|access_token|token)"\s*:\s*")'
+            r'(?!\[REDACTED:[a-z_]+\](?="))(?:\\.|[^"\\])*"',
+            re.IGNORECASE,
+        ),
+        r'\1[REDACTED:secret_assignment]"',
+    ),
+    RedactionRule(
+        "secret_dict_field",
+        re.compile(
+            r"(?<![A-Za-z0-9])('(?:[A-Za-z0-9]+_)*(?:secret_access_key|private_key|credential|secret|password|"
+            r"passwd|pwd|api_key|apikey|access_token|token)'\s*:\s*')"
+            r"(?!\[REDACTED:[a-z_]+\](?='))(?:\\.|[^'\\])*'",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED:secret_assignment]'",
+    ),
+    RedactionRule(
+        "secret_colon_field",
+        re.compile(
+            r"(?<![A-Za-z0-9])((?:secret_access_key|private_key|credential|secret|"
+            r"password|passwd|pwd|api_key|apikey|access_token|token)\s*:\s*)"
+            r"(?!\[REDACTED:[a-z_]+\](?!\S))\S+",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED:secret_assignment]",
+    ),
+    RedactionRule(
         "secret_assignment",
         # ``\b`` does not fire before ``token`` in ``CURIE_CHANNEL_TOKEN=``
         # because ``_`` is a word character. Require a non-alphanumeric
-        # predecessor so ``*_TOKEN=`` / ``*_SECRET=`` match while
+        # predecessor so ``*_TOKEN=`` / ``*_SECRET=`` and private or AWS
+        # secret key assignments match while
         # ``mytoken=`` does not. Keep the key name; drop only the value.
         # The guard skips only a value that IS exactly one placeholder
         # (idempotent re-run); a placeholder followed by leftover
@@ -131,7 +162,8 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         # value and left a trailing suffix exposed) still matches so the
         # whole value, placeholder and suffix together, is consumed here.
         re.compile(
-            r"(?<![A-Za-z0-9])((?:secret|password|passwd|pwd|api_key|apikey|access_token|token)="
+            r"(?<![A-Za-z0-9])((?:secret_access_key|private_key|credential|secret|password|passwd|pwd|"
+            r"api_key|apikey|access_token|token)="
             r")(?!\[REDACTED:[a-z_]+\](?!\S))\S+",
             re.IGNORECASE,
         ),

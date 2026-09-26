@@ -375,6 +375,15 @@ class SandboxClient(Protocol):
         request_timeout_seconds: float,
     ) -> bool: ...
 
+    def pod_unschedulable(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> str | None:
+        """The scheduler's message when pod ``name`` is ``PodScheduled=False``
+        with reason ``Unschedulable``; None when it is scheduled, missing, or
+        unreadable."""
+
+        ...
+
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None: ...
 
 
@@ -384,6 +393,15 @@ class SandboxError(Exception):
 
 class ClaimTimeoutError(SandboxError):
     """The claim did not bind a ready sandbox within the configured timeout."""
+
+
+class UnschedulableClaimError(ClaimTimeoutError):
+    """The claim timed out while its pod was Unschedulable: no node has room.
+
+    A ClaimTimeoutError subclass, so every caller that handles a claim timeout
+    keeps doing so; only the factory work-item path treats it as capacity
+    (#3169).
+    """
 
 
 class CapacityExhaustedError(SandboxError):

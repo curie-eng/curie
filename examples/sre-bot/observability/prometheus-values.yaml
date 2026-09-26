@@ -144,9 +144,34 @@ serverFiles:
   alerting_rules.yml:
     groups:
       - name: curie-reliability
+        # CurieTaskFailure, CurieWorkerSupervisedRestartLoop,
+        # CurieReplyDeliveryRefused and CurieChannelTokenRotationFailed each
+        # have a second term for a new series. The SDK exports a counter only
+        # after its first measurement, so a series arrives at its first value
+        # with no zero before it, and increase() cannot see a first sample.
+        # Each process exports under its own `instance`, so a restarted
+        # process's counters are new series too.
+        # `X unless last_over_time(X[1h] offset O)` is a series with no sample
+        # in the hour ending O ago. O is the rule's window, so a new series'
+        # value counts as its increase over the same window increase() uses.
+        # The costs: a Prometheus with no history of a running process, such
+        # as a fresh install or a lost volume, treats every counter as new,
+        # and each one already at its threshold pages once, for up to its
+        # window. A series with no sample for longer than the 1h lookback
+        # plus the rule's `for` refires once when samples resume;
+        # CurieApplicationMetricsAbsent pages long before a gap that long.
+        # CurieTurnAcceptedStale uses the same term the other way round, to
+        # raise a count rather than to page; its own comment gives its costs.
+        #
+        # An install that sets api.approvalSweepIntervalSeconds to 0 or less
+        # records no curie_approval_pending and should drop that term from
+        # CurieApplicationMetricsAbsent.
         rules:
           - alert: CurieApplicationMetricsAbsent
-            expr: absent(curie_turn_accepted_total)
+            expr: |
+              absent(curie_queue_depth{service_name="curie-worker"})
+              or
+              absent(curie_approval_pending{service_name="curie-api"})
             for: 10m
             labels:
               severity: page
@@ -154,18 +179,63 @@ serverFiles:
             annotations:
               summary: Curie application metrics are absent from Prometheus
               description: >-
-                No curie_turn_accepted_total series has been retained for 10
-                minutes. Treat missing metrics as a failure, not as a quiet
-                system.
+                curie_queue_depth or curie_approval_pending has had no sample
+                for about 15 minutes. The worker records curie_queue_depth on
+                every maintenance tick and the api records
+                curie_approval_pending on every sweep, so a missing gauge is a
+                broken metrics pipeline, a dead process, or a worker or api that
+                cannot read Valkey or Postgres, never a quiet system.
           - alert: CurieTurnAcceptedStale
+            # Counted per label set, not per series: a restart leaves the old
+            # instance's series flat in the range, where a per-series count
+            # pages, and starts the new one's at its first turn. So both
+            # windows sum without `instance`, and the alert names no process.
+            # The 90m count adds the new-series term above, reading
+            # last_over_time(X[90m]) for X, so a new instance's first turn
+            # counts for the whole window: a process that took one turn and
+            # exited, including the runner's one-turn sandboxes, still counts
+            # after X drops it. The 7d gate adds no such term: with under
+            # seven days of history every live series looks new over 7d, and
+            # a term there would page every label set with a lifetime count
+            # above zero and no turn in 90 minutes. A label set with no series left in the 90m range,
+            # such as an old instance's after a restart with no turn since,
+            # counts as zero rather than absent. The costs: a label set whose
+            # only turns in seven days are new series' first samples, such as
+            # its first turn ever and then silence, is not armed; and a label
+            # set that stops recording for good pages for up to seven days,
+            # while its turns are still in the 7d range; and after a metrics
+            # gap longer than the 1h lookback every series looks new until 90
+            # minutes after samples resume, so the 90m count reads lifetime
+            # values and a canary that stopped around the gap stays hidden
+            # until then. CurieApplicationMetricsAbsent pages the gap itself.
             expr: |
               (
-                increase(curie_turn_accepted_total[90m]) == 0
-              )
+                sum without (instance) (
+                  (
+                    increase(curie_turn_accepted_total[90m])
+                    unless
+                    (
+                      last_over_time(curie_turn_accepted_total[90m])
+                      unless
+                      last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                    )
+                  )
+                  or
+                  (
+                    last_over_time(curie_turn_accepted_total[90m])
+                    unless
+                    last_over_time(curie_turn_accepted_total[1h] offset 90m)
+                  )
+                )
+                or
+                0 * sum without (instance) (
+                  increase(curie_turn_accepted_total[7d])
+                )
+              ) == 0
               and
-              (
-                increase(curie_turn_accepted_total[7d]) > 0
-              )
+              sum without (instance) (
+                increase(curie_turn_accepted_total[7d])
+              ) > 0
             for: 15m
             labels:
               severity: page
@@ -180,6 +250,15 @@ serverFiles:
               increase(
                 curie_turn_completed_total{outcome="classified_failure"}[15m]
               ) > 0
+              or
+              (
+                curie_turn_completed_total{outcome="classified_failure"}
+                unless
+                last_over_time(
+                  curie_turn_completed_total{outcome="classified_failure"}[1h]
+                  offset 15m
+                )
+              ) > 0
             for: 5m
             labels:
               severity: page
@@ -188,7 +267,8 @@ serverFiles:
               summary: A Curie turn completed as classified_failure
               description: >-
                 curie_turn_completed_total with outcome classified_failure
-                increased in the last 15 minutes.
+                increased in the last 15 minutes, counting a series' first
+                sample as an increase from zero.
           - alert: CurieQueueMessageAgeHigh
             expr: curie_queue_message_age_seconds > 900
             for: 10m
@@ -231,6 +311,15 @@ serverFiles:
               increase(
                 curie_worker_supervised_restart_total{outcome="restart"}[30m]
               ) >= 3
+              or
+              (
+                curie_worker_supervised_restart_total{outcome="restart"}
+                unless
+                last_over_time(
+                  curie_worker_supervised_restart_total{outcome="restart"}[1h]
+                  offset 30m
+                )
+              ) >= 3
             for: 5m
             labels:
               severity: page
@@ -239,9 +328,9 @@ serverFiles:
               summary: A supervised worker task is crash-looping
               description: >-
                 curie_worker_supervised_restart_total with outcome restart
-                increased by three or more in 30 minutes for one operation.
-                The task is backing off and will be parked if it keeps
-                crashing.
+                increased by three or more in 30 minutes for one operation,
+                counting a series' first sample as an increase from zero. The
+                task is backing off and will be parked if it keeps crashing.
           - alert: CurieWorkerSupervisedTaskParked
             # A level check, not increase(): a parked task emits give_up once
             # and its series first appears already at 1 with no zero sample, so
@@ -263,6 +352,14 @@ serverFiles:
               increase(
                 curie_reply_delivery_total{outcome="failure"}[15m]
               ) >= 3
+              or
+              (
+                curie_reply_delivery_total{outcome="failure"}
+                unless
+                last_over_time(
+                  curie_reply_delivery_total{outcome="failure"}[1h] offset 15m
+                )
+              ) >= 3
             for: 10m
             labels:
               severity: page
@@ -271,7 +368,8 @@ serverFiles:
               summary: Repeated Curie reply delivery failures
               description: >-
                 curie_reply_delivery_total with outcome failure increased by
-                three or more in 15 minutes.
+                three or more in 15 minutes, counting a series' first sample
+                as an increase from zero.
           - alert: CurieChannelTokenRotationFailed
             expr: |
               increase(
@@ -279,6 +377,21 @@ serverFiles:
                   operation="/channels/token",
                   outcome="5xx"
                 }[1h]
+              ) > 0
+              or
+              (
+                curie_http_server_request_total{
+                  operation="/channels/token",
+                  outcome="5xx"
+                }
+                unless
+                last_over_time(
+                  curie_http_server_request_total{
+                    operation="/channels/token",
+                    outcome="5xx"
+                  }[1h]
+                  offset 1h
+                )
               ) > 0
             for: 5m
             labels:
@@ -288,7 +401,8 @@ serverFiles:
               summary: Channel-token HTTP rotation returned 5xx
               description: >-
                 curie_http_server_request_total for /channels/token with
-                outcome 5xx increased in the last hour.
+                outcome 5xx increased in the last hour, counting a series'
+                first sample as an increase from zero.
           - alert: CurieMailAdapterNotReady
             # Two terms, because `unavailable > 0` alone cannot see a
             # Deployment scaled to zero: kube-state-metrics reports

@@ -74,6 +74,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       serviceAccountName: {{ include "curie.langfuse.serviceAccountName" . }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- if or .Values.langfuse.clickhouseReadiness.enabled $pgReadiness.enabled }}
       initContainers:
       {{- if $pgReadiness.enabled }}
@@ -184,6 +187,9 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       serviceAccountName: {{ include "curie.langfuse.serviceAccountName" . }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- if or .Values.langfuse.clickhouseReadiness.enabled $pgReadiness.enabled }}
       initContainers:
       {{- if $pgReadiness.enabled }}

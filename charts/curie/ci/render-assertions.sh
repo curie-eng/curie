@@ -54,6 +54,15 @@
 # `strategy: Recreate` with no rollingUpdate block, and every other workload must
 # keep the strategy it rendered before the fix.
 #
+# Issue #3182 (sandbox pods preempt Langfuse, the OTel collector and the UI),
+# Assertion 8 extension. Those workloads ran at priority 0, so sandbox pods
+# preempted them and the collector's OTLP endpoint went `Connection refused`
+# mid-run. They now join the platform PriorityClass; the inventory over every
+# rendered Deployment/StatefulSet/DaemonSet is exhaustive, so a new template
+# cannot miss its class; the runner-prewarm DaemonSet is pinned classless
+# (priority 0, below curie-sandbox). Negative controls A and B prove both
+# halves can fail.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -526,33 +535,71 @@ if check_runner_env "$MUTANT" "mutant (CURIE_SANDBOX_ID -> CURIE_SANBOX_ID)" 2>&
 fi
 echo "  ok: misspelled runner env name is rejected (the assert can fail)"
 
-echo "=== Assertion 8: priorityClassName on every control-plane pod + the sandbox controller + the sandbox (ADR-0059 decision 5, #759, #816) ==="
+echo "=== Assertion 8: priorityClassName on every long-running platform workload + the sandbox controller + the sandbox (ADR-0059 decision 5, #759, #816, #3182) ==="
 # The control plane (worker, api, dispatcher, data tier: postgres, valkey,
 # clickhouse, rustfs) must outrank sandbox pods for node-pressure eviction, so
 # the components that supervise, drain, and reclaim a sandbox are never
-# themselves preferred for eviction over the sandboxes they manage. Render with
-# the dispatcher enabled (it needs both Slack tokens to render at all) so every
-# control-plane pod is present in one pass.
+# themselves preferred for eviction over the sandboxes they manage. The
+# vendored agent-sandbox controller (#816) is control plane too: it reconciles
+# sandbox claims/releases, so it must also outrank the sandbox pods it
+# manages. It is a static Deployment named exactly `agent-sandbox-controller`,
+# not prefixed by the chart fullname, so it needs its own exact-name key in the
+# inventory below.
 #
-# The vendored agent-sandbox controller (#816) is control plane too: it
-# reconciles sandbox claims/releases, so it must also outrank the sandbox pods
-# it manages for node-pressure eviction. It is a static Deployment named
-# exactly `agent-sandbox-controller`, not prefixed by the chart fullname, so it
-# cannot be matched by the suffix table below and needs its own exact-name
-# lookup. This is also the tripwire for the template-layer string-injection
-# anchor silently drifting on a future upstream controller bump: if the anchor
-# stops matching, the field silently stops being set, and only an assert that
-# actually reads the rendered priorityClassName back out would catch it.
+# #3182 extends the platform set to the observability and UI tier: langfuse-web,
+# langfuse-worker, the OTel collector, the UI, and (when deployed) inference and
+# the mail adapter. At priority 0 those pods were preempted by the very
+# sandboxes whose traces and metrics they carry: the v0.10.0 staging install
+# logged `Preempted by pod ...` for langfuse-web, langfuse-worker and the
+# collector, and the runners then hit `Connection refused` on
+# curie-otel-collector:4318, losing the traces of the runs that caused the
+# eviction. A sandbox that does not fit now waits for capacity instead.
+#
+# The runner-prewarm DaemonSet deliberately sets NO priorityClassName (#3182's
+# second bullet, first arm): the image-cache pod is the chart's designated
+# sacrifice, so it stays at priority 0, below curie-sandbox (100000), and a
+# full node evicts it before anything the platform needs. Giving it a class of
+# its own would also change the chart-rendered cluster-singleton inventory and
+# the CLI's cluster-up preflight; that is a separate maintainer decision, not
+# part of this fix.
+#
+# The check is an exhaustive inventory, not a spot check (#3182's third bullet):
+# EVERY rendered Deployment/StatefulSet/DaemonSet must appear in EXPECTED_PLATFORM
+# below (or be the prewarm DaemonSet) and carry the class the inventory names, so
+# a new template that forgets priorityClassName fails the render instead of
+# shipping at priority 0. Jobs and hook Pods are out of scope: they are not
+# long-running. Exact (kind, name) keys, never suffix matching:
+# `curie-langfuse-worker` also ends in `-worker`, so the old suffix table would
+# have recorded the langfuse worker's pod under the `-worker` key and clobbered
+# the control-plane entry -- the same trap the controller exact-name lookup
+# already warned about.
+#
+# The render enables every first-party long-running workload that is off by
+# default (inference, mailAdapter -- the same flags the placement assertion
+# uses) plus the dispatcher (which needs both Slack tokens to render at all),
+# so the inventory is exhaustive in one pass.
+PRIO_HELM_ARGS=(
+  --set dispatcher.slack.appToken=xapp-render-assert
+  --set dispatcher.slack.botToken=xoxb-render-assert
+  --set inference.deploy=true
+  --set inference.persistence.enabled=true
+  --set mailAdapter.deploy=true
+  --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24'
+  --set mailAdapter.persistence.existingClaim=render-assert-mail-state
+)
+
 PRIO_OUT="$(mktemp -d -p "$TMP")"
-helm template "$CHART" --output-dir "$PRIO_OUT" \
-  --set dispatcher.slack.appToken=xapp-render-assert \
-  --set dispatcher.slack.botToken=xoxb-render-assert \
-  > /dev/null
+# Release name `curie` makes every fullname-prefixed workload name exactly
+# `curie-<component>` (the fullname helper keeps a release name that contains
+# the chart name as-is), so the inventory keys below are deterministic.
+helm template curie "$CHART" --output-dir "$PRIO_OUT" \
+  "${PRIO_HELM_ARGS[@]}" > /dev/null
 
 PRIO_CHECK="$TMP/check_priority_class.py"
 cat > "$PRIO_CHECK" <<'PYEOF'
-"""Assert priorityClassName on every control-plane pod template, the vendored
-agent-sandbox controller Deployment, and the sandbox pod template.
+"""Assert priorityClassName on every long-running platform workload, the vendored
+agent-sandbox controller Deployment, and the sandbox pod template; assert the
+runner-prewarm DaemonSet sets none and so stays below the sandbox class.
 
 argv: <rendered-dir> <expected-platform-name> <expected-sandbox-name>
 Exits 0 on pass, 1 naming the offending workload on failure.
@@ -564,109 +611,225 @@ import yaml
 
 rendered, platform_name, sandbox_name = sys.argv[1], sys.argv[2], sys.argv[3]
 
-# Deployment/StatefulSet name suffix -> expected priorityClassName. The data
-# tier (postgres/valkey/clickhouse/rustfs) and the three first-party services
-# (worker, api, dispatcher) are all control plane per ADR-0059 decision 5;
-# langfuse/ui/inference/otel are deliberately out of scope (not named in the
-# decision).
-EXPECTED = {
-    "-worker": platform_name,
-    "-api": platform_name,
-    "-dispatcher": platform_name,
-    "-postgres": platform_name,
-    "-valkey": platform_name,
-    "-clickhouse": platform_name,
-    "-rustfs": platform_name,
+# Every rendered Deployment/StatefulSet/DaemonSet must be classified here (or
+# be the prewarm DaemonSet in PREWARM below) and carry the platform class. A
+# workload absent from this inventory fails the check as unclassified, so a new
+# template cannot silently ship at priority 0 (#3182). Exact (kind, name)
+# keys: `curie-langfuse-worker` also ends in `-worker`, so a suffix table would
+# clobber the control-plane entry.
+EXPECTED_PLATFORM = {
+    ("Deployment", "curie-api"),
+    ("Deployment", "curie-dispatcher"),
+    ("Deployment", "curie-worker"),
+    ("Deployment", "curie-ui"),
+    ("Deployment", "curie-inference"),
+    ("Deployment", "curie-langfuse-web"),
+    ("Deployment", "curie-langfuse-worker"),
+    ("Deployment", "curie-otel-collector"),
+    ("Deployment", "curie-mail-adapter"),
+    # Exact name, not fullname-prefixed: the vendored controller Deployment is
+    # static and unprefixed, and a loose `-controller` suffix would silently
+    # match `curie-preflight-controller` and friends.
+    ("Deployment", "agent-sandbox-controller"),
+    ("StatefulSet", "curie-postgres"),
+    ("StatefulSet", "curie-valkey"),
+    ("StatefulSet", "curie-clickhouse"),
+    ("StatefulSet", "curie-rustfs"),
 }
 
-# Exact name, not a suffix match: `agent-sandbox-controller-extensions` and
-# `release-name-curie-preflight-controller` also exist in the render, and a
-# loose `-controller` suffix would silently match the wrong object.
-CONTROLLER_NAME = "agent-sandbox-controller"
+# The one long-running workload that deliberately carries NO class: the prewarm
+# pod sleeps to pin the runner image on the node, so it is the designated
+# sacrifice -- priority 0, below curie-sandbox, evicted before anything the
+# platform needs (#3182's second bullet, first arm).
+PREWARM = ("DaemonSet", "curie-runner-prewarm")
 
-found = {}
-controller_found = None
-sandbox_found = []
+workloads = {}
+priority_classes = {}
+sandbox_templates = []
 for path in sorted(pathlib.Path(rendered).rglob("*.yaml")):
     for doc in yaml.safe_load_all(path.read_text()):
         if not isinstance(doc, dict):
             continue
         kind = doc.get("kind")
-        if kind in ("Deployment", "StatefulSet"):
-            name = doc.get("metadata", {}).get("name", "")
-            spec = (
+        name = doc.get("metadata", {}).get("name", "")
+        if kind == "PriorityClass":
+            priority_classes[name] = doc.get("value")
+        elif kind in ("Deployment", "StatefulSet", "DaemonSet"):
+            key = (kind, name)
+            if key in workloads:
+                sys.stderr.write(f"duplicate rendered workload {key!r}\n")
+                sys.exit(1)
+            workloads[key] = (
                 doc.get("spec", {})
                 .get("template", {})
                 .get("spec", {})
+                .get("priorityClassName")
             )
-            for suffix in EXPECTED:
-                if name.endswith(suffix):
-                    found[suffix] = (name, spec.get("priorityClassName"))
-            if kind == "Deployment" and name == CONTROLLER_NAME:
-                controller_found = (name, spec.get("priorityClassName"))
         elif kind == "SandboxTemplate":
             spec = doc.get("spec", {}).get("podTemplate", {}).get("spec", {})
-            sandbox_found.append((doc.get("metadata", {}).get("name", ""), spec.get("priorityClassName")))
+            sandbox_templates.append((name, spec.get("priorityClassName")))
 
-missing = sorted(set(EXPECTED) - set(found))
+expected = EXPECTED_PLATFORM | {PREWARM}
+missing = sorted(expected - set(workloads))
 if missing:
-    sys.stderr.write(f"render is missing expected control-plane workload(s): {missing}\n")
+    sys.stderr.write(f"render is missing expected long-running workload(s): {missing}\n")
+    sys.exit(1)
+
+unclassified = sorted(set(workloads) - expected)
+if unclassified:
+    for kind, name in unclassified:
+        sys.stderr.write(
+            f"{kind} '{name}' is not in the priorityClassName inventory. Every "
+            "long-running platform workload must set a priority class (#3182): "
+            "add it to EXPECTED_PLATFORM in this check (or to PREWARM if it is "
+            "deliberately the lowest).\n")
     sys.exit(1)
 
 mismatched = [
-    (suffix, name, got, EXPECTED[suffix])
-    for suffix, (name, got) in found.items()
-    if got != EXPECTED[suffix]
+    (key, got)
+    for key, got in sorted(workloads.items())
+    if key in EXPECTED_PLATFORM and got != platform_name
 ]
 if mismatched:
-    for suffix, name, got, want in mismatched:
+    for (kind, name), got in mismatched:
         sys.stderr.write(
-            f"workload '{name}' (matched by suffix '{suffix}') has "
-            f"priorityClassName={got!r}, expected {want!r}\n")
+            f"{kind} '{name}' has priorityClassName={got!r}, "
+            f"expected {platform_name!r}\n")
     sys.exit(1)
 
-if controller_found is None:
+prewarm_got = workloads[PREWARM]
+if prewarm_got is not None:
     sys.stderr.write(
-        f"found no Deployment named exactly {CONTROLLER_NAME!r} in the render; "
-        "the agent-sandbox controller priorityClassName assert would pass vacuously\n")
+        f"DaemonSet '{PREWARM[1]}' has priorityClassName={prewarm_got!r}, "
+        "expected none: the prewarm pod stays below curie-sandbox at priority 0 "
+        "(#3182); promoting it is a separate decision (cluster-singleton "
+        "inventory, CLI preflight).\n")
     sys.exit(1)
 
-controller_name, controller_got = controller_found
-if controller_got != platform_name:
-    sys.stderr.write(
-        f"controller Deployment '{controller_name}' has "
-        f"priorityClassName={controller_got!r}, expected {platform_name!r}\n")
-    sys.exit(1)
+# The unclassed prewarm sits at priority 0, so "stays below curie-sandbox" is
+# exactly "sandbox value > 0" -- with platform outranking sandbox per ADR-0059
+# decision 5. Only checkable when the chart renders the class objects
+# (create: true); a BYO-class install has no object to read.
+platform_value = priority_classes.get(platform_name)
+sandbox_value = priority_classes.get(sandbox_name)
+if platform_value is not None and sandbox_value is not None:
+    # Helm renders a large integer value as 1e+06, so parse through float.
+    if not int(float(platform_value)) > int(float(sandbox_value)) > 0:
+        sys.stderr.write(
+            "rendered PriorityClass values do not order platform > sandbox > 0 "
+            f"(platform={platform_value!r}, sandbox={sandbox_value!r}); the "
+            "unclassed prewarm pod (priority 0) must stay below curie-sandbox "
+            "(#3182)\n")
+        sys.exit(1)
 
-if not sandbox_found:
+if not sandbox_templates:
     sys.stderr.write("found no SandboxTemplate in the render; the sandbox assert would pass vacuously\n")
     sys.exit(1)
 
-sandbox_mismatched = [(n, got) for n, got in sandbox_found if got != sandbox_name]
+sandbox_mismatched = [(n, got) for n, got in sandbox_templates if got != sandbox_name]
 if sandbox_mismatched:
     for name, got in sandbox_mismatched:
         sys.stderr.write(
             f"SandboxTemplate '{name}' has priorityClassName={got!r}, expected {sandbox_name!r}\n")
     sys.exit(1)
 
-print(f"  ok: {len(found)} control-plane workloads and the agent-sandbox controller carry "
-      f"priorityClassName={platform_name!r}; SandboxTemplate carries priorityClassName={sandbox_name!r}")
+print(f"  ok: {len(EXPECTED_PLATFORM)} long-running platform workloads (including "
+      f"the agent-sandbox controller) carry priorityClassName={platform_name!r}; "
+      f"the prewarm DaemonSet sets none (priority 0, below {sandbox_name!r}); "
+      f"SandboxTemplate carries priorityClassName={sandbox_name!r}")
 PYEOF
 
 python3 "$PRIO_CHECK" "$PRIO_OUT" "curie-platform" "curie-sandbox" \
-  || fail "default render did not set the expected priorityClassName on every control-plane pod, the agent-sandbox controller, and the sandbox."
+  || fail "default render did not set the expected priorityClassName on every long-running platform workload, the agent-sandbox controller, and the sandbox."
+
+echo "=== Assertion 8 negative control A: a platform workload without a class FAILS ==="
+# Mandatory, per Assertion 7's convention: an assert that has never been shown
+# failing is not a pin. Mutate a TEMP COPY of the chart (never the real
+# template) back to the pre-#3182 shape -- the UI Deployment with no
+# priorityClassName -- and require the inventory check to reject it by name.
+PRIO_MUTANT_UI="$TMP/mutant-prio-ui"
+cp -a "$CHART" "$PRIO_MUTANT_UI"
+python3 - "$PRIO_MUTANT_UI/templates/ui.yaml" <<'PYEOF'
+import pathlib
+import sys
+
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+old = """      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+"""
+if text.count(old) != 1:
+    sys.stderr.write(
+        "negative control A could not find exactly one platform "
+        f"priorityClassName block in ui.yaml (found {text.count(old)})\n")
+    sys.exit(1)
+p.write_text(text.replace(old, "", 1))
+PYEOF
+PRIO_MUTANT_UI_RENDER="$(mktemp -d -p "$TMP")"
+helm template curie "$PRIO_MUTANT_UI" --output-dir "$PRIO_MUTANT_UI_RENDER" \
+  "${PRIO_HELM_ARGS[@]}" > /dev/null
+prio_ui_negative_output=""
+if prio_ui_negative_output="$(python3 "$PRIO_CHECK" "$PRIO_MUTANT_UI_RENDER" "curie-platform" "curie-sandbox" 2>&1)"; then
+  fail "negative control A did not fire: a classless UI Deployment passed the priorityClassName inventory, so Assertion 8 is not actually pinning anything."
+fi
+if [[ "$prio_ui_negative_output" != *"curie-ui"* ]]; then
+  fail "classless-UI negative control failed unexpectedly: $prio_ui_negative_output"
+fi
+echo "  ok: a platform workload without a class is rejected by name (the assert can fail)"
+
+echo "=== Assertion 8 negative control B: an unclassified new workload FAILS ==="
+# The #3182 third bullet is forward-looking ("a new template can't miss it"),
+# so prove THAT path fires too: drop a synthetic classless Deployment into a
+# temp chart copy and require the inventory to reject it as unclassified.
+PRIO_MUTANT_NEW="$TMP/mutant-prio-new"
+cp -a "$CHART" "$PRIO_MUTANT_NEW"
+cat > "$PRIO_MUTANT_NEW/templates/render-assert-unclassified.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "curie.fullname" . }}-synthetic-unclassified
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curie
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: curie
+    spec:
+      containers:
+        - name: sleep
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+EOF
+PRIO_MUTANT_NEW_RENDER="$(mktemp -d -p "$TMP")"
+helm template curie "$PRIO_MUTANT_NEW" --output-dir "$PRIO_MUTANT_NEW_RENDER" \
+  "${PRIO_HELM_ARGS[@]}" > /dev/null
+prio_new_negative_output=""
+if prio_new_negative_output="$(python3 "$PRIO_CHECK" "$PRIO_MUTANT_NEW_RENDER" "curie-platform" "curie-sandbox" 2>&1)"; then
+  fail "negative control B did not fire: an unclassified classless Deployment passed the priorityClassName inventory, so the 'a new template can't miss it' half of Assertion 8 pins nothing."
+fi
+if [[ "$prio_new_negative_output" != *"not in the priorityClassName inventory"* ]]; then
+  fail "unclassified-workload negative control failed unexpectedly: $prio_new_negative_output"
+fi
+echo "  ok: an unclassified new workload is rejected (a new template cannot miss its class)"
 
 echo "=== Assertion 9: priorityClassName names are operator-overridable (additive values, #759) ==="
 PRIO_OVERRIDE_OUT="$(mktemp -d -p "$TMP")"
-helm template "$CHART" --output-dir "$PRIO_OVERRIDE_OUT" \
-  --set dispatcher.slack.appToken=xapp-render-assert \
-  --set dispatcher.slack.botToken=xoxb-render-assert \
+# Same workload flag set as Assertion 8 so the reused checker sees the same
+# inventory; only the class names change.
+helm template curie "$CHART" --output-dir "$PRIO_OVERRIDE_OUT" \
+  "${PRIO_HELM_ARGS[@]}" \
   --set priorityClasses.platform.name=custom-platform-class \
   --set priorityClasses.sandbox.name=custom-sandbox-class \
   > /dev/null
 python3 "$PRIO_CHECK" "$PRIO_OVERRIDE_OUT" "custom-platform-class" "custom-sandbox-class" \
   || fail "overriding priorityClasses.platform.name/sandbox.name did not propagate to priorityClassName on the rendered pods."
-echo "  ok: overriding priorityClasses.platform.name/sandbox.name propagates to every control-plane pod, the agent-sandbox controller, and the sandbox"
+echo "  ok: overriding priorityClasses.platform.name/sandbox.name propagates to every long-running platform workload, the agent-sandbox controller, and the sandbox"
 
 echo "=== Assertion 10: SandboxTemplate opts the controller out of its own permissive NetworkPolicy when Rail 1 is on (#765) ==="
 # NetworkPolicy allows are additive across objects that select the same pods --
@@ -2157,4 +2320,4 @@ PYEOF
 echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); and the dispatcher rolls out with Recreate while every other workload keeps its strategy."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); and the dispatcher rolls out with Recreate while every other workload keeps its strategy."

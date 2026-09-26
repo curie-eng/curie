@@ -98,6 +98,7 @@ api:
   COMMIT_POLL_INTERVAL_S: api.commitPollIntervalSeconds
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_APPROVAL_RECOVERY_ENABLED: api.approvalRecovery.enabled
+  CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
@@ -114,6 +115,7 @@ api:
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret
   GITHUB_CLONE_BASE: api.githubCloneBase
   GITHUB_FACTORY_CARD_BASE_URL: api.githubFactoryCardBaseUrl
+  GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
   GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
   GITHUB_FACTORY_LABEL: api.githubFactoryLabel
   GITHUB_FACTORY_MENTION: api.githubFactoryMention
