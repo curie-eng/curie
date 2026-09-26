@@ -337,6 +337,10 @@ def test_released_upgrade_selects_every_repo_file_the_upgrade_matrix_reads(
         "cli/scripts/gnu-process.py",
         "cli/src/application_schema_windows.json",
     } <= set(_repo_root_references(script))
+    # The chart's left-out path holds only while helm still drops it.
+    helmignore = (REPO_ROOT / "charts" / "curie" / ".helmignore").read_text()
+    assert UPGRADE_MATRIX_DIRECTORY_INPUTS["charts/curie"] == ("charts/curie/ci",)
+    assert "ci/" in helmignore.splitlines()
     assert _unselected_matrix_inputs(tmp_path, script) == []
 
 
