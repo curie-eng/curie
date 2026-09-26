@@ -93,6 +93,41 @@
       },
       "cardinality_bound": 192
     },
+    "curie.agent.turn.completed": {
+      "type": "counter",
+      "unit": "{turn}",
+      "description": "Terminal turns for one agent. The agent label admits at most 32 distinct slugs per process; further names and non-slugs share other, and a turn with no resolved agent is unbound.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker"
+        ],
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted"
+        ],
+        "agent": {
+          "kind": "bounded",
+          "ceiling": 32,
+          "reserved": [
+            "other",
+            "unbound"
+          ],
+          "overflow": "other",
+          "unset": "unbound"
+        }
+      },
+      "cardinality_bound": 272
+    },
     "curie.history.resume.cache_read": {
       "type": "histogram",
       "unit": "{token}",

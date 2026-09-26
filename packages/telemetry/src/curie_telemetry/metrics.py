@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, Final
@@ -35,15 +36,51 @@ _TURN_OUTCOMES: Final = [
 ]
 
 
+# Distinct agent names admitted on ``curie.agent.turn.completed`` in one
+# process. Names past the ceiling, and names that are not a short slug, share
+# the reserved ``other`` series. ``unbound`` is the series for a terminal turn
+# that never resolved an agent. Neither reserved value consumes a ceiling slot.
+_AGENT_LABEL_CEILING: Final = 32
+_AGENT_LABEL_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+_BOUNDED_SEEN: dict[tuple[str, str], dict[str, None]] = {}
+
+
+def reset_bounded_labels() -> None:
+    """Drop process-local bounded-label admissions. Tests only."""
+
+    _BOUNDED_SEEN.clear()
+
+
+def _bounded_agent_label() -> dict[str, Any]:
+    return {
+        "kind": "bounded",
+        "ceiling": _AGENT_LABEL_CEILING,
+        "reserved": ["other", "unbound"],
+        "overflow": "other",
+        "unset": "unbound",
+    }
+
+
+def _domain_width(values: Any) -> int:
+    if isinstance(values, Mapping) and values.get("kind") == "bounded":
+        return int(values["ceiling"]) + len(values["reserved"])
+    return len(values)
+
+
 def _definition(
     instrument_type: str,
     unit: str,
     description: str,
     monotonic: bool,
-    attributes: Mapping[str, list[str]],
+    attributes: Mapping[str, Any],
 ) -> dict[str, Any]:
-    domains = {key: list(values) for key, values in attributes.items()}
-    bound = math.prod(len(values) for values in domains.values())
+    domains: dict[str, Any] = {}
+    for key, values in attributes.items():
+        if isinstance(values, Mapping) and values.get("kind") == "bounded":
+            domains[key] = dict(values)
+        else:
+            domains[key] = list(values)
+    bound = math.prod(_domain_width(values) for values in domains.values())
     return {
         "type": instrument_type,
         "unit": unit,
@@ -63,6 +100,14 @@ _TURN_COMPLETED_ATTRIBUTES = {
     "service.name": _SERVICE_NAMES,
     "source": _TURN_SOURCES,
     "outcome": _TURN_OUTCOMES,
+}
+# One agent dimension, on its own instrument, so the fleet-wide turn counter
+# stays unlabeled. The ceiling is the cardinality contract (#2952).
+_AGENT_TURN_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "source": ["worker"],
+    "outcome": _TURN_OUTCOMES,
+    "agent": _bounded_agent_label(),
 }
 _HISTORY_CACHE_ATTRIBUTES = {
     "service.name": ["curie-runner"],
@@ -348,6 +393,15 @@ _METRICS: dict[str, dict[str, Any]] = {
     "curie.turn.duration": _definition(
         "histogram", "s", "End to end turn duration.", False, _TURN_COMPLETED_ATTRIBUTES
     ),
+    "curie.agent.turn.completed": _definition(
+        "counter",
+        "{turn}",
+        "Terminal turns for one agent. The agent label admits at most 32 distinct "
+        "slugs per process; further names and non-slugs share other, and a turn "
+        "with no resolved agent is unbound.",
+        True,
+        _AGENT_TURN_ATTRIBUTES,
+    ),
     "curie.history.resume.cache_read": _definition(
         "histogram",
         "{token}",
@@ -541,6 +595,24 @@ def configure_meter_provider(provider: MeterProvider) -> MeterProvider:
     return provider
 
 
+def _admit_bounded(metric: str, key: str, spec: Mapping[str, Any], value: str) -> str:
+    """Map one label onto the declared ceiling without raising."""
+
+    overflow = str(spec["overflow"])
+    reserved = spec["reserved"]
+    if value in reserved:
+        return value
+    if _AGENT_LABEL_RE.fullmatch(value) is None:
+        return overflow
+    seen = _BOUNDED_SEEN.setdefault((metric, key), {})
+    if value in seen:
+        return value
+    if len(seen) >= int(spec["ceiling"]):
+        return overflow
+    seen[value] = None
+    return value
+
+
 def record_metric(
     name: str,
     value: float = 1,
@@ -553,15 +625,22 @@ def record_metric(
     if definition is None:
         raise ValueError(f"undeclared metric {name!r}")
     supplied = dict(attributes or {})
-    domains: dict[str, list[str]] = definition["attributes"]
+    domains: dict[str, Any] = definition["attributes"]
     unknown = set(supplied) - set(domains)
     if unknown:
         raise ValueError(f"undeclared attribute for {name}: {sorted(unknown)!r}")
     missing = set(domains) - set(supplied)
     if missing:
         raise ValueError(f"missing declared attribute for {name}: {sorted(missing)!r}")
+    normalized = dict(supplied)
     for key, item in supplied.items():
-        if item not in domains[key]:
+        domain = domains[key]
+        if isinstance(domain, dict):
+            if not isinstance(item, str):
+                raise ValueError(f"attribute {key!r} value must be a string")
+            normalized[key] = _admit_bounded(name, key, domain, item)
+            continue
+        if item not in domain:
             raise ValueError(f"attribute {key!r} value {item!r} is outside its declared domain")
     if not math.isfinite(float(value)):
         raise ValueError("metric value must be finite")
@@ -571,8 +650,8 @@ def record_metric(
     context = _normalize_trace_context()
     instrument_type = definition["type"]
     if instrument_type in {"counter", "up_down_counter"}:
-        instrument.add(value, supplied, context=context)
+        instrument.add(value, normalized, context=context)
     elif instrument_type == "histogram":
-        instrument.record(value, supplied, context=context)
+        instrument.record(value, normalized, context=context)
     else:
-        instrument.set(value, supplied, context=context)
+        instrument.set(value, normalized, context=context)

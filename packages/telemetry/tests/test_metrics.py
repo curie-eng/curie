@@ -18,7 +18,7 @@ from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
 from curie_telemetry import build_resource, configure_meter_provider, record_metric
-from curie_telemetry.metrics import declared_metric_manifest
+from curie_telemetry.metrics import declared_metric_manifest, reset_bounded_labels
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
@@ -164,9 +164,19 @@ def test_every_metric_declares_a_finite_cardinality_contract() -> None:
         calculated_bound = 1
         for key, domain in attributes.items():
             assert isinstance(key, str) and key
-            assert isinstance(domain, list) and domain
-            assert len(domain) == len(set(domain))
-            calculated_bound *= len(domain)
+            if isinstance(domain, dict):
+                assert domain["kind"] == "bounded"
+                assert isinstance(domain["ceiling"], int) and domain["ceiling"] >= 1
+                reserved = domain["reserved"]
+                assert isinstance(reserved, list) and reserved
+                assert len(reserved) == len(set(reserved))
+                assert domain["overflow"] in reserved
+                assert domain["unset"] in reserved
+                calculated_bound *= domain["ceiling"] + len(reserved)
+            else:
+                assert isinstance(domain, list) and domain
+                assert len(domain) == len(set(domain))
+                calculated_bound *= len(domain)
         assert definition["cardinality_bound"] == calculated_bound, name
 
 
@@ -574,6 +584,54 @@ def test_supervised_restart_metric_rejects_undeclared_operation_by_execution(
                 "outcome": "crash",
             },
         )
+
+
+def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """#2952: one agent label, capped. The 33rd distinct slug shares ``other``.
+
+    Calls the real recorder. A non-slug never becomes its own series.
+    """
+
+    provider, reader = metrics
+    reset_bounded_labels()
+    base = {
+        "service.name": "curie-worker",
+        "source": "worker",
+        "outcome": "done",
+    }
+    for index in range(32):
+        record_metric(
+            "curie.agent.turn.completed",
+            attributes={**base, "agent": f"acme-{index}"},
+        )
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "acme-overflow"},
+    )
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "not a slug"},
+    )
+    record_metric(
+        "curie.agent.turn.completed",
+        attributes={**base, "agent": "unbound"},
+    )
+    assert provider.force_flush(timeout_millis=5000)
+    labels = {
+        dict(point)["agent"]
+        for point in _exported_series(reader)["curie.agent.turn.completed"]
+    }
+    assert "acme-0" in labels
+    assert "acme-31" in labels
+    assert "acme-overflow" not in labels
+    assert "other" in labels
+    assert "unbound" in labels
+    assert "not a slug" not in labels
+    manifest = declared_metric_manifest()["metrics"]["curie.agent.turn.completed"]
+    assert manifest["attributes"]["agent"]["ceiling"] == 32
+    assert manifest["cardinality_bound"] == 8 * (32 + 2)
 
 
 def test_record_metric_still_rejects_unknown_turn_outcome(

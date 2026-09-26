@@ -252,6 +252,8 @@ _LIFECYCLE_SPAN: ContextVar[Any | None] = ContextVar("curie_worker_lifecycle_spa
 _LIFECYCLE_OUTCOME: ContextVar[str | None] = ContextVar(
     "curie_worker_lifecycle_outcome", default=None
 )
+# Agent slug for the per-agent turn counter. Unset until binding resolves.
+_TURN_AGENT: ContextVar[str | None] = ContextVar("curie_worker_turn_agent", default=None)
 _ERROR_LIFECYCLE_OUTCOMES = frozenset(
     {
         "awaiting_approval",
@@ -1714,6 +1716,7 @@ class Kernel:
         ) as span:
             token = _LIFECYCLE_SPAN.set(span)
             outcome_token = _LIFECYCLE_OUTCOME.set(None)
+            agent_token = _TURN_AGENT.set(None)
             try:
                 if lease is None:
                     # A caller with no lease reaches the body exactly as it did
@@ -1772,6 +1775,7 @@ class Kernel:
                     )
                 span.add_event("turn.processing.completed", {"outcome": outcome})
                 _LIFECYCLE_OUTCOME.reset(outcome_token)
+                _TURN_AGENT.reset(agent_token)
                 _LIFECYCLE_SPAN.reset(token)
                 _HOOK_RUN_CARRY.reset(hook_token)
         if error is not None:
@@ -2211,6 +2215,7 @@ class Kernel:
                         hook_outcome="failed",
                     )
                     return
+                _TURN_AGENT.set(resolved.agent_name)
                 if self._killswitch is not None and await self._killswitch.is_killed(
                     resolved.agent_id
                 ):
@@ -2256,6 +2261,7 @@ class Kernel:
                     if undeployed is not None:
                         # A bound non-Slack route may carry the only endpoint the
                         # platform can use to deliver this status reply.
+                        _TURN_AGENT.set(undeployed.agent_name)
                         route = TargetRoute(
                             endpoint=undeployed.endpoint or handle.endpoint,
                             adapter=undeployed.adapter or handle.adapter,
@@ -2295,6 +2301,7 @@ class Kernel:
                     endpoint=resolved.endpoint or handle.endpoint,
                     adapter=resolved.adapter or handle.adapter,
                 )
+                _TURN_AGENT.set(getattr(resolved, "agent_name", None))
                 hook_carry = _HOOK_RUN_CARRY.get()
                 if (
                     qevent.source is TurnSource.CRON
@@ -3592,6 +3599,7 @@ class Kernel:
             "outcome": telemetry_outcome,
         }
         record_metric("curie.turn.completed", attributes=attributes)
+        self._record_agent_turn(telemetry_outcome)
         try:
             received = datetime.fromisoformat(qevent.received_at)
             if received.tzinfo is None:
@@ -3650,6 +3658,25 @@ class Kernel:
                 "service.name": "curie-worker",
                 "source": "worker",
                 "outcome": telemetry_outcome,
+            },
+        )
+        self._record_agent_turn(telemetry_outcome)
+
+    def _record_agent_turn(self, telemetry_outcome: str) -> None:
+        """Count the terminal turn under the resolved agent, or ``unbound``.
+
+        The fleet counter stays unlabeled. This series is the one a per-agent
+        silence alarm can group on, and the label is capped in ``record_metric``.
+        """
+
+        raw = _TURN_AGENT.get()
+        record_metric(
+            "curie.agent.turn.completed",
+            attributes={
+                "service.name": "curie-worker",
+                "source": "worker",
+                "outcome": telemetry_outcome,
+                "agent": raw if raw else "unbound",
             },
         )
 
