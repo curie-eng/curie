@@ -3121,7 +3121,7 @@ tests:
   - name: queue dead letter fires and clears after its window
     interval: 1m
     input_series:
-      - series: 'curie_queue_dead_letter_total{service_name="curie-worker",source="worker",outcome="dead-letter"}'
+      - series: 'curie_queue_dead_letter_total{service_name="curie-worker",source="worker",outcome="success"}'
         values: '1+0x30'
     alert_rule_test:
       - eval_time: 5m
@@ -3129,7 +3129,7 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-queue
-              outcome: dead-letter
+              outcome: success
               service_name: curie-worker
               severity: page
               source: worker
@@ -3145,9 +3145,9 @@ tests:
   - name: slow sandbox claims fire and clear after fast claims
     interval: 1m
     input_series:
-      - series: 'curie_sandbox_claim_duration_seconds_sum{service_name="curie-worker",operation="claim",outcome="claimed"}'
+      - series: 'curie_sandbox_claim_duration_seconds_sum{service_name="curie-worker",operation="claim",outcome="failed"}'
         values: '0+120x20 2430+30x30'
-      - series: 'curie_sandbox_claim_duration_seconds_count{service_name="curie-worker",operation="claim",outcome="claimed"}'
+      - series: 'curie_sandbox_claim_duration_seconds_count{service_name="curie-worker",operation="claim",outcome="failed"}'
         values: '0+1x20 21+1x30'
     alert_rule_test:
       - eval_time: 20m
@@ -3156,7 +3156,7 @@ tests:
           - exp_labels:
               component: curie-sandbox
               operation: claim
-              outcome: claimed
+              outcome: failed
               service_name: curie-worker
               severity: page
             exp_annotations:
@@ -3171,7 +3171,7 @@ tests:
   - name: sandbox capacity refusal fires and clears after its window
     interval: 1m
     input_series:
-      - series: 'curie_sandbox_lifecycle_total{service_name="curie-worker",operation="reclaim",outcome="refused-no-budget"}'
+      - series: 'curie_sandbox_lifecycle_total{service_name="curie-worker",operation="reclaim",outcome="reclaimed-retry-refused"}'
         values: '1+0x30'
     alert_rule_test:
       - eval_time: 5m
@@ -3180,7 +3180,7 @@ tests:
           - exp_labels:
               component: curie-sandbox
               operation: reclaim
-              outcome: refused-no-budget
+              outcome: reclaimed-retry-refused
               service_name: curie-worker
               severity: page
             exp_annotations:
