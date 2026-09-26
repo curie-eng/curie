@@ -6190,9 +6190,9 @@ def test_a_replay_matches_a_default_identity_a_later_migration_names(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
-    """ADR-0168 decision 3: a contract migration backfills the default Slack
-    identity to 'default', while this release's writers still send no adapter
-    for it. A replay compares the identities, so the two spellings match."""
+    """ADR-0168 decision 3: migration 0061 backfills the default Slack identity
+    to 'default', and a caller that names none means the same identity. A
+    replay compares the identities, so the two spellings match."""
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
     payload = _publication_payload(deployment["id"])
@@ -6203,6 +6203,33 @@ def test_a_replay_matches_a_default_identity_a_later_migration_names(
     )
     _execute(
         "UPDATE curie.publications SET reply_adapter = 'default' WHERE id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+
+    assert replay.status_code in {200, 201}, replay.text
+    assert replay.json()["id"] == first["id"]
+
+
+def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """A publication raised from a handle queued before migration 0061 can
+    still store NULL for the default Slack identity, while its replay now
+    arrives as 'default'. Same identity, same replay."""
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"])
+    _, first = _create_publication(client, payload)
+    _execute(
+        "UPDATE curie.approvals SET reply_adapter = NULL WHERE dedupe_key = :k",
+        {"k": payload["dedupe_key"]},
+    )
+    _execute(
+        "UPDATE curie.publications SET reply_adapter = NULL WHERE id = :id",
         {"id": uuid.UUID(first["id"])},
     )
 
