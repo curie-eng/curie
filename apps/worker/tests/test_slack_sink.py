@@ -947,6 +947,16 @@ def test_an_edit_over_slacks_limit_is_cut_to_fit_and_says_so() -> None:
     assert sent.rstrip().endswith("(Cut here: Slack refuses a longer edit.)_")
 
 
+def test_a_long_edit_keeps_the_action_receipt_with_the_answer() -> None:
+    receipt = "_What I changed:_\n• 25 Bash calls; changes not described"
+    sent = _captured_update("A long report line.\n" * 600 + "\n\n" + receipt)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long report line.")
+    assert "(Cut here: Slack refuses a longer edit.)_" in sent
+    assert sent.endswith(receipt)
+
+
 def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
     line = "• called `a_tool` — non-idempotent tool completed\n"
     text = line * 78  # 3,900 characters: under the limit counted as characters

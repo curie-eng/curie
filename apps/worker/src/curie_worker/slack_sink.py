@@ -200,6 +200,7 @@ def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
 # and a refused final edit used to lose the whole turn (#3064).
 _EDIT_MAX_BYTES = 4000
 _CUT_NOTE = "\n…\n_(Cut here: Slack refuses a longer edit.)_"
+_RECEIPT_HEADER = "\n\n_What I changed:_\n"
 
 
 def _fit_edit(text: str) -> str:
@@ -211,12 +212,18 @@ def _fit_edit(text: str) -> str:
     """
     if len(text.encode("utf-8")) <= _EDIT_MAX_BYTES:
         return text
-    budget = _EDIT_MAX_BYTES - len(_CUT_NOTE.encode("utf-8"))
-    head = text.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    answer, separator, receipt = text.rpartition(_RECEIPT_HEADER)
+    suffix = separator + receipt if separator else ""
+    if not separator:
+        answer = text
+    if len(suffix.encode("utf-8")) >= _EDIT_MAX_BYTES - len(_CUT_NOTE.encode("utf-8")):
+        answer, suffix = text, ""
+    budget = _EDIT_MAX_BYTES - len(_CUT_NOTE.encode("utf-8")) - len(suffix.encode("utf-8"))
+    head = answer.encode("utf-8")[:budget].decode("utf-8", "ignore")
     line_end = head.rfind("\n")
     if line_end > len(head) // 2:
         head = head[:line_end]
-    return head + _CUT_NOTE
+    return head + _CUT_NOTE + suffix
 
 
 def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
