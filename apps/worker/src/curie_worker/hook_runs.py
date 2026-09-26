@@ -211,6 +211,39 @@ class HookRunRecorder:
             outcome=outcome,
         )
 
+    async def renew(self, ref: HookRunRef, lease_s: float) -> bool:
+        """Extend an open run's claim lease to at least ``lease_s`` from now.
+
+        Returns False when the run is no longer open, for example because the
+        hook's next fire reclaimed it after this worker read it (#2931).
+        """
+        key = _parse_ref(ref)
+        try:
+            async with self._engine.begin() as connection:
+                renewed = (
+                    await connection.execute(
+                        text(
+                            "UPDATE curie.hook_runs SET lease_expires_at = GREATEST("
+                            "lease_expires_at, now() + make_interval(secs => :lease_s)) "
+                            "WHERE agent_id = :agent_id "
+                            "AND name = :name AND slot_utc = :slot_utc "
+                            "AND outcome IS NULL RETURNING id"
+                        ),
+                        {
+                            "agent_id": key.agent_id,
+                            "name": key.name,
+                            "slot_utc": key.slot_utc,
+                            "lease_s": lease_s,
+                        },
+                    )
+                ).one_or_none()
+        except SQLAlchemyError as exc:
+            raise HookRunRecorderError(
+                "hook run lease could not be renewed",
+                code="backend",
+            ) from exc
+        return renewed is not None
+
     async def close(self, ref: HookRunRef, outcome: HookRunOutcome) -> None:
         """Set one open run terminally without overwriting an earlier outcome."""
         key = _parse_ref(ref)

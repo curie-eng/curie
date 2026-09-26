@@ -112,6 +112,15 @@ class HookRunSeed:
             ).one_or_none()
         return None if row is None else (row.outcome, row.ended_at)
 
+    async def lease_expires_at(self) -> datetime | None:
+        async with self.engine.connect() as conn:
+            return (
+                await conn.execute(
+                    text("SELECT lease_expires_at FROM curie.hook_runs WHERE id = :run_id"),
+                    {"run_id": self.run_id},
+                )
+            ).scalar_one()
+
 
 @pytest.fixture
 def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[HookRunSeed]]:

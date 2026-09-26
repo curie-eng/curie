@@ -942,3 +942,40 @@ def test_bound_agent_mismatch_refuses_cron_before_runner_start(
                     )
 
     asyncio.run(go())
+
+
+def test_starting_a_cron_turn_renews_its_claim_lease(make_harness, make_hook_run) -> None:
+    """The scheduler's lease starts at admission, but the event can wait on the
+    stream before a worker takes it. The kernel renews the lease when it starts
+    the turn, so queue time never lets the next fire reclaim a live run (#2931)."""
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder(), delivery_budget_s=600.0
+        ) as h:
+            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+            assert await run.lease_expires_at() is None
+            before = time.time()
+            await h.kernel.process_event(_event(hook_run=run.ref))
+            assert await run.state() is not None
+            lease = await run.lease_expires_at()
+            assert lease is not None
+            # At least the delivery budget from when the turn started. Closing
+            # the run leaves the renewed lease in place.
+            assert lease.timestamp() >= before + 600.0 - 5.0
+
+    asyncio.run(go())
+
+
+def test_renew_refuses_a_claim_the_next_fire_already_reclaimed(make_hook_run) -> None:
+    """If the claim was reclaimed between the kernel's read and its renewal, the
+    renewal reports it, so the kernel drops the event instead of running it."""
+
+    async def go() -> None:
+        async with make_hook_run(outcome="reclaimed") as run:
+            assert await run.recorder().renew(run.ref, 600.0) is False  # type: ignore[attr-defined]
+        async with make_hook_run() as run:
+            assert await run.recorder().renew(run.ref, 600.0) is True  # type: ignore[attr-defined]
+            assert await run.lease_expires_at() is not None
+
+    asyncio.run(go())

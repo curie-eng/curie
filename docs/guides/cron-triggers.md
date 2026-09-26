@@ -65,6 +65,18 @@ outcome is one of:
   run.
 - `skipped`: an earlier run of the same trigger was still in flight, or the
   slot was missed and is not the one catch-up fires.
+- `reclaimed`: the run's worker died before closing it, and the trigger's
+  next fire found its claim past its lease and took the hook back.
+
+An in-flight run holds its claim under a lease. The lease defaults to the
+worker's delivery budget (`CURIE_DELIVERY_BUDGET_S`), the longest a turn can
+run, and `CURIE_HOOK_CLAIM_LEASE_S` sets a longer one. It cannot be shorter
+than the budget, since that would reclaim a run that is still going. The worker
+renews the lease when it starts the turn, so time a fire spends queued does not
+count against it. A run left with no lease by an older worker is held for one
+lease from its start. Until the
+lease lapses, later fires record `skipped`; after it lapses, the next fire
+records the old run `reclaimed` and runs its own slot.
 
 Catch-up is bounded to one slot. When the scheduler comes back and finds slots
 it slept through since the trigger's last recorded slot, it fires only the
@@ -93,8 +105,7 @@ platform API and no run record.
 A hook that failed on its newest slot is visible in that one response,
 including when the three newest slots all failed. A slot that has not ended
 yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, `deferred`,
-and `skipped`. `reclaimed` is part of the run record vocabulary and is not
-written by the current scheduler.
+`skipped`, and `reclaimed`.
 
 A fire aimed at a thread that holds a live session does not steer that
 session or open a second one. It records `deferred`, and the scheduler fires

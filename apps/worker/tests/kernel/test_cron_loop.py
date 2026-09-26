@@ -34,7 +34,7 @@ from .conftest import _DB_URL, _VALKEY_HOST, _VALKEY_PORT, _VALKEY_PW
 
 HOOK = "nightly"
 PROMPT = "Summarize.\n  Keep the  spacing verbatim."
-BUDGET_S = 300.0
+LEASE_S = 300.0
 ENDPOINT = "http://curie-test-adapter:8080/"
 ADAPTER = "test-adapter"
 
@@ -65,7 +65,8 @@ class _Seed:
                 (
                     await conn.execute(
                         text(
-                            "SELECT id, outcome, slot_utc, ended_at FROM curie.hook_runs "
+                            "SELECT id, outcome, slot_utc, ended_at, started_at, lease_expires_at "
+                            "FROM curie.hook_runs "
                             "WHERE agent_id = :a AND name = :n ORDER BY slot_utc"
                         ),
                         {"a": self.agent_id, "n": name},
@@ -98,15 +99,23 @@ class _Seed:
             )
 
     async def add_run(
-        self, slot: datetime, started_at: datetime, outcome: str | None = None
+        self,
+        slot: datetime,
+        started_at: datetime,
+        outcome: str | None = None,
+        lease_expires_at: datetime | None = None,
     ) -> uuid.UUID:
+        """Seed a claim. An open one's lease defaults to still live."""
         run_id = uuid.uuid4()
+        if lease_expires_at is None and outcome is None:
+            lease_expires_at = datetime.now(UTC) + timedelta(seconds=LEASE_S)
         async with self.engine.begin() as conn:
             await conn.execute(
                 text(
                     "INSERT INTO curie.hook_runs "
-                    "(id, agent_id, name, slot_utc, version_id, outcome, started_at) "
-                    "VALUES (:id, :a, :n, :slot, :v, :outcome, :started)"
+                    "(id, agent_id, name, slot_utc, version_id, outcome, started_at, "
+                    "lease_expires_at) "
+                    "VALUES (:id, :a, :n, :slot, :v, :outcome, :started, :lease)"
                 ),
                 {
                     "id": run_id,
@@ -116,6 +125,7 @@ class _Seed:
                     "v": self.version_id,
                     "started": started_at,
                     "outcome": outcome,
+                    "lease": lease_expires_at,
                 },
             )
         return run_id
@@ -254,7 +264,7 @@ def _loop(
         db_schema="curie",
         stream=stream,
         interval_seconds=1.0,
-        delivery_budget_s=BUDGET_S,
+        claim_lease_s=LEASE_S,
         default_max_usd_per_day=10.0,
         default_max_output_tokens_per_run=100_000,
         started_at=started_at or slot - timedelta(seconds=30),
@@ -431,22 +441,156 @@ def test_previous_fire_still_in_flight_skips_the_new_slot(
     asyncio.run(body())
 
 
-def test_stale_in_flight_row_is_failed_and_the_new_slot_admitted(
+def test_claim_past_its_lease_is_reclaimed_and_the_new_slot_admitted(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A run whose worker died mid-turn never closes its row. Once its lease
+    has lapsed the next fire records it ``reclaimed`` and proceeds (#2931)."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            previous = seed.slot - timedelta(days=1)
+            # Started moments ago, so no started_at-based staleness rule could
+            # fire; only the lapsed lease makes this claim reclaimable.
+            await seed.add_run(
+                previous,
+                datetime.now(UTC) - timedelta(seconds=5),
+                lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+            client = _async_redis()
+            try:
+                loop = _loop(
+                    seed.engine, client, _Triggers(seed, _trigger(seed)), names["stream"], seed.slot
+                )
+                summary = await loop.one_pass(now=seed.slot + timedelta(seconds=30))
+            finally:
+                await client.aclose()
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [
+                (previous, "reclaimed"),
+                (seed.slot, None),
+            ]
+            assert rows[0].ended_at is not None
+            assert summary.reclaimed == 1
+            assert summary.admitted == 1
+            assert len(_entries(sync_redis, names["stream"])) == 1
+
+    asyncio.run(body())
+
+
+def test_claim_older_than_the_old_budget_rule_but_inside_its_lease_is_not_reclaimed(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """The interim budget-plus-60s rule is gone: age alone reclaims nothing."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            previous = seed.slot - timedelta(days=1)
+            await seed.add_run(previous, datetime.now(UTC) - timedelta(hours=6))
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [
+                (previous, None),
+                (seed.slot, "skipped"),
+            ]
+            assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+def test_leaseless_claim_is_reclaimed_once_its_start_is_a_lease_old(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A claim written without a lease (an older worker mid-rollout) is held
+    for one lease from its start, then reclaimed like any other."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            young, old = seed.slot - timedelta(days=2), seed.slot - timedelta(days=1)
+            await seed.add_run(young, datetime.now(UTC) - timedelta(seconds=LEASE_S + 60))
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET lease_expires_at = NULL "
+                        "WHERE agent_id = :a AND name = :n"
+                    ),
+                    {"a": seed.agent_id, "n": HOOK},
+                )
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            rows = await seed.runs()
+            # Catch-up records the slot slept through between the two.
+            assert [(r.slot_utc, r.outcome) for r in rows] == [
+                (young, "reclaimed"),
+                (old, "skipped"),
+                (seed.slot, None),
+            ]
+
+    asyncio.run(body())
+
+
+def test_leaseless_claim_inside_a_lease_of_its_start_is_not_reclaimed(
     sync_redis: redis.Redis, names: dict[str, str]
 ) -> None:
     async def body() -> None:
         async with _seed() as seed:
-            now = seed.slot + timedelta(seconds=30)
             previous = seed.slot - timedelta(days=1)
-            await seed.add_run(previous, now - timedelta(seconds=BUDGET_S + 120))
+            await seed.add_run(previous, datetime.now(UTC) - timedelta(seconds=10))
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET lease_expires_at = NULL "
+                        "WHERE agent_id = :a AND name = :n"
+                    ),
+                    {"a": seed.agent_id, "n": HOOK},
+                )
             await _pass_once(seed, names["stream"], _trigger(seed))
             rows = await seed.runs()
             assert [(r.slot_utc, r.outcome) for r in rows] == [
-                (previous, "failed"),
-                (seed.slot, None),
+                (previous, None),
+                (seed.slot, "skipped"),
             ]
-            assert rows[0].ended_at is not None
-            assert len(_entries(sync_redis, names["stream"])) == 1
+
+    asyncio.run(body())
+
+
+def test_blocked_fire_still_reclaims_a_claim_past_its_lease(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """A fire the kill switch refuses is still the hook's next fire: it records
+    the dead run ``reclaimed`` before recording its own slot ``blocked``."""
+
+    async def killed(_agent_id: uuid.UUID) -> bool:
+        return True
+
+    async def body() -> None:
+        async with _seed() as seed:
+            previous = seed.slot - timedelta(days=1)
+            await seed.add_run(
+                previous,
+                datetime.now(UTC) - timedelta(seconds=5),
+                lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+            await _pass_once(seed, names["stream"], _trigger(seed), is_killed=killed)
+            rows = await seed.runs()
+            assert [(r.slot_utc, r.outcome) for r in rows] == [
+                (previous, "reclaimed"),
+                (seed.slot, "blocked"),
+            ]
+            assert _entries(sync_redis, names["stream"]) == []
+
+    asyncio.run(body())
+
+
+def test_admitted_claim_carries_a_lease_of_the_configured_length(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            rows = await seed.runs()
+            assert [r.outcome for r in rows] == [None]
+            lease = rows[0].lease_expires_at - rows[0].started_at
+            assert lease == timedelta(seconds=LEASE_S)
 
     asyncio.run(body())
 

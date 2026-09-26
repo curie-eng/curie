@@ -1711,7 +1711,8 @@ class HookRun(Base):
             name="hook_runs_agent_name_slot_key",
         ),
         CheckConstraint(
-            "outcome IS NULL OR outcome IN ('ran', 'deferred', 'skipped', 'blocked', 'failed')",
+            "outcome IS NULL OR outcome IN "
+            "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
     )
@@ -1732,6 +1733,8 @@ class HookRun(Base):
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # When an open claim becomes reclaimable by the hook's next fire (#2931).
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Tenant(Base):
