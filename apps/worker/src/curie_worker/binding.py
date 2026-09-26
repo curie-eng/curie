@@ -31,10 +31,11 @@ per-adapter token.
 ``agent_channels.kind`` ROUTES: since ADR-0096 phase 2 the queue wire
 (``ReplyHandle``) carries a required ``kind``, so the routing key is the PAIR
 (``kind`` AND ``address``) and migration 0023 widens the uniqueness constraint to
-match. There is no address-only overload and no default kind -- either would be
-the silent address-fallback the pair exists to remove. One address can now
-legitimately be bound twice under two different kinds, and each turn reaches its
-own agent.
+match; migration 0061 widens it again to the route triple, so several
+identities may share a pair. There is no address-only overload and no default
+kind -- either would be the silent address-fallback the pair exists to remove.
+One address can now legitimately be bound twice under two different kinds, and
+each turn reaches its own agent.
 
 The binding row also carries the server-controlled reply route: ``endpoint`` (the
 channel API base URL this kind's replies go back through) and ``adapter`` (the
@@ -42,11 +43,12 @@ egress adapter identity whose credential authenticates them). Both are read here
 so the worker gets the route from the same query that resolves the agent, never
 from an ingress request body. ``slack`` never carries an ``endpoint``, because
 its route is the worker's configured Slack origin, but it DOES name its bot
-identity in ``adapter`` (ADR-0168 decision 3) -- a NULL there means the
-installation's one pre-ADR identity, read through ``route_identity``, never "no
-route" the way a non-Slack NULL pair does. Resolution matches on that identity,
-not the raw column (``matching_routes``, ``aci_protocol.turn``), so a route bound
-under one Slack identity does not answer a turn addressed to another.
+identity in ``adapter`` (ADR-0168 decision 3). A turn queued without one means
+``default``, read through ``route_identity``, never "no route" the way a
+non-Slack NULL pair does. The worker resolves by all three fields: the SQL
+selects the pair and ``matching_routes`` (``aci_protocol.turn``) narrows by
+identity, so a route bound under one Slack identity does not answer a turn
+addressed to another.
 
 A pair that is not bound, or bound but not to this turn's identity, resolves
 to None -- a polite drop naming both halves, never a fallback to the address
@@ -360,11 +362,9 @@ class ResolvedDeployment(BaseModel):
     # `endpoint` is the channel API base URL this kind's replies go back
     # through. `adapter` is the egress adapter identity whose credential
     # authenticates them for a non-Slack kind, and, for `slack`, the bot
-    # IDENTITY this route names (ADR-0168 decision 3) -- `route_identity`
-    # reads a NULL there as the installation's one pre-ADR identity,
-    # `DEFAULT_IDENTITY`, never as "no route". `slack` still carries no
+    # IDENTITY this route names (ADR-0168 decision 3). `slack` carries no
     # `endpoint`, because its route is the worker's configured Slack origin;
-    # any other kind sets both together (`agent_channels_route_pair_ck`).
+    # any other kind sets both or neither (`agent_channels_route_ck`).
     endpoint: str | None = None
     adapter: str | None = None
     # Whether this agent's bindings share one general-state namespace, or each
@@ -392,12 +392,14 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
     kinds).
 
     The ORDER BY picks one deterministic winner (prod-first, then most recent).
-    The API enforces one agent per bound pair (``agent_channels_kind_address_key``,
-    migration 0023, superseding 0021's address-only ``agent_channels_address_key``
-    and 0017's ``agents_slack_channel_key``), so this state is no longer
-    reachable through the write paths. It stays as defense in depth for
-    rows predating the constraint or written out of band, and because silently
-    shadowing an agent is the failure mode #38 existed to kill.
+    The API holds one agent per route (``agent_channels_route_key``, migration
+    0061, superseding 0023's pair key, 0021's address-only
+    ``agent_channels_address_key`` and 0017's ``agents_slack_channel_key``), so
+    a Slack turn, or a turn that names its adapter, cannot reach this state
+    through the write paths. A non-Slack turn that omits its adapter selects
+    every route on the pair and can. It stays for that, as defense in depth
+    for rows written out of band, and because silently shadowing an agent is
+    the failure mode #38 existed to kill.
 
     One agent with both a dev and a prod deployment active is two rows but one
     agent, so count distinct agents, not rows.
@@ -473,13 +475,11 @@ class BindingResolver:
         """Resolve a turn's route TRIPLE ``(kind, adapter, address)`` to its
         active deployment.
 
-        ``kind`` and ``address`` still select the SQL rows -- migration 0023's
-        ``agent_channels_kind_address_key`` still caps that pair at one bound
-        row -- but every row is narrowed in Python by ``matching_routes``
-        (ADR-0168 decision 3) against the turn's ``adapter``, so a row bound
-        under one identity does not answer a turn addressed to another once
-        that decision's contract migration (#3100) lets several identities
-        share a pair. All three are required and none has a default: an omitted
+        It resolves by all three fields (ADR-0168 decision 3): ``kind`` and
+        ``address`` select the SQL rows, and ``matching_routes`` narrows them in
+        Python by the turn's ``adapter``, so a row bound under one identity
+        does not answer a turn addressed to another on a pair several
+        identities share. All three are required and none has a default: an omitted
         identity or an address-only overload would silently answer with
         whichever row happened to be bound, which is #38's misroute wearing a
         new hat.
