@@ -988,7 +988,18 @@ def test_cluster_message_lineage_binds_its_channel_and_admits_real_review(
     assert len(entries) == 1
     turn = parse_queued_turn(entries[0][1]["payload"])
     assert turn.conversation_id == "1700000000.000001"
-    assert turn.reply_handle.kind == "slack" and turn.reply_handle.channel == "C0LOCALDEV"
+    # The reply stays on the relay the conversation came from, never the Slack
+    # sink a bare binding would select, and carries the ref the relay requires.
+    handle = turn.reply_handle
+    assert (handle.kind, handle.channel, handle.endpoint, handle.adapter) == (
+        "slack",
+        "C0LOCALDEV",
+        None,
+        "curie-cluster-message",
+    )
+    assert handle.placeholder is not None
+    assert uuid.UUID(handle.placeholder).version == 4
+    assert str(uuid.UUID(handle.placeholder)) == handle.placeholder
 
 
 def test_unbound_cluster_message_lineage_is_still_refused(
