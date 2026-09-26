@@ -1783,3 +1783,49 @@ async fn a_targeted_cluster_deploy_binds_only_its_connectors_secret_names() {
         "loki is not this target's connector"
     );
 }
+
+// @spec ADR-0168 d8
+#[tokio::test]
+async fn a_local_deploy_narrows_the_bring_up_to_the_targets_connectors() {
+    // Only `restrict_to` and `bring_up_local`'s own refusal are unit-tested
+    // elsewhere; nothing pins that `deploy`'s local-tier branch actually hands
+    // `bring_up_local` the NARROWED decl rather than the bundle's full one. Two
+    // connectors, each declaring a secret nothing here provides: the bring-up
+    // refuses before touching docker (the same fail-fast `bring_up_local`
+    // performs), and which secret name it names is the proof. If the wiring
+    // regressed to the unnarrowed decl, the excluded connector's secret would
+    // be reported too.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/deploy-targets/resolve") => Response::json(
+            200,
+            r#"{"agent":"deal-desk","env":"dev","slack_channel":null,"identity":"default","connectors":["kept"]}"#,
+        ),
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => Response::json(201, &agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    std::fs::write(
+        dir.path().join("connectors.yaml"),
+        "connectors:\n  excluded:\n    image: ghcr.io/example/e:1\n    \
+         secrets: [CURIE_TEST_D8_EXCLUDED_TOKEN]\n  kept:\n    image: ghcr.io/example/k:1\n    \
+         secrets: [CURIE_TEST_D8_KEPT_TOKEN]\n",
+    )
+    .unwrap();
+    std::env::remove_var("CURIE_TEST_D8_EXCLUDED_TOKEN");
+    std::env::remove_var("CURIE_TEST_D8_KEPT_TOKEN");
+
+    let opts = identity_deploy_opts(&server, dir.path(), None, Some("dev"), Some(BOUND));
+    let err = commands::deploy(opts).await.unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("CURIE_TEST_D8_KEPT_TOKEN"),
+        "the kept connector's own missing secret is named: {message}"
+    );
+    assert!(
+        !message.contains("CURIE_TEST_D8_EXCLUDED_TOKEN"),
+        "excluded is not this target's connector and must never reach bring_up_local: {message}"
+    );
+}

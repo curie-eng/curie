@@ -6493,6 +6493,60 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8. Only `refuse_named_route` itself was pinned above; none
+    // of its three call sites (`message_local`'s connected branch,
+    // `message_connected`, and `message_cluster`'s disconnected relay) had a
+    // test that would go red if the call were simply dropped from the caller.
+    // Each call site is factored into its own named, pure wrapper so a test can
+    // reach it without a live dispatcher, connected workspace, or cluster.
+    #[test]
+    fn local_messages_connected_transport_branch_refuses_a_named_route() {
+        let named = SelectedRoute {
+            channel: "C0EXAMPLE1".to_string(),
+            identity: Some("ops-bot".to_string()),
+            agent: "ops".to_string(),
+        };
+        let err = refuse_named_route_for_local_connected(&named).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the connected Slack transport"),
+            "{text}"
+        );
+        let default = SelectedRoute {
+            channel: "C0EXAMPLE1".to_string(),
+            identity: None,
+            agent: "ops".to_string(),
+        };
+        assert!(refuse_named_route_for_local_connected(&default).is_ok());
+    }
+
+    #[test]
+    fn message_connected_refuses_a_named_route() {
+        let err =
+            refuse_named_route_for_cluster_connected(Some("ops-bot"), Some("ops"), "C0EXAMPLE1")
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the connected Slack transport"),
+            "{text}"
+        );
+        assert!(refuse_named_route_for_cluster_connected(None, Some("ops"), "C0EXAMPLE1").is_ok());
+    }
+
+    #[test]
+    fn message_clusters_disconnected_relay_refuses_a_named_route() {
+        // #1817's retained compatibility lane: it always speaks as the
+        // installation's default bot, so a named identity must refuse here too.
+        let err = refuse_named_route_for_relay(Some("ops-bot"), Some("ops"), "C0EXAMPLE1")
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("ops-bot") && text.contains("the disconnected cluster relay"),
+            "{text}"
+        );
+        assert!(refuse_named_route_for_relay(None, Some("ops"), "C0EXAMPLE1").is_ok());
+    }
+
     // @spec ADR-0168 d8
     #[test]
     fn an_agent_flag_is_not_counted_as_a_positional() {
@@ -7308,6 +7362,60 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn cluster_message_dry_run_shows_the_agents_binding_not_a_guessed_channel() {
+        // A plain --channel prints verbatim; a real run with --agent instead
+        // resolves that agent's own (channel, identity) pair, which the plan
+        // cannot see offline, so it must say so rather than reprinting whatever
+        // --channel happens to also carry.
+        let mut named = opts(Some("C123"));
+        named.agent = Some("ops".to_string());
+        let lines = dry_run_lines(&named, "10.1.2.3");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("the Slack binding of agent `ops`")
+                    && l.contains("channel and identity")),
+            "the plan must name the agent's binding, not channel C123: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("for channel C123")),
+            "a named agent must not be reported as channel C123: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("a named identity's route is refused")),
+            "the plan must say a named identity is refused on cluster message: {lines:?}"
+        );
+
+        // No --agent still prints the plain --channel line, unchanged.
+        let unnamed = dry_run_lines(&opts(Some("C123")), "10.1.2.3");
+        assert!(
+            unnamed.iter().any(|l| l.contains("for channel C123")),
+            "{unnamed:?}"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn local_dry_run_channel_line_prefers_the_agents_binding() {
+        // Shared by `local message` and `local eval`: an --agent beats a
+        // --channel that happens to also be set, since the real send resolves
+        // the agent's own binding rather than trusting the channel flag.
+        assert_eq!(
+            local_dry_run_channel_line(Some("ops"), Some("C123"), "http://localhost:8080"),
+            "the Slack binding of agent `ops` (channel and identity) via http://localhost:8080/agents"
+        );
+        assert_eq!(
+            local_dry_run_channel_line(None, Some("C123"), "http://localhost:8080"),
+            "channel C123"
+        );
+        assert_eq!(
+            local_dry_run_channel_line(None, None, "http://localhost:8080"),
+            "channel <the sole bound (agent, Slack channel) pair via http://localhost:8080/agents>"
+        );
+    }
+
     #[test]
     fn connected_turn_conversation_id_is_the_real_placeholder_ts() {
         // Issue #954: with no --thread the connected path posts a TOP-LEVEL
@@ -7733,6 +7841,21 @@ mod tests {
         );
     }
 
+    // @spec ADR-0168 d8
+    #[test]
+    fn local_eval_dry_run_shows_the_agents_binding_when_named() {
+        let mut named = eval_opts(true, Some("C123"));
+        named.agent = Some("ops".to_string());
+        let lines = eval_dry_run_lines(&named, "smoke", 1).expect("eval dry-run plan");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("the Slack binding of agent `ops`")
+                    && l.contains("channel and identity")),
+            "the plan must name the agent's binding, not channel C123: {lines:?}"
+        );
+    }
+
     #[test]
     fn cluster_eval_dry_run_plan_lists_the_valkey_forward_and_stub() {
         let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2)
@@ -7803,6 +7926,24 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("synthetic QueuedTurn")),
             "sweep is the eval plane, not the message path: {lines:?}"
+        );
+    }
+
+    // @spec ADR-0168 d8
+    #[test]
+    fn model_sweep_dry_run_names_the_agent_over_a_channel_it_also_carries() {
+        let mut named = sweep_opts(true, Some("C7"), &["opus"]);
+        named.agent = Some("ops".to_string());
+        let lines = eval_dry_run_lines(&named, "smoke", 1).expect("eval dry-run plan");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("/evals/trigger") && l.contains("agent `ops`'s Slack binding")),
+            "the trigger line must name the agent, not channel C7: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("channel C7")),
+            "{lines:?}"
         );
     }
 
