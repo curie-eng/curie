@@ -167,7 +167,8 @@ class SeedMetadata:
 # Three agents, one binding each. The names are prefixed `gate-` so they are
 # unmistakably synthetic, and all three names and all three addresses are
 # distinct so neither the seed nor 0021's backfill can trip
-# `agents_slack_channel_key` / `agent_channels_kind_address_key`.
+# `agents_slack_channel_key`, `agent_channels_kind_address_key` or 0061's
+# `agent_channels_route_key`.
 #
 # `C0EXAMPLE1` is the repo's sanctioned placeholder Slack id (`.gitleaks.toml`
 # stopword); `#general` and `C-0a1b2c3d` cannot match the scanner's
@@ -814,6 +815,9 @@ def _run_readback(
             arguments.extend(
                 ("--expect-state-value", json.dumps(legacy_state.value, sort_keys=True))
             )
+    if _candidate_supports_route_identity(tree):
+        # Every seeded binding is Slack, stored NULL by the released app.
+        arguments.extend(("--expect-slack-identity", "default"))
 
     return _run_in_tree(
         _readback_command(tree, *arguments),
@@ -953,6 +957,20 @@ def _detect_approval_route_era(released_tree: Path) -> str:
     if any(versions.glob("0034_*.py")):
         return APPROVAL_ROUTE_ERA_SPLIT
     return APPROVAL_ROUTE_ERA_LEGACY
+
+
+ROUTE_IDENTITY_REVISION_FILE = "0061_agent_channels_route_identity.py"
+
+
+def _candidate_supports_route_identity(candidate_tree: Path) -> bool:
+    """Whether the candidate carries migration 0061 exactly (ADR-0168 decision 3).
+
+    The same exact-file gating as the 0037 state sentinel: only a candidate
+    that names every Slack binding's identity is asked to prove it did.
+    """
+
+    versions = candidate_tree / "apps" / "api" / "alembic" / "versions"
+    return (versions / ROUTE_IDENTITY_REVISION_FILE).is_file()
 
 
 def _candidate_supports_legacy_state(candidate_tree: Path) -> bool:
@@ -1098,8 +1116,9 @@ def _plan_seed_statements(
             # One statement per agent, so the binding is written in the same
             # transaction as the row it belongs to and the new id never has to be
             # round-tripped back through psql. `endpoint` / `adapter` are left
-            # NULL, which is the posture `agent_channels_route_pair_ck` permits
-            # and the one 0024 backfills existing rows to.
+            # NULL, the released shape of a Slack row (0024's
+            # `agent_channels_route_pair_ck` permits it), which 0061 names
+            # `default` under `agent_channels_route_ck`.
             statements.append(
                 "WITH seeded AS (\n"
                 f"    INSERT INTO curie.agents ({insert_columns})\n"
