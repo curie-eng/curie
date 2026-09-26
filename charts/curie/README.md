@@ -1271,6 +1271,13 @@ render. The runner-prewarm DaemonSet deliberately stays unclassed (priority
 0, below the sandbox class): the image-cache pod is the designated sacrifice
 a full node evicts first.
 
+**Priority class on install hooks (#3206).** On a fresh install with
+`priorityClasses.platform.create: true`, preinstall hooks omit the platform
+priority class because Helm creates that class after preinstall hooks run.
+Upgrade hooks use the configured class, and install hooks use it when
+`priorityClasses.platform.create: false`. In that case, operators must create
+the named class before installing the chart.
+
 **Verifying the rails.** The security-boundary probe suite re-runs as a `helm test`:
 
 ```bash

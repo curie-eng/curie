@@ -43,8 +43,10 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- if or (not .Release.IsInstall) (not .Values.priorityClasses.platform.create) }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
+      {{- end }}
       {{- end }}
       containers:
         - name: avx-check

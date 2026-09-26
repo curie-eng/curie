@@ -58,8 +58,10 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       restartPolicy: Never
+      {{- if or (not .Release.IsInstall) (not .Values.priorityClasses.platform.create) .Values.security.gvisor.installRuntimeClass }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
+      {{- end }}
       {{- end }}
       runtimeClassName: {{ $gvisorClass }}
       containers:
