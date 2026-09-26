@@ -1679,3 +1679,182 @@ def test_derived_bearer_header_matches_the_frozen_vector(vector: dict) -> None:
         assert authorization is None, vector["name"]
     else:
         assert authorization == f"Bearer ${{{expected}}}", vector["name"]
+
+
+# ADR-0168 decision 7: the caller proxy. The keys are the public halves frozen
+# in tests/vectors/connector-caller-token.json.
+_CALLER_PUBLIC = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+_CALLER_PREVIOUS = "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+_PROXY_IMAGE = "ghcr.io/curie-eng/curie-worker:0.0.0"
+
+
+def _proxy(*keys: str) -> r.ConnectorProxy:
+    # Built per test, not at import, so a missing ConnectorProxy fails these
+    # tests alone and leaves the rest of the module collecting.
+    return r.ConnectorProxy(image=_PROXY_IMAGE, public_keys=keys or (_CALLER_PUBLIC,))
+
+
+def _by_kind(objs: list[dict]) -> dict[str, dict]:
+    keyed: dict[str, dict] = {}
+    for obj in objs:
+        key = obj["kind"]
+        if key == "NetworkPolicy":
+            key = f"{key}/{obj['spec']['policyTypes'][0]}"
+        keyed[key] = obj
+    return keyed
+
+
+def _proxied(
+    spec: ConnectorSpec = HOSTED, proxy: r.ConnectorProxy | None = None
+) -> dict[str, dict]:
+    return _by_kind(
+        r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector="grafana",
+            spec=spec,
+            secret_name="conn-secrets",
+            proxy=proxy or _proxy(),
+        )
+    )
+
+
+def _containers(objs: dict[str, dict]) -> dict[str, dict]:
+    pod = objs["Deployment"]["spec"]["template"]["spec"]
+    return {c["name"]: c for c in pod["containers"]}
+
+
+def _proxy_env(objs: dict[str, dict]) -> dict[str, str]:
+    return {e["name"]: e["value"] for e in _containers(objs)[r.CALLER_PROXY_CONTAINER]["env"]}
+
+
+def _policy_ports(objs: dict[str, dict]) -> list[int]:
+    ports: list[int] = []
+    for key in ("NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        rules = objs[key]["spec"].get("egress") or objs[key]["spec"].get("ingress")
+        ports.extend(p["port"] for rule in rules for p in rule["ports"])
+    return ports
+
+
+# @spec ADR-0168 d7
+def test_without_a_proxy_a_connector_renders_as_it_did() -> None:
+    objs = _by_kind(_objs())
+    assert list(_containers(objs)) == ["server"]
+    assert objs["Service"]["spec"]["ports"] == [
+        {"name": "http", "port": HOSTED.port, "targetPort": "http"}
+    ]
+    assert _policy_ports(objs) == [HOSTED.port, HOSTED.port]
+
+
+# @spec ADR-0168 d7
+def test_a_proxy_fronts_the_server_and_nothing_rendered_opens_the_server_port() -> None:
+    objs = _proxied()
+    containers = _containers(objs)
+    assert list(containers) == ["server", r.CALLER_PROXY_CONTAINER]
+    assert containers["server"]["ports"] == [{"name": "http", "containerPort": HOSTED.port}]
+    assert containers[r.CALLER_PROXY_CONTAINER]["ports"] == [
+        {"name": "caller", "containerPort": r.CALLER_PROXY_PORT}
+    ]
+    # The sandbox keeps dialling spec.port, so the URL and the allowed hosts
+    # stay; the Service lands it on the proxy.
+    assert objs["Service"]["spec"]["ports"] == [
+        {"name": "http", "port": HOSTED.port, "targetPort": "caller"}
+    ]
+    # Both policies, not only the ingress one: each matches the pod port after
+    # the Service DNAT, so an egress rule left on spec.port drops every call.
+    assert _policy_ports(objs) == [r.CALLER_PROXY_PORT, r.CALLER_PROXY_PORT]
+    assert HOSTED.port not in _policy_ports(objs)
+
+
+# @spec ADR-0168 d7
+def test_the_proxy_is_told_the_server_port_the_keys_and_its_own_port() -> None:
+    objs = _proxied(proxy=_proxy(_CALLER_PUBLIC, _CALLER_PREVIOUS))
+    container = _containers(objs)[r.CALLER_PROXY_CONTAINER]
+    assert container["image"] == _PROXY_IMAGE
+    assert container["command"] == ["python", "-m", "curie_connector_proxy"]
+    env = _proxy_env(objs)
+    assert env["CURIE_CALLER_PROXY_PORT"] == str(r.CALLER_PROXY_PORT)
+    assert env["CURIE_CALLER_PROXY_UPSTREAM_PORT"] == str(HOSTED.port)
+    assert env["CURIE_CALLER_PROXY_PUBLIC_KEYS"] == f"{_CALLER_PUBLIC},{_CALLER_PREVIOUS}"
+    assert "valueFrom" not in json.dumps(container["env"])
+
+
+def test_the_proxy_is_hardened_like_the_server() -> None:
+    containers = _containers(_proxied())
+    proxy, server = containers[r.CALLER_PROXY_CONTAINER], containers["server"]
+    assert proxy["securityContext"] == server["securityContext"]
+    assert proxy["resources"] == {
+        "requests": {"cpu": "10m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "128Mi"},
+    }
+
+
+# @spec ADR-0168 d7
+@pytest.mark.parametrize(
+    ("admits", "rendered"),
+    [
+        (None, ["acme-bot"]),
+        ([], []),
+        (["self"], ["acme-bot"]),
+        (["self", "acme-bot"], ["acme-bot"]),
+        (["acme-bot", "self"], ["acme-bot"]),
+        (["self", "other-agent"], ["acme-bot", "other-agent"]),
+        (["other-agent"], ["other-agent"]),
+    ],
+)
+def test_admits_renders_with_self_resolved_to_the_deploying_agent(
+    admits: list[str] | None, rendered: list[str]
+) -> None:
+    spec = HOSTED.model_copy(update={"admits": admits})
+    assert r.resolved_admits(spec, "acme-bot") == rendered
+    assert json.loads(_proxy_env(_proxied(spec))["CURIE_CALLER_PROXY_ADMITS"]) == rendered
+
+
+# @spec ADR-0168 d7
+def test_a_server_on_the_proxy_port_moves_the_proxy_not_the_server() -> None:
+    spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
+    objs = _proxied(spec)
+    containers = _containers(objs)
+    assert containers["server"]["ports"] == [
+        {"name": "http", "containerPort": r.CALLER_PROXY_PORT}
+    ]
+    assert containers[r.CALLER_PROXY_CONTAINER]["ports"] == [
+        {"name": "caller", "containerPort": r.CALLER_PROXY_ALTERNATE_PORT}
+    ]
+    assert _proxy_env(objs)["CURIE_CALLER_PROXY_UPSTREAM_PORT"] == str(r.CALLER_PROXY_PORT)
+    assert _policy_ports(objs) == [r.CALLER_PROXY_ALTERNATE_PORT, r.CALLER_PROXY_ALTERNATE_PORT]
+
+
+def test_a_remote_connector_renders_no_proxy() -> None:
+    assert (
+        r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector="internal",
+            spec=REMOTE,
+            secret_name="conn-secrets",
+            proxy=_proxy(),
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("image", "keys"),
+    [
+        ("", (_CALLER_PUBLIC,)),
+        (_PROXY_IMAGE, ()),
+        (_PROXY_IMAGE, ("not base64!",)),
+        (_PROXY_IMAGE, ("c2hvcnQ=",)),
+        (_PROXY_IMAGE, (_CALLER_PUBLIC.replace("/", "_"),)),
+    ],
+)
+def test_a_proxy_without_an_image_or_a_usable_key_is_refused(
+    image: str, keys: tuple[str, ...]
+) -> None:
+    with pytest.raises(ValueError):
+        r.ConnectorProxy(image=image, public_keys=keys)
