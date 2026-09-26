@@ -346,14 +346,13 @@ def test_a_policy_routed_approval_card_posts_with_the_turns_identity_token(
     asyncio.run(go())
 
 
-def test_a_custom_transport_turns_policy_routed_card_still_posts_as_default(
+def test_a_stub_turns_policy_routed_card_posts_as_its_identity(
     make_harness,
 ) -> None:
-    """A Slack turn carrying its own ``endpoint`` is the pre-ADR custom-transport
-    form (D4.4): its ``adapter`` is a credential slug, not an identity
-    (``aci_protocol.turn.slack_speaking_identity``), so a policy card that turn
-    triggers must still speak as ``default`` -- it must never borrow that slug
-    the way the identity-form fix above does.
+    """A Slack turn's ``endpoint`` is only a per-turn Slack origin, such as a CLI
+    stub turn's (#19), never a credential selector: a named identity's stub
+    turn speaks as that identity, and so does the policy card it triggers
+    (ADR-0168 decision 3).
     """
 
     async def go() -> None:
@@ -364,24 +363,20 @@ def test_a_custom_transport_turns_policy_routed_card_still_posts_as_default(
             port = server.port
             assert port is not None
             endpoint = f"http://127.0.0.1:{port}/slack/api/"
-            binding = _TripleBinding(
-                {("slack", "some-credential-slug", _CHANNEL): _routed_resolved(
-                    "some-credential-slug"
-                )}
-            )
+            binding = _TripleBinding({("slack", "ops-bot", _CHANNEL): _routed_resolved("ops-bot")})
             approvals = _RecordingApprovals()
             async with make_harness(binding=binding, sink=_sink(port), approvals=approvals) as h:
                 h.runner.default_script = _awaiting_routed_script("needs sign-off")
                 ev = QueuedTurn(
                     event_id=uuid.uuid4().hex,
-                    conversation_id="t-custom-transport",
+                    conversation_id="t-stub-turn",
                     author="U1",
                     text="please",
                     reply_handle=ReplyHandle(
                         kind="slack",
                         channel=_CHANNEL,
                         placeholder="1720000000.000100",
-                        adapter="some-credential-slug",
+                        adapter="ops-bot",
                         endpoint=endpoint,
                     ),
                     received_at="2026-07-05T00:00:00+00:00",
@@ -390,7 +385,7 @@ def test_a_custom_transport_turns_policy_routed_card_still_posts_as_default(
 
                 assert len(approvals.requests) == 1
             assert "chat.postMessage" in capture.methods()
-            assert capture.tokens() == {f"Bearer {_DEFAULT_TOKEN}"}
+            assert capture.tokens() == {f"Bearer {_OPS_TOKEN}"}
         finally:
             await server.close()
 
