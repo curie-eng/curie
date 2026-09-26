@@ -33,7 +33,10 @@ Three constraints follow from that inversion, and all three are load-bearing:
    address expectations are checked by searching the SERIALIZED dump rather
    than by reading a named field. The optional state assertion is different: it
    is passed only to candidates containing revision 0037, whose exact state
-   fields are the contract being proved.
+   fields are the contract being proved. The optional Slack identity assertion
+   is the second such exact-field sentinel: it is passed only to candidates
+   containing revision 0061, and reads `AgentChannel.adapter` for the same
+   reason.
 3. **It cannot pass vacuously.** Zero agents is a FAILURE. A seed that silently
    wrote nothing, or a migration that silently dropped the seeded rows, is the
    precise failure mode this gate exists to close, so "the read path raised
@@ -248,6 +251,52 @@ async def _load_state_observations(
         await engine.dispose()
 
 
+#: One Slack binding as the candidate's ORM read it: agent name, address, adapter.
+SlackIdentityObservation = tuple[str, str, str | None]
+
+
+def _read_slack_identities(session: Session) -> tuple[SlackIdentityObservation, ...]:
+    """Every Slack binding's stored identity, with its owning agent's name."""
+
+    rows = session.execute(
+        select(models.Agent.name, models.AgentChannel.address, models.AgentChannel.adapter)
+        .join(models.Agent, models.AgentChannel.agent_id == models.Agent.id)
+        .where(models.AgentChannel.kind == "slack")
+        .order_by(models.Agent.name, models.AgentChannel.address)
+    ).all()
+    return tuple((name, address, adapter) for name, address, adapter in rows)
+
+
+async def _load_slack_identities(database_url: str) -> tuple[SlackIdentityObservation, ...]:
+    """Read Slack identities only when the caller enabled the revision-0061 expectation."""
+
+    engine = create_async_engine(database_url)
+    try:
+        async with AsyncSession(engine) as session:
+            return await session.run_sync(_read_slack_identities)
+    finally:
+        await engine.dispose()
+
+
+def _serialized_slack_routes(value: Any) -> list[dict[str, Any]]:
+    """Every serialized Slack route that carries an `adapter`, at any depth.
+
+    Searched rather than read from a named field, for the same reason the
+    address check is (module docstring, constraint 2).
+    """
+
+    found: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if value.get("kind") == "slack" and "address" in value and "adapter" in value:
+            found.append(value)
+        for child in value.values():
+            found.extend(_serialized_slack_routes(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_serialized_slack_routes(child))
+    return found
+
+
 def _rendered_addresses(addresses: tuple[str, ...]) -> str:
     if not addresses:
         return "no address recorded"
@@ -261,6 +310,8 @@ def _collect_failures(
     expected_addresses: tuple[str, ...],
     state_expectation: StateSentinelExpectation | None = None,
     state_observations: tuple[StateSentinelObservation, ...] = (),
+    slack_identity: str | None = None,
+    slack_identity_observations: tuple[SlackIdentityObservation, ...] = (),
 ) -> tuple[str, ...]:
     """Judge a set of dumps against the seeded expectations. Empty tuple == pass.
 
@@ -354,6 +405,30 @@ def _collect_failures(
                     "the upgrade so runners select the shared state identity"
                 )
 
+    if slack_identity is not None:
+        if not slack_identity_observations:
+            # The same vacuous-pass guard as above: an expectation that
+            # observed nothing asserted nothing.
+            failures.append(
+                "read-back found no Slack binding to check for identity "
+                f"{slack_identity!r}: the seed wrote none or the migration dropped them"
+            )
+        for name, address, adapter in slack_identity_observations:
+            if adapter != slack_identity:
+                failures.append(
+                    f"Slack binding of agent {name!r} on {address!r} reads adapter "
+                    f"{adapter!r}, expected {slack_identity!r}: migration 0061 did not "
+                    "name its identity"
+                )
+        for dump in dumps:
+            for route in _serialized_slack_routes(dump.dump):
+                if route["adapter"] != slack_identity:
+                    failures.append(
+                        f"agent {dump.name!r} serialized Slack binding "
+                        f"{route['address']!r} with adapter {route['adapter']!r}, "
+                        f"expected {slack_identity!r}"
+                    )
+
     return tuple(failures)
 
 
@@ -400,6 +475,11 @@ def main() -> int:
         "--expect-state-value",
         metavar="JSON",
         help="Exact JSON value of the optional released legacy-state sentinel.",
+    )
+    parser.add_argument(
+        "--expect-slack-identity",
+        metavar="NAME",
+        help="The identity every migrated Slack binding must name (revision 0061).",
     )
     args = parser.parse_args()
 
@@ -474,12 +554,23 @@ def main() -> int:
                 f"{observation.owner_memory!r}"
             )
 
+    slack_identities: tuple[SlackIdentityObservation, ...] = ()
+    if args.expect_slack_identity is not None:
+        slack_identities = asyncio.run(_load_slack_identities(database_url))
+        for name, address, adapter in slack_identities:
+            print(
+                f"read-back: Slack binding of agent {name!r} on {address!r} "
+                f"names identity {adapter!r}"
+            )
+
     failures = _collect_failures(
         dumps,
         expected_agents=tuple(args.expect_agent),
         expected_addresses=tuple(args.expect_address),
         state_expectation=state_expectation,
         state_observations=state_observations,
+        slack_identity=args.expect_slack_identity,
+        slack_identity_observations=slack_identities,
     )
     if failures:
         print("Released upgrade read-back failed:")
