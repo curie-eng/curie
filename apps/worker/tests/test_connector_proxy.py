@@ -9,6 +9,7 @@ tests/vectors/connector-caller-refusal.json, which the runner reads too.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import subprocess
@@ -96,7 +97,9 @@ async def _serving(
     upstream_port: int | None = None,
 ) -> AsyncIterator[tuple[_Upstream, TestServer]]:
     upstream = _Upstream()
-    upstream_server = TestServer(upstream.app, handler_cancellation=True)
+    # The stand-in server keeps what it was sent as sent, so a body the proxy
+    # altered on the way cannot be decoded back into looking unchanged.
+    upstream_server = TestServer(upstream.app, handler_cancellation=True, auto_decompress=False)
     await upstream_server.start_server()
     proxy = TestServer(
         server.make_app(
@@ -368,6 +371,88 @@ def test_the_log_names_the_agent_and_the_outcome_and_never_the_token(
     assert "caller=acme-dev outcome=not_admitted" in text
     assert _TOKEN not in text
     assert _TOKEN.split(".")[2] not in text
+
+
+# @spec ADR-0168 d7
+def test_an_encoded_body_reaches_the_server_byte_for_byte() -> None:
+    plain = b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"pad":"'
+    plain += b"a" * 2000 + b'"}}'
+    encoded = gzip.compress(plain)
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/mcp"),
+                    data=encoded,
+                    headers={
+                        caller.HEADER: _TOKEN,
+                        "Content-Encoding": "gzip",
+                        "Content-Type": "application/json",
+                    },
+                ) as answer:
+                    assert answer.status == 201
+            [seen] = upstream.seen
+            # Forwarded as sent: the proxy never decodes a body it relays, so
+            # the length and the encoding it passes on still describe it.
+            assert seen["body"] == encoded
+            assert seen["headers"]["Content-Encoding"] == "gzip"
+            assert seen["headers"]["Content-Length"] == str(len(encoded))
+
+    _run(go)
+
+
+# @spec ADR-0168 d7
+def test_a_path_cannot_forge_a_second_log_line(caplog: pytest.LogCaptureFixture) -> None:
+    forged = "caller=a outcome=admitted method=GET path=/mcp"
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                path = "/a%0Acaller=a%20outcome=admitted%20method=GET%20path=/mcp"
+                async with client.get(proxy.make_url(path)) as answer:
+                    assert answer.status == server.REFUSAL_STATUS
+            assert upstream.seen == []
+
+    with caplog.at_level(logging.INFO, logger="curie_connector_proxy"):
+        _run(go)
+    [message] = [r.getMessage() for r in caplog.records if r.name == "curie_connector_proxy"]
+    assert "\n" not in message
+    assert message.startswith(f"caller=- outcome={caller.MISSING} method=GET path=")
+    assert not any(line.startswith(forged) for line in caplog.text.splitlines())
+
+
+# @spec ADR-0168 d7
+def test_a_request_the_parser_refuses_logs_no_caller_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An obs-folded header is a parse error, and aiohttp's own error log quotes
+    # the offending bytes, which here are the token.
+    raw = (
+        b"GET /mcp HTTP/1.1\r\nHost: connector\r\n"
+        + caller.HEADER.encode()
+        + b": a\r\n "
+        + _TOKEN.encode()
+        + b"\r\n\r\n"
+    )
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            reader, writer = await asyncio.open_connection(proxy.host, proxy.port)
+            writer.write(raw)
+            await writer.drain()
+            answer = await asyncio.wait_for(reader.read(), timeout=5)
+            writer.close()
+            assert answer.startswith(b"HTTP/1.0 400") or answer.startswith(b"HTTP/1.1 400")
+            assert upstream.seen == []
+
+    with caplog.at_level(logging.DEBUG):
+        _run(go)
+    # Not vacuous: the parser's refusal was logged, only without the token.
+    assert any("Error handling request" in r.getMessage() for r in caplog.records)
+    assert "cct." not in caplog.text
+    for segment in _TOKEN.split(".")[1:]:
+        assert segment[:16] not in caplog.text
 
 
 def _env(**overrides: str) -> dict[str, str]:

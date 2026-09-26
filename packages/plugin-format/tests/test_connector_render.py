@@ -1700,6 +1700,13 @@ def _by_kind(objs: list[dict]) -> dict[str, dict]:
         key = obj["kind"]
         if key == "NetworkPolicy":
             key = f"{key}/{obj['spec']['policyTypes'][0]}"
+        # The Service named after the connector is the one the sandbox dials;
+        # any other Service selecting the same pods is the direct one.
+        if key == "Service" and (
+            obj["metadata"]["name"] != obj["metadata"]["labels"]["app.kubernetes.io/name"]
+        ):
+            key = "Service/direct"
+        assert key not in keyed, key
         keyed[key] = obj
     return keyed
 
@@ -1858,3 +1865,85 @@ def test_a_proxy_without_an_image_or_a_usable_key_is_refused(
 ) -> None:
     with pytest.raises(ValueError):
         r.ConnectorProxy(image=image, public_keys=keys)
+
+
+# @spec ADR-0168 d7
+def test_a_proxy_keeps_a_direct_service_on_the_server_port_for_callers_that_are_not_agents() -> (
+    None
+):
+    objs = _proxied()
+    direct = objs["Service/direct"]
+    assert direct["metadata"]["name"] == "acme-rel-acme-bot-mcp-grafana-direct"
+    assert direct["metadata"]["name"] == r.direct_service_name("acme-rel", "acme-bot", "grafana")
+    assert direct["metadata"]["labels"] == objs["Service"]["metadata"]["labels"]
+    # The same pods as the connector Service, landing on the server itself.
+    assert direct["spec"]["selector"] == objs["Service"]["spec"]["selector"]
+    assert direct["spec"]["type"] == "ClusterIP"
+    assert direct["spec"]["ports"] == [{"name": "http", "port": HOSTED.port, "targetPort": "http"}]
+    # Nothing rendered opens that port: only an operator-applied peer-ingress
+    # policy naming spec.port lets a caller through it.
+    assert HOSTED.port not in _policy_ports(objs)
+
+
+# @spec ADR-0168 d7
+def test_without_a_proxy_there_is_no_direct_service() -> None:
+    assert [o["metadata"]["name"] for o in _objs() if o["kind"] == "Service"] == [
+        r.object_name("acme-bot", "acme-bot", "grafana")
+    ]
+
+
+# @spec ADR-0168 d7
+def test_a_server_on_the_proxy_port_keeps_its_direct_service_on_that_port() -> None:
+    spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
+    direct = _proxied(spec)["Service/direct"]
+    assert direct["spec"]["ports"] == [
+        {"name": "http", "port": r.CALLER_PROXY_PORT, "targetPort": "http"}
+    ]
+
+
+# @spec ADR-0168 d7
+def test_a_long_direct_service_name_is_still_a_dns_label_and_still_distinct() -> None:
+    release, agent = "a-release-name-that-is-long", "an-agent-name-that-is-long"
+    names = {
+        connector: r.direct_service_name(release, agent, connector)
+        for connector in ("connector-one", "connector-two", "c")
+    }
+    for connector, name in names.items():
+        assert len(name) <= 63, name
+        assert name.endswith("-direct"), name
+        assert name != r.object_name(release, agent, connector)
+        assert name == r.direct_service_name(release, agent, connector)
+    assert len(set(names.values())) == len(names)
+
+
+def _pull_proxy(**pull: object) -> r.ConnectorProxy:
+    return r.ConnectorProxy(image=_PROXY_IMAGE, public_keys=(_CALLER_PUBLIC,), **pull)
+
+
+# @spec ADR-0168 d7
+def test_the_proxy_pulls_with_the_worker_pull_secrets_and_policy() -> None:
+    objs = _proxied(
+        proxy=_pull_proxy(pull_policy="Always", pull_secrets=("ghcr-pull", "mirror-pull"))
+    )
+    pod = objs["Deployment"]["spec"]["template"]["spec"]
+    assert pod["imagePullSecrets"] == [{"name": "ghcr-pull"}, {"name": "mirror-pull"}]
+    containers = _containers(objs)
+    assert containers[r.CALLER_PROXY_CONTAINER]["imagePullPolicy"] == "Always"
+    # The server's pull policy stays what it was: the cluster default.
+    assert "imagePullPolicy" not in containers["server"]
+
+
+# @spec ADR-0168 d7
+def test_a_proxy_with_no_pull_settings_renders_none() -> None:
+    objs = _proxied()
+    assert "imagePullSecrets" not in objs["Deployment"]["spec"]["template"]["spec"]
+    assert "imagePullPolicy" not in _containers(objs)[r.CALLER_PROXY_CONTAINER]
+
+
+@pytest.mark.parametrize(
+    "pull",
+    [{"pull_policy": "Sometimes"}, {"pull_secrets": ("",)}, {"pull_secrets": ("Not_A_Name",)}],
+)
+def test_a_proxy_with_an_unusable_pull_setting_is_refused(pull: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        _pull_proxy(**pull)

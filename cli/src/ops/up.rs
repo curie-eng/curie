@@ -6682,6 +6682,64 @@ mod tests {
         );
     }
 
+    /// Half a pair would leave the worker signing with one key while every
+    /// caller proxy verifies with the other, so every hosted connector would
+    /// refuse every caller. Refused before anything is resolved, on a sealed
+    /// and a `--dev` up alike, whichever half is given.
+    #[test]
+    fn a_set_of_one_caller_key_half_is_a_usage_error_naming_both() {
+        use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+        let recorded = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "connectorCaller": {"signingKey": "SEED-RECORDED", "verifyKey": "PUBLIC-RECORDED"}
+        });
+        for half in [CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY] {
+            for dev in [false, true] {
+                let mut opts = completed_dev_up(None, vec![]);
+                opts.dev = dev;
+                opts.secrets = vec![];
+                opts.set = vec![format!("{half}=NEW-HALF")];
+                let Err(err) = complete_up_opts_without_runner_egress(
+                    opts,
+                    Some(&recorded),
+                    None,
+                    false,
+                    true,
+                ) else {
+                    panic!("half a caller key pair must be refused: {half} dev={dev}");
+                };
+                assert_eq!(
+                    crate::exit::classify(&err).0,
+                    crate::exit::ExitClass::Usage,
+                    "{half} dev={dev}"
+                );
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains(CONNECTOR_CALLER_SIGNING_KEY)
+                        && message.contains(CONNECTOR_CALLER_VERIFY_KEY),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// Both halves together, or both cleared together, stay the operator's.
+    #[test]
+    fn a_set_of_both_caller_key_halves_is_accepted() {
+        use crate::connector_caller::{CONNECTOR_CALLER_SIGNING_KEY, CONNECTOR_CALLER_VERIFY_KEY};
+        for (seed, public) in [("NEW-SEED", "NEW-PUBLIC"), ("", "")] {
+            let opts = completed_sealed_up(
+                None,
+                vec![
+                    format!("{CONNECTOR_CALLER_SIGNING_KEY}={seed}"),
+                    format!("{CONNECTOR_CALLER_VERIFY_KEY}={public}"),
+                ],
+            );
+            assert_eq!(secret_for(&opts, CONNECTOR_CALLER_SIGNING_KEY), None);
+            assert_eq!(secret_for(&opts, CONNECTOR_CALLER_VERIFY_KEY), None);
+        }
+    }
+
     #[test]
     fn a_dev_upgrade_stays_disconnected_after_comms_disconnect() {
         let existing = serde_json::json!({

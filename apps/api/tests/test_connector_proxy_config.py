@@ -18,6 +18,8 @@ _NAMES = (
     "CURIE_CONNECTOR_CALLER_PUBLIC_KEY",
     "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY",
     "CURIE_CONNECTOR_PROXY_IMAGE",
+    "CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY",
+    "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS",
 )
 
 
@@ -51,6 +53,30 @@ def test_a_rotation_carries_the_previous_key_after_the_current(
 
 
 # @spec ADR-0168 d7
+def test_the_proxy_pulls_as_the_worker_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_PUBLIC_KEY", _CURRENT)
+    monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE", _IMAGE)
+    monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY", "Always")
+    monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "ghcr-pull, mirror-pull")
+    assert Settings().connector_proxy() == ConnectorProxy(
+        image=_IMAGE,
+        public_keys=(_CURRENT,),
+        pull_policy="Always",
+        pull_secrets=("ghcr-pull", "mirror-pull"),
+    )
+
+
+# @spec ADR-0168 d7
+def test_unset_pull_settings_leave_the_cluster_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_PUBLIC_KEY", _CURRENT)
+    monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE", _IMAGE)
+    monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "")
+    proxy = Settings().connector_proxy()
+    assert proxy is not None
+    assert (proxy.pull_policy, proxy.pull_secrets) == (None, ())
+
+
+# @spec ADR-0168 d7
 @pytest.mark.parametrize(
     "env",
     [
@@ -61,8 +87,13 @@ def test_a_rotation_carries_the_previous_key_after_the_current(
             "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY": _PREVIOUS,
             "CURIE_CONNECTOR_PROXY_IMAGE": _IMAGE,
         },
+        {
+            "CURIE_CONNECTOR_CALLER_PUBLIC_KEY": _CURRENT,
+            "CURIE_CONNECTOR_PROXY_IMAGE": _IMAGE,
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY": "Sometimes",
+        },
     ],
-    ids=["not_base64", "not_32_bytes", "no_image", "previous_without_current"],
+    ids=["not_base64", "not_32_bytes", "no_image", "previous_without_current", "pull_policy"],
 )
 def test_a_proxy_the_render_could_not_use_fails_at_boot(
     env: dict[str, str], monkeypatch: pytest.MonkeyPatch

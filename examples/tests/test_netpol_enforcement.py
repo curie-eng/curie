@@ -47,6 +47,7 @@ def _run_gate(
     foreign_namespace_env: str | None = None,
     foreign_namespace_exists: bool = False,
     foreign_namespace_create_races: bool = False,
+    direct_services: bool = False,
 ) -> GateRun:
     fake = tmp_path / "kubectl"
     log = tmp_path / "kubectl.jsonl"
@@ -62,6 +63,9 @@ with open(os.environ["FAKE_KUBECTL_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 
 connectors = tuple(filter(None, os.environ.get("FAKE_CONNECTORS", "").split(",")))
+# With a caller proxy each connector also has a direct Service. It is named
+# `<connector>-direct` and carries the connector's own name label.
+direct_services = os.environ.get("FAKE_DIRECT_SERVICES") == "1"
 sandbox_unreachable = set(
     filter(None, os.environ.get("FAKE_SANDBOX_UNREACHABLE", "").split(","))
 )
@@ -208,8 +212,12 @@ if "get" in args and "pod" in args:
 
 if "get" in args and "svc" in args:
     if "-l" in args:
-        if connectors:
-            print("\\n".join(connectors))
+        listed = list(connectors)
+        if direct_services:
+            by_label = "labels" in args[-1]
+            listed += [c if by_label else f"{c}-direct" for c in connectors]
+        if listed:
+            print("\\n".join(listed))
         raise SystemExit(0)
     print("8000", end="")
     raise SystemExit(0)
@@ -300,6 +308,7 @@ raise SystemExit(90)
             "FAKE_FOREIGN_FQDN_UNRESOLVABLE": ",".join(foreign_fqdn_unresolvable),
             "FAKE_FOREIGN_NAMESPACE_EXISTS": ("1" if foreign_namespace_exists else "0"),
             "FAKE_FOREIGN_NAMESPACE_CREATE_RACES": ("1" if foreign_namespace_create_races else "0"),
+            "FAKE_DIRECT_SERVICES": ("1" if direct_services else "0"),
         }
     )
     # Popped rather than left alone: an ambient CURIE_NETPOL_FOREIGN_NS on the
@@ -512,6 +521,18 @@ def test_every_connector_checks_sandbox_allow_outside_deny_and_foreign_deny(
         ("netpol-probe-outside", "curie-mcp-beta"),
         ("netpol-probe-foreign", "curie-mcp-beta"),
     }
+
+
+def test_a_connector_s_direct_service_is_not_a_second_connector(tmp_path: Path) -> None:
+    # ADR-0168 decision 7: the direct Service lands on the server's own port,
+    # which only an operator policy opens, so a sandbox is refused there by
+    # design. It fronts the same connector and must not be probed as another.
+    connectors = ("curie-mcp-alpha", "curie-mcp-beta")
+    result = _run_gate(tmp_path, connectors=connectors, direct_services=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "connector Service count: 2" in result.stdout
+    assert "-direct" not in json.dumps(result.kubectl_calls)
 
 
 def test_connector_denials_follow_outside_control_and_deployment_readiness(

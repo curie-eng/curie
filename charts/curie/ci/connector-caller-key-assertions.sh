@@ -3,7 +3,7 @@
 # Render assertions for the connector caller key pair (ADR-0168 decision 7).
 #
 # The worker signs each sandbox's caller token, and the API renders the public
-# half into every hosted connector's caller proxy. Five properties:
+# half into every hosted connector's caller proxy. Six properties:
 #
 #   (a) A stock install references the signing key from the worker alone and
 #       the public key from the API alone, both from the release Secret, which
@@ -16,6 +16,8 @@
 #       API holding the signing key could mint a token naming any agent.
 #   (d) The previous public key reaches the API alone, as a plain value.
 #   (e) The proxy image is the worker's own image, digest pin included.
+#   (f) The proxy pulls as the worker does: the API is handed the worker's pull
+#       policy and the names of its pull secrets.
 set -euo pipefail
 
 # NOTE: read variables with a herestring, never `printf ... | cmd`; see
@@ -154,5 +156,28 @@ for pin in "" "--set worker.image.digest=sha256:00000000000000000000000000000000
         echo "ok: the proxy image is the worker image (${pin:-default})"
     fi
 done
+
+# -- (f) ----------------------------------------------------------------------
+POLICY="$(holders CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY <<<"$DEFAULT")"
+SECRETS="$(holders CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS <<<"$DEFAULT")"
+if [[ "$POLICY" != "api api - Always" ]]; then
+    fail "a stock install handed the proxy the pull policy: ${POLICY:-nothing}"
+elif [[ "$SECRETS" != "api api - " ]]; then
+    fail "a stock install handed the proxy the pull secrets: ${SECRETS:-nothing}"
+else
+    echo "ok: a stock install pulls the proxy with the worker's policy and no pull secret"
+fi
+PULLED="$(render "$CHART" --set worker.image.pullPolicy=IfNotPresent \
+    --set 'worker.imagePullSecrets[0].name=ghcr-pull' \
+    --set 'worker.imagePullSecrets[1].name=mirror-pull')"
+POLICY="$(holders CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY <<<"$PULLED")"
+SECRETS="$(holders CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS <<<"$PULLED")"
+if [[ "$POLICY" != "api api - IfNotPresent" ]]; then
+    fail "the proxy pull policy is not the worker's: ${POLICY:-nothing}"
+elif [[ "$SECRETS" != "api api - ghcr-pull,mirror-pull" ]]; then
+    fail "the proxy pull secrets are not the worker's: ${SECRETS:-nothing}"
+else
+    echo "ok: the proxy pulls with the worker's policy and pull secrets"
+fi
 
 exit "$FAILED"
