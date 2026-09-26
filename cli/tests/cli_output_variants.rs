@@ -35,14 +35,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary,
-    ScheduleList, Version,
+    ApprovalRecord, ChannelBinding, HookFireRecord, MemoryEntry, MetricPoint, MetricSeries,
+    MetricsSummary, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
-    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, HookFireOutput, KillOutput,
+    MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
+    SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -493,6 +493,26 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 }))
                 .expect("the recovery outcome mirror deserializes ApprovalRecoveryOut"),
             },
+        ],
+    );
+    m.insert(
+        "HookFireOutput",
+        samples![
+            "DryRun" => HookFireOutput::DryRun(plan()),
+            "Record" => HookFireOutput::Record(
+                serde_json::from_value::<HookFireRecord>(serde_json::json!({
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "agent_id": "11111111-1111-4111-8111-111111111111",
+                    "agent": "acme-bot",
+                    "name": "nightly-cleanup",
+                    "trigger": "cron",
+                    "slot_utc": "2026-09-26T12:00:00Z",
+                    "outcome": "ran",
+                    "started_at": "2026-09-26T12:00:00Z",
+                    "ended_at": "2026-09-26T12:00:01Z"
+                }))
+                .unwrap(),
+            ),
         ],
     );
     m.insert(

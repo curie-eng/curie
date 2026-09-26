@@ -808,6 +808,56 @@ export const commandManifest = {
           "name": "eval"
         },
         {
+          "about": "Run a declared cron hook against the local runner, or report that a durable schedule or record is unavailable at this tier (ADR-0099)",
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run the named cron hook now against the local runner. No durable record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trigger name from `.claude-plugin/plugin.json`",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "."
+                  ],
+                  "global": false,
+                  "help": "Plugin bundle directory",
+                  "id": "plugin_dir",
+                  "long": "plugin-dir",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Runner base URL. Default: the URL recorded by `skill up`",
+                  "id": "url",
+                  "long": "url",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            },
+            {
+              "about": "Not available at this tier: there is no scheduler",
+              "hidden": false,
+              "name": "schedule"
+            },
+            {
+              "about": "Not available at this tier: there is no hook run record",
+              "hidden": false,
+              "name": "record"
+            }
+          ]
+        },
+        {
           "about": "Interview to generate a starter `evals/cases.json` (guided eval generation)",
           "args": [
             {
@@ -2863,6 +2913,79 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "schedules"
+        },
+        {
+          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run one cron hook now, bypassing its schedule, and print the run record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "120"
+                  ],
+                  "global": false,
+                  "help": "How long to wait for the turn to settle, in seconds",
+                  "id": "wait_secs",
+                  "long": "wait-secs",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            }
+          ]
         },
         {
           "about": "Delete an agent via the local platform API",
@@ -5505,6 +5628,100 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "schedules"
+        },
+        {
+          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "args": [
+            {
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": true,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": true,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run one cron hook now, bypassing its schedule, and print the run record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "120"
+                  ],
+                  "global": false,
+                  "help": "How long to wait for the turn to settle, in seconds",
+                  "id": "wait_secs",
+                  "long": "wait-secs",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            }
+          ]
         },
         {
           "about": "List an agent's immutable versions (`GET /agents/{id}/versions`)",

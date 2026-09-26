@@ -261,6 +261,8 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/state/{namespace}/{key}",
     "/agents/{agent_id}/state/{namespace}/{key}/append",
     "/agents/{agent_id}/threads/{thread_key}/reset",
+    "/agents/{agent_id}/hooks/{name}/fire",
+    "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
     "/agents/{agent_id}/versions",
     "/agents/{agent_id}/versions/{version_id}/bundle",
     "/agents/{agent_id}/versions/{version_id}/connectors",

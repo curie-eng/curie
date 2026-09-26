@@ -58,6 +58,7 @@ from .routers import (
     gitflow_routing,
     github,
     github_reviews,
+    hook_fire,
     hooks,
     memory,
     observability,
@@ -403,6 +404,7 @@ def create_app() -> FastAPI:
     app.include_router(evals.router)
     app.include_router(runs.router)
     app.include_router(schedules.router)
+    app.include_router(hook_fire.router)
     app.include_router(state.router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise

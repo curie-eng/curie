@@ -24,6 +24,11 @@
       "omissions": []
     },
     {
+      "struct": "HookFireRecord",
+      "schema": "HookFireOut",
+      "omissions": []
+    },
+    {
       "struct": "AgentSchedules",
       "schema": "AgentSchedulesOut",
       "omissions": []

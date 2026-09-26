@@ -1095,6 +1095,8 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
@@ -1196,7 +1198,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4160
+      "cardinality_bound": 4240
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1233,6 +1235,8 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
@@ -1334,7 +1338,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 4160
+      "cardinality_bound": 4240
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1371,6 +1375,8 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
           "/agents/{agent_id}/versions/{version_id}/bundle",
           "/agents/{agent_id}/versions/{version_id}/connectors",
@@ -1465,7 +1471,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 832
+      "cardinality_bound": 848
     },
     "curie.background.loop": {
       "type": "counter",

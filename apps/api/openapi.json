@@ -3842,6 +3842,87 @@
         "title": "HookAccepted",
         "type": "object"
       },
+      "HookFireOut": {
+        "description": "One test-fire run record. `outcome` is null while the turn is in flight.",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "slot_utc": {
+            "format": "date-time",
+            "title": "Slot Utc",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "trigger": {
+            "title": "Trigger",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "agent",
+          "name",
+          "trigger",
+          "slot_utc",
+          "outcome",
+          "started_at",
+          "ended_at"
+        ],
+        "title": "HookFireOut",
+        "type": "object"
+      },
       "HookPartitionConfig": {
         "additionalProperties": false,
         "description": "How one hook names the thing each delivery is about (ADR-0134).\n\nOne model serves ``AgentCreate``, ``AgentUpdate`` AND ``AgentOut``, which the\n``_StoredWithoutNulls`` tripwire above would otherwise argue against: that\nsplit only happens for models carrying the wrap serializer, and this one has\nneither it nor an optional field, so the dumped and validated shapes are the\nsame and no ``-Input``/``-Output`` pair is generated. Do not add a separate\n``...Out`` variant.",
@@ -8654,6 +8735,146 @@
         "tags": [
           "control"
         ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{name}/fire": {
+      "post": {
+        "description": "Run one named cron hook now and return its run record.",
+        "operationId": "fire_hook_agents__agent_id__hooks__name__fire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookFireOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fire Hook"
+      }
+    },
+    "/agents/{agent_id}/hooks/{name}/runs/{run_id}": {
+      "get": {
+        "description": "Read one test-fire record, including a turn that has not settled.",
+        "operationId": "get_hook_run_agents__agent_id__hooks__name__runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookFireOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Hook Run"
       }
     },
     "/agents/{agent_id}/kill": {

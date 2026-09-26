@@ -102,6 +102,18 @@ slot ended. A missing `timezone` is reported as `UTC`. `GET /schedules` is the
 same list. `curie skill schedules` is refused, because that tier has no
 platform API and no run record.
 
+## Firing a hook now
+
+`curie local hook fire <agent> <name>` and `curie cluster hook fire <agent> <name>`
+run that hook immediately. The schedule is skipped. An in-flight run of the
+same hook is not: the new fire is recorded `skipped` and no second turn is
+queued. The command prints the run record once the turn settles.
+
+`curie skill hook fire <name>` runs the hook's prompt against the local runner
+and prints that turn's outcome. It does not write a run record. `curie skill
+hook schedule` and `curie skill hook record` are refused, because that tier
+has no scheduler and no run table.
+
 A hook that failed on its newest slot is visible in that one response,
 including when the three newest slots all failed. A slot that has not ended
 yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, `deferred`,
