@@ -2785,7 +2785,10 @@ jobs:
     if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # Two waves for 14 shards. Four ran four waves, 57 minutes on run
+      # 36204726414, past #2733's 45 minute ceiling, while other jobs across
+      # 35 runs never queued more than 40 seconds for a runner.
+      max-parallel: 7
       matrix:
         shard: ${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}
     steps:

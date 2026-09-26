@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -285,6 +286,103 @@ def test_charts_curie_still_selects_cluster(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
     assert outputs["cluster"] == "true"
+
+
+# `ci/` is helmignored, so `helm package charts/curie` (the upgrade matrix) and
+# `helm upgrade ... charts/curie` (the released upgrade) never load it. A change
+# there cannot alter an upgrade and must not book fourteen kind shards.
+RELEASED_UPGRADE_JOBS = (
+    "e2e-released-upgrade",
+    "e2e-released-upgrade-negative",
+    "e2e-cluster-upgrade-matrix-shards",
+    "e2e-cluster-upgrade-matrix",
+)
+# The scripts those jobs hand the chart to. A charts/curie/ci path either of
+# them starts running must stay on released-upgrade too.
+RELEASED_UPGRADE_SCRIPTS = (
+    "cli/scripts/cluster-upgrade-matrix.sh",
+    "cli/tests/data/upgrade-driver.py",
+)
+CHART_ROOT = "charts/curie"
+CHART_CI = "charts/curie/ci"
+
+
+def _selector_outputs(tmp_path: Path, path: str) -> dict[str, str]:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    return dict(line.split("=", maxsplit=1) for line in output.splitlines())
+
+
+def _strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in _strings(item)]
+    if isinstance(value, list):
+        return [text for item in value for text in _strings(item)]
+    return []
+
+
+def _chart_ci_paths_run_by_released_upgrade_jobs() -> set[str]:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    texts = [text for name in RELEASED_UPGRADE_JOBS for text in _strings(jobs[name])]
+    texts.extend((REPO_ROOT / script).read_text() for script in RELEASED_UPGRADE_SCRIPTS)
+    return {
+        match for text in texts for match in re.findall(rf"{CHART_CI}/[A-Za-z0-9_./-]+", text)
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
+        "charts/curie/ci/runtime/publication-job-assertions.sh",
+        "charts/curie/ci/live-manifest-parity-assertions.sh",
+    ],
+)
+def test_released_upgrade_skips_chart_ci_scripts_the_chart_never_ships(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    outputs = _selector_outputs(tmp_path, path)
+    assert outputs["released_upgrade"] == "false"
+    assert outputs["cluster"] == "true"
+
+
+def test_released_upgrade_selects_chart_ci_scripts_its_own_jobs_run(
+    tmp_path: Path,
+) -> None:
+    run_by_jobs = _chart_ci_paths_run_by_released_upgrade_jobs()
+    # Negative control: the scan must find the two scripts known to be run, or
+    # an empty scan would pass this test without checking anything.
+    assert {
+        "charts/curie/ci/make-upgrade-mutants.py",
+        "charts/curie/ci/live_manifest_parity.py",
+    } <= run_by_jobs
+    for path in sorted(run_by_jobs):
+        assert (REPO_ROOT / path).is_file(), path
+        assert _selector_outputs(tmp_path, path)["released_upgrade"] == "true", path
+
+
+def test_every_shipped_chart_file_selects_released_upgrade(tmp_path: Path) -> None:
+    helmignore = (REPO_ROOT / CHART_ROOT / ".helmignore").read_text().splitlines()
+    assert "ci/" in helmignore, "the released-upgrade carve-out assumes ci/ is not shipped"
+    tracked = subprocess.run(
+        ["git", "ls-files", CHART_ROOT],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    # Every tracked file, not one per entry: a new shipped file, a narrowed
+    # rule, or an ignored hole inside templates/ fails here instead of
+    # silently dropping out of the upgrade gate.
+    shipped = [path for path in tracked if not path.startswith(f"{CHART_CI}/")]
+    assert len(shipped) < len(tracked), "expected tracked charts/curie/ci files"
+    entries = {path.removeprefix(f"{CHART_ROOT}/").split("/", 1)[0] for path in shipped}
+    assert {"Chart.yaml", "templates", "values.yaml"} <= entries
+    for path in shipped:
+        assert _selector_outputs(tmp_path, path)["released_upgrade"] == "true", path
 
 
 @pytest.mark.parametrize(
@@ -667,7 +765,9 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     assert job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     assert job["timeout-minutes"] == 45
     assert job["strategy"]["fail-fast"] is False
-    assert job["strategy"]["max-parallel"] == 4
+    # 14 shards of 9 to 18 minutes: 4 at a time took four waves (57 minutes on
+    # run 36204726414, past #2733's 45 minute ceiling); 7 takes two.
+    assert job["strategy"]["max-parallel"] == 7
     assert job["strategy"]["matrix"] == {
         "shard": (
             "${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}"
