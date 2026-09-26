@@ -1586,12 +1586,16 @@ def test_sdk_exception_logs_turn_failure(caplog) -> None:
         classifier=SideEffectClassifier(),
         trace_name="t",
     )
-    with caplog.at_level(logging.ERROR, logger="curie_runner.session"):
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
         events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     messages = [record.getMessage() for record in caplog.records]
     assert [e.type for e in events] == ["error", "final"]
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert any(
+        "turn end" in message and "status=classified-failure" in message
+        for message in messages
+    )
     assert any(
         record.levelno == logging.ERROR
         and "turn failed" in record.getMessage()
@@ -1715,10 +1719,15 @@ def test_budget_halt_logged(caplog) -> None:
     ]
     runner, _ = _runner(lambda: script, ceiling=10)
 
-    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
         events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert any(
+        "turn end" in record.getMessage()
+        and "status=classified-failure" in record.getMessage()
+        for record in caplog.records
+    )
     assert any(
         record.levelno == logging.WARNING and "budget halt" in record.getMessage()
         for record in caplog.records

@@ -839,12 +839,6 @@ class SessionRunner:
                                 # without requesting the generator's next item.
                                 metric_outcome = self._metric_outcome(tracker)
                             yield line
-                        logger.info(
-                            "turn end session=%s status=%s duration_ms=%d",
-                            self._session_id,
-                            self._status.value,
-                            int((time.monotonic() - start) * 1000),
-                        )
                         metric_outcome = self._metric_outcome(tracker)
                     except Exception as exc:  # noqa: BLE001 - the ACI stream must
                         # always terminate in a final; a raised SDK/transport error
@@ -970,6 +964,13 @@ class SessionRunner:
                                 self._turn_ready = False
                                 self._turn_epoch = None
             finally:
+                if not self._turn_open:
+                    logger.info(
+                        "turn end session=%s status=%s duration_ms=%d",
+                        self._session_id,
+                        self._status.value,
+                        int((time.monotonic() - start) * 1000),
+                    )
                 self._active_state = None
                 if self._approval_gate is not None:
                     self._approval_gate.clear_publication_context()
