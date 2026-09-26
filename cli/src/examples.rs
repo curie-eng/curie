@@ -1030,8 +1030,9 @@ fn recorded_runner_egress(existing: &serde_json::Value) -> BTreeMap<String, Stri
 }
 
 /// The recorded entries kept verbatim, then one TCP 443 entry per provider
-/// CIDR not already recorded, the shape `cluster up` appends for an inferred
-/// provider.
+/// CIDR, the shape `cluster up` appends for an inferred provider. No dedupe
+/// against recorded CIDRs: a recorded entry for the same address may allow a
+/// different port, and a duplicate rule costs nothing.
 fn carried_runner_egress_sets(
     recorded: BTreeMap<String, String>,
     provider_cidrs: &[String],
@@ -1048,17 +1049,8 @@ fn carried_runner_egress_sets(
         })
         .max()
         .map_or(0, |index| index + 1);
-    let recorded_cidrs: Vec<String> = recorded
-        .iter()
-        .filter(|(key, _)| key.ends_with("].cidr"))
-        .map(|(_, cidr)| cidr.clone())
-        .collect();
     let mut sets = recorded;
-    for (offset, cidr) in provider_cidrs
-        .iter()
-        .filter(|cidr| !recorded_cidrs.contains(cidr))
-        .enumerate()
-    {
+    for (offset, cidr) in provider_cidrs.iter().enumerate() {
         let entry = format!("{RUNNER_EGRESS_KEY}[{}]", next_index + offset);
         sets.insert(format!("{entry}.cidr"), cidr.clone());
         sets.insert(format!("{entry}.ports[0].protocol"), "TCP".to_string());
@@ -3196,11 +3188,9 @@ mod tests {
         assert_eq!(key("[1].cidr"), Some("198.51.100.9/32"));
         assert_eq!(key("[1].ports[0].port"), Some("443"));
         assert_eq!(key("[1].ports[0].protocol"), Some("TCP"));
-        assert_eq!(
-            key("[2].cidr"),
-            None,
-            "an already recorded CIDR is not added twice"
-        );
+        // Same address as the recorded 5432 entry, still gets its own 443 rule.
+        assert_eq!(key("[2].cidr"), Some("203.0.113.7/32"));
+        assert_eq!(key("[2].ports[0].port"), Some("443"));
 
         let mut model = ModelCredential::from_value(Some("sk-or-EXAMPLE"));
         model.egress_sets = sets;
