@@ -63,8 +63,8 @@ async def _seed_agent(engine: AsyncEngine, *, name: str, address: str) -> uuid.U
         )
         await conn.execute(
             text(
-                f"INSERT INTO {_SCHEMA}.agent_channels (id, agent_id, kind, address) "
-                "VALUES (:id, :agent_id, 'slack', :address)"
+                f"INSERT INTO {_SCHEMA}.agent_channels (id, agent_id, kind, address, adapter) "
+                "VALUES (:id, :agent_id, 'slack', :address, 'default')"
             ),
             {"id": uuid.uuid4(), "agent_id": agent_id, "address": address},
         )
