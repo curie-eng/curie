@@ -118,7 +118,9 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   name, so two different (agent, connector) pairs would render byte-identical objects — checked
   only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
   derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
-  entry is the authored URL, so its name is not checked), and others). Authored mapping keys are checked for
+  entry is the authored URL, so its name is not checked), `connectors.direct_service_collision` (a
+  hosted connector named `x-direct` beside a hosted `x`, whose direct Service behind a caller proxy
+  would render the same Service name), and others). Authored mapping keys are checked for
   duplicates before validation, so a repeated connector name is rejected rather than
   silently replaced by the last YAML value.
 - `connectors.lock.yaml` (ADR-0113,

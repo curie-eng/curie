@@ -1780,7 +1780,14 @@ front of every hosted connector. The proxy refuses a call whose token is
 missing, invalid or expired, or names an agent the connector's `admits` list
 does not, and forwards the rest to the server over loopback. The proxy runs
 from the worker image (`CURIE_CONNECTOR_PROXY_IMAGE`, from `worker.image`), so
-nothing new is pulled from a new place.
+nothing new is pulled from a new place. It pulls with `worker.image.pullPolicy`
+and `worker.imagePullSecrets`, which the connector pod carries, so a private
+worker image needs its pull Secret in the namespace the connectors run in.
+
+A caller that is not an agent, such as a keep-alive Job, has no token. Each
+proxied connector also gets a Service named after its own with `-direct`,
+which selects the same pods on the server's own port. No rendered policy opens
+that port, so the caller also needs an ingress policy of your own naming it.
 
 `curie cluster up` generates the pair on a release that records none and
 re-supplies it on every upgrade, as it does the sealing keypair. `--dev`
@@ -1811,7 +1818,10 @@ neither pod template carries a checksum of this Secret. Tokens live 24 hours,
 so clear `previousVerifyKey` a day later.
 
 Upgrading onto this release rolls every hosted connector pod once, because its
-rendered Deployment gains the proxy. A sandbox that was already running carries
+rendered Deployment gains the proxy. Upgrade note: a keep-alive Job that dialled
+the connector Service now dials `<name>-direct`, keeping its port, because the
+connector Service lands on the proxy, which refuses a caller without a token.
+Its peer-ingress policy keeps naming the server's port. A sandbox that was already running carries
 no token. The next turn on its thread claims a fresh sandbox instead, and a
 turn already in progress finishes first. Every hosted connector refuses a
 runner image from before the release that added the `X-Curie-Caller` header,

@@ -160,20 +160,33 @@ enters a sandbox
 When the API holds the matching public key, `render` puts a caller proxy in
 front of every hosted connector it renders
 (`packages/plugin-format/src/plugin_format/connector_render.py::ConnectorProxy`).
-The proxy runs from the worker image as `python -m curie_connector_proxy` and
-holds only the public keys and the connector's `admits` list, resolved at render
+The proxy runs from the worker image as `python -m curie_connector_proxy`, pulled
+with the worker's pull policy and pull secrets, and holds only the public keys
+and the connector's `admits` list, resolved at render
 (`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`).
 The Service keeps the connector's port, so the URL and the allowed hosts do not
 move, and lands it on the proxy's port. Both rendered NetworkPolicies open only
-that port, so nothing Curie renders opens the server's own port; an
-operator-applied policy that names it still admits its peers, because policies
-are additive. The proxy admits a request whose token either configured key
+that port, so nothing Curie renders opens the server's own port.
+
+Callers that are not agents, such as a keep-alive Job, carry no token. For them
+the render adds a second Service, `<connector Service>-direct`
+(`packages/plugin-format/src/plugin_format/connector_render.py::direct_service_name`),
+which selects the same pods and targets the server's own port
+(`packages/plugin-format/src/plugin_format/connector_render.py::render_direct_service`).
+No rendered policy opens that port, so a sandbox cannot use it. It admits only
+the peers of an operator-applied ingress policy naming the server's port,
+because policies are additive. An install with no caller key renders no
+`-direct` Service.
+
+The proxy admits a request whose token either configured key
 verifies, that has not expired and that names a listed agent
 (`apps/worker/src/curie_connector_proxy/caller.py::decide`), strips the header
-and forwards it to the server over loopback with its `Host` unchanged
+and forwards it to the server over loopback with its `Host` unchanged and its
+body as sent, never decoded
 (`apps/worker/src/curie_connector_proxy/server.py::make_app`). It checks every
 path the same way, the MCP client's OAuth discovery and registration requests
-included. Any other request gets a 403 carrying a JSON-RPC error and no
+included. Its log line quotes the path, and aiohttp's own error and access logs
+redact a caller token. Any other request gets a 403 carrying a JSON-RPC error and no
 challenge, and never reaches the server; the shape is frozen in
 `tests/vectors/connector-caller-refusal.json`, and the runner reports it as the
 connector refusing this sandbox
@@ -227,7 +240,8 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   to satisfy a port that never mentions Kubernetes in its own signatures.
 - **Rendering is Kubernetes-specific and sits outside the port.** `render`
   (`packages/plugin-format/src/plugin_format/connector_render.py::render`) emits a
-  Deployment, a Service and two NetworkPolicies, and it runs in the API, not
+  Deployment, a Service and two NetworkPolicies, plus the `-direct` Service
+  behind a caller proxy, and it runs in the API, not
   behind `ConnectorClient`. Swapping the host therefore swaps only the applier;
   the second host needs a second renderer too, and no port covers that half.
 - **There is no selector.** Unlike the substrate seam's `CURIE_SANDBOX_SUBSTRATE`,
