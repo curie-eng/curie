@@ -599,6 +599,30 @@ class WorkerConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _hook_claim_lease_covers_the_budget(self) -> WorkerConfig:
+        """Fail at construction if a cron claim's lease is shorter than a turn.
+
+        The next fire reclaims a claim past its lease (ADR-0099, #2931). A
+        lease shorter than the overall delivery budget would reclaim a turn
+        that is still running and let a second fire of the hook start beside it.
+        """
+        lease = self.hook_claim_lease_s
+        if lease is not None and lease < self.delivery_budget_s:
+            raise ValueError(
+                f"CURIE_HOOK_CLAIM_LEASE_S ({lease!r}) must be at least "
+                f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a shorter "
+                "lease reclaims a scheduled turn that is still running"
+            )
+        return self
+
+    @property
+    def effective_hook_claim_lease_s(self) -> float:
+        """The cron claim lease; the delivery budget when none is configured."""
+        if self.hook_claim_lease_s is None:
+            return self.delivery_budget_s
+        return self.hook_claim_lease_s
+
+    @model_validator(mode="after")
     def _runner_request_fits_the_budget(self) -> WorkerConfig:
         """Fail at construction if the per-request ceiling exceeds the budget.
 
@@ -770,6 +794,14 @@ class WorkerConfig(BaseSettings):
         ge=60.0,
         le=MAX_DELIVERY_BUDGET_S,
         validation_alias="CURIE_DELIVERY_BUDGET_S",
+    )
+    # How long a cron hook run claim holds before the hook's next fire may
+    # reclaim it (ADR-0099, #2931). ``None`` means the delivery budget: the
+    # budget bounds the whole delivery, so a turn past it is dead by
+    # construction. Set it higher when turns wait long on the stream before a
+    # worker claims them; it can never be lower than the budget.
+    hook_claim_lease_s: float | None = Field(
+        default=None, gt=0, validation_alias="CURIE_HOOK_CLAIM_LEASE_S"
     )
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"

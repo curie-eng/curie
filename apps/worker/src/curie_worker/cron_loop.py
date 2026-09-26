@@ -15,6 +15,13 @@ whose watermarks differ can resolve different slots of one hook, so admission
 also takes a transaction-scoped advisory lock per ``(agent, name)`` and treats
 any other open row for that hook as in flight.
 
+**A claim carries a lease.** Every in-flight row records when its lease
+lapses, and the kernel renews it when it starts the turn, so time spent
+queued on the stream never counts against a live run. A worker that dies
+mid-turn never closes its row, so the hook's next fire closes any open row
+past its lease as ``reclaimed`` and proceeds, the same recovery
+``XAUTOCLAIM`` gives a stream delivery whose consumer died.
+
 **Catch-up is bounded to one slot (#2930).** A pass covers (watermark, now],
 reaching back to the hook's last recorded slot when that is earlier, so a
 restarted worker still sees the slots it slept through. It fires only the
@@ -80,10 +87,6 @@ logger = logging.getLogger(__name__)
 # wall time reads earlier than the window start (a fold) is still enumerated
 # and then filtered on its instant.
 _ITERATION_MARGIN = timedelta(hours=3)
-
-# A stale in-flight row is one whose turn has outlived every delivery deadline
-# plus this slack; the kernel should have closed it long ago.
-_STALE_SLACK_S = 60.0
 
 # A missed slot older than this is skipped rather than fired, however coarse the
 # schedule: a monthly hook four weeks late starts fresh.
@@ -276,9 +279,11 @@ WHERE agent_id = :agent_id AND address = :address
 
 _INSERT_SQL = """
 INSERT INTO {schema}.hook_runs
-       (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at)
+       (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at,
+        lease_expires_at)
 VALUES (:id, :agent_id, :name, :slot, :version_id, CAST(:outcome AS text), now(),
-        CASE WHEN :terminal THEN now() END)
+        CASE WHEN :terminal THEN now() END,
+        CASE WHEN :terminal THEN NULL ELSE now() + make_interval(secs => :lease_s) END)
 ON CONFLICT (agent_id, name, slot_utc) DO NOTHING
 RETURNING id
 """
@@ -290,11 +295,15 @@ _LOCK_SQL = """
 SELECT pg_advisory_xact_lock(hashtextextended(CAST(:agent_id AS text) || ':' || :name, 0))
 """
 
-_CLOSE_STALE_SQL = """
+# The lease is compared on the database clock, the clock that set it. A claim
+# with no lease (written before migration 0062, or by an older worker during a
+# rollout) is held for one lease from its start.
+_RECLAIM_SQL = """
 UPDATE {schema}.hook_runs
-SET outcome = 'failed', ended_at = now()
+SET outcome = 'reclaimed', ended_at = now()
 WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL
-  AND slot_utc <> :slot AND started_at < :cutoff
+  AND slot_utc <> :slot
+  AND COALESCE(lease_expires_at, started_at + make_interval(secs => :lease_s)) < now()
 """
 
 # Any other open row for this hook blocks, whichever slot it holds: a later
@@ -341,7 +350,8 @@ WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = '
 # The reopen is a CAS on ``deferred``, so of two replicas retrying one slot
 # exactly one gets the row back in flight and enqueues it.
 _REOPEN_SQL = """
-UPDATE {schema}.hook_runs SET outcome = NULL, ended_at = NULL, started_at = now()
+UPDATE {schema}.hook_runs SET outcome = NULL, ended_at = NULL, started_at = now(),
+       lease_expires_at = now() + make_interval(secs => :lease_s)
 WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
 RETURNING id
 """
@@ -376,11 +386,19 @@ class CronPassSummary:
     blocked: int = 0
     skipped: int = 0
     failed: int = 0
+    reclaimed: int = 0
     lost: int = 0
 
     @property
     def did_work(self) -> bool:
-        return bool(self.admitted or self.retried or self.blocked or self.skipped or self.failed)
+        return bool(
+            self.admitted
+            or self.retried
+            or self.blocked
+            or self.skipped
+            or self.failed
+            or self.reclaimed
+        )
 
 
 class CronSchedulerLoop:
@@ -396,7 +414,7 @@ class CronSchedulerLoop:
         db_schema: str,
         stream: str,
         interval_seconds: float,
-        delivery_budget_s: float,
+        claim_lease_s: float,
         default_max_usd_per_day: float,
         default_max_output_tokens_per_run: int,
         started_at: datetime | None = None,
@@ -408,7 +426,7 @@ class CronSchedulerLoop:
         self._is_killed = is_killed
         self._stream = stream
         self._interval = interval_seconds
-        self._stale_after = timedelta(seconds=delivery_budget_s + _STALE_SLACK_S)
+        self._claim_lease_s = claim_lease_s
         self._default_usd = default_max_usd_per_day
         self._default_tokens = default_max_output_tokens_per_run
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -419,7 +437,7 @@ class CronSchedulerLoop:
         self._targets_sql = text(_TARGETS_SQL.format(schema=db_schema))
         self._bindings_sql = text(_BINDINGS_SQL.format(schema=db_schema))
         self._insert_sql = text(_INSERT_SQL.format(schema=db_schema))
-        self._close_stale_sql = text(_CLOSE_STALE_SQL.format(schema=db_schema))
+        self._reclaim_sql = text(_RECLAIM_SQL.format(schema=db_schema))
         self._lock_sql = text(_LOCK_SQL)
         self._in_flight_sql = text(_IN_FLIGHT_SQL.format(schema=db_schema))
         self._fail_run_sql = text(_FAIL_RUN_SQL.format(schema=db_schema))
@@ -491,6 +509,7 @@ class CronSchedulerLoop:
                     "outcome": outcome,
                     # Terminal outcomes close the row at once; NULL is in flight.
                     "terminal": outcome is not None,
+                    "lease_s": self._claim_lease_s,
                 },
             )
         ).first()
@@ -570,13 +589,13 @@ class CronSchedulerLoop:
         target: _Target,
         trigger: dict[str, Any],
         slot: datetime,
-        now: datetime,
         summary: CronPassSummary,
         defer_if_busy: bool,
     ) -> None:
         name = str(trigger["name"])
         if await self._is_killed(target.agent_id) or self._budget_spent(target):
             async with self._engine.begin() as conn:
+                await self._lock_and_reclaim(conn, target, name, slot, summary)
                 await self._insert(conn, target, name, slot, "blocked")
             summary.blocked += 1
             return
@@ -585,17 +604,18 @@ class CronSchedulerLoop:
             handle = await self._reply_handle(target, trigger)
         except _UnboundTarget:
             async with self._engine.begin() as conn:
+                await self._lock_and_reclaim(conn, target, name, slot, summary)
                 await self._insert(conn, target, name, slot, "failed")
             summary.failed += 1
             return
 
         async with self._engine.begin() as conn:
-            await self._lock(conn, target, name)
+            await self._lock_and_reclaim(conn, target, name, slot, summary)
             paused_at, _, _ = await self._control(conn, target, name)
             if paused_at is not None:
                 await self._insert(conn, target, name, slot, "deferred")
                 return
-            if await self._blocked_by_in_flight(conn, target, name, slot, now):
+            if await self._blocked_by_in_flight(conn, target, name, slot):
                 await self._insert(
                     conn, target, name, slot, "deferred" if defer_if_busy else "skipped"
                 )
@@ -615,8 +635,37 @@ class CronSchedulerLoop:
             raise
         summary.admitted += 1
 
-    async def _lock(self, conn: AsyncConnection, target: _Target, name: str) -> None:
+    async def _lock_and_reclaim(
+        self,
+        conn: AsyncConnection,
+        target: _Target,
+        name: str,
+        slot: datetime,
+        summary: CronPassSummary,
+    ) -> None:
+        """Take the hook's admission lock and reclaim its claims past their lease.
+
+        Every fire of the hook does this, whatever it records for its own slot,
+        so a dead run is recorded ``reclaimed`` by the very next fire.
+        """
         await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
+        reclaimed = await conn.execute(
+            self._reclaim_sql,
+            {
+                "agent_id": target.agent_id,
+                "name": name,
+                "slot": slot,
+                "lease_s": self._claim_lease_s,
+            },
+        )
+        if reclaimed.rowcount:
+            logger.warning(
+                "cron hook %s for agent=%s reclaimed %d claim(s) past their lease",
+                name,
+                target.agent_name,
+                reclaimed.rowcount,
+            )
+            summary.reclaimed += reclaimed.rowcount
 
     async def _blocked_by_in_flight(
         self,
@@ -624,17 +673,7 @@ class CronSchedulerLoop:
         target: _Target,
         name: str,
         slot: datetime,
-        now: datetime,
     ) -> bool:
-        await conn.execute(
-            self._close_stale_sql,
-            {
-                "agent_id": target.agent_id,
-                "name": name,
-                "slot": slot,
-                "cutoff": now - self._stale_after,
-            },
-        )
         in_flight = (
             await conn.execute(
                 self._in_flight_sql,
@@ -760,17 +799,19 @@ class CronSchedulerLoop:
                 summary.failed += 1
                 continue
             async with self._engine.begin() as conn:
-                await self._lock(conn, target, name)
+                await self._lock_and_reclaim(conn, target, name, slot, summary)
                 paused_at, _, _ = await self._control(conn, target, name)
                 if paused_at is not None:
                     # The pause raced the pass. Leave the row deferred for a
                     # later pass after resume.
                     return
-                if await self._blocked_by_in_flight(conn, target, name, slot, now):
+                if await self._blocked_by_in_flight(conn, target, name, slot):
                     # Another fire of this hook is live; stay deferred until it
                     # settles or this slot ages out.
                     continue
-                row = (await conn.execute(self._reopen_sql, key)).first()
+                row = (
+                    await conn.execute(self._reopen_sql, {**key, "lease_s": self._claim_lease_s})
+                ).first()
             if row is None:
                 # Another replica reopened or settled it first.
                 summary.lost += 1
@@ -825,7 +866,7 @@ class CronSchedulerLoop:
                     await self._skip(target, str(name), skipped, summary)
                     if fire is not None:
                         await self._admit(
-                            target, trigger, fire, now, summary, resume_from is not None
+                            target, trigger, fire, summary, resume_from is not None
                         )
                     if resume_from is not None:
                         async with self._engine.begin() as conn:
@@ -854,12 +895,14 @@ class CronSchedulerLoop:
         # stays at DEBUG.
         log = logger.info if (summary.did_work or summary.lost) else logger.debug
         log(
-            "cron pass: %d admitted, %d retried, %d blocked, %d skipped, %d failed, %d lost",
+            "cron pass: %d admitted, %d retried, %d blocked, %d skipped, %d failed, "
+            "%d reclaimed, %d lost",
             summary.admitted,
             summary.retried,
             summary.blocked,
             summary.skipped,
             summary.failed,
+            summary.reclaimed,
             summary.lost,
         )
         return summary

@@ -648,7 +648,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             db_schema=config.db_schema,
             stream=config.stream,
             interval_seconds=config.cron_tick_interval_s,
-            delivery_budget_s=config.delivery_budget_s,
+            claim_lease_s=config.effective_hook_claim_lease_s,
             default_max_usd_per_day=config.default_max_usd_per_day,
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),

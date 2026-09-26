@@ -1973,7 +1973,12 @@ class Kernel:
                         lease=lease,
                     )
                     return
-                if hook_state.outcome is not None:
+                # Renew the claim lease before the turn starts, so time spent
+                # queued never lets the hook's next fire reclaim a live run.
+                # A run reclaimed since the read above is terminal (#2931).
+                if hook_state.outcome is not None or not await self._hook_runs.renew(
+                    qevent.hook_run, self._config.effective_hook_claim_lease_s
+                ):
                     logger.info(
                         "cron event %s belongs to an already terminal hook run; dropping",
                         event_id,
