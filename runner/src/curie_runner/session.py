@@ -749,6 +749,7 @@ class SessionRunner:
             }
             record_metric("curie.turn.accepted", attributes=metric_attributes)
             metrics_emitted = False
+            terminal_for_log = False
 
             def emit_completed_metrics() -> None:
                 """Emit the terminal metric pair once, synchronously."""
@@ -926,6 +927,7 @@ class SessionRunner:
                                 )
                                 metric_outcome = self._metric_outcome(tracker)
                                 emit_completed_metrics()
+                            terminal_for_log = not self._turn_open
                         finally:
                             # The SDK serializes this turn's stop and any later
                             # query onto one locked stdin stream. Wait until the
@@ -964,7 +966,7 @@ class SessionRunner:
                                 self._turn_ready = False
                                 self._turn_epoch = None
             finally:
-                if not self._turn_open:
+                if terminal_for_log:
                     logger.info(
                         "turn end session=%s status=%s duration_ms=%d",
                         self._session_id,

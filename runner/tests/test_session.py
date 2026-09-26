@@ -1413,6 +1413,7 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
     session_type,
     expected_phase: str,
     expect_tool: bool,
+    caplog,
 ) -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -1449,7 +1450,9 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
             scope_holder[0].cancel()
         await runner.close()
 
-    anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        anyio.run(go)
+    assert not any("turn end" in record.getMessage() for record in caplog.records)
     spans = list(exporter.get_finished_spans())
     root = _span_named(spans, "agent.run")[0]
     assert root.attributes["curie.phase"] == expected_phase
