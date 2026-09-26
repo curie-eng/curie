@@ -25,6 +25,8 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import QueuedTurn, TurnSource
+from curie_telemetry import record_metric
+from curie_worker import cron_loop as cron_loop_module
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy import text
@@ -278,6 +280,26 @@ def _entries(sync_redis: redis.Redis, stream: str) -> list[QueuedTurn]:
     ]
 
 
+def _capture_fire_metrics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    recorded: list[dict[str, str]] = []
+
+    def capture(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
+        record_metric(name, value, attributes=attributes)
+        if name == "curie.schedule.fire":
+            assert value == 1
+            assert attributes is not None
+            recorded.append(dict(attributes))
+
+    monkeypatch.setattr(cron_loop_module, "record_metric", capture)
+    return recorded
+
+
+def _fire_labels(outcome: str) -> dict[str, str]:
+    return {"service.name": "curie-worker", "outcome": outcome, "trigger": "cron"}
+
+
 async def _pass_once(
     seed: _Seed,
     stream: str,
@@ -393,8 +415,9 @@ def test_a_pass_that_loses_the_slot_race_logs_the_loss_at_info(
 
 
 def test_killed_agent_records_blocked_and_enqueues_nothing(
-    sync_redis: redis.Redis, names: dict[str, str]
+    sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
     async def killed(_agent_id: uuid.UUID) -> bool:
         return True
 
@@ -405,6 +428,7 @@ def test_killed_agent_records_blocked_and_enqueues_nothing(
             assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "blocked")]
             assert rows[0].ended_at is not None
             assert _entries(sync_redis, names["stream"]) == []
+            assert fires == [_fire_labels("blocked")]
 
     asyncio.run(body())
 
@@ -442,10 +466,11 @@ def test_previous_fire_still_in_flight_skips_the_new_slot(
 
 
 def test_claim_past_its_lease_is_reclaimed_and_the_new_slot_admitted(
-    sync_redis: redis.Redis, names: dict[str, str]
+    sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A run whose worker died mid-turn never closes its row. Once its lease
     has lapsed the next fire records it ``reclaimed`` and proceeds (#2931)."""
+    fires = _capture_fire_metrics(monkeypatch)
 
     async def body() -> None:
         async with _seed() as seed:
@@ -474,6 +499,7 @@ def test_claim_past_its_lease_is_reclaimed_and_the_new_slot_admitted(
             assert summary.reclaimed == 1
             assert summary.admitted == 1
             assert len(_entries(sync_redis, names["stream"])) == 1
+            assert fires == [_fire_labels("reclaimed")]
 
     asyncio.run(body())
 
@@ -645,8 +671,9 @@ def test_targetless_hook_mints_a_turn_without_a_reply_handle(
 
 
 def test_target_not_bound_to_the_agent_records_failed(
-    sync_redis: redis.Redis, names: dict[str, str]
+    sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    fires = _capture_fire_metrics(monkeypatch)
     async def body() -> None:
         async with _seed() as seed:
             unbound = f"C{uuid.uuid4().hex[:10].upper()}"
@@ -654,6 +681,7 @@ def test_target_not_bound_to_the_agent_records_failed(
             rows = await seed.runs()
             assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "failed")]
             assert _entries(sync_redis, names["stream"]) == []
+            assert fires == [_fire_labels("failed")]
 
     asyncio.run(body())
 
