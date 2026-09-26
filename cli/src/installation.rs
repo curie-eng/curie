@@ -928,7 +928,7 @@ comms:
 /// then Curie private storage. Mirrors `commands::secret_store_env`'s order --
 /// shell env beats the vault -- so `curie apply` and `curie skill up` disagree
 /// about nothing.
-fn resolve_credential(name: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_credential(name: &str) -> Result<Option<String>> {
     if let Ok(value) = std::env::var(name) {
         if !value.is_empty() {
             return Ok(Some(value));

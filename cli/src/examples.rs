@@ -553,6 +553,7 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     let approvers = parse_approvers(&opts.approvers)?;
 
     let identity = InstallIdentity::from_opts(&opts);
+    let mut model = ModelCredential::resolve()?;
 
     preflight_capacity(&identity.observability_namespace).await?;
 
@@ -577,7 +578,9 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             identity.observability_namespace
         ));
         lines.extend(stack_commands.iter().map(|command| command.display(&chart)));
-        lines.extend(apply_curie_platform(&chart, true, &identity, &opts.workspace_repo).await?);
+        lines.extend(
+            apply_curie_platform(&chart, true, &identity, &opts.workspace_repo, &model).await?,
+        );
         lines.push(integration_command.display(&chart));
         lines.push(read_access_command.display(&chart));
         lines.push(format!(
@@ -666,8 +669,12 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     }
     // Before the apply, not after: the point is to refuse while the credential
     // still exists.
-    refuse_to_drop_a_recorded_model_credential(&identity).await?;
-    apply_curie_platform(&chart, false, &identity, &opts.workspace_repo).await?;
+    if model.declared.is_none() {
+        refuse_to_drop_a_recorded_model_credential(&identity).await?;
+    } else {
+        keep_recorded_runner_egress(&identity, &mut model).await?;
+    }
+    apply_curie_platform(&chart, false, &identity, &opts.workspace_repo, &model).await?;
     run_install_command(&integration_command, &workspace, &chart).await?;
     run_install_command(&read_access_command, &workspace, &chart).await?;
     let kubeconfig = kubernetes_connector_kubeconfig(&identity.namespace).await?;
@@ -918,9 +925,9 @@ async fn apply_upgrade_path(
 /// stayed healthy, and the bot kept answering -- in three milliseconds, from the
 /// fake model, "all done" (#2129).
 ///
-/// So the installer asks first. On a fresh install, run this installer before
-/// configuring the model credential, then use `curie cluster up` to record it.
-/// On an existing release, refusing prevents an invisible credential loss.
+/// So the installer asks first when it declares no credential: with
+/// `CURIE_CREDENTIALS` exported it declares one (#2920) and nothing is dropped.
+/// Without it, refusing prevents an invisible credential loss.
 /// Does this release's recorded values carry a model credential?
 ///
 /// Split out so the decision is testable without a cluster: the read is the part
@@ -953,13 +960,89 @@ async fn refuse_to_drop_a_recorded_model_credential(identity: &InstallIdentity) 
          on the chart's fakeModel default, healthy in every way except that the agent \
          is no longer a model. That state is hard to see: pods stay Ready and turns \
          still answer.\n\n\
-         For a fresh install, run `curie example sre-bot install` before configuring \
-         a model credential. Then export CURIE_CREDENTIALS and run `curie cluster up` \
-         so the release records it. This installer is not an upgrade path for an \
-         existing release that already records a model credential; use the normal \
-         Curie cluster lifecycle for that release.",
+         Export CURIE_CREDENTIALS before re-running and the installer declares it, \
+         so nothing is cleared. Otherwise use the normal Curie cluster lifecycle for \
+         a release that already records a model credential.",
         identity.release, identity.namespace,
     )))
+}
+
+/// The model credential this installer declares, read the way `curie cluster up`
+/// reads it.
+///
+/// The platform step used to declare no credential at all, so a
+/// `CURIE_CREDENTIALS` exported before the install was ignored and the release
+/// came up on the fake model (#2920). Declaring it by NAME keeps the value out of
+/// the plan; the provider egress is inferred from the credential prefix, as
+/// `cluster up` infers it, so the real model is reachable rather than sealed.
+struct ModelCredential {
+    declared: Option<crate::installation::Credentials>,
+    egress: Vec<crate::installation::Egress>,
+}
+
+const MODEL_CREDENTIAL_ENV: &str = "CURIE_CREDENTIALS";
+
+impl ModelCredential {
+    fn resolve() -> Result<Self> {
+        Ok(Self::from_value(
+            crate::installation::resolve_credential(MODEL_CREDENTIAL_ENV)?.as_deref(),
+        ))
+    }
+
+    /// Split out so the decision is testable without the environment.
+    fn from_value(credential: Option<&str>) -> Self {
+        let Some(credential) = credential.filter(|value| !value.trim().is_empty()) else {
+            return Self {
+                declared: None,
+                egress: Vec::new(),
+            };
+        };
+        Self {
+            declared: Some(crate::installation::Credentials {
+                model: Some(MODEL_CREDENTIAL_ENV.to_string()),
+                ..Default::default()
+            }),
+            egress: crate::ops::provider_from_credential_prefix(credential)
+                .map(|provider| crate::installation::Egress {
+                    host: provider.to_string(),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+/// Does this release's recorded values carry runner egress of its own?
+fn records_runner_egress(existing: &serde_json::Value) -> bool {
+    existing
+        .pointer("/security/networkPolicy/allowedEgress")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| !entries.is_empty())
+}
+
+/// A declared egress host REPLACES the release's recorded runner egress on the
+/// declarative path, so on a rerun the inferred provider route would drop
+/// entries an operator recorded with `cluster up`. When the release already
+/// records egress, declare none and let the path preserve what is there.
+async fn keep_recorded_runner_egress(
+    identity: &InstallIdentity,
+    model: &mut ModelCredential,
+) -> Result<()> {
+    if model.egress.is_empty() {
+        return Ok(());
+    }
+    let opts = crate::ops::CommonOpts {
+        namespace: identity.namespace.clone(),
+        release: identity.release.clone(),
+        dry_run: false,
+    };
+    if crate::ops::fetch_release_values(&opts)
+        .await?
+        .is_some_and(|existing| records_runner_egress(&existing))
+    {
+        model.egress.clear();
+    }
+    Ok(())
 }
 
 fn github_repo_allowlist_sets(repos: &[String]) -> BTreeMap<String, String> {
@@ -970,24 +1053,36 @@ fn github_repo_allowlist_sets(repos: &[String]) -> BTreeMap<String, String> {
         .collect()
 }
 
-async fn apply_curie_platform(
-    chart: &Path,
-    dry_run: bool,
+fn platform_installation(
     identity: &InstallIdentity,
     workspace_repo: &[String],
-) -> Result<Vec<String>> {
-    let installation = crate::installation::Installation {
+    model: &ModelCredential,
+) -> crate::installation::Installation {
+    crate::installation::Installation {
         version: crate::installation::SUPPORTED_VERSION,
         install: crate::installation::Install {
             namespace: identity.namespace.clone(),
             release: identity.release.clone(),
             context: None,
         },
-        platform: crate::installation::Platform::default(),
-        credentials: crate::installation::Credentials::default(),
+        platform: crate::installation::Platform {
+            egress: model.egress.clone(),
+            ..Default::default()
+        },
+        credentials: model.declared.clone().unwrap_or_default(),
         comms: crate::installation::Comms::default(),
         set: github_repo_allowlist_sets(workspace_repo),
-    };
+    }
+}
+
+async fn apply_curie_platform(
+    chart: &Path,
+    dry_run: bool,
+    identity: &InstallIdentity,
+    workspace_repo: &[String],
+    model: &ModelCredential,
+) -> Result<Vec<String>> {
+    let installation = platform_installation(identity, workspace_repo, model);
     let local = crate::installation::plan_installation(installation, dry_run)?;
     match crate::installation::apply(crate::installation::ApplyOpts {
         local,
@@ -2970,6 +3065,63 @@ mod tests {
         assert!(allow
             .iter()
             .any(|tool| tool.as_str() == Some(PLATFORM_UPGRADE_TOOL)));
+    }
+
+    fn test_identity() -> InstallIdentity {
+        InstallIdentity {
+            namespace: "curie".to_string(),
+            release: "curie".to_string(),
+            observability_namespace: "observability".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_exported_credential_is_declared_with_its_provider_egress() {
+        // #2920: CURIE_CREDENTIALS was set and the installer still declared no
+        // credential, so the release came up on the fake model.
+        let model = ModelCredential::from_value(Some("sk-or-EXAMPLE"));
+        let installation = platform_installation(&test_identity(), &[], &model);
+        assert_eq!(
+            installation.credentials.model.as_deref(),
+            Some("CURIE_CREDENTIALS")
+        );
+        assert_eq!(installation.egress_hosts(), vec!["openrouter"]);
+    }
+
+    #[test]
+    fn a_credential_with_no_known_prefix_is_declared_without_guessing_egress() {
+        let model = ModelCredential::from_value(Some("zhipu-EXAMPLE"));
+        let installation = platform_installation(&test_identity(), &[], &model);
+        assert_eq!(
+            installation.credentials.model.as_deref(),
+            Some("CURIE_CREDENTIALS")
+        );
+        assert!(installation.egress_hosts().is_empty());
+    }
+
+    #[test]
+    fn no_credential_keeps_the_fake_model_install() {
+        for value in [None, Some(""), Some("  ")] {
+            let model = ModelCredential::from_value(value);
+            assert!(model.declared.is_none());
+            let installation = platform_installation(&test_identity(), &[], &model);
+            assert_eq!(installation.credentials.model, None);
+            assert!(installation.egress_hosts().is_empty());
+        }
+    }
+
+    #[test]
+    fn recorded_runner_egress_is_detected_so_a_rerun_preserves_it() {
+        let existing = serde_json::json!({"security": {"networkPolicy": {"allowedEgress": [
+            {"cidr": "203.0.113.7/32", "ports": [{"protocol": "TCP", "port": 443}]}
+        ]}}});
+        assert!(records_runner_egress(&existing));
+        for existing in [
+            serde_json::json!({}),
+            serde_json::json!({"security": {"networkPolicy": {"allowedEgress": []}}}),
+        ] {
+            assert!(!records_runner_egress(&existing), "{existing}");
+        }
     }
 
     #[test]
