@@ -5,6 +5,11 @@ rules:
     compose.dev.yaml: [local]
     pyproject.toml: [skill, local, local-release, cluster]
     uv.lock: [skill, local, local-release, cluster]
+    # The upgrade matrix and the repository files it reads. A test scans the
+    # script's $REPO_ROOT reads and fails on any that skips released-upgrade.
+    cli/scripts/gnu-process.py: [released-upgrade]
+    apps/api/src/curie_api/schema_compat.json: [released-upgrade]
+    cli/src/application_schema_windows.json: [released-upgrade]
     cli/scripts/cluster-upgrade-matrix.sh: [released-upgrade]
     cli/tests/data/upgrade-driver.py: [released-upgrade]
     apps/worker/src/curie_worker/approval_cards.py: [local, local-release, cluster, released-upgrade]
@@ -42,6 +47,8 @@ rules:
     apps/ui: []
     apps/dispatcher: []
     scripts: []
+    # Edits to the released-upgrade jobs select nothing either. Dispatch CI on
+    # the branch to run them before merge.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []

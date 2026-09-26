@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -21,6 +22,18 @@ SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 UPGRADE_MUTANT_BUILDER = REPO_ROOT / "charts" / "curie" / "ci" / "make-upgrade-mutants.py"
+UPGRADE_MATRIX = REPO_ROOT / "cli" / "scripts" / "cluster-upgrade-matrix.sh"
+# Directories the upgrade matrix reads whole, each with the files that stand
+# for it. The matrix runs `helm package` on charts/curie, and .helmignore
+# leaves charts/curie/ci out of that package.
+UPGRADE_MATRIX_DIRECTORY_INPUTS = {
+    "charts/curie": (
+        "charts/curie/Chart.yaml",
+        "charts/curie/values.yaml",
+        "charts/curie/values.schema.json",
+        "charts/curie/templates/_helpers.tpl",
+    ),
+}
 
 TIERS = ("skill", "local", "local-release", "cluster", "released-upgrade")
 BASE_TIERS = TIERS[:-1]
@@ -152,6 +165,12 @@ def _assert_selection(
         ("cli/src/main.rs", BASE_TIERS),
         ("cli/src/ops/upgrade.rs", TIERS),
         ("cli/scripts/cluster-upgrade-matrix.sh", TIERS),
+        ("cli/scripts/gnu-process.py", TIERS),
+        ("cli/src/application_schema_windows.json", TIERS),
+        (
+            "apps/api/src/curie_api/schema_compat.json",
+            ("local", "local-release", "cluster", "released-upgrade"),
+        ),
         ("packages/example.py", BASE_TIERS),
         ("packages/aci-protocol/src/aci_protocol/wire.py", BASE_TIERS),
         ("packages/plugin-format/src/plugin_format/manifest.py", BASE_TIERS),
@@ -239,6 +258,142 @@ def test_released_upgrade_does_not_select_unrelated_paths(
     assert completed.returncode == 0, completed.stderr
     outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
     assert outputs["released_upgrade"] == "false"
+
+
+def _repo_root_references(script: str) -> list[str]:
+    references = re.findall(r"\$\{?REPO_ROOT\}?/([\w.][\w./-]*)", script)
+    return sorted({reference.rstrip("./") for reference in references})
+
+
+def _git_ignored(path: str) -> bool:
+    completed = subprocess.run(
+        ["git", "check-ignore", "--quiet", "--", path],
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    assert completed.returncode in {0, 1}, f"git check-ignore failed for {path}"
+    return completed.returncode == 0
+
+
+def _unselected_matrix_inputs(
+    tmp_path: Path,
+    script: str,
+    registry: Path = REGISTRY,
+) -> list[str]:
+    """Name each repository input of the script that skips released-upgrade."""
+    problems: list[str] = []
+    for reference in _repo_root_references(script):
+        if _git_ignored(reference):
+            # Build output or local scratch: never part of a diff.
+            continue
+        target = REPO_ROOT / reference
+        paths: tuple[str, ...]
+        if target.is_dir():
+            if reference not in UPGRADE_MATRIX_DIRECTORY_INPUTS:
+                problems.append(f"{reference}: directory with no listed files")
+                continue
+            paths = UPGRADE_MATRIX_DIRECTORY_INPUTS[reference]
+        elif target.is_file():
+            paths = (reference,)
+        else:
+            problems.append(f"{reference}: neither in the checkout nor ignored")
+            continue
+        for path in paths:
+            if not (REPO_ROOT / path).is_file():
+                problems.append(f"{path}: listed for {reference} but missing")
+                continue
+            completed, output = _invoke_selector(tmp_path, path, registry=registry)
+            assert completed.returncode == 0, completed.stderr
+            outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
+            if outputs["released_upgrade"] != "true":
+                problems.append(f"{path}: does not select released-upgrade")
+    return problems
+
+
+def test_released_upgrade_selects_every_repo_file_the_upgrade_matrix_reads(
+    tmp_path: Path,
+) -> None:
+    script = UPGRADE_MATRIX.read_text()
+    # The scan still sees the inputs these rules were written for.
+    assert {
+        "apps/api/src/curie_api/schema_compat.json",
+        "charts/curie",
+        "cli/scripts/gnu-process.py",
+        "cli/src/application_schema_windows.json",
+    } <= set(_repo_root_references(script))
+    assert _unselected_matrix_inputs(tmp_path, script) == []
+
+
+def test_matrix_input_guard_names_each_read_the_registry_drops(tmp_path: Path) -> None:
+    dropped = (
+        "apps/api/src/curie_api/schema_compat.json",
+        "cli/scripts/gnu-process.py",
+        "cli/src/application_schema_windows.json",
+    )
+    text = REGISTRY.read_text()
+    for path in dropped:
+        rule = f"    {path}: [released-upgrade]\n"
+        assert rule in text
+        text = text.replace(rule, "")
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(text)
+    assert _unselected_matrix_inputs(
+        tmp_path, UPGRADE_MATRIX.read_text(), registry
+    ) == [f"{path}: does not select released-upgrade" for path in dropped]
+
+
+@pytest.mark.parametrize(
+    ("script", "problems"),
+    [
+        (
+            'BIN="$REPO_ROOT/cli/src/main.rs"\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            'DIR="${REPO_ROOT}/cli/scripts"\n',
+            ["cli/scripts: directory with no listed files"],
+        ),
+        (
+            'HELPER="$REPO_ROOT/cli/scripts/no-such-helper.py"\n',
+            ["cli/scripts/no-such-helper.py: neither in the checkout nor ignored"],
+        ),
+        ('KUBECONFIG_FILE="$REPO_ROOT/.projects/kubeconfig-example"\n', []),
+        ('BIN="$REPO_ROOT/cli/target/release/curie"\n', []),
+    ],
+)
+def test_matrix_input_guard_classifies_each_reference(
+    tmp_path: Path,
+    script: str,
+    problems: list[str],
+) -> None:
+    assert _unselected_matrix_inputs(tmp_path, script) == problems
+
+
+def test_e2e_ladder_script_stays_off_released_upgrade(tmp_path: Path) -> None:
+    """A recorded gap, not an oversight.
+
+    e2e-released-upgrade runs the ladder's cluster rung against the upgraded
+    install. e2e-ladder-cluster runs the same invocation against a fresh one,
+    and the cli prefix already selects it for every ladder edit. Selecting
+    released-upgrade as well would boot the negative control and every matrix
+    shard, none of which read the ladder. Push to main and a dispatch still
+    run the smoke on the upgraded install.
+    """
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+
+    def ladder_tiers(job: str) -> list[str | None]:
+        return [
+            step.get("env", {}).get("CURIE_E2E_TIERS")
+            for step in jobs[job]["steps"]
+            if "cli/scripts/e2e-ladder.sh" in str(step.get("run", ""))
+        ]
+
+    assert ladder_tiers("e2e-released-upgrade") == ["cluster"]
+    assert ladder_tiers("e2e-ladder-cluster") == ["cluster"]
+    assert ladder_tiers("e2e-released-upgrade-negative") == []
+    assert ladder_tiers("e2e-cluster-upgrade-matrix") == []
+    assert "e2e-ladder" not in UPGRADE_MATRIX.read_text()
+    _assert_selection(tmp_path, "cli/scripts/e2e-ladder.sh", BASE_TIERS)
 
 
 @pytest.mark.parametrize(
