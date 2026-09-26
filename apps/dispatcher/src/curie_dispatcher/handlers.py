@@ -278,10 +278,8 @@ def _mint_turn(
         # The literal "slack" is this dispatcher stating what it is; it never
         # comes from config, because a Slack Socket Mode dispatcher that could
         # claim another kind is a misrouting vector. `adapter` is the identity
-        # of the app this delivery arrived on, never a field of the delivery
-        # (ADR-0168 decision 2); `minted_adapter` keeps `default` as None until
-        # #3146, so a stock install mints the handle it always did. Same rule,
-        # same reason, on both lanes.
+        # whose app the delivery arrived on, never a field of the delivery
+        # (ADR-0168 decisions 2 and 3). Same rule, same reason, on both lanes.
         reply_handle=ReplyHandle(
             kind="slack",
             channel=channel,
