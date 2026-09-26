@@ -465,6 +465,51 @@ def test_namespace_over_the_per_namespace_cap_is_rejected(
         get_settings.cache_clear()
 
 
+def test_transcript_get_advertises_configured_cap_even_when_key_is_missing(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/factory-3211"
+    settings = get_settings()
+    settings.transcript_max_thread_bytes = 128 * 1024
+    try:
+        missing = client.get(url, headers=auth_headers)
+        assert missing.status_code == 404, missing.text
+        assert missing.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+
+        scoped_url = (
+            f"/agents/{aid}/state/bindings/slack/C000000S01/transcript/factory-3211"
+        )
+        scoped_missing = client.get(scoped_url, headers=auth_headers)
+        assert scoped_missing.status_code == 404, scoped_missing.text
+        assert scoped_missing.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+
+        created = client.post(
+            f"{url}/append", json={"item": {"user": "issue", "assistant": "done"}},
+            headers=auth_headers,
+        )
+        assert created.status_code == 200, created.text
+        present = client.get(url, headers=auth_headers)
+        assert present.status_code == 200, present.text
+        assert present.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+        assert present.json()["value"] == [{"user": "issue", "assistant": "done"}]
+
+        scoped_created = client.post(
+            f"{scoped_url}/append",
+            json={"item": {"user": "scoped issue", "assistant": "scoped answer"}},
+            headers=auth_headers,
+        )
+        assert scoped_created.status_code == 200, scoped_created.text
+        scoped_present = client.get(scoped_url, headers=auth_headers)
+        assert scoped_present.status_code == 200, scoped_present.text
+        assert scoped_present.headers["X-Curie-Transcript-Max-Bytes"] == "131072"
+        assert scoped_present.json()["value"] == [
+            {"user": "scoped issue", "assistant": "scoped answer"}
+        ]
+    finally:
+        get_settings.cache_clear()
+
+
 def test_transcript_value_cap_records_once_without_mutating_the_log(
     client: Any,
     auth_headers: dict[str, str],

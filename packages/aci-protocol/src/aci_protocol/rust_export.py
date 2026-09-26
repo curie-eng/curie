@@ -12,6 +12,7 @@ Run as ``python -m aci_protocol.rust_export`` to rewrite the committed crate.
 
 import types as _types
 import uuid
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
@@ -23,6 +24,7 @@ from .events import (
     Event,
     Final,
     Interrupt,
+    PublicationContext,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
@@ -52,6 +54,7 @@ _SCALARS: dict[type, str] = {
     float: "f64",
     bool: "bool",
     uuid.UUID: "String",
+    datetime: "String",
 }
 
 # Multi-valued string literals map to a dedicated Rust enum. Only Event.type
@@ -347,6 +350,7 @@ mod tests {
             ts: "1.0".to_string(),
             session_id: None,
             history_ref: None,
+            publication_context: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
@@ -477,6 +481,7 @@ def render_rust() -> str:
         _struct(EvalJob),
         _struct(EvalReport),
         _struct(ApprovalRequest),
+        _struct(PublicationContext),
         _tagged_enum("InboundMessage", "kind", (Event, Interrupt)),
         _tagged_enum(
             "OutboundEvent",

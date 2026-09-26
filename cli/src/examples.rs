@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::commands::{self, DeployOpts, DeployTier};
-use crate::ui::DryRunPlan;
+use crate::ui::{CliOutput, DryRunPlan, Ui};
 
 const OBSERVABILITY_NAMESPACE: &str = "observability";
 const CURIE_NAMESPACE: &str = "curie";
@@ -39,6 +39,8 @@ const MIB: u128 = 1024 * 1024;
 const HELM_TIMEOUT: &str = "10m";
 const MANAGED_HELM_RELEASES: [&str; 4] = ["grafana", "loki", "alloy", "prometheus"];
 const GRAFANA_ADMIN_SECRET: &str = "grafana-admin";
+const GRAFANA_CONNECTOR_SECRET: &str = "curie-grafana-connector";
+const GRAFANA_CONNECTOR_KEY: &str = "GRAFANA_SERVICE_ACCOUNT_TOKEN";
 const GRAFANA_RELEASE: &str = "grafana";
 const READER_IDENTITY: &str = "sre-bot-kubernetes";
 const READER_TOKEN_SECRET: &str = "sre-bot-kubernetes-token";
@@ -263,6 +265,45 @@ impl InstallIdentity {
 pub enum SreBotInstallResult {
     DryRun(DryRunPlan),
     Installed(Box<commands::DeployOutput>),
+}
+
+pub struct ObservabilityProvisionOpts {
+    pub namespace: String,
+    pub release: String,
+    pub observability_namespace: String,
+    pub chart: Option<String>,
+    pub dry_run: bool,
+}
+
+pub enum ObservabilityProvisionResult {
+    DryRun(DryRunPlan),
+    Ready(ObservabilityProvisionOutput),
+}
+
+pub struct ObservabilityProvisionOutput {
+    pub namespace: String,
+    pub release: String,
+    pub observability_namespace: String,
+}
+
+impl CliOutput for ObservabilityProvisionOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "secret": GRAFANA_CONNECTOR_SECRET,
+            "key": GRAFANA_CONNECTOR_KEY,
+            "namespace": self.namespace,
+            "release": self.release,
+            "observability_namespace": self.observability_namespace,
+            "ready": true,
+        })
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!(
+            "Secret {GRAFANA_CONNECTOR_SECRET} key {GRAFANA_CONNECTOR_KEY} is ready in namespace {}",
+            self.namespace
+        ));
+    }
 }
 
 #[derive(Clone)]
@@ -666,6 +707,172 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     )
     .await?;
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
+}
+
+pub fn observability_provision_plan(
+    chart: &str,
+    namespace: &str,
+    release: &str,
+    observability_namespace: &str,
+) -> Vec<String> {
+    let identity = InstallIdentity {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        observability_namespace: observability_namespace.to_string(),
+    };
+    let chart = Path::new(chart);
+    let mut lines = vec![
+        format!("create namespace {observability_namespace} when it is absent"),
+        format!(
+            "preserve or create Secret {GRAFANA_ADMIN_SECRET} in namespace {observability_namespace} (without exposing its generated password)"
+        ),
+    ];
+    lines.extend(
+        stack_install_commands(observability_namespace)
+            .into_iter()
+            .map(|command| command.display(chart)),
+    );
+    lines.push(curie_integration_command(&identity).display(chart));
+    lines.push(format!(
+        "require Secret {GRAFANA_CONNECTOR_SECRET} in namespace {namespace} to contain key {GRAFANA_CONNECTOR_KEY}"
+    ));
+    lines
+}
+
+pub async fn provision_observability(
+    opts: ObservabilityProvisionOpts,
+) -> Result<ObservabilityProvisionResult> {
+    if opts.dry_run {
+        let chart = opts.chart.as_deref().unwrap_or("charts/curie");
+        return Ok(ObservabilityProvisionResult::DryRun(DryRunPlan {
+            lines: observability_provision_plan(
+                chart,
+                &opts.namespace,
+                &opts.release,
+                &opts.observability_namespace,
+            ),
+        }));
+    }
+
+    require_existing_release(&opts.release, &opts.namespace).await?;
+    let chart = provision_chart(opts.chart.as_deref()).await?;
+    preflight_capacity(&opts.observability_namespace).await?;
+    ensure_grafana_admin_secret(&opts.observability_namespace).await?;
+    let workspace = EmbeddedWorkspace::create_observability(&opts.observability_namespace)?;
+    let identity = InstallIdentity {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        observability_namespace: opts.observability_namespace.clone(),
+    };
+    for command in stack_install_commands(&identity.observability_namespace) {
+        run_install_command(&command, &workspace, &chart).await?;
+    }
+    let integration = curie_integration_command(&identity);
+    run_install_command(&integration, &workspace, &chart).await?;
+    require_grafana_connector_token(&identity.namespace).await?;
+    Ok(ObservabilityProvisionResult::Ready(
+        ObservabilityProvisionOutput {
+            namespace: opts.namespace,
+            release: opts.release,
+            observability_namespace: opts.observability_namespace,
+        },
+    ))
+}
+
+async fn require_existing_release(release: &str, namespace: &str) -> Result<()> {
+    crate::ops::require_on_path("helm")?;
+    let output = tokio::process::Command::new("helm")
+        .args(["status", release, "--namespace", namespace])
+        .output()
+        .await
+        .with_context(|| {
+            format!("failed to run `helm status {release} --namespace {namespace}`")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if crate::ops::failure_reason(&stderr) == "Error: release: not found" {
+        return Err(crate::exit::usage(format!(
+            "release {release} in namespace {namespace} does not exist; run `curie cluster up` before provisioning observability"
+        )));
+    }
+    let reason = crate::ops::failure_reason(&stderr);
+    Err(crate::exit::CliError::failure(format!(
+        "could not read Helm status for release {release} in namespace {namespace}: {reason}"
+    ))
+    .into())
+}
+
+async fn provision_chart(chart: Option<&str>) -> Result<PathBuf> {
+    if let Some(chart) = chart {
+        let path = PathBuf::from(chart);
+        if path.is_dir() {
+            return Ok(path);
+        }
+        return Err(crate::exit::usage(format!(
+            "chart directory {} does not exist",
+            path.display()
+        )));
+    }
+    let resolved = crate::artifacts::resolve_chart(
+        None,
+        crate::artifacts::Channel::current(),
+        crate::artifacts::version(),
+        crate::artifacts::cache_root,
+        Path::new("charts/curie").is_dir(),
+    )?;
+    let path = crate::artifacts::ensure_cached(&resolved).await?;
+    if path.exists() {
+        return Ok(path);
+    }
+    Err(crate::exit::usage(format!(
+        "chart {} does not exist",
+        path.display()
+    )))
+}
+
+async fn require_grafana_connector_token(namespace: &str) -> Result<()> {
+    let output = tokio::process::Command::new("kubectl")
+        .args([
+            "get",
+            "secret",
+            GRAFANA_CONNECTOR_SECRET,
+            "--namespace",
+            namespace,
+            "-o",
+            "json",
+        ])
+        .output()
+        .await
+        .context("reading the Grafana connector Secret")?;
+    let present = output.status.success()
+        && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .is_ok_and(|secret| grafana_connector_token_present(&secret));
+    drop(output);
+    if present {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::failure(format!(
+        "key {GRAFANA_CONNECTOR_KEY} is absent from Secret {GRAFANA_CONNECTOR_SECRET} in namespace {namespace}"
+    ))
+    .into())
+}
+
+fn grafana_connector_token_present(secret: &serde_json::Value) -> bool {
+    let Some(encoded) = secret
+        .pointer("/data/GRAFANA_SERVICE_ACCOUNT_TOKEN")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(token) = String::from_utf8(decoded) else {
+        return false;
+    };
+    !token.trim().is_empty()
 }
 
 /// Apply the upgrade path's objects and mint the connector's kubeconfig.
@@ -1641,11 +1848,7 @@ impl EmbeddedWorkspace {
         std::fs::create_dir(&root)
             .with_context(|| format!("creating embedded SRE bot workspace {}", root.display()))?;
         let workspace = Self { root };
-        for (name, contents) in OBSERVABILITY_FILES {
-            let rendered =
-                rewrite_observability_namespace(contents, &identity.observability_namespace);
-            workspace.write(&Path::new("observability").join(name), &rendered)?;
-        }
+        workspace.write_observability_files(&identity.observability_namespace)?;
         for (name, contents) in BUNDLE_FILES {
             if *name == "connectors.yaml" {
                 let runtime = runtime_connector_declaration(
@@ -1702,6 +1905,23 @@ impl EmbeddedWorkspace {
         Ok(workspace)
     }
 
+    fn create_observability(observability_namespace: &str) -> Result<Self> {
+        let root = std::env::temp_dir().join(format!(
+            "curie-sre-bot-observability-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).with_context(|| {
+            format!(
+                "creating embedded observability workspace {}",
+                root.display()
+            )
+        })?;
+        let workspace = Self { root };
+        workspace.write_observability_files(observability_namespace)?;
+        Ok(workspace)
+    }
+
     fn write(&self, relative: &Path, contents: &[u8]) -> Result<()> {
         let path = self.root.join(relative);
         if let Some(parent) = path.parent() {
@@ -1717,6 +1937,14 @@ impl EmbeddedWorkspace {
 
     fn bundle_dir(&self) -> PathBuf {
         self.root.join("bundle")
+    }
+
+    fn write_observability_files(&self, observability_namespace: &str) -> Result<()> {
+        for (name, contents) in OBSERVABILITY_FILES {
+            let rendered = rewrite_observability_namespace(contents, observability_namespace);
+            self.write(&Path::new("observability").join(name), &rendered)?;
+        }
+        Ok(())
     }
 }
 

@@ -65,6 +65,13 @@ permanent overlay deployed.
 5. Permanent soak remains an operator step after that disposable proof. It is
    not performed by implementation tasks.
 
+   A Prometheus with no history of a running Curie, such as a first install
+   against the soak or one whose volume was lost, treats every Curie counter
+   as new. Each counter rule whose counter is already at its threshold pages
+   once, for about its window, and then clears. Expect that one burst after
+   the install: it reports failures counted before this Prometheus saw them,
+   not new ones.
+
 ## Rollback
 
 Roll Prometheus and the Curie release back to the prior Helm revision. Verify

@@ -168,6 +168,15 @@ class Settings(BaseSettings):
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
     github_factory_card_base_url: str = ""
+    # How long a published factory run waits on its pull request's CI, from the
+    # push (#3162). The execution deadline still caps it; at most 10800 s, the
+    # longest execution deadline (ADR 0171).
+    github_factory_ci_wait_s: int = Field(
+        default=1200,
+        gt=0,
+        le=10800,
+        validation_alias="GITHUB_FACTORY_CI_WAIT_S",
+    )
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -245,6 +254,10 @@ class Settings(BaseSettings):
     # keyspace. Match WorkerConfig's actual legacy environment contract:
     # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.
     worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
+    # The Helm installation the worker's upgrade quiesce marker is scoped to
+    # (#2374, mirrored from WorkerConfig.installation_id). Blank is standalone
+    # or Compose, which use the legacy release-wide key.
+    installation_id: str = Field(default="", validation_alias="CURIE_INSTALLATION_ID")
 
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
@@ -586,6 +599,17 @@ class Settings(BaseSettings):
         # through from_url to the pool (#2315).
         scheme = "rediss" if self.valkey_tls else "redis"
         return f"{scheme}://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
+
+    def upgrade_quiesce_key(self) -> str:
+        # Mirrors WorkerConfig.upgrade_quiesce_key (#2374, #3127): one
+        # authoritative "stop taking new work" marker per Helm installation,
+        # written by the worker with the same key_prefix and installation_id.
+        # A blank installation_id (standalone or Compose) keeps the legacy
+        # release-wide key.
+        legacy_key = f"{self.worker_key_prefix}:upgrade:quiesce"
+        if not self.installation_id:
+            return legacy_key
+        return f"{legacy_key}:{self.installation_id}"
 
     @model_validator(mode="after")
     def _validate_github_repo_allowlist(self) -> "Settings":

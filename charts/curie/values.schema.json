@@ -46,6 +46,12 @@
           "type": "string",
           "description": "Public https origin GitHub's image proxy fetches the live factory status card from. Empty omits the card image."
         },
+        "githubFactoryCiWaitSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10800,
+          "description": "Seconds a published factory run waits on its pull request's CI, from the push. The execution deadline still caps it."
+        },
         "githubFactoryMention": {
           "type": "string",
           "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."
@@ -138,7 +144,7 @@
               "type": "integer",
               "exclusiveMinimum": 0,
               "maximum": 86400,
-              "description": "Floor for the lifetime of the fleet-wide quiesce flag, derived above the effective drain wait so it cannot lapse mid-drain. Setting it at or below timeoutSeconds is refused at render time. Finite by construction, so an upgrade killed between the two hooks cannot leave the fleet permanently unable to claim."
+              "description": "Roll hold: lifetime of the fleet-wide quiesce flag after a clean drain, capped at the effective drain wait (issue #3127). While the gate waits, the flag is a short lease renewed every poll, so a killed gate releases the fleet within one lease. Finite by construction, so an upgrade killed between the two hooks cannot leave the fleet permanently unable to claim."
             },
             "resources": {"type": "object"}
           }

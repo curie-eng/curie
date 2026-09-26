@@ -20,13 +20,16 @@ from typing import Any
 
 from .factory_progress import PhaseSlot, PhaseView, pill_for
 
-WIDTH, HEIGHT = 800, 300
+# 878 is the content width of a GitHub issue comment at the capped desktop
+# layout (viewport 1366 and wider), so the card fills the box with no gutter.
+# Narrower columns scale it down through GitHub's img max-width: 100%.
+WIDTH, HEIGHT = 878, 300
 _TITLE_MAX = 70
 _NOTE_MAX = 110
 _TEXT_MAX = 40
 _CAUSE_MAX = 110
 _GRID_LEFT = 48
-_GRID_WIDTH = 750
+_GRID_WIDTH = WIDTH - 50
 _GRID_Y = (150, 190, 230)
 _ROWS = 3
 _BOW = 22
@@ -152,7 +155,7 @@ def _arcs(view: PhaseView) -> list[str]:
 
 
 def render_card(card: CardInput) -> str:
-    """Render the 800x300 status card as a standalone SVG document."""
+    """Render the WIDTH x HEIGHT status card as a standalone SVG document."""
 
     label, color, live = pill_for(card.status, card.publishing)
     subject = f"{card.repo} #{card.issue_number}"

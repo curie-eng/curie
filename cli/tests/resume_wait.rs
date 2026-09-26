@@ -401,7 +401,18 @@ async fn run_local_message_terminal(debug: bool) -> Option<String> {
     std::fs::write(
         &fake_docker,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  ps) echo curie-test-worker ;;\n  inspect) echo /tmp/curie-test-compose.yaml ;;\n  compose) exec '{}' -m curie_dispatcher.enqueue_once ;;\n  *) echo unsupported fake docker command >&2; exit 64 ;;\nesac\n",
+            r#"#!/bin/sh
+case "$1" in
+  ps) echo curie-test-worker ;;
+  inspect) echo /tmp/curie-test-compose.yaml ;;
+  compose)
+    case " $* " in
+      *" exec "*) printf '%s\n' '{{"state":"claims_enabled","since":null,"revision":null,"ttl_seconds":null}}' ;;
+      *) exec '{}' -m curie_dispatcher.enqueue_once ;;
+    esac ;;
+  *) echo unsupported fake docker command >&2; exit 64 ;;
+esac
+"#,
             python.display()
         ),
     )

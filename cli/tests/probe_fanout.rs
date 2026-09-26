@@ -148,7 +148,7 @@ RULES = {
     ("kubectl", ("get", "pods", "-n", "curie", "-l", WORKER_SELECTOR, "-o", "json")):
         '{"items":[{"metadata":{"name":"curie-worker-current","labels":{"app.kubernetes.io/instance":"curie","app.kubernetes.io/component":"worker"}},"status":{"phase":"Running"}}]}\n',
     ("kubectl", ("exec", "-n", "curie", "curie-worker-current", "--", "python", "-m",
-                 "curie_worker.upgrade_drain", "--mode", "status", "--json")):
+                 "curie_worker.upgrade_drain", "--mode", "status", "--json", "--with-ttl")):
         '{"state":"claims_enabled","since":null,"revision":null}\n',
     ("kubectl", ("exec", "-n", "curie", "curie-worker-current", "--", "python", "-m",
                  "curie_worker.completion_health", "--json")):

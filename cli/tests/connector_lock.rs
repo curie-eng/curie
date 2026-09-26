@@ -91,7 +91,10 @@ fn declaring_a_build(connector: &str) -> ConnectorsFileDecl {
             ..Default::default()
         },
     );
-    ConnectorsFileDecl { connectors }
+    ConnectorsFileDecl {
+        connectors,
+        ..Default::default()
+    }
 }
 
 fn declaring_an_image(connector: &str) -> ConnectorsFileDecl {
@@ -103,7 +106,10 @@ fn declaring_an_image(connector: &str) -> ConnectorsFileDecl {
             ..Default::default()
         },
     );
-    ConnectorsFileDecl { connectors }
+    ConnectorsFileDecl {
+        connectors,
+        ..Default::default()
+    }
 }
 
 fn lock_for(
@@ -125,6 +131,7 @@ fn lock_for(
     ConnectorLockFileDecl {
         version: LOCK_VERSION,
         connectors,
+        ..Default::default()
     }
 }
 
@@ -637,4 +644,102 @@ fn the_fix_line_names_the_operators_own_bundle_directory() {
         !fix.contains("/tmp/"),
         "a temp path means the preflight ran after the pack: {fix}"
     );
+}
+
+// ─── The layered runner (ADR 0173 decisions 1 and 2) ─────────────────────────
+//
+// Built through the public readers rather than struct literals so the tests
+// state the operator's files, not the mirror's field layout.
+
+const RUNNER_DECL: &str = "connectors: {}\nrunner:\n  build:\n    context: runner\n    \
+                           platforms: [linux/amd64, linux/arm64]\n";
+
+fn runner_lock(image: &str, base: &str, delivery: &str) -> ConnectorLockFileDecl {
+    curie::connector_build::parse_lock(&format!(
+        "version: 1\nconnectors: {{}}\nrunner:\n  image: {image}\n  base: {base}\n  \
+         delivery: {delivery}\n  platforms: [linux/amd64, linux/arm64]\n  source_digest: {FRESH}\n"
+    ))
+    .expect("a well formed runner lock")
+}
+
+const RUNNER_PUSHED: &str = "registry.example/acme/sre-bot-runner@sha256:\
+                             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const RUNNER_BASE: &str = "ghcr.io/curie-eng/curie-runner@sha256:\
+                           bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// A declared runner with no runner entry in the lock is refused at both
+/// tiers, naming the runner and the command that writes it. Deploying anyway
+/// would run the platform runner and silently drop every tool the layer adds.
+#[test]
+fn a_declared_runner_with_no_lock_entry_is_refused_at_both_tiers() {
+    let decl = curie::connector_build::parse_connectors(RUNNER_DECL).expect("runner decl");
+    let empty =
+        curie::connector_build::parse_lock("version: 1\nconnectors: {}\n").expect("an empty lock");
+    for lock in [None, Some(&empty)] {
+        for tier in [DeployTier::Local, DeployTier::Cluster] {
+            let error = lock_preflight(&plugin_dir(), &decl, lock, &BTreeMap::new(), tier)
+                .expect_err("an unlocked runner layer must be refused");
+            assert_actionable_usage_refusal(&error, &["runner", "curie build --plugin-dir"]);
+        }
+    }
+}
+
+/// A local-daemon runner layer deploys locally and is refused at cluster: the
+/// same pair as for connectors, because the same pair is the property.
+#[test]
+fn a_local_daemon_runner_deploys_locally_and_is_refused_at_cluster() {
+    let decl = curie::connector_build::parse_connectors(RUNNER_DECL).expect("runner decl");
+    let lock = runner_lock(LOCAL_ID, LOCAL_ID, "local-daemon");
+
+    lock_preflight(
+        &plugin_dir(),
+        &decl,
+        Some(&lock),
+        &BTreeMap::new(),
+        DeployTier::Local,
+    )
+    .expect("a local-daemon runner layer is what `curie local deploy` is for");
+
+    let error = lock_preflight(
+        &plugin_dir(),
+        &decl,
+        Some(&lock),
+        &BTreeMap::new(),
+        DeployTier::Cluster,
+    )
+    .expect_err("a cluster node cannot pull the runner from the operator's daemon");
+    assert_actionable_usage_refusal(&error, &["runner", "--registry"]);
+}
+
+/// The open state: a registry runner entry passes at both tiers.
+#[test]
+fn a_registry_runner_lock_passes_at_both_tiers() {
+    let decl = curie::connector_build::parse_connectors(RUNNER_DECL).expect("runner decl");
+    let lock = runner_lock(RUNNER_PUSHED, RUNNER_BASE, "registry");
+    for tier in [DeployTier::Local, DeployTier::Cluster] {
+        lock_preflight(&plugin_dir(), &decl, Some(&lock), &BTreeMap::new(), tier).unwrap_or_else(
+            |error| panic!("a registry runner lock must deploy ({tier:?}): {error:#}"),
+        );
+    }
+}
+
+/// `parse_lock` refuses a tag in either runner field, so neither `skill up`
+/// nor a deploy can start from one.
+#[test]
+fn a_tag_in_the_runner_image_or_base_is_refused_at_the_read() {
+    for (image, base) in [
+        ("registry.example/acme/sre-bot-runner:v1", RUNNER_BASE),
+        (RUNNER_PUSHED, "ghcr.io/curie-eng/curie-runner:0.10.0"),
+    ] {
+        let document = format!(
+            "version: 1\nconnectors: {{}}\nrunner:\n  image: {image}\n  base: {base}\n  \
+             delivery: registry\n  platforms: [linux/amd64]\n  source_digest: {FRESH}\n"
+        );
+        let error = curie::connector_build::parse_lock(&document)
+            .expect_err("a mutable tag must be refused in the runner entry");
+        assert!(
+            format!("{error:#}").contains("runner"),
+            "the refusal must name the runner entry: {error:#}"
+        );
+    }
 }

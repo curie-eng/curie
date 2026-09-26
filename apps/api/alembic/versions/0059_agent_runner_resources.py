@@ -5,8 +5,8 @@ Adds nullable ``agents.runner_resources``. NULL means the chart
 limits block the next sandbox claim copies onto a worker-owned template.
 An existing sandbox is not resized.
 
-Revision ID: 0058
-Revises: 0057
+Revision ID: 0059
+Revises: 0058
 Create Date: 2026-09-25
 """
 
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0058"
-down_revision: str | None = "0057"
+revision: str = "0059"
+down_revision: str | None = "0058"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -62,6 +62,16 @@ logger = logging.getLogger(__name__)
 
 _SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
 
+# The CLI's built-in instructions tell the model to end commits with a
+# "Co-Authored-By: Claude" trailer and PR bodies with the "Generated with
+# [Claude Code]" footer (#3193). Both texts are governed by the CLI's
+# ``attribution`` settings object; an empty string hides each. Delivered on
+# the flag-settings layer (``ClaudeAgentOptions.settings``, the ``--settings``
+# CLI flag, highest priority among user-controlled settings), and with both
+# texts empty the CLI emits no attribution instruction at all, so no model --
+# Claude or otherwise -- ever sees one.
+_SDK_ATTRIBUTION_OFF_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
+
 
 class _SeededSessionStore:
     """SDK mirror seeded from portable messages or an optional native checkpoint."""
@@ -107,6 +117,11 @@ class _SeededSessionStore:
             kind=kind,
             entries=tuple(json.loads(json.dumps(selected))),
         )
+
+    def request_full_checkpoint(self) -> None:
+        """The prior native export was not durable; reset the delta baseline."""
+
+        self._checkpoint_required = True
 
 
 @dataclass(frozen=True)
@@ -422,6 +437,9 @@ def build_options(
         # In-process platform tools (the approval-request gate, ADR-0010).
         mcp_servers=cast("Any", mcp_servers or {}),
         include_partial_messages=True,
+        # Commit/PR attribution off for every session this runner builds
+        # (#3193); see _SDK_ATTRIBUTION_OFF_SETTINGS above.
+        settings=_SDK_ATTRIBUTION_OFF_SETTINGS,
     )
 
 
@@ -488,6 +506,14 @@ class ClaudeAgentSession:
         if isinstance(store, _SeededSessionStore):
             return await store.export_replay_state()
         return None
+
+    def request_full_checkpoint(self) -> None:
+        """Make the next native export self contained after a bounded write."""
+
+        store = self._options.session_store
+        if not isinstance(store, _SeededSessionStore):
+            raise RuntimeError("native replay store is unavailable")
+        store.request_full_checkpoint()
 
     async def ensure_mcp_server(self, name: str) -> bool:
         """Confirm the SDK session's own MCP connection to ``name`` (#2634).

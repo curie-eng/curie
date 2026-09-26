@@ -42,7 +42,17 @@ def _vector_file(name: str) -> dict:
 _LOCKS = _vector_file("connector-lock.json")
 _DIGESTS = _vector_file("connector-source-digest.json")
 
-_LOCK_KEYS = {"name", "why", "connectors", "lock", "portable", "expect", "resolved", "codes"}
+_LOCK_KEYS = {
+    "name",
+    "why",
+    "connectors",
+    "lock",
+    "portable",
+    "expect",
+    "resolved",
+    "resolved_runner",
+    "codes",
+}
 _DIGEST_KEYS = {"name", "why", "tree", "build", "source_digest"}
 
 # A registry manifest digest is `<repo>@sha256:` plus 64 lowercase hex
@@ -265,14 +275,22 @@ def test_lock_vectors(vector: dict) -> None:
         assert errors == [], f"{vector['name']} must parse cleanly, got {codes}"
 
     if vector["expect"] == "raise":
+        # The deploy path runs both resolvers; either may be the one refusing
+        # (ADR 0173 puts the runner's refusals in resolve_runner_image).
         with pytest.raises(ValueError):
             connector_lock.apply_lock(declared, parsed_lock, portable=vector["portable"])
+            connector_lock.resolve_runner_image(declared, parsed_lock, portable=vector["portable"])
         return
 
     resolved = connector_lock.apply_lock(declared, parsed_lock, portable=vector["portable"])
     for name, image in vector["resolved"].items():
         assert resolved.connectors[name].image == image
         assert resolved.connectors[name].build is None
+    if "resolved_runner" in vector:
+        assert (
+            connector_lock.resolve_runner_image(declared, parsed_lock, portable=vector["portable"])
+            == vector["resolved_runner"]
+        )
 
 
 def test_lock_model_field_names_match_the_frozen_vector() -> None:
@@ -285,6 +303,129 @@ def test_lock_model_field_names_match_the_frozen_vector() -> None:
     fields = _vector_file("connector-fields.json")["models"]
     assert set(ConnectorLockFile.model_fields) == set(fields["ConnectorLockFile"])
     assert set(ConnectorLockEntry.model_fields) == set(fields["ConnectorLockEntry"])
+
+
+def test_runner_lock_model_field_names_match_the_frozen_vector() -> None:
+    from plugin_format.connector_lock import RunnerLockEntry
+
+    fields = _vector_file("connector-fields.json")["models"]
+    assert set(RunnerLockEntry.model_fields) == set(fields["RunnerLockEntry"])
+
+
+# --------------------------------------------------------------------------- #
+# resolve_runner_image: the single runner resolver (ADR 0173 decision 2)
+# --------------------------------------------------------------------------- #
+RUNNER = {
+    "connectors": {},
+    "runner": {"build": {"context": "runner", "platforms": ["linux/amd64", "linux/arm64"]}},
+}
+_RUNNER_IMAGE = "registry.example/acme/acme-bot-runner@sha256:" + "a" * 64
+_RUNNER_BASE = "ghcr.io/curie-eng/curie-runner@sha256:" + "b" * 64
+
+
+def _runner_lock(
+    image: str = _RUNNER_IMAGE, base: str = _RUNNER_BASE, delivery: str = "registry"
+) -> dict:
+    return {
+        "version": 1,
+        "connectors": {},
+        "runner": {
+            "image": image,
+            "base": base,
+            "delivery": delivery,
+            "platforms": ["linux/amd64", "linux/arm64"],
+            "source_digest": _SOURCE_DIGEST,
+        },
+    }
+
+
+def test_no_declared_runner_resolves_to_none() -> None:
+    # Every existing bundle: the platform runner is used, lock or no lock.
+    from plugin_format import connector_lock
+
+    assert connector_lock.resolve_runner_image(_declared(BUILT), None, portable=True) is None
+    assert (
+        connector_lock.resolve_runner_image(
+            _declared(BUILT), _parse_lock(_lock(_REGISTRY_IMAGE)), portable=True
+        )
+        is None
+    )
+
+
+def test_a_locked_runner_resolves_to_exactly_the_recorded_image() -> None:
+    from plugin_format import connector_lock
+
+    assert (
+        connector_lock.resolve_runner_image(
+            _declared(RUNNER), _parse_lock(_runner_lock()), portable=True
+        )
+        == _RUNNER_IMAGE
+    )
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        None,
+        {"version": 1, "connectors": {}},
+        _runner_lock(image="registry.example/acme/acme-bot-runner:v1"),
+        _runner_lock(base="ghcr.io/curie-eng/curie-runner:0.10.0"),
+    ],
+    ids=["no-lock", "no-runner-entry", "tag-image", "tag-base"],
+)
+def test_a_declared_runner_without_a_pinned_lock_is_refused(lock: dict | None) -> None:
+    from plugin_format import connector_lock
+
+    parsed = None if lock is None else _parse_lock(lock)
+    with pytest.raises(ValueError) as exc:
+        connector_lock.resolve_runner_image(_declared(RUNNER), parsed, portable=False)
+    assert "runner" in str(exc.value)
+
+
+def test_a_local_daemon_runner_is_refused_only_where_portability_is_required() -> None:
+    from plugin_format import connector_lock
+
+    lock = _parse_lock(
+        _runner_lock(image=_LOCAL_IMAGE, base="sha256:" + "b" * 64, delivery="local-daemon")
+    )
+    assert (
+        connector_lock.resolve_runner_image(_declared(RUNNER), lock, portable=False) == _LOCAL_IMAGE
+    )
+    with pytest.raises(ValueError):
+        connector_lock.resolve_runner_image(_declared(RUNNER), lock, portable=True)
+
+
+def test_resolve_runner_image_portable_is_keyword_only() -> None:
+    from plugin_format import connector_lock
+
+    with pytest.raises(TypeError):
+        connector_lock.resolve_runner_image(  # type: ignore[misc]
+            _declared(RUNNER), _parse_lock(_runner_lock()), True
+        )
+
+
+# --------------------------------------------------------------------------- #
+# The runner Dockerfile takes its base as CURIE_RUNNER_IMAGE (shared corpus)
+# --------------------------------------------------------------------------- #
+_RUNNER_DOCKERFILES = _vector_file("runner-dockerfile-base.json")
+
+
+def test_every_runner_dockerfile_vector_declares_only_modelled_keys() -> None:
+    for vector in _RUNNER_DOCKERFILES["vectors"]:
+        assert set(vector) == {"name", "why", "dockerfile", "expect"}, vector["name"]
+        assert vector["expect"] in {"accept", "reject"}
+
+
+@pytest.mark.parametrize("vector", _RUNNER_DOCKERFILES["vectors"], ids=lambda v: v["name"])
+def test_runner_dockerfile_base_vectors(vector: dict) -> None:
+    from plugin_format import connector_lock
+
+    message = connector_lock.check_runner_dockerfile(vector["dockerfile"])
+    if vector["expect"] == "accept":
+        assert message is None, f"{vector['name']}: {message}"
+    else:
+        assert message, f"{vector['name']} must be refused"
+        assert "CURIE_RUNNER_IMAGE" in message
 
 
 # --------------------------------------------------------------------------- #

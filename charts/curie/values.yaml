@@ -77,13 +77,20 @@ placement:
     affinity: {}
 
 # ---------------------------------------------------------------------------
-# PriorityClass (ADR-0059 decision 5): ranks the control plane -- worker, api,
-# dispatcher, and the data tier (postgres, valkey, clickhouse, rustfs) -- above
-# sandbox pods for node-pressure eviction, so the components that supervise,
-# drain, and reclaim a sandbox are never themselves preferred for eviction over
-# the sandboxes they manage. Priority is a ranking and preemption lever, not
-# immunity: a node fully out of a resource (e.g. disk) can still take anything
-# down regardless of priority.
+# PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
+# dispatcher, the data tier (postgres, valkey, clickhouse, rustfs), and the
+# observability and UI tier (langfuse web/worker, the OTel collector, the UI,
+# inference, the mail adapter) -- above sandbox pods for node-pressure
+# eviction, so the components that supervise, drain, and reclaim a sandbox --
+# and the components that carry its traces and metrics -- are never themselves
+# preferred for eviction over the sandboxes they manage. The observability and
+# UI tier joined the platform set in #3182: at priority 0 those pods were
+# preempted by the very sandboxes whose telemetry they collect, and the
+# collector's OTLP endpoint went `Connection refused` mid-run. The
+# runner-prewarm DaemonSet deliberately stays UNCLASSED (priority 0, below
+# `sandbox`): the image-cache pod is the designated sacrifice. Priority is a
+# ranking and preemption lever, not immunity: a node fully out of a resource
+# (e.g. disk) can still take anything down regardless of priority.
 #
 # Both names are cluster-scoped (PriorityClass has no namespace), so installing
 # a second curie release into the SAME cluster must override one release's
@@ -97,7 +104,9 @@ placement:
 priorityClasses:
   platform:
     # Renders the PriorityClass and sets priorityClassName on every
-    # control-plane pod. Set false (and repoint `name` at an existing class) if
+    # long-running platform workload (control plane, data tier, observability
+    # and UI; the full inventory is pinned by ci/render-assertions.sh
+    # Assertion 8). Set false (and repoint `name` at an existing class) if
     # the cluster/another release already defines an equivalent one.
     create: true
     name: curie-platform
@@ -1127,8 +1136,12 @@ api:
   githubFactoryLabel: ""
   githubFactoryMention: ""
   # Public https origin GitHub's image proxy fetches the live factory status card
-  # from (#3077). Empty omits the card image; the comment keeps its checklist.
+  # from (#3077). Set, the card replaces the phase checklist (#3125); empty omits
+  # the card and the comment shows the checklist instead.
   githubFactoryCardBaseUrl: ""
+  # Seconds a published factory run waits on its pull request's CI, from the
+  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
+  githubFactoryCiWaitSeconds: 1200
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -1211,6 +1224,9 @@ api:
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
+  # Each sweep also records curie_approval_pending, so 0 stops that gauge too;
+  # the SRE bot example's CurieApplicationMetricsAbsent reads it, and an install
+  # that disables the sweeper drops that term.
   approvalSweepIntervalSeconds: 30
   # Break-glass approval recovery (#2753). OFF by default. Turn it on only for
   # the duration of a recovery, then turn it off again.
@@ -1979,17 +1995,15 @@ worker:
     timeoutSeconds: 900
     # How often the gate re-reads the in-flight set while waiting.
     pollIntervalSeconds: 5
-    # How long the quiesce flag lives. Also a floor: it is derived above the
-    # EFFECTIVE wait above, because the worker refuses a TTL that does not
-    # outlast the drain at boot, and a render the app rejects is a green
-    # `helm upgrade` followed by a CrashLoopBackOff. Finite by construction, so
-    # an upgrade killed between the two hooks cannot leave the fleet
-    # permanently unable to claim. Size it to span the expected rollout: the
-    # flag is what keeps replacement Pods from reclaiming mid-roll.
-    #
-    # Setting it at or below timeoutSeconds IS refused at render time -- that
-    # pair is written together, so contradicting yourself there is a stated
-    # intent worth surfacing rather than silently raising.
+    # The roll hold: how long the quiesce flag lives after a CLEAN drain, while
+    # the roll runs and until the post-upgrade release clears it. Capped at the
+    # EFFECTIVE wait above (#3127), so a gate whose roll never follows cannot
+    # strand a paused fleet for longer than the upgrade could have waited.
+    # While the gate is still waiting, the flag is a short lease renewed every
+    # poll (max(30s, 3 x pollIntervalSeconds)), so a gate Job that is deleted,
+    # times out or is killed releases the fleet at once or within one lease.
+    # Size it to span the expected rollout: the flag is what keeps replacement
+    # Pods from reclaiming mid-roll.
     quiesceTtlSeconds: 1800
     resources:
       requests:
@@ -2251,6 +2265,16 @@ agentSandbox:
   #         ports:
   #           - { protocol: TCP, port: 443 }
   registryEgress: {}
+  # Per-agent layered runner image (ADR-0173): agent name -> the runner image
+  # that agent's bundle layers on the platform runner, as the digest reference
+  # `<repository>@sha256:<64 hex>` that `curie build` records in the bundle's
+  # connectors.lock.yaml. A tag is refused at render time. Each listed agent
+  # gets its own SandboxTemplate and warm pool rendering that digest, every
+  # other template keeps runner.image, and the runner prewarm DaemonSet also
+  # pulls each distinct digest so a cold boot never pulls an image.
+  #   runnerImages:
+  #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
+  runnerImages: {}
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with

@@ -915,3 +915,48 @@ async def test_a_hook_conversation_id_does_not_thread_an_approval_card() -> None
     )
 
     assert seen["thread_ts"] is None, seen
+
+
+# MEASURED 2026-09-25 against api.slack.com with a bot token, from a 0.9.2
+# worker pod: chat.update accepted 4,000 ASCII characters and refused 4,001 with
+# msg_too_long, and refused 4,000 characters that included the multi-byte "•"
+# and "—" a receipt uses. chat.postMessage accepted 40,001. The edit limit is
+# 4,000 bytes of UTF-8, and it is the one a streamed reply meets (#3064).
+_EDIT_LIMIT_BYTES = 4000
+
+
+def _captured_update(text: str) -> str:
+    sink = SlackReplyAdapter("xoxb-test")
+    captured: dict[str, str] = {}
+
+    async def _fake_chat_update(*, channel: str, ts: str, text: str) -> None:
+        captured["text"] = text
+
+    sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
+    asyncio.run(_update(sink, text=text))
+    return captured["text"]
+
+
+def test_an_edit_over_slacks_limit_is_cut_to_fit_and_says_so() -> None:
+    # Before #3064 the whole edit went out, Slack refused it, and the turn was
+    # lost and escalated as a worker restart. A cut reply still reaches the thread.
+    sent = _captured_update("A long report line.\n" * 600)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+    assert sent.startswith("A long report line.")
+    assert sent.rstrip().endswith("(Cut here: Slack refuses a longer edit.)_")
+
+
+def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
+    line = "• called `a_tool` — non-idempotent tool completed\n"
+    text = line * 78  # 3,900 characters: under the limit counted as characters
+    assert len(text) < _EDIT_LIMIT_BYTES < len(text.encode("utf-8"))
+
+    sent = _captured_update(text)
+
+    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+
+
+def test_an_edit_within_the_limit_is_sent_unchanged() -> None:
+    text = "x" * _EDIT_LIMIT_BYTES
+    assert _captured_update(text) == text

@@ -17,11 +17,13 @@ from urllib.parse import urlsplit
 # ``ApprovalCreate``; ``EvalReport`` kept its name.
 from aci_protocol import ApprovalRequest as ApprovalRequest
 from aci_protocol import EvalReport as EvalReport
+from aci_protocol import PublicationContext as PublicationContext
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
 from plugin_format.connector_render import agent_forges_join
 from pydantic import (
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -1787,6 +1789,47 @@ class ReviewRevisionOut(BaseModel):
 class ReviewRevisionCancel(BaseModel):
     origin_key: str = Field(min_length=1, max_length=180)
     expected_version: int = Field(ge=1, strict=True)
+
+
+class PublicationContextMint(BaseModel):
+    """Trusted worker identity for a running factory execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: uuid.UUID
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    runtime_epoch: int = Field(gt=0, strict=True)
+    queued_event_id: str = Field(min_length=1, max_length=1024)
+
+
+class PublicationPrecheck(BaseModel):
+    """Observed metadata and a proposal, with no caller selected resource."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_title: str = Field(max_length=256)
+    observed_body_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: AwareDatetime
+    proposed_title: str = Field(min_length=1, max_length=256)
+    proposed_body: str = Field(min_length=1, max_length=65_536)
+
+    @field_validator("observed_title", "proposed_title", "proposed_body")
+    @classmethod
+    def _utf8_metadata(cls, value: str) -> str:
+        value.encode("utf-8")
+        return value
+
+    @field_validator("proposed_title", "proposed_body")
+    @classmethod
+    def _nonblank_metadata(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("publication title and body must be nonblank")
+        return value
+
+
+class PublicationPrecheckResult(BaseModel):
+    result: Literal["unchanged", "metadata_changed"]
 
 
 class PublicationLineageAdvance(BaseModel):

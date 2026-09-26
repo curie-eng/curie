@@ -10,16 +10,25 @@
             "build": {
               "context": "connectors/k8s-write",
               "dockerfile": "Dockerfile",
-              "platforms": ["linux/amd64", "linux/arm64"]
+              "platforms": [
+                "linux/amd64",
+                "linux/arm64"
+              ]
             },
-            "env": { "K8S_WRITE_ALLOWLIST": "acme-ns/acme-api" },
-            "secret_files": { "K8S_WRITE_KUBECONFIG": "/secrets/kubeconfig" }
+            "env": {
+              "K8S_WRITE_ALLOWLIST": "acme-ns/acme-api"
+            },
+            "secret_files": {
+              "K8S_WRITE_KUBECONFIG": "/secrets/kubeconfig"
+            }
           }
         }
       },
       "expect": "accept",
       "codes": [],
-      "resolved_dockerfile": { "k8s-write": "Dockerfile" }
+      "resolved_dockerfile": {
+        "k8s-write": "Dockerfile"
+      }
     },
     {
       "name": "dockerfile_defaults_to_Dockerfile",
@@ -29,14 +38,18 @@
           "tempo": {
             "build": {
               "context": "connectors/tempo",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
       },
       "expect": "accept",
       "codes": [],
-      "resolved_dockerfile": { "tempo": "Dockerfile" }
+      "resolved_dockerfile": {
+        "tempo": "Dockerfile"
+      }
     },
     {
       "name": "a_named_dockerfile_inside_the_context_is_accepted",
@@ -47,14 +60,19 @@
             "build": {
               "context": "connectors/tempo",
               "dockerfile": "build/Dockerfile.tempo",
-              "platforms": ["linux/amd64", "linux/arm64"]
+              "platforms": [
+                "linux/amd64",
+                "linux/arm64"
+              ]
             }
           }
         }
       },
       "expect": "accept",
       "codes": [],
-      "resolved_dockerfile": { "tempo": "build/Dockerfile.tempo" }
+      "resolved_dockerfile": {
+        "tempo": "build/Dockerfile.tempo"
+      }
     },
     {
       "name": "build_and_image_together_are_ambiguous",
@@ -65,13 +83,17 @@
             "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1",
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.ambiguous"]
+      "codes": [
+        "connectors.ambiguous"
+      ]
     },
     {
       "name": "build_and_url_together_are_ambiguous",
@@ -82,24 +104,34 @@
             "url": "https://mcp.acme.example.com/mcp",
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.ambiguous"]
+      "codes": [
+        "connectors.ambiguous"
+      ]
     },
     {
       "name": "none_of_the_three_forms_is_underspecified",
       "why": "The message must now name all three forms. An author who meant to write `build:` and typed it wrong gets told the form exists.",
       "document": {
         "connectors": {
-          "k8s-write": { "secrets": ["K8S_WRITE_TOKEN"] }
+          "k8s-write": {
+            "secrets": [
+              "K8S_WRITE_TOKEN"
+            ]
+          }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.underspecified"]
+      "codes": [
+        "connectors.underspecified"
+      ]
     },
     {
       "name": "build_with_headers_is_rejected",
@@ -109,14 +141,20 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             },
-            "headers": { "Authorization": "Bearer ${ACME_TOKEN}" }
+            "headers": {
+              "Authorization": "Bearer ${ACME_TOKEN}"
+            }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.hosted_has_headers"]
+      "codes": [
+        "connectors.hosted_has_headers"
+      ]
     },
     {
       "name": "empty_platforms_is_rejected",
@@ -124,12 +162,17 @@
       "document": {
         "connectors": {
           "tempo": {
-            "build": { "context": "connectors/tempo", "platforms": [] }
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": []
+            }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_no_platforms"]
+      "codes": [
+        "connectors.build_no_platforms"
+      ]
     },
     {
       "name": "a_malformed_platform_string_is_rejected",
@@ -139,13 +182,18 @@
           "tempo": {
             "build": {
               "context": "connectors/tempo",
-              "platforms": ["linux/amd64", "nonsense"]
+              "platforms": [
+                "linux/amd64",
+                "nonsense"
+              ]
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_bad_platform"]
+      "codes": [
+        "connectors.build_bad_platform"
+      ]
     },
     {
       "name": "a_variant_qualified_platform_is_accepted",
@@ -155,14 +203,19 @@
           "tempo": {
             "build": {
               "context": "connectors/tempo",
-              "platforms": ["linux/amd64", "linux/arm/v7"]
+              "platforms": [
+                "linux/amd64",
+                "linux/arm/v7"
+              ]
             }
           }
         }
       },
       "expect": "accept",
       "codes": [],
-      "resolved_dockerfile": { "tempo": "Dockerfile" }
+      "resolved_dockerfile": {
+        "tempo": "Dockerfile"
+      }
     },
     {
       "name": "an_absolute_context_is_rejected",
@@ -170,12 +223,19 @@
       "document": {
         "connectors": {
           "k8s-write": {
-            "build": { "context": "/etc", "platforms": ["linux/amd64"] }
+            "build": {
+              "context": "/etc",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_context_escapes"]
+      "codes": [
+        "connectors.build_context_escapes"
+      ]
     },
     {
       "name": "a_context_with_a_parent_traversal_is_rejected",
@@ -185,24 +245,37 @@
           "k8s-write": {
             "build": {
               "context": "connectors/../../secrets",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_context_escapes"]
+      "codes": [
+        "connectors.build_context_escapes"
+      ]
     },
     {
       "name": "an_empty_context_is_rejected",
       "why": "An empty string normalizes to the bundle root on one reader and to the process working directory on another. Both are wrong and only one is obviously wrong.",
       "document": {
         "connectors": {
-          "k8s-write": { "build": { "context": "", "platforms": ["linux/amd64"] } }
+          "k8s-write": {
+            "build": {
+              "context": "",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
+          }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_context_escapes"]
+      "codes": [
+        "connectors.build_context_escapes"
+      ]
     },
     {
       "name": "a_dockerfile_with_a_parent_traversal_is_rejected",
@@ -213,13 +286,17 @@
             "build": {
               "context": "connectors/k8s-write",
               "dockerfile": "../../Dockerfile",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_dockerfile_escapes"]
+      "codes": [
+        "connectors.build_dockerfile_escapes"
+      ]
     },
     {
       "name": "an_absolute_dockerfile_is_rejected",
@@ -230,13 +307,17 @@
             "build": {
               "context": "connectors/k8s-write",
               "dockerfile": "/etc/Dockerfile",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_dockerfile_escapes"]
+      "codes": [
+        "connectors.build_dockerfile_escapes"
+      ]
     },
     {
       "name": "a_symlinked_dockerfile_leaving_the_context_is_refused",
@@ -247,17 +328,27 @@
             "build": {
               "context": "connectors/k8s-write",
               "dockerfile": "Dockerfile",
-              "platforms": ["linux/amd64"]
+              "platforms": [
+                "linux/amd64"
+              ]
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.build_dockerfile_escapes"],
+      "codes": [
+        "connectors.build_dockerfile_escapes"
+      ],
       "fixture": {
-        "outside_files": { "outside/Dockerfile": "FROM scratch\n" },
-        "bundle_files": { "connectors/k8s-write/server.py": "print('hi')\n" },
-        "bundle_symlinks": { "connectors/k8s-write/Dockerfile": "../../../outside/Dockerfile" }
+        "outside_files": {
+          "outside/Dockerfile": "FROM scratch\n"
+        },
+        "bundle_files": {
+          "connectors/k8s-write/server.py": "print('hi')\n"
+        },
+        "bundle_symlinks": {
+          "connectors/k8s-write/Dockerfile": "../../../outside/Dockerfile"
+        }
       }
     },
     {
@@ -268,14 +359,18 @@
           "k8s-write": {
             "build": {
               "context": "connectors/k8s-write",
-              "platforms": ["linux/amd64"],
+              "platforms": [
+                "linux/amd64"
+              ],
               "target": "runtime"
             }
           }
         }
       },
       "expect": "reject",
-      "codes": ["connectors.invalid"]
+      "codes": [
+        "connectors.invalid"
+      ]
     },
     {
       "name": "an_existing_image_connector_is_untouched",
@@ -284,9 +379,17 @@
         "connectors": {
           "grafana": {
             "image": "ghcr.io/acme-corp/mcp-grafana:0.17.2",
-            "args": ["-t", "streamable-http", "-disable-write"],
-            "env": { "GRAFANA_URL": "https://grafana.example.com" },
-            "secrets": ["GRAFANA_SERVICE_ACCOUNT_TOKEN"]
+            "args": [
+              "-t",
+              "streamable-http",
+              "-disable-write"
+            ],
+            "env": {
+              "GRAFANA_URL": "https://grafana.example.com"
+            },
+            "secrets": [
+              "GRAFANA_SERVICE_ACCOUNT_TOKEN"
+            ]
           }
         }
       },
@@ -300,13 +403,121 @@
         "connectors": {
           "internal": {
             "url": "https://mcp.acme.example.com/mcp",
-            "headers": { "Authorization": "Bearer ${INTERNAL_TOKEN}" },
-            "secrets": ["INTERNAL_TOKEN"]
+            "headers": {
+              "Authorization": "Bearer ${INTERNAL_TOKEN}"
+            },
+            "secrets": [
+              "INTERNAL_TOKEN"
+            ]
           }
         }
       },
       "expect": "accept",
       "codes": []
+    },
+    {
+      "name": "a_runner_build_block_is_accepted",
+      "why": "ADR 0173 decision 1: a bundle declares the source of its runner layer beside its connectors, in the same `build:` shape, so both readers accept it before anything is built.",
+      "document": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "dockerfile": "Dockerfile",
+            "platforms": [
+              "linux/amd64",
+              "linux/arm64"
+            ]
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
+    },
+    {
+      "name": "a_runner_build_beside_built_connectors_is_accepted",
+      "why": "The runner block is additive. A bundle that already builds connectors from source must keep validating when it also layers the runner.",
+      "document": {
+        "connectors": {
+          "tempo": {
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": [
+                "linux/amd64"
+              ]
+            }
+          }
+        },
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64"
+            ]
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": [],
+      "resolved_dockerfile": {
+        "tempo": "Dockerfile"
+      }
+    },
+    {
+      "name": "a_runner_build_context_escaping_the_bundle_is_rejected",
+      "why": "The runner build runs the same `docker buildx build` over a bundle-authored context, so the ADR 0113 containment rule applies unchanged: `..` must not walk out of the bundle.",
+      "document": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner/../../secrets",
+            "platforms": [
+              "linux/amd64"
+            ]
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": [
+        "connectors.build_context_escapes"
+      ]
+    },
+    {
+      "name": "a_runner_build_with_empty_platforms_is_rejected",
+      "why": "A silently single-arch runner layer is the same `no matching manifest` failure ADR 0113 names, surfacing only when a sandbox is scheduled on the other architecture.",
+      "document": {
+        "connectors": {},
+        "runner": {
+          "build": {
+            "context": "runner",
+            "platforms": []
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": [
+        "connectors.build_no_platforms"
+      ]
+    },
+    {
+      "name": "an_unknown_key_inside_runner_is_rejected",
+      "why": "The deny_unknown_fields proof for the runner block. `image:` is the plausible thing to reach for, and ADR 0173 deliberately has the bundle declare source only; dropping it silently would run the platform runner while the author believes their image is in use.",
+      "document": {
+        "connectors": {},
+        "runner": {
+          "image": "ghcr.io/acme-corp/acme-runner:v1",
+          "build": {
+            "context": "runner",
+            "platforms": [
+              "linux/amd64"
+            ]
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": [
+        "connectors.invalid"
+      ]
     }
   ]
 }

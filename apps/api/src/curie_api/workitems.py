@@ -61,6 +61,8 @@ ConflictCode = Literal[
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
 _IN_FLIGHT_PUBLICATION = ("pending", "approved", "launching", "running")
+# A failed finish that never published defers to an in-flight publication (#2577, #3128).
+_UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop"})
 # Longest provider message a factory notice keeps (#3073).
 _NOTICE_DETAIL_MAX = 1200
 
@@ -932,7 +934,7 @@ async def _terminalize_execution(
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
-    if status == "failed" and cause.strip() == "no_pull_request":
+    if status == "failed" and cause.strip() in _UNPUBLISHED_CAUSES:
         if await _publication_owns_terminus(session, work_item):
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request

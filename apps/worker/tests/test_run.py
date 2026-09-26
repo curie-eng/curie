@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -931,6 +932,7 @@ def test_supervise_policy_reads_worker_config() -> None:
         "max_restart_backoff_s": 30.0,
         "max_consecutive_failures": 5,
         "failure_reset_s": 120.0,
+        "boot_grace_s": run._BOOT_GRACE_S,
     }
 
 
@@ -1322,3 +1324,154 @@ def test_substrate_config_reads_agent_sandbox_pools() -> None:
     assert _substrate_config({}).agent_pools == frozenset()
     config = _substrate_config({"CURIE_AGENT_SANDBOX_POOLS": "factory, acme-a,"})
     assert config.agent_pools == frozenset({"factory", "acme-a"})
+
+
+# -- _supervise: quiet boot while dependencies come up (#3079) ---------------
+
+
+def _crash_twice_then_return(exc: BaseException):  # type: ignore[no-untyped-def]
+    calls = {"n": 0}
+
+    async def factory() -> None:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise exc
+
+    return factory, calls
+
+
+def _supervise_once(factory, clock) -> None:  # type: ignore[no-untyped-def]
+    async def go() -> None:
+        await asyncio.wait_for(
+            _supervise(
+                "runs",
+                factory,
+                asyncio.Event(),
+                restart_backoff_s=0,
+                max_consecutive_failures=0,
+                boot_grace_s=120.0,
+                clock=clock,
+            ),
+            timeout=2,
+        )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        socket.gaierror(-2, "Name or service not known"),
+        ConnectionRefusedError(111, "Connection refused"),
+        redis.exceptions.ConnectionError("Error connecting to valkey:6379"),
+    ],
+    ids=["dns", "refused", "valkey"],
+)
+def test_supervise_logs_dependency_not_ready_during_boot_as_one_line_warning(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: BaseException,
+) -> None:
+    """A dependency that is still coming up during the boot window is a one-line
+    warning that says it will retry, with no traceback."""
+    _capture_metrics(monkeypatch)
+    factory, calls = _crash_twice_then_return(exc)
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    assert calls["n"] == 3
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert len(records) == 2
+    for record in records:
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None
+        message = record.getMessage()
+        assert "\n" not in message
+        assert "retrying" in message
+        assert type(exc).__name__ in message
+
+
+def test_supervise_quiet_boot_follows_the_exception_chain(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library wrapper whose cause is a connection failure is still expected."""
+    _capture_metrics(monkeypatch)
+    try:
+        try:
+            raise socket.gaierror(-2, "Name or service not known")
+        except OSError as inner:
+            raise RuntimeError("could not reach postgres") from inner
+    except RuntimeError as wrapped:
+        exc = wrapped
+    factory, _ = _crash_twice_then_return(exc)
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.WARNING]
+    assert all(r.exc_info is None for r in records)
+
+
+def test_supervise_keeps_tracebacks_for_unexpected_failures_during_boot(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real bug at boot is not a dependency warming up: full traceback."""
+    _capture_metrics(monkeypatch)
+    factory, _ = _crash_twice_then_return(KeyError("latent bug"))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert len(records) == 2
+    assert all(r.levelno == logging.ERROR and r.exc_info for r in records)
+
+
+def test_supervise_keeps_tracebacks_for_connection_failures_after_boot(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the boot window has passed, a lost dependency is unexpected again
+    and logs its full traceback."""
+    _capture_metrics(monkeypatch)
+    ticks = iter([0.0] + [500.0] * 20)
+    factory, _ = _crash_twice_then_return(ConnectionRefusedError(111, "refused"))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: next(ticks))
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert len(records) == 2
+    assert all(r.levelno == logging.ERROR and r.exc_info for r in records)
+
+
+def test_run_warns_in_one_line_when_valkey_is_not_ready_for_the_boot_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Valkey still coming up on a fresh install is expected at boot (#3079): the
+    migration is skipped with a one-line warning, not a traceback."""
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        events = _boot(
+            monkeypatch,
+            raises=redis.exceptions.ConnectionError("Error connecting to valkey:6379"),
+        )
+
+    assert "runs" in events
+    records = [
+        r for r in caplog.records if r.name == "curie_worker.run" and "migration" in r.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is None
+    assert "not ready" in records[0].getMessage()
+
+
+def test_supervise_keeps_tracebacks_for_local_os_errors_during_boot(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PermissionError is a local fault, not a dependency warming up."""
+    _capture_metrics(monkeypatch)
+    factory, _ = _crash_twice_then_return(PermissionError(13, "Permission denied"))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
+        _supervise_once(factory, clock=lambda: 0.0)
+
+    records = [r for r in caplog.records if r.name == "curie_worker.run"]
+    assert all(r.levelno == logging.ERROR and r.exc_info for r in records)

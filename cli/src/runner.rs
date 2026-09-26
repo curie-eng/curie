@@ -112,6 +112,7 @@ impl RunnerClient {
             ts: slack_ts(),
             session_id: None,
             history_ref: None,
+            publication_context: None,
         };
         let resp = self
             .http
