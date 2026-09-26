@@ -6186,3 +6186,30 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
         "github_pr_node_id": None,
         "base_ref": None,
     }
+
+
+def test_a_replay_matches_a_default_identity_a_later_migration_names(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """ADR-0168 decision 3: a contract migration backfills the default Slack
+    identity to 'default', while this release's writers still send no adapter
+    for it. A replay compares the identities, so the two spellings match."""
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"])
+    _, first = _create_publication(client, payload)
+    _execute(
+        "UPDATE curie.approvals SET reply_adapter = 'default' WHERE dedupe_key = :k",
+        {"k": payload["dedupe_key"]},
+    )
+    _execute(
+        "UPDATE curie.publications SET reply_adapter = 'default' WHERE id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+
+    assert replay.status_code in {200, 201}, replay.text
+    assert replay.json()["id"] == first["id"]
