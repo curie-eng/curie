@@ -23,8 +23,13 @@ from ..github_factory_review import (
     is_actionable_feedback,
 )
 from ..github_review_audit import claim_review_delivery, settle_review_delivery
-from ..github_review_events import FeedbackIgnored, FeedbackUnavailable, parse_feedback
-from ..github_review_store import admit_feedback
+from ..github_review_events import (
+    FeedbackHeld,
+    FeedbackIgnored,
+    FeedbackUnavailable,
+    parse_feedback,
+)
+from ..github_review_store import admit_feedback, hold_feedback
 from ..models import GitHubReviewFeedback
 from ..schemas import WebhookResult
 from ..wirebody import read_bounded_body
@@ -153,6 +158,30 @@ async def github_webhook(
                 client=request.app.state.http_client,
                 traceparent=request.headers.get("traceparent"),
             )
+        except FeedbackHeld as exc:
+            # The PR's lineage has not yet recorded GitHub identity (#2962).
+            # GitHub never redelivers, so hold the normalized feedback durably
+            # and acknowledge; the reconciler or the identity advance replays it.
+            try:
+                await hold_feedback(
+                    request.app.state.valkey,
+                    feedback,
+                    traceparent=request.headers.get("traceparent"),
+                    settings=settings,
+                )
+            except Exception:
+                # Without Valkey the hold cannot be durable; degrade to the
+                # pre-#2962 refusal rather than acknowledge a lost review.
+                logger.warning("GitHub review hold unavailable; refusing held feedback")
+                settle_review_delivery(audit, "rejected", "lineage_absent_or_ambiguous")
+                await session.commit()
+                return WebhookResult(
+                    status="feedback_ignored",
+                    errors=[{"code": "lineage_absent_or_ambiguous"}],
+                )
+            settle_review_delivery(audit, "retryable", exc.code)
+            await session.commit()
+            return WebhookResult(status="feedback_held")
         except FeedbackUnavailable as exc:
             settle_review_delivery(audit, "retryable", exc.code)
             await session.commit()

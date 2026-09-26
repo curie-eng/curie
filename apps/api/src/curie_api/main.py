@@ -119,6 +119,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.sessionmaker,
         valkey,
         settings,
+        http_client,
     )
     app.state.github_review_reconciler_task = (
         asyncio.create_task(app.state.github_review_reconciler.run_forever())
