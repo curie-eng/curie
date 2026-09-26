@@ -167,6 +167,7 @@ from .workspace import (
     WORKSPACES_DISABLED_REFUSAL,
     WorkspaceClaimCoordinator,
     WorkspacePreparationError,
+    WorkspaceRepositoryNotAllowed,
     WorkspaceSelectionRefused,
     parse_github_repo_fact,
     trusted_repository_fact,
@@ -4746,13 +4747,30 @@ class Kernel:
             ):
                 workspace_repo = None
             else:
-                workspace_repo = await asyncio.to_thread(
-                    self._workspace.select_repository,
-                    thread_key=thread_key,
-                    deployment_id=workspace_deployment_id,
-                    author=event.user,
-                    repo_full_name=repo_fact,
-                )
+                try:
+                    workspace_repo = await asyncio.to_thread(
+                        self._workspace.select_repository,
+                        thread_key=thread_key,
+                        deployment_id=workspace_deployment_id,
+                        author=event.user,
+                        repo_full_name=repo_fact,
+                    )
+                except WorkspaceRepositoryNotAllowed:
+                    # A bare owner/repo token is a guess (#2947): `profit/loss`
+                    # matches. The allowlist is the ground truth for a bare
+                    # slug, so one outside it means no repository was named,
+                    # and the turn proceeds as if the message named none. A
+                    # URL outside the allowlist is still refused.
+                    if not getattr(repo_fact, "bare", False):
+                        raise
+                    repo_fact = None
+                    workspace_repo = await asyncio.to_thread(
+                        self._workspace.select_repository,
+                        thread_key=thread_key,
+                        deployment_id=workspace_deployment_id,
+                        author=event.user,
+                        repo_full_name=None,
+                    )
             if (
                 lineage_branch is None
                 and workspace_repo is not None
