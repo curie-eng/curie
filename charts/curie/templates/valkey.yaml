@@ -68,7 +68,7 @@ spec:
             - name: VALKEY_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
                   key: valkeyPassword
           ports:
             - name: valkey

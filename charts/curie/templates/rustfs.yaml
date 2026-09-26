@@ -75,7 +75,7 @@ spec:
             - name: RUSTFS_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
                   key: rustfsSecretKey
           ports:
             - name: s3
@@ -181,7 +181,7 @@ spec:
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
                   key: rustfsSecretKey
             - name: AWS_DEFAULT_REGION
               value: us-east-1
