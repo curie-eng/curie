@@ -432,10 +432,10 @@ run_self_test() {
         log "self-test: exclusive_kind_tag must untag siblings before and after kind load"
         failed=1
     fi
-    if awk '/^run_compatible_rollback\(\)/,/^}/' "$script_path" | grep -q 'exclusive_kind_tag "0.10.0"'; then
-        log "compatible rollback reloads exclusive 0.10.0 images"
+    if awk '/^run_compatible_rollback\(\)/,/^}/' "$script_path" | grep -q 'rollback to the published application window unexpectedly succeeded'; then
+        log "rollback scenario requires refusal before Helm mutation"
     else
-        log "self-test: compatible rollback must exclusive_kind_tag 0.10.0 before helm rollback"
+        log "self-test: rollback scenario must require refusal before Helm mutation"
         failed=1
     fi
     if awk '/^run_rollback_published_088\(\)/,/^}/' "$script_path" | grep -q 'load_tag_images "0.8.8"'; then
@@ -1343,24 +1343,28 @@ run_n_to_n1() {
 }
 
 run_compatible_rollback() {
+    # The candidate schema includes revision 0059. Published 0.10.0 and 0.10.1
+    # declare head 0058, so rollback must refuse before Helm mutates.
     local status=0
-    # n-to-n1 left exclusive 0.10.1 on the node. Rollback to 0.10.0 cannot
-    # pull that tag with pullPolicy Never.
-    exclusive_kind_tag "0.10.0"
     set +e
     "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
         >"$EVIDENCE_DIR/compatible-rollback.json" 2>"$EVIDENCE_DIR/compatible-rollback.err"
     status=$?
     set -e
-    (( status == 0 )) || die "compatible rollback exited $status"
-    wait_rollout || die "compatible rollback rollout timed out (helm $(helm_version))"
-    [[ "$(helm_version)" == "0.10.0" ]] || die "compatible rollback helm version is $(helm_version) not 0.10.0"
-    kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
-        || die "api not Ready after compatible rollback"
-    api_health >/dev/null || die "api health failed after compatible rollback"
+    (( status != 0 )) || die "rollback to the published application window unexpectedly succeeded"
+    local err
+    err="$(cat "$EVIDENCE_DIR/compatible-rollback.json" "$EVIDENCE_DIR/compatible-rollback.err" 2>/dev/null || true)"
+    echo "$err" | grep -F "$TARGET_HEAD" >/dev/null \
+        || die "rollback refusal did not name live head $TARGET_HEAD: $err"
+    echo "$err" | grep -F "$SUPPORTED_ROLLBACK_HEAD" >/dev/null \
+        || die "rollback refusal did not name published head $SUPPORTED_ROLLBACK_HEAD: $err"
+    echo "$err" | grep -F "outside its declared schema range" >/dev/null \
+        || die "rollback refusal did not name the declared schema range: $err"
+    [[ "$(helm_version)" == "0.10.1" ]] || die "rollback refusal changed serving version to $(helm_version)"
+    api_health >/dev/null || die "api health failed after rollback refusal"
     assert_sentinel
-    assert_alembic "$SUPPORTED_ROLLBACK_HEAD"
-    log "compatible rollback previous version 0.10.0 serves"
+    assert_alembic "$TARGET_HEAD"
+    log "rollback to 0.10.0 refused; 0.10.1 continues serving"
 }
 
 helm_history_088() {
@@ -1466,8 +1470,8 @@ run_rollback_published_089() {
         || die "rollback-089 refusal did not name 0.8.9: $err"
     echo "$err" | grep -F "$PUBLISHED_HEAD" >/dev/null \
         || die "rollback-089 refusal did not name published head $PUBLISHED_HEAD: $err"
-    echo "$err" | grep -F "$SUPPORTED_ROLLBACK_HEAD" >/dev/null \
-        || die "rollback-089 refusal did not name supported head $SUPPORTED_ROLLBACK_HEAD: $err"
+    echo "$err" | grep -F "$TARGET_HEAD" >/dev/null \
+        || die "rollback-089 refusal did not name live head $TARGET_HEAD: $err"
     echo "$err" | grep -F "outside its declared schema range" >/dev/null \
         || die "rollback-089 refusal did not name the declared schema range: $err"
     if echo "$err" | grep -F "could not establish" >/dev/null; then

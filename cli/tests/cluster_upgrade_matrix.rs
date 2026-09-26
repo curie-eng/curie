@@ -107,8 +107,8 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin exclusive_kind_tag untag-before-load\n{text}"
     );
     assert!(
-        text.contains("compatible rollback reloads exclusive 0.10.0 images"),
-        "self-test must pin compatible rollback reloading 0.10.0 images\n{text}"
+        text.contains("rollback scenario requires refusal before Helm mutation"),
+        "self-test must pin rollback refusal before Helm mutation\n{text}"
     );
     assert!(
         text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
@@ -312,7 +312,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         scenario.contains("status != 0")
             && scenario.contains("0.8.9")
             && scenario.contains("PUBLISHED_HEAD")
-            && scenario.contains("SUPPORTED_ROLLBACK_HEAD")
+            && scenario.contains("TARGET_HEAD")
             && scenario.contains("outside its declared schema range")
             && scenario.contains("if echo \"$err\" | grep -F \"could not establish\"")
             && scenario.contains("failed identity classification"),
@@ -331,7 +331,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
     );
     assert!(
         scenario.contains("run_compatible_rollback"),
-        "the same scenario must prove one compatible rollback succeeds"
+        "the same scenario must prove the 0.10.0 rollback is refused"
     );
 
     let compatible = source
@@ -340,8 +340,9 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         .expect("run_compatible_rollback function");
     assert!(
         compatible.contains("assert_sentinel")
-            && compatible.contains("assert_alembic \"$SUPPORTED_ROLLBACK_HEAD\""),
-        "supported 0.10.1 to 0.10.0 rollback must retain the sentinel and catalogued Alembic head"
+            && compatible.contains("assert_alembic \"$TARGET_HEAD\"")
+            && compatible.contains("0.10.1"),
+        "0.10.0 rollback refusal must leave 0.10.1 serving the candidate Alembic head"
     );
 }
 
