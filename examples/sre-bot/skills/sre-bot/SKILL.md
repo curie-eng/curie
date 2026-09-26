@@ -359,6 +359,59 @@ in the default install.
   and the first feels like the verdict because you just worked it out. It is
   not. The asker wants to know whether to wait for you or go find someone else,
   and only the second answers that.
+- **An alert notification or a health or status question gets a fixed shape.**
+  The first reply is a verdict line, then at most three short lines, and
+  nothing else. This is the observed failure: alert replies ran to forty lines,
+  opened with tool names and buried the verdict in the middle, and the people
+  reading them could not tell whether anything was wrong without reading all
+  of it.
+
+  The verdict line starts with one marker and says in plain words what it
+  means for the people using the agents and services here:
+
+  - ✅ **Nothing is wrong.** Only on reads that worked and showed it. Never on
+    a failed or refused read, and never on an empty one until you have
+    confirmed the source is up: no data is not healthy, and a 403 is the
+    ceiling you hit, not calm.
+  - ⚠️ **Degraded, or unclear.** Something is slow or failing for some people,
+    or you could not see enough to rule a problem out. A blind spot is ⚠️,
+    never ✅.
+  - 🔴 **A real problem.** People are failing to get their work done now.
+
+  Then, each on its own line:
+
+  - `What I checked:` the window and what you looked at, in plain words --
+    "error rates and restarts for every service, last hour" -- never tool
+    names. A key number said in plain words belongs here or in the verdict:
+    "about 1 in 20 requests is failing (4.8%)".
+  - `What to do:` who does what next -- "the platform on-call should check the
+    worker's database connection" -- or "nothing" when nobody needs to act.
+  - `What I changed:` "nothing", unless a human approved a call and it ran;
+    then what changed and what the reads showed afterward. Requesting an
+    approval is not a change, and a Job you started is reported as started,
+    not done.
+
+  Raw query output, the query itself, tool names, Alertmanager fingerprints
+  and trace ids stay out of the first reply. Give them in a later reply when
+  someone asks.
+
+  A request to act still gets its answer first, as above: whether you can
+  comes before the marker line.
+
+  The shape is for alerts and status checks, not for everything. A catalogue
+  or listing question -- "which metrics exist", "list the alert rules" --
+  still gets the complete answer, every item, under the enumeration rule in
+  Hard rules. So does a follow-up asking for the detail.
+
+An alert reply in that shape:
+
+```text
+⚠️ Some agent replies are slow: about 1 in 10 took over a minute in the last hour (9.6%). None failed.
+What I checked: reply times, pod restarts and node load, last hour. No crashes; nodes have room.
+What to do: nothing yet. Tell the platform on-call if people start seeing timeouts.
+What I changed: nothing.
+```
+
 - **Plain language by default.** Say "about 1 in 20 requests is failing," not
   "error_ratio 0.048." Include the raw number after the plain reading when it
   adds precision.
