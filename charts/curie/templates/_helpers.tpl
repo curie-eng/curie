@@ -595,6 +595,12 @@ processors:
     limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
     spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
+  transform/runner_identity:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - 'set(attributes["service.instance.id"], resource.attributes["service.instance.id"]) where resource.attributes["service.name"] == "curie-runner"'
 exporters:
   otlphttp/langfuse:
     endpoint: {{ include "curie.langfuse.url" . }}/api/public/otel
@@ -649,7 +655,7 @@ service:
       exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, transform/runner_identity, batch]
       exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
@@ -697,6 +703,13 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- if and (not (empty $protocol)) (not (or (eq $protocol "http/protobuf") (eq $protocol "grpc") (eq $protocol "http/json"))) -}}
 {{- fail "otelCollector.protocol must be grpc, http/protobuf, or http/json." -}}
 {{- end -}}
+{{- $temporality := "delta" -}}
+{{- if hasKey $otel "metricsTemporalityPreference" -}}
+{{- $temporality = get $otel "metricsTemporalityPreference" -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $temporality) (has $temporality (list "delta" "cumulative" "lowmemory"))) -}}
+{{- fail "otelCollector.metricsTemporalityPreference must be delta, cumulative, or lowmemory." -}}
+{{- end -}}
 {{- if and .Values.security.checkDefaultCredentials (not $otel.deploy) (not $otel.telemetryDisabled) (empty $otel.endpoint) -}}
 {{- fail "security.checkDefaultCredentials is on but neither a chart-managed collector nor otelCollector.endpoint is configured. Set otelCollector.endpoint to the external collector, keep otelCollector.deploy true, or set otelCollector.telemetryDisabled=true to acknowledge that telemetry is disabled." -}}
 {{- end -}}
@@ -711,13 +724,16 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- $hasEndpoint := false -}}
 {{- $hasProtocol := false -}}
 {{- $hasHeaders := false -}}
+{{- $hasMetricsTemporalityPreference := false -}}
 {{- range $extra -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" -}}{{- $hasEndpoint = true -}}{{- end -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" -}}{{- $hasProtocol = true -}}{{- end -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_HEADERS" -}}{{- $hasHeaders = true -}}{{- end -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE" -}}{{- $hasMetricsTemporalityPreference = true -}}{{- end -}}
 {{- end -}}
 {{- $endpoint := include "curie.otel.endpoint" .root | trim -}}
 {{- $protocol := .root.Values.otelCollector.protocol | default "http/protobuf" -}}
+{{- $temporality := .root.Values.otelCollector.metricsTemporalityPreference | default "delta" -}}
 {{- if and (not $hasEndpoint) (ne $endpoint "") }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ $endpoint | quote }}
@@ -725,6 +741,10 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- if and (not $hasProtocol) (ne $endpoint "") }}
 - name: OTEL_EXPORTER_OTLP_PROTOCOL
   value: {{ $protocol | quote }}
+{{- end }}
+{{- if and (not $hasMetricsTemporalityPreference) (ne $endpoint "") }}
+- name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+  value: {{ $temporality | quote }}
 {{- end }}
 {{- if and (not $hasHeaders) (not .root.Values.otelCollector.deploy) (not .root.Values.otelCollector.telemetryDisabled) (ne $endpoint "") }}
 {{- if not (empty .root.Values.otelCollector.headersExistingSecret) }}

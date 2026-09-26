@@ -941,6 +941,31 @@ for label, docs in (("install", curie_install_docs), ("upgrade", curie_upgrade_d
         f"{label} must retain Curie metrics on prometheusremotewrite/soak"
     )
 
+    workload_containers = list(containers(docs))
+    workload_containers.extend(
+        (doc, at(doc, "spec", "podTemplate", "spec"), container)
+        for doc in docs if doc.get("kind") == "SandboxTemplate"
+        for container in at(doc, "spec", "podTemplate", "spec").get("containers", [])
+    )
+    instrumented_components = set()
+    for doc, _, container in workload_containers:
+        env = container.get("env", [])
+        if not any(item.get("name") == "OTEL_EXPORTER_OTLP_ENDPOINT" for item in env):
+            continue
+        component = at(doc, "metadata", "labels", "app.kubernetes.io/component")
+        instrumented_components.add(component)
+        preferences = [
+            item.get("value") for item in env
+            if item.get("name") == "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"
+        ]
+        assert preferences == ["cumulative"], (
+            f"{label} {component} container {container.get('name')} must export "
+            "cumulative metrics to Prometheus remote write"
+        )
+    assert {"api", "worker", "agent-sandbox"} <= instrumented_components, (
+        f"{label} must check the API, worker, and runner sandbox metrics temporality"
+    )
+
 default_config = collector_config(curie_default_docs)
 assert at(default_config, "service", "pipelines", "metrics", "exporters") == ["nop/metrics"], (
     "chart default must keep metrics on nop until an overlay adds a destination"
@@ -952,6 +977,9 @@ assert "prometheusremotewrite/soak" not in default_config.get("exporters", {}), 
 assert at(curie_values, "otelCollector", "extraMetricPipelineExporters") == [
     "prometheusremotewrite/soak"
 ]
+assert at(curie_values, "otelCollector", "metricsTemporalityPreference") == "cumulative", (
+    "the observability overlay must request cumulative metrics for Prometheus remote write"
+)
 assert at(prometheus_values, "server", "extraArgs") == {
     "web.enable-remote-write-receiver": ""
 }

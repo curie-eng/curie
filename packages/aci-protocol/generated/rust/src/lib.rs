@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.3";
+pub const PROTOCOL_VERSION: &str = "0.5.4";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -201,6 +201,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub model_env_key: Option<String>,
     #[serde(default)]
+    pub metrics_temporality_preference: Option<String>,
+    #[serde(default)]
     pub max_turns: Option<i64>,
     #[serde(default)]
     pub history_max_turns: Option<i64>,
@@ -249,6 +251,7 @@ pub mod env_keys {
     pub const CURIE_THINKING: &str = "CURIE_THINKING";
     pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
+    pub const OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: &str = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE";
     pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 }
 
@@ -548,13 +551,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.4","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.5","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.3","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.4","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }
