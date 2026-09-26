@@ -749,6 +749,7 @@ class SessionRunner:
             }
             record_metric("curie.turn.accepted", attributes=metric_attributes)
             metrics_emitted = False
+            terminal_for_log = False
 
             def emit_completed_metrics() -> None:
                 """Emit the terminal metric pair once, synchronously."""
@@ -790,6 +791,8 @@ class SessionRunner:
                                 classified_failure=True,
                             )
                             for line in _history_capacity_lines():
+                                if isinstance(parse_ndjson_line(line), Final):
+                                    terminal_for_log = True
                                 yield line
                             return
                         await self._refresh_connector_failures()
@@ -806,6 +809,7 @@ class SessionRunner:
                                 interrupt_requested=self._interrupt_requested,
                                 classified_failure=True,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run timed out",
@@ -824,6 +828,7 @@ class SessionRunner:
                                 interrupt_requested=True,
                                 classified_failure=False,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run interrupted",
@@ -838,13 +843,8 @@ class SessionRunner:
                                 # Final reaches the consumer, even if it closes
                                 # without requesting the generator's next item.
                                 metric_outcome = self._metric_outcome(tracker)
+                                terminal_for_log = True
                             yield line
-                        logger.info(
-                            "turn end session=%s status=%s duration_ms=%d",
-                            self._session_id,
-                            self._status.value,
-                            int((time.monotonic() - start) * 1000),
-                        )
                         metric_outcome = self._metric_outcome(tracker)
                     except Exception as exc:  # noqa: BLE001 - the ACI stream must
                         # always terminate in a final; a raised SDK/transport error
@@ -867,6 +867,7 @@ class SessionRunner:
                                 interrupt_requested=self._interrupt_requested,
                                 classified_failure=True,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run timed out",
@@ -886,6 +887,7 @@ class SessionRunner:
                                 interrupt_requested=True,
                                 classified_failure=False,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run interrupted",
@@ -909,6 +911,7 @@ class SessionRunner:
                                     classification="runner-error",
                                 )
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run failed",
@@ -932,6 +935,7 @@ class SessionRunner:
                                 )
                                 metric_outcome = self._metric_outcome(tracker)
                                 emit_completed_metrics()
+                                terminal_for_log = True
                         finally:
                             # The SDK serializes this turn's stop and any later
                             # query onto one locked stdin stream. Wait until the
@@ -970,6 +974,13 @@ class SessionRunner:
                                 self._turn_ready = False
                                 self._turn_epoch = None
             finally:
+                if terminal_for_log:
+                    logger.info(
+                        "turn end session=%s status=%s duration_ms=%d",
+                        self._session_id,
+                        self._status.value,
+                        int((time.monotonic() - start) * 1000),
+                    )
                 self._active_state = None
                 if self._approval_gate is not None:
                     self._approval_gate.clear_publication_context()
