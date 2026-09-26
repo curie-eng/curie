@@ -370,6 +370,27 @@ def require_dedicated_actor(actor_login: str, operator_login: str) -> None:
         )
 
 
+# Installation permission names the factory CI wait reads. GitHub reports
+# "write" when the App was granted more than read; either satisfies the wait.
+_CI_READ_PERMISSIONS = (
+    ("checks", "Checks: read"),
+    ("statuses", "Commit statuses: read"),
+)
+
+
+def missing_ci_read_permissions(installation: Any) -> list[str]:
+    """Labels for Checks and Commit statuses reads the installation lacks."""
+
+    granted = installation.get("permissions") if isinstance(installation, dict) else None
+    if not isinstance(granted, dict):
+        granted = {}
+    missing: list[str] = []
+    for key, label in _CI_READ_PERMISSIONS:
+        if granted.get(key) not in ("read", "write"):
+            missing.append(label)
+    return missing
+
+
 def webhook_restore_target(
     original_url: str, restore_url: str | None, tunnel_alive: Callable[[str], bool]
 ) -> str:
@@ -1590,11 +1611,22 @@ class Preflight:
         self.step("candidate images published", tag=tag)
 
     def check_app(self) -> None:
-        status, body = self.as_app("GET", f"/app/installations/{self.config.installation_id}")
+        status, installation = self.as_app(
+            "GET", f"/app/installations/{self.config.installation_id}"
+        )
         if status != 200:
             raise PreflightFailed(
                 f"the App JWT could not read installation {self.config.installation_id} "
                 f"(HTTP {status}); check CURIE_FACTORY_APP_ID and the private key"
+            )
+        missing = missing_ci_read_permissions(installation)
+        if missing:
+            named = " and ".join(missing)
+            raise PreflightFailed(
+                f"the GitHub App installation is missing {named}. "
+                "On the GitHub App, open Permissions and events, set the missing "
+                "permission to Read, save, then accept the permission update on "
+                "the installation."
             )
         status, body = self.as_actor("GET", f"/repos/{self.config.repo}")
         if status != 200 or not isinstance(body, dict):

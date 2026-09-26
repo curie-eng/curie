@@ -315,6 +315,16 @@ def tried_summary(publications: Iterable[Any], verdict: Verdict, pr_url: str | N
         lines.append(f"Pending checks: {_check_list(verdict.pending)}")
     if verdict.reason:
         lines.append(f"Reason: {verdict.reason}")
+    if verdict.reason == "github_forbidden":
+        # A 403 on check runs or commit statuses does not say which permission
+        # was missing, so the notice names both reads the wait needs.
+        lines.append(
+            "GitHub returned 403, so check that the installation grants "
+            "Checks: read and Commit statuses: read. The 403 does not say "
+            "which one is missing. On the GitHub App, open Permissions and "
+            "events, set each missing permission to Read, save, then accept "
+            "the permission update on the installation."
+        )
     if pr_url:
         lines.append(pr_url)
     return "\n".join(lines)

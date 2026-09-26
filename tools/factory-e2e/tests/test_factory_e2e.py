@@ -2322,7 +2322,14 @@ def test_check_app_refuses_when_the_actor_is_the_operator(
     env = _env(_app_dir(tmp_path))
     env["CURIE_FACTORY_OPERATOR_LOGIN"] = "operator"
     preflight = _preflight(tmp_path, env)
-    monkeypatch.setattr(preflight, "as_app", lambda method, path, body=None: (200, {}))
+    monkeypatch.setattr(
+        preflight,
+        "as_app",
+        lambda method, path, body=None: (
+            200,
+            {"permissions": {"checks": "read", "statuses": "read"}},
+        ),
+    )
     login = {"value": "Operator"}
 
     def as_actor(method: str, path: str, body: Any = None) -> tuple[int, Any]:
@@ -2339,6 +2346,28 @@ def test_check_app_refuses_when_the_actor_is_the_operator(
     assert preflight.evidence["actor_login"] == "factory-tester"
 
 
+def test_check_app_names_a_missing_ci_permission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(_app_dir(tmp_path))
+    env["CURIE_FACTORY_OPERATOR_LOGIN"] = "operator"
+    preflight = _preflight(tmp_path, env)
+    monkeypatch.setattr(
+        preflight,
+        "as_app",
+        lambda method, path, body=None: (200, {"permissions": {"checks": "read"}}),
+    )
+
+    def as_actor(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        raise AssertionError("actor checks run only after CI permissions pass")
+
+    monkeypatch.setattr(preflight, "as_actor", as_actor)
+    with pytest.raises(fe.PreflightFailed, match="Commit statuses: read") as raised:
+        preflight.check_app()
+    message = str(raised.value)
+    assert "Checks: read" not in message.split("missing", 1)[1].split(".", 1)[0]
+    assert "Permissions and events" in message
+    assert "accept the permission update" in message
 
 
 def test_only_the_default_model_gets_a_context_window_by_default(tmp_path: Path) -> None:

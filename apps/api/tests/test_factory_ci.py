@@ -485,6 +485,18 @@ def test_tried_summary_lists_each_fix_round() -> None:
     assert PR_URL in summary
 
 
+def test_tried_summary_names_the_403_permission_and_how_to_grant_it() -> None:
+    verdict = factory_ci.Verdict(kind="unverified", reason="github_forbidden")
+    summary = factory_ci.tried_summary([], verdict, PR_URL)
+    assert "Reason: github_forbidden" in summary
+    assert "Checks: read" in summary
+    assert "Commit statuses: read" in summary
+    assert "does not say which one is missing" in summary
+    assert "Missing permission:" not in summary
+    assert "Permissions and events" in summary
+    assert "accept the permission update" in summary
+
+
 def test_tried_summary_clips_a_long_title() -> None:
     publications = [
         SimpleNamespace(revision_number=1, title="first", changed_paths=["a.py"]),
