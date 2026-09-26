@@ -169,19 +169,21 @@ pub fn synthetic_turn(
     placeholder: impl Into<String>,
     endpoint: Option<String>,
 ) -> QueuedTurn {
+    let kind: String = kind.into();
+    // A Slack turn names its identity (ADR-0168 decision 3); `speak_as` and
+    // the cluster-message relay override it.
+    let adapter = (kind == "slack").then(|| DEFAULT_SLACK_IDENTITY.to_string());
     QueuedTurn {
         event_id: new_event_id(),
         conversation_id: conversation_id.into(),
         author: author.into(),
         text: text.into(),
         reply_handle: Some(ReplyHandle {
-            kind: kind.into(),
+            kind,
             channel: channel.into(),
             placeholder: Some(placeholder.into()),
             endpoint,
-            // The CLI's stub keeps the Slack shape, so its route is the
-            // configured `SLACK_API_BASE_URL` dev origin, not a named adapter.
-            adapter: None,
+            adapter,
         }),
         received_at: now_rfc3339(),
         // The CLI drives a turn on a person's behalf, so it is a message and not
@@ -198,8 +200,8 @@ pub fn synthetic_turn(
     }
 }
 
-/// Stamp the identity a selected route speaks through. `None` leaves the turn
-/// exactly as minted.
+/// Stamp the identity a selected route speaks through. `None` leaves the
+/// minted identity (`default` for Slack).
 /// @spec ADR-0168 d8
 pub fn speak_as(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
     if let (Some(identity), Some(handle)) = (identity, turn.reply_handle.as_mut()) {
