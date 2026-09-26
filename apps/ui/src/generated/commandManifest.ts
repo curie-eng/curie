@@ -6028,6 +6028,14 @@ export const commandManifest = {
         },
         {
           "global": false,
+          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "id": "runner_image",
+          "long": "runner-image",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
           "help": "Replace a registry lock with a local-daemon one deliberately",
           "id": "force",
           "long": "force",
