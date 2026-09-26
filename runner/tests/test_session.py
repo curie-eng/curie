@@ -552,7 +552,7 @@ def test_persistence_stage_timeout_is_bounded_and_loss_stays_sticky(
     assert runner.history_durable is False
 
 
-def test_cancellation_during_persistence_marks_loss_without_a_terminal() -> None:
+def test_cancellation_during_persistence_marks_loss_without_a_terminal(caplog) -> None:
     store = _FirstBlockedTranscriptStore()
     runner, fake = _runner_with_history(store)
     first_lines: list[str] = []
@@ -585,10 +585,12 @@ def test_cancellation_during_persistence_marks_loss_without_a_terminal() -> None
         ]
         return parse_ndjson("".join(second_lines))
 
-    second = anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        second = anyio.run(go)
     first = parse_ndjson("".join(first_lines))
     assert not any(isinstance(event, Final) for event in first)
     assert second[-1].status is SessionStatus.DONE
+    assert sum("turn end" in record.getMessage() for record in caplog.records) == 1
     assert [record.user for record in store.turns] == ["second"]
     assert fake.interrupts == 0
     assert runner.turn_active is False
@@ -780,6 +782,7 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
 
 def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
     monkeypatch: pytest.MonkeyPatch,
+    caplog,
 ) -> None:
     """Closing at a suspended yield must not let abandonment store first."""
 
@@ -823,7 +826,13 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
         await turn.aclose()
         await runner.close()
 
-    anyio.run(go)
+    with caplog.at_level(logging.INFO, logger="curie_runner.session"):
+        anyio.run(go)
+    assert sum(
+        "turn end" in record.getMessage()
+        and "status=classified-failure" in record.getMessage()
+        for record in caplog.records
+    ) == 1
     spans = list(exporter.get_finished_spans())
     root = _span_named(spans, "agent.run")[0]
     assert root.attributes["curie.terminal.cause"] == "runner_timeout"

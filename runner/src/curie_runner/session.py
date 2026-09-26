@@ -791,6 +791,8 @@ class SessionRunner:
                                 classified_failure=True,
                             )
                             for line in _history_capacity_lines():
+                                if isinstance(parse_ndjson_line(line), Final):
+                                    terminal_for_log = True
                                 yield line
                             return
                         await self._refresh_connector_failures()
@@ -807,6 +809,7 @@ class SessionRunner:
                                 interrupt_requested=self._interrupt_requested,
                                 classified_failure=True,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run timed out",
@@ -825,6 +828,7 @@ class SessionRunner:
                                 interrupt_requested=True,
                                 classified_failure=False,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run interrupted",
@@ -839,6 +843,7 @@ class SessionRunner:
                                 # Final reaches the consumer, even if it closes
                                 # without requesting the generator's next item.
                                 metric_outcome = self._metric_outcome(tracker)
+                                terminal_for_log = True
                             yield line
                         metric_outcome = self._metric_outcome(tracker)
                     except Exception as exc:  # noqa: BLE001 - the ACI stream must
@@ -862,6 +867,7 @@ class SessionRunner:
                                 interrupt_requested=self._interrupt_requested,
                                 classified_failure=True,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run timed out",
@@ -881,6 +887,7 @@ class SessionRunner:
                                 interrupt_requested=True,
                                 classified_failure=False,
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run interrupted",
@@ -904,6 +911,7 @@ class SessionRunner:
                                     classification="runner-error",
                                 )
                             )
+                            terminal_for_log = True
                             yield to_ndjson_line(
                                 Final(
                                     text="run failed",
@@ -927,7 +935,7 @@ class SessionRunner:
                                 )
                                 metric_outcome = self._metric_outcome(tracker)
                                 emit_completed_metrics()
-                            terminal_for_log = not self._turn_open
+                                terminal_for_log = True
                         finally:
                             # The SDK serializes this turn's stop and any later
                             # query onto one locked stdin stream. Wait until the
