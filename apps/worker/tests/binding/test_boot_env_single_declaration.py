@@ -216,6 +216,14 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # IS a declared boot key. The key itself never enters a sandbox: holding
         # it, agent-authored code could mint a token naming any agent.
         "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
+        # The connector caller proxy's own config (ADR-0168 decision 7), read
+        # by curie_connector_proxy.server from env the connector render writes
+        # into the proxy container. It runs in a connector pod, never in a
+        # sandbox, and nothing here reaches a boot env.
+        "CURIE_CALLER_PROXY_PORT",
+        "CURIE_CALLER_PROXY_UPSTREAM_PORT",
+        "CURIE_CALLER_PROXY_PUBLIC_KEYS",
+        "CURIE_CALLER_PROXY_ADMITS",
         "CURIE_EVAL_CONSUMER_GROUP",
         "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
         "CURIE_EVAL_STREAM",

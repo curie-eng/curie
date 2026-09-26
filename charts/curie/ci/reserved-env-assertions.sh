@@ -73,7 +73,6 @@ with tempfile.TemporaryDirectory() as tmp:
     for workload, name, replacement in [
         ("worker", "SLACK_API_BASE_URL", "worker.slackApiBaseUrl"),
         ("worker", "CURIE_CONNECTOR_RECONCILE", "worker.connectorReconciler.enabled"),
-        ("worker", "CURIE_CONNECTOR_CALLER_SIGNING_KEY", "connectorCaller.existingSecret"),
         ("agentSandbox.runner", "ANTHROPIC_BASE_URL", "inference.service.port"),
     ]:
         result, _ = render(chart, "--set", f"{workload}.extraEnv[0].name={name}", "--set-string", f"{workload}.extraEnv[0].value=conflict", ok=False)

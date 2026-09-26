@@ -476,12 +476,12 @@ def _validate_agent_name(value: str) -> str:
     join point is not recoverable from the rendered string: agent ``a-mcp-b``
     with connector ``c`` and agent ``a`` with connector ``b-mcp-c`` render
     byte-identical objects AND the identical ``app.kubernetes.io/name`` pod
-    selector. The connector is deliberately unauthenticated (ADR-0086 -- the
-    sandbox holds no credential to authenticate WITH, so the network is the
-    whole of the access control), which makes that name the only thing binding
-    a sandbox to a credential: one agent's sandbox reaches another agent's
-    connector holding another agent's production token, and nothing errors
-    anywhere (#1446).
+    selector. That selector is what the connector's Service and both
+    NetworkPolicies bind to, and the Deployment it names carries the caller
+    proxy's admits list (ADR-0086, ADR-0168 decision 7), which makes that name
+    what binds a sandbox to a credential: one agent's sandbox reaches another
+    agent's connector holding another agent's production token, and nothing
+    errors anywhere (#1446).
 
     ``connectors.yaml`` names and ``deploy.yaml``'s ``target.agent`` are both
     gated by bundle validation. ``POST /agents`` is the hole -- the stored

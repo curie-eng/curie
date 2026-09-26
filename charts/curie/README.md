@@ -1775,18 +1775,30 @@ that names nobody, so the exchange cannot restart itself.
 ### The connector caller key pair
 
 The worker signs each sandbox's connector caller token (ADR-0168 decision 7)
-with an Ed25519 key it reads from a Secret you name. Nothing verifies the
-token yet. BYO only in this release: the chart does not generate the key.
-`curie cluster up` does not mint or persist one yet either, so a render
-without cluster access (`helm template`, a client-only upgrade) has nothing
-that could keep a generated key stable. A later release has `curie cluster
-up` generate the key and carry it forward, the way it already does for the
-sealing keypair.
+with an Ed25519 key, and the API renders the public half into a caller proxy in
+front of every hosted connector. The proxy refuses a call whose token is
+missing, invalid or expired, or names an agent the connector's `admits` list
+does not, and forwards the rest to the server over loopback. The proxy runs
+from the worker image (`CURIE_CONNECTOR_PROXY_IMAGE`, from `worker.image`), so
+nothing new is pulled from a new place. It pulls with `worker.image.pullPolicy`
+and `worker.imagePullSecrets`, which the connector pod carries, so a private
+worker image needs its pull Secret in the namespace the connectors run in.
 
-The Secret holds both halves as standard base64: the 32-byte seed under
-`connectorCaller.signingKeyKey` (default `signingKey`) and its 32-byte public
-key under `connectorCaller.verifyKeyKey` (default `verifyKey`). With PyNaCl
-installed:
+A caller that is not an agent, such as a keep-alive Job, has no token. Each
+proxied connector also gets a Service named after its own with `-direct`,
+which selects the same pods on the server's own port. No rendered policy opens
+that port, so the caller also needs an ingress policy of your own naming it.
+
+`curie cluster up` generates the pair on a release that records none and
+re-supplies it on every upgrade, as it does the sealing keypair. `--dev`
+generates none, and neither does a plain `helm install` that sets no
+`connectorCaller` value: with no key the worker mints no token, the API renders
+no proxy, and each connector's NetworkPolicy is its only access check.
+
+To bring your own pair, name a Secret holding both halves as standard base64:
+the 32-byte seed under `connectorCaller.signingKeyKey` (default `signingKey`)
+and its 32-byte public key under `connectorCaller.verifyKeyKey` (default
+`verifyKey`). With PyNaCl installed:
 
 ```bash
 python3 -c 'import base64, nacl.signing as s; k = s.SigningKey.generate(); print(base64.b64encode(bytes(k)).decode()); print(base64.b64encode(bytes(k.verify_key)).decode())'
@@ -1797,10 +1809,23 @@ connectorCaller:
   existingSecret: my-connector-caller   # holds signingKey and verifyKey
 ```
 
-Only the worker receives the signing key. Leaving `existingSecret` empty mints
-no token, and every sandbox boots as before. A plain `curie cluster up` does
-not carry `connectorCaller` forward yet, so pass it with every upgrade:
-`curie cluster up --set connectorCaller.existingSecret=<name>`.
+Only the worker receives the signing key, and only the API the public key.
+`cluster up` carries `existingSecret` forward as well.
+
+To rotate, set `connectorCaller.previousVerifyKey` to the current public key,
+set the new pair, and `kubectl rollout restart` the api and worker Deployments:
+neither pod template carries a checksum of this Secret. Tokens live 24 hours,
+so clear `previousVerifyKey` a day later.
+
+Upgrading onto this release rolls every hosted connector pod once, because its
+rendered Deployment gains the proxy. Upgrade note: a keep-alive Job that dialled
+the connector Service now dials `<name>-direct`, keeping its port, because the
+connector Service lands on the proxy, which refuses a caller without a token.
+Its peer-ingress policy keeps naming the server's port. A sandbox that was already running carries
+no token. The next turn on its thread claims a fresh sandbox instead, and a
+turn already in progress finishes first. Every hosted connector refuses a
+runner image from before the release that added the `X-Curie-Caller` header,
+so keep any agent-specific runner image on this release too.
 
 ### Reserved environment variables
 

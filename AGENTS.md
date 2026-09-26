@@ -604,6 +604,17 @@ as a whole; remembered only):
 - CLI `--json` DTOs vs the API models they mirror. [gate: `cli/tests/api_field_parity.rs`]
 - deploy-time validators vs the runtime loaders that re-parse the same value
   (share normalization code). [convention]
+- worker caller-token minter vs connector proxy verifier -- `mint`
+  (`apps/worker/src/curie_worker/caller_token.py`) and `decide`
+  (`apps/worker/src/curie_connector_proxy/caller.py`) run in different pods,
+  and the proxy may not import the worker, so both read one frozen corpus; the
+  CLI derives its generated public keys against the same seeds.
+  [vector: `tests/vectors/connector-caller-token.json`]
+- connector proxy refusal vs runner diagnosis -- the proxy's refusal body
+  (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's
+  `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
+  ship in different images, so they are frozen together.
+  [vector: `tests/vectors/connector-caller-refusal.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR

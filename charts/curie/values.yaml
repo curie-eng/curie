@@ -655,17 +655,28 @@ sealing:
   previousPrivateKeyExistingSecretKey: sealingPreviousPrivateKey
 
 # The connector caller key pair (ADR-0168 decision 7). The worker signs each
-# sandbox's caller token with the private half, and the sandbox presents the
-# token to its hosted connectors. Nothing verifies the token yet.
+# sandbox's caller token with the private half. The API renders the public half
+# into the caller proxy in front of every hosted connector, which refuses a
+# caller whose token is missing, invalid or expired, or names an agent the
+# connector's `admits` list does not.
 #
-# BYO only in this release: the chart does not generate the key, and `curie
-# cluster up` does not generate and keep it yet either. A later release has
-# `curie cluster up` mint the key and carry it forward, as it already does for
-# the sealing keypair. Name a Secret holding both halves as standard base64, a
-# 32-byte Ed25519 seed under signingKeyKey and its 32-byte public key under
-# verifyKeyKey. Empty mints no token, which leaves every sandbox's boot env as
-# it was.
+# `curie cluster up` generates the pair on a release that records none and
+# re-supplies it on every upgrade, as it does the sealing keypair; `--dev`
+# generates none. Do not set these by hand unless you are restoring a backup
+# or rotating. Empty mints no token and renders no proxy, and each connector's
+# NetworkPolicy is then its only access check.
+#
+# To rotate, set previousVerifyKey to the current verifyKey, set the new pair,
+# and restart the api and worker Deployments. Clear previousVerifyKey a day
+# later, when every token signed with the old key has expired.
+#
+# existingSecret (BYO) wins over signingKey and verifyKey: name a Secret holding
+# both halves as standard base64, the 32-byte seed under signingKeyKey and its
+# public key under verifyKeyKey.
 connectorCaller:
+  signingKey: ""
+  verifyKey: ""
+  previousVerifyKey: ""
   existingSecret: ""
   signingKeyKey: signingKey
   verifyKeyKey: verifyKey

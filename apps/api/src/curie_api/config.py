@@ -21,6 +21,7 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -591,6 +592,58 @@ class Settings(BaseSettings):
         ),
     )
 
+    # The caller proxy every hosted connector render carries (ADR-0168
+    # decision 7): the public key the worker's signing key pairs with, the one
+    # it replaced during a rotation, and the image the proxy runs from, with
+    # the worker's pull policy and comma-separated pull secret names. An empty
+    # current key renders no proxy.
+    connector_caller_public_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_CALLER_PUBLIC_KEY", "connector_caller_public_key"
+        ),
+    )
+    connector_caller_previous_public_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY", "connector_caller_previous_public_key"
+        ),
+    )
+    connector_proxy_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_CONNECTOR_PROXY_IMAGE", "connector_proxy_image"),
+    )
+    connector_proxy_image_pull_policy: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY", "connector_proxy_image_pull_policy"
+        ),
+    )
+    connector_proxy_image_pull_secrets: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
+        ),
+    )
+
+    def connector_proxy(self) -> ConnectorProxy | None:
+        """The proxy each hosted connector renders with, or None for none."""
+
+        current = self.connector_caller_public_key.strip()
+        if not current:
+            return None
+        previous = self.connector_caller_previous_public_key.strip()
+        return ConnectorProxy(
+            image=self.connector_proxy_image.strip(),
+            public_keys=(current, previous) if previous else (current,),
+            pull_policy=self.connector_proxy_image_pull_policy.strip() or None,
+            pull_secrets=tuple(
+                name.strip()
+                for name in self.connector_proxy_image_pull_secrets.split(",")
+                if name.strip()
+            ),
+        )
+
     def valkey_dsn(self) -> str:
         if self.valkey_url:
             return self.valkey_url
@@ -610,6 +663,24 @@ class Settings(BaseSettings):
         if not self.installation_id:
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
+
+    @model_validator(mode="after")
+    def _validate_connector_proxy(self) -> "Settings":
+        # At boot, not at the first render: a key the proxy cannot use would
+        # otherwise surface as a 500 on every connector deploy.
+        if (
+            self.connector_caller_previous_public_key.strip()
+            and not self.connector_caller_public_key.strip()
+        ):
+            raise ValueError(
+                "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY is set without "
+                "CURIE_CONNECTOR_CALLER_PUBLIC_KEY"
+            )
+        try:
+            self.connector_proxy()
+        except ValueError as exc:
+            raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
 
     @model_validator(mode="after")
     def _validate_github_repo_allowlist(self) -> "Settings":

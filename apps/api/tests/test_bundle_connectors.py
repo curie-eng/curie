@@ -794,3 +794,60 @@ def test_an_agent_no_target_names_still_renders_every_connector(
     body = _rendered(client, auth_headers, root)
     assert {_connector_of(o) for o in body["manifests"]} == {"grafana", "loki"}
     assert body["owned_secret_keys"] == ["GRAFANA_TOKEN", "LOKI_TOKEN"]
+
+
+# ADR-0168 decision 7: the caller proxy rides every hosted connector render
+# once the API holds a caller public key. The key is a public half frozen in
+# tests/vectors/connector-caller-token.json.
+_CALLER_PUBLIC = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+_PROXY_IMAGE = "ghcr.io/curie-eng/curie-worker:0.0.0"
+
+
+def _proxy_admits(manifests: list[dict[str, Any]]) -> list[str]:
+    dep = next(o for o in manifests if o["kind"] == "Deployment")
+    containers = {c["name"]: c for c in dep["spec"]["template"]["spec"]["containers"]}
+    env = {e["name"]: e["value"] for e in containers["caller-proxy"]["env"]}
+    return json.loads(env["CURIE_CALLER_PROXY_ADMITS"])
+
+
+# @spec ADR-0168 d7
+def test_the_manifests_carry_the_proxy_the_caller_passes(tmp_path: Path) -> None:
+    from plugin_format.connector_render import ConnectorProxy
+
+    root = _bundle(tmp_path, HOSTED)
+    manifests = bundles.render_connector_manifests(
+        bundles.read_connectors(root),
+        release=RELEASE,
+        agent=AGENT,
+        namespace=NAMESPACE,
+        app_name=APP_NAME,
+        secret_name=SECRET_NAME,
+        proxy=ConnectorProxy(image=_PROXY_IMAGE, public_keys=(_CALLER_PUBLIC,)),
+    )
+    # The stored agent name, the same name the worker signs into the token.
+    assert _proxy_admits(manifests) == [AGENT]
+    assert "caller-proxy" not in json.dumps(_render(root))
+
+
+@pytest.fixture
+def _caller_key(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setenv("CURIE_CONNECTOR_CALLER_PUBLIC_KEY", _CALLER_PUBLIC)
+    monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE", _PROXY_IMAGE)
+    get_settings.cache_clear()
+    yield
+    monkeypatch.undo()
+    get_settings.cache_clear()
+
+
+# @spec ADR-0168 d7
+def test_the_route_renders_the_proxy_from_the_api_settings(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    body = _rendered(client, auth_headers, _bundle(tmp_path, HOSTED))
+    assert _proxy_admits(body["manifests"]) == ["acme-bot"]
+    service = next(o for o in body["manifests"] if o["kind"] == "Service")
+    assert service["spec"]["ports"][0]["targetPort"] == "caller"

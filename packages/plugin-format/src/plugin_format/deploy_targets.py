@@ -191,9 +191,8 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
                         "agent/connector pair would render the same Service, Deployment, "
                         "both NetworkPolicies and the same `app.kubernetes.io/name` -- which "
                         "IS the pod selector, so one agent's sandbox would reach the other's "
-                        "connector and the credential bound to it (the connector is "
-                        "deliberately unauthenticated, ADR-0086) -- rename the agent so it "
-                        "does not end in `-mcp` or contain `-mcp-`",
+                        "connector and the credential bound to it (ADR-0086) -- rename the "
+                        "agent so it does not end in `-mcp` or contain `-mcp-`",
                     )
                 )
         if target.slack_channel is not None and not _SLACK_RE.fullmatch(target.slack_channel):

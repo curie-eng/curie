@@ -143,29 +143,59 @@ object kinds, so a worker that is not reconciling does not hold that grant.
 
 Who may call a hosted connector is decision 7 of
 [ADR-0168](../../adr/0168-one-installation-hosts-several-bot-identities.md).
-Today the rendered ingress policy, `render_ingress_networkpolicy`
-(`packages/plugin-format/src/plugin_format/connector_render.py::render_ingress_networkpolicy`),
-is still the whole check: it admits every sandbox of the release. What this
-release adds is the caller's identity, carried but not yet checked. When
-`CURIE_CONNECTOR_CALLER_SIGNING_KEY` is set, the worker's `boot_env`
+When `CURIE_CONNECTOR_CALLER_SIGNING_KEY` is set, the worker's `boot_env`
 (`apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`) signs the
 resolved agent's name with `mint`
 (`apps/worker/src/curie_worker/caller_token.py::mint`), and `render_worker`
 (`packages/aci-protocol/src/aci_protocol/session.py::BootEnv.render_worker`)
 emits it as `CURIE_CONNECTOR_CALLER_TOKEN` with the connector scope. The runner's
 `derive_mcp_servers`
-(`runner/src/curie_runner/connectors.py::derive_mcp_servers`) then gives each
-hosted entry the header `X-Curie-Caller`
+(`runner/src/curie_runner/connectors.py::derive_mcp_servers`) gives each hosted
+entry the header `X-Curie-Caller`
 (`runner/src/curie_runner/connectors.py::CALLER_HEADER`) with the token's
-placeholder, and gives none to a remote or fallback URL. The token stays in the
-sandbox env, because the MCP client expands the header from it; the signing key
-never enters a sandbox
+placeholder, and gives none to a remote or fallback URL. The signing key never
+enters a sandbox
 (`apps/worker/src/curie_worker/sandbox/types.py::HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
-The wire is frozen in `tests/vectors/connector-caller-token.json`. With no key
-set, nothing is minted and the boot env is unchanged. Nothing checks the token
-yet, and no proxy strips the header before it reaches the connector: until one
-does, the hosted server image itself receives `X-Curie-Caller`, including on
-its own OAuth discovery requests.
+
+When the API holds the matching public key, `render` puts a caller proxy in
+front of every hosted connector it renders
+(`packages/plugin-format/src/plugin_format/connector_render.py::ConnectorProxy`).
+The proxy runs from the worker image as `python -m curie_connector_proxy`, pulled
+with the worker's pull policy and pull secrets, and holds only the public keys
+and the connector's `admits` list, resolved at render
+(`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`).
+The Service keeps the connector's port, so the URL and the allowed hosts do not
+move, and lands it on the proxy's port. Both rendered NetworkPolicies open only
+that port, so nothing Curie renders opens the server's own port.
+
+Callers that are not agents, such as a keep-alive Job, carry no token. For them
+the render adds a second Service, `<connector Service>-direct`
+(`packages/plugin-format/src/plugin_format/connector_render.py::direct_service_name`),
+which selects the same pods and targets the server's own port
+(`packages/plugin-format/src/plugin_format/connector_render.py::render_direct_service`).
+No rendered policy opens that port, so a sandbox cannot use it. It admits only
+the peers of an operator-applied ingress policy naming the server's port,
+because policies are additive. An install with no caller key renders no
+`-direct` Service.
+
+The proxy admits a request whose token either configured key
+verifies, that has not expired and that names a listed agent
+(`apps/worker/src/curie_connector_proxy/caller.py::decide`), strips the header
+and forwards it to the server over loopback with its `Host` unchanged and its
+body as sent, never decoded
+(`apps/worker/src/curie_connector_proxy/server.py::make_app`). It checks every
+path the same way, the MCP client's OAuth discovery and registration requests
+included. Its log line quotes the path, and aiohttp's own error and access logs
+redact a caller token. Any other request gets a 403 carrying a JSON-RPC error and no
+challenge, and never reaches the server; the shape is frozen in
+`tests/vectors/connector-caller-refusal.json`, and the runner reports it as the
+connector refusing this sandbox
+(`runner/src/curie_runner/mcp_tool_capability.py::ConnectorCapabilityFailure`).
+The token wire is frozen in `tests/vectors/connector-caller-token.json`. An API
+with no public key renders no proxy, and the network policy is then the whole
+of the check again. A runner claimed before its worker held a key carries no
+token, so the next turn on its thread claims a fresh one
+(`apps/worker/src/curie_worker/kernel.py::_boots_differently`).
 
 ## Implementations today
 
@@ -210,7 +240,8 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   to satisfy a port that never mentions Kubernetes in its own signatures.
 - **Rendering is Kubernetes-specific and sits outside the port.** `render`
   (`packages/plugin-format/src/plugin_format/connector_render.py::render`) emits a
-  Deployment, a Service and two NetworkPolicies, and it runs in the API, not
+  Deployment, a Service and two NetworkPolicies, plus the `-direct` Service
+  behind a caller proxy, and it runs in the API, not
   behind `ConnectorClient`. Swapping the host therefore swaps only the applier;
   the second host needs a second renderer too, and no port covers that half.
 - **There is no selector.** Unlike the substrate seam's `CURIE_SANDBOX_SUBSTRATE`,
@@ -253,6 +284,9 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   `bearer_secret` or one plain-string secret and exclude an implicit `SecretRef`.
   Unlike `OWNER_LABEL`, the four cases are frozen in
   `tests/vectors/connector-derived-bearer.json`.
+- **The Docker dev-tier host enforces no caller.** Its connector containers share
+  one network with no policy and no caller proxy, so any container on it can
+  reach a connector's port, the trade ADR-0009 makes for the local substrate.
 - **The port's own docstring miscounts itself.** `ConnectorClient` is introduced
   as "deliberately four verbs" while declaring three; the cluster module states
   the true shape, four object kinds and three verbs. A second implementer reading

@@ -1027,3 +1027,34 @@ def test_bundle_surfaces_a_refused_admits_entry(tmp_path: Path) -> None:
     result = validate_bundle(str(root))
     assert not result.valid
     assert "connectors.bad_admits_agent" in [e.code for e in result.errors]
+
+
+# ADR-0168 decision 7: with a caller proxy, connector `X` also renders a Service
+# named `<X's object name>-direct`, which is exactly the object name of a
+# sibling connector named `X-direct`. The two would overwrite one Service.
+def test_a_hosted_connector_named_after_a_siblings_direct_service_is_rejected() -> None:
+    codes = _codes(
+        {"connectors": {"grafana": {"image": "x:1"}, "grafana-direct": {"image": "y:1"}}}
+    )
+    assert codes == ["connectors.direct_service_collision"]
+    _, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x:1"}, "grafana-direct": {"image": "y:1"}}}
+    )
+    message = errors[0][1]
+    assert "grafana-direct" in message
+    assert "rename" in message.lower()
+
+
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        {"grafana-direct": {"image": "y:1"}},
+        {"grafana": {"url": "https://g.example/mcp"}, "grafana-direct": {"image": "y:1"}},
+        {"grafana": {"image": "x:1"}, "grafana-direct": {"url": "https://g.example/mcp"}},
+    ],
+    ids=["no_sibling", "remote_sibling", "remote_direct"],
+)
+def test_a_direct_suffix_that_renders_no_colliding_service_is_accepted(
+    connectors: dict[str, object],
+) -> None:
+    assert "connectors.direct_service_collision" not in _codes({"connectors": connectors})
