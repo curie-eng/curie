@@ -138,8 +138,10 @@ def test_a_declared_identity_with_a_blank_token_is_named_and_left_out(
         ("slack", "default", None, "default"),
         ("slack", "ops-bot", None, "ops-bot"),
         ("slack", "curie-cluster-message", None, "default"),
-        # The pre-ADR custom-transport form: `reply_adapter` is a credential slug.
-        ("slack", "agentmail-sandbox", "http://stub.example/api/", "default"),
+        # A Slack approval's endpoint is only a CLI stub turn's per-turn origin:
+        # no Slack binding carries a transport since migration 0061, so the
+        # custom-transport form this row used to pin no longer exists.
+        ("slack", "default", "http://stub.example/api/", "default"),
         # A mail turn's card and its approvers are Slack's default app's.
         ("email", "agentmail-sandbox", "https://adapter.example/hook", "default"),
         (None, None, None, "default"),
@@ -182,6 +184,26 @@ def test_an_identity_with_no_token_fails_closed_and_never_borrows_default() -> N
 
     assert not verdict.member and verdict.undetermined
     assert verdict.evidence is not None and "'ops-bot'" in verdict.evidence["error"]
+    assert calls == []
+
+
+def test_an_approval_naming_an_undeclared_identity_fails_closed() -> None:
+    """A stored Slack `reply_adapter` is an identity. One this installation does
+    not declare -- custom-transport history the upgrade leaves as stored, whose
+    adapter was a credential slug -- has no token to resolve with, so it fails
+    closed rather than borrowing default's."""
+
+    calls: list[httpx.Request] = []
+    select = build_approver_set_selector(
+        _http(calls),
+        _settings(declared=_DECLARED),
+        environ={"CURIE_SLACK_BOT_TOKEN__1": _OPS_TOKEN},
+    )
+
+    verdict = _contains(select(_approval(adapter="agentmail-sandbox"), _BINDING))
+
+    assert not verdict.member and verdict.undetermined
+    assert verdict.evidence is not None and "'agentmail-sandbox'" in verdict.evidence["error"]
     assert calls == []
 
 

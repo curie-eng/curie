@@ -263,8 +263,8 @@ def test_a_named_slack_key_never_finds_the_default_apps_work_item(
         )
         await session.execute(
             text(
-                "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
-                "VALUES (:id, :a, 'slack', 'C0EXAMPLE1')"
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                "VALUES (:id, :a, 'slack', 'C0EXAMPLE1', 'default')"
             ),
             {"id": uuid.uuid4(), "a": agent_id},
         )

@@ -1481,7 +1481,7 @@ def test_a_half_configured_route_is_rejected_on_create_and_on_patch(
 ) -> None:
     """T-C11 (round-2 P2). Both-or-neither, on BOTH write verbs.
 
-    `agent_channels_route_pair_ck` states the same invariant at the database for
+    `agent_channels_route_ck` states the same invariant at the database for
     out-of-band writers (T-A16); this is the half that gives an operator a
     message instead of an IntegrityError. Both verbs, because the reviewer's
     failure mode was a row that "accepts ingress and fails later in the worker",
