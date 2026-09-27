@@ -205,7 +205,7 @@ def test_both_kinds_appear_together() -> None:
 
 
 def test_a_failed_call_is_reported_as_maybe_rather_than_done() -> None:
-    """"It may have happened" is the state a human most needs told."""
+    """ "It may have happened" is the state a human most needs told."""
 
     receipt = render_receipt([_action(status="failed", undoable=False, result=None)])
 
@@ -481,3 +481,20 @@ def test_other_actions_survive_beside_memory_tool_actions() -> None:
     assert "MEMORY-SAVE" not in receipt
     assert "MEMORY-FORGET" not in receipt
     assert receipt.count("•") == 1
+
+
+def test_the_receipt_filter_names_match_the_runner_published_memory_tools() -> None:
+    """F8: the worker filters by live name, so the two sides must agree exactly.
+
+    A rename on the runner side would otherwise put every save back into the
+    receipt with nothing failing. Cross-package like test_approval_prefix_pin.py.
+    """
+
+    from curie_runner.approval import APPROVAL_SERVER_NAME, platform_tool_names
+    from curie_runner.memory_facts import MEMORY_TOOL_NAMES
+    from curie_worker import receipt
+
+    published = {f"mcp__{APPROVAL_SERVER_NAME}__{name}" for name in MEMORY_TOOL_NAMES}
+    assert published <= platform_tool_names(state_server_mounted=False, memory_tools_mounted=True)
+    assert set(receipt._UNANNOUNCED_TOOLS) == published
+    assert set(_MEMORY_TOOLS) == published

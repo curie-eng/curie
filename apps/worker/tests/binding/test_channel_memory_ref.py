@@ -11,6 +11,8 @@ like ``test_eval_memory_isolation.py``.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import uuid
 
 import pytest
@@ -96,6 +98,78 @@ def test_the_memory_scoped_agent_shape_does_not_change_the_ref() -> None:
     assert env[_KEY] == f"{_base()}/agents/{_AGENT}/state/bindings/slack/C0123/memory"
 
 
-def test_both_resolver_statements_select_memory_writes() -> None:
+# --- F1: memory_writes is read apart from deployment resolution --------------
+#
+# Resolution runs in migration tests against schemas that predate the column
+# (migration 0068), so, as runner_resources did in 2f76e6283, the value comes
+# from its own read. DB-free: a fake engine answers that read.
+
+
+def test_resolver_statements_do_not_select_memory_writes() -> None:
     for sql in (binding._RESOLVE_SQL, binding._RESOLVE_AGENT_SQL):
-        assert "memory_writes" in sql
+        assert "memory_writes" not in sql
+
+
+class _Result:
+    def __init__(self, row: tuple[object, ...] | None) -> None:
+        self._row = row
+
+    def first(self) -> tuple[object, ...] | None:
+        return self._row
+
+
+class _Conn:
+    def __init__(self, engine: _Engine) -> None:
+        self._engine = engine
+
+    async def __aenter__(self) -> _Conn:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def execute(self, sql: object, params: dict[str, object] | None = None) -> _Result:
+        self._engine.statements.append((str(sql), dict(params or {})))
+        return _Result(self._engine.row)
+
+
+class _Engine:
+    def __init__(self, row: tuple[object, ...] | None) -> None:
+        self.row = row
+        self.statements: list[tuple[str, dict[str, object]]] = []
+
+    def connect(self) -> _Conn:
+        return _Conn(self)
+
+
+def _reader(row: tuple[object, ...] | None) -> tuple[BindingResolver, _Engine]:
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig()
+    engine = _Engine(row)
+    resolver._engine = engine  # type: ignore[assignment]
+    return resolver, engine
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [((True,), True), ((False,), False), ((None,), False), (None, False)],
+    ids=["on", "off", "null", "no-agent-row"],
+)
+def test_memory_writes_for_reads_the_agent_setting(
+    row: tuple[object, ...] | None, expected: bool
+) -> None:
+    resolver, engine = _reader(row)
+    assert asyncio.run(resolver.memory_writes_for(_AGENT)) is expected
+    [(sql, params)] = engine.statements
+    assert "memory_writes" in sql
+    assert f"{WorkerConfig().db_schema}.agents" in sql
+    assert _AGENT in params.values()
+
+
+def test_memory_writes_for_is_called_on_the_turn_path() -> None:
+    # The separate read is only useful if a turn uses it: the definition plus at
+    # least one call site across the resolver and the kernel.
+    from curie_worker import kernel
+
+    sources = inspect.getsource(binding) + inspect.getsource(kernel)
+    assert sources.count("memory_writes_for(") >= 2
