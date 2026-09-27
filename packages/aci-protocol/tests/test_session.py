@@ -86,6 +86,7 @@ _API_BASE = "https://api.example.test"
 _SESSION_ID = f"agent-{_AGENT_ID}-thread-{_THREAD_KEY}"
 _MEMORY_REF = f"{_API_BASE}/agents/{_AGENT_ID}/state/memory"
 _HISTORY_REF = f"{_API_BASE}/agents/{_AGENT_ID}/state/transcript/{_THREAD_SEGMENT}"
+_CHANNEL_MEMORY_REF = f"http://api:8000/agents/{_AGENT_ID}/state/bindings/slack/C0ABC/memory"
 
 # binding.budget_for builds a Budget with no task_budget_hint, rendered with
 # Budget.model_dump_json().
@@ -170,6 +171,7 @@ def _full_boot_env() -> BootEnv:
         model="claude-opus-4-6",
         fake_model=True,
         history_ref=_HISTORY_REF,
+        channel_memory_ref=_CHANNEL_MEMORY_REF,
         history_token="st-history-token",
         memory_token="st-memory-token",
         state_url="http://api:8000/agents/agent-abc/state",
@@ -555,6 +557,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         connector_namespace="curie",
         connector_caller_token="cct.payload.signature",
         bundle_version="abc123def456",
+        channel_memory_ref=_CHANNEL_MEMORY_REF,
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -786,6 +789,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_MODEL",
         "CURIE_FAKE_MODEL",
         "CURIE_HISTORY_REF",
+        "CURIE_CHANNEL_MEMORY_REF",
         "CURIE_HISTORY_TOKEN",
         "CURIE_MEMORY_TOKEN",
         "CURIE_STATE_URL",
@@ -1029,3 +1033,40 @@ def test_the_caller_token_survives_the_worker_render_and_the_consumer_parse() ->
 
 def test_the_caller_token_has_one_producer_the_worker() -> None:
     assert _producers_of("CURIE_CONNECTOR_CALLER_TOKEN") == {"worker"}
+
+
+# --- Channel memory ref (#3389) ----------------------------------------------
+
+
+def test_render_worker_emits_the_channel_memory_ref_when_given() -> None:
+    env = _worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF)
+    assert env["CURIE_CHANNEL_MEMORY_REF"] == _CHANNEL_MEMORY_REF
+
+
+def test_render_worker_omits_the_channel_memory_ref_when_not_given() -> None:
+    assert "CURIE_CHANNEL_MEMORY_REF" not in _worker_env()
+    assert "CURIE_CHANNEL_MEMORY_REF" not in _worker_env(channel_memory_ref=None)
+
+
+def test_channel_memory_ref_survives_the_worker_render_and_the_consumer_parse() -> None:
+    boot = BootEnv.from_env(_worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF) | _SUBSTRATE_ENV)
+    assert boot.channel_memory_ref == _CHANNEL_MEMORY_REF
+    assert boot.to_env()["CURIE_CHANNEL_MEMORY_REF"] == _CHANNEL_MEMORY_REF
+    assert BootEnv.from_env(boot.to_env()) == boot
+
+
+def test_to_env_omits_the_channel_memory_ref_when_unset() -> None:
+    boot = BootEnv(session=_boot_session())
+    assert boot.channel_memory_ref is None
+    assert "CURIE_CHANNEL_MEMORY_REF" not in boot.to_env()
+
+
+def test_from_env_reads_an_empty_channel_memory_ref_as_unset() -> None:
+    env = BootEnv(session=_boot_session()).to_env()
+    env["CURIE_CHANNEL_MEMORY_REF"] = ""
+    assert BootEnv.from_env(env).channel_memory_ref is None
+
+
+def test_channel_memory_ref_is_a_worker_only_env_key() -> None:
+    assert BootEnv.env_key("channel_memory_ref") == "CURIE_CHANNEL_MEMORY_REF"
+    assert _producers_of("CURIE_CHANNEL_MEMORY_REF") == {"worker"}
