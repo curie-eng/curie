@@ -287,7 +287,7 @@ async def _steer(request: web.Request) -> web.Response:
     if not isinstance(frame, Event):
         return web.json_response({"error": "expected an event frame"}, status=400)
 
-    delivered = await runner.steer(frame.text)
+    delivered = await runner.steer(frame.text, event=frame)
     if not delivered:
         return web.json_response(
             {"error": "no active turn to steer; open a new /v1/event"}, status=409

@@ -76,6 +76,7 @@ from plugin_format import (
 
 from .memory_facts import (
     FORGET_TOOL,
+    MAX_STATEMENT_CHARS,
     MEMORY_TOOL_NAMES,
     REMEMBER_TOOL,
     UPDATE_TOOL,
@@ -567,7 +568,22 @@ def build_memory_tools(
             return statement.strip()
         return None
 
+    def bad_statement(statement: str | None) -> dict[str, Any] | None:
+        if statement is None:
+            return _approval_error("statement must be a non-empty string.")
+        if len(statement) > MAX_STATEMENT_CHARS:
+            return _approval_error(
+                f"Refused: a statement may be at most {MAX_STATEMENT_CHARS} characters "
+                f"(this one is {len(statement)}). Nothing was saved."
+            )
+        return None
+
     def failure(exc: MemoryFactsError, memory: object, fact_id: object = None) -> dict[str, Any]:
+        if isinstance(exc, MemoryFull) and exc.limit == "value":
+            return _approval_error(
+                f"Refused: that fact is too large to store as one {memory} memory entry "
+                f"({exc}). Nothing was saved; state it more briefly."
+            )
         if isinstance(exc, MemoryFull):
             return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
         if isinstance(exc, FactNotFound):
@@ -584,8 +600,10 @@ def build_memory_tools(
         if store is None:
             return _approval_error(problem or "Unknown memory.")
         statement = statement_of(args)
-        if statement is None:
-            return _approval_error("statement must be a non-empty string.")
+        refusal = bad_statement(statement)
+        if refusal is not None:
+            return refusal
+        assert statement is not None
         try:
             fact_id = await store.add(
                 statement=statement, author=turn.author, session_id=session_id
@@ -600,8 +618,10 @@ def build_memory_tools(
         if store is None:
             return _approval_error(problem or "Unknown memory.")
         statement = statement_of(args)
-        if statement is None:
-            return _approval_error("statement must be a non-empty string.")
+        refusal = bad_statement(statement)
+        if refusal is not None:
+            return refusal
+        assert statement is not None
         fact_id = args.get("id")
         try:
             await store.update(

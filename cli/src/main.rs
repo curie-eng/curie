@@ -4192,10 +4192,6 @@ async fn main() {
     }
 }
 
-/// Route a handler's structured output through the one success-path emit
-/// (`Ui::emit`), mirroring the centralized error emit in `main`. The read verbs
-/// return a `CliOutput` instead of touching stdout themselves, so the
-/// json-vs-human decision is made in exactly one place (issue #456).
 /// Run a `<tier> memory --guidance*` action and emit its result: a dry-run
 /// plan through the memory verb's own `MemoryOutput::DryRun`, otherwise the
 /// effective guidance.
@@ -4249,6 +4245,10 @@ impl MemoryGuidanceArgs {
     }
 }
 
+/// Route a handler's structured output through the one success-path emit
+/// (`Ui::emit`), mirroring the centralized error emit in `main`. The read verbs
+/// return a `CliOutput` instead of touching stdout themselves, so the
+/// json-vs-human decision is made in exactly one place (issue #456).
 fn emit<T: curie::ui::CliOutput>(out: T) -> Result<()> {
     ui::ui().emit(&out);
     Ok(())

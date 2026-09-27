@@ -690,16 +690,22 @@ class SessionRunner:
             self._turn_ready = False
             self._status = SessionStatus.IDLE_AWAITING_INPUT
 
-    async def steer(self, text: str) -> bool:
+    async def steer(self, text: str, *, event: Event | None = None) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
 
         Returns False when no turn is active (the finish-race boundary F1 owns:
         the caller falls back to opening a fresh turn). The steered output appears
         on the already-open turn's NDJSON stream.
+
+        ``event`` is the steered frame. When given, the memory tools' author is
+        rebound to its sender before the model sees the text (#1461), exactly as
+        turn start does, so a fact saved in reply is attributed to whoever said it.
         """
 
         if self._session is None or not self._turn_open or not self._turn_ready:
             return False
+        if event is not None and self._memory_turn is not None:
+            self._memory_turn.begin(event)
         await self._session.query(text)
         if self._active_state is not None:
             self._active_state.history_messages.append(

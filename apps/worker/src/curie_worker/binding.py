@@ -240,7 +240,6 @@ SELECT a.id AS agent_id,
        d.workspace_enabled AS workspace_enabled,
        d.environment AS deployment_environment,
        a.memory AS memory,
-       a.memory_writes AS memory_writes,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -275,7 +274,6 @@ SELECT a.id AS agent_id,
        d.workspace_enabled AS workspace_enabled,
        d.environment AS deployment_environment,
        a.memory AS memory,
-       a.memory_writes AS memory_writes,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -386,6 +384,9 @@ class ResolvedDeployment(BaseModel):
     # Whether the operator turned memory writes on for this agent (#1461,
     # ADR-0167). On, a bound turn's runner gets its channel memory ref and
     # mounts the remember/update/forget tools; off (the default), neither.
+    # Not selected by the resolver statements: the column arrives in migration
+    # 0068 and resolution runs against older schemas, so the kernel reads it
+    # with ``memory_writes_for`` and copies it on, as with runner_resources.
     memory_writes: bool = False
 
 
@@ -852,6 +853,20 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def memory_writes_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator turned memory writes on for the agent (#1461).
+
+        A separate read from deployment resolution, like
+        ``runner_resources_for``: resolution runs in migration tests against
+        schemas that predate the column (migration 0068). A missing agent row or
+        a null value reads as off.
+        """
+        sql = text(f"SELECT memory_writes FROM {self._config.db_schema}.agents WHERE id = :id")
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        return bool(row is not None and row[0])
+
     async def model_settings_for(
         self, agent_id: uuid.UUID
     ) -> tuple[str | None, str | None, dict[str, Any] | None]:
@@ -968,19 +983,6 @@ class BindingResolver:
                 f"{base}/agents/{resolved.agent_id}/state/bindings/"
                 f"{quote(kind, safe='')}/{quote(address, safe='')}"
             )
-        # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
-        # the memory/history loaders and the bundle reach DIFFERENT namespaces:
-        #  - the broad ``state`` token backs the memory and history tokens, whose
-        #    loaders MUST read/write the reserved ``memory``/``transcript``
-        #    namespaces to rehydrate the agent across suspend/resume;
-        #  - the narrow ``state.app`` token backs the bundle-facing state token,
-        #    which the API state router refuses on those reserved namespaces
-        #    (#249) -- so a skill cannot corrupt memory/history by composing the
-        #    mounted ``CURIE_STATE_URL`` directly with the token it holds.
-        # The scope strings are mirrored in ``apps/api`` ``routers/state.py``
-        # (STATE_SCOPE / STATE_APP_SCOPE). When no platform key is configured
-        # (fake/local) there is nothing to sign with, so neither token is minted
-        # and none is set -- preserving the pre-#410 no-key path.
         # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
         # to this turn's binding, on the same store and read/written with the
         # same broad memory token. Its presence is the runner's signal to mount
@@ -998,6 +1000,19 @@ class BindingResolver:
                 f"{base}/agents/{resolved.agent_id}/state/bindings/"
                 f"{quote(kind, safe='')}/{quote(address, safe='')}/memory"
             )
+        # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
+        # the memory/history loaders and the bundle reach DIFFERENT namespaces:
+        #  - the broad ``state`` token backs the memory and history tokens, whose
+        #    loaders MUST read/write the reserved ``memory``/``transcript``
+        #    namespaces to rehydrate the agent across suspend/resume;
+        #  - the narrow ``state.app`` token backs the bundle-facing state token,
+        #    which the API state router refuses on those reserved namespaces
+        #    (#249) -- so a skill cannot corrupt memory/history by composing the
+        #    mounted ``CURIE_STATE_URL`` directly with the token it holds.
+        # The scope strings are mirrored in ``apps/api`` ``routers/state.py``
+        # (STATE_SCOPE / STATE_APP_SCOPE). When no platform key is configured
+        # (fake/local) there is nothing to sign with, so neither token is minted
+        # and none is set -- preserving the pre-#410 no-key path.
         state_token: str | None = None
         app_state_token: str | None = None
         exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS

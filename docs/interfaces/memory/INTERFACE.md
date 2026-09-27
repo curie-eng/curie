@@ -84,8 +84,11 @@ reached with the same memory token:
   only when the agent's `memory_writes` setting is on and the turn has a
   binding, and never on an eval-isolated turn.
 
-At boot the runner lists both and renders a "Remembered facts" block (agent
-facts, then channel facts, newest first) after the legacy log preamble. When
+At boot the runner lists whichever of the two it was given and renders a
+"Remembered facts" block (agent facts, then channel facts, newest first, at
+most 200 per memory, each statement flattened to one line and framed as data,
+not instructions) after the legacy log preamble. With memory writes off no
+channel ref is minted, so only agent facts are loaded. When
 `CURIE_CHANNEL_MEMORY_REF` is set it also mounts `remember`, `update` and
 `forget` on the platform `curie` server and injects the guidance block
 (`guidance` if stored, else `DEFAULT_GUIDANCE`) before the bundle prompt. The

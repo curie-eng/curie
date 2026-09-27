@@ -2687,6 +2687,14 @@ class Kernel:
                 agent_name = getattr(resolved, "agent_name", None)
                 reader = getattr(self._binding, "runner_resources_for", None)
                 runner_resources = await reader(agent_id) if reader is not None else None
+                # Memory writes (#1461) are read apart from resolution for the
+                # same schema reason as runner_resources; boot_env reads them
+                # off the resolved deployment. hasattr: binding doubles may not
+                # carry the method.
+                if hasattr(self._binding, "memory_writes_for") and (
+                    await self._binding.memory_writes_for(agent_id)
+                ):
+                    resolved = resolved.model_copy(update={"memory_writes": True})
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
