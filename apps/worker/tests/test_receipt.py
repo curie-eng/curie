@@ -448,3 +448,36 @@ def test_off_mode_never_renders_a_receipt() -> None:
 
     for actions in ([], [_action()], _mixed_turn(), _long_turn(), _failed_only(_mixed_turn())):
         assert render_receipt(actions, mode="off") is None
+
+# --- #1461: memory saves are recorded, not announced --------------------------
+
+_MEMORY_TOOLS = ("mcp__curie__remember", "mcp__curie__update", "mcp__curie__forget")
+
+
+def test_memory_tool_actions_are_left_out_of_the_receipt() -> None:
+    """A saved fact is not a change to the world; a receipt line per save is noise."""
+
+    receipt = render_receipt(
+        [
+            _action(tool=name, result={"summary": f"MEMORY-{name}"}, undoable=False)
+            for name in _MEMORY_TOOLS
+        ]
+    )
+
+    assert receipt is None
+
+
+def test_other_actions_survive_beside_memory_tool_actions() -> None:
+    receipt = render_receipt(
+        [
+            _action(tool="mcp__curie__remember", result={"summary": "MEMORY-SAVE"}),
+            _action(),
+            _action(tool="mcp__curie__forget", result={"summary": "MEMORY-FORGET"}),
+        ]
+    )
+
+    assert receipt is not None
+    assert "scaled public/api from 3 to 10" in receipt
+    assert "MEMORY-SAVE" not in receipt
+    assert "MEMORY-FORGET" not in receipt
+    assert receipt.count("•") == 1

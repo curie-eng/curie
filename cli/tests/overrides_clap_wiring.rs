@@ -367,3 +367,185 @@ fn execution_deadline_above_the_maximum_is_refused_client_side() {
         "a deadline above 10800 seconds must be refused before any request"
     );
 }
+
+// --- `--memory-writes on|off` (issue #1461) ---------------------------------
+//
+// `memory_writes` is a NOT NULL boolean on the agent, so the flag takes an
+// explicit `on`/`off` and the PATCH body carries a JSON BOOLEAN under
+// `memory_writes` -- never the strings "on"/"off", and never null.
+
+fn usage_refused(argv: &[&str]) {
+    let output = Command::new(bin())
+        .args(argv)
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .output()
+        .unwrap_or_else(|e| panic!("run curie {}: {e}", argv.join(" ")));
+    assert!(
+        !output.status.success(),
+        "curie {} must be refused; stdout: {}",
+        argv.join(" "),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn local_overrides_memory_writes_on_sends_json_true() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": true}),
+        "--memory-writes on must send a JSON boolean true under its own key: {plan}"
+    );
+}
+
+#[test]
+fn local_overrides_memory_writes_off_sends_json_false() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "off",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": false}),
+        "--memory-writes off must send a JSON boolean false, not null: {plan}"
+    );
+}
+
+#[test]
+fn cluster_overrides_memory_writes_on_sends_json_true() {
+    let plan = dry_run_plan_line(&[
+        "cluster",
+        "overrides",
+        "deal-desk",
+        "--api-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "curie-test-key",
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": true}),
+        "--memory-writes on must send a JSON boolean true under its own key: {plan}"
+    );
+}
+
+#[test]
+fn cluster_overrides_memory_writes_off_sends_json_false() {
+    let plan = dry_run_plan_line(&[
+        "cluster",
+        "overrides",
+        "deal-desk",
+        "--api-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "curie-test-key",
+        "--memory-writes",
+        "off",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"memory_writes": false}),
+        "--memory-writes off must send a JSON boolean false, not null: {plan}"
+    );
+}
+
+#[test]
+fn memory_writes_combines_with_model_under_separate_keys() {
+    let plan = dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--model",
+        MODEL_SENTINEL,
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        patch_body(&plan),
+        serde_json::json!({"model": MODEL_SENTINEL, "memory_writes": true}),
+        "each flag must land under its own body key: {plan}"
+    );
+}
+
+#[test]
+fn memory_writes_rejects_a_value_other_than_on_or_off_at_both_tiers() {
+    // Anchor: the flag exists and takes `on`. Without this the refusals below
+    // would pass vacuously against a binary that has no --memory-writes at all.
+    dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "on",
+        "--dry-run",
+        "--json",
+    ]);
+    for value in ["yes", "true", "1", ""] {
+        usage_refused(&[
+            "local",
+            "overrides",
+            "deal-desk",
+            "--memory-writes",
+            value,
+            "--dry-run",
+            "--json",
+        ]);
+        usage_refused(&[
+            "cluster",
+            "overrides",
+            "deal-desk",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "curie-test-key",
+            "--memory-writes",
+            value,
+            "--dry-run",
+            "--json",
+        ]);
+    }
+}
+
+#[test]
+fn memory_writes_without_a_value_is_refused() {
+    // Anchor, as above: `off` must parse before a bare flag's refusal means anything.
+    dry_run_plan_line(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "off",
+        "--dry-run",
+        "--json",
+    ]);
+    usage_refused(&[
+        "local",
+        "overrides",
+        "deal-desk",
+        "--memory-writes",
+        "--dry-run",
+        "--json",
+    ]);
+}
