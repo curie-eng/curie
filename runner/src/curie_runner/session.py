@@ -71,6 +71,7 @@ from .memory import (
     consolidate_memory,
     utcnow_iso,
 )
+from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
 from .side_effects import SideEffectClassifier
@@ -273,12 +274,16 @@ class SessionRunner:
         progress_activity: ProgressActivity | None = None,
         usage_reporter: UsageSink | None = None,
         primary_model: str | None = None,
+        memory_turn: MemoryTurn | None = None,
     ) -> None:
         self._factory = session_factory
         # Per-model token usage reported at the ResultMessage boundary (#3223);
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
         self._primary_model = primary_model
+        # Who the memory tools attribute a fact to (#1461); None when the
+        # tools are not mounted. Set at each turn start from the inbound event.
+        self._memory_turn = memory_turn
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
@@ -817,6 +822,8 @@ class SessionRunner:
             self._turn_ready = False
             state = TurnState()
             self._active_state = state
+            if self._memory_turn is not None:
+                self._memory_turn.begin(event)
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:

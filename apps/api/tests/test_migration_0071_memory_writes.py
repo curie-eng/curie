@@ -1,4 +1,4 @@
-"""Migration 0068 adds `agents.memory_writes` (#1461).
+"""Migration 0071 adds `agents.memory_writes` (#1461).
 
 `BOOLEAN NOT NULL DEFAULT false`: existing agents come out of the upgrade with
 the memory tools off, and downgrade removes the column again.
@@ -19,8 +19,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
-REVISION = "0068"
-BELOW = "0067"
+REVISION = "0071"
+BELOW = "0070"
 
 
 def _config() -> Config:
@@ -55,19 +55,19 @@ def _insert_agent() -> uuid.UUID:
     agent_id = uuid.uuid4()
     _sql(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
-        {"id": agent_id, "name": f"m0068-{agent_id.hex[:8]}"},
+        {"id": agent_id, "name": f"m0071-{agent_id.hex[:8]}"},
     )
     return agent_id
 
 
-def test_0068_follows_0067() -> None:
+def test_0071_follows_0070() -> None:
     script = ScriptDirectory.from_config(_config())
     revision = script.get_revision(REVISION)
     assert revision is not None
     assert revision.down_revision == BELOW
 
 
-def test_0068_adds_memory_writes_default_false_and_downgrade_drops_it(
+def test_0071_adds_memory_writes_default_false_and_downgrade_drops_it(
     isolated_migration_db: None,
 ) -> None:
     config = _config()

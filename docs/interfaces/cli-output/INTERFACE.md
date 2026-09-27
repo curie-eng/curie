@@ -79,7 +79,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `ListAgentsOutput`, `BumpVersionOutput`, `StatusOutput`, `SkillMessageOutput`,
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
   `BudgetOutput`, `ResetThreadOutput`,
-  `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `HookOutput`, `ApprovalsOutput`,
+  `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `MemoryGuidanceOutput`, `HookOutput`, `ApprovalsOutput`,
   `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`,
   `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
   `ConnectorBuildOutput`. The last is

@@ -1059,6 +1059,11 @@
             "title": "Memory",
             "type": "boolean"
           },
+          "memory_writes": {
+            "default": false,
+            "title": "Memory Writes",
+            "type": "boolean"
+          },
           "model": {
             "anyOf": [
               {
@@ -1294,6 +1299,17 @@
               }
             ],
             "title": "Memory"
+          },
+          "memory_writes": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Writes"
           },
           "model": {
             "anyOf": [
@@ -4301,6 +4317,43 @@
           "version"
         ],
         "title": "MemoryEntryOut",
+        "type": "object"
+      },
+      "MemoryGuidanceIn": {
+        "description": "Operator memory guidance for one agent (#1461).\n\nStored verbatim at ``memory/guidance`` as ``{\"text\": ...}``; the runner shows\nit to the model beside its memory tools in place of the platform default.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "MemoryGuidanceIn",
+        "type": "object"
+      },
+      "MemoryGuidanceOut": {
+        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent, else\n``default`` and ``text`` is the platform default.",
+        "properties": {
+          "source": {
+            "enum": [
+              "default",
+              "operator"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "source"
+        ],
+        "title": "MemoryGuidanceOut",
         "type": "object"
       },
       "MemoryProvenanceOut": {
@@ -9970,6 +10023,185 @@
           }
         },
         "summary": "Create Memory",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/memory/guidance": {
+      "delete": {
+        "description": "Remove operator guidance, so the platform default applies again (#1461).\n\nRemoving guidance that is not stored is a no-op, still 204.",
+        "operationId": "delete_memory_guidance_agents__agent_id__memory_guidance_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Memory Guidance",
+        "tags": [
+          "memory"
+        ]
+      },
+      "get": {
+        "description": "The agent's effective memory guidance and its source (#1461).",
+        "operationId": "get_memory_guidance_agents__agent_id__memory_guidance_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryGuidanceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Memory Guidance",
+        "tags": [
+          "memory"
+        ]
+      },
+      "put": {
+        "description": "Store operator guidance, replacing any earlier one (#1461).\n\nThe runner reads it at the next session boot; a live thread keeps the\nguidance it booted with.",
+        "operationId": "put_memory_guidance_agents__agent_id__memory_guidance_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryGuidanceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryGuidanceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Memory Guidance",
         "tags": [
           "memory"
         ]

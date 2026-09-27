@@ -74,6 +74,17 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .memory_facts import (
+    FORGET_TOOL,
+    MEMORY_TOOL_NAMES,
+    REMEMBER_TOOL,
+    UPDATE_TOOL,
+    FactNotFound,
+    MemoryFactsError,
+    MemoryFactsStore,
+    MemoryFull,
+    MemoryTurn,
+)
 from .publication_precheck import PublicationPrecheck
 from .state import STATE_TOOL_NAMES
 
@@ -264,6 +275,16 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     {APPROVAL_TOOL_NAME, PLATFORM_PUBLISH_TOOL_NAME, PROGRESS_TOOL_NAME}
 )
 
+# The memory tools (#1461, ADR-0167), on the same ``curie`` server but mounted
+# only when the worker set a channel memory ref. Rendered from the one tuple
+# ``memory_facts.build_memory_tools`` registers, so a fourth memory tool cannot
+# be published without being exempted. Unlike ``report_progress`` these are
+# exempt ONLY when mounted: they write, so a name the platform did not publish
+# this session must fall to the fail-closed default.
+MEMORY_TOOL_LIVE_NAMES: frozenset[str] = frozenset(
+    f"mcp__{APPROVAL_SERVER_NAME}__{name}" for name in MEMORY_TOOL_NAMES
+)
+
 # Platform-owned remote-development publication gate.  This is deliberately
 # mounted beside the policy tool rather than shipped by a bundle: a bundle is
 # untrusted input and must not be able to remove, execute, or grant its own
@@ -417,6 +438,7 @@ def build_approval_server(
     managed_workspace: bool = False,
     include_request_approval: bool = True,
     progress_tool: SdkMcpTool[Any] | None = None,
+    memory_tools: Sequence[SdkMcpTool[Any]] = (),
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -440,6 +462,9 @@ def build_approval_server(
 
     ``progress_tool`` (#3077) is the ``report_progress`` tool, appended when the
     runner resolved a progress URL, token and phase declaration.
+
+    ``memory_tools`` (#1461) are ``remember``/``update``/``forget``, passed only
+    when the worker set a channel memory ref.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -470,12 +495,135 @@ def build_approval_server(
     tools.append(publish_changes)
     if progress_tool is not None:
         tools.append(progress_tool)
+    tools.extend(memory_tools)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
         version="1.0.0",
         tools=tools,
     )
+
+
+# --- The memory tools (#1461, ADR-0167) ---------------------------------------
+
+_MEMORY_PROPERTY = {
+    "type": "string",
+    "enum": ["agent", "channel"],
+    "description": "Which memory: channel (this channel only) or agent (every channel).",
+}
+_STATEMENT_PROPERTY = {"type": "string", "description": "One fact, stated plainly."}
+_ID_PROPERTY = {"type": "string", "description": "The fact's id, as shown in brackets."}
+
+_REMEMBER_SCHEMA = {
+    "type": "object",
+    "properties": {"memory": _MEMORY_PROPERTY, "statement": _STATEMENT_PROPERTY},
+    "required": ["memory", "statement"],
+}
+_UPDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "memory": _MEMORY_PROPERTY,
+        "id": _ID_PROPERTY,
+        "statement": _STATEMENT_PROPERTY,
+    },
+    "required": ["memory", "id", "statement"],
+}
+_FORGET_SCHEMA = {
+    "type": "object",
+    "properties": {"memory": _MEMORY_PROPERTY, "id": _ID_PROPERTY},
+    "required": ["memory", "id"],
+}
+
+
+def build_memory_tools(
+    *,
+    agent_store: MemoryFactsStore | None,
+    channel_store: MemoryFactsStore,
+    turn: MemoryTurn,
+    session_id: str,
+) -> list[SdkMcpTool[Any]]:
+    """The ``remember``/``update``/``forget`` tools for the ``curie`` server.
+
+    The author of every write is ``turn.author``, set by the SessionRunner from
+    the turn's inbound event; no argument names an author, a channel or a URL,
+    and an ``author`` the model passes anyway is ignored. Every failure (an
+    unknown memory, an unknown id, a full memory, an unreachable store) is an
+    ``is_error`` result the model reads.
+    """
+
+    def pick(args: Mapping[str, Any]) -> tuple[MemoryFactsStore | None, str | None]:
+        memory = args.get("memory")
+        if memory == "channel":
+            return channel_store, None
+        if memory == "agent":
+            if agent_store is None:
+                return None, "Agent memory is not available in this session."
+            return agent_store, None
+        return None, f"Unknown memory {memory!r}; pass memory as agent or channel."
+
+    def statement_of(args: Mapping[str, Any]) -> str | None:
+        statement = args.get("statement")
+        if isinstance(statement, str) and statement.strip():
+            return statement.strip()
+        return None
+
+    def failure(exc: MemoryFactsError, memory: object, fact_id: object = None) -> dict[str, Any]:
+        if isinstance(exc, MemoryFull):
+            return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
+        if isinstance(exc, FactNotFound):
+            return _approval_error(f"Not found: no fact with id {fact_id!r} in {memory} memory.")
+        logger.warning("memory tool failed error_class=%s: %s", type(exc).__name__, exc)
+        return _approval_error(f"The {memory} memory could not be reached. Nothing changed.")
+
+    def ok(payload: dict[str, Any]) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    @tool(REMEMBER_TOOL, "Save one new fact to memory. Returns its id.", _REMEMBER_SCHEMA)
+    async def remember(args: dict[str, Any]) -> dict[str, Any]:
+        store, problem = pick(args)
+        if store is None:
+            return _approval_error(problem or "Unknown memory.")
+        statement = statement_of(args)
+        if statement is None:
+            return _approval_error("statement must be a non-empty string.")
+        try:
+            fact_id = await store.add(
+                statement=statement, author=turn.author, session_id=session_id
+            )
+        except MemoryFactsError as exc:
+            return failure(exc, args.get("memory"))
+        return ok({"id": fact_id})
+
+    @tool(UPDATE_TOOL, "Replace the statement of a remembered fact, by id.", _UPDATE_SCHEMA)
+    async def update(args: dict[str, Any]) -> dict[str, Any]:
+        store, problem = pick(args)
+        if store is None:
+            return _approval_error(problem or "Unknown memory.")
+        statement = statement_of(args)
+        if statement is None:
+            return _approval_error("statement must be a non-empty string.")
+        fact_id = args.get("id")
+        try:
+            await store.update(
+                str(fact_id), statement=statement, author=turn.author, session_id=session_id
+            )
+        except MemoryFactsError as exc:
+            return failure(exc, args.get("memory"), fact_id)
+        return ok({"id": fact_id, "updated": True})
+
+    @tool(FORGET_TOOL, "Remove a remembered fact, by id.", _FORGET_SCHEMA)
+    async def forget(args: dict[str, Any]) -> dict[str, Any]:
+        store, problem = pick(args)
+        if store is None:
+            return _approval_error(problem or "Unknown memory.")
+        fact_id = args.get("id")
+        try:
+            await store.forget(str(fact_id))
+        except MemoryFactsError as exc:
+            return failure(exc, args.get("memory"), fact_id)
+        return ok({"id": fact_id, "forgotten": True})
+
+    return [remember, update, forget]
 
 
 def resolve_policy_route(
@@ -731,6 +879,10 @@ class ApprovalGate:
     # state server, so a forgotten wiring costs an over-refusal a human can see
     # rather than a silent bypass nobody can.
     state_server_mounted: bool = False
+    # Whether THIS session mounted the memory tools on the ``curie`` server
+    # (#1461). Same fact-not-default reasoning as ``state_server_mounted``:
+    # ``__main__`` sets it from the expression that decides the mount.
+    memory_tools_mounted: bool = False
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -971,7 +1123,9 @@ def canonical_tool_name(
     return None
 
 
-def platform_tool_names(*, state_server_mounted: bool) -> frozenset[str]:
+def platform_tool_names(
+    *, state_server_mounted: bool, memory_tools_mounted: bool = False
+) -> frozenset[str]:
     """The live tool names Curie's own in-process servers mounted THIS session.
 
     Always the two ``curie`` server tools; the five ``curie-state`` tools only
@@ -985,14 +1139,22 @@ def platform_tool_names(*, state_server_mounted: bool) -> frozenset[str]:
     The state names come from ``state.STATE_TOOL_NAMES``, which is rendered from
     the SAME spec list ``build_state_server`` registers, so a sixth state tool
     cannot be published without being exempted (#2286).
+
+    The three memory tools (#1461) join the set only when the runner mounted
+    them, on the same reasoning as the state tools.
     """
 
+    names = _APPROVAL_SERVER_TOOL_NAMES
     if state_server_mounted:
-        return _APPROVAL_SERVER_TOOL_NAMES | STATE_TOOL_NAMES
-    return _APPROVAL_SERVER_TOOL_NAMES
+        names = names | STATE_TOOL_NAMES
+    if memory_tools_mounted:
+        names = names | MEMORY_TOOL_LIVE_NAMES
+    return names
 
 
-def is_platform_owned_tool(live_tool_name: str, *, state_server_mounted: bool) -> bool:
+def is_platform_owned_tool(
+    live_tool_name: str, *, state_server_mounted: bool, memory_tools_mounted: bool = False
+) -> bool:
     """Whether a live SDK name is one Curie's own servers published (#2286).
 
     EXACT membership in ``platform_tool_names``, and the exactness is the whole
@@ -1025,7 +1187,9 @@ def is_platform_owned_tool(live_tool_name: str, *, state_server_mounted: bool) -
     named ``curie`` (its live names carry the ``plugin_<bundle>_`` infix).
     """
 
-    return live_tool_name in platform_tool_names(state_server_mounted=state_server_mounted)
+    return live_tool_name in platform_tool_names(
+        state_server_mounted=state_server_mounted, memory_tools_mounted=memory_tools_mounted
+    )
 
 
 def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecision | None:
@@ -1053,7 +1217,11 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
     # Outside policy scope is not permission to run. Returning None means the
     # policy has no opinion; `_decide_gate` still applies gate.required, the
     # operator gates, and the publication special case below.
-    if is_platform_owned_tool(tool_name, state_server_mounted=gate.state_server_mounted):
+    if is_platform_owned_tool(
+        tool_name,
+        state_server_mounted=gate.state_server_mounted,
+        memory_tools_mounted=gate.memory_tools_mounted,
+    ):
         return None
     canonical = canonical_tool_name(
         tool_name,

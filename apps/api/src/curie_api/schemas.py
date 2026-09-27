@@ -1483,6 +1483,10 @@ class AgentUpdate(BaseModel):
     repo_full_name: RepoFullName | None = None
     # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
+    # Whether the runner mounts its memory tools (#1461). Omitted (None) leaves
+    # it unchanged; the column is NOT NULL, so like `memory` there is no
+    # default for a null to clear back to.
+    memory_writes: bool | None = None
     # Omitted leaves the current publication policy. Explicit null is refused.
     # ``publication_branch_prefix`` null clears the prefix.
     publication_policy: Literal["approve", "auto"] | None = None
@@ -1543,6 +1547,8 @@ class AgentOut(BaseModel):
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up).
     memory: bool
+    # Whether the runner mounts its remember/update/forget tools (#1461).
+    memory_writes: bool = False
     publication_policy: Literal["approve", "auto"] = "approve"
     publication_policy_version: int = 1
     publication_draft: bool = False
@@ -3006,6 +3012,34 @@ class MemoryEntryCreate(BaseModel):
         if not stripped:
             raise ValueError("content must not be empty")
         return stripped
+
+
+class MemoryGuidanceIn(BaseModel):
+    """Operator memory guidance for one agent (#1461).
+
+    Stored verbatim at ``memory/guidance`` as ``{"text": ...}``; the runner shows
+    it to the model beside its memory tools in place of the platform default.
+    """
+
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def _text_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("text must not be empty")
+        return value
+
+
+class MemoryGuidanceOut(BaseModel):
+    """The agent's effective memory guidance and where it comes from (#1461).
+
+    ``source`` is ``operator`` when guidance is stored for the agent, else
+    ``default`` and ``text`` is the platform default.
+    """
+
+    text: str
+    source: Literal["default", "operator"]
 
 
 # --- console sessions (ADR-0083, #1044) -------------------------------------

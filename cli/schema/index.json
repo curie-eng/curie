@@ -208,10 +208,16 @@
       "version": "1.0"
     },
     {
+      "result": "MemoryGuidanceOutput",
+      "kind": "CliOutput",
+      "schema": "memory.schema.json",
+      "version": "2.1"
+    },
+    {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "MessageDryRunOutput",

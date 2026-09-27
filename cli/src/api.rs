@@ -314,6 +314,11 @@ pub struct Agent {
     /// is the separate, explicit toggle for whether those surfaces share
     /// cross-turn state.
     pub memory: bool,
+    /// Whether the runner mounts its remember/update/forget memory tools for
+    /// this agent (#1461). Defaulted so a platform older than the field reads
+    /// as off, which is what it does.
+    #[serde(default)]
+    pub memory_writes: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
     #[serde(default = "default_publication_policy")]
     pub publication_policy: String,
@@ -742,6 +747,15 @@ pub struct MemoryEntry {
     pub version: u64,
     #[serde(default)]
     pub provenance: MemoryProvenance,
+}
+
+/// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
+/// text the runner shows beside its memory tools, and whether it is the
+/// platform `default` or `operator`-set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryGuidance {
+    pub text: String,
+    pub source: String,
 }
 
 /// One row returned by `GET /langfuse/traces`.
@@ -3254,6 +3268,65 @@ impl ApiClient {
             .json()
             .await
             .context("decoding created memory entry")
+    }
+
+    /// The agent's effective memory guidance: `GET /agents/{id}/memory/guidance`.
+    pub async fn get_memory_guidance(&self, agent_id: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding memory guidance")
+    }
+
+    /// Store operator memory guidance: `PUT /agents/{id}/memory/guidance`.
+    /// Returns the effective guidance as the API stored it.
+    pub async fn put_memory_guidance(&self, agent_id: &str, text: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "text": text })),
+                "PUT /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "storing memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding stored memory guidance")
+    }
+
+    /// Remove operator memory guidance: `DELETE /agents/{id}/memory/guidance`.
+    pub async fn delete_memory_guidance(&self, agent_id: &str) -> Result<()> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "DELETE /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "removing memory guidance").await?;
+        Ok(())
     }
 
     /// The server's max page for `GET /work-items` (`limit` maximum 200 in

@@ -67,6 +67,33 @@ starts with `eval:` (#1909): that path omits the ref so the runner boots
 `NullMemoryStore` and a deployed memory log cannot change a static suite.
 `NullMemoryStore` is also the no-ref sink.
 
+### Facts, channel memory and the memory tools (#1461, ADR-0167)
+
+Beside the legacy `log`, memory also holds **facts**, read and written by
+`runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather than through
+the `MemoryStore` port. A fact is one key `fact-<32 hex>` whose value is
+`{statement, author, stated_at, session_id}`. Facts live in two namespaces
+reached with the same memory token:
+
+- **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
+  holds two reserved keys that are never facts: `log` (above) and `guidance`
+  (`{"text": ...}`, an operator's replacement for the default guidance).
+- **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
+  (`BootEnv.channel_memory_ref`), the binding-scoped namespace
+  `.../agents/<id>/state/bindings/<kind>/<address>/memory`. The worker sets it
+  only when the agent's `memory_writes` setting is on and the turn has a
+  binding, and never on an eval-isolated turn.
+
+At boot the runner lists both and renders a "Remembered facts" block (agent
+facts, then channel facts, newest first) after the legacy log preamble. When
+`CURIE_CHANNEL_MEMORY_REF` is set it also mounts `remember`, `update` and
+`forget` on the platform `curie` server and injects the guidance block
+(`guidance` if stored, else `DEFAULT_GUIDANCE`) before the bundle prompt. The
+tools take `memory: agent|channel`; the author is the turn's sender, never a
+tool argument. A write the state API refuses at its cap is reported to the model
+as refused. The tools are exempt from bundle toolPolicy by published name, and
+the worker leaves them out of change receipts.
+
 ## Known leakage
 
 - **Scoped memory token (was: shared API key).** Earlier the state API's one

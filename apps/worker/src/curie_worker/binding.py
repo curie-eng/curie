@@ -240,6 +240,7 @@ SELECT a.id AS agent_id,
        d.workspace_enabled AS workspace_enabled,
        d.environment AS deployment_environment,
        a.memory AS memory,
+       a.memory_writes AS memory_writes,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -274,6 +275,7 @@ SELECT a.id AS agent_id,
        d.workspace_enabled AS workspace_enabled,
        d.environment AS deployment_environment,
        a.memory AS memory,
+       a.memory_writes AS memory_writes,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -381,6 +383,10 @@ class ResolvedDeployment(BaseModel):
     # takes effect on the very next turn -- there is no cached copy anywhere
     # to go stale.
     memory: bool = False
+    # Whether the operator turned memory writes on for this agent (#1461,
+    # ADR-0167). On, a bound turn's runner gets its channel memory ref and
+    # mounts the remember/update/forget tools; off (the default), neither.
+    memory_writes: bool = False
 
 
 class AmbiguousRoute(RuntimeError):
@@ -953,7 +959,9 @@ class BindingResolver:
         # WHICH agent, and a partition key within that agent's own,
         # already-fully-accessible store has no privilege to carry, so the API
         # verifies it against ``agent_channels`` directly instead of trusting
-        # an opaque claim). memory and history stay agent-wide either way.
+        # an opaque claim). Agent memory and history stay agent-wide either
+        # way; channel memory (below) is binding-scoped by design (ADR-0167,
+        # #1461) and is decided separately from this ``memory`` flag.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
         if not resolved.memory and kind is not None and address is not None:
             state_url = (
@@ -973,6 +981,23 @@ class BindingResolver:
         # (STATE_SCOPE / STATE_APP_SCOPE). When no platform key is configured
         # (fake/local) there is nothing to sign with, so neither token is minted
         # and none is set -- preserving the pre-#410 no-key path.
+        # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
+        # to this turn's binding, on the same store and read/written with the
+        # same broad memory token. Its presence is the runner's signal to mount
+        # the memory tools, so it is set only when the operator turned memory
+        # writes on and the turn names a binding. An eval-isolated turn carries
+        # no memory at all, so it gets none either.
+        channel_memory_ref: str | None = None
+        if (
+            resolved.memory_writes
+            and kind is not None
+            and address is not None
+            and not (isolate_memory or is_eval_isolate_thread(thread_key))
+        ):
+            channel_memory_ref = (
+                f"{base}/agents/{resolved.agent_id}/state/bindings/"
+                f"{quote(kind, safe='')}/{quote(address, safe='')}/memory"
+            )
         state_token: str | None = None
         app_state_token: str | None = None
         exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
@@ -1046,6 +1071,7 @@ class BindingResolver:
             model_env_key=self._config.model_env_key or None,
             history_token=state_token,
             memory_token=state_token,
+            channel_memory_ref=channel_memory_ref,
             # The general state store exposed to bundle code (#249): the NARROW
             # ``state.app`` token authorizes the URL -- refused on the reserved
             # memory/transcript namespaces server-side -- so the token is omitted

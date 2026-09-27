@@ -148,8 +148,8 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
 
 /// Released 0.9.1 reports catalog head 0044. The packaged chart applies
 /// expansions through 0059, contracts 0060 and 0063, feature-train expansions
-/// through 0069, then route-identity contract 0070, so the upgrade is
-/// forward-only.
+/// through 0069, route-identity contract 0070, then memory-writes expansion
+/// 0071, so the upgrade is forward-only.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -159,7 +159,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0070");
-    assert_eq!(target.schema_head, "0070");
+    assert_eq!(target.schema_head, "0071");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -169,7 +169,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         [
             "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
             "0056", "0057", "0058", "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066",
-            "0067", "0068", "0069", "0070"
+            "0067", "0068", "0069", "0070", "0071"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -211,7 +211,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0070");
+    assert_eq!(target.schema_head, "0071");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
@@ -219,7 +219,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
         revisions,
         [
             "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068", "0069",
-            "0070"
+            "0070", "0071"
         ]
     );
 
@@ -244,8 +244,8 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
 }
 
 /// Released 0.10.2 stamps 0062. Stable 0.10.3 follows with contract 0063,
-/// the feature train continues with expansions through 0069, and contract
-/// 0070 establishes route identity.
+/// the feature train continues with expansions through 0069, contract
+/// 0070 establishes route identity, and expansion 0071 adds memory writes.
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
     let source = window_for("0.10.2").expect("released 0.10.2 is catalogued");
@@ -259,13 +259,14 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
-        ["0063", "0064", "0065", "0066", "0067", "0068", "0069", "0070"]
+        ["0063", "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071"]
     );
-    assert_eq!(pending[0].kind, "contract");
-    assert!(pending[1..pending.len() - 1]
+    let contracts: Vec<&str> = pending
         .iter()
-        .all(|step| step.kind == "expand"));
-    assert_eq!(pending.last().expect("0070 is pending").kind, "contract");
+        .filter(|step| step.kind == "contract")
+        .map(|step| step.revision.as_str())
+        .collect();
+    assert_eq!(contracts, ["0063", "0070"]);
 
     let refused = plan_upgrade(
         Some(&source.schema_head),
@@ -288,7 +289,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
 /// Released 0.10.3 owns revision 0063. The feature train must start after it,
 /// so an upgrade applies every unreleased expansion without mistaking the
 /// released factory queue migration for runner resources. Route identity 0070
-/// remains a final contract step.
+/// is the only contract step; memory writes 0071 expands after it.
 #[test]
 fn released_v0103_upgrades_through_the_renumbered_feature_train() {
     let source = window_for("0.10.3").expect("released 0.10.3 is catalogued");
@@ -302,14 +303,14 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
-        ["0064", "0065", "0066", "0067", "0068", "0069", "0070"]
+        ["0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071"]
     );
-    let (last, earlier) = pending.split_last().expect("0070 is pending");
-    assert!(earlier.iter().all(|step| step.kind == "expand"));
-    assert_eq!(
-        (last.revision.as_str(), last.kind.as_str()),
-        ("0070", "contract")
-    );
+    let contracts: Vec<&str> = pending
+        .iter()
+        .filter(|step| step.kind == "contract")
+        .map(|step| step.revision.as_str())
+        .collect();
+    assert_eq!(contracts, ["0070"]);
 
     let refused = plan_upgrade(
         Some(&source.schema_head),

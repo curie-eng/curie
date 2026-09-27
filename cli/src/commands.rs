@@ -6967,6 +6967,128 @@ pub async fn memory_add(
     })
 }
 
+/// Which guidance operation `<tier> memory <agent>` was asked for (#1461).
+#[derive(Debug, Clone)]
+pub enum MemoryGuidanceAction {
+    /// `--guidance`: read the effective guidance.
+    Show,
+    /// `--guidance-from <file>`: store this file's text as operator guidance.
+    SetFrom(std::path::PathBuf),
+    /// `--reset-guidance`: remove operator guidance.
+    Reset,
+}
+
+/// The result of [`memory_guidance`]: a dry-run plan (emitted through the
+/// memory verb's own `MemoryOutput::DryRun`), or the effective guidance.
+#[derive(Debug)]
+pub enum MemoryGuidanceResult {
+    DryRun(crate::ui::DryRunPlan),
+    Shown(MemoryGuidanceOutput),
+}
+
+/// Output of `<tier> memory <agent> --guidance|--guidance-from|--reset-guidance`:
+/// the guidance the agent gets beside its memory tools after this invocation,
+/// its source (`default` or `operator`), and whether this invocation wrote.
+#[derive(Debug)]
+pub struct MemoryGuidanceOutput {
+    pub agent: String,
+    pub text: String,
+    pub source: String,
+    pub changed: bool,
+}
+
+impl crate::ui::CliOutput for MemoryGuidanceOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "text": self.text,
+            "source": self.source,
+            "changed": self.changed,
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        let verb = if self.changed { " now" } else { "" };
+        ui.payload(&format!(
+            "{} memory guidance{verb} ({}):",
+            self.agent, self.source
+        ));
+        ui.payload(&self.text);
+    }
+}
+
+/// `<tier> memory <agent> --guidance|--guidance-from <file>|--reset-guidance`.
+///
+/// The file is read, and an empty or whitespace-only one refused, before
+/// anything else, dry run included, so a plan is never printed for a write that
+/// would be refused. The text is sent verbatim. After a write, the result is
+/// the effective guidance the API reports, so the operator sees what the agent
+/// will get rather than what was intended.
+pub async fn memory_guidance(
+    opts: AgentActionOpts,
+    action: MemoryGuidanceAction,
+) -> Result<MemoryGuidanceResult> {
+    let text = match &action {
+        MemoryGuidanceAction::SetFrom(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                crate::exit::usage(format!(
+                    "cannot read --guidance-from {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if text.trim().is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "--guidance-from {} is empty. Put the guidance text in the file, \
+                     or pass --reset-guidance to go back to the platform default",
+                    path.display()
+                )));
+            }
+            Some(text)
+        }
+        _ => None,
+    };
+    if opts.dry_run {
+        let url = format!("{}/agents/<id>/memory/guidance", opts.api_url);
+        let line = match (&action, &text) {
+            (MemoryGuidanceAction::SetFrom(path), Some(text)) => format!(
+                "PUT {url}  {{\"text\": <{} bytes from {}>}}  (would resolve agent {:?} first)",
+                text.len(),
+                path.display(),
+                opts.agent
+            ),
+            (MemoryGuidanceAction::Reset, _) => format!(
+                "DELETE {url}  (would resolve agent {:?} first; the platform default applies after)",
+                opts.agent
+            ),
+            _ => format!(
+                "GET {url}  (read-only: would resolve agent {:?} first)",
+                opts.agent
+            ),
+        };
+        return Ok(MemoryGuidanceResult::DryRun(crate::ui::DryRunPlan {
+            lines: vec![line],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let (guidance, changed) = match (&action, text) {
+        (MemoryGuidanceAction::SetFrom(_), Some(text)) => {
+            (client.put_memory_guidance(&agent.id, &text).await?, true)
+        }
+        (MemoryGuidanceAction::Reset, _) => {
+            client.delete_memory_guidance(&agent.id).await?;
+            (client.get_memory_guidance(&agent.id).await?, true)
+        }
+        _ => (client.get_memory_guidance(&agent.id).await?, false),
+    };
+    Ok(MemoryGuidanceResult::Shown(MemoryGuidanceOutput {
+        agent: agent.name,
+        text: guidance.text,
+        source: guidance.source,
+        changed,
+    }))
+}
+
 /// The pending-list / resolve flags for `local approvals` (#506). Defaulted so
 /// the skill/cluster tiers, which keep only the gate view/set surface, pass an
 /// empty value.
@@ -13353,8 +13475,56 @@ pub async fn overrides(
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
 ) -> Result<OverridesOutput> {
+    overrides_with_memory_writes(
+        opts,
+        model,
+        thinking,
+        execution_deadline,
+        runner_resources,
+        None,
+    )
+    .await
+}
+
+/// The `--memory-writes on|off` value as the boolean the API stores, or `None`
+/// when the flag was not passed. Clap has already refused any other value.
+pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
+    value.map(|v| v == "on")
+}
+
+/// [`overrides`] plus the `memory_writes` switch (#1461).
+///
+/// `memory_writes` is a NOT NULL boolean rather than a nullable override, so it
+/// has no clear: `Some(b)` sends a JSON boolean under its own key, `None`
+/// leaves the key out of the body. The result keeps the overrides verb's
+/// existing shape; the switch is not echoed back in it.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   model: the intent for the model override.
+///   thinking: the intent for the thinking override.
+///   execution_deadline: the intent for the execution deadline.
+///   runner_resources: the intent for the runner resources override.
+///   memory_writes: the new memory-writes switch, if one was asked for.
+///
+/// Returns:
+///   The stored overrides, or the dry-run plan.
+pub async fn overrides_with_memory_writes(
+    opts: AgentActionOpts,
+    model: OverrideChange,
+    thinking: OverrideChange,
+    execution_deadline: OverrideChange,
+    runner_resources: OverrideChange,
+    memory_writes: Option<bool>,
+) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
+    let mut body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
+    if let Some(on) = memory_writes {
+        let map = body.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(obj) = map.as_object_mut() {
+            obj.insert("memory_writes".to_string(), serde_json::Value::Bool(on));
+        }
+    }
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(

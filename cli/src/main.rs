@@ -2161,13 +2161,17 @@ enum LocalAction {
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
     /// `--add <content>` seeds an operator-authored record; a fresh session is
-    /// required before it is injected at boot.
+    /// required before it is injected at boot. `--guidance` shows the guidance
+    /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
+    /// it and `--reset-guidance` restores the platform default.
     Memory {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
         /// Append this content as an operator-authored memory record.
         #[arg(long, value_name = "CONTENT")]
         add: Option<String>,
+        #[command(flatten)]
+        guidance: MemoryGuidanceArgs,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -2275,6 +2279,10 @@ enum LocalAction {
         /// Clear the runner resource override back to the chart block.
         #[arg(long)]
         clear_runner_resources: bool,
+        /// Turn the agent's remember/update/forget memory tools on or off
+        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_writes: Option<String>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -3239,6 +3247,10 @@ enum ClusterAction {
         /// Clear the runner resource override back to the chart block.
         #[arg(long)]
         clear_runner_resources: bool,
+        /// Turn the agent's remember/update/forget memory tools on or off
+        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_writes: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -3478,13 +3490,17 @@ enum ClusterAction {
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
     /// `--add <content>` seeds an operator-authored record; a fresh session is
-    /// required before it is injected at boot.
+    /// required before it is injected at boot. `--guidance` shows the guidance
+    /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
+    /// it and `--reset-guidance` restores the platform default.
     Memory {
         #[command(flatten)]
         target: ClusterAgentTarget,
         /// Append this content as an operator-authored memory record.
         #[arg(long, value_name = "CONTENT")]
         add: Option<String>,
+        #[command(flatten)]
+        guidance: MemoryGuidanceArgs,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -4180,6 +4196,59 @@ async fn main() {
 /// (`Ui::emit`), mirroring the centralized error emit in `main`. The read verbs
 /// return a `CliOutput` instead of touching stdout themselves, so the
 /// json-vs-human decision is made in exactly one place (issue #456).
+/// Run a `<tier> memory --guidance*` action and emit its result: a dry-run
+/// plan through the memory verb's own `MemoryOutput::DryRun`, otherwise the
+/// effective guidance.
+async fn emit_memory_guidance(
+    opts: AgentActionOpts,
+    action: commands::MemoryGuidanceAction,
+) -> Result<()> {
+    match commands::memory_guidance(opts, action).await? {
+        commands::MemoryGuidanceResult::DryRun(plan) => emit(commands::MemoryOutput::DryRun(plan)),
+        commands::MemoryGuidanceResult::Shown(out) => emit(out),
+    }
+}
+
+/// The memory-guidance flags shared by `local memory` and `cluster memory`
+/// (#1461). `--guidance-from` and `--reset-guidance` are two different writes,
+/// and none of them combines with `--add`, which writes the memory log.
+#[derive(clap::Args, Debug, Default, Clone)]
+struct MemoryGuidanceArgs {
+    /// Show the guidance the agent gets beside its memory tools, and whether it
+    /// is the platform default or operator-set
+    /// (`GET /agents/{id}/memory/guidance`).
+    #[arg(long, conflicts_with = "add")]
+    guidance: bool,
+    /// Replace the agent's memory guidance with this file's text
+    /// (`PUT /agents/{id}/memory/guidance`). An empty file is refused.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["reset_guidance", "add"]
+    )]
+    guidance_from: Option<std::path::PathBuf>,
+    /// Remove operator guidance so the platform default applies again
+    /// (`DELETE /agents/{id}/memory/guidance`).
+    #[arg(long, conflicts_with = "add")]
+    reset_guidance: bool,
+}
+
+impl MemoryGuidanceArgs {
+    /// The one guidance action asked for, or `None` for the plain memory verb.
+    /// A write wins over `--guidance`, whose output it already is.
+    fn action(&self) -> Option<commands::MemoryGuidanceAction> {
+        if let Some(path) = &self.guidance_from {
+            Some(commands::MemoryGuidanceAction::SetFrom(path.clone()))
+        } else if self.reset_guidance {
+            Some(commands::MemoryGuidanceAction::Reset)
+        } else if self.guidance {
+            Some(commands::MemoryGuidanceAction::Show)
+        } else {
+            None
+        }
+    }
+}
+
 fn emit<T: curie::ui::CliOutput>(out: T) -> Result<()> {
     ui::ui().emit(&out);
     Ok(())
@@ -5004,9 +5073,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-            LocalAction::Memory { target, add } => match add {
-                None => emit(commands::memory(target.into()).await?),
-                Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
+            LocalAction::Memory {
+                target,
+                add,
+                guidance,
+            } => match (guidance.action(), add) {
+                (Some(action), _) => emit_memory_guidance(target.into(), action).await,
+                (None, None) => emit(commands::memory(target.into()).await?),
+                (None, Some(content)) => {
+                    emit(commands::memory_add(target.into(), content, "local").await?)
+                }
             },
             LocalAction::Approvals {
                 target,
@@ -5072,11 +5148,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_execution_deadline,
                 runner_resources,
                 clear_runner_resources,
+                memory_writes,
                 api_url,
                 api_key,
                 dry_run,
             } => emit(
-                commands::overrides(
+                commands::overrides_with_memory_writes(
                     AgentActionOpts {
                         api_url,
                         api_key,
@@ -5093,6 +5170,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         runner_resources,
                         clear_runner_resources,
                     )?,
+                    commands::memory_writes_flag(memory_writes.as_deref()),
                 )
                 .await?,
             ),
@@ -6243,6 +6321,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_execution_deadline,
                 runner_resources,
                 clear_runner_resources,
+                memory_writes,
                 conn,
                 dry_run,
             } => {
@@ -6264,7 +6343,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
-                    commands::overrides(
+                    commands::overrides_with_memory_writes(
                         AgentActionOpts {
                             api_url,
                             api_key,
@@ -6275,6 +6354,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         thinking,
                         execution_deadline,
                         runner_resources,
+                        commands::memory_writes_flag(memory_writes.as_deref()),
                     )
                     .await?,
                 )
@@ -6583,7 +6663,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                     _ => unreachable!(),
                 }
             }
-            ClusterAction::Memory { target, add } => {
+            ClusterAction::Memory {
+                target,
+                add,
+                guidance,
+            } => {
                 let ClusterAgentTarget {
                     agent,
                     conn,
@@ -6597,9 +6681,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                     agent,
                     dry_run,
                 };
-                match add {
-                    None => emit(commands::memory(opts).await?),
-                    Some(content) => emit(commands::memory_add(opts, content, "cluster").await?),
+                match (guidance.action(), add) {
+                    (Some(action), _) => emit_memory_guidance(opts, action).await,
+                    (None, None) => emit(commands::memory(opts).await?),
+                    (None, Some(content)) => {
+                        emit(commands::memory_add(opts, content, "cluster").await?)
+                    }
                 }
             }
             ClusterAction::Approvals {
@@ -8645,7 +8732,7 @@ mod tests {
         .expect("local memory --add should parse");
         match cli.command {
             Some(Command::Local {
-                action: LocalAction::Memory { target, add },
+                action: LocalAction::Memory { target, add, .. },
             }) => {
                 assert_eq!(target.agent, "translation-bot");
                 assert_eq!(add.as_deref(), Some("ask before translating to French"));
@@ -8667,7 +8754,7 @@ mod tests {
         .expect("cluster memory --add should parse");
         match cli.command {
             Some(Command::Cluster {
-                action: ClusterAction::Memory { target, add },
+                action: ClusterAction::Memory { target, add, .. },
                 ..
             }) => {
                 assert_eq!(target.agent, "translation-bot");
