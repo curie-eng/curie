@@ -120,6 +120,10 @@ pub struct SlackCall {
     /// payload contains a valid id. This is independent of placeholder edit
     /// ordering, so a card that arrives before its notice can still be resumed.
     pub approval_id: Option<String>,
+    /// The ts this stub answered a `chat.postMessage` with, so a wait can follow
+    /// a reply the worker posted as a new message (ADR-0179). `None` for every
+    /// other method.
+    pub posted_ts: Option<String>,
 }
 
 /// If this call is a `chat.update` editing `placeholder_ts`, its new text.
@@ -129,6 +133,32 @@ pub fn placeholder_update_text<'a>(call: &'a SlackCall, placeholder_ts: &str) ->
     } else {
         None
     }
+}
+
+/// Follow the message this wait reports as the reply, then observe its edits.
+///
+/// The tracked message starts as the placeholder. A resumed answer below an
+/// in-thread approval card is posted as a new message instead (ADR-0179), so a
+/// post that is not an approval card, arriving before this wait has seen any
+/// edit, becomes the tracked message and its text the first snapshot. Once the
+/// placeholder carries the reply, a later post never takes its place.
+fn observe_reply(
+    call: &SlackCall,
+    tracked_ts: &mut String,
+    latest: &mut Option<String>,
+    observer: &mut impl FnMut(&str),
+) {
+    if latest.is_none() && call.method == "chat.postMessage" && !call.approval_card {
+        if let Some(posted) = call.posted_ts.as_deref() {
+            *tracked_ts = posted.to_string();
+            if let Some(text) = call.text.as_deref() {
+                observer(text);
+                *latest = Some(text.to_string());
+            }
+            return;
+        }
+    }
+    observe_placeholder_update(call, tracked_ts, latest, observer);
 }
 
 /// Notify the caller immediately for each distinct edit to the tracked placeholder,
@@ -363,6 +393,7 @@ async fn handle_call(
     let ts_out = ts
         .clone()
         .unwrap_or_else(|| synthetic_thread_and_placeholder().0);
+    let posted_ts = (method == "chat.postMessage").then(|| ts_out.clone());
     let _ = state.tx.send(SlackCall {
         method,
         channel: channel.clone(),
@@ -370,6 +401,7 @@ async fn handle_call(
         text: text.clone(),
         approval_card,
         approval_id,
+        posted_ts,
     });
     Json(json!({ "ok": true, "ts": ts_out, "channel": channel, "text": text }))
 }
@@ -476,6 +508,9 @@ pub async fn await_reply(
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
     let mut latest: Option<String> = None;
+    // The message whose edits are the reply: the placeholder, unless the turn
+    // posts its reply as a new message (see `observe_reply`).
+    let mut tracked_ts = placeholder_ts.to_string();
     // Whether the worker posted an approval card during this turn: the turn parked
     // awaiting approval rather than finalizing normally (#529).
     let mut awaiting_approval = false;
@@ -489,7 +524,7 @@ pub async fn await_reply(
                     if call.approval_id.is_some() {
                         card_approval_id = call.approval_id.clone();
                     }
-                    observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
+                    observe_reply(&call, &mut tracked_ts, &mut latest, observer);
                 }
             }
             _ = poll.tick() => {
@@ -512,7 +547,7 @@ pub async fn await_reply(
                         if call.approval_id.is_some() {
                             card_approval_id = call.approval_id.clone();
                         }
-                        observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
+                        observe_reply(&call, &mut tracked_ts, &mut latest, observer);
                     }
                     // Either signal parks the turn: the card seen here, or an
                     // authoritative approval notice in the latest placeholder
