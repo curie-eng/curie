@@ -204,7 +204,12 @@ def test_moving_a_binding_onto_a_declared_identity_stores_it(
 
     assert moved.status_code == 200, moved.text
     assert moved.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "second"}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE1",
+            "adapter": "second",
+            "allowed_callers": None,
+        }
     ]
     assert _stored(agent_id) == {"C0EXAMPLE1": "second"}
 

@@ -137,9 +137,8 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
 }
 
 /// Released 0.9.1 reports catalog head 0044. The packaged chart applies
-/// expansions through 0059, contract 0060, expansions 0061 through 0067, then
-/// contract 0068 (ADR-0168 decision 3), which is also its floor, so the
-/// upgrade applies only forward-only.
+/// expansions through 0059, requires forward only for contract 0060, then
+/// applies expansions 0061 through 0068.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -148,7 +147,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0044");
-    assert_eq!(target.schema_min, "0068");
+    assert_eq!(target.schema_min, "0060");
     assert_eq!(target.schema_head, "0068");
 
     let pending =
@@ -231,8 +230,8 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
 }
 
 /// Released 0.10.2 stamps 0062. The feature train's revisions follow it as
-/// expansions 0063 through 0067 and contract 0068, so the upgrade never reads
-/// a released revision id as another migration and applies only forward-only.
+/// 0063 through 0068, all expansions, so the upgrade applies without the
+/// forward flag and never reads a released revision id as another migration.
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
     let source = window_for("0.10.2").expect("released 0.10.2 is catalogued");
@@ -245,12 +244,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
         .expect("released 0.10.2 reaches the new head");
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(revisions, ["0063", "0064", "0065", "0066", "0067", "0068"]);
-    let (last, earlier) = pending.split_last().expect("0068 is pending");
-    assert!(earlier.iter().all(|step| step.kind == "expand"));
-    assert_eq!(
-        (last.revision.as_str(), last.kind.as_str()),
-        ("0068", "contract")
-    );
+    assert!(pending.iter().all(|step| step.kind == "expand"));
 
     let refused = plan_upgrade(
         Some(&source.schema_head),
