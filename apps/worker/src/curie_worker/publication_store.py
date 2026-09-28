@@ -6,7 +6,7 @@ import re
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from channel_protocol.reply import ReplyTarget
 from sqlalchemy import text
@@ -35,6 +35,7 @@ class PublicationResult:
     error: str | None
     resolved_by: str | None
     resolution_note: str | None
+    resolved_at: datetime | None
     target: ReplyTarget
     route: TargetRoute
     attempt: int
@@ -657,7 +658,8 @@ class PostgresPublicationStore:
                    p.reply_placeholder, p.reply_endpoint, p.reply_adapter,
                    COALESCE(p.workspace_conversation_id, l.conversation_id)
                        AS workspace_conversation_id,
-                   a.agent_id, a.conversation_id, a.resolved_by, a.resolution_note
+                   a.agent_id, a.conversation_id, a.resolved_by, a.resolution_note,
+                   a.resolved_at
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
               LEFT JOIN {self._lineages} l ON l.id = p.lineage_id
@@ -755,6 +757,12 @@ class PostgresPublicationStore:
                 str(row["resolution_note"])
                 if row["resolution_note"] is not None
                 else None
+            ),
+            # The row's naive UTC instant, made aware for the settled card.
+            resolved_at=(
+                row["resolved_at"].replace(tzinfo=UTC)
+                if row["resolved_at"] is not None and row["resolved_at"].tzinfo is None
+                else row["resolved_at"]
             ),
             target=ReplyTarget(
                 kind=str(row["reply_kind"]),

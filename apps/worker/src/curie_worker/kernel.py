@@ -94,6 +94,7 @@ from .approvals import (
     PublicationLineage,
     ReviewAuthorityUnavailable,
     VerifiedReviewFeedback,
+    decided_field,
 )
 from .attachments import (
     AttachmentCoordinator,
@@ -6486,8 +6487,11 @@ class Kernel:
             # A resolve states what was decided, and that comes from the durable
             # record before the card ref is touched.
             outcome: SettledOutcome | None = None
+            decided: datetime | None = None
             if not is_expiry:
-                outcome = await self._settled_from_record(approval_id)
+                read = await self._settled_from_record(approval_id)
+                if read is not None:
+                    outcome, decided = read
                 if outcome is None:
                     logger.info(
                         "no readable approval outcome for thread %s -- "
@@ -6534,7 +6538,13 @@ class Kernel:
                         conversation_id=qevent.conversation_id,
                         reply_ref=ref.ts,
                     ),
-                    message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
+                    message=OutboundMessage(
+                        version=MESSAGE_VERSION,
+                        text=ref.summary,
+                        # When it was decided, as data (ADR-0179); the adapter
+                        # chooses how to show it.
+                        fields=[decided_field(decided)] if decided is not None else [],
+                    ),
                     settled=settled,
                 ),
                 route=TargetRoute(
@@ -6557,8 +6567,10 @@ class Kernel:
                 exc,
             )
 
-    async def _settled_from_record(self, approval_id: str) -> SettledOutcome | None:
-        """The resolved outcome to stamp, read from the durable record.
+    async def _settled_from_record(
+        self, approval_id: str
+    ) -> tuple[SettledOutcome, datetime | None] | None:
+        """The resolved outcome to stamp and its decision time, from the record.
 
         Read, not parsed. The resume turn does state the decision, the resolver
         and the note, but it states them in a sentence written for a language
@@ -6575,11 +6587,14 @@ class Kernel:
         record = await self._approval_reader.get(approval_id)
         if record is None or record.status not in ("approved", "rejected"):
             return None
-        return SettledOutcome(
-            requested_by="",
-            decision=record.status,
-            resolver=record.resolved_by,
-            note=record.resolution_note,
+        return (
+            SettledOutcome(
+                requested_by="",
+                decision=record.status,
+                resolver=record.resolved_by,
+                note=record.resolution_note,
+            ),
+            record.resolved_at,
         )
 
     async def _adopt_remembered_notice_ref(self, qevent: QueuedTurn) -> None:
