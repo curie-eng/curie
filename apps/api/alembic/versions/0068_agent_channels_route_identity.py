@@ -15,10 +15,15 @@
 **Contract** (`revision_kinds.json`), as 0041 was: an application that stores
 `'default'` cannot serve a database whose 0024 check refuses it, so the window
 floor moves to this revision and an upgrade across it needs `--forward-only`.
-v0.11.0 compares a Slack route's identity through
-`aci_protocol.turn.route_identity`, and includes the publication replay
-tolerance (#3310), so its pods read a backfilled `'default'` as the NULL they
-wrote while the upgrade rolls out.
+It ships in v0.11.0 with the readers that compare a Slack route's identity
+through `aci_protocol.turn.route_identity`, so every upgrade from v0.10.x
+crosses it, and a rollback below v0.11.0 is refused as for any contract.
+v0.10.x pods still serving during the roll keep running against it: their
+schema check treats a revision they do not know as a compatible expand, runs
+only at API startup, and the worker has none. Those pods write a Slack binding
+with no identity, which the new check refuses, and compare a publication
+replay's `reply_adapter` raw, so a replay of a publication stored before this
+revision, now `'default'`, is refused as a conflict.
 
 The pre-flight refuses, before anything moves, while a Slack binding or a Slack
 approval notification still carries an endpoint: the pre-ADR custom-transport

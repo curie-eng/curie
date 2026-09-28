@@ -1701,28 +1701,37 @@ flags, state rows, the constraint, and the Alembic revision stay unchanged.
 
 ### Slack route identity migration (Alembic revision 0068)
 
-Revision 0068 is a contract migration (ADR-0168 decision 3). It stores the
-identity on every Slack binding, `default` where none was named, and makes the
-binding key `(kind, address, adapter)`, so two identities can bind one channel.
-Before it changes anything it refuses, naming each row, while a Slack binding
-or an approval route's Slack notification still carries an `endpoint`: that is
-the retired custom-transport form. Move each one to an identity first. Rebind a
-Slack binding with no endpoint (under `default`, or a declared identity), or
-delete it, and drop `endpoint` and `adapter` from a Slack notification in the
-agent's approval routes. Then upgrade with `curie cluster upgrade --to <version>
---forward-only`, or set `api.migrate.forwardOnly=true` on a direct `helm
-upgrade`. Without it the schema check refuses the upgrade before any mutation,
-because the migration closes the rollback window to the previous release.
+Revision 0068 is a contract migration (ADR-0168 decision 3), and it ships in
+v0.11.0. It stores the identity on every Slack binding, `default` where none was
+named, and makes the binding key `(kind, address, adapter)`, so two identities
+can bind one channel. Before it changes anything it refuses, naming each row,
+while a Slack binding or an approval route's Slack notification still carries an
+`endpoint`: that is the retired custom-transport form. Move each one to an
+identity first. Rebind a Slack binding with no endpoint (under `default`, or a
+declared identity), or delete it, and drop `endpoint` and `adapter` from a Slack
+notification in the agent's approval routes. Then upgrade from v0.10.x with
+`curie cluster upgrade --to 0.11.0 --forward-only`, or set
+`api.migrate.forwardOnly=true` on a direct `helm upgrade`. Without it the schema
+check refuses the upgrade before any mutation. As with any contract, a rollback
+below v0.11.0 is refused once the migration has run.
 
-During the roll, an API pod still on the previous release can answer a Slack
-binding write with a 500: creating an agent with a Slack channel, adding or
-changing a Slack binding (`surfaces --add`, or a deploy that binds a channel),
-or moving a binding to Slack. The previous release writes a Slack binding with
-no identity, which 0068's check refuses. The window runs
-from the `-schema-migrate` Job to the last previous-release API pod stopping.
-The chart's upgrade drain runs before the migration and pauses worker claims,
-not API writes, so it does not cover this window; hold binding changes until
-the API Deployment has rolled, and retry any write that failed during it.
+During the roll, v0.10.x pods keep serving against the migrated schema. Their
+schema check treats a revision they do not know as a compatible expand and runs
+only when an API pod starts, and the worker has none, so nothing stops them.
+Two things they do fail against it:
+
+- A v0.10.x API pod answers a Slack binding write with a 500: creating an agent
+  with a Slack channel, adding or changing a Slack binding (`surfaces --add`, or
+  a deploy that binds a channel), or moving a binding to Slack. It writes a
+  Slack binding with no identity, which 0068's check refuses.
+- A v0.10.x API pod compares a publication replay's reply adapter as stored, so
+  a replay of a publication raised before the migration, which now names
+  `default`, is refused as a conflict.
+
+The window runs from the `-schema-migrate` Job to the last v0.10.x API pod
+stopping. The chart's upgrade drain runs before the migration and pauses worker
+claims, not API writes, so it does not cover this window; hold binding changes
+until the API Deployment has rolled, and retry any write that failed during it.
 
 A local stack runs the same schema check in its one-shot `curie-migrate`
 service, which takes no forward-only flag, so `curie local up` on a volume that
