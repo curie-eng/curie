@@ -21,6 +21,7 @@
 //! `chat.update` edits land at this stub instead of real Slack. No Slack token,
 //! channel, or real Slack HTTP on the CLI side.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -147,7 +148,7 @@ fn observe_reply(
     tracked_ts: &mut String,
     latest: &mut Option<String>,
     observer: &mut impl FnMut(&str),
-) {
+) -> bool {
     if latest.is_none() && call.method == "chat.postMessage" && !call.approval_card {
         if let Some(posted) = call.posted_ts.as_deref() {
             *tracked_ts = posted.to_string();
@@ -155,10 +156,15 @@ fn observe_reply(
                 observer(text);
                 *latest = Some(text.to_string());
             }
-            return;
+            return true;
         }
     }
-    observe_placeholder_update(call, tracked_ts, latest, observer);
+    if placeholder_update_text(call, tracked_ts).is_some() {
+        observe_placeholder_update(call, tracked_ts, latest, observer);
+        true
+    } else {
+        false
+    }
 }
 
 /// Notify the caller immediately for each distinct edit to the tracked placeholder,
@@ -303,6 +309,7 @@ struct StubState {
 pub struct SlackStub {
     base_api_url: String,
     calls: mpsc::UnboundedReceiver<SlackCall>,
+    deferred_calls: VecDeque<SlackCall>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -357,6 +364,7 @@ impl SlackStub {
         Ok(Self {
             base_api_url: format!("http://{advertise_host}:{}/api/", addr.port()),
             calls,
+            deferred_calls: VecDeque::new(),
             server,
         })
     }
@@ -368,7 +376,17 @@ impl SlackStub {
 
     /// Await the next captured call, or `None` if the stub has shut down.
     pub async fn recv(&mut self) -> Option<SlackCall> {
-        self.calls.recv().await
+        match self.deferred_calls.pop_front() {
+            Some(call) => Some(call),
+            None => self.calls.recv().await,
+        }
+    }
+
+    /// Put calls back ahead of the live receiver for the next logical turn.
+    fn restore_calls(&mut self, calls: Vec<SlackCall>) {
+        for call in calls.into_iter().rev() {
+            self.deferred_calls.push_front(call);
+        }
     }
 }
 
@@ -515,6 +533,10 @@ pub async fn await_reply(
     // awaiting approval rather than finalizing normally (#529).
     let mut awaiting_approval = false;
     let mut card_approval_id: Option<String> = None;
+    // A fast approval resolution can enqueue and deliver the resume before this
+    // wait has returned from the parked turn. Keep calls that do not belong to
+    // this turn and replay them to await_resume instead of losing them here.
+    let mut deferred_calls = Vec::new();
     let mut poll = tokio::time::interval(ACK_POLL_INTERVAL);
     loop {
         tokio::select! {
@@ -524,7 +546,10 @@ pub async fn await_reply(
                     if call.approval_id.is_some() {
                         card_approval_id = call.approval_id.clone();
                     }
-                    observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                    let consumed = observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                    if awaiting_approval && !call.approval_card && !consumed {
+                        deferred_calls.push(call);
+                    }
                 }
             }
             _ = poll.tick() => {
@@ -547,16 +572,23 @@ pub async fn await_reply(
                         if call.approval_id.is_some() {
                             card_approval_id = call.approval_id.clone();
                         }
-                        observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                        let consumed = observe_reply(&call, &mut tracked_ts, &mut latest, observer);
+                        if awaiting_approval && !call.approval_card && !consumed {
+                            deferred_calls.push(call);
+                        }
                     }
                     // Either signal parks the turn: the card seen here, or an
                     // authoritative approval notice in the latest placeholder
                     // text (the route-bound case, where no card reaches us).
-                    return completed_turn_outcome(
+                    let outcome = completed_turn_outcome(
                         latest,
                         awaiting_approval,
                         card_approval_id,
                     );
+                    if matches!(outcome, Outcome::AwaitingApproval { .. }) {
+                        stub.restore_calls(deferred_calls);
+                    }
+                    return outcome;
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
@@ -1018,7 +1050,10 @@ mod tests {
             &mut pause,
             &mut |text| seen.push(text.to_string()),
         ));
-        assert_eq!(pause.as_deref(), Some("Approval requested. See the card below."));
+        assert_eq!(
+            pause.as_deref(),
+            Some("Approval requested. See the card below.")
+        );
 
         let mut resume_tracked = "ph".to_string();
         let mut resumed = None;
