@@ -77,7 +77,7 @@ _WORKSPACE_UNSET = object()
 
 class AmbiguousRoute(RuntimeError):
     """Raised when an omitted non-Slack adapter selects several routes on one
-    pair, which migration 0068's triple key allows. Never resolved by picking
+    pair, which migration 0069's triple key allows. Never resolved by picking
     one: every caller answers it.
     """
 

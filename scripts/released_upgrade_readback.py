@@ -35,7 +35,7 @@ Three constraints follow from that inversion, and all three are load-bearing:
    is passed only to candidates containing revision 0037, whose exact state
    fields are the contract being proved. The optional Slack identity assertion
    is the second such exact-field sentinel: it is passed only to candidates
-   containing revision 0068, and reads `AgentChannel.adapter` for the same
+   containing revision 0069, and reads `AgentChannel.adapter` for the same
    reason.
 3. **It cannot pass vacuously.** Zero agents is a FAILURE. A seed that silently
    wrote nothing, or a migration that silently dropped the seeded rows, is the
@@ -268,7 +268,7 @@ def _read_slack_identities(session: Session) -> tuple[SlackIdentityObservation, 
 
 
 async def _load_slack_identities(database_url: str) -> tuple[SlackIdentityObservation, ...]:
-    """Read Slack identities only when the caller enabled the revision-0068 expectation."""
+    """Read Slack identities only when the caller enabled the revision-0069 expectation."""
 
     engine = create_async_engine(database_url)
     try:
@@ -417,7 +417,7 @@ def _collect_failures(
             if adapter != slack_identity:
                 failures.append(
                     f"Slack binding of agent {name!r} on {address!r} reads adapter "
-                    f"{adapter!r}, expected {slack_identity!r}: migration 0068 did not "
+                    f"{adapter!r}, expected {slack_identity!r}: migration 0069 did not "
                     "name its identity"
                 )
         for dump in dumps:
@@ -479,7 +479,7 @@ def main() -> int:
     parser.add_argument(
         "--expect-slack-identity",
         metavar="NAME",
-        help="The identity every migrated Slack binding must name (revision 0068).",
+        help="The identity every migrated Slack binding must name (revision 0069).",
     )
     args = parser.parse_args()
 

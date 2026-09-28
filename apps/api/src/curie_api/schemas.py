@@ -1036,7 +1036,7 @@ class ChannelBindingOut(BaseModel):
 
     @model_validator(mode="after")
     def _present_route_identity(self) -> "ChannelBindingOut":
-        # Migration 0068 names every Slack row's identity, but a stored
+        # Migration 0069 names every Slack row's identity, but a stored
         # approval notification target keeps the default implicit
         # (`ApprovalNotificationTarget`), and `ApprovalTargetOut` reads it
         # through this class. `route_identity` is the one place every reader

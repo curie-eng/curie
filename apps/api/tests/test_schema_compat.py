@@ -41,8 +41,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
-# The window floor: the newest contract revision (0068, ADR-0168 decision 3).
-APP_SCHEMA_MIN = "0068"
+# The window floor: the newest contract revision (0069, ADR-0168 decision 3).
+APP_SCHEMA_MIN = "0069"
 REVIEW_SCHEMA_MIN = "0060"
 PREV = "0040"
 
@@ -123,20 +123,20 @@ def test_planner_refuses_0041_contract_without_forward_only() -> None:
 
 
 def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -> None:
-    """0068 (ADR-0168 decision 3) is a contract, as 0041 was: the app that
+    """0069 (ADR-0168 decision 3) is a contract, as 0041 was: the app that
     stores `default` cannot serve a database whose 0024 check refuses it."""
     kinds = load_kinds()
-    assert kinds["0068"] == KIND_CONTRACT
-    assert load_window().schema_min == "0068"
+    assert kinds["0069"] == KIND_CONTRACT
+    assert load_window().schema_min == "0069"
     decision = plan_upgrade(
         current_revision="0067",
         window=load_window(),
         kinds=kinds,
-        pending=("0068",),
+        pending=("0069",),
         forward_only=False,
     )
     assert decision.action == "refuse"
-    assert "0068" in decision.reason
+    assert "0069" in decision.reason
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

@@ -2292,11 +2292,11 @@ def test_released_state_readback_rejects_an_owner_that_remains_memory_false(
     ("revisions", "expected"),
     [
         (("0067_execution_request_model_usage.py",), False),
-        (("0068_agent_channels_route_identity.py",), True),
-        (("0068_something_else.py",), False),
+        (("0069_agent_channels_route_identity.py",), True),
+        (("0069_something_else.py",), False),
     ],
 )
-def test_route_identity_readback_is_pinned_to_the_exact_0068_file(
+def test_route_identity_readback_is_pinned_to_the_exact_0069_file(
     gate: ModuleType, tmp_path: Path, revisions: tuple[str, ...], expected: bool
 ) -> None:
     tree = _fake_released_tree(tmp_path, revisions=revisions)
@@ -2304,7 +2304,7 @@ def test_route_identity_readback_is_pinned_to_the_exact_0068_file(
     assert gate._candidate_supports_route_identity(tree) is expected
 
 
-def test_route_identity_readback_argument_is_enabled_only_by_0068(
+def test_route_identity_readback_argument_is_enabled_only_by_0069(
     gate: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured: list[list[str]] = []
@@ -2316,7 +2316,7 @@ def test_route_identity_readback_argument_is_enabled_only_by_0068(
     monkeypatch.setattr(gate, "_run_in_tree", _fake_run_in_tree)
     for name, revision in (
         ("before", "0067_execution_request_model_usage.py"),
-        ("after", "0068_agent_channels_route_identity.py"),
+        ("after", "0069_agent_channels_route_identity.py"),
     ):
         gate._run_readback(
             _fake_released_tree(tmp_path / name, revisions=(revision,)),

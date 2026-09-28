@@ -97,7 +97,7 @@ def route_identity(kind: str, adapter: str | None) -> str | None:
 
     A Slack route with no adapter predates the identity: a handle still queued
     across the upgrade, or a row written by an API pod that has not rolled
-    (migration 0068 backfills every row stored before it). It means the default app, so every
+    (migration 0069 backfills every row stored before it). It means the default app, so every
     reader compares identities through this function and never on the raw
     column. ``CLUSTER_MESSAGE_ADAPTER`` on a Slack route is a delivery
     selector, not an identity, so it is the default too. Any other kind is
@@ -156,7 +156,7 @@ def matching_routes[R: RouteRow](
     For Slack, ``adapter`` names an IDENTITY and the match is on the RESOLVED
     identity (``route_identity``), never the raw column, so an omitted
     adapter means 'default'. For any other kind, an omitted adapter selects
-    every row on ``(kind, address)`` -- the triple key (migration 0068) lets
+    every row on ``(kind, address)`` -- the triple key (migration 0069) lets
     several routes share a pair, and a caller that needs one row narrows
     further -- and a non-Slack ``adapter=other`` selects none.
     """

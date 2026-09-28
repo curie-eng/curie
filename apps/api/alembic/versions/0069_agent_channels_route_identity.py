@@ -40,13 +40,13 @@ token (0024's `_redacted` rule).
 `downgrade` refuses while a Slack identity other than `'default'` is bound, or
 while two rows share one `(kind, address)`: 0023's key cannot hold either. It
 then restores 0023's key and 0024's check, and hands NULL back to every Slack
-route and to every Slack reply stored as `'default'`, because the pre-0068
+route and to every Slack reply stored as `'default'`, because the pre-0069
 application compares `reply_adapter` raw on a replay. A reply raised under a
 named identity keeps its name. It never writes `generation`, which is what
 revokes a token minted before a rebind.
 
-Revision ID: 0068
-Revises: 0067
+Revision ID: 0069
+Revises: 0068
 Create Date: 2026-09-26
 """
 
@@ -56,8 +56,8 @@ import sqlalchemy as sa
 from alembic import op
 from curie_api.migration_fence import fence_identity_tables
 
-revision: str = "0068"
-down_revision: str | None = "0067"
+revision: str = "0069"
+down_revision: str | None = "0068"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -157,7 +157,7 @@ def upgrade() -> None:
     refused = _custom_transport(conn)
     if refused:
         raise RuntimeError(
-            "cannot upgrade to 0068: these Slack routes still carry an endpoint, the "
+            "cannot upgrade to 0069: these Slack routes still carry an endpoint, the "
             "custom-transport form ADR-0168 decision 3 retires -- "
             + "; ".join(refused)
             + ". Settle each approval listed first (resolve it, or let it expire) and "
@@ -218,8 +218,8 @@ def downgrade() -> None:
             for name, agent_id, address, identity in named
         )
         raise RuntimeError(
-            "cannot downgrade below 0068: a Slack identity other than 'default' is bound "
-            f"({rows}). The pre-0068 schema has one Slack app; delete those bindings "
+            "cannot downgrade below 0069: a Slack identity other than 'default' is bound "
+            f"({rows}). The pre-0069 schema has one Slack app; delete those bindings "
             "first. Nothing was changed."
         )
     shared = conn.execute(
@@ -233,8 +233,8 @@ def downgrade() -> None:
     if shared:
         rows = "; ".join(f"{kind}:{address} held by {held}" for kind, address, held in shared)
         raise RuntimeError(
-            "cannot downgrade below 0068: several routes share one (kind, address), which "
-            f"the pre-0068 key holds to one row ({rows}). Delete all but one of each "
+            "cannot downgrade below 0069: several routes share one (kind, address), which "
+            f"the pre-0069 key holds to one row ({rows}). Delete all but one of each "
             "first. Nothing was changed."
         )
 

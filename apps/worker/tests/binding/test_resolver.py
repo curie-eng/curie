@@ -9,7 +9,7 @@ The binding is a row in `agent_channels` carrying `kind` and `address`
 (ADR-0096, #1459), not a column on `agents`. Since phase 2 the ROUTING KEY IS
 THE PAIR: `ReplyHandle.kind` rides the queue wire (required, D1), so
 `resolve(kind, address)` binds both halves into the predicate and migration 0023
-widens uniqueness to `(kind, address)`; migration 0068 widens it again to the
+widens uniqueness to `(kind, address)`; migration 0069 widens it again to the
 route triple `(kind, address, adapter)`. There is no address-only overload and no
 default for `kind` -- either would be the silent-address-fallback compatibility
 path phase 2 exists to remove.

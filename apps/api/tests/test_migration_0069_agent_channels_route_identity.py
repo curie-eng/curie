@@ -1,4 +1,4 @@
-"""Migration 0068: a Slack route names its identity, and the key is the triple.
+"""Migration 0069: a Slack route names its identity, and the key is the triple.
 
 ADR-0168 decision 3. A throwaway database per test (`isolated_migration_db`),
 real Postgres, raw SQL seeds: the constraints are database invariants because
@@ -27,8 +27,8 @@ from sqlalchemy.sql import text
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # Named, never relative: a later head would make "-1" stop short (#1391).
-BELOW = "0067"
-REVISION = "0068"
+BELOW = "0068"
+REVISION = "0069"
 ROUTE_KEY = "agent_channels_route_key"
 ROUTE_CK = "agent_channels_route_ck"
 SECRET_ENDPOINT = "http://127.0.0.1:1/replies?token=never-echo-me"
@@ -90,7 +90,7 @@ def _approval(kind: str, channel: str, *, endpoint: str | None = None) -> uuid.U
     _sql(
         "INSERT INTO curie.approvals (id, conversation_id, author, summary, reply_kind, "
         "reply_channel, reply_placeholder, reply_endpoint, dedupe_key, status) "
-        "VALUES (:id, 'th-0068', 'U1', 'seeded', :kind, :channel, NULL, :endpoint, "
+        "VALUES (:id, 'th-0069', 'U1', 'seeded', :kind, :channel, NULL, :endpoint, "
         ":dedupe, 'pending')",
         {
             "id": approval_id,
@@ -165,7 +165,7 @@ def test_upgrade_refuses_a_slack_binding_that_carries_an_endpoint_by_name() -> N
         command.upgrade(_cfg(), REVISION)
 
     message = str(err.value)
-    assert message.startswith("cannot upgrade to 0068:"), message
+    assert message.startswith("cannot upgrade to 0069:"), message
     assert "custom-transport" in message and "C0EXAMPLE2" in message
     assert "proof-offline" in message
     assert "never-echo-me" not in message and "127.0.0.1" not in message
@@ -193,7 +193,7 @@ def test_upgrade_refuses_a_slack_notification_target_that_carries_an_endpoint() 
         command.upgrade(_cfg(), REVISION)
 
     message = str(err.value)
-    assert message.startswith("cannot upgrade to 0068:"), message
+    assert message.startswith("cannot upgrade to 0069:"), message
     assert "notifier" in message and "'deploy'" in message, message
     assert "C0EXAMPLE4" in message
     assert "never-echo-me" not in message and "127.0.0.1" not in message
@@ -252,7 +252,7 @@ def _owed_approval(
         "INSERT INTO curie.approvals (id, agent_id, conversation_id, author, summary, "
         "reply_kind, reply_channel, reply_placeholder, reply_endpoint, reply_adapter, "
         "dedupe_key, status, resolved_at, resumed_at) "
-        "VALUES (:id, :agent, 'th-0068', 'U1', 'seeded', 'slack', :channel, NULL, "
+        "VALUES (:id, :agent, 'th-0069', 'U1', 'seeded', 'slack', :channel, NULL, "
         ":endpoint, :adapter, :dedupe, :status, "
         "CASE WHEN :resolved THEN now() END, CASE WHEN :resumed THEN now() END)",
         {
@@ -288,7 +288,7 @@ def test_upgrade_refuses_an_owed_approval_raised_through_a_custom_transport_by_n
         command.upgrade(_cfg(), REVISION)
 
     message = str(err.value)
-    assert message.startswith("cannot upgrade to 0068:"), message
+    assert message.startswith("cannot upgrade to 0069:"), message
     assert str(pending) in message and str(unresumed) in message, message
     assert "custom-approver" in message and "C0EXAMPLE7" in message
     assert "proof-offline" in message
@@ -385,7 +385,7 @@ def test_downgrade_refuses_a_named_slack_identity_by_name() -> None:
     with pytest.raises(RuntimeError) as err:
         command.downgrade(_cfg(), BELOW)
     message = str(err.value)
-    assert message.startswith("cannot downgrade below 0068:"), message
+    assert message.startswith("cannot downgrade below 0069:"), message
     assert "'second'" in message and "C0EXAMPLE3" in message and "named" in message
     assert _sql("SELECT version_num FROM curie.alembic_version") == [(REVISION,)]
 
@@ -399,7 +399,7 @@ def test_downgrade_refuses_two_routes_that_collapse_onto_one_pair() -> None:
     with pytest.raises(RuntimeError) as err:
         command.downgrade(_cfg(), BELOW)
     message = str(err.value)
-    assert message.startswith("cannot downgrade below 0068:"), message
+    assert message.startswith("cannot downgrade below 0069:"), message
     assert str(a) in message and str(b) in message and "ops@example.com" in message
     assert "a.example" not in message and "b.example" not in message
 

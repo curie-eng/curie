@@ -104,7 +104,7 @@ def _seed_copy(
 
 def test_0060_contract_requires_forward_only() -> None:
     # 0060 set the floor for the release that shipped it; a later contract
-    # (0068) raises it again, so the pin is that it never falls below 0060.
+    # (0069) raises it again, so the pin is that it never falls below 0060.
     assert load_window().schema_min >= "0060"
     window = AppWindow(schema_min="0060", schema_head="0067")
     kinds = load_kinds()

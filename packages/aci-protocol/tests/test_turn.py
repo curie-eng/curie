@@ -722,7 +722,7 @@ def test_a_non_slack_turn_with_an_adapter_matches_only_its_own_row() -> None:
 
 
 def test_a_non_slack_turn_with_no_adapter_matches_every_row_on_the_pair() -> None:
-    # Migration 0068's triple key allows this, and the omitted selector's
+    # Migration 0069's triple key allows this, and the omitted selector's
     # semantics are "every row on the pair", not "none".
     first = _Row(
         kind="webhook", address="https://example.test/hook", adapter="acme", endpoint="http://a/"

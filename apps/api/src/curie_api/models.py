@@ -276,7 +276,7 @@ class AgentChannel(Base):
     pair-unique constraint under an address-only lookup would let two agents hold
     one address while the resolver could not tell them apart, which is #38's
     silent misrouting wearing a different hat. That ordering is why 0023 lands
-    after the cutover proves no old worker is running. Migration 0068 widens the
+    after the cutover proves no old worker is running. Migration 0069 widens the
     key to `(kind, address, adapter)` (ADR-0168 decision 3).
 
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
@@ -296,7 +296,7 @@ class AgentChannel(Base):
     __tablename__ = "agent_channels"
     __table_args__ = (
         # One agent per ROUTE, the `(kind, address, adapter)` triple (ADR-0168
-        # decision 3, migration 0068; 0023 keyed the pair, 0021 the address).
+        # decision 3, migration 0069; 0023 keyed the pair, 0021 the address).
         # A second agent bound to the same route could never respond -- it
         # would be silently shadowed (#38). Enforced here so it fails at create
         # time. The pair leads so `(kind, address)` lookups keep the index

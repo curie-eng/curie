@@ -31,7 +31,7 @@ per-adapter token.
 ``agent_channels.kind`` ROUTES: since ADR-0096 phase 2 the queue wire
 (``ReplyHandle``) carries a required ``kind``, so the routing key is the PAIR
 (``kind`` AND ``address``) and migration 0023 widens the uniqueness constraint to
-match; migration 0068 widens it again to the route triple, so several
+match; migration 0069 widens it again to the route triple, so several
 identities may share a pair. There is no address-only overload and no default
 kind -- either would be the silent address-fallback the pair exists to remove.
 One address can now legitimately be bound twice under two different kinds, and
@@ -386,7 +386,7 @@ class AmbiguousRoute(RuntimeError):
     """A turn names no adapter on a non-Slack pair that several agents bind.
 
     An omitted non-Slack adapter selects every route on the pair
-    (``matching_routes``), and migration 0068's triple key lets two agents hold
+    (``matching_routes``), and migration 0069's triple key lets two agents hold
     one pair under different adapters, so no deployment is this turn's. The
     worker's twin of the API's ``crud.AmbiguousRoute``: never resolved by
     picking one, because the pick runs one agent's turn under another's
@@ -434,7 +434,7 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
 
     The ORDER BY picks one deterministic winner (prod-first, then most recent).
     The API holds one agent per route (``agent_channels_route_key``, migration
-    0068, superseding 0023's pair key, 0021's address-only
+    0069, superseding 0023's pair key, 0021's address-only
     ``agent_channels_address_key`` and 0017's ``agents_slack_channel_key``), so
     a Slack turn, or a turn that names its adapter, cannot reach this state
     through the write paths. A non-Slack turn that omits its adapter selects

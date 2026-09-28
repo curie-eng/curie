@@ -6330,7 +6330,7 @@ def test_a_replay_matches_a_default_identity_a_later_migration_names(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
-    """ADR-0168 decision 3: migration 0068 backfills the default Slack identity
+    """ADR-0168 decision 3: migration 0069 backfills the default Slack identity
     to 'default', and a caller that names none means the same identity. A
     replay compares the identities, so the two spellings match."""
     client, _ = publication_stack
@@ -6357,7 +6357,7 @@ def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
-    """A publication raised from a handle queued before migration 0068 can
+    """A publication raised from a handle queued before migration 0069 can
     still store NULL for the default Slack identity, while its replay now
     arrives as 'default'. Same identity, same replay."""
     client, _ = publication_stack
