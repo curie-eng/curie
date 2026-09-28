@@ -1924,15 +1924,33 @@ set the new pair, and `kubectl rollout restart` the api and worker Deployments:
 neither pod template carries a checksum of this Secret. Tokens live 24 hours,
 so clear `previousVerifyKey` a day later.
 
-Upgrading onto this release rolls every hosted connector pod once, because its
-rendered Deployment gains the proxy. Upgrade note: a keep-alive Job that dialled
-the connector Service now dials `<name>-direct`, keeping its port, because the
+The worker that signs the token, the runner that presents it in
+`X-Curie-Caller`, and the proxy that checks it arrive in the same release, so
+no earlier runner image carries the header and every hosted connector refuses
+one. Keep any agent-specific runner image on this release too.
+
+The first upgrade that gives the release a caller key rolls every hosted
+connector pod once, because its rendered Deployment gains the proxy. That is
+the `curie cluster up` upgrade of a release recording none. `curie cluster
+upgrade` generates no key, so it renders no proxy until a later `cluster up`
+or a key of your own. Upgrade note: a keep-alive Job that dialled the
+connector Service now dials `<name>-direct`, keeping its port, because the
 connector Service lands on the proxy, which refuses a caller without a token.
-Its peer-ingress policy keeps naming the server's port. A sandbox that was already running carries
-no token. The next turn on its thread claims a fresh sandbox instead, and a
-turn already in progress finishes first. Every hosted connector refuses a
-runner image from before the release that added the `X-Curie-Caller` header,
-so keep any agent-specific runner image on this release too.
+Its peer-ingress policy keeps naming the server's port.
+
+A sandbox booted by a worker that held no signing key carries no token, and a
+proxied connector refuses every call it makes: the runner reports that
+connector as refusing this sandbox and its tools as unavailable. The next turn
+on its thread that a worker holding the key takes claims a fresh sandbox
+instead, and a turn already in progress finishes first. Every sandbox from
+before the upgrade is such a sandbox, and so is one booted during the roll by
+a worker pod the roll has not replaced yet. The pre-upgrade drain
+(`worker.upgradeDrain`) stops every worker taking new work until its
+post-upgrade release, but `cluster up` runs Helm without `--wait`, so that
+release can clear the pause while a worker pod from before the upgrade is
+still running, and that pod can take turns until it is replaced. Upgrading
+first with no key and generating one later does not remove this: the second
+upgrade rolls workers that do not yet hold the key in the same way.
 
 ### Reserved environment variables
 
