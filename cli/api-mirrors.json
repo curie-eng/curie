@@ -493,10 +493,6 @@
           "why": "Same reason as `channels`: whether an agent's bindings share workflow state (#1525 follow-up, ADR-0118) is a separate concern from the model/thinking pair this verb reads and writes, and it has no CLI surface of its own yet -- emitting it here would imply this verb can change it."
         },
         {
-          "field": "memory_writes",
-          "why": "`--memory-writes on|off` writes it (#1461), but the result keeps the overrides verb's existing shape: echoing it needs a new OverridesOutput::Done field and schema minor bump, which also changes the variant samples in cli/tests/cli_output_variants.rs and the destructuring in cli/tests/api_lifecycle.rs. Left for a follow-up; the PATCH response is still decoded into Agent."
-        },
-        {
           "field": "publication_policy",
           "why": "Publication policy has its own verb. Emitting it from overrides would imply that verb can change it."
         },

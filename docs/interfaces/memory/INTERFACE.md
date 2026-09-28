@@ -1,7 +1,7 @@
 ---
 seam: Memory
 kind: CLEAN
-impls: 1 loader (StateApiMemoryStore)
+impls: 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore)
 grade: not separately graded
 epics:
   - "#28"
@@ -13,7 +13,7 @@ order: 15
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 loader (StateApiMemoryStore) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -54,7 +54,10 @@ frozen ACI field is unchanged; the state-API bearer is a runner-local knob
 
 ## Implementations today
 
-One: **`StateApiMemoryStore`**, backing memory as a scoped `memory` namespace
+Two stores over the same backing. The `MemoryStore` port has one loader; the
+facts store (`MemoryFactsStore`, below) sits beside the port, not behind it.
+
+**`StateApiMemoryStore`** is the port's loader, backing memory as a scoped `memory` namespace
 over the durable KV/document store landed for #23/#248
 (`apps/api` `/agents/{agent_id}/state/{namespace}/{key}`, Postgres JSONB).
 `load` GETs the single log-shaped key; `append` POSTs to that key's `/append`
@@ -140,8 +143,8 @@ the worker leaves them out of change receipts.
   `curie local memory --add` and `curie cluster memory` /
   `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike
   the sandbox path it is platform-key-only (`require_api_key`), so the scoped
-  memory token cannot reach it. This is coherent today (one loader, one backing
-  store, and the router says so in its own docstring), but it is the precise leak
+  memory token cannot reach it. This is coherent today (one loader plus the facts
+  store, one backing store, and the router says so in its own docstring), but it is the precise leak
   a real second loader would trip over: an `s3://` store would satisfy the port
   and still leave every operator read returning an empty list and every edit and
   delete 404ing, because the operator plane is addressing a Postgres row that

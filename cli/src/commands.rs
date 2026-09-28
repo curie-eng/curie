@@ -13350,6 +13350,9 @@ pub fn overrides_patch_body(
 ///   agent: the agent's name.
 ///   model: the stored model override, `None` when the platform default applies.
 ///   thinking: the stored thinking override, same convention.
+///   execution_deadline_seconds: the stored deadline override, same convention.
+///   runner_resources: the stored runner resources override, same convention.
+///   memory_writes: whether the agent's memory tools are on (#1461).
 ///   changed: whether this invocation wrote, as opposed to inspecting.
 ///
 /// Returns:
@@ -13360,6 +13363,7 @@ pub fn overrides_summary(
     thinking: &Option<String>,
     execution_deadline_seconds: &Option<u32>,
     runner_resources: &Option<serde_json::Value>,
+    memory_writes: bool,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
@@ -13373,8 +13377,9 @@ pub fn overrides_summary(
     // The verb carries its own leading space, so an inspect closes straight
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
+    let writes = if memory_writes { "on" } else { "off" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}",
+        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
         show(model),
         show(thinking)
     )
@@ -13388,6 +13393,8 @@ pub fn overrides_summary(
 /// fact the API returns as JSON null: the platform default applies. `changed`
 /// distinguishes an inspect from a write, so an agent consumer can tell "this
 /// is what it is" from "this is what it now is" without diffing.
+/// `memory_writes` is the agent's NOT NULL memory-tools switch (#1461), so it
+/// is always a boolean, never null.
 #[derive(Debug)]
 pub enum OverridesOutput {
     DryRun(crate::ui::DryRunPlan),
@@ -13397,6 +13404,7 @@ pub enum OverridesOutput {
         thinking: Option<String>,
         execution_deadline_seconds: Option<u32>,
         runner_resources: Option<serde_json::Value>,
+        memory_writes: bool,
         changed: bool,
     },
 }
@@ -13411,6 +13419,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
+                memory_writes,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
@@ -13418,6 +13427,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 "thinking": thinking,
                 "execution_deadline_seconds": execution_deadline_seconds,
                 "runner_resources": runner_resources,
+                "memory_writes": memory_writes,
                 "changed": changed,
             }),
         }
@@ -13432,6 +13442,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
+                memory_writes,
                 changed,
             } => {
                 ui.payload(&overrides_summary(
@@ -13440,6 +13451,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                     thinking,
                     execution_deadline_seconds,
                     runner_resources,
+                    *memory_writes,
                     *changed,
                 ));
             }
@@ -13496,8 +13508,8 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 ///
 /// `memory_writes` is a NOT NULL boolean rather than a nullable override, so it
 /// has no clear: `Some(b)` sends a JSON boolean under its own key, `None`
-/// leaves the key out of the body. The result keeps the overrides verb's
-/// existing shape; the switch is not echoed back in it.
+/// leaves the key out of the body. The result reports the switch as the API
+/// stored it, like every other field.
 ///
 /// Args:
 ///   opts: api url/key, the agent name or id, and the dry-run flag.
@@ -13551,6 +13563,7 @@ pub async fn overrides_with_memory_writes(
             thinking: agent.thinking,
             execution_deadline_seconds: agent.execution_deadline_seconds,
             runner_resources: agent.runner_resources,
+            memory_writes: agent.memory_writes,
             changed: false,
         });
     };
@@ -13572,6 +13585,7 @@ pub async fn overrides_with_memory_writes(
         thinking: saved.thinking,
         execution_deadline_seconds: saved.execution_deadline_seconds,
         runner_resources: saved.runner_resources,
+        memory_writes: saved.memory_writes,
         changed: true,
     })
 }
@@ -13841,11 +13855,18 @@ mod overrides_tests {
     // verb was interpolated as an empty string before the colon.
     #[test]
     fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
-        let line =
-            super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, &None, false);
+        let line = super::overrides_summary(
+            "a",
+            &Some("kimi-k2".into()),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+        );
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default"
+            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -13853,8 +13874,16 @@ mod overrides_tests {
     #[test]
     fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
         assert_eq!(
-            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), &None, true),
-            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default"
+            super::overrides_summary(
+                "a",
+                &None,
+                &Some("adaptive".into()),
+                &Some(90),
+                &None,
+                true,
+                true
+            ),
+            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
         );
     }
 

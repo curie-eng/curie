@@ -453,15 +453,21 @@ def build_runner(
     # don't see an attachment" about a message that visibly carries one.
     attachment_paths = _discover_attachments(attachments_path)
     # The memory tools (#1461, ADR-0167) mount iff the worker set a channel
-    # memory ref: that ref is the operator's memory-writes switch as the sandbox
-    # sees it. The guidance block rides with the tools and only with them; the
-    # facts block does not, because reading memory needs no switch.
-    channel_facts_store = resolve_facts_store(
-        config.channel_memory_ref, os.environ.get(MEMORY_TOKEN_ENV)
-    )
+    # memory ref (the operator's memory-writes switch as the sandbox sees it)
+    # AND a memory token to write with, and only on the real-model path, which
+    # is the only path that mounts platform MCP servers at all. The toolPolicy
+    # exemption below reads this same flag, so the claim matches the mount.
+    # The guidance block rides with the tools and only with them; the facts
+    # block does not, because reading memory needs no switch.
+    memory_token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    channel_facts_store = resolve_facts_store(config.channel_memory_ref, memory_token)
     if config.channel_memory_ref and channel_facts_store is None:
         logger.warning("memory tools not mounted: unsupported channel memory ref scheme")
-    memory_tools_mounted = channel_facts_store is not None
+    if config.channel_memory_ref and memory_token is None:
+        logger.warning("memory tools not mounted: no memory token")
+    memory_tools_mounted = (
+        channel_facts_store is not None and memory_token is not None and not fake_model
+    )
     memory_turn = MemoryTurn() if memory_tools_mounted else None
     system_prompt = _compose_system_prompt(
         system_prompt,
@@ -687,7 +693,9 @@ def build_runner(
                         turn=memory_turn,
                         session_id=config.session.session_id,
                     )
-                    if channel_facts_store is not None and memory_turn is not None
+                    if memory_tools_mounted
+                    and channel_facts_store is not None
+                    and memory_turn is not None
                     else ()
                 ),
             ),

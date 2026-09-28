@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/overrides/v1.2.json",
+  "$id": "https://schemas.curietech.ai/cli/overrides/v2.json",
   "title": "curie <tier> overrides --json",
-  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when no override is pinned, which is the same fact the API returns: the platform default applies. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
+  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when no override is pinned, which is the same fact the API returns: the platform default applies. `memory_writes` is the agent's memory-tools switch, always a boolean. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -61,6 +61,9 @@
             "null"
           ]
         },
+        "memory_writes": {
+          "type": "boolean"
+        },
         "changed": {
           "type": "boolean"
         }
@@ -69,6 +72,7 @@
         "agent",
         "model",
         "thinking",
+        "memory_writes",
         "changed"
       ]
     }

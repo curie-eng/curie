@@ -26,7 +26,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Bundle format | CLEAN, frozen | 1 | not separately graded | #30 | [Bundle format](interfaces/bundle-format/INTERFACE.md) |
 | Approval / authorizer | CLEAN | 3 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
-| Memory | CLEAN | 1 loader (StateApiMemoryStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
+| Memory | CLEAN | 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
 | Triggers | SOFT | 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) + per-agent cron scheduler (worker cron_loop) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
 | CLI output (agent-facing `--json`) | CLEAN | 57 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |

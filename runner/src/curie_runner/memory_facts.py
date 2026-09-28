@@ -313,9 +313,15 @@ _FACTS_PREAMBLE = (
 
 
 def _fact_line(fact: Fact) -> str:
-    stamp = _stated_at_sort_key(fact)
-    date = stamp.date().isoformat() if stamp.year > 1 else fact.stated_at[:10]
+    # The tools' length cap applies at render too: a fact stored some other way
+    # (the state API, older data) is cut to MAX_STATEMENT_CHARS plus an ellipsis.
     statement = " ".join(fact.statement.split())
+    if len(statement) > MAX_STATEMENT_CHARS:
+        statement = statement[:MAX_STATEMENT_CHARS] + "…"
+    stamp = _stated_at_sort_key(fact)
+    date = stamp.date().isoformat() if stamp.year > 1 else fact.stated_at.strip()[:10]
+    if not date:
+        return f"- [{fact.id}] {statement}"
     return f"- [{fact.id}] {statement} (as of {date})"
 
 

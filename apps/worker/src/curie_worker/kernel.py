@@ -2690,10 +2690,21 @@ class Kernel:
                 # Memory writes (#1461) are read apart from resolution for the
                 # same schema reason as runner_resources; boot_env reads them
                 # off the resolved deployment. hasattr: binding doubles may not
-                # carry the method.
-                if hasattr(self._binding, "memory_writes_for") and (
-                    await self._binding.memory_writes_for(agent_id)
-                ):
+                # carry the method. A failed read (a DB error, or a schema from
+                # before migration 0068) never fails the turn: it runs with
+                # memory writes off and a warning, the safe direction.
+                memory_writes = False
+                if hasattr(self._binding, "memory_writes_for"):
+                    try:
+                        memory_writes = await self._binding.memory_writes_for(agent_id)
+                    except Exception as exc:  # noqa: BLE001 - degrade to off
+                        logger.warning(
+                            "memory writes read failed agent=%s error_class=%s;"
+                            " running with memory writes off",
+                            agent_id,
+                            type(exc).__name__,
+                        )
+                if memory_writes:
                     resolved = resolved.model_copy(update={"memory_writes": True})
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
