@@ -1361,16 +1361,20 @@ pub struct DeployNamedOpts {
 }
 
 /// `curie dev bump-version <X.Y.Z>`: set the release-coupled version across
-/// cli/Cargo.toml + Chart.yaml version/appVersion in one shot, so a release cut
-/// cannot leave the three out of sync (the drift the #489 consistency gate
-/// catches). It rewrites ONLY the line-anchored release fields (never a
+/// cli/Cargo.toml + Chart.yaml version/appVersion and promote the candidate
+/// schema window under that version. It refuses to change a window whose
+/// version is registered in the architecture atlas. It rewrites ONLY the
+/// line-anchored release fields (never a
 /// dependency `version = ` line), refreshes the CLI lockfile, and prints the
 /// commit + tag follow-up -- it does not commit, tag, or push. `--dry-run` prints
 /// the planned edits and writes nothing.
 pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
     let ui = crate::ui::ui();
     // semver X.Y.Z with an optional -rc.N (the only pre-release shape we cut).
-    let semver = regex::Regex::new(r"^\d+\.\d+\.\d+(-rc\.\d+)?$").expect("static regex");
+    let semver = regex::Regex::new(
+        r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.(0|[1-9][0-9]*))?$",
+    )
+    .expect("static regex");
     if !semver.is_match(version) {
         return Err(crate::exit::usage(format!(
             "version {version:?} must be semver X.Y.Z or X.Y.Z-rc.N"
@@ -1383,10 +1387,26 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
 
     let cargo_path = root.join("cli/Cargo.toml");
     let chart_path = root.join("charts/curie/Chart.yaml");
+    let catalog_path = root.join("cli/src/application_schema_windows.json");
+    let atlas_path = root.join("docs/architecture-atlas/versions.json");
     let cargo = std::fs::read_to_string(&cargo_path)
         .with_context(|| format!("reading {}", cargo_path.display()))?;
     let chart = std::fs::read_to_string(&chart_path)
         .with_context(|| format!("reading {}", chart_path.display()))?;
+    let catalog = std::fs::read_to_string(&catalog_path)
+        .with_context(|| format!("reading {}", catalog_path.display()))?;
+    let atlas = std::fs::read_to_string(&atlas_path)
+        .with_context(|| format!("reading {}", atlas_path.display()))?;
+    let published = atlas_version_registered(&atlas, version)?;
+    let catalog_value: serde_json::Value =
+        serde_json::from_str(&catalog).context("parsing application schema window catalog")?;
+    let had_window = catalog_value
+        .get("windows")
+        .and_then(serde_json::Value::as_object)
+        .context("catalog has no release windows")?
+        .contains_key(version);
+    let catalog_new = promote_candidate_window(&catalog, version, published)?;
+    let catalog_changed = catalog_new != catalog;
 
     // Line-anchored so a dependency `version = "x"` line is never touched: only
     // the first `version = ` at column 0 (the [package] version) is rewritten.
@@ -1407,12 +1427,31 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
                 format!("cli/Cargo.toml: version = \"{version}\""),
                 format!("charts/curie/Chart.yaml: version: {version}"),
                 format!("charts/curie/Chart.yaml: appVersion: \"{version}\""),
+                if catalog_changed {
+                    if had_window {
+                        format!(
+                            "cli/src/application_schema_windows.json: update unpublished windows[{version}] from candidate"
+                        )
+                    } else {
+                        format!(
+                            "cli/src/application_schema_windows.json: promote candidate to windows[{version}]"
+                        )
+                    }
+                } else {
+                    format!(
+                        "cli/src/application_schema_windows.json: windows[{version}] already matches candidate"
+                    )
+                },
                 "cargo update -p curie (refresh Cargo.lock)".to_string(),
             ],
         });
         return Ok(());
     }
 
+    if catalog_changed {
+        std::fs::write(&catalog_path, catalog_new)
+            .with_context(|| format!("writing {}", catalog_path.display()))?;
+    }
     std::fs::write(&cargo_path, cargo_new)
         .with_context(|| format!("writing {}", cargo_path.display()))?;
     std::fs::write(&chart_path, chart_new)
@@ -1420,6 +1459,16 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
     ui.note(&format!(
         "set version {version} in cli/Cargo.toml and charts/curie/Chart.yaml"
     ));
+    if catalog_changed {
+        ui.note(&format!(
+            "{} the candidate schema window for application {version}",
+            if had_window { "updated" } else { "promoted" }
+        ));
+    } else {
+        ui.note(&format!(
+            "application {version} schema window already matches the candidate"
+        ));
+    }
 
     // Refresh the CLI lockfile so the committed Cargo.lock matches the new crate
     // version. Best-effort: a missing cargo or offline registry must not fail the
@@ -1441,6 +1490,83 @@ pub async fn bump_version(version: &str, dry_run: bool) -> Result<()> {
         version: version.to_string(),
     });
     Ok(())
+}
+
+fn atlas_version_registered(manifest: &str, version: &str) -> Result<bool> {
+    let atlas: serde_json::Value =
+        serde_json::from_str(manifest).context("parsing architecture atlas versions")?;
+    let versions = atlas
+        .get("versions")
+        .and_then(serde_json::Value::as_array)
+        .context("architecture atlas versions manifest is malformed")?;
+    let target = format!("v{version}");
+    let mut registered = false;
+    for entry in versions {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("architecture atlas version entry has no id")?;
+        registered |= id == target;
+    }
+    Ok(registered)
+}
+
+fn promote_candidate_window(catalog: &str, version: &str, published: bool) -> Result<String> {
+    let mut payload: serde_json::Value =
+        serde_json::from_str(catalog).context("parsing application schema window catalog")?;
+    let candidate = payload
+        .get("candidate")
+        .and_then(serde_json::Value::as_object)
+        .context("catalog has no candidate schema window")?
+        .clone();
+    let candidate_min = candidate
+        .get("schema_min")
+        .and_then(serde_json::Value::as_str)
+        .context("candidate has no schema_min")?;
+    let candidate_head = candidate
+        .get("schema_head")
+        .and_then(serde_json::Value::as_str)
+        .context("candidate has no schema_head")?;
+    let revisions = payload
+        .get("revisions")
+        .and_then(serde_json::Value::as_array)
+        .context("catalog has no revisions")?;
+    let min_index = revisions
+        .iter()
+        .position(|revision| revision.as_str() == Some(candidate_min))
+        .context("candidate schema_min is not a catalog revision")?;
+    let head_index = revisions
+        .iter()
+        .position(|revision| revision.as_str() == Some(candidate_head))
+        .context("candidate schema_head is not a catalog revision")?;
+    if min_index > head_index {
+        bail!("candidate schema_min is after candidate schema_head");
+    }
+    let windows = payload
+        .get_mut("windows")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("catalog has no release windows")?;
+    let candidate = serde_json::Value::Object(candidate);
+    if let Some(existing) = windows.get(version) {
+        if existing == &candidate {
+            return Ok(catalog.to_string());
+        }
+        if published {
+            bail!(
+                "application {version} is registered in the architecture atlas; bump to the next version"
+            );
+        }
+    }
+    if published && !windows.contains_key(version) {
+        bail!(
+            "application {version} is registered in the architecture atlas but has no catalog window; cannot promote the candidate"
+        );
+    }
+    windows.insert(version.to_string(), candidate);
+    let mut updated = serde_json::to_string_pretty(&payload)
+        .context("serializing application schema window catalog")?;
+    updated.push('\n');
+    Ok(updated)
 }
 
 /// Replace the first line beginning with `prefix` (after optional leading
@@ -2216,6 +2342,29 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // packing would leave the runner refusing the stale copy it was handed
     // while the source directory holds the fresh one.
     let connector_decl = crate::connector_build::load(&plugin_dir)?;
+    // Stage each hosted connector's Bearer secret into the runner env (#2518),
+    // the skill-tier twin of the cluster sandbox binding (#2503). The mounted
+    // entry (including the `unhosted_url` fallback) carries
+    // `Authorization: Bearer ${NAME}`, and the MCP client expands it from THIS
+    // container's env; a name that never reaches it ships the literal
+    // placeholder and the server answers 401. Resolved like `--secret`: the
+    // shell env first, then Curie storage; only the NAME rides the argv.
+    for name in crate::connector_build::hosted_env_secret_names(&connector_decl) {
+        crate::connector_build::refuse_reserved_env_secret_name(&name)?;
+        if passthrough_env.contains(&name) {
+            continue;
+        }
+        if !env_credential_present(&name) && !stored_env_contains(&docker_env, &name) {
+            match secret_store_env(&name)? {
+                Some(pair) => docker_env.push(pair),
+                None => crate::ui::ui().note(&format!(
+                    "connector secret {name}: not set in the environment or Curie secret store; \
+                     nothing will be forwarded for it"
+                )),
+            }
+        }
+        passthrough_env.push(name);
+    }
     let declares_hosted_connectors = connector_decl
         .connectors
         .values()
@@ -5012,6 +5161,11 @@ async fn prepare_deploy_with_commit_sha(
     // long before anything is applied. `opts.plugin_dir` (not the canonicalized
     // copy) is the path they typed.
     let connector_decl = crate::connector_build::load(&plugin_dir)?;
+    if let Some(warning) =
+        crate::connector_build::undeclared_runner_dockerfile(&opts.plugin_dir, &connector_decl)
+    {
+        crate::ui::ui().warn(&warning);
+    }
     if opts.tier == DeployTier::Local
         && connector_decl
             .connectors
@@ -5068,14 +5222,16 @@ async fn prepare_deploy_with_commit_sha(
     // on the connector pod.
     let connector_env_secret_names =
         crate::connector_build::hosted_env_secret_names(&connector_decl);
-    // Automatic delivery of connectors.yaml secrets exists only for
-    // DeployTier::Cluster (#2503 follow-up); `local deploy` has no delivery
-    // path yet, so its effective set must stay exactly `opts.secret`.
-    let effective_secret_names = if opts.tier == DeployTier::Cluster {
-        merge_secret_env(opts.secret.clone(), &connector_env_secret_names)
-    } else {
-        opts.secret.clone()
-    };
+    // Before any value is read: local resolves these names from the operator's
+    // env and vault onto the agent record (#2518), and `unhosted_url`
+    // connectors escape `refuse_reserved_secret_names`.
+    for name in &connector_env_secret_names {
+        crate::connector_build::refuse_reserved_env_secret_name(name)?;
+    }
+    // Both tiers auto-bind the connectors.yaml Bearer names (#2503 cluster,
+    // #2518 local). Local resolves their values below and delivers them on the
+    // agent record, exactly like an explicit `--secret`.
+    let effective_secret_names = merge_secret_env(opts.secret.clone(), &connector_env_secret_names);
 
     if opts.secret_binding_supported {
         let declared = read_declared_secrets(&plugin_dir)?;
@@ -5222,17 +5378,45 @@ async fn prepare_deploy_with_commit_sha(
     // Resolve each --secret NAME to a value (env wins, else the host vault) so
     // the connector secret is bound on the agent for the worker to forward into
     // the sandbox (ADR-0009, #429). The value never appears in argv.
+    // On Local the auto-bound connector Bearer names are resolved here too
+    // (#2518): the record is local's only sandbox delivery path. Cluster keeps
+    // `opts.secret` alone; its connector values are resolved cluster-scoped.
+    // @spec ADR-0168 d8. Only a resolved target narrows the CLI's own work; the
+    // API render and the runner narrow every deploy's pods regardless.
+    let connector_allowlist = resolved.as_ref().and_then(|r| r.connectors.clone());
+    // The explicit `--secret` names plus the Bearer names of the connectors
+    // this target keeps. Local resolves their values here; an excluded
+    // connector never reaches `bring_up_local`, so its secret is not this
+    // deploy's to require.
+    let target_secret_names = merge_secret_env(
+        opts.secret.clone(),
+        &crate::connector_build::hosted_env_secret_names(&crate::connector_build::restrict_to(
+            &connector_decl,
+            connector_allowlist.as_deref(),
+        )),
+    );
+    let resolved_names: &[String] = match opts.tier {
+        DeployTier::Local => &target_secret_names,
+        DeployTier::Cluster => &opts.secret,
+    };
     let mut secrets: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for name in &opts.secret {
+    for name in resolved_names {
         let value = crate::secrets::resolve_env_or_saved(name)?;
         match value {
             Some(v) => {
                 secrets.insert(name.clone(), v);
             }
-            None => {
+            None if opts.secret.contains(name) => {
                 return Err(crate::exit::usage(format!(
                     "--secret {name}: not set in the environment and not saved in Curie \
                      storage; export it or run `curie secrets set {name}` first"
+                )));
+            }
+            None => {
+                return Err(crate::exit::usage(format!(
+                    "connector secret {name} (the Bearer secret connectors.yaml declares): not \
+                     set in the environment and not saved in Curie storage; export it or run \
+                     `curie secrets set {name}` first"
                 )));
             }
         }
@@ -5272,17 +5456,8 @@ async fn prepare_deploy_with_commit_sha(
         .with_fix("pass --slack-channel <id>, or add slack_channel to the deploy.yaml target")
         .into());
     }
-    // @spec ADR-0168 d8. Only a resolved target narrows the CLI's own work; the
-    // API render and the runner narrow every deploy's pods regardless.
-    let connector_allowlist = resolved.as_ref().and_then(|r| r.connectors.clone());
     let record_secret_names = if opts.tier == DeployTier::Cluster {
-        merge_secret_env(
-            opts.secret.clone(),
-            &crate::connector_build::hosted_env_secret_names(&crate::connector_build::restrict_to(
-                &connector_decl,
-                connector_allowlist.as_deref(),
-            )),
-        )
+        target_secret_names.clone()
     } else {
         opts.secret.clone()
     };
@@ -5748,6 +5923,112 @@ pub struct AgentActionOpts {
     /// same name lookup `deploy` uses (`ApiClient::find_agent`).
     pub agent: String,
     pub dry_run: bool,
+}
+
+/// One success result for both local and cluster hook operations. The secret
+/// variant deliberately has no Debug implementation.
+pub enum HookOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Config {
+        id: String,
+        agent: String,
+        hook_partitions: Option<BTreeMap<String, serde_json::Value>>,
+        source_bindings: Option<BTreeMap<String, serde_json::Value>>,
+    },
+    Secret {
+        secret: String,
+    },
+}
+
+impl crate::ui::CliOutput for HookOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::DryRun(plan) => plan.to_json(),
+            Self::Config {
+                id,
+                agent,
+                hook_partitions,
+                source_bindings,
+            } => serde_json::json!({
+                "id": id,
+                "agent": agent,
+                "hook_partitions": hook_partitions,
+                "source_bindings": source_bindings,
+            }),
+            Self::Secret { secret } => serde_json::json!({"secret": secret}),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            Self::DryRun(plan) => plan.render(ui),
+            Self::Config { .. } => ui.payload_plain(
+                &serde_json::to_string_pretty(&self.to_json()).expect("hook config is JSON"),
+            ),
+            Self::Secret { secret } => ui.payload_plain(secret),
+        }
+    }
+}
+
+fn hook_config_output(agent: crate::api::Agent) -> HookOutput {
+    HookOutput::Config {
+        id: agent.id,
+        agent: agent.name,
+        hook_partitions: agent.hook_partitions,
+        source_bindings: agent.source_bindings,
+    }
+}
+
+pub async fn hooks_show(opts: AgentActionOpts) -> Result<HookOutput> {
+    if opts.dry_run {
+        return Ok(HookOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "GET /agents  (would find agent {:?} and show its hook configuration)",
+                opts.agent
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    Ok(hook_config_output(client.find_agent(&opts.agent).await?))
+}
+
+pub async fn hooks_configure(opts: AgentActionOpts, file: &Path) -> Result<HookOutput> {
+    let raw = std::fs::read_to_string(file)
+        .with_context(|| format!("reading hook configuration from {}", file.display()))?;
+    let config: crate::api::HookConfigInput = serde_json::from_str(&raw)
+        .with_context(|| format!("decoding hook configuration from {}", file.display()))?;
+    if config.is_empty() {
+        bail!("hook configuration must contain hook_partitions or source_bindings");
+    }
+    let body = serde_json::to_value(config).context("encoding hook configuration")?;
+    if opts.dry_run {
+        return Ok(HookOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "PATCH /agents/<id>  (would resolve agent {:?} and update hook configuration)",
+                opts.agent
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    Ok(hook_config_output(
+        client.update_agent(&agent.id, &body).await?,
+    ))
+}
+
+pub async fn hooks_secret(opts: AgentActionOpts) -> Result<HookOutput> {
+    if opts.dry_run {
+        return Ok(HookOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "GET /agents/<id>/hook-secret  (would resolve agent {:?} first; secret redacted)",
+                opts.agent
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let secret = client.hook_secret(&agent.id).await?;
+    Ok(HookOutput::Secret { secret })
 }
 
 /// Output of `<tier> kill <agent>`: the dry-run plan, or the resulting kill
@@ -6912,6 +7193,9 @@ pub enum ApprovalsOutput {
     Pending {
         agent: String,
         records: Vec<crate::api::ApprovalRecord>,
+        /// Current route bindings fetched with the agent for this list read.
+        /// These are display context, never a snapshot of resolve authority.
+        routes: BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
         /// `true` when `records.len()` hit the server's page-size cap
         /// (`ApiClient::APPROVALS_LIST_LIMIT`), meaning more pending approvals
         /// may exist beyond what was fetched (#670). Always present (never
@@ -6971,6 +7255,22 @@ fn approval_record_json(r: &crate::api::ApprovalRecord) -> serde_json::Value {
     })
 }
 
+fn pending_approval_record_json(
+    record: &crate::api::ApprovalRecord,
+    routes: &BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
+) -> serde_json::Value {
+    let mut row = approval_record_json(record);
+    let current_route_approvers = record
+        .route
+        .as_ref()
+        .and_then(|route| routes.get(route))
+        .and_then(|binding| binding.approvers.as_ref());
+    // This reports the route configuration observed when listing. The API
+    // reads the binding again when an actor attempts to resolve the approval.
+    row["current_route_approvers"] = serde_json::json!(current_route_approvers);
+    row
+}
+
 impl crate::ui::CliOutput for ApprovalsOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -6987,10 +7287,11 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             ApprovalsOutput::Pending {
                 agent,
                 records,
+                routes,
                 truncated,
             } => serde_json::json!({
                 "agent": agent,
-                "pending": records.iter().map(approval_record_json).collect::<Vec<_>>(),
+                "pending": records.iter().map(|record| pending_approval_record_json(record, routes)).collect::<Vec<_>>(),
                 "count": records.len(),
                 "truncated": truncated,
             }),
@@ -7052,6 +7353,7 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             ApprovalsOutput::Pending {
                 agent,
                 records,
+                routes,
                 truncated,
             } => {
                 if records.is_empty() {
@@ -7077,10 +7379,20 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                             .as_deref()
                             .filter(|c| !c.is_empty())
                             .unwrap_or("(requesting channel)");
+                        let approvers = match r.route.as_deref() {
+                            Some(route) => routes.get(route).map_or_else(
+                                || {
+                                    "route binding missing; restore it before resolution"
+                                        .to_string()
+                                },
+                                describe_approvers,
+                            ),
+                            None => format!("members of {card} (routeless default)"),
+                        };
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{} — {} [tool: {tool}, route: {route}, channel: {card}, by: {}]",
+                                "{}: {} [tool: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
                                 r.summary, r.conversation_id, r.author
                             ),
                         );
@@ -7654,6 +7966,7 @@ pub async fn approvals(
         return Ok(ApprovalsOutput::Pending {
             agent: agent.name,
             records,
+            routes: agent.approval_routes.unwrap_or_default(),
             truncated,
         });
     }
@@ -8466,8 +8779,16 @@ fn check_deploy_routes_bound(
          approvals {name}"
     );
     for route in unbound.iter().chain(bound.iter().copied()) {
-        fix.push_str(&format!(" --route-resolution {route}=<channel>"));
+        fix.push_str(&format!(
+            " --route-resolution {route}=<channel> --route-approvers {route}=users:<user-id>"
+        ));
     }
+    // #2902: an operator principal resolves only a route bound to an explicit
+    // user list, so name it here rather than leave the channel-members default.
+    fix.push_str(
+        " (the explicit users list is what lets an operator principal resolve these \
+         approvals from the CLI; drop --route-approvers to leave approval to channel members)",
+    );
     if !bound.is_empty() {
         fix.push_str(
             " (a route write replaces the whole map, so this repeats the routes already bound; \
@@ -8804,11 +9125,127 @@ pub fn skill_schedules_unavailable() -> anyhow::Error {
     crate::exit::unsupported("schedules", SCHEDULES_REASON, SCHEDULES_ALT)
 }
 
+/// Why `skill hook schedule` and `skill hook record` cannot be answered here.
+pub const HOOK_RECORD_REASON: &str =
+    "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
+/// Where a durable hook record lives instead.
+pub const HOOK_RECORD_ALT: &str =
+    "use `curie local hook fire` or `curie cluster hook fire`, which print the run record";
+
+/// `skill hook schedule` and `skill hook record` (ADR-0099, #2932).
+pub fn skill_hook_record_unavailable(verb: &str) -> anyhow::Error {
+    crate::exit::unsupported(verb, HOOK_RECORD_REASON, HOOK_RECORD_ALT)
+}
+
+/// The prompt of one cron hook declared in `.claude-plugin/plugin.json`.
+pub fn hook_prompt(plugin_dir: &Path, name: &str) -> Result<String> {
+    let path = plugin_dir.join(".claude-plugin/plugin.json");
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).context("parsing plugin.json")?;
+    let triggers = value
+        .get("triggers")
+        .and_then(|item| item.as_array())
+        .context("plugin.json has no triggers array")?;
+    for trigger in triggers {
+        if trigger.get("type").and_then(|item| item.as_str()) != Some("cron") {
+            continue;
+        }
+        if trigger.get("name").and_then(|item| item.as_str()) != Some(name) {
+            continue;
+        }
+        let prompt = trigger
+            .get("prompt")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .context("cron hook has no prompt")?;
+        return Ok(prompt.to_string());
+    }
+    bail!("no cron hook named {name}")
+}
+
+/// `skill hook fire`: run the named hook against the local runner. No run row.
+pub async fn skill_hook_fire(plugin_dir: &Path, name: &str, url: Option<String>) -> Result<bool> {
+    let prompt = hook_prompt(plugin_dir, name)?;
+    send(&prompt, "hook", SendType::Job.into(), url, false).await
+}
+
+/// Inputs for `<tier> hook fire`.
+pub struct HookFireOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: String,
+    pub name: String,
+    pub dry_run: bool,
+    pub wait_secs: u64,
+}
+
+/// Output of `<tier> hook fire`.
+pub enum HookFireOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Record(crate::api::HookFireRecord),
+}
+
+impl crate::ui::CliOutput for HookFireOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            HookFireOutput::DryRun(plan) => plan.to_json(),
+            HookFireOutput::Record(record) => serde_json::to_value(record).unwrap_or_default(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            HookFireOutput::DryRun(plan) => plan.render(ui),
+            HookFireOutput::Record(record) => {
+                let outcome = record.outcome.as_deref().unwrap_or("-");
+                ui.payload(&format!(
+                    "{} {} {} {} {}",
+                    record.agent, record.name, record.slot_utc, outcome, record.id
+                ));
+            }
+        }
+    }
+}
+
+fn hook_fire_path(agent: &str, name: &str) -> String {
+    format!("/agents/{agent}/hooks/{name}/fire")
+}
+
+/// `<tier> hook fire`: run the hook now and print the record once it settles.
+pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
+    let path = hook_fire_path(&opts.agent, &opts.name);
+    if opts.dry_run {
+        return Ok(HookFireOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!("POST {}{path}", opts.api_url.trim_end_matches('/'))],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let mut record = client.fire_hook(&opts.agent, &opts.name).await?;
+    let deadline = Instant::now() + Duration::from_secs(opts.wait_secs);
+    while record.outcome.is_none() {
+        if Instant::now() >= deadline {
+            return Err(crate::exit::transient(format!(
+                "hook {} did not settle within {}s; run {}",
+                opts.name, opts.wait_secs, record.id
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        record = client
+            .get_hook_run(&opts.agent, &opts.name, &record.id)
+            .await?;
+    }
+    Ok(HookFireOutput::Record(record))
+}
+
 /// Inputs for `<tier> schedules [--agent NAME_OR_ID]`.
 pub struct SchedulesOpts {
     pub api_url: String,
     pub api_key: String,
     pub agent: Option<String>,
+    pub pause: Option<String>,
+    pub resume: Option<String>,
     pub dry_run: bool,
 }
 
@@ -8816,6 +9253,7 @@ pub struct SchedulesOpts {
 pub enum SchedulesOutput {
     DryRun(crate::ui::DryRunPlan),
     List(crate::api::ScheduleList),
+    Control(crate::api::ScheduleControl),
 }
 
 impl crate::ui::CliOutput for SchedulesOutput {
@@ -8823,12 +9261,19 @@ impl crate::ui::CliOutput for SchedulesOutput {
         match self {
             SchedulesOutput::DryRun(plan) => plan.to_json(),
             SchedulesOutput::List(list) => serde_json::to_value(list).unwrap_or_default(),
+            SchedulesOutput::Control(control) => serde_json::to_value(control).unwrap_or_default(),
         }
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             SchedulesOutput::DryRun(plan) => plan.render(ui),
+            SchedulesOutput::Control(control) => ui.payload(&format!(
+                "{} {} {}",
+                control.agent,
+                control.name,
+                if control.paused { "paused" } else { "resumed" }
+            )),
             SchedulesOutput::List(list) => {
                 if list.schedules.is_empty() {
                     ui.payload("no schedules");
@@ -8843,8 +9288,14 @@ impl crate::ui::CliOutput for SchedulesOutput {
                         let fire = hook.last_fire_at.as_deref().unwrap_or("-");
                         let outcome = hook.last_outcome.as_deref().unwrap_or("-");
                         ui.payload(&format!(
-                            "{} {} {} {} {} {}",
-                            hook.name, hook.trigger, hook.schedule, hook.zone, fire, outcome
+                            "{} {} {} {} {} {} {}",
+                            hook.name,
+                            hook.trigger,
+                            hook.schedule,
+                            hook.zone,
+                            fire,
+                            outcome,
+                            if hook.paused { "paused" } else { "active" }
                         ));
                     }
                 }
@@ -8855,20 +9306,47 @@ impl crate::ui::CliOutput for SchedulesOutput {
 
 /// `<tier> schedules`: list cron hooks and the newest recorded slot (`GET /schedules`).
 pub async fn schedules(opts: SchedulesOpts) -> Result<SchedulesOutput> {
+    let action = match (opts.pause.as_deref(), opts.resume.as_deref()) {
+        (Some(name), None) => Some((name, true)),
+        (None, Some(name)) => Some((name, false)),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err(crate::exit::usage("choose pause or resume")),
+    };
+    if action.is_some() && opts.agent.is_none() {
+        return Err(crate::exit::usage("schedule control requires --agent"));
+    }
     let agent_query = opts
         .agent
         .as_ref()
         .map(|agent| format!("?agent={agent}"))
         .unwrap_or_default();
     if opts.dry_run {
-        return Ok(SchedulesOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
+        let line = if let Some((name, pause)) = action {
+            format!(
+                "POST {}/schedules/{}/{}/{}",
+                opts.api_url.trim_end_matches('/'),
+                opts.agent.as_deref().unwrap_or_default(),
+                name,
+                if pause { "pause" } else { "resume" }
+            )
+        } else {
+            format!(
                 "GET {}/schedules{agent_query}",
                 opts.api_url.trim_end_matches('/')
-            )],
+            )
+        };
+        return Ok(SchedulesOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![line],
         }));
     }
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    if let Some((name, pause)) = action {
+        return Ok(SchedulesOutput::Control(
+            client
+                .control_schedule(opts.agent.as_deref().unwrap_or_default(), name, pause)
+                .await?,
+        ));
+    }
     Ok(SchedulesOutput::List(
         client.list_schedules(opts.agent.as_deref()).await?,
     ))
@@ -9158,11 +9636,12 @@ mod tests {
         absent_container_note, check_deploy_routes_bound, declared_approval_routes,
         github_repo_allowlist_is_empty, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
-        plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
-        report_sweep, resolve_cases_path, resolve_env_file_credentials, route_write_refusal,
-        routing_warning, seed_env_if_missing, select_in_force_deployment, select_passthrough_env,
-        sweep_json_row, sweep_table_row, unbound_approval_routes, validate_channel_binding,
-        validate_notification_target, ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan,
+        plan_recorded_teardown, plan_skill_down, promote_candidate_window, recorded_ids_match,
+        replace_first_line, report_sweep, resolve_cases_path, resolve_env_file_credentials,
+        route_write_refusal, routing_warning, seed_env_if_missing, select_in_force_deployment,
+        select_passthrough_env, sweep_json_row, sweep_table_row, unbound_approval_routes,
+        validate_channel_binding, validate_notification_target, ApprovalGateDecl, DeclaringVersion,
+        DeployTier, DownPlan,
         EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
@@ -9821,6 +10300,77 @@ mod tests {
         assert!(replace_first_line(chart, "nonexistent:", "x").is_none());
     }
 
+    const RELEASE_CATALOG: &str = r#"{
+        "revisions": ["0045", "0058", "0059"],
+        "candidate": {"schema_min": "0045", "schema_head": "0059"},
+        "windows": {
+            "0.10.0": {"schema_min": "0045", "schema_head": "0058"},
+            "0.10.1": {"schema_min": "0045", "schema_head": "0058"}
+        }
+    }"#;
+
+    #[test]
+    fn bump_version_promotes_candidate_and_preserves_prior_release_windows() {
+        let promoted = promote_candidate_window(RELEASE_CATALOG, "0.10.2", false)
+            .expect("new release can claim the candidate window");
+        let catalog: serde_json::Value = serde_json::from_str(&promoted).unwrap();
+        assert_eq!(catalog["windows"]["0.10.2"], catalog["candidate"]);
+        assert_eq!(catalog["windows"]["0.10.2"]["schema_head"], "0059");
+        for version in ["0.10.0", "0.10.1"] {
+            assert_eq!(catalog["windows"][version]["schema_min"], "0045");
+            assert_eq!(catalog["windows"][version]["schema_head"], "0058");
+        }
+    }
+
+    #[test]
+    fn bump_version_repeating_the_same_promotion_is_idempotent() {
+        let once = promote_candidate_window(RELEASE_CATALOG, "0.10.2", false).unwrap();
+        let twice = promote_candidate_window(&once, "0.10.2", true).unwrap();
+        let once: serde_json::Value = serde_json::from_str(&once).unwrap();
+        let twice: serde_json::Value = serde_json::from_str(&twice).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn bump_version_refuses_to_rewrite_a_registered_window() {
+        let error = promote_candidate_window(RELEASE_CATALOG, "0.10.1", true)
+            .expect_err("registered 0.10.1 must keep its published schema head");
+        assert!(format!("{error:#}").contains("0.10.1"));
+        assert!(format!("{error:#}").contains("next version"));
+    }
+
+    #[test]
+    fn bump_version_refuses_to_create_a_missing_registered_window() {
+        let error = promote_candidate_window(RELEASE_CATALOG, "0.10.2", true)
+            .expect_err("registered 0.10.2 must already have a catalog window");
+        assert!(format!("{error:#}").contains("0.10.2"));
+        assert!(format!("{error:#}").contains("no catalog window"));
+    }
+
+    #[test]
+    fn bump_version_can_repromote_an_unregistered_window() {
+        let promoted = promote_candidate_window(RELEASE_CATALOG, "0.10.1", false)
+            .expect("unregistered version can be prepared again");
+        let catalog: serde_json::Value = serde_json::from_str(&promoted).unwrap();
+        assert_eq!(catalog["windows"]["0.10.1"], catalog["candidate"]);
+        assert_eq!(catalog["windows"]["0.10.1"]["schema_head"], "0059");
+        assert_eq!(catalog["windows"]["0.10.0"]["schema_head"], "0058");
+    }
+
+    #[tokio::test]
+    async fn bump_version_refuses_leading_zero_components() {
+        for version in ["00.10.2", "0.010.2", "0.10.02", "0.10.2-rc.01"] {
+            let error = super::bump_version(version, true)
+                .await
+                .expect_err("noncanonical version must be refused before reading the checkout");
+            assert_eq!(
+                crate::exit::classify(&error).0,
+                crate::exit::ExitClass::Usage,
+                "{version}: {error:#}"
+            );
+        }
+    }
+
     /// Scaffold a bundle at `dir` under `name`, then overwrite its manifest's
     /// `secrets` policy with `secrets`. Shared setup for tests exercising the
     /// declared-secrets gate in `deploy()`.
@@ -10434,20 +10984,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deploy_local_tier_still_refuses_a_connectors_yaml_auto_bound_secret() {
-        // #2503 round-2 review finding: automatic hosted-connector secret
-        // delivery is Cluster-only (no sandbox delivery path on Local yet), so
-        // a bundle that declares GH in plugin.json AND connectors.yaml, with no
-        // `--secret` flag, must still be refused on `local deploy` -- the same
-        // bundle passes the gate on `cluster deploy` (see the paired test
-        // below). This drives the real gate through `deploy()`, not the pure
-        // helper functions.
+    async fn deploy_local_tier_auto_binds_and_resolves_a_connectors_yaml_bearer_secret() {
+        // #2518: local now auto-binds the connectors.yaml Bearer name, like
+        // cluster (#2503). The #464 gate must pass with no `--secret`, and the
+        // name must then be resolved for delivery on the agent record, so an
+        // unset value is refused by name before any network attempt.
         let dir = tempfile::tempdir().unwrap();
-        scaffold_with_secrets(dir.path(), "test-agent", &["GH"]);
+        scaffold_with_secrets(dir.path(), "test-agent", &["GH_2518_UNSET_BEARER"]);
         write_manifest(
             dir.path(),
             "connectors.yaml",
-            "connectors:\n  gh:\n    image: ghcr.io/example/gh:1\n    secrets:\n      - GH\n",
+            "connectors:\n  gh:\n    image: ghcr.io/example/gh:1\n    secrets:\n      - GH_2518_UNSET_BEARER\n",
         );
 
         let opts = super::DeployOpts {
@@ -10471,12 +11018,54 @@ mod tests {
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("GH"),
-            "local deploy has no auto-delivery path, so the gate must still name GH: {rendered}"
+            !rendered.contains("declares connector secret(s) that were not bound on deploy"),
+            "local's effective bind set now includes the connectors.yaml name: {rendered}"
+        );
+        assert!(
+            rendered.contains("connector secret GH_2518_UNSET_BEARER"),
+            "the auto-bound name must be resolved for record delivery: {rendered}"
         );
         assert!(
             !rendered.contains("UNREACHABLE-HINT-SENTINEL"),
-            "the gate must fire before any network attempt: {rendered}"
+            "resolution must fail before any network attempt: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_local_tier_refuses_a_reserved_auto_bound_bearer_before_reading_it() {
+        // #2518 review: an `unhosted_url` connector is skipped by
+        // `refuse_reserved_secret_names`, yet its Bearer name is auto-bound, so
+        // local would otherwise read the operator's model credential onto the
+        // agent record.
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_with_secrets(dir.path(), "test-agent", &[]);
+        write_manifest(
+            dir.path(),
+            "connectors.yaml",
+            "connectors:\n  gh:\n    image: ghcr.io/example/gh:1\n    secrets:\n      - ANTHROPIC_API_KEY\n    unhosted_url: http://127.0.0.1:1/mcp\n",
+        );
+        let opts = super::DeployOpts {
+            delivery: None,
+            agent: None,
+            target: None,
+            identity: None,
+            plugin_dir: dir.path().to_path_buf(),
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            slack_channel: None,
+            repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
+            env: Some(super::DeployEnv::Dev),
+            label: Some("v0".to_string()),
+            secret: vec![],
+            secret_binding_supported: true,
+            connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Local,
+        };
+        let rendered = format!("{:#}", super::deploy(opts).await.unwrap_err());
+        assert!(
+            rendered.contains("`ANTHROPIC_API_KEY` is a reserved"),
+            "a reserved Bearer name must be refused before resolution: {rendered}"
         );
     }
 
@@ -10855,8 +11444,15 @@ mod tests {
         );
         assert!(message.contains("was created by this deploy"), "{message}");
         assert!(
-            fix.contains("curie local approvals deal-desk --route-resolution ops=<channel>"),
+            fix.contains(
+                "curie local approvals deal-desk --route-resolution ops=<channel> \
+                 --route-approvers ops=users:<user-id>"
+            ),
             "{fix}"
+        );
+        assert!(
+            fix.contains("operator principal"),
+            "the fix says why an explicit user list matters (#2902): {fix}"
         );
         assert!(!fix.contains("curie cluster approvals"), "{fix}");
         assert!(
@@ -10900,6 +11496,10 @@ mod tests {
         assert!(fix.contains("--route-resolution ops=<channel>"), "{fix}");
         assert!(
             fix.contains("--route-resolution finance=<channel>"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("--route-approvers finance=users:<user-id>"),
             "{fix}"
         );
         assert!(fix.contains("--routes-from"), "{fix}");

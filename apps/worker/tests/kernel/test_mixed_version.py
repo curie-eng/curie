@@ -33,6 +33,7 @@ from aci_protocol import (
 )
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
+from curie_worker.delivery_lease import DeliveryLeaseStore
 
 DONE = SessionStatus.DONE
 
@@ -119,7 +120,12 @@ def test_an_old_runner_leaves_the_entry_pending_and_completes_nothing(
                 TextDelta(text="streaming from an old runner", version="0.2.9"),
                 Final(text="an answer", status=DONE, version="0.2.9"),
             ]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             qe = _qevent(thread="tMix", event_id="mix-1")

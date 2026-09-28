@@ -2104,7 +2104,7 @@
         "type": "object"
       },
       "ApprovalRequest": {
-        "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
+        "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``granted_arguments`` is the canonical JSON object of the denied permission\ngated call (#3255), carried independently of the human summary. It is\noptional for older producers, while an empty object remains a real value.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
         "properties": {
           "agent_id": {
             "anyOf": [
@@ -2165,6 +2165,18 @@
                 "type": "null"
               }
             ]
+          },
+          "granted_arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Arguments"
           },
           "granted_tool": {
             "anyOf": [
@@ -3000,6 +3012,35 @@
             "minItems": 1,
             "title": "Phases",
             "type": "array"
+          },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
+          "stages": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/StageDeclaration"
+                },
+                "maxItems": 12,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stages"
           }
         },
         "required": [
@@ -3842,6 +3883,87 @@
         "title": "HookAccepted",
         "type": "object"
       },
+      "HookFireOut": {
+        "description": "One test-fire run record. `outcome` is null while the turn is in flight.",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "slot_utc": {
+            "format": "date-time",
+            "title": "Slot Utc",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "trigger": {
+            "title": "Trigger",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "agent",
+          "name",
+          "trigger",
+          "slot_utc",
+          "outcome",
+          "started_at",
+          "ended_at"
+        ],
+        "title": "HookFireOut",
+        "type": "object"
+      },
       "HookPartitionConfig": {
         "additionalProperties": false,
         "description": "How one hook names the thing each delivery is about (ADR-0134).\n\nOne model serves ``AgentCreate``, ``AgentUpdate`` AND ``AgentOut``, which the\n``_StoredWithoutNulls`` tripwire above would otherwise argue against: that\nsplit only happens for models carrying the wrap serializer, and this one has\nneither it nor an optional field, so the dumped and validated shapes are the\nsame and no ``-Input``/``-Output`` pair is generated. Do not add a separate\n``...Out`` variant.",
@@ -3879,6 +4001,19 @@
           "slot_utc"
         ],
         "title": "HookRunRef",
+        "type": "object"
+      },
+      "HookSecretOut": {
+        "properties": {
+          "secret": {
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret"
+        ],
+        "title": "HookSecretOut",
         "type": "object"
       },
       "KillState": {
@@ -4204,6 +4339,65 @@
           "error_rate"
         ],
         "title": "MetricsSummary",
+        "type": "object"
+      },
+      "ModelUsageEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_write_tokens": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Cache Write Tokens",
+            "type": "integer"
+          },
+          "cached_input_tokens": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Cached Input Tokens",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "model": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "output_tokens": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "enum": [
+                  "implementer",
+                  "reviewer"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          }
+        },
+        "required": [
+          "model",
+          "input_tokens",
+          "cached_input_tokens",
+          "cache_write_tokens",
+          "output_tokens"
+        ],
+        "title": "ModelUsageEntry",
         "type": "object"
       },
       "NamedTarget": {
@@ -4669,7 +4863,6 @@
               "type": "string"
             },
             "maxItems": 4096,
-            "minItems": 1,
             "title": "Changed Paths",
             "type": "array"
           },
@@ -4700,8 +4893,55 @@
             ],
             "title": "Expires In Seconds"
           },
+          "observed_body_sha256": {
+            "anyOf": [
+              {
+                "pattern": "[0-9a-f]{64}",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Body Sha256"
+          },
+          "observed_lineage_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Lineage Id"
+          },
+          "observed_lineage_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Lineage Version"
+          },
+          "observed_title": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Title"
+          },
           "patch_b64": {
-            "minLength": 1,
             "title": "Patch B64",
             "type": "string"
           },
@@ -4881,6 +5121,18 @@
             "title": "Lease Owner",
             "type": "string"
           },
+          "metadata_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata Updated At"
+          },
           "pr_number": {
             "exclusiveMinimum": 0.0,
             "title": "Pr Number",
@@ -4910,7 +5162,8 @@
           "lease_owner",
           "pr_number",
           "pr_url",
-          "head_sha"
+          "head_sha",
+          "metadata_updated_at"
         ],
         "title": "PublicationLineageAdvance",
         "type": "object"
@@ -6053,6 +6306,30 @@
         "title": "RunningWorkItemRequest",
         "type": "object"
       },
+      "ScheduleControlOut": {
+        "description": "Current operator pause state for a named cron hook.",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "agent",
+          "name",
+          "paused"
+        ],
+        "title": "ScheduleControlOut",
+        "type": "object"
+      },
       "ScheduleHookOut": {
         "description": "One cron hook on the in-force bundle, with its newest slot.",
         "properties": {
@@ -6091,6 +6368,10 @@
             "title": "Name",
             "type": "string"
           },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          },
           "schedule": {
             "title": "Schedule",
             "type": "string"
@@ -6110,7 +6391,8 @@
           "schedule",
           "zone",
           "last_fire_at",
-          "last_outcome"
+          "last_outcome",
+          "paused"
         ],
         "title": "ScheduleHookOut",
         "type": "object"
@@ -6259,6 +6541,38 @@
           "trace_url"
         ],
         "title": "SourceTraceOut",
+        "type": "object"
+      },
+      "StageDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "phases": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "minItems": 1,
+            "title": "Phases",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "phases"
+        ],
+        "title": "StageDeclaration",
         "type": "object"
       },
       "StartBody": {
@@ -6554,6 +6868,43 @@
         ],
         "title": "TurnSource",
         "type": "string"
+      },
+      "UsageReport": {
+        "additionalProperties": false,
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelUsageEntry"
+            },
+            "maxItems": 20,
+            "title": "Models",
+            "type": "array"
+          },
+          "primary_model": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Primary Model"
+          },
+          "turn_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "models"
+        ],
+        "title": "UsageReport",
+        "type": "object"
       },
       "ValidationError": {
         "properties": {
@@ -7221,6 +7572,236 @@
           "last_deferral_reason"
         ],
         "title": "WorkItemRequestOut",
+        "type": "object"
+      },
+      "WorkItemUsageModel": {
+        "properties": {
+          "cache_write_tokens": {
+            "default": 0,
+            "title": "Cache Write Tokens",
+            "type": "integer"
+          },
+          "cached_input_tokens": {
+            "default": 0,
+            "title": "Cached Input Tokens",
+            "type": "integer"
+          },
+          "estimated_cost_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost Usd"
+          },
+          "input_tokens": {
+            "default": 0,
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "output_tokens": {
+            "default": 0,
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "role": {
+            "enum": [
+              "implementer",
+              "reviewer"
+            ],
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "role"
+        ],
+        "title": "WorkItemUsageModel",
+        "type": "object"
+      },
+      "WorkItemUsageOut": {
+        "description": "Token usage and estimated cost summed over every request of a WorkItem (#3223).\n\n``cost_complete`` is false when any reported model had no price, and then\n``estimated_cost_usd`` covers only the priced models. It is also false when\n``requests_without_usage`` (started requests with no usage report) is > 0.",
+        "properties": {
+          "cost_complete": {
+            "title": "Cost Complete",
+            "type": "boolean"
+          },
+          "estimated_cost_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost Usd"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemUsageModel"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "pr_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Number"
+          },
+          "pr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Url"
+          },
+          "price_sources": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemUsagePriceSource"
+            },
+            "title": "Price Sources",
+            "type": "array"
+          },
+          "requests": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemUsageRequest"
+            },
+            "title": "Requests",
+            "type": "array"
+          },
+          "requests_without_usage": {
+            "default": 0,
+            "title": "Requests Without Usage",
+            "type": "integer"
+          },
+          "roles": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/WorkItemUsageRole"
+            },
+            "title": "Roles",
+            "type": "object"
+          },
+          "total_tokens": {
+            "title": "Total Tokens",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "total_tokens",
+          "estimated_cost_usd",
+          "cost_complete",
+          "roles",
+          "models",
+          "requests",
+          "price_sources"
+        ],
+        "title": "WorkItemUsageOut",
+        "type": "object"
+      },
+      "WorkItemUsagePriceSource": {
+        "properties": {
+          "as_of": {
+            "format": "date-time",
+            "title": "As Of",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "as_of"
+        ],
+        "title": "WorkItemUsagePriceSource",
+        "type": "object"
+      },
+      "WorkItemUsageRequest": {
+        "properties": {
+          "estimated_cost_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost Usd"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "tokens": {
+            "default": 0,
+            "title": "Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "WorkItemUsageRequest",
+        "type": "object"
+      },
+      "WorkItemUsageRole": {
+        "description": "Tokens and estimate of one role (#3223). The estimate covers priced rows only.",
+        "properties": {
+          "cost_complete": {
+            "default": true,
+            "title": "Cost Complete",
+            "type": "boolean"
+          },
+          "estimated_cost_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost Usd"
+          },
+          "tokens": {
+            "default": 0,
+            "title": "Tokens",
+            "type": "integer"
+          }
+        },
+        "title": "WorkItemUsageRole",
         "type": "object"
       },
       "WorkspaceCredentialRequest": {
@@ -8625,6 +9206,205 @@
         "tags": [
           "control"
         ]
+      }
+    },
+    "/agents/{agent_id}/hook-secret": {
+      "get": {
+        "operationId": "get_hook_secret_agents__agent_id__hook_secret_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSecretOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Hook Secret",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{name}/fire": {
+      "post": {
+        "description": "Run one named cron hook now and return its run record.",
+        "operationId": "fire_hook_agents__agent_id__hooks__name__fire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookFireOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fire Hook"
+      }
+    },
+    "/agents/{agent_id}/hooks/{name}/runs/{run_id}": {
+      "get": {
+        "description": "Read one test-fire record, including a turn that has not settled.",
+        "operationId": "get_hook_run_agents__agent_id__hooks__name__runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookFireOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Hook Run"
       }
     },
     "/agents/{agent_id}/kill": {
@@ -13674,6 +14454,142 @@
         ]
       }
     },
+    "/schedules/{agent}/{name}/pause": {
+      "post": {
+        "description": "Pause a named cron hook without changing its in force bundle.",
+        "operationId": "pause_schedule_schedules__agent___name__pause_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "title": "Agent",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleControlOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pause Schedule",
+        "tags": [
+          "schedules"
+        ]
+      }
+    },
+    "/schedules/{agent}/{name}/resume": {
+      "post": {
+        "description": "Resume a named cron hook with one bounded catch up opportunity.",
+        "operationId": "resume_schedule_schedules__agent___name__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "title": "Agent",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleControlOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Schedule",
+        "tags": [
+          "schedules"
+        ]
+      }
+    },
     "/v1/factory/cards/{token}.svg": {
       "get": {
         "operationId": "factory_status_card_v1_factory_cards__token__svg_get",
@@ -15538,6 +16454,76 @@
         ]
       }
     },
+    "/v1/work-item-progress/{request_id}/usage": {
+      "post": {
+        "description": "Record one turn's per-model token usage on the token's request (#3223).\n\nA replayed turn is a no-op that still answers 201, so the runner's retry\nis safe.",
+        "operationId": "report_work_item_usage_v1_work_item_progress__request_id__usage_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UsageReport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Report Work Item Usage V1 Work Item Progress  Request Id  Usage Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Work Item Usage",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
     "/work-items": {
       "get": {
         "operationId": "list_work_items_work_items_get",
@@ -15687,6 +16673,83 @@
           }
         },
         "summary": "Get Work Item",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/usage": {
+      "get": {
+        "description": "Token usage and estimated cost over every round of the work item (#3223).",
+        "operationId": "get_work_item_usage_work_items__work_item_id__usage_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkItemUsageOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Work Item Usage",
         "tags": [
           "work-items"
         ]

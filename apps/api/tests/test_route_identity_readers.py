@@ -72,6 +72,10 @@ from apps.api.tests.test_publications import review_lineage_app as review_lineag
 # --------------------------------------------------------------------------
 
 
+async def _no_metadata_check() -> None:
+    """The observed-metadata check (#3057 era) is not under test here."""
+
+
 def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
     channels_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -223,7 +227,7 @@ def test_create_publication_keeps_the_binding_when_reply_adapter_names_none(
             sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 publication, created = await crud.create_publication(
-                    session, data, patch=data.decoded_patch()
+                    session, data, patch=data.decoded_patch(), metadata_check=_no_metadata_check
                 )
                 assert created is True
                 await session.commit()
@@ -238,10 +242,7 @@ def test_create_publication_keeps_the_binding_when_reply_adapter_names_none(
         try:
             async with engine.connect() as conn:
                 result = await conn.execute(
-                    text(
-                        "SELECT binding_id FROM curie.thread_publication_lineages "
-                        "WHERE id = :id"
-                    ),
+                    text("SELECT binding_id FROM curie.thread_publication_lineages WHERE id = :id"),
                     {"id": lineage_id},
                 )
                 return result.scalar_one()
@@ -287,7 +288,7 @@ def test_review_revision_accepts_an_omitted_reply_adapter(
             sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 publication, created = await crud.create_publication(
-                    session, data, patch=data.decoded_patch()
+                    session, data, patch=data.decoded_patch(), metadata_check=_no_metadata_check
                 )
                 await session.commit()
                 return publication.id

@@ -550,15 +550,22 @@ Contract notes the kernel must know:
 
 Quota pressure reclamation runs only after a real ResourceQuota refusal and
 only when the remaining delivery budget is at least 70 seconds plus
-`claim_timeout_seconds`. A lower budget returns the capacity response without
-scanning. Reclamation adds no periodic timer, scheduler, or warm pool.
+`claim_timeout_seconds`. A lower budget skips the scan. An interactive Slack
+turn waits durably for capacity under its original event identity, with a
+fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
+The worker acknowledges a parked stream delivery, then wakes the turn through
+the same stream when its retry is due. Waiting does not use a runner attempt or
+hold a conversation lock. Its placeholder says queued while waiting and
+receives an expiry message if the deadline passes. Other turn sources retain
+their capacity response. Operators can inspect the persisted wait state and
+`curie.capacity.wait` metrics for waiting, active, and expired turns.
 
 The rejection retains every exceeded resource and its requested, used, and
 hard quantity. Before scanning, the worker validates the complete map with
 Kubernetes quantity semantics, including CPU DecimalSI, memory BinarySI, pod
-counts, and combined rejections. Invalid or incomplete evidence returns the
-capacity response with `outcome=refused-invalid-quota` and performs no pressure
-Redis call or deletion.
+counts, and combined rejections. Invalid or incomplete evidence skips
+pressure reclamation with `outcome=refused-invalid-quota` and performs no
+pressure Redis call or deletion.
 
 After one exact idle route is detached and deleted, the worker polls the exact
 named ResourceQuota in its configured namespace within the existing 20 second

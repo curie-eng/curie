@@ -32,15 +32,16 @@ redefine them.
 
 ## Current contract
 
-A second implementation is an **ACI server**, an HTTP process serving seven authenticated
-control routes. The six POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
+A second implementation is an **ACI server**, an HTTP process serving eight authenticated
+control routes. The seven POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the
 next turn starts fresh (409 while a turn is active), `POST /v1/snapshot` captures a
-bounded managed-workspace snapshot for publication, and `POST /v1/timeout` stops the
-exact open turn named by the event response epoch. Two GETs sit alongside them and stay
+bounded managed-workspace snapshot for publication, `POST /v1/timeout` stops the
+exact open turn named by the event response epoch, and `POST /v1/turn-admit` grants or denies
+the exact waiting turn epoch. Two GETs sit alongside them and stay
 unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
-sends no auth header. The seventh authenticated control route, `GET /v1/status`, returns
+sends no auth header. The eighth authenticated control route, `GET /v1/status`, returns
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
 `cwd`) plus `history_durable` for the worker's replacement-authority check. The timeout
 and `/v1/status` are runner-private, bearer-authenticated control routes. A server that

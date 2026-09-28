@@ -6,8 +6,9 @@ import json
 import socket
 import threading
 import urllib.parse
+import warnings
 from collections.abc import Callable
-from http.client import HTTPResponse
+from http.client import HTTPResponse, RemoteDisconnected
 
 import pytest
 from _support import (
@@ -164,17 +165,53 @@ def test_chunked_authenticated_body_is_rejected(
         + f"X-Curie-Adapter-Secret: {EGRESS_SECRET}\r\n".encode()
         + b"Transfer-Encoding: chunked\r\n\r\n"
     )
-    try:
-        with socket.create_connection(
-            (parsed.hostname or "127.0.0.1", parsed.port), timeout=10
-        ) as connection:
-            connection.sendall(request)
-            response = HTTPResponse(connection)
-            response.begin()
-            status = response.status
-            response.read()
-    except OSError as error:
-        pytest.fail(f"chunked request transport failed before a response: {error}")
+    # A clean disconnect is not a refusal, so it is never accepted as a pass.
+    # It is retried because a loaded runner can miss the adapter's two-second
+    # incomplete-header deadline before the handler parses the request. A
+    # handler crash before the response can surface the same way, so the retry
+    # bounds that exposure rather than eliminating it: three clean disconnects
+    # in a row still fail.
+    disconnect_attempts: list[int] = []
+    for attempt in range(1, 4):
+        status = 0
+        remote_disconnected = False
+        try:
+            with socket.create_connection(
+                (parsed.hostname or "127.0.0.1", parsed.port), timeout=10
+            ) as connection:
+                connection.sendall(request)
+                response = HTTPResponse(connection)
+                response.begin()
+                status = response.status
+                response.read()
+        # RemoteDisconnected subclasses OSError, so this clause must come first.
+        except RemoteDisconnected:
+            remote_disconnected = True
+        except OSError as error:
+            pytest.fail(
+                "chunked request transport failed before a response on attempt "
+                f"{attempt}: {type(error).__name__}: {error}"
+            )
+        if remote_disconnected:
+            disconnect_attempts.append(attempt)
+            continue
+        assert status == 400, (
+            f"chunked request was not refused with 400 on attempt {attempt}: "
+            f"status={status}"
+        )
+        if disconnect_attempts:
+            # stacklevel=1 attributes the warning to this warn call inside the
+            # test; stacklevel=2 would point one frame up, into pytest's runner.
+            warnings.warn(
+                "chunked request received 400 only after RemoteDisconnected on "
+                f"attempt(s) {', '.join(str(number) for number in disconnect_attempts)}",
+                stacklevel=1,
+            )
+        break
+    else:
+        pytest.fail(
+            "chunked request never received the 400 refusal after 3 attempts; "
+            "transport_error=RemoteDisconnected"
+        )
 
-    assert status == 400
     assert mail.replies == []

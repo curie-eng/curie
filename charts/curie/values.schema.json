@@ -207,6 +207,22 @@
           }
         }
       }
+    },
+    "e2eConnectorIdentity": {
+      "type": "object",
+      "description": "End to end connector identity on a test cluster (ADR 0176 decision 4, issue #3243).",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "serviceAccountName": {"type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"},
+        "namespacePrefix": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?-$"},
+        "ownerLabel": {
+          "type": "object",
+          "properties": {
+            "key": {"type": "string", "minLength": 1},
+            "value": {"type": "string", "pattern": "^([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$"}
+          }
+        }
+      }
     }
   }
 }

@@ -554,15 +554,17 @@ pub fn provider_egress_note(providers: &[String]) -> Option<String> {
 pub fn sealed_credential_warning(
     credentials_present: bool,
     any_egress_opened: bool,
+    invocation: UpInvocation,
 ) -> Option<String> {
     if credentials_present && !any_egress_opened {
-        Some(
-            "a real model credential is set but the sandbox is sealed -- no egress opened, so the \
-             model is unreachable. Pass --allow-egress-host \
-             <anthropic|openrouter|zhipu|moonshot|deepseek> \
-             (or --allow-web-egress <CIDR>) and re-run."
+        Some(match invocation {
+            UpInvocation::ClusterUp => "a real model credential is set but the sandbox is sealed -- no egress opened, so the \
+                 model is unreachable. Pass --allow-egress-host \
+                 <anthropic|openrouter|zhipu|moonshot|deepseek> \
+                 (or --allow-web-egress <CIDR>) and re-run."
                 .to_string(),
-        )
+            UpInvocation::Apply => "a real model credential is set but the sandbox is sealed; the model is unreachable. Add matching `platform.egress[].host` entries in `curie.yaml` and rerun `curie apply`.".to_string(),
+        })
     } else {
         None
     }
@@ -571,10 +573,15 @@ pub fn sealed_credential_warning(
 /// Shared tail of the no-credential guidance: both the live fake-model note
 /// and the dry-run fresh-install note end with exactly this text, so the two
 /// paths cannot drift apart (#1898).
-const NO_CREDENTIAL_GUIDANCE: &str = "Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, \
-     Moonshot, or DeepSeek credential and configure matching egress before re-running \
-     `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and \
-     DeepSeek also need their matching worker runtime base URL.";
+fn no_credential_guidance(invocation: UpInvocation) -> &'static str {
+    match invocation {
+        UpInvocation::ClusterUp => "Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, \
+             Moonshot, or DeepSeek credential and configure matching egress before re-running \
+             `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and \
+             DeepSeek also need their matching worker runtime base URL.",
+        UpInvocation::Apply => "Set `credentials.model` in `curie.yaml` to the name of an Anthropic, OpenRouter, Zhipu, Moonshot, or DeepSeek credential, add matching `platform.egress[].host` entries, and rerun `curie apply` to enable the real model. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL.",
+    }
+}
 
 /// The ordered model+egress status lines `up` prints, as (is_warning, message)
 /// pairs, derived purely so every credential/egress combination is unit-tested.
@@ -591,6 +598,7 @@ pub fn model_egress_status_lines(
     providers: &[String],
     any_egress_opened: bool,
     dry_run: bool,
+    invocation: UpInvocation,
 ) -> Vec<(bool, String)> {
     let mut lines: Vec<(bool, String)> = Vec::new();
     // Past-tense provider note only on a live run; under dry-run the handler
@@ -600,13 +608,14 @@ pub fn model_egress_status_lines(
             false,
             provider_egress_note(providers).expect("providers non-empty"),
         ));
-        lines.push((
-            false,
-            "resolved provider IPs can rotate; re-run `curie cluster up` if model calls start failing".into(),
-        ));
+        let retry = match invocation {
+            UpInvocation::ClusterUp => "resolved provider IPs can rotate; re-run `curie cluster up` if model calls start failing".to_string(),
+            UpInvocation::Apply => "resolved provider IPs can rotate; rerun `curie apply` if model calls start failing".to_string(),
+        };
+        lines.push((false, retry));
     }
     if credentials_present {
-        if let Some(w) = sealed_credential_warning(true, any_egress_opened) {
+        if let Some(w) = sealed_credential_warning(true, any_egress_opened, invocation) {
             lines.push((true, w));
         }
     } else if local_model {
@@ -615,10 +624,14 @@ pub fn model_egress_status_lines(
             "local model enabled; installing the chart inference deployment".into(),
         ));
     } else if !fake_model && !dry_run {
+        let missing = match invocation {
+            UpInvocation::ClusterUp => "no CURIE_CREDENTIALS set",
+            UpInvocation::Apply => "no model credential declared in `curie.yaml`",
+        };
         lines.push((
             true,
             format!(
-                "no CURIE_CREDENTIALS set; installing with the fake model{}",
+                "{missing}; installing with the fake model{}",
                 if any_egress_opened {
                     ""
                 } else {
@@ -628,7 +641,10 @@ pub fn model_egress_status_lines(
         ));
         lines.push((
             false,
-            format!("Replies will be canned. {NO_CREDENTIAL_GUIDANCE}"),
+            format!(
+                "Replies will be canned. {}",
+                no_credential_guidance(invocation)
+            ),
         ));
     } else if !fake_model {
         // `--dry-run` stays offline (#1898): it cannot read the release's
@@ -638,10 +654,14 @@ pub fn model_egress_status_lines(
         // fake-model outcome here contradicted the live run and `cluster up
         // --help`, which is corrosive for the one preflight signal an operator
         // has before an upgrade -- so state what is unknown offline instead.
+        let missing = match invocation {
+            UpInvocation::ClusterUp => "no CURIE_CREDENTIALS set",
+            UpInvocation::Apply => "no model credential declared in `curie.yaml`",
+        };
         lines.push((
             true,
             format!(
-                "no CURIE_CREDENTIALS set; a live run preserves the release's recorded model \
+                "{missing}; a live run preserves the release's recorded model \
                  configuration when there is one -- not read under --dry-run{}",
                 if any_egress_opened {
                     ""
@@ -654,7 +674,8 @@ pub fn model_egress_status_lines(
             false,
             format!(
                 "With nothing recorded -- a fresh install -- the release comes up on the fake \
-                 model and replies will be canned. {NO_CREDENTIAL_GUIDANCE}"
+                 model and replies will be canned. {}",
+                no_credential_guidance(invocation)
             ),
         ));
     }
@@ -1132,8 +1153,8 @@ mod tests {
     fn sealed_credential_warning_only_when_cred_present_and_no_egress() {
         // The one combination that warns: a credential is present but nothing
         // opened egress, so the model is unreachable behind the sealed sandbox.
-        let warn =
-            sealed_credential_warning(true, false).expect("cred present + no egress must warn");
+        let warn = sealed_credential_warning(true, false, UpInvocation::ClusterUp)
+            .expect("cred present + no egress must warn");
         assert!(warn.contains("sealed"), "{warn}");
         assert!(warn.contains("unreachable"), "{warn}");
         assert!(warn.contains("--allow-egress-host"), "{warn}");
@@ -1146,9 +1167,9 @@ mod tests {
         }
 
         // Every other combination stays silent.
-        assert!(sealed_credential_warning(true, true).is_none());
-        assert!(sealed_credential_warning(false, false).is_none());
-        assert!(sealed_credential_warning(false, true).is_none());
+        assert!(sealed_credential_warning(true, true, UpInvocation::ClusterUp).is_none());
+        assert!(sealed_credential_warning(false, false, UpInvocation::ClusterUp).is_none());
+        assert!(sealed_credential_warning(false, true, UpInvocation::ClusterUp).is_none());
     }
 
     #[test]
@@ -1156,8 +1177,15 @@ mod tests {
         // The exact contradiction bug: no credential but egress opened via a
         // provider. The provider note must report the open, and the fake-model
         // warning must NOT claim the egress is sealed.
-        let lines =
-            model_egress_status_lines(false, false, false, &["anthropic".to_string()], true, false);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            false,
+            &["anthropic".to_string()],
+            true,
+            false,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         assert!(msgs.iter().any(|m| m.contains("egress opened")), "{msgs:?}");
         for m in &msgs {
@@ -1169,7 +1197,15 @@ mod tests {
     fn model_egress_status_lines_cred_no_egress_warns_sealed() {
         // A credential present with nothing opened surfaces the sealed warning
         // naming both flags.
-        let lines = model_egress_status_lines(true, false, false, &[], false, false);
+        let lines = model_egress_status_lines(
+            true,
+            false,
+            false,
+            &[],
+            false,
+            false,
+            UpInvocation::ClusterUp,
+        );
         let warn = lines
             .iter()
             .find(|(w, _)| *w)
@@ -1184,8 +1220,15 @@ mod tests {
     fn model_egress_status_lines_cred_open_egress_no_sealed() {
         // A credential with a provider egress opened: provider note + rotation
         // present, and no message claims the sandbox is sealed.
-        let lines =
-            model_egress_status_lines(true, false, false, &["openrouter".to_string()], true, false);
+        let lines = model_egress_status_lines(
+            true,
+            false,
+            false,
+            &["openrouter".to_string()],
+            true,
+            false,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         assert!(msgs.iter().any(|m| m.contains("egress opened")), "{msgs:?}");
         assert!(msgs.iter().any(|m| m.contains("can rotate")), "{msgs:?}");
@@ -1199,7 +1242,15 @@ mod tests {
         // No credential, no egress, real (not --fake-model) install: the
         // fake-model warning keeps the "(model egress stays sealed)" clause and
         // a canned-replies note follows.
-        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            false,
+            &[],
+            false,
+            false,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         assert!(
             msgs.iter()
@@ -1214,7 +1265,15 @@ mod tests {
 
     #[test]
     fn model_egress_status_lines_canned_guidance_requires_native_base_urls() {
-        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            false,
+            &[],
+            false,
+            false,
+            UpInvocation::ClusterUp,
+        );
         let canned = lines
             .iter()
             .map(|(_, message)| message.as_str())
@@ -1232,8 +1291,15 @@ mod tests {
     fn model_egress_status_lines_dry_run_skips_past_tense_note() {
         // Under dry-run the handler prints its own "a live run resolves..."
         // note, so this fn emits no past-tense "egress opened" line.
-        let lines =
-            model_egress_status_lines(true, false, false, &["anthropic".to_string()], true, true);
+        let lines = model_egress_status_lines(
+            true,
+            false,
+            false,
+            &["anthropic".to_string()],
+            true,
+            true,
+            UpInvocation::ClusterUp,
+        );
         for (_, m) in &lines {
             assert!(!m.contains("egress opened"), "{m}");
         }
@@ -1247,7 +1313,15 @@ mod tests {
         // must not claim the sandbox "stays sealed": a live rerun could
         // re-supply the release's recorded egress, so that assertion would be
         // just as false offline as the fake-model one.
-        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            false,
+            &[],
+            false,
+            true,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         for m in &msgs {
             assert!(!m.contains("installing with the fake model"), "{m}");
@@ -1269,7 +1343,15 @@ mod tests {
         // Sibling of model_egress_status_lines_dry_run_does_not_assert_fake_model:
         // same inputs but a live run, which must keep asserting the fake-model
         // outcome. Pins that only the dry-run path changed under #1898.
-        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            false,
+            &[],
+            false,
+            false,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         assert!(
             msgs.iter()
@@ -1291,7 +1373,15 @@ mod tests {
         // An operator on a fresh install must still be told how to enable the
         // real model, so softening the assertion under --dry-run must not drop
         // the guidance.
-        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            false,
+            &[],
+            false,
+            true,
+            UpInvocation::ClusterUp,
+        );
         let note = lines
             .iter()
             .find(|(is_warning, _)| !*is_warning)
@@ -1310,8 +1400,15 @@ mod tests {
         // preservation-unknown line must not carry the live-only "sealed" or
         // "installing with the fake model" language, and its "no model egress
         // is opened by this run" suffix must drop when egress is in fact open.
-        let lines =
-            model_egress_status_lines(false, false, false, &["anthropic".to_string()], true, true);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            false,
+            &["anthropic".to_string()],
+            true,
+            true,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         for m in &msgs {
             assert!(!m.contains("sealed"), "{m}");
@@ -1329,7 +1426,15 @@ mod tests {
         // No test above ever passes fake_model = true. An explicit --fake-model
         // run has already declared the outcome, so this helper must emit
         // nothing for it even under --dry-run.
-        let lines = model_egress_status_lines(false, false, true, &[], false, true);
+        let lines = model_egress_status_lines(
+            false,
+            false,
+            true,
+            &[],
+            false,
+            true,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         assert!(lines.is_empty(), "{msgs:?}");
     }
@@ -1339,7 +1444,15 @@ mod tests {
         // No test above ever passes local_model = true. --dry-run --local-model
         // must keep reporting the local-model install, not the new
         // preservation-unknown warning.
-        let lines = model_egress_status_lines(false, true, false, &[], false, true);
+        let lines = model_egress_status_lines(
+            false,
+            true,
+            false,
+            &[],
+            false,
+            true,
+            UpInvocation::ClusterUp,
+        );
         let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
         assert!(
             msgs.iter().any(|m| m.contains("local model enabled")),
@@ -1349,5 +1462,47 @@ mod tests {
             assert!(!m.contains("not read under --dry-run"), "{m}");
             assert!(!m.contains("installing with the fake model"), "{m}");
         }
+    }
+
+    #[test]
+    fn provider_rotation_guidance_tracks_the_invocation() {
+        let providers = ["anthropic".to_string()];
+        let apply = model_egress_status_lines(
+            true,
+            false,
+            false,
+            &providers,
+            true,
+            false,
+            UpInvocation::Apply,
+        );
+        let apply_retry = apply
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .find(|line| line.contains("provider IPs can rotate"))
+            .expect("apply status must include the provider retry guidance");
+        assert!(
+            apply_retry.contains("curie apply") && !apply_retry.contains("cluster up"),
+            "apply guidance must preserve the file based invocation: {apply_retry}"
+        );
+
+        let cluster_up = model_egress_status_lines(
+            true,
+            false,
+            false,
+            &providers,
+            true,
+            false,
+            UpInvocation::ClusterUp,
+        );
+        let cluster_retry = cluster_up
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .find(|line| line.contains("provider IPs can rotate"))
+            .expect("cluster up status must include the provider retry guidance");
+        assert!(
+            cluster_retry.contains("curie cluster up") && !cluster_retry.contains("curie apply"),
+            "direct cluster up guidance must keep its invocation: {cluster_retry}"
+        );
     }
 }

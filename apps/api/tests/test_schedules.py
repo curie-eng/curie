@@ -174,9 +174,61 @@ def _set_bundle_ref(version_id: str, bundle_ref: str) -> None:
     asyncio.run(run())
 
 
+def _control_resume_from(agent_id: str, name: str) -> datetime | None:
+    async def read() -> datetime | None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as connection:
+                return (
+                    await connection.execute(
+                        text(
+                            "SELECT resume_from FROM curie.schedule_controls "
+                            "WHERE agent_id = :agent_id AND name = :name"
+                        ),
+                        {"agent_id": uuid.UUID(agent_id), "name": name},
+                    )
+                ).scalar_one_or_none()
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
+def _control_generation(agent_id: str, name: str) -> int:
+    async def read() -> int:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as connection:
+                return (
+                    await connection.execute(
+                        text(
+                            "SELECT generation FROM curie.schedule_controls "
+                            "WHERE agent_id = :agent_id AND name = :name"
+                        ),
+                        {"agent_id": uuid.UUID(agent_id), "name": name},
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
 def _schedules(client: Any, headers: dict[str, str], agent: str | None = None) -> Any:
     params = {} if agent is None else {"agent": agent}
     return client.get("/schedules", params=params, headers=headers)
+
+
+def _schedule_action(
+    client: Any,
+    headers: dict[str, str],
+    agent_id: str,
+    hook_name: str,
+    action: str,
+) -> Any:
+    return client.post(
+        f"/schedules/{agent_id}/{hook_name}/{action}", headers=headers
+    )
 
 
 def _body(response: Any) -> dict[str, Any]:
@@ -392,3 +444,85 @@ def test_a_run_for_a_hook_the_bundle_no_longer_declares_is_omitted(
     row = _agent(_body(_schedules(client, auth_headers)), "acme-renamed")
     assert [hook["name"] for hook in row["hooks"]] == ["kept"]
     assert _hook(row, "kept")["last_outcome"] == "ran"
+
+
+def test_pause_and_resume_only_change_the_named_hook_for_the_named_agent(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    owner_id, owner_version = _publish(
+        client,
+        auth_headers,
+        _archive(
+            _bundle(
+                tmp_path / "owner",
+                [
+                    _cron("nightly-cleanup", "0 9 * * *"),
+                    _cron("weekly-report", "0 16 * * FRI"),
+                ],
+            )
+        ),
+        "acme-pause-owner",
+        channel="C0EXAMPLE3",
+    )
+    _deploy(client, auth_headers, owner_id, owner_version, "dev")
+    other_id, other_version = _publish(
+        client,
+        auth_headers,
+        _archive(_bundle(tmp_path / "other", [_cron("nightly-cleanup", "0 8 * * *")])),
+        "acme-pause-other",
+        channel="C0EXAMPLE4",
+    )
+    _deploy(client, auth_headers, other_id, other_version, "dev")
+
+    unauthenticated = _schedule_action(client, {}, owner_id, "nightly-cleanup", "pause")
+    assert unauthenticated.status_code != 200
+
+    paused = _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "pause"
+    )
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["paused"] is True
+    assert _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "pause"
+    ).json()["paused"] is True
+    assert _schedule_action(
+        client, auth_headers, owner_id, "not-declared", "pause"
+    ).status_code == 404
+
+    body = _body(_schedules(client, auth_headers))
+    owner = _agent(body, "acme-pause-owner")
+    other = _agent(body, "acme-pause-other")
+    assert _hook(owner, "nightly-cleanup")["paused"] is True
+    assert _hook(owner, "weekly-report")["paused"] is False
+    assert _hook(other, "nightly-cleanup")["paused"] is False
+
+    resumed = _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "resume"
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["paused"] is False
+    first_resume_floor = _control_resume_from(owner_id, "nightly-cleanup")
+    assert first_resume_floor is not None
+    first_generation = _control_generation(owner_id, "nightly-cleanup")
+    assert _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "pause"
+    ).json()["paused"] is True
+    assert _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "resume"
+    ).json()["paused"] is False
+    assert _control_resume_from(owner_id, "nightly-cleanup") == first_resume_floor
+    assert _control_generation(owner_id, "nightly-cleanup") == first_generation + 2
+    assert _schedule_action(
+        client, auth_headers, owner_id, "nightly-cleanup", "resume"
+    ).json()["paused"] is False
+    assert _control_generation(owner_id, "nightly-cleanup") == first_generation + 2
+
+    body = _body(_schedules(client, auth_headers))
+    owner = _agent(body, "acme-pause-owner")
+    other = _agent(body, "acme-pause-other")
+    assert _hook(owner, "nightly-cleanup")["paused"] is False
+    assert _hook(owner, "weekly-report")["paused"] is False
+    assert _hook(other, "nightly-cleanup")["paused"] is False

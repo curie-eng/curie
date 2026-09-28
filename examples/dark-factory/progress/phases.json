@@ -12,6 +12,15 @@
   ],
   "loops": [
     {"start": "plan", "review": "plan_review", "cap": 3},
-    {"start": "implement", "review": "review_diff", "cap": 3}
+    {"start": "implement", "review": "review_diff", "cap": 3},
+    {"start": "implement", "review": "wait_ci", "cap": 3}
+  ],
+  "reviewer_model": "anthropic/claude-opus-5.5",
+  "stages": [
+    {"id": "plan", "label": "Plan", "phases": ["read_issue", "pin_criteria", "plan"]},
+    {"id": "plan_review", "label": "Plan review", "phases": ["plan_review"]},
+    {"id": "implement", "label": "Implement", "phases": ["failing_test", "implement"]},
+    {"id": "review_diff", "label": "Review diff", "phases": ["review_diff", "publish"]},
+    {"id": "wait_ci", "label": "Wait for CI", "phases": ["wait_ci"]}
   ]
 }

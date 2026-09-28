@@ -11,6 +11,7 @@ import enum
 import secrets
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -24,6 +25,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -503,6 +505,12 @@ class Approval(Base):
     # which is the rolling-deploy window the worker's prefix fallback covers.
     gate_kind: Mapped[str | None] = mapped_column(default=None)
     granted_tool: Mapped[str | None] = mapped_column(default=None)
+    # Canonical arguments of the denied permission gated call. NULL on old
+    # approvals and policy gates; an empty object is a real argument value.
+    # Kept private to the worker's resume lookup bound to the agent.
+    granted_arguments: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
     # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
     # requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
@@ -1068,6 +1076,59 @@ class ExecutionRequestPhaseReport(Base):
     )
 
 
+class ExecutionRequestModelUsage(Base):
+    """Token usage of one model in one turn of a request, with its estimate (#3223).
+
+    Cost, price source, and price time are all NULL or all set: an unpriced
+    model keeps its tokens with no estimate.
+    """
+
+    __tablename__ = "execution_request_model_usage"
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('implementer', 'reviewer')",
+            name="execution_request_model_usage_role_ck",
+        ),
+        CheckConstraint(
+            "input_tokens >= 0 AND cached_input_tokens >= 0 "
+            "AND cache_write_tokens >= 0 AND output_tokens >= 0",
+            name="execution_request_model_usage_tokens_ck",
+        ),
+        CheckConstraint(
+            "(estimated_cost_usd IS NULL AND price_source IS NULL AND price_as_of IS NULL) "
+            "OR (estimated_cost_usd IS NOT NULL AND estimated_cost_usd >= 0 "
+            "AND price_source IS NOT NULL AND price_as_of IS NOT NULL)",
+            name="execution_request_model_usage_price_ck",
+        ),
+        UniqueConstraint(
+            "execution_request_id",
+            "turn_id",
+            "model",
+            "role",
+            name="execution_request_model_usage_turn_model_role_key",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+    )
+    turn_id: Mapped[str] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cached_input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cache_write_tokens: Mapped[int] = mapped_column(BigInteger)
+    output_tokens: Mapped[int] = mapped_column(BigInteger)
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 6), default=None)
+    price_source: Mapped[str | None] = mapped_column(Text, default=None)
+    price_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+
+
 class PublicationReviewReservation(Base):
     """One review origin's claim on the existing publication revision writer."""
 
@@ -1168,6 +1229,9 @@ class GitHubReviewFeedback(Base):
         CheckConstraint(
             "enqueue_attempts >= 0", name="github_review_feedback_attempts_ck"
         ),
+        CheckConstraint(
+            "notice_scan_page >= 1", name="github_review_feedback_notice_scan_page_ck"
+        ),
         Index("ix_github_review_feedback_pending", "status", "created_at"),
     )
 
@@ -1205,6 +1269,8 @@ class GitHubReviewFeedback(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     queued_at: Mapped[datetime | None] = mapped_column(default=None)
     terminal_scan_cursor: Mapped[str | None] = mapped_column(default=None)
+    notice_marker: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    notice_scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
 
 
 class Publication(Base):
@@ -1293,6 +1359,11 @@ class Publication(Base):
     # these bytes while preserving the audit/result metadata.
     patch_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
     changed_paths: Mapped[list[str]] = mapped_column(JSONB)
+    observed_title_sha256: Mapped[str | None] = mapped_column(default=None)
+    observed_body_sha256: Mapped[str | None] = mapped_column(default=None)
+    metadata_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     title: Mapped[str]
     body: Mapped[str] = mapped_column(Text)
     reply_kind: Mapped[str]
@@ -1693,6 +1764,20 @@ class ConsoleSession(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class ScheduleControl(Base):
+    """Operator pause state for one agent and named cron hook."""
+
+    __tablename__ = "schedule_controls"
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    resume_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 
@@ -1705,7 +1790,8 @@ class HookRun(Base):
             name="hook_runs_agent_name_slot_key",
         ),
         CheckConstraint(
-            "outcome IS NULL OR outcome IN ('ran', 'deferred', 'skipped', 'blocked', 'failed')",
+            "outcome IS NULL OR outcome IN "
+            "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
     )
@@ -1726,6 +1812,8 @@ class HookRun(Base):
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # When an open claim becomes reclaimable by the hook's next fire (#2931).
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Tenant(Base):

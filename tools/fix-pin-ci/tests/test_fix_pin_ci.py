@@ -24,8 +24,10 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKER = REPO_ROOT / "tools" / "fix-pin-ci" / "check.py"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+FIX_PIN_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "fix-pin.yaml"
 REQUIRED_WORKFLOWS = (
     CI_WORKFLOW,
+    FIX_PIN_WORKFLOW,
     REPO_ROOT / ".github" / "workflows" / "codeql.yaml",
     REPO_ROOT / ".github" / "workflows" / "dependency-audit.yaml",
     REPO_ROOT / ".github" / "workflows" / "gitleaks.yaml",
@@ -41,7 +43,6 @@ LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
 CHART_SELECTOR = "charts/curie/ci/render-assertions.sh"
-PR_CONDITION = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
 REPOSITORY = "curie-eng/curie"
 STACK_BRANCH = "task/local-deployment-fix-pin"
 BASE_SHA = "a" * 40
@@ -709,8 +710,8 @@ def test_required_workflows_reach_one_task_branch_without_widening_pushes() -> N
         assert pull_request.get("branches") == ["main", "next", "task/**"], path.name
 
         push = trigger.get("push")
-        if path.name == "pr-body.yaml":
-            assert push is None, "the PR body guard must remain pull request only"
+        if path.name in {"pr-body.yaml", "fix-pin.yaml"}:
+            assert push is None, f"{path.name} must remain pull request only"
         else:
             assert isinstance(push, dict), f"{path.name} must retain its push trigger"
             assert push.get("branches") == ["main", "next"], path.name
@@ -739,16 +740,12 @@ def _string(step: dict[str, Any], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _pull_request_only(step: dict[str, Any]) -> bool:
-    return bool(PR_CONDITION.search(_string(step, "if")))
-
-
 def _fix_pin_job() -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    document = _load_ci()
+    document = _load_workflow(FIX_PIN_WORKFLOW)
     jobs = document.get("jobs")
-    assert isinstance(jobs, dict), "ci.yaml must declare jobs"
+    assert isinstance(jobs, dict), "fix-pin.yaml must declare jobs"
     job = jobs.get("fix-pin")
-    assert isinstance(job, dict), "ci.yaml must retain the fix-pin job"
+    assert isinstance(job, dict), "fix-pin.yaml must retain the fix-pin job"
     steps = job.get("steps")
     assert isinstance(steps, list), "the fix pin job must retain steps"
     return job, [step for step in steps if isinstance(step, dict)]
@@ -860,10 +857,9 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     """Everything the gate needs must be in the job that now runs it."""
     job, steps = _fix_pin_job()
     assert "needs" not in job, "the required fix pin check must not be skippable"
-    assert _pull_request_only(job), (
-        "only a pull request carries the body this gate reads, so the job is "
-        "pull-request only and its steps no longer each repeat that condition"
-    )
+    assert not _string(job, "if"), "the job must run for every configured pull request event"
+    trigger = _workflow_trigger(_load_workflow(FIX_PIN_WORKFLOW))["pull_request"]
+    assert set(trigger["types"]) == {"opened", "synchronize", "reopened", "edited"}
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the fix pin job must declare job level permissions"
@@ -1027,11 +1023,9 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     ):
         step = steps[_single_step_index(steps, predicate, description)]
         condition = _string(step, "if")
-        # The job carries the pull-request condition now, so the steps state
-        # only what is theirs: the parser's answer.
-        assert _pull_request_only(job), (
-            f"{description} must stay pull-request only"
-        )
+        # The workflow runs only for pull requests, so these steps need only
+        # the parser's answer.
+        assert not _string(job, "if"), f"{description} must run on edited pull requests"
         assert CARGO_NEEDED_GUARD in condition, (
             f"{description} must build only when the parser says the binary "
             f"is needed: {condition!r}"

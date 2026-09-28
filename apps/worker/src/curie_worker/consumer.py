@@ -39,8 +39,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import nullcontext
 from datetime import UTC, datetime
 
+from aci_protocol import QueuedTurn
 from curie_dispatcher.queue import from_stream_fields
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -53,10 +55,21 @@ from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
 
+from . import capacity_wait as capacity_wait_module
+from .capacity_wait import (
+    WAIT_GENERATION_FIELD,
+    WAIT_REPLY_REF_FIELD,
+    WAIT_TERMINAL_ONLY_FIELD,
+    CapacityWaitExpired,
+    CapacityWaitRecord,
+    CapacityWaitRequested,
+    CapacityWaitStore,
+    wait_delivery_scope,
+)
 from .completion_health import observe_completion_outbox
 from .config import WorkerConfig
 from .consumer_liveness import ConsumerLivenessStore
-from .delivery_lease import DeliveryLeaseStore, LeaseLostError
+from .delivery_lease import DeliveryLease, DeliveryLeaseStore, LeaseLostError
 from .kernel import Kernel, _thread_key_for
 from .markers import Markers
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
@@ -154,16 +167,13 @@ class Consumer(StreamConsumer):
         redis: Redis,
         kernel: Kernel,
         config: WorkerConfig,
+        leases: DeliveryLeaseStore,
         max_concurrency: int = 16,
-        leases: DeliveryLeaseStore | None = None,
         drain: UpgradeDrainGate | None = None,
     ) -> None:
-        # The delivery-ownership fence (ADR-0131) lives entirely in the shared
-        # base: acquisition, the background heartbeat, release, and the reclaim
-        # liveness guards. This lane supplies only the store and the lane-specific
-        # way to stop a runner when the fence moves, so runs and evals share one
-        # implementation by construction. ``leases=None`` keeps every pre-ADR-0131
-        # construction (and the tests that use it) behaving exactly as before.
+        # Capacity parking requires a real delivery fence, so every runs
+        # consumer supplies the same lease store the production entry point uses.
+        # Acquisition and renewal remain in the shared transport base.
         super().__init__(
             redis,
             leases=leases,
@@ -180,6 +190,7 @@ class Consumer(StreamConsumer):
         self._valkey: Redis = redis
         self._kernel = kernel
         self._config = config
+        self._waits = CapacityWaitStore(redis, config)
         self._max_concurrency = max_concurrency
         self._sem = asyncio.Semaphore(max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
@@ -245,6 +256,8 @@ class Consumer(StreamConsumer):
                 "startup-completion-sweep": self._startup_completion_sweep,
                 "read": self._read_loop,
                 "maintenance": self._maintenance_loop,
+                "capacity-wake": self._capacity_wake_loop,
+                "capacity-notices": self._capacity_notice_loop,
                 "prompt-reclaim": self._prompt_reclaim_loop,
             },
             may_complete=frozenset({"startup-completion-sweep"}),
@@ -304,6 +317,141 @@ class Consumer(StreamConsumer):
         task = asyncio.create_task(self._handle(entry_id, fields))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
+
+    async def _send_wait_notice(self, record: CapacityWaitRecord) -> None:
+        token = await self._waits.claim_notice(record.event_id, record.generation)
+        if token is None:
+            return
+        delivered = False
+        reply_ref: str | None = None
+        try:
+            qevent = from_stream_fields(record.fields)
+            if record.reply_ref is not None and qevent.reply_handle is not None:
+                qevent = qevent.model_copy(
+                    update={
+                        "reply_handle": qevent.reply_handle.model_copy(
+                            update={"placeholder": record.reply_ref}
+                        )
+                    }
+                )
+            async with asyncio.timeout(capacity_wait_module._NOTICE_SEND_TIMEOUT_S):
+                ack = await self._kernel.notify_capacity_queued(qevent)
+            reply_ref = ack.ref
+            delivered = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "capacity wait notice failed for event %s",
+                record.event_id,
+                exc_info=True,
+            )
+        finally:
+            await self._waits.finish_notice(
+                record.event_id,
+                record.generation,
+                token,
+                delivered=delivered,
+                reply_ref=reply_ref,
+            )
+
+    async def _repair_wait_notices(self) -> None:
+        for record in await self._waits.notices_due():
+            await self._send_wait_notice(record)
+
+    async def _repair_expiry_notices(self) -> None:
+        for record in await self._waits.expiry_notices_due():
+            token = await self._waits.claim_expiry_notice(
+                record.event_id, record.generation
+            )
+            if token is None:
+                continue
+            delivered = False
+            reply_ref: str | None = None
+            try:
+                qevent = from_stream_fields(record.fields)
+                if record.reply_ref is not None and qevent.reply_handle is not None:
+                    qevent = qevent.model_copy(
+                        update={
+                            "reply_handle": qevent.reply_handle.model_copy(
+                                update={"placeholder": record.reply_ref}
+                            )
+                        }
+                    )
+                async with asyncio.timeout(capacity_wait_module._NOTICE_SEND_TIMEOUT_S):
+                    ack = await self._kernel.notify_capacity_expired(
+                        qevent, cause=record.cause
+                    )
+                delivered = True
+                reply_ref = ack.ref
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "capacity wait expiry notice failed for event %s",
+                    record.event_id,
+                    exc_info=True,
+                )
+            finally:
+                await self._waits.finish_expiry_notice(
+                    record.event_id,
+                    record.generation,
+                    token,
+                    delivered=delivered,
+                    reply_ref=reply_ref,
+                )
+
+    async def _expire_wait_delivery(
+        self,
+        entry_id: str,
+        qevent: QueuedTurn,
+        generation: int,
+        lease: DeliveryLease,
+    ) -> None:
+        record = await self._waits.get(qevent.event_id)
+        if (
+            record is not None
+            and not record.grant_confirmed
+            and record.grant_epoch is not None
+        ):
+            result = await self._kernel.resolve_capacity_grant(
+                qevent, record.grant_epoch
+            )
+            if result == "granted":
+                confirmed = await self._waits.confirm_grant(
+                    qevent.event_id, generation, lease, record.grant_epoch
+                )
+                # A confirmed start follows the ordinary bounded retry path.
+                # This delivery stays pending for reclaim, never a no-start
+                # expiry despite the lost grant response.
+                if record.state == "active" or not confirmed:
+                    return
+            if result == "unknown":
+                await self._waits.mark_grant_unknown(
+                    qevent.event_id, generation, record.grant_epoch
+                )
+        if not await self._waits.flag_expiry(qevent.event_id, generation):
+            return
+        record = await self._waits.get(qevent.event_id)
+        if record is None:
+            return
+        delivered, reply_ref = await self._kernel.expire_capacity_wait(
+            qevent, lease=lease, cause=record.cause,
+            grant_epoch=record.grant_epoch,
+        )
+        if not await self._waits.mark_terminal(qevent.event_id, generation):
+            return
+        if delivered:
+            await self._waits.finish_expiry_notice(
+                qevent.event_id,
+                generation,
+                None,
+                delivered=True,
+                reply_ref=reply_ref,
+            )
+        lease.raise_if_lost()
+        await self._ack(entry_id)
+        await self._settle_delivery_best_effort(entry_id)
 
     async def _handle(self, entry_id: str, fields: dict[str, str]) -> None:
         started = time.monotonic()
@@ -372,6 +520,94 @@ class Consumer(StreamConsumer):
                     if qevent.event_id:
                         span.set_attribute("event_id", qevent.event_id)
 
+                    wait_generation: int | None = None
+                    if WAIT_GENERATION_FIELD in fields:
+                        wait_generation = int(fields[WAIT_GENERATION_FIELD])
+                        if WAIT_REPLY_REF_FIELD in fields and qevent.reply_handle is not None:
+                            qevent = qevent.model_copy(
+                                update={
+                                    "reply_handle": qevent.reply_handle.model_copy(
+                                        update={"placeholder": fields[WAIT_REPLY_REF_FIELD]}
+                                    )
+                                }
+                            )
+                        wait_state = await self._waits.check_delivery(
+                            qevent.event_id, wait_generation
+                        )
+                        if wait_state == "pending":
+                            # The earlier grant has no confirmed result. Leave
+                            # this entry pending until its fixed wait deadline.
+                            return
+                        if WAIT_TERMINAL_ONLY_FIELD in fields and wait_state == "ready":
+                            logger.warning(
+                                "capacity terminal delivery was not due for event %s",
+                                qevent.event_id,
+                            )
+                            return
+                        if wait_state == "stale" or await Markers(
+                            self._valkey, self._config
+                        ).is_terminal(qevent.event_id):
+                            if wait_state != "stale":
+                                if not await self._waits.mark_terminal(
+                                    qevent.event_id, wait_generation
+                                ):
+                                    return
+                            lease.raise_if_lost()
+                            await self._ack(entry_id)
+                            await self._settle_delivery_best_effort(entry_id)
+                            return
+                        if wait_state == "expired":
+                            await self._expire_wait_delivery(
+                                entry_id, qevent, wait_generation, lease
+                            )
+                            return
+
+                    if self._leases is not None and self._kernel._is_approval_resume(
+                        qevent.event_id
+                    ):
+                        # A second stream entry has its own delivery lease. Only
+                        # one holder of this resume event may enter the kernel
+                        # while the first approved turn is still running. The
+                        # winning entry stays pending until its turn finishes.
+                        # The redundant entry can be acknowledged now: keeping
+                        # it pending would charge repeated reclaim deliveries
+                        # and could dead letter it before the winner finishes.
+                        if not await self._leases.claim_resume(
+                            lease, qevent.event_id, consumer=self._spec.consumer
+                        ):
+                            logger.debug(
+                                "approval resume %s is in flight; acknowledging "
+                                "redundant entry %s",
+                                qevent.event_id,
+                                entry_id,
+                            )
+                            try:
+                                lease.raise_if_lost()
+                                await self._ack(entry_id)
+                            except LeaseLostError:
+                                logger.warning(
+                                    "refusing to ack redundant approval resume entry %s: "
+                                    "this owner lost the delivery lease",
+                                    entry_id,
+                                )
+                                record_metric(
+                                    "curie.queue.settle",
+                                    attributes={**metric_attributes, "outcome": "pending"},
+                                )
+                                return
+                            await self._settle_delivery_best_effort(entry_id)
+                            process_outcome = "success"
+                            span.add_event("queue.message.acked", {"outcome": "ack"})
+                            record_metric(
+                                "curie.queue.process",
+                                attributes={**metric_attributes, "outcome": "success"},
+                            )
+                            record_metric(
+                                "curie.queue.settle",
+                                attributes={**metric_attributes, "outcome": "ack"},
+                            )
+                            return
+
                     age = self._message_age_seconds(qevent.received_at)
                     for name in (
                         "curie.queue.wait.duration",
@@ -416,16 +652,40 @@ class Consumer(StreamConsumer):
                     # with this turn's event id and land in this request's trace.
                     with channel_event_id_scope(qevent.event_id):
                         try:
-                            if self._leases is None:
-                                # No fence configured: call the kernel EXACTLY as it
-                                # was called before ADR-0131. The base yields a
-                                # permissive sentinel so this handler body stays
-                                # uniform, but forwarding that sentinel would claim
-                                # an authority nobody holds -- and ``process_event``
-                                # keeps its lease optional for precisely this caller.
-                                await self._kernel.process_event(qevent)
-                            else:
+                            with (
+                                wait_delivery_scope(
+                                    self._waits, qevent.event_id, wait_generation, lease
+                                )
+                                if wait_generation is not None
+                                else nullcontext()
+                            ):
                                 await self._kernel.process_event(qevent, lease=lease)
+                        except CapacityWaitExpired:
+                            if wait_generation is None:
+                                raise
+                            await self._expire_wait_delivery(
+                                entry_id, qevent, wait_generation, lease
+                            )
+                            return
+                        except CapacityWaitRequested:
+                            try:
+                                record = await self._waits.park(
+                                    entry_id, fields, qevent.event_id, lease
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "capacity wait park failed for entry %s; left pending",
+                                    entry_id,
+                                )
+                                return
+                            await self._settle_delivery_best_effort(entry_id)
+                            await self._send_wait_notice(record)
+                            process_outcome = "queued"
+                            record_metric(
+                                "curie.queue.process",
+                                attributes={**metric_attributes, "outcome": "queued"},
+                            )
+                            return
                         except Exception as exc:
                             # Leave the entry pending: the lease-expiry reclaim pass
                             # picks it up one lease TTL after this handler released
@@ -462,7 +722,11 @@ class Consumer(StreamConsumer):
                                 # leaseless sentinel this never raises, so a base-only
                                 # consumer still notifies.
                                 lease.raise_if_lost()
-                                await self._kernel.notify_turn_not_started(qevent, lease=lease)
+                                wait_record = await self._waits.get(qevent.event_id)
+                                if wait_record is None:
+                                    await self._kernel.notify_turn_not_started(
+                                        qevent, lease=lease
+                                    )
                             except LeaseLostError:
                                 logger.warning(
                                     "skipping the not-started notice for entry %s: this "
@@ -499,6 +763,11 @@ class Consumer(StreamConsumer):
                                 attributes={**metric_attributes, "outcome": "pending"},
                             )
                             return
+                        if wait_generation is not None:
+                            if not await self._waits.mark_terminal(
+                                qevent.event_id, wait_generation
+                            ):
+                                return
                         await self._ack(entry_id)
                         # Terminal acknowledgement: remove the delivery state as well
                         # as the lease (the base's release drops only the lease). The
@@ -531,12 +800,9 @@ class Consumer(StreamConsumer):
     async def _interrupt_on_lease_lost(self, entry_id: str, fields: dict[str, str]) -> None:
         """Stop the live runner for a delivery whose fence has moved (ADR-0131).
 
-        Wired as the base's ``on_lease_lost``. It uses ``interrupt_thread`` --
-        the EXISTING bounded control path -- and nothing else. Cancelling the
-        handler task instead would look tidier and be wrong: a bare cancel skips
-        the runner-side stop and leaves a turn producing effects on a sandbox
-        this process no longer owns, which is exactly what the replacement's
-        reclaim preflight then has to clean up.
+        A capacity wake may have started no turn, or a later message may now
+        own the thread. Its recorded epoch is the only runner turn this callback
+        may stop. Other deliveries keep the existing thread interrupt path.
 
         Every failure is logged and swallowed. Failing to interrupt must not mask
         the lease loss itself, which ``lease.lost`` has already recorded and which
@@ -545,6 +811,19 @@ class Consumer(StreamConsumer):
         """
         try:
             qevent = from_stream_fields(fields)
+            if WAIT_GENERATION_FIELD in fields:
+                generation = int(fields[WAIT_GENERATION_FIELD])
+                record = await self._waits.get(qevent.event_id)
+                if (
+                    record is None
+                    or record.generation != generation
+                    or record.grant_epoch is None
+                ):
+                    return
+                await self._kernel.resolve_capacity_grant(
+                    qevent, record.grant_epoch
+                )
+                return
             await self._kernel.interrupt_thread(
                 _thread_key_for(qevent), "delivery lease lost"
             )
@@ -619,6 +898,26 @@ class Consumer(StreamConsumer):
 
     # -- maintenance loop -----------------------------------------------------
 
+    async def _capacity_wake_loop(self) -> None:
+        while not self._should_stop():
+            try:
+                if not await self._claims_paused():
+                    await self._waits.wake_due()
+                    await self._waits.reconcile_lost_wakes()
+                await self._waits.prune()
+            except Exception:
+                logger.exception("capacity wait tick failed")
+            await self._sleep_or_stop(min(5.0, self._config.reclaim_interval_s))
+
+    async def _capacity_notice_loop(self) -> None:
+        while not self._should_stop():
+            try:
+                await self._repair_wait_notices()
+                await self._repair_expiry_notices()
+            except Exception:
+                logger.exception("capacity wait notice tick failed")
+            await self._sleep_or_stop(min(5.0, self._config.reclaim_interval_s))
+
     async def _maintenance_loop(self) -> None:
         while not self._should_stop():
             try:
@@ -646,7 +945,24 @@ class Consumer(StreamConsumer):
             # observer contains and logs its own failures.
             await self._observe_queue_state()
             await self._observe_completion_outbox()
+            await self._observe_capacity_waits()
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _observe_capacity_waits(self) -> None:
+        try:
+            counts = await self._waits.snapshot()
+            for state, count in counts.items():
+                record_metric(
+                    "curie.capacity.wait",
+                    count,
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": "worker",
+                        "state": state,
+                    },
+                )
+        except Exception:
+            logger.warning("capacity wait observation failed", exc_info=True)
 
     async def _observe_completion_outbox(self) -> None:
         """Publish completion-outbox gauges; observation never settles records."""

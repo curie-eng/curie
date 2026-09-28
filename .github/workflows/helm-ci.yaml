@@ -256,6 +256,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
 
+      # Opt-in Kubernetes Events receiver for the collector (#2954): off by
+      # default, namespace-scoped read-only RBAC, refused into nop-only logs.
+      - name: helm render assertions (otel collector kubernetes events)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-k8s-events-assertions.sh
+
       # Prove every first-party chart workload carries the shared OTLP env
       # (#2360). Membership is derived from rendered chart-owned images, not a
       # named allowlist, so a sixth Deployment is rejected rather than skipped.
@@ -481,6 +488,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
 
+      # Pin the end to end connector's test cluster identity (ADR 0176
+      # decision 4, #3243): off by default, no cluster scoped write beyond
+      # namespace create and delete, the per namespace role never bound cluster
+      # wide, and an admission policy that fails closed on this identity alone.
+      # The live denials are proven by ci/runtime/e2e-connector-identity-runtime.sh.
+      - name: helm render assertions (e2e connector identity)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/e2e-connector-identity-assertions.sh
+
       - name: helm render assertions (remote dev capability)
         run: |
           set -euo pipefail
@@ -651,6 +668,15 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/tenant-capacity-assertions.sh
+
+      # Prove the sandbox quota-vs-node-capacity arithmetic (issue #2949): the
+      # quota is an admission ceiling, not a scheduling guarantee, so NOTES
+      # compares its ceiling with what fits on schedulable nodes and warns when
+      # it is higher. Fixture Node/Pod data drives the pure helpers.
+      - name: helm render assertions (sandbox quota vs node capacity)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/sandbox-capacity-fit-assertions.sh
 
       # Prove the in-chart rustfs resource floors (issue #2706). Presence is
       # not the defect; the 512Mi memory ceiling is. The shipped default sat

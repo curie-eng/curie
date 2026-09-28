@@ -307,8 +307,9 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("metadata_only", [False, True])
 def test_a_fix_publication_carries_the_adopted_request_and_epoch(
-    make_harness, monkeypatch: pytest.MonkeyPatch
+    make_harness, monkeypatch: pytest.MonkeyPatch, metadata_only: bool
 ) -> None:
     from curie_worker.approvals import CreatedPublication
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
@@ -316,6 +317,14 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
     class PublicationApi(_PublicationApi):
         def __init__(self) -> None:
             self.creates: list[object] = []
+            self.contexts: list[PublicationContext] = []
+
+        async def get_publication_precheck_context(
+            self, **kwargs: object
+        ) -> PublicationContext:
+            context = await super().get_publication_precheck_context(**kwargs)
+            self.contexts.append(context)
+            return context
 
         async def get_publication_lineage(self, *_args: object) -> None:
             return None
@@ -350,8 +359,10 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
                 return RunnerWorkspaceSnapshot(
                     repo_full_name=WORK_ITEM_REPO,
                     base_sha=HEAD,
-                    patch=b"diff --git a/src/widget.py b/src/widget.py\n",
-                    changed_paths=("src/widget.py",),
+                    patch=(
+                        b"" if metadata_only else b"diff --git a/src/widget.py b/src/widget.py\n"
+                    ),
+                    changed_paths=() if metadata_only else ("src/widget.py",),
                     contains_workflow_files=False,
                     publication_title="Fix the widget parser off-by-one",
                     publication_body="Fixes the failing unit-tests check.",
@@ -369,6 +380,11 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
             created = publications.creates[0]
             assert created.work_item_request_id == request_id  # type: ignore[attr-defined]
             assert created.work_item_runtime_epoch == EPOCH  # type: ignore[attr-defined]
+            if metadata_only:
+                assert created.patch == b""  # type: ignore[attr-defined]
+                assert created.observed_title == publications.contexts[0].observed_title  # type: ignore[attr-defined]
+                assert created.observed_body_sha256 == publications.contexts[0].observed_body_sha256  # type: ignore[attr-defined]
+                assert created.observed_lineage_id == publications.contexts[0].lineage_id  # type: ignore[attr-defined]
             assert "acquire" not in work_items.calls
 
     asyncio.run(exercise())

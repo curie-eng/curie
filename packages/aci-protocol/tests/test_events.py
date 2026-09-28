@@ -82,6 +82,20 @@ def test_final_defaults_to_done_status() -> None:
     assert Final(text="ok").status is SessionStatus.DONE
 
 
+def test_final_preserves_canonical_approved_arguments() -> None:
+    arguments = {"command": "printf ok", "options": {"flags": ["a", "b"]}}
+    final = Final(
+        text="Approval requested",
+        status=SessionStatus.AWAITING_APPROVAL,
+        approval_gate_kind="permission",
+        approval_granted_tool="Bash",
+        approval_granted_arguments=arguments,
+    )
+    decoded = _OUTBOUND.validate_json(final.model_dump_json())
+    assert decoded.approval_granted_arguments == arguments
+    assert Final(text="done").approval_granted_arguments is None
+
+
 def test_unknown_session_status_is_rejected() -> None:
     # Decision 3: an unknown SessionStatus is a hard decode error, never
     # degraded to a fallback. Status is control-bearing (awaiting-approval drives

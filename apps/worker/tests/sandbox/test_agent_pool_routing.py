@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 from curie_worker.binding import CONNECTOR_SECRET_KEYS_ENV, inject_connector_secrets
 from curie_worker.sandbox import SandboxSubstrate, SubstrateConfig
+from curie_worker.sandbox import types as sandbox_types
 from curie_worker.sandbox.affinity import AffinityStore
 from curie_worker.sandbox.types import AGENT_LABEL, agent_warm_pool_name
 
@@ -19,9 +21,24 @@ from .conftest import FakeSandboxClient
 
 
 def _substrate(
-    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    agent_pools: frozenset[str] = frozenset({"acme-a", "acme-b"}),
 ) -> SandboxSubstrate:
-    return SandboxSubstrate(fake_k8s, affinity, replace(config, warm_pool="curie-runner-pool"))
+    # agent_pools stands in for CURIE_AGENT_SANDBOX_POOLS (every per-agent pool
+    # the chart rendered) and CURIE_AGENT_CONNECTOR_SECRET_POOLS (the ones whose
+    # template carries connector secrets); here every pool carries them.
+    return SandboxSubstrate(
+        fake_k8s,
+        affinity,
+        replace(
+            config,
+            warm_pool="curie-runner-pool",
+            agent_pools=agent_pools,
+            connector_secret_pools=agent_pools,
+        ),
+    )
 
 
 def test_agent_warm_pool_name_matches_chart_template() -> None:
@@ -64,7 +81,7 @@ def test_claim_with_connector_secrets_targets_the_per_agent_pool(
 def test_claim_without_connector_secrets_stays_on_the_generic_pool(
     fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
 ) -> None:
-    handle = _substrate(fake_k8s, affinity, config).claim(
+    handle = _substrate(fake_k8s, affinity, config, agent_pools=frozenset()).claim(
         "T-generic", env={"CURIE_BUDGET": "{}"}, agent_name="acme-a"
     )
     claim = fake_k8s.claims[handle.claim_name]
@@ -103,3 +120,90 @@ def test_registry_egress_agent_without_secrets_targets_its_per_agent_pool(
     other = substrate.claim("T-other", env={"CURIE_BUDGET": "{}"}, agent_name="acme-a")
     assert fake_k8s.claims[declared.claim_name].pool == "curie-agent-factory-runner-pool"
     assert fake_k8s.claims[other.claim_name].pool == "curie-runner-pool"
+
+
+def test_connector_secrets_without_a_rendered_pool_fail_fast_naming_pool_and_agent(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # #2943: an agent deployed by the CLI whose connectors.yaml declares secrets
+    # carries the marker, but the chart rendered no pool for it. The claim used
+    # to name that pool and wait out ClaimTimeoutError three times.
+    env: dict[str, str] = {"CURIE_BUDGET": "{}"}
+    inject_connector_secrets(
+        env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret"}, agent_label="cli-bot"
+    )
+    substrate = _substrate(fake_k8s, affinity, config, agent_pools=frozenset())
+    with pytest.raises(sandbox_types.MissingAgentPoolError) as raised:
+        substrate.claim("T-cli", env=env, agent_name="cli-bot")
+    message = str(raised.value)
+    assert "curie-agent-cli-bot-runner-pool" in message
+    assert "cli-bot" in message
+    assert "agentSandbox.connectorSecrets" in message
+    assert raised.value.agent_name == "cli-bot"
+    assert raised.value.pool == "curie-agent-cli-bot-runner-pool"
+    assert fake_k8s.claims == {}
+
+
+def test_connector_secrets_with_an_operator_pool_override_are_refused(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # A non-chart pool name has no derivable per-agent sibling, and the generic
+    # pool never receives connector secret values (they are stripped from the
+    # claim env), so the claim is refused rather than run without its secrets.
+    env: dict[str, str] = {"CURIE_BUDGET": "{}"}
+    inject_connector_secrets(
+        env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret"}, agent_label="cli-bot"
+    )
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, warm_pool="custom-pool", agent_pools=frozenset())
+    )
+    with pytest.raises(sandbox_types.MissingAgentPoolError) as raised:
+        substrate.claim("T-custom", env=env, agent_name="cli-bot")
+    assert "cli-bot" in str(raised.value)
+    assert "custom-pool" in str(raised.value)
+    assert fake_k8s.claims == {}
+
+
+def test_connector_secrets_on_a_registry_only_pool_are_refused(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # A registryEgress pool exists but its template carries no connector
+    # secretKeyRef, so a bundle declaring secrets must not land there.
+    env: dict[str, str] = {"CURIE_BUDGET": "{}"}
+    inject_connector_secrets(
+        env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret"}, agent_label="factory"
+    )
+    substrate = SandboxSubstrate(
+        fake_k8s,
+        affinity,
+        replace(config, warm_pool="curie-runner-pool", agent_pools=frozenset({"factory"})),
+    )
+    with pytest.raises(sandbox_types.MissingAgentPoolError) as raised:
+        substrate.claim("T-reg-secret", env=env, agent_name="factory")
+    assert "curie-agent-factory-runner-pool" in str(raised.value)
+    assert fake_k8s.claims == {}
+
+
+def test_connector_secrets_with_a_custom_base_pool_are_refused_even_when_listed(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # With a non-chart base pool the per-agent name cannot be derived, so the
+    # claim would land on the base pool, which carries no connector secrets.
+    env: dict[str, str] = {"CURIE_BUDGET": "{}"}
+    inject_connector_secrets(
+        env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret"}, agent_label="acme-a"
+    )
+    listed = frozenset({"acme-a"})
+    substrate = SandboxSubstrate(
+        fake_k8s,
+        affinity,
+        replace(
+            config,
+            warm_pool="custom-pool",
+            agent_pools=listed,
+            connector_secret_pools=listed,
+        ),
+    )
+    with pytest.raises(sandbox_types.MissingAgentPoolError):
+        substrate.claim("T-custom-listed", env=env, agent_name="acme-a")
+    assert fake_k8s.claims == {}

@@ -407,6 +407,49 @@ def test_a_hosted_connector_with_several_secrets_must_name_the_bearer() -> None:
     )
 
 
+def test_a_hosted_connector_with_only_secretrefs_needs_no_bearer() -> None:
+    # #3057: every SecretRef is the connector's own upstream credential, so
+    # there is no client to authenticate and no correct bearer_secret.
+    from plugin_format.connector_render import mcp_entry
+
+    doc = {
+        "connectors": {
+            "tool": {
+                "image": "ghcr.io/example/tool@sha256:" + "0" * 64,
+                "secrets": [
+                    {
+                        "name": "SERVICE_A_TOKEN",
+                        "from_secret": "tool-credentials",
+                        "key": "SERVICE_A_TOKEN",
+                    },
+                    {
+                        "name": "SERVICE_B_TOKEN",
+                        "from_secret": "tool-credentials",
+                        "key": "SERVICE_B_TOKEN",
+                    },
+                ],
+            }
+        }
+    }
+    parsed, errors = validate_connectors(doc)
+    assert errors == []
+    entry = mcp_entry("curie", "agent", "curie", "tool", parsed.connectors["tool"])
+    assert "headers" not in entry
+
+
+def test_a_secretref_plus_a_plain_secret_still_must_name_the_bearer() -> None:
+    assert "connectors.bearer_secret_required" in _codes(
+        {
+            "connectors": {
+                "g": {
+                    "image": "x:1",
+                    "secrets": ["PAT", {"name": "UPSTREAM", "from_secret": "s"}],
+                }
+            }
+        }
+    )
+
+
 def test_a_named_bearer_secret_must_be_one_of_the_declared_secrets() -> None:
     assert "connectors.bearer_secret_unknown" in _codes(
         {

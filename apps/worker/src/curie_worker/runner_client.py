@@ -51,6 +51,7 @@ _MIN_REQUEST_TIMEOUT_S = 0.05
 _POST_FINAL_CLEANUP_TIMEOUT_S = 1.0
 _POST_FINAL_DISCARD_CHUNK_BYTES = 64 * 1024
 _TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
+_CAPACITY_ADMISSION_HEADER = "X-Curie-Capacity-Admission"
 _TURN_EPOCH_MIN_LENGTH = 32
 _TURN_EPOCH_MAX_LENGTH = 256
 _T = TypeVar("_T")
@@ -126,16 +127,18 @@ class RunnerWorkspaceSnapshot:
 
 
 class TurnStream:
-    """An open ``/v1/event`` response: the turn is active; iterate for frames."""
+    """An open ``/v1/event`` response; capacity turns await admission."""
 
     def __init__(
         self,
         response: aiohttp.ClientResponse,
         budget_s: float,
         deadline: float,
+        turn_epoch: str | None,
         timeout_callback: Callable[[], Awaitable[TimeoutResult]] | None = None,
     ) -> None:
         self._response = response
+        self.turn_epoch = turn_epoch
         self._saw_final = False
         # The streaming budget this stream is running under, carried from the
         # client so the stream can NAME the budget it blew (#2011).
@@ -411,8 +414,9 @@ class RunnerClient:
         token: str | None = None,
         *,
         remaining_s: float | None = None,
+        capacity_admission: bool = False,
     ) -> TurnStream:
-        """Open a turn. Returns once the runner has accepted it (turn active)."""
+        """Open a turn. Capacity turns need a separate post-lock grant."""
         request_timeout = self._request_timeout(remaining_s)
         stream_timeout_s = (
             self._total_timeout_s
@@ -429,10 +433,13 @@ class RunnerClient:
         async def request(headers: dict[str, str] | None) -> tuple[TurnStream, str]:
             assert stream_timeout_s is not None
             deadline = asyncio.get_running_loop().time() + stream_timeout_s
+            request_headers = dict(headers or {})
+            if capacity_admission:
+                request_headers[_CAPACITY_ADMISSION_HEADER] = "wait"
             resp = await self._session.post(
                 f"{base_url}/v1/event",
                 json=event.model_dump(mode="json"),
-                headers=headers,
+                headers=request_headers or None,
                 timeout=request_timeout,
             )
             if resp.status != 200:
@@ -444,6 +451,9 @@ class RunnerClient:
                 resp.release()
                 raise RunnerError(f"/v1/event -> {resp.status}: {body}")
             turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
+            if capacity_admission and not _valid_turn_epoch(turn_epoch):
+                resp.release()
+                raise RunnerError("capacity turn response carried no valid epoch")
             timeout_callback: Callable[[], Awaitable[TimeoutResult]] | None = None
             if _valid_turn_epoch(turn_epoch):
                 # ``turn_epoch`` is narrowed by the validation above. Keep the
@@ -455,7 +465,7 @@ class RunnerClient:
 
                 timeout_callback = notify_timeout
             return (
-                TurnStream(resp, stream_timeout_s, deadline, timeout_callback),
+                TurnStream(resp, stream_timeout_s, deadline, turn_epoch, timeout_callback),
                 "success",
             )
 
@@ -495,6 +505,13 @@ class RunnerClient:
                 type(exc).__name__,
             )
             return "unconfirmed"
+
+    async def timeout_turn(
+        self, base_url: str, turn_epoch: str, *, token: str | None = None
+    ) -> TimeoutResult:
+        """Stop only the runner turn identified by this private epoch."""
+
+        return await self._notify_timeout(base_url, turn_epoch, token)
 
     async def steer(
         self,
@@ -668,6 +685,63 @@ class RunnerClient:
                 return data, "success"
 
         return await self._rpc("status", token, request)
+
+    async def capacity_status(
+        self,
+        base_url: str,
+        *,
+        epoch: str | None = None,
+        token: str | None = None,
+        remaining_s: float | None = None,
+    ) -> dict[str, object]:
+        """Read the private epoch bound to the runner's current turn lock."""
+
+        async def request(headers: dict[str, str] | None) -> tuple[dict[str, object], str]:
+            control_headers = dict(headers or {})
+            if epoch is not None:
+                if not _valid_turn_epoch(epoch):
+                    raise RunnerError("invalid capacity turn epoch")
+                control_headers[_TURN_EPOCH_HEADER] = epoch
+            async with self._session.get(
+                f"{base_url}/v1/status",
+                headers=control_headers or None,
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status != 200:
+                    raise RunnerError(f"/v1/status -> {resp.status}")
+                data: dict[str, object] = await resp.json()
+                return data, "success"
+
+        return await self._rpc("status", token, request)
+
+    async def admit_turn(
+        self,
+        base_url: str,
+        turn_epoch: str,
+        *,
+        allow: bool,
+        token: str | None = None,
+        remaining_s: float | None = None,
+    ) -> None:
+        """Grant or deny one exact runner turn after its lock is held."""
+
+        if not _valid_turn_epoch(turn_epoch):
+            raise RunnerError("invalid capacity turn epoch")
+
+        async def request(headers: dict[str, str] | None) -> tuple[None, str]:
+            control_headers = dict(headers or {})
+            control_headers[_TURN_EPOCH_HEADER] = turn_epoch
+            async with self._session.post(
+                f"{base_url}/v1/turn-admit",
+                json={"allow": allow},
+                headers=control_headers,
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status != 200:
+                    raise RunnerError(f"/v1/turn-admit -> {resp.status}")
+                return None, "success"
+
+        await self._rpc("turn-admit", token, request)
 
     async def close(self) -> None:
         if self._own_session:

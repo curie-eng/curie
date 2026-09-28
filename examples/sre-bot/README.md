@@ -54,20 +54,20 @@ The CLI does not apply it.
 
 ## Install
 
-Use this order for a fresh cluster. The example installer creates the platform
-on its fake model default, installs the observability stack, applies the
-Kubernetes identity, builds its kubeconfig in memory, binds the approval route,
-and deploys the bundle. Enter the model credential only after that command
-succeeds, then run `curie cluster up` to record it outside bundle content.
+Use this order for a fresh cluster. Enter the model credential first. The
+example installer reads `CURIE_CREDENTIALS` the way `curie cluster up` does,
+records it in the release, and opens egress to the provider its prefix names.
+It then installs the observability stack, applies the Kubernetes identity,
+builds its kubeconfig in memory, binds the approval route, and deploys the
+bundle. Without `CURIE_CREDENTIALS` the platform comes up on the fake model.
 
 ```bash
-curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
-  --approvers U0EXAMPLE1,U0EXAMPLE2 \
-  --workspace-repo acme-corp/acme-bot
 read -rsp 'Model credential: ' CURIE_CREDENTIALS
 printf '\n'
 export CURIE_CREDENTIALS
-curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
+curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
+  --approvers U0EXAMPLE1,U0EXAMPLE2 \
+  --workspace-repo acme-corp/acme-bot
 ```
 
 These commands use the current Kubernetes context and the default `curie`
@@ -76,10 +76,10 @@ Persistent volumes use the cluster's default storage class, including the
 default supplied by a stock kind cluster. See the complete executable sequence
 in [DEMO.md](DEMO.md#fresh-install).
 
-The installer is a fresh install command. If the selected release already
-records a model credential, it refuses before platform mutation because its
-declarative platform step would clear the credential and restore the fake model
-default. Use the normal cluster lifecycle for an existing release.
+If the selected release already records a model credential and
+`CURIE_CREDENTIALS` is not exported, the installer refuses before platform
+mutation because its declarative platform step would clear the credential and
+restore the fake model default.
 
 The installer binds the `sre-approvals` route that gates the six Kubernetes
 mutations and platform publication before it deploys. Terminal resolution
@@ -104,7 +104,9 @@ for its approval route.
 
 Inspect the mutation plan first with `--dry-run`. Add `--platform-upgrade` only
 after reading `manifests/platform-upgrade-role.yaml`; it creates a separate,
-purpose-built upgrade path with much wider authority.
+purpose-built upgrade path with much wider authority. It arms only
+`upgrade_platform`; it does not apply `self-upgrade/cronjob.yaml`, so
+`upgrade_self` stays unarmed on installer-built deployments.
 
 For a manual install, apply `manifests/kubernetes-access.yaml`, assemble a
 kubeconfig for `sre-bot-kubernetes`, store it as the connector secret
@@ -183,14 +185,94 @@ prerequisites, and the expected evidence for each are in [DEMO.md](DEMO.md).
 
 ## Alert source (opt-in)
 
-Alertmanager stays off in the default observability overlay. One supported
-signed source is opt-in: apply `observability/alertmanager-webhook.yaml`, run
-`observability/alert-signer/server.py` with `CURIE_HOOK_URL`,
-`CURIE_HOOK_SECRET`, and `CURIE_SIGNER_TOKEN`, and configure the agent's `source_bindings` for hook
-`alertmanager` (workload pointer `/commonLabels/curie_workload`, partition
-`/curie_partition`). A genuine signed alert creates one partitioned
-investigation. Missing, ambiguous, or unauthorized mappings visibly stop
-coding. Invalid signatures and replayed delivery ids do not multiply work.
+Alertmanager stays off in the default observability overlay. The optional source
+uses the signer in `observability/alert-signer.yaml` because Alertmanager cannot
+sign webhook bodies. The signer runs the checked in `server.py` in a pinned
+Python image. Its Service is named `alert-signer` in Alertmanager's namespace.
+The webhook overlay mounts only the bearer token into Alertmanager; the
+derived Curie hook secret stays in the signer pod.
+
+Configure the two distinct agent fields first. `source_bindings.alertmanager`
+maps `/commonLabels/curie_workload` to the repository and deployed revision.
+`hook_partitions.alertmanager.pointer` names `/curie_partition`, which the
+signer adds to each forwarded body. Set the following inputs for your release
+and workload, then run the commands from this checkout. The default service
+address assumes the `curie` release in the `curie` namespace and the chart's
+default API port. The Slack channel is the agent's bound reply channel.
+
+```bash
+(
+set -euo pipefail
+umask 077
+: "${KUBE_CONTEXT:?Set the Kubernetes context for this installation}"
+: "${SLACK_CHANNEL:?Set the bound Slack channel ID}"
+OBS_NAMESPACE=${OBS_NAMESPACE:-observability}
+CURIE_NAMESPACE=${CURIE_NAMESPACE:-curie}
+CURIE_RELEASE=${CURIE_RELEASE:-curie}
+CURIE_AGENT=${CURIE_AGENT:-sre-bot}
+: "${CURIE_WORKLOAD:?Set the curie_workload label used by your alert rules}"
+: "${CURIE_REPOSITORY:?Set the allowlisted owner/repository}"
+: "${CURIE_REVISION:?Set the deployed commit revision}"
+private_dir=$(mktemp -d)
+trap 'rm -rf "$private_dir"' EXIT
+jq -n \
+  --arg workload "$CURIE_WORKLOAD" \
+  --arg repository "$CURIE_REPOSITORY" \
+  --arg revision "$CURIE_REVISION" \
+  '{hook_partitions:{alertmanager:{pointer:"/curie_partition"}},
+    source_bindings:{alertmanager:{workload_pointer:"/commonLabels/curie_workload",
+      map:{($workload):{repository:$repository,revision:$revision}}}}}' \
+  > "$private_dir/hooks.json"
+curie cluster hooks configure "$CURIE_AGENT" --file "$private_dir/hooks.json"
+agent_id=$(curie cluster hooks show "$CURIE_AGENT" --json | jq -er '.id')
+curie cluster hooks secret "$CURIE_AGENT" --json |
+  jq -ej '.secret' > "$private_dir/CURIE_HOOK_SECRET"
+printf 'http://%s-api.%s.svc.cluster.local:8000/hooks/%s/alertmanager?kind=slack&address=%s' \
+  "$CURIE_RELEASE" "$CURIE_NAMESPACE" "$agent_id" "$SLACK_CHANNEL" \
+  > "$private_dir/CURIE_HOOK_URL"
+openssl rand -hex 32 | tr -d '\n' > "$private_dir/token"
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" create secret generic alert-signer-hook \
+  --from-file="$private_dir/CURIE_HOOK_SECRET" \
+  --from-file="$private_dir/CURIE_HOOK_URL" \
+  --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" apply --server-side -f -
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" create secret generic alertmanager-signer-token \
+  --from-file="$private_dir/token" --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" apply --server-side -f -
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" create configmap alert-signer-code \
+  --from-file=server.py=examples/sre-bot/observability/alert-signer/server.py \
+  --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" apply -f -
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" apply \
+  -f examples/sre-bot/observability/alert-signer.yaml
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" rollout status deployment/alert-signer
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" get endpointslice \
+  -l kubernetes.io/service-name=alert-signer -o json |
+  jq -e 'any(.items[].endpoints[]?; .conditions.ready == true)' > /dev/null
+helm --kube-context "$KUBE_CONTEXT" upgrade prometheus prometheus-community/prometheus \
+  --version 29.27.0 -n "$OBS_NAMESPACE" \
+  -f examples/sre-bot/observability/prometheus-values.yaml \
+  -f examples/sre-bot/observability/alertmanager-webhook.yaml \
+  --wait
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" rollout status \
+  statefulset/prometheus-alertmanager
+)
+```
+
+The hook URL uses the agent UUID returned by `hooks show`, not the display
+name. For a custom release, namespace, API service port, or reply channel,
+change those inputs before creating the Secret. Do not paste either credential
+into a command argument, a values file, or a log. The private files above have
+mode 0600 and are removed when the shell exits. If the hook secret or bearer
+token changes later, update the corresponding Secret through private files and
+restart both `deployment/alert-signer` and
+`statefulset/prometheus-alertmanager` so their environment and bearer file are
+read again. Recreate the hook URL Secret if the agent UUID or reply channel
+changes. A changed `server.py` ConfigMap also needs a signer restart.
+
+A genuine signed alert creates one partitioned investigation. Missing,
+ambiguous, or unauthorized mappings visibly stop coding. Invalid signatures
+and replayed delivery ids do not multiply work.
 
 ## What watches the alert path
 
@@ -216,26 +298,24 @@ kubectl -n observability create secret generic alertmanager-heartbeat \
 ```
 
 Then upgrade the Prometheus release with the overlays in this order, the
-heartbeat overlay last. `my-alertmanager.yaml` stands for your own overlay, the
-one that mounts the alert-signer token through `extraSecretMounts`:
+heartbeat overlay last. The webhook overlay supplies the signer token mount:
 
 ```bash
 helm upgrade prometheus prometheus-community/prometheus --version 29.27.0 \
   -n observability \
   -f examples/sre-bot/observability/prometheus-values.yaml \
   -f examples/sre-bot/observability/alertmanager-webhook.yaml \
-  -f my-alertmanager.yaml \
   -f examples/sre-bot/observability/alertmanager-heartbeat.yaml
 ```
 
 The heartbeat overlay goes after the webhook overlay: the other way round the
 config is invalid (`undefined receiver "heartbeat"`). The heartbeat overlay
 mounts its Secret through `extraVolumes` and `extraVolumeMounts` and leaves
-`extraSecretMounts` alone, so your token mount survives. Helm replaces lists,
-so an overlay of yours that sets `extraVolumes` or `extraVolumeMounts`, or
-restates the routes or receivers, collides with it whichever comes last: apply
-yours after it, carrying the heartbeat's entries, with the heartbeat route first
-(the first matching child route wins). Re-running
+`extraSecretMounts` alone, so the webhook token mount survives. Helm replaces
+lists, so a custom overlay that sets `extraSecretMounts` must carry the webhook
+mount too. A custom overlay that sets `extraVolumes` or `extraVolumeMounts`, or
+restates the routes or receivers, must carry the heartbeat entries and put the
+heartbeat route first because the first matching child route wins. Re-running
 `curie example sre-bot install --observability` upgrades the release with
 `prometheus-values.yaml` alone, which removes the overlays and turns
 Alertmanager off; run the command above again after it.
@@ -255,18 +335,41 @@ does not alarm, so after the upgrade confirm the external service shows a first
 post. Only then does a stop in the posts raise its alarm.
 
 The heartbeat cannot see the last leg, from Alertmanager to the bot. Check that
-with one synthetic alert posted to Alertmanager's API:
+with one synthetic alert posted to Alertmanager's API. Use a disposable workload
+that has an entry in `source_bindings.alertmanager.map`, since a mapped alert
+can start a coding investigation:
 
 ```bash
-kubectl -n observability exec prometheus-alertmanager-0 -- \
-  amtool alert add CurieSyntheticDeliveryCheck \
+(
+set -euo pipefail
+: "${KUBE_CONTEXT:?Set the Kubernetes context for this installation}"
+: "${CURIE_WORKLOAD:?Set the configured curie_workload label}"
+OBS_NAMESPACE=${OBS_NAMESPACE:-observability}
+probe_name="CurieSyntheticDeliveryCheck$(date -u +%Y%m%d%H%M%S)"
+kubectl --context "$KUBE_CONTEXT" -n "$OBS_NAMESPACE" exec prometheus-alertmanager-0 -- \
+  amtool alert add "$probe_name" "curie_workload=$CURIE_WORKLOAD" \
   --annotation=summary='Synthetic delivery check' \
   --alertmanager.url=http://localhost:9093
+alerts_path="/api/v1/namespaces/$OBS_NAMESPACE/services/http:prometheus-alertmanager:9093/proxy/api/v2/alerts"
+for attempt in $(seq 1 15); do
+  if kubectl --context "$KUBE_CONTEXT" get --raw "$alerts_path" |
+    jq -e --arg name "$probe_name" --arg workload "$CURIE_WORKLOAD" \
+      'any(.[]; .labels.alertname == $name and
+        .labels.curie_workload == $workload and
+        any(.receivers[]?; .name == "curie-sre"))' > /dev/null; then
+    printf 'Alertmanager routed %s to curie-sre\n' "$probe_name"
+    exit 0
+  fi
+  sleep 2
+done
+printf 'Alertmanager did not route %s to curie-sre\n' "$probe_name" >&2
+exit 1
+)
 ```
 
-Then wait for the bot's reply in the bound channel (`C0EXAMPLE1` above). The
-alert names no workload, so the hook runs the investigation with coding
-stopped and the reply should say so. Because `curie-sre` sets `send_resolved`,
+The API check proves Alertmanager accepted the alert and selected `curie-sre`.
+It does not prove the webhook arrived at Curie. Confirm the bot's investigation
+appears in the bound Slack channel. Because `curie-sre` sets `send_resolved`,
 expect a second, resolved delivery about five minutes later. A missing reply
 means the path is broken somewhere between Alertmanager and the bot.
 

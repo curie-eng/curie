@@ -162,13 +162,32 @@ def test_heartbeat_receiver_reads_its_url_from_the_mounted_secret() -> None:
     )
 
 
-def test_heartbeat_overlay_leaves_extra_secret_mounts_to_the_operator() -> None:
+def test_heartbeat_overlay_preserves_the_webhook_token_mount() -> None:
     alertmanager = _load(HEARTBEAT_OVERLAY)["alertmanager"]
     assert "extraSecretMounts" not in alertmanager, (
-        "the operator's alert-signer token mount lives in extraSecretMounts, "
+        "the webhook token mount lives in extraSecretMounts, "
         "and Helm replaces the list, so setting it here drops that mount or "
         "loses the heartbeat's, whichever overlay is applied last"
     )
+
+
+def test_webhook_overlay_mounts_the_token_read_by_its_receiver() -> None:
+    overlay = _load(WEBHOOK_OVERLAY)
+    webhook = _receivers(overlay)[BOT_RECEIVER]["webhook_configs"][0]
+    token_file = PurePosixPath(webhook["http_config"]["authorization"]["credentials_file"])
+    mounts = overlay["alertmanager"].get("extraSecretMounts") or []
+    matching = [
+        mount
+        for mount in mounts
+        if token_file.is_relative_to(PurePosixPath(mount["mountPath"]))
+    ]
+    assert len(matching) == 1, (
+        f"the webhook token file {token_file} needs one Secret mount; got {mounts}"
+    )
+    mount = matching[0]
+    assert mount["secretName"] == "alertmanager-signer-token"
+    assert mount["readOnly"] is True
+    assert token_file == PurePosixPath(mount["mountPath"]) / "token"
 
 
 def test_heartbeat_overlay_restates_curie_sre_exactly() -> None:

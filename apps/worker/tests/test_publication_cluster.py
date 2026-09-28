@@ -125,6 +125,10 @@ def _payload(
         pr_url=None,
         title="Publish cluster proof",
         body="Approved publication cluster proof.",
+        observed_title_sha256=None,
+        observed_body_sha256=None,
+        github_repository_id=None,
+        github_pr_node_id=None,
     )
 
 

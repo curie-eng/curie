@@ -294,6 +294,24 @@ def substitute(value: str, subs: dict[str, str]) -> str:
     return value
 
 
+def _readiness_probe() -> dict[str, Any]:
+    """``tcpSocket`` on the connector port.
+
+    The connector spec declares no health path today, so the probe checks the
+    one thing every MCP server must do: accept a connection on its port. That
+    catches a server that hangs before binding, fails to bind, or listens on
+    the wrong port (#3058).
+    """
+
+    return {
+        "tcpSocket": {"port": "http"},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 3,
+        "failureThreshold": 3,
+    }
+
+
 def render_deployment(
     release: str,
     agent: str,
@@ -413,6 +431,13 @@ def render_deployment(
                             "env": env,
                             **({"volumeMounts": volume_mounts} if volume_mounts else {}),
                             "ports": [{"name": "http", "containerPort": spec.port}],
+                            # Without a probe, Ready means only "the process
+                            # started", so a server that hangs, fails to bind,
+                            # or listens on the wrong port stays Available and
+                            # CurieConnectorNotReady can never see it (#3058).
+                            # Readiness only, never liveness: a slow upstream
+                            # leaves the Service, it is not restarted in a loop.
+                            "readinessProbe": _readiness_probe(),
                             "securityContext": {
                                 "allowPrivilegeEscalation": False,
                                 "readOnlyRootFilesystem": True,
@@ -485,12 +510,15 @@ def render_ingress_networkpolicy(
     switches it from allow-by-default to deny-by-default for that direction).
     A separate default-deny object would be inert.
 
-    Safe here specifically because the connector Deployment declares no probes:
-    an ingress policy that omits the kubelet would otherwise fail readiness and
-    take the connector out of its Service endpoints -- the failure mode being a
-    connector that is healthy, running, and unreachable. If probes are ever
-    added to ``render_deployment``, this rule has to grow a companion for them
-    in the same commit.
+    The connector Deployment carries a readiness probe (#3058), and this policy
+    deliberately grows no kubelet rule for it. The NetworkPolicy API guarantees
+    it: "When a pod is isolated for ingress, the only allowed connections into
+    the pod are those from the pod's node and those allowed by the ingress list"
+    (kubernetes.io, Network Policies). The kubelet's probe comes from the pod's
+    node, so it needs no ``from``. A CNI that denies it violates that contract
+    and breaks every probed pod behind a policy, not just this one. Adding one would
+    mean an ``ipBlock`` of node addresses: unknowable at render time, and wide
+    enough to readmit every hostNetwork pod this rule exists to keep out.
     """
 
     return {
@@ -581,8 +609,10 @@ def _derived_headers(spec: ConnectorSpec) -> dict[str, Any]:
     single plain string secret (the github-mcp-server shape). A ``SecretRef``
     does not imply client authentication. An explicit ``bearer_secret`` still
     requests a header for that name.
-    A hosted connector with several secrets and no ``bearer_secret`` is refused
-    at validation rather than silently using ``secrets[0]`` (#2559). Remaining
+    A hosted connector with several secrets, any of them a plain string, and no
+    ``bearer_secret`` is refused at validation rather than silently using
+    ``secrets[0]`` (#2559). One whose secrets are all ``SecretRef``s is valid and
+    derives no header (#3057). Remaining
     secrets keep their pod-side ``secretKeyRef`` delivery.
 
     With the header present, a wrong token surfaces from the tool call as
@@ -608,17 +638,17 @@ def unhosted_mcp_entry(spec: ConnectorSpec) -> dict[str, Any] | None:
     point at IS "declared but not exercisable here" (#1093). Mounting a URL that
     resolves nowhere would turn that into a connection refused mid-turn.
 
-    Unlike ``mcp_entry``, this fallback deliberately does not derive the
-    ``Authorization`` header: no non-cluster tier stages the declared secret
-    into the runner env, so there is nothing yet to derive it from (follow-up
-    issue noted in the PR).
+    The ``Authorization`` header is derived here exactly as ``mcp_entry``
+    derives it: the skill and local tiers stage the Bearer secret named by
+    ``_derived_headers`` into the runner env (#2518), so the ``${NAME}``
+    placeholder expands there the same way it does in a cluster sandbox.
     """
 
     if not spec.is_hosted:
         return mcp_entry("", "", "", "", spec)
     if not spec.unhosted_url:
         return None
-    return {"type": "http", "url": spec.unhosted_url}
+    return {"type": "http", "url": spec.unhosted_url, **_derived_headers(spec)}
 
 
 def mcp_entry(

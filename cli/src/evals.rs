@@ -438,6 +438,13 @@ pub fn selection_note(selector: &[String], selected: usize, total: usize) -> Opt
 }
 
 fn parse_suite(path: &Path, body: &[u8]) -> Result<EvalSuite> {
+    #[derive(Deserialize)]
+    struct SuiteEnvelope {
+        #[serde(rename = "name")]
+        _name: String,
+        cases: Vec<serde_json::Value>,
+    }
+
     let value: serde_json::Value = serde_json::from_slice(body)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
     if value.is_array() {
@@ -450,8 +457,38 @@ fn parse_suite(path: &Path, body: &[u8]) -> Result<EvalSuite> {
             path.display()
         );
     }
-    let suite: EvalSuite = serde_json::from_value(value)
-        .with_context(|| format!("{} is not a valid eval suite", path.display()))?;
+    let envelope: SuiteEnvelope = serde_json::from_value(value.clone()).map_err(|err| {
+        let reason = err.to_string();
+        anyhow::Error::new(err).context(format!(
+            "{} is not a valid eval suite: {reason}",
+            path.display()
+        ))
+    })?;
+    let suite: EvalSuite = serde_json::from_value(value).map_err(|err| {
+        let detail = envelope
+            .cases
+            .iter()
+            .enumerate()
+            .find_map(|(index, case)| {
+                serde_json::from_value::<EvalCase>(case.clone())
+                    .err()
+                    .map(|case_err| {
+                        let location = case
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map_or_else(
+                                || format!("case at index {index}"),
+                                |id| format!("case {id:?}"),
+                            );
+                        format!("{location}: {case_err}")
+                    })
+            })
+            .unwrap_or_else(|| err.to_string());
+        anyhow::Error::new(err).context(format!(
+            "{} is not a valid eval suite: {detail}",
+            path.display()
+        ))
+    })?;
     validate_suite(&suite.name, &suite.cases)?;
     Ok(suite)
 }
@@ -768,6 +805,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -878,6 +916,42 @@ mod tests {
             r#"{"name":"s","cases":[{"id":"a","input":"b","grader":{"kind":"llm_judge","expected":"x"}}]}"#,
         );
         assert!(load_suite(&path).is_err());
+    }
+
+    #[test]
+    fn invalid_grader_names_the_case_and_valid_kinds_in_the_human_error() {
+        let (_dir, path) = write(
+            r#"{"name":"s","cases":[{"id":"valid_case","input":"b","grader":{"kind":"contains","expected":"x"}},{"id":"bad_grader_case","input":"b","grader":{"kind":"llm_judge","expected":"x"}}]}"#,
+        );
+        let err = load_suite(&path).unwrap_err();
+        let (shown, _) = crate::exit::present_error(&err);
+        assert!(shown.contains("bad_grader_case"), "{shown}");
+        assert!(shown.contains("unknown variant"), "{shown}");
+        assert!(shown.contains("contains"), "{shown}");
+        assert!(shown.contains("tool_called"), "{shown}");
+    }
+
+    #[test]
+    fn invalid_case_id_does_not_name_a_later_case_with_the_same_serde_error() {
+        let (_dir, path) = write(
+            r#"{"name":"s","cases":[{"id":42,"input":"b","grader":{"kind":"contains","expected":"x"}},{"id":"later_case","input":42,"grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let err = load_suite(&path).unwrap_err();
+        let (shown, _) = crate::exit::present_error(&err);
+        assert!(shown.contains("invalid type"), "{shown}");
+        assert!(shown.contains("case at index 0"), "{shown}");
+        assert!(!shown.contains("later_case"), "{shown}");
+    }
+
+    #[test]
+    fn invalid_suite_name_is_not_attributed_to_a_case_with_the_same_serde_error() {
+        let (_dir, path) = write(
+            r#"{"name":42,"cases":[{"id":"bad_case","input":42,"grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let err = load_suite(&path).unwrap_err();
+        let (shown, _) = crate::exit::present_error(&err);
+        assert!(shown.contains("invalid type"), "{shown}");
+        assert!(!shown.contains("bad_case"), "{shown}");
     }
 
     #[test]

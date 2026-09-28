@@ -111,7 +111,7 @@ spec:
             - name: NEXTAUTH_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
                   key: langfuseNextauthSecret
             # Headless bootstrap: fixed dev org/project + keys so the OTel path
             # authenticates on first boot with no manual key-minting.
@@ -128,7 +128,7 @@ spec:
             - name: LANGFUSE_INIT_PROJECT_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
                   key: langfuseInitProjectSecretKey
             - name: LANGFUSE_INIT_USER_EMAIL
               value: {{ .Values.langfuse.init.userEmail | quote }}
@@ -137,7 +137,7 @@ spec:
             - name: LANGFUSE_INIT_USER_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+                  name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
                   key: langfuseInitUserPassword
           ports:
             - name: http

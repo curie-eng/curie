@@ -25,6 +25,10 @@ struct ClusterCase {
 fn cluster_cases() -> Vec<ClusterCase> {
     vec![
         ClusterCase {
+            name: "lint-values",
+            args: &["lint-values", "-f", "values.yaml"],
+        },
+        ClusterCase {
             name: "up",
             args: &["up", "--fake-model", "--dry-run"],
         },
@@ -106,6 +110,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["surfaces", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "hooks",
+            args: &["hooks", "show", "acme-bot", "--dry-run"],
+        },
+        ClusterCase {
             name: "channel-token",
             args: &["channel-token", "acme-bot", "--show-exp", "--dry-run"],
         },
@@ -147,6 +155,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
         ClusterCase {
             name: "schedules",
             args: &["schedules", "--dry-run"],
+        },
+        ClusterCase {
+            name: "hook",
+            args: &["hook", "fire", "acme-bot", "nightly-cleanup", "--dry-run"],
         },
     ]
 }
@@ -251,7 +263,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 26);
+    assert_eq!(covered_names.len(), 29);
 }
 
 #[test]

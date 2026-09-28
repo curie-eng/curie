@@ -140,8 +140,9 @@ in code now:
   (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`, #411), which re-enqueues
   every owed wake past a grace horizon. In Helm, `api.resumeReconciler.graceSeconds` derives
   from `worker.deliveryBudgetSeconds + worker.deliveryShutdownReserveSeconds`, and an explicit
-  non-null override below that floor is refused at render time so a duplicate resume cannot
-  reach an active turn. Outside Helm, `resume_reconciler_grace_seconds` remains the intentionally
+  non-null override below that floor is refused at render time so the backstop allows the
+  inline delivery its configured lifecycle before retrying. Outside Helm,
+  `resume_reconciler_grace_seconds` remains the intentionally
   conservative 900s Settings fallback. Since #532, it first runs
   `ResumeReconciler.reopen_dead_lettered_resumes` to re-open an approval whose *delivered*
   resume turn died at the worker's ADR-0039 delivery cap and was dead-lettered (`resumed_at`
@@ -151,9 +152,16 @@ in code now:
   wake at all, which the sweeper's own failure log states outright (the resolve endpoint
   compensates for the same switch by re-raising its enqueue failure as a 500 instead of
   deferring, `apps/api/src/curie_api/routers/approvals.py`, but a sweeper flip has no caller
-  to raise to). The reconciler is a backstop, not an unconditional exactly-once guarantee: a
-  worker retry loop can keep a turn live past the grace after an inline mark failure, for
-  which a worker-side in-flight lease is the named follow-up.
+  to raise to). Concurrent copies of the same resume event are serialized in the worker by an
+  event ID claim tied to the active delivery lease. A losing delivery is acknowledged as
+  redundant while the original delivery remains pending under its lease. If the holder crashes,
+  the claim may outlive its delivery lease. A new claimant detects that the recorded winner's
+  lease is gone or its PEL row is absent, then atomically replaces the stale claim so delivery
+  recovery can retry the original delivery. After it reaches terminal completion, the existing
+  marker absorbs later enqueues within the configured idempotency TTL (default 24h). The
+  reconciler remains a backstop, and
+  neither the claim nor the terminal marker guarantees exactly once external side effects across
+  a crash after a side effect or after the marker TTL expires.
 - **The permission gate (landed, #245, #1852).** Per-agent config
   (`agents.approval_required_tools`, forwarded as `CURIE_APPROVAL_REQUIRED_TOOLS` by the
   worker binding) marks tools approval-required. The runner intercepts those calls

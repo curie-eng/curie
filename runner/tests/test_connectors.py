@@ -281,6 +281,26 @@ def test_a_fallback_makes_a_hosted_connector_reachable_at_the_skill_tier(tmp_pat
     assert servers["grafana"]["url"] == "http://host.docker.internal:8765/mcp"
 
 
+def test_the_skill_tier_fallback_carries_the_derived_bearer_header(tmp_path: Path) -> None:
+    # #2518: `skill up` stages the Bearer secret into the runner env, so the
+    # fallback entry must ask for it or the server answers 401.
+    servers = derive_mcp_servers(
+        _bundle(
+            tmp_path,
+            "connectors:\n"
+            "  gh:\n"
+            "    image: ghcr.io/github/github-mcp-server:1\n"
+            "    secrets:\n"
+            "      - GH_PAT\n"
+            "    unhosted_url: http://host.docker.internal:8765/mcp\n",
+        ),
+        release=None,
+        agent=None,
+        namespace=None,
+    )
+    assert servers["gh"]["headers"] == {"Authorization": "Bearer ${GH_PAT}"}
+
+
 def test_the_cluster_still_uses_the_service_it_created(tmp_path: Path) -> None:
     # A fallback that won everywhere would repoint a production agent at
     # someone's laptop. The derived URL must win wherever Curie hosts.

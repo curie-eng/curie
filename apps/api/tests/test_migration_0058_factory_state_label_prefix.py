@@ -159,16 +159,16 @@ def test_0058_downgrade_refuses_a_stored_new_state_label(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
-    command.upgrade(config, "head")
+    command.upgrade(config, "0058")
     try:
         work_item_id, request_id = _seed_request(9103)
         _seed_notice(work_item_id, request_id, NEW)
         assert _applied(request_id) == NEW
-        command.downgrade(config, "0058")
-        head = _revision()
         with pytest.raises(Exception):  # noqa: B017 (the migration raises on purpose)
             command.downgrade(config, "0057")
-        assert _revision() == head
+        # Later expand revisions can roll back. 0058 itself stays applied
+        # because its downgrade refuses a stored new state label.
+        assert _revision() == "0058"
         # Move off the stored value so the check runs, then write the new name again.
         _set_applied(request_id, "")
         _set_applied(request_id, NEW)

@@ -4,6 +4,9 @@
 ``work_item.progress`` sandbox token bound to that request id. The platform key
 is refused here, so the route has one credential.
 
+``POST /v1/work-item-progress/{request_id}/usage`` takes the same token and
+records the turn's per-model token usage (#3223).
+
 ``GET /v1/factory/cards/{token}.svg`` carries no auth dependency: GitHub's image
 proxy sends no credential, so the 64-hex card token is the capability. The
 response is never cached, so the image stays live.
@@ -31,6 +34,7 @@ from ..factory_progress import (
     phase_view,
     record_report,
 )
+from ..factory_usage import PriceBook, UsageReport, get_price_book, record_usage
 from ..models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
@@ -89,6 +93,32 @@ async def report_work_item_progress(
     return {"recorded": True, "request_id": str(result.request_id)}
 
 
+@router.post(
+    "/v1/work-item-progress/{request_id}/usage",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_progress_token)],
+)
+async def report_work_item_usage(
+    request_id: uuid.UUID,
+    body: UsageReport,
+    session: SessionDep,
+    price_book: Annotated[PriceBook, Depends(get_price_book)],
+) -> Any:
+    """Record one turn's per-model token usage on the token's request (#3223).
+
+    A replayed turn is a no-op that still answers 201, so the runner's retry
+    is safe.
+    """
+
+    if not await record_usage(
+        session, request_id=request_id, body=body, price_book=price_book
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"code": "request_not_found"}
+        )
+    return {"recorded": True, "request_id": str(request_id)}
+
+
 @router.get(
     "/v1/factory/cards/{token}.svg",
     response_class=Response,
@@ -143,7 +173,7 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             terminal_at=request.terminal_at,
             now=datetime.now(UTC),
             activity=row.activity,
-            note=reports[-1].note if reports else None,
+            note=next((report.note for report in reversed(reports) if report.note), None),
             phase_view=phase_view(
                 row.declaration or {"phases": [], "loops": []},
                 reports,
@@ -153,6 +183,8 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             cause_text=(
                 cause_text(terminal) if terminal and terminal != "completed" else None
             ),
+            needs_human=request.status == "failed"
+            and terminal in {"runner_escalated", "ci_failed"},
         )
     )
     return Response(

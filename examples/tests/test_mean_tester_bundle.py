@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
     PluginManifest,
@@ -72,13 +73,29 @@ def _cases() -> list[dict]:
     return json.loads((BUNDLE / "evals" / "cases.json").read_text())["cases"]
 
 
+def _only_the_unbuilt_runner_layer(errors: list) -> bool:
+    """The shipped bundle's one intake error is its unbuilt runner layer (#3420).
+
+    Its stdio MCP servers live in the layer `curie build` builds and locks for
+    the operator's own registry, so the checkout carries no lock and intake
+    refuses it until that build runs. Anything else is a real defect."""
+
+    return [(e.code, e.message.split(":", 1)[0]) for e in errors] == [
+        ("connectors.lock_missing", "runner")
+    ]
+
+
 def test_the_bundle_validates():
     result = validate_bundle(BUNDLE, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
-    assert result.valid, result.errors
+    assert _only_the_unbuilt_runner_layer(result.errors), result.errors
 
 
 def test_there_is_no_custom_connector():
-    assert not (BUNDLE / "connectors.yaml").exists()
+    # connectors.yaml declares only the runner layer that carries the two
+    # off-the-shelf stdio servers (#3420), never a connector of its own.
+    declared = yaml.safe_load((BUNDLE / "connectors.yaml").read_text())
+    assert declared["connectors"] == {}
+    assert declared["runner"]["build"]["dockerfile"] == "runner.Dockerfile"
     assert not (BUNDLE / "connectors").exists()
 
 

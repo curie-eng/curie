@@ -8,6 +8,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
@@ -1652,8 +1653,12 @@ class PublicationCreate(BaseModel):
     base_sha: str
     work_item_request_id: uuid.UUID | None = None
     work_item_runtime_epoch: int | None = Field(default=None, ge=1)
-    patch_b64: str = Field(min_length=1)
-    changed_paths: list[str] = Field(min_length=1, max_length=4096)
+    observed_title: str | None = Field(default=None, max_length=256)
+    observed_body_sha256: str | None = Field(default=None, pattern=r"[0-9a-f]{64}")
+    observed_lineage_id: uuid.UUID | None = None
+    observed_lineage_version: int | None = Field(default=None, ge=1)
+    patch_b64: str
+    changed_paths: list[str] = Field(max_length=4096)
     expires_in_seconds: int | None = Field(default=None, ge=1)
     title: str | None = Field(default=None, max_length=256)
     body: str | None = Field(default=None, max_length=65_536)
@@ -1819,6 +1824,7 @@ class PublicationLineageAdvance(BaseModel):
     pr_number: int = Field(gt=0)
     pr_url: str = Field(min_length=1, max_length=2048)
     head_sha: str
+    metadata_updated_at: AwareDatetime | None
 
     @field_validator("expected_head_sha", "head_sha")
     @classmethod
@@ -1958,6 +1964,56 @@ class WorkItemCiOut(BaseModel):
     reason: str | None = None
     head_sha: str | None = None
     observed_at: datetime | None = None
+
+
+class WorkItemUsageRole(BaseModel):
+    """Tokens and estimate of one role (#3223). The estimate covers priced rows only."""
+
+    tokens: int = 0
+    estimated_cost_usd: Decimal | None = None
+    cost_complete: bool = True
+
+
+class WorkItemUsageModel(BaseModel):
+    model: str
+    role: Literal["implementer", "reviewer"]
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: Decimal | None = None
+
+
+class WorkItemUsageRequest(BaseModel):
+    request_id: uuid.UUID
+    tokens: int = 0
+    estimated_cost_usd: Decimal | None = None
+
+
+class WorkItemUsagePriceSource(BaseModel):
+    source: str
+    as_of: datetime
+
+
+class WorkItemUsageOut(BaseModel):
+    """Token usage and estimated cost summed over every request of a WorkItem (#3223).
+
+    ``cost_complete`` is false when any reported model had no price, and then
+    ``estimated_cost_usd`` covers only the priced models. It is also false when
+    ``requests_without_usage`` (started requests with no usage report) is > 0.
+    """
+
+    work_item_id: uuid.UUID
+    total_tokens: int
+    estimated_cost_usd: Decimal | None
+    cost_complete: bool
+    requests_without_usage: int = 0
+    roles: dict[str, WorkItemUsageRole]
+    models: list[WorkItemUsageModel]
+    requests: list[WorkItemUsageRequest]
+    price_sources: list[WorkItemUsagePriceSource]
+    pr_number: int | None = None
+    pr_url: str | None = None
 
 
 class WorkItemOutcomeOut(BaseModel):
@@ -2825,6 +2881,15 @@ class ScheduleHookOut(BaseModel):
     zone: str
     last_fire_at: datetime | None
     last_outcome: ScheduleOutcome | None
+    paused: bool
+
+
+class ScheduleControlOut(BaseModel):
+    """Current operator pause state for a named cron hook."""
+
+    agent: str
+    name: str
+    paused: bool
 
 
 class AgentSchedulesOut(BaseModel):
@@ -2840,3 +2905,17 @@ class ScheduleListOut(BaseModel):
     """Every in-force cron hook the platform can see."""
 
     schedules: list[AgentSchedulesOut]
+
+
+class HookFireOut(BaseModel):
+    """One test-fire run record. `outcome` is null while the turn is in flight."""
+
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    agent: str
+    name: str
+    trigger: str
+    slot_utc: datetime
+    outcome: ScheduleOutcome | None
+    started_at: datetime
+    ended_at: datetime | None

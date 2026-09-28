@@ -58,7 +58,15 @@ def _die_like(signum: int) -> int:
         resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
     except (OSError, ValueError):
         return 128 + signum
-    signal.signal(signum, signal.SIG_DFL)
+    # signal() refuses SIGKILL, whose disposition cannot change, and GNU
+    # ignores that refusal too: the kill below still ends this process by it.
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+    except OSError:
+        pass
+    # timeout() keeps the signals it holds blocked once the command has
+    # exited, and a blocked one would only be left pending.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signum})
     os.kill(os.getpid(), signum)
     return 128 + signum
 
@@ -103,26 +111,50 @@ def timeout(arguments: list[str]) -> int:
 
     for signum in (signal.SIGALRM, *FORWARDED_SIGNALS):
         signal.signal(signum, forward)
-    # Held until the child is recorded: a command can start before Popen
-    # returns, and a signal that arrived then would otherwise be lost with it.
-    held = {signal.SIGALRM, *FORWARDED_SIGNALS}
-    signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    # Handled, so the command's exit ends the wait below. It also clears an
+    # inherited SIG_IGN, under which the kernel would reap the command itself.
+    signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
+    # CPython runs a Python handler only between bytecodes, so a signal that
+    # lands just as a blocking wait starts would be handled only once the wait
+    # returned. The C level handler writes a byte here for every signal Python
+    # handles, and the wait is a read of it, so any such signal ends the wait.
+    # os.pipe() is not inherited, so neither end reaches the command.
+    wake_read, wake_write = os.pipe()
+    os.set_blocking(wake_write, False)
+    signal.set_wakeup_fd(wake_write, warn_on_full_buffer=False)
+    # Held across Popen: a command can start before Popen returns, and a
+    # signal that arrived then would otherwise be lost with it.
+    held = {signal.SIGALRM, signal.SIGCHLD, *FORWARDED_SIGNALS}
+    original = signal.pthread_sigmask(signal.SIG_BLOCK, held)
     try:
+        # The command starts with the mask this process started with, less
+        # SIGCHLD and SIGALRM, which GNU 9.5 unblocks before it saves the mask.
         state["child"] = subprocess.Popen(
             command,
             close_fds=False,
-            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, held),
+            preexec_fn=lambda: signal.pthread_sigmask(
+                signal.SIG_SETMASK, original - {signal.SIGCHLD, signal.SIGALRM}
+            ),
         )
     except OSError as error:
-        return _cannot_run("timeout", command[0], error)
-    finally:
+        status = _cannot_run("timeout", command[0], error)
+        # One that arrived meanwhile exits 128 + sig, as GNU's child does before exec.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+        return status
     # Not stopped when a command in a background group touches the terminal.
     signal.signal(signal.SIGTTIN, signal.SIG_IGN)
     signal.signal(signal.SIGTTOU, signal.SIG_IGN)
     if seconds:
         signal.setitimer(signal.ITIMER_REAL, seconds)
-    returncode = state["child"].wait()
+    # Polled only while held, so no handler can signal a pid already reaped:
+    # handlers run from the unblock through the block that follows it, never
+    # after the poll that reaps the command. The signals stay held after the
+    # loop, as GNU keeps them after its waitpid.
+    while state["child"].poll() is None:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+        os.read(wake_read, 512)
+        signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    returncode = state["child"].returncode
 
     if returncode >= 0:
         return EXIT_TIMEDOUT if state["timed_out"] else returncode

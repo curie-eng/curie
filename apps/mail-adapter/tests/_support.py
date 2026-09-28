@@ -33,8 +33,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, cast
 
 from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
@@ -489,6 +490,42 @@ def serve(handler: type[BaseHTTPRequestHandler], state: Any) -> ThreadingHTTPSer
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+@contextmanager
+def refused_agentmail_connection() -> Iterator[str]:
+    """Reserve a loopback port without listening so an HTTP dial gets ECONNREFUSED."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}/v0"
+
+
+class _ThreadThenRefuseHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = b'{"messages":[]}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.server.server_close()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+@contextmanager
+def refused_agentmail_reply() -> Iterator[str]:
+    """Serve the witness read, then refuse the following reply connection."""
+    server = HTTPServer(("127.0.0.1", 0), _ThreadThenRefuseHandler)
+    server.timeout = 5
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/v0"
+    finally:
+        server.server_close()
+        thread.join(5)
 
 
 # --- the neutral reply wire the platform speaks to the adapter ---------------

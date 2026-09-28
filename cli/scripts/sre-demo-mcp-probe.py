@@ -30,7 +30,7 @@ async def probe_session(session, expected_namespace):
         # unavailable transport cannot pass this negative control.
         refused = exc.code in {-32601, -32602} and bool(
             re.search(
-                r"unknown tool[: ]+configuration_view\b|"
+                r"unknown tool[: ]+[\"']?configuration_view\b|"
                 r"tool [\"']?configuration_view[\"']? "
                 r"(?:not found|not available|does not exist)\b",
                 exc.message,
@@ -41,7 +41,7 @@ async def probe_session(session, expected_namespace):
         text = forbidden.model_dump_json()
         refused = forbidden.is_error and bool(
             re.search(
-                r"unknown tool[: ]+configuration_view\b|"
+                r"unknown tool[: ]+[\"']?configuration_view\b|"
                 r"tool [\"']?configuration_view[\"']? "
                 r"(?:not found|not available|does not exist)\b",
                 text,

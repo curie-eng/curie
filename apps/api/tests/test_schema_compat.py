@@ -43,6 +43,7 @@ ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
 # The window floor: the newest contract revision (0061, ADR-0168 decision 3).
 APP_SCHEMA_MIN = "0061"
+REVIEW_SCHEMA_MIN = "0060"
 PREV = "0040"
 
 
@@ -96,6 +97,8 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
+    assert kinds[APP_SCHEMA_MIN] == KIND_CONTRACT
+    assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
     if HEAD != APP_SCHEMA_MIN:
         assert kinds[HEAD] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND

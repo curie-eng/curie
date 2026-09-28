@@ -354,8 +354,7 @@ def _pick_lineage(
     item: WorkItem, lineages: Iterable[ThreadPublicationLineage]
 ) -> ThreadPublicationLineage | None:
     """The linked lineage when set; otherwise the conversation's lineage for the
-    same agent and repository, open first, then newest (D2: nothing links
-    ``publication_lineage_id`` in production yet)."""
+    same agent and repository, open first, then newest for older unlinked rows."""
 
     candidates = list(lineages)
     if item.publication_lineage_id is not None:
@@ -932,7 +931,8 @@ async def _observe_ci_detail(
                 return None, "malformed_response"
 
         runs_payload, reason = await get(
-            f"/commits/{head_sha}/check-runs", {"per_page": CHECK_RUNS_PAGE}
+            f"/commits/{head_sha}/check-runs",
+            {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
         )
         if reason is None:
             reason = _check_runs_reason(runs_payload)

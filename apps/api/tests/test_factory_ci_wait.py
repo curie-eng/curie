@@ -155,6 +155,8 @@ async def _attach_fix_async(
     head_sha: str,
     title: str,
     paths: list[str],
+    body: str = "Approved platform publication.",
+    base_sha: str = "0123456789abcdef0123456789abcdef01234567",
     status: str = "succeeded",
 ) -> uuid.UUID:
     """A fix round's publication for the SAME request, advancing the lineage head."""
@@ -202,12 +204,14 @@ async def _attach_fix_async(
                     "(id, approval_id, deployment_id, workspace_conversation_id, "
                     "lineage_id, execution_request_id, revision_number, repo_full_name, "
                     "status, base_sha, changed_paths, title, body, reply_kind, "
-                    "reply_channel, result_url, terminal_at) "
+                    "reply_channel, result_url, terminal_at, metadata_updated_at) "
                     "VALUES (:id, :approval, :deployment, :conversation, :lineage, "
                     ":request_id, :revision, :repo, :status, :base, "
-                    "CAST(:paths AS jsonb), :title, 'Approved platform publication.', "
+                    "CAST(:paths AS jsonb), :title, :body, "
                     "'github', :channel, :result, "
                     + ("clock_timestamp()" if terminal else "NULL")
+                    + ", "
+                    + ("clock_timestamp()" if terminal and not paths else "NULL")
                     + ")"
                 ),
                 {
@@ -220,9 +224,10 @@ async def _attach_fix_async(
                     "revision": revision,
                     "repo": REPO,
                     "status": status,
-                    "base": "0123456789abcdef0123456789abcdef01234567",
+                    "base": base_sha,
                     "paths": json.dumps(paths),
                     "title": title,
+                    "body": body,
                     "channel": REPO,
                     "result": item["pr_url"] if terminal else None,
                 },
@@ -252,6 +257,8 @@ def _attach_fix(
     head_sha: str,
     title: str,
     paths: list[str],
+    body: str = "Approved platform publication.",
+    base_sha: str = "0123456789abcdef0123456789abcdef01234567",
     status: str = "succeeded",
 ) -> uuid.UUID:
     return asyncio.run(
@@ -262,6 +269,8 @@ def _attach_fix(
             head_sha=head_sha,
             title=title,
             paths=paths,
+            body=body,
+            base_sha=base_sha,
             status=status,
         )
     )
@@ -622,6 +631,142 @@ def test_a_green_fix_round_completes_the_same_request(admitted: Any) -> None:
     assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
     assert len(_notices(published["id"])) == 1
     assert _count_requests(number) == 1
+
+
+def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9707
+    old_time = "2020-01-01T00:00:00Z"
+    new_time = "2999-01-01T00:00:00Z"
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(
+                check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
+            ),
+            ci_entry(
+                check_run("PR body (real newlines)", started_at=old_time),
+                check_run("unrelated", started_at=new_time),
+            ),
+            ci_entry(check_run("PR body (real newlines)", started_at=new_time)),
+        ]
+    }
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Fix the test",
+        paths=[],
+        body="Corrected pull request body for the failing CI check.",
+        base_sha=HEAD_A,
+    )
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    _reconcile_later(21)
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
+    assert _count_requests(number) == 1
+
+
+def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9790
+    old_time = "2020-01-01T00:00:00Z"
+    new_time = "2999-01-01T00:00:00Z"
+    old_failure = check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(old_failure),
+            ci_entry(old_failure, check_run("unrelated", started_at=new_time)),
+        ]
+    }
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Correct the pull request body",
+        paths=[],
+        body="Corrected pull request body for the failing CI check.",
+        base_sha=HEAD_A,
+    )
+
+    _reconcile()
+    _reconcile_later(130)
+    assert _terminal(number) == ("running", None)
+    assert len(_ci_turns(published["id"])) == 1
+    assert _terminal_notices(published["id"]) == []
+
+    _reconcile_later(1300)
+    assert _terminal(number) == ("failed", "ci_unverified")
+    assert len(_ci_turns(published["id"])) == 1
+    assert "Reason: checks_not_rerun" in _body(sink, published["id"])
+
+
+def test_body_only_fix_reports_only_a_fresh_unrelated_failure(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9791
+    old_time = "2020-01-01T00:00:00Z"
+    new_time = "2999-01-01T00:00:00Z"
+    old_failure = check_run(
+        "PR body (real newlines)",
+        conclusion="failure",
+        summary="Old body failure",
+        started_at=old_time,
+    )
+    old_status = {
+        "context": "ci/pr-body",
+        "state": "failure",
+        "description": "Old status failure",
+        "created_at": old_time,
+    }
+    fresh_failure = check_run(
+        "unit-tests", conclusion="failure", summary="Fresh test failure", started_at=new_time
+    )
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(old_failure, statuses=(old_status,)),
+            ci_entry(old_failure, fresh_failure, statuses=(old_status,)),
+        ]
+    }
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Correct the pull request body",
+        paths=[],
+        body="Corrected pull request body for the failing CI check.",
+        base_sha=HEAD_A,
+    )
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    turns = _ci_turns(published["id"])
+    assert [turn["event_id"] for turn in turns] == [
+        f"work-item-{published['id']}-ci-2",
+        f"work-item-{published['id']}-ci-3",
+    ]
+    report = json.loads(turns[1]["text"].splitlines()[3])
+    assert [check["name"] for check in report["failing_checks"]] == ["unit-tests"]
+    assert report["failing_statuses"] == []
+    assert "Fresh test failure" in turns[1]["text"]
+    assert "Old body failure" not in turns[1]["text"]
+    assert "Old status failure" not in turns[1]["text"]
 
 
 # --- A fix turn that ends without publishing ---------------------------------------

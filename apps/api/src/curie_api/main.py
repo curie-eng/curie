@@ -58,6 +58,7 @@ from .routers import (
     gitflow_routing,
     github,
     github_reviews,
+    hook_fire,
     hooks,
     memory,
     observability,
@@ -119,6 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.sessionmaker,
         valkey,
         settings,
+        http_client,
     )
     app.state.github_review_reconciler_task = (
         asyncio.create_task(app.state.github_review_reconciler.run_forever())
@@ -403,6 +405,7 @@ def create_app() -> FastAPI:
     app.include_router(evals.router)
     app.include_router(runs.router)
     app.include_router(schedules.router)
+    app.include_router(hook_fire.router)
     app.include_router(state.router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise

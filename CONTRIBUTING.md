@@ -225,6 +225,13 @@ CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
+The schema window gate requires the candidate window to match the Alembic head
+and the API window in `apps/api/src/curie_api/schema_compat.json`. It also
+requires the chart version's window to match the candidate. If a migration
+lands after the chart version is registered in the architecture atlas, bump
+the chart and CLI to a new version first. While the version is unregistered,
+rerun `curie dev bump-version` after the migration to refresh its window.
+
 Tag v0.7.0 from `main` only after both commands pass. Only an administrator may
 retire `next`. Before deleting it, the administrator must merge one release
 workflow and contract test change that removes `next` from the workflow trigger

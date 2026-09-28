@@ -823,6 +823,31 @@ def test_a_hosted_connector_with_a_fallback_is_reachable_where_it_cannot_be_host
     }
 
 
+def test_the_fallback_derives_the_bearer_header_the_tier_now_stages() -> None:
+    # #2518: skill and local stage the Bearer secret into the runner env, so the
+    # fallback carries the same derived header `mcp_entry` does on a cluster.
+    spec = ConnectorSpec(
+        image="x:1", secrets=["GH_PAT"], unhosted_url="http://host.docker.internal:8765/mcp"
+    )
+    assert r.unhosted_mcp_entry(spec) == {
+        "type": "http",
+        "url": "http://host.docker.internal:8765/mcp",
+        "headers": {"Authorization": "Bearer ${GH_PAT}"},
+    }
+
+
+def test_the_fallback_honors_an_explicit_bearer_secret() -> None:
+    spec = ConnectorSpec(
+        image="x:1",
+        secrets=["A", "B"],
+        bearer_secret="B",
+        unhosted_url="http://host.docker.internal:8765/mcp",
+    )
+    entry = r.unhosted_mcp_entry(spec)
+    assert entry is not None
+    assert entry["headers"] == {"Authorization": "Bearer ${B}"}
+
+
 def test_a_hosted_connector_with_no_fallback_mounts_nothing_rather_than_a_dead_url() -> None:
     # None is a real answer: "declared but not exercisable here" (#1093). A URL
     # that resolves nowhere would turn that into a connection refused mid-turn.
@@ -1679,3 +1704,47 @@ def test_derived_bearer_header_matches_the_frozen_vector(vector: dict) -> None:
         assert authorization is None, vector["name"]
     else:
         assert authorization == f"Bearer ${{{expected}}}", vector["name"]
+
+
+# -- readiness (#3058) --------------------------------------------------------
+
+
+def _server(spec: ConnectorSpec) -> dict:
+    (dep,) = [o for o in _objs(spec=spec) if o["kind"] == "Deployment"]
+    (container,) = dep["spec"]["template"]["spec"]["containers"]
+    return container
+
+
+def test_connector_gets_a_tcp_readiness_probe_on_its_own_port() -> None:
+    # A server that never binds (the `sleep infinity` break test) stayed
+    # 1/1 Available because Ready meant only "the process started".
+    container = _server(HOSTED)
+    probe = container["readinessProbe"]
+    assert probe["tcpSocket"] == {"port": "http"}
+    assert "httpGet" not in probe
+    # "http" must name the port the server actually listens on.
+    assert {"name": "http", "containerPort": HOSTED.port} in container["ports"]
+    moved = _server(HOSTED.model_copy(update={"port": 9100}))
+    assert moved["readinessProbe"]["tcpSocket"] == {"port": "http"}
+    assert {"name": "http", "containerPort": 9100} in moved["ports"]
+
+
+def test_connector_never_gets_a_liveness_or_startup_probe() -> None:
+    # A slow upstream must leave the Service, not be restarted in a loop.
+    for spec in (HOSTED, HOSTED.model_copy(update={"port": 9100})):
+        container = _server(spec)
+        assert "livenessProbe" not in container
+        assert "startupProbe" not in container
+
+
+def test_every_shipped_sre_bot_connector_renders_a_readiness_probe() -> None:
+    root = Path(__file__).resolve().parents[3]
+    data = yaml.safe_load((root / "examples" / "sre-bot" / "connectors.yaml").read_text())
+    parsed, errors = validate_connectors(data)
+    assert errors == [] and parsed is not None
+    hosted = {n: s for n, s in parsed.connectors.items() if s.is_hosted}
+    assert {"kubernetes", "grafana", "tempo"} <= set(hosted)
+    for name, spec in hosted.items():
+        dep = r.render_deployment("curie", "sre-bot", "curie", name, spec, "s")
+        (container,) = dep["spec"]["template"]["spec"]["containers"]
+        assert "readinessProbe" in container, name

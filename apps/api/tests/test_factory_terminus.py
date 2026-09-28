@@ -86,6 +86,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "workspace_error",
         "runner_escalated",
         "runner_failed",
+        "approval_create_failed",
         "no_pull_request",
         "execution_deadline",
         "capacity_wait_expired",
@@ -197,12 +198,14 @@ def check_run(
     title: str | None = None,
     summary: str | None = None,
     run_id: int | None = None,
+    started_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": run_id if run_id is not None else next(_CHECK_IDS),
         "name": name,
         "status": status,
         "conclusion": conclusion if status == "completed" else None,
+        "started_at": started_at,
         "output": {"title": title, "summary": summary},
     }
 
@@ -748,6 +751,63 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     assert _request(number)["version"] == version
 
 
+def test_approval_create_failure_posts_terminal_issue_notice_and_clears_running_label(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9294
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    sink.issue_labels.setdefault(number, set()).add("curie:running")
+
+    failed = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "approval_create_failed",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+    _reconcile()
+
+    assert _request(number)["terminal_cause"] == "approval_create_failed"
+    assert sink.posts == 1
+    assert sink.comments[0]["body"].startswith("Could not complete:")
+    assert "curie:running" not in sink.issue_labels[number]
+    assert "curie-factory:needs-human" in sink.issue_labels[number]
+
+
+def test_approval_create_failure_after_first_publication_ends_ci_fix_round(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9295
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    _attach_publication(row["work_item_id"], status="succeeded", pr=4295)
+    sink.issue_labels.setdefault(number, set()).add("curie:running")
+
+    failed = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "approval_create_failed",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+    _reconcile()
+
+    assert _request(number)["terminal_cause"] == "approval_create_failed"
+    assert sink.comments[0]["body"].startswith("Could not complete:")
+    assert "curie:running" not in sink.issue_labels[number]
+
+
 def test_credit_exhausted_finish_comments_the_redacted_provider_message(
     admitted: Any,
 ) -> None:
@@ -818,7 +878,10 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
     _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
 
 
-def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any) -> None:
+@pytest.mark.parametrize("cause", ["early_stop", "approval_create_failed"])
+def test_an_early_stop_finish_defers_to_an_in_flight_publication(
+    admitted: Any, cause: str
+) -> None:
     """#3128: like ``no_pull_request``, publication owns the terminus."""
 
     client, github, sink = admitted
@@ -834,7 +897,7 @@ def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any) 
         json={
             "runtime_epoch": epoch,
             "outcome": "failed",
-            "cause": "early_stop",
+            "cause": cause,
             "detail": "stopping",
         },
     )

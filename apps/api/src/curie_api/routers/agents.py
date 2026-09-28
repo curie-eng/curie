@@ -9,15 +9,16 @@ from pathlib import Path
 from typing import NoReturn
 
 from aci_protocol.turn import route_identity
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
 from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
+from pydantic import BaseModel
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud, deploy
+from .. import bundles, crud, deploy, hook_signing
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
@@ -39,6 +40,10 @@ from ..schemas import (
 )
 
 router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
+
+
+class HookSecretOut(BaseModel):
+    secret: str
 
 # Postgres SQLSTATE for a unique_violation. asyncpg exposes it (and the
 # violated constraint's name) as plain attributes on the wrapped driver
@@ -161,6 +166,23 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return AgentOut.model_validate(agent)
+
+
+@router.get("/{agent_id}/hook-secret", response_model=HookSecretOut)
+async def get_hook_secret(
+    agent_id: uuid.UUID, session: SessionDep, response: Response
+) -> HookSecretOut:
+    agent = await crud.get_agent(session, agent_id)
+    if agent is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    response.headers["Cache-Control"] = "no-store"
+    return HookSecretOut(
+        secret=hook_signing.derive(
+            get_settings().api_key,
+            agent_id=str(agent.id),
+            generation=agent.hook_generation,
+        )
+    )
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)

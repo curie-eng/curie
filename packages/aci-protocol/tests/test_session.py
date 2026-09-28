@@ -178,6 +178,7 @@ def _full_boot_env() -> BootEnv:
         progress_token="sbx-progress-token",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
+        approval_grant_arguments={"command": "printf ok"},
         approval_resumed_kind="policy",
         approval_decision="approved",
         connector_secret_keys=["GITHUB_TOKEN", "LINEAR_API_KEY"],
@@ -189,7 +190,9 @@ def _full_boot_env() -> BootEnv:
         base_url="http://litellm:4000",
         api_backend="messages",
         thinking="disabled",
+        deployment_environment="prod",
         model_env_key="MY_PROVIDER_KEY",
+        metrics_temporality_preference="delta",
         max_turns=50,
         history_max_turns=10,
         history_max_bytes=2048,
@@ -543,6 +546,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         credentials_ref="k8s://secret/demo",
         api_backend="messages",
         thinking="disabled",
+        deployment_environment="prod",
         model_env_key="MY_PROVIDER_KEY",
         state_url="http://api:8000/agents/agent-abc/state",
         state_token="st-scoped-token",
@@ -571,6 +575,7 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS",
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
         "CURIE_PROGRESS_URL",
@@ -628,6 +633,7 @@ def test_from_env_on_the_worker_subset_alone_raises() -> None:
 def test_from_env_parses_the_resume_overlay() -> None:
     overlay = {
         "CURIE_APPROVAL_GRANT_TOOL": "Bash",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS": '{"command":"printf ok","options":{"flags":["a"]}}',
         "CURIE_APPROVAL_RESUMED_KIND": "policy",
     }
     boot = BootEnv.from_env(
@@ -637,6 +643,7 @@ def test_from_env_parses_the_resume_overlay() -> None:
     )
     assert boot.approval_required_tools == ["Bash", "mcp__github__create_pr"]
     assert boot.approval_grant_tool == "Bash"
+    assert boot.approval_grant_arguments == {"command": "printf ok", "options": {"flags": ["a"]}}
     assert boot.approval_resumed_kind == "policy"
 
 
@@ -787,6 +794,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_PROGRESS_TOKEN",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS",
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
         "CURIE_CONNECTOR_SECRET_KEYS",
@@ -798,7 +806,9 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "ANTHROPIC_BASE_URL",
         "CURIE_MODEL_API_BACKEND",
         "CURIE_THINKING",
+        "CURIE_DEPLOYMENT_ENVIRONMENT",
         "CURIE_MODEL_ENV_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
@@ -881,6 +891,7 @@ def test_the_substrate_writes_identity_otel_and_the_warm_pool_defaults() -> None
         "CURIE_RUNNER_PORT",
         "OTEL_EXPORTER_OTLP_ENDPOINT",  # agent-sandbox.yaml:433
         "OTEL_EXPORTER_OTLP_PROTOCOL",  # agent-sandbox.yaml:435
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         # Worker-authoritative with a substrate fallback: the chart bakes a
         # warm-pool default into the runner container so an unclaimed pod boots
         # resolvable, and the worker's per-claim value legitimately wins under

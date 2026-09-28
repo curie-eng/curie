@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+FIX_PIN_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "fix-pin.yaml"
 
 
 def _invoke_selector(
@@ -90,7 +91,7 @@ def _named_steps() -> dict[str, dict[str, Any]]:
 
 
 def _fix_pin_named_steps() -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    workflow = yaml.safe_load(WORKFLOW.read_text())
+    workflow = yaml.safe_load(FIX_PIN_WORKFLOW.read_text())
     job = workflow["jobs"]["fix-pin"]
     assert isinstance(job, dict)
     return job, {
@@ -312,8 +313,8 @@ def test_the_fix_pin_gate_left_the_python_job() -> None:
 
 def test_cargo_guard_if_is_unchanged() -> None:
     job, named = _fix_pin_named_steps()
-    # The job carries the pull-request condition for every step in it.
-    assert _string(job, "if") == "github.event_name == 'pull_request'"
+    # The workflow trigger confines every step to pull requests.
+    assert "if" not in job
 
     probe = named["Decide whether the current curie binary is needed"]
     assert probe["id"] == "fix-pin-curie"

@@ -1177,6 +1177,7 @@ fn skill_message_awaiting_approval_output_preserves_final_approval_fields() {
         approval_route: Some("reviewers".to_string()),
         approval_gate_kind: Some("permission".to_string()),
         approval_granted_tool: Some("ExampleTool".to_string()),
+        approval_granted_arguments: None,
         approval_display: None,
         input_tokens: Some(10),
         output_tokens: Some(5),
@@ -1210,6 +1211,7 @@ fn skill_message_awaiting_approval_output_is_not_finalized() {
         approval_route: Some("reviewers".to_string()),
         approval_gate_kind: Some("policy".to_string()),
         approval_granted_tool: None,
+        approval_granted_arguments: None,
         approval_display: None,
         input_tokens: None,
         output_tokens: None,
@@ -1247,6 +1249,7 @@ fn skill_message_only_marks_awaiting_approval_as_not_finalized() {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -1921,6 +1924,8 @@ fn doctor_output_validates() {
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
         target: Some(("acme".to_string(), "acme".to_string())),
+        declared_installation: false,
+        apply_context: None,
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },
@@ -2001,6 +2006,8 @@ fn doctor_ready_tracks_the_checks() {
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
         target: Some(("acme".to_string(), "acme".to_string())),
+        declared_installation: false,
+        apply_context: None,
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },
@@ -2332,6 +2339,7 @@ fn approvals_output_validates_all_variants() {
     let pending = ApprovalsOutput::Pending {
         agent: "d".to_string(),
         records: vec![approval_record()],
+        routes: Default::default(),
         truncated: false,
     };
     assert_valid("approvals.schema.json", &pending.to_json());

@@ -9,6 +9,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal, Protocol, cast
 
 from channel_protocol import MESSAGE_VERSION, Action, ConfirmIntent, OutboundMessage
@@ -37,6 +38,7 @@ _PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$",
 _PR_NUMBER_MARKER = re.compile(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", re.MULTILINE)
 _COMMIT_MARKER = re.compile(r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", re.MULTILINE)
 _PR_STATE_MARKER = re.compile(r"^CURIE_PR_STATE=(closed|merged)$", re.MULTILINE)
+_PR_UPDATED_MARKER = re.compile(r"^CURIE_PR_UPDATED_AT=([^\s]+)$", re.MULTILINE)
 # How many CONSECUTIVE unavailable identity reads one publication may escape
 # reconcile() uncharged before it falls back to the ordinary bounded path.
 # publication_authority.py maps 401, 403, 404, 429 and every 5xx onto
@@ -115,11 +117,15 @@ class PublicationWork:
     branch: str
     pr_number: int | None
     pr_url: str | None
+    github_repository_id: int | None
+    github_pr_node_id: str | None
     expected_prior_head: str
     expected_remote_head: str | None
     base_sha: str
     patch: bytes
     changed_paths: tuple[str, ...]
+    observed_title_sha256: str | None
+    observed_body_sha256: str | None
     title: str
     body: str
     target: ReplyTarget
@@ -163,6 +169,7 @@ class PublicationStore(Protocol):
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        metadata_updated_at: datetime | None,
     ) -> None | Awaitable[None]: ...
 
     def pending_result(self, publication_id: uuid.UUID | None = None) -> Any: ...
@@ -220,6 +227,7 @@ class PublicationLineageAuthority(Protocol):
         pr_number: int,
         pr_url: str,
         head_sha: str,
+        metadata_updated_at: datetime | None,
     ) -> None | Awaitable[None]: ...
 
 
@@ -323,6 +331,17 @@ def _marker_commit(logs: str) -> str | None:
 def _marker_state(logs: str) -> Literal["closed", "merged"] | None:
     match = _PR_STATE_MARKER.search(logs)
     return cast(Literal["closed", "merged"], match.group(1)) if match else None
+
+
+def _marker_updated_at(logs: str) -> datetime | None:
+    match = _PR_UPDATED_MARKER.search(logs)
+    if match is None:
+        return None
+    try:
+        value = datetime.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    return value if value.tzinfo is not None else None
 
 
 def _validated_pr_url(work: PublicationWork, url: str | None) -> str | None:
@@ -491,6 +510,7 @@ class PublicationReconciler:
         outcome: str,
         pr_url: str | None = None,
         error: str | None = None,
+        metadata_updated_at: datetime | None,
     ) -> None:
         await _resolve(
             self._store.persist_result(
@@ -498,6 +518,7 @@ class PublicationReconciler:
                 outcome=outcome,
                 pr_url=pr_url,
                 error=error,
+                metadata_updated_at=metadata_updated_at,
             )
         )
         # Terminal: this publication is never reconciled again, so its escape
@@ -714,23 +735,31 @@ class PublicationReconciler:
         pr_number: int | None = None,
         new_head: str | None = None,
         names: PublicationResourceNames,
+        metadata_updated_at: datetime | None,
     ) -> None:
         # The durable outcome is the source of truth. Resource cleanup and reply
         # delivery are independent outboxes; result claims remain gated until
         # cleanup has durably completed.
+        if outcome == "published" and not work.patch and metadata_updated_at is None:
+            raise PublicationReconcileError("metadata-only publication has no GitHub update time")
         if new_head is not None:
             if pr_url is None or pr_number is None:
                 raise PublicationReconcileError(
                     "publication success omitted pull request identity"
                 )
             await self._advance_lineage(
-                work, pr_url=pr_url, pr_number=pr_number, new_head=new_head
+                work,
+                pr_url=pr_url,
+                pr_number=pr_number,
+                new_head=new_head,
+                metadata_updated_at=metadata_updated_at,
             )
         await self._persist_result(
             work,
             outcome=outcome,
             pr_url=pr_url,
             error=error,
+            metadata_updated_at=metadata_updated_at,
         )
         await self.deliver_pending_cleanup()
         await self.deliver_pending_result(work.publication_id)
@@ -742,10 +771,15 @@ class PublicationReconciler:
         pr_url: str,
         pr_number: int,
         new_head: str,
+        metadata_updated_at: datetime | None,
     ) -> None:
         # ADR 0143: the API verifies GitHub identity and advances the lineage
         # with the publication outcome in one compare-and-set, fenced by this
         # worker's claimed publication version and lease.
+        if (not work.patch) != (metadata_updated_at is not None):
+            raise PublicationReconcileError(
+                "a GitHub update time is required only for metadata only publications"
+            )
         try:
             await _resolve(
                 self._lineage.advance(
@@ -757,6 +791,7 @@ class PublicationReconciler:
                     pr_number=pr_number,
                     pr_url=pr_url,
                     head_sha=new_head,
+                    metadata_updated_at=metadata_updated_at,
                 )
             )
         except PublicationRemoteTerminalError as terminal:
@@ -860,8 +895,12 @@ class PublicationReconciler:
             branch=work.branch,
             pr_number=work.pr_number,
             pr_url=work.pr_url,
+            github_repository_id=work.github_repository_id,
+            github_pr_node_id=work.github_pr_node_id,
             title=work.title,
             body=work.body,
+            observed_title_sha256=work.observed_title_sha256,
+            observed_body_sha256=work.observed_body_sha256,
             open_as_draft=work.open_as_draft,
             branch_prefix=work.branch_prefix,
         )
@@ -960,6 +999,9 @@ class PublicationReconciler:
                 pr_number=pr_number,
                 new_head=commit_sha,
                 names=names,
+                metadata_updated_at=(
+                    _marker_updated_at(observation.logs) if not work.patch else None
+                ),
             )
             return True
         # Jobs created by the immediately preceding release emitted only the
@@ -972,6 +1014,7 @@ class PublicationReconciler:
                 outcome="published",
                 pr_url=pr_url,
                 names=names,
+                metadata_updated_at=None,
             )
             return True
         if observation.phase == "failed":
@@ -1054,6 +1097,7 @@ class PublicationReconciler:
                             outcome="failed",
                             pr_url=None,
                             error="the factory run already ended",
+                            metadata_updated_at=None,
                         )
                     )
                     return
@@ -1094,6 +1138,7 @@ class PublicationReconciler:
                     outcome="failed",
                     pr_url=None,
                     error="the factory run already ended",
+                    metadata_updated_at=None,
                 )
             )
             return
@@ -1174,6 +1219,7 @@ class PublicationReconciler:
                         pr_number=recovered.number,
                         new_head=recovered.head_sha,
                         names=names,
+                        metadata_updated_at=None,
                     )
                     return
             if pull is not None and pull.state != "open":
@@ -1249,6 +1295,7 @@ class PublicationReconciler:
                     pr_url=pull.url,
                     pr_number=pull.number,
                     new_head=pull.head_sha,
+                    metadata_updated_at=None,
                 )
             except PublicationIdentityUnavailable as identity_exc:
                 await self._identity_unavailable(work, identity_exc)
@@ -1261,6 +1308,7 @@ class PublicationReconciler:
                 outcome="published",
                 pr_url=pull.url,
                 names=names,
+                metadata_updated_at=None,
             )
             return
 
@@ -1289,7 +1337,8 @@ class PublicationReconciler:
                     "ask again to request a new publication approval."
                 )
                 await self._terminalize(
-                    work, outcome="failed", error=error, names=names
+                    work, outcome="failed", error=error, names=names,
+                    metadata_updated_at=None,
                 )
                 return
             try:

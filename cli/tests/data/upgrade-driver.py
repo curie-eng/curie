@@ -159,6 +159,8 @@ BASE = {
     "alembic_current": "0043 (head)",
     "alembic_fail": False,
     "compat_metadata": None,
+    "drain_annotation": "auto",
+    "drain_render_fails": False,
 }
 
 SCENARIOS = {
@@ -220,6 +222,9 @@ SCENARIOS = {
     "values-read-fails": {"values_fail": True},
     # A second `helm get values` would return a different document.
     "values-drift": {"values_drift": True},
+    "drain-annotation-missing": {"drain_annotation": None},
+    "drain-annotation-invalid": {"drain_annotation": "many"},
+    "drain-render-fails": {"drain_render_fails": True},
     # Every checkpoint write fails, starting with the first one before any
     # mutation.
     "persist-fails": {"checkpoint_patch_fails": "always"},
@@ -695,6 +700,41 @@ if program == "helm":
                 )
             )
             sys.exit(0)
+        if show_only is None:
+            if scenario["drain_render_fails"]:
+                print("Error: target render failed", file=sys.stderr)
+                sys.exit(1)
+            values_file = flag_value("-f")
+            values = json.loads(Path(values_file).read_text()) if values_file else {}
+            if values_file:
+                capture("render-values", ".json", values_file)
+            worker = values.get("worker", {})
+            if (
+                worker.get("deploy", True) is False
+                or worker.get("upgradeDrain", {}).get("enabled", True) is False
+            ):
+                emit({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "no-drain"}})
+            budget = int(worker.get("deliveryBudgetSeconds", 600)) + int(
+                worker.get("deliveryShutdownReserveSeconds", 60)
+            )
+            drain = max(int(worker.get("upgradeDrain", {}).get("timeoutSeconds", 900)), budget)
+            grace = max(int(worker.get("terminationGracePeriodSeconds", 1860)), budget)
+            minimum = str(drain + 120 + grace + 60)
+            annotation = scenario["drain_annotation"]
+            if annotation == "auto":
+                annotation = minimum
+            annotations = {"helm.sh/hook": "pre-upgrade"}
+            if annotation is not None:
+                annotations["curie.ai/minimum-helm-timeout-seconds"] = annotation
+            emit({
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {
+                    "name": f"{RELEASE}-upgrade-drain",
+                    "labels": {"app.kubernetes.io/component": "upgrade-drain"},
+                    "annotations": annotations,
+                },
+            })
         print(
             f"Error: could not find template {show_only or '<template>'} in chart",
             file=sys.stderr,

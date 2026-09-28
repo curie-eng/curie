@@ -213,6 +213,8 @@ class EgressHandler(BaseHTTPRequestHandler):
             return self._respond(500, {"detail": "adapter error"})
         if status == 410:
             return self._respond(status, {"detail": "thread deleted at provider"})
+        if status == 424:
+            return self._respond(status, {"detail": "provider egress refused"})
         self._respond(status, ReplyAck().model_dump())
 
     def dispatch(self, event: ReplyEvent) -> int:

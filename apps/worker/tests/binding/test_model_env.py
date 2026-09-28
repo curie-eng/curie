@@ -26,7 +26,11 @@ from curie_worker.eval.stream import EvalJob, EvalStreamConsumer
 from curie_worker.sandbox_token import verify
 
 
-def _resolved(model: str | None = None, thinking: str | None = None) -> ResolvedDeployment:
+def _resolved(
+    model: str | None = None,
+    thinking: str | None = None,
+    deployment_environment: str | None = None,
+) -> ResolvedDeployment:
     return ResolvedDeployment(
         agent_id=uuid.uuid4(),
         agent_name="test-agent",
@@ -37,6 +41,7 @@ def _resolved(model: str | None = None, thinking: str | None = None) -> Resolved
         max_output_tokens_per_run=None,
         model=model,
         thinking=thinking,
+        deployment_environment=deployment_environment,
     )
 
 
@@ -623,3 +628,21 @@ def test_an_empty_per_agent_thinking_does_not_emit_an_empty_key() -> None:
     resolver = BindingResolver.__new__(BindingResolver)
     resolver._config = WorkerConfig()  # type: ignore[attr-defined]
     assert THINKING_ENV not in resolver.boot_env(_resolved(thinking=""), "thread-1")
+
+
+# --- deployment environment (#3166) --------------------------------------------
+# Runner traces take their Langfuse ``environment`` from this key, and the UI's
+# metrics filter on it; without it every run lands in ``default`` and reads zero.
+
+
+def test_boot_env_forwards_the_active_deployment_environment() -> None:
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig()  # type: ignore[attr-defined]
+    env = resolver.boot_env(_resolved(deployment_environment="prod"), "thread-1")
+    assert env["CURIE_DEPLOYMENT_ENVIRONMENT"] == "prod"
+
+
+def test_boot_env_omits_an_unknown_deployment_environment() -> None:
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig()  # type: ignore[attr-defined]
+    assert "CURIE_DEPLOYMENT_ENVIRONMENT" not in resolver.boot_env(_resolved(), "thread-1")

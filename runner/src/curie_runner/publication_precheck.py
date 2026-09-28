@@ -227,8 +227,5 @@ class PublicationPrecheck:
                     "Make a working tree file change before requesting publication."
                 )
             if result.get("result") == "metadata_changed":
-                return (
-                    "metadata_only_unsupported: This publication path requires a working "
-                    "tree file change. Metadata changes alone cannot be published yet."
-                )
+                return None
             return _UNAVAILABLE

@@ -62,7 +62,7 @@ which can render a required value as blank. Helm 3.14 and newer provide the
 safe merge directly:
 
 ```bash
-helm upgrade curie <new-chart> -n curie --reset-then-reuse-values
+helm upgrade curie <new-chart> -n curie --reset-then-reuse-values --timeout <minimum>s
 ```
 
 For an auditable values file instead, capture the release's user supplied
@@ -76,14 +76,22 @@ values privately and pass that file over the new defaults:
   chmod 600 "$upgrade_values"
   helm get values curie -n curie -o yaml > "$upgrade_values"
   test -s "$upgrade_values"
-  helm upgrade curie <new-chart> -n curie -f "$upgrade_values"
+  helm upgrade curie <new-chart> -n curie -f "$upgrade_values" --timeout <minimum>s
 )
 ```
 
 Keep the file private because retained values can contain credentials. Remove
 it after the upgrade even when Helm fails. The commands below use
 `--reuse-values` only for same chart configuration changes, not a chart version
-upgrade.
+upgrade. The pre-upgrade drain Job publishes the required minimum in the
+`curie.ai/minimum-helm-timeout-seconds` annotation. For customized worker or
+drain budgets, use the annotation rendered from the same chart and values as
+the upgrade, and pass that value with an `s` suffix to `helm upgrade --timeout`.
+The default minimum is 2940 seconds. The chart derives it from the effective
+drain wait, 120 seconds for the Job, the effective worker termination grace,
+and 60 seconds for scheduling and Helm operations. Raising
+`worker.deliveryBudgetSeconds` raises both the effective drain wait and worker
+grace automatically, so the Helm timeout must rise too.
 
 **Upgrade drain and claim state.** Before each upgrade, a hook pauses new worker
 claims and waits for accepted deliveries to finish. The chart stores an
@@ -107,6 +115,7 @@ model credential, upgrade in place (the exact command is also printed in
 
 ```bash
 helm upgrade curie charts/curie -n curie --reuse-values \
+  --timeout <minimum>s \
   --set dispatcher.slack.appToken=xapp-... \
   --set dispatcher.slack.botToken=xoxb-... \
   --set dispatcher.slack.signingSecret=... \
@@ -137,6 +146,7 @@ API Service (`http://<fullname>-api:<api.service.port>`, derived, so an overridd
 
 ```bash
 helm upgrade curie charts/curie -n curie --reuse-values \
+  --timeout <minimum>s \
   --set dispatcher.apiBaseUrl=https://your-api.example
 ```
 
@@ -291,6 +301,18 @@ log/metrics backend. The in-chart collector receives gRPC on
 `OTEL_EXPORTER_OTLP_*` settings. The chart owns one destination for every
 instrumented workload:
 
+`otelCollector.metricsTemporalityPreference` defaults to `delta` for push
+exporters. It sets `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` on every
+instrumented workload, including runner sandboxes. Set it to `cumulative` for
+a backend that requires cumulative counters and histograms. Prometheus remote
+write requires cumulative points, so the supplied SRE observability overlay
+sets this value to `cumulative`. The collector
+copies each runner's anonymous `service.instance.id` resource value onto its
+metric points so concurrent sandboxes retain separate series; it does not add
+an instance label to other services. For a release wide served turn count, use
+`curie.turn.completed` with `source=worker` and `outcome=done`. Runner
+completions count sandbox results and can differ from served turns.
+
 - `otelCollector.deploy: true` (default) wires the in-cluster collector.
 - `otelCollector.deploy: false` plus `otelCollector.endpoint` wires an
   external collector, with optional `protocol`, `headers`, or
@@ -322,6 +344,12 @@ HTTP. Logs and metrics retain explicit collector pipelines. Their destinations
 are operator-configured collector exporters; installing Grafana, Loki, Tempo,
 Prometheus, or another retained backend is deliberately separate from this
 chart's OTLP write path.
+
+The SRE bot Prometheus overlay includes alerts for dead lettered messages,
+slow sandbox claims, refused capacity reclamation, and transcript persistence
+failures. It counts a counter's first observed sample so failures are visible
+even when a process has just started. See
+[`examples/sre-bot/observability/prometheus-values.yaml`](../../examples/sre-bot/observability/prometheus-values.yaml).
 
 The chart-managed collector is a bounded gateway, not a lossless store. Every
 network exporter uses retry plus a bounded sending queue. `memory_limiter` runs
@@ -370,6 +398,16 @@ collector stdout. `values-dev.yaml` explicitly enables it and selects an
 ephemeral queue for disposable development. Use the same explicit persistence
 override for any short-lived test installation; production installs retain the
 PVC by default.
+
+Kubernetes keeps Events for about an hour, so the Warning events behind an
+OOMKill, eviction, failed schedule or probe failure are usually gone before an
+incident review. Set `otelCollector.kubernetesEvents.enabled=true` to add a
+`k8sobjects/events` receiver that watches `events.k8s.io` Events in the release
+namespace and feeds them into the logs pipeline. The chart then runs the
+collector as its own ServiceAccount bound to a namespaced Role with only
+get/list/watch on events. The logs pipeline exports to `nop/logs` by default,
+so Helm refuses the setting unless `extraLogPipelineExporters` names a durable
+log exporter (or the development `debug` exporter is enabled).
 
 Additional trace destinations are configured through
 `otelCollector.extraExporters`, a map of exporter names to collector exporter
@@ -951,7 +989,10 @@ Scope each role to the bucket it actually uses:
   still consumes `rustfs.auth` static keys for that bucket; the key-free path
   only omits credentials from the API, the worker, and the sandbox bundle-fetch
   init container. Scope those keys (or a Langfuse-specific IAM user) to
-  `rustfs.bucket`.
+  `rustfs.bucket`. Langfuse never deletes `events/` objects after ingest. The
+  in-chart RustFS gets an expiration rule for that prefix
+  (`langfuse.eventUpload.retentionDays`, default 2), but a BYO bucket is not
+  touched, so add the same lifecycle rule to it yourself.
 
 Two constraints are worth stating plainly.
 
@@ -1231,6 +1272,20 @@ already-configured control-plane pod at admission time. Both objects are
 independently toggleable (`resourceQuota.enabled`, `limitRange.enabled`,
 each default `true`) and every ceiling is overridable, per ADR-0059 decision 6.
 
+The `ResourceQuota` is an admission ceiling, not a scheduling guarantee
+(#2949). It admits up to min(`sandboxPodCount`, `requestsCpu` / runner cpu
+request, `requestsMemory` / runner memory request, `limitsCpu` / runner cpu
+limit, `limitsMemory` / runner memory limit) sandboxes (8 with the shipped
+defaults, bound by `limitsCpu`) whether or not the nodes can hold them; past node capacity, sandboxes sit Pending until the
+claim times out. `helm install`/`upgrade` NOTES compare that ceiling with
+what fits on the schedulable nodes and warn when it is higher. That report
+lists Nodes and Pods cluster-wide during install/upgrade; if the helm identity
+cannot, the release fails, so set `resourceQuota.capacityReport=false`. A quota
+refusal is a pod create rejected with "exceeded quota"
+(`kubectl describe resourcequota <fullname>-sandbox-quota`); an unschedulable
+sandbox is a Pending pod with `FailedScheduling` events. The arithmetic and a
+worked example sit at `resourceQuota` in `values.yaml`.
+
 **Which pods outrank sandboxes (ADR-0059 decision 5, #3182).** Every
 long-running platform workload carries `priorityClassName:
 priorityClasses.platform.name`: the control plane (api, worker, dispatcher),
@@ -1243,6 +1298,13 @@ the inventory exhaustive, so a new template that forgets its class fails the
 render. The runner-prewarm DaemonSet deliberately stays unclassed (priority
 0, below the sandbox class): the image-cache pod is the designated sacrifice
 a full node evicts first.
+
+**Priority class on hooks (#3206).** When
+`priorityClasses.platform.create: true`, preinstall and preupgrade hooks omit
+the platform priority class because it can be absent until normal resources
+are applied. Postinstall and postupgrade hooks use the configured class. When
+`priorityClasses.platform.create: false`, hooks use the configured class, so
+operators must create the named class before installing the chart.
 
 **Verifying the rails.** The security-boundary probe suite re-runs as a `helm test`:
 
@@ -1258,6 +1320,51 @@ false-pass rather than trusted. Claim 4 reports honestly: if the gvisor
 runtimeclass is absent it is marked NOT-TESTABLE (per the security-boundary test plan, never faked), with
 enforcement asserted separately by the preflight and proven live in the security-boundary test plan
 (`uname` = `4.19.0-gvisor`).
+
+## End to end connector identity on a test cluster (ADR 0176)
+
+`curie cluster up --e2e-connector-identity` (chart value
+`e2eConnectorIdentity.enabled`) installs the identity the end to end connector
+uses on a separate **test** cluster. Pass it only on that cluster's owner
+release (ADR 0129), never on the cluster that runs the factory. It needs
+Kubernetes 1.30 or newer for `admissionregistration.k8s.io/v1`.
+
+What it grants, and how the cluster enforces it:
+
+- A service account, `<fullname>-e2e-connector`, with a cluster grant of
+  exactly: read, create and delete namespaces; create RoleBindings; and `bind`
+  on one ClusterRole, `<fullname>-e2e-connector-namespace`. No namespace update
+  or patch, and no other cluster scoped write.
+- The `-namespace` ClusterRole is bound only by a RoleBinding the connector
+  creates inside a namespace it created. That RoleBinding is its only source of
+  namespaced reads and writes, so every other namespace is unreadable to it.
+- A ValidatingAdmissionPolicy, failing closed, matched to that service account
+  and to every service account inside a prefixed namespace, so a token the
+  identity mints there is held to the same rules. It admits a namespace create
+  only when the name starts with `e2eConnectorIdentity.namespacePrefix` (default
+  `curie-e2e-`), the namespace carries `e2eConnectorIdentity.ownerLabel`
+  (default `curietech.ai/e2e-owner=<release>`), and it sets
+  `pod-security.kubernetes.io/enforce` to `baseline` or `restricted`, so no pod
+  there may be privileged, share host namespaces or mount a host path. It
+  admits a namespace delete only for a prefixed, labelled namespace; admits a
+  namespaced write only inside one; denies every other cluster scoped write;
+  and refuses a RoleBinding naming anything but a service account of its own
+  namespace, so no grant reaches a user, a group or another namespace.
+
+A namespace an administrator creates with the prefix and label is inside the
+identity's scope by definition: the label is the ownership claim. Only the
+identity and cluster administrators can create such a namespace.
+
+`ci/e2e-connector-identity-assertions.sh` pins the rendered grant.
+`ci/runtime/e2e-connector-identity-runtime.sh` proves each denial against a live
+API server by impersonating the service account:
+
+```bash
+CURIE_E2E_IDENTITY_CONTEXT=<test cluster context> \
+  bash charts/curie/ci/runtime/e2e-connector-identity-runtime.sh
+```
+
+It creates only objects named from its run id and deletes them on exit.
 
 ## Uninstalling and CRD lifecycle
 

@@ -77,6 +77,32 @@ placement:
     affinity: {}
 
 # ---------------------------------------------------------------------------
+# End to end connector identity (ADR 0176 decision 4, issue #3243)
+#
+# Install this ONLY on the release that owns a separate TEST cluster (ADR 0129
+# owner release), never on the cluster that runs the factory. Enable it with
+# `curie cluster up --e2e-connector-identity`.
+#
+# It renders a service account that may create and delete only namespaces whose
+# name starts with `namespacePrefix` and that carry `ownerLabel`, may read and
+# write only inside such namespaces, and holds no cluster scoped write. A
+# ValidatingAdmissionPolicy enforces the prefix and label at the API server,
+# so it needs admissionregistration.k8s.io/v1 (Kubernetes 1.30 or newer). The
+# template header in templates/e2e-connector-identity.yaml explains the grant.
+# ---------------------------------------------------------------------------
+e2eConnectorIdentity:
+  enabled: false
+  # Defaults to <fullname>-e2e-connector.
+  serviceAccountName: ""
+  # Lowercase DNS label ending in "-". Every namespace the identity creates
+  # must start with it.
+  namespacePrefix: "curie-e2e-"
+  ownerLabel:
+    key: "curietech.ai/e2e-owner"
+    # Defaults to the release name.
+    value: ""
+
+# ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
 # dispatcher, the data tier (postgres, valkey, clickhouse, rustfs), and the
 # observability and UI tier (langfuse web/worker, the OTel collector, the UI,
@@ -108,6 +134,10 @@ priorityClasses:
     # and UI; the full inventory is pinned by ci/render-assertions.sh
     # Assertion 8). Set false (and repoint `name` at an existing class) if
     # the cluster/another release already defines an equivalent one.
+    # Preinstall and preupgrade hooks omit this class when create is true,
+    # because the class can be absent until normal resources are applied.
+    # Postinstall and postupgrade hooks use it. When create is false, create
+    # the named class before installing so hooks can use it.
     create: true
     name: curie-platform
     value: 1000000
@@ -125,6 +155,16 @@ priorityClasses:
 # ---------------------------------------------------------------------------
 langfuse:
   deploy: true
+  # Langfuse writes every ingested event to <rustfs.bucket>/events/ and never
+  # deletes it after ingest; ClickHouse keeps the trace. Each trace costs about
+  # three inodes on the RustFS volume, and on a long-lived install those
+  # objects filled the node's inode table while kubelet still reported
+  # DiskPressure=False (#2870). The in-chart RustFS init Job installs an S3
+  # lifecycle rule that expires events/ after this many days. 0 disables the
+  # rule. A BYO store (rustfs.deploy false) is not touched: put the same
+  # expiration rule on its bucket yourself.
+  eventUpload:
+    retentionDays: 2
   # Bare external hostname required only when deploy is false. Consumers build
   # the URL as <langfuse.scheme>://<host>:<langfuse.web.service.port>, with the
   # scheme coming from `langfuse.scheme` below; do not include a scheme or port
@@ -907,6 +947,11 @@ otelCollector:
   #  - cidr: 192.0.2.10/32
   #    ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
+  # SDK metrics use delta aggregation so each export carries the measurements
+  # made since the prior collection. Override to cumulative or lowmemory when
+  # the receiving backend requires that preference. A workload extraEnv entry
+  # with the same OTEL variable takes precedence.
+  metricsTemporalityPreference: delta
   # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
   # credentials so they never enter Helm values. The two sources are mutually
   # exclusive; a literal is only for non-sensitive values such as a tenant id.
@@ -947,6 +992,18 @@ otelCollector:
   extraLogPipelineExporters: []
   extraMetricPipelineExporters: []
   debugExporter:
+    enabled: false
+  # Kubernetes Events for this release's namespace (#2954). Kubernetes keeps
+  # events for about an hour, so without a durable copy the Warning events that
+  # explain an OOMKill, eviction, failed schedule or probe failure are gone by
+  # the time an incident review asks. When enabled, a k8sobjects receiver
+  # watches events.k8s.io Events in the release namespace and feeds them into
+  # the logs pipeline, and the chart creates a collector ServiceAccount with a
+  # namespaced Role limited to get/list/watch on events. The logs pipeline
+  # exports only to nop until an operator adds extraLogPipelineExporters, so
+  # the render is refused unless one is set (or debugExporter is enabled):
+  # watching events into nop would look enabled while recording nothing.
+  kubernetesEvents:
     enabled: false
   # The built-in Langfuse hop retains at most 1000 queued export requests and
   # retries each request for at most 5 minutes. Queue overflow or retry expiry is
@@ -2005,6 +2062,11 @@ worker:
     # promised it would postpone upgrades during ordinary traffic. Raising the
     # delivery budget therefore raises this automatically rather than breaking
     # the render for a value you never touched.
+    # Helm needs a timeout of at least the effective drain wait plus the 120
+    # second drain Job allowance, the effective worker termination grace, and
+    # 60 seconds for scheduling and Helm operations. The pre upgrade drain Job
+    # publishes this minimum in curie.ai/minimum-helm-timeout-seconds. With the
+    # default values it is 900 + 120 + 1860 + 60 = 2940 seconds.
     timeoutSeconds: 900
     # How often the gate re-reads the in-flight set while waiting.
     pollIntervalSeconds: 5
@@ -2237,7 +2299,9 @@ agentSandbox:
   # (<fullname>-agent-<name>-connector-secrets), kept off the shared chart
   # Secret and off the value-only SandboxClaim CR. The runner sandbox reads a
   # value via a per-agent SandboxTemplate `secretKeyRef`. Worker claims route
-  # to that agent's pool (#1488). Empty by default; supply per agent,
+  # to that agent's pool (#1488). An agent whose bundle declares connector
+  # secrets but has no entry here gets no pool, and its turns are refused
+  # with a reply naming this value (#2943). Empty by default; supply per agent,
   # e.g.:
   #   connectorSecrets:
   #     github-issues:
@@ -2760,6 +2824,43 @@ resourceQuota:
   # (`priorityClasses.sandbox.create: false`) whose name differs from
   # `priorityClasses.sandbox.name`. Setting it overrides the derivation.
   sandboxPriorityClassName: ""
+  # THE QUOTA IS AN ADMISSION CEILING, NOT A SCHEDULING GUARANTEE (#2949).
+  # Kubernetes checks these numbers against the requests of sandbox pods, never
+  # against what the nodes can hold. A quota above node capacity admits sandboxes
+  # that then sit Pending until the claim times out.
+  #
+  #   quota ceiling = min(sandboxPodCount,
+  #                       requestsCpu    / agentSandbox.runner.resources.requests.cpu,
+  #                       requestsMemory / agentSandbox.runner.resources.requests.memory,
+  #                       limitsCpu      / agentSandbox.runner.resources.limits.cpu,
+  #                       limitsMemory   / agentSandbox.runner.resources.limits.memory)
+  #   (a term whose per-sandbox value is unset or 0 is skipped). With the
+  #   shipped defaults: min(50, 4/50m=80, 8Gi/192Mi=42, 8/1=8, 16Gi/768Mi=21)
+  #   = 8, so limitsCpu is the binding term.
+  #   what fits     = sum over schedulable nodes of
+  #                   floor((allocatable - non-sandbox pod requests) / per-sandbox request),
+  #                   taking the smaller of the cpu and memory counts per node
+  #
+  # Worked example: 3 nodes with 3.23 cpu free between them (roughly 1.08 each),
+  # 1 cpu per sandbox -> 1 fits per node, 3 in total. A quota of
+  # requestsCpu: "8" advertised 8; sandboxes 4 through 8 were admitted and
+  # never scheduled. `helm install`/`upgrade` NOTES print both numbers and a
+  # warning when the ceiling exceeds what fits.
+  #
+  # Telling the refusals apart:
+  #   quota refusal: the pod create is rejected with "exceeded quota" --
+  #     kubectl describe resourcequota <fullname>-sandbox-quota -n <ns>
+  #   unschedulable: the pod exists, is Pending, and has FailedScheduling events --
+  #     kubectl get events --field-selector reason=FailedScheduling -n <ns>
+  # Remedy for the second: lower hard.* to what fits, or add node capacity.
+  #
+  # capacityReport: the NOTES comparison above. To compute "what fits" it
+  # lists every Node and every Pod cluster-wide (Helm `lookup`) during
+  # install/upgrade. If the identity running helm is forbidden to list Nodes or
+  # Pods across all namespaces, that lookup errors and Helm FAILS THE RELEASE.
+  # Set false in that case; the quota itself is unaffected, only the report is
+  # skipped and no lookup runs.
+  capacityReport: true
   hard:
     requestsCpu: "4"
     requestsMemory: 8Gi
