@@ -533,8 +533,16 @@
       ],
       "revision": "0067",
       "sha256": "257e1b5c21f2e8a39c7f3631300c404c35e6df1ba7f2e0faf8730593aa9bf17e"
+    },
+    {
+      "kind": "contract",
+      "parents": [
+        "0067"
+      ],
+      "revision": "0068",
+      "sha256": "751f8325fbf8d849d76b398706bea70d9fe3c036ef89dd79f573a2b58a68ceca"
     }
   ],
-  "schema_head": "0067",
-  "schema_min": "0060"
+  "schema_head": "0068",
+  "schema_min": "0068"
 }

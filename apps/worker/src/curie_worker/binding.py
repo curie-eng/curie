@@ -31,7 +31,7 @@ per-adapter token.
 ``agent_channels.kind`` ROUTES: since ADR-0096 phase 2 the queue wire
 (``ReplyHandle``) carries a required ``kind``, so the routing key is the PAIR
 (``kind`` AND ``address``) and migration 0023 widens the uniqueness constraint to
-match; migration 0061 widens it again to the route triple, so several
+match; migration 0068 widens it again to the route triple, so several
 identities may share a pair. There is no address-only overload and no default
 kind -- either would be the silent address-fallback the pair exists to remove.
 One address can now legitimately be bound twice under two different kinds, and
@@ -401,7 +401,7 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
 
     The ORDER BY picks one deterministic winner (prod-first, then most recent).
     The API holds one agent per route (``agent_channels_route_key``, migration
-    0061, superseding 0023's pair key, 0021's address-only
+    0068, superseding 0023's pair key, 0021's address-only
     ``agent_channels_address_key`` and 0017's ``agents_slack_channel_key``), so
     a Slack turn, or a turn that names its adapter, cannot reach this state
     through the write paths. A non-Slack turn that omits its adapter selects

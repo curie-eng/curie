@@ -436,8 +436,8 @@ revision or a pending contract/irreversible migration without
 `--forward-only` refuses before `helm upgrade`. `--forward-only` sets
 `api.migrate.forwardOnly=true` on the overlay Apply hands Helm. The
 `migrate` phase is a resumable checkpoint boundary only; it performs no
-migration of its own. Revision 0061 is such a migration; see
-[Slack route identity migration](#slack-route-identity-migration-alembic-revision-0061)
+migration of its own. Revision 0068 is such a migration; see
+[Slack route identity migration](#slack-route-identity-migration-alembic-revision-0068)
 before an upgrade crosses it.
 
 The redacted plan names the configuration schema version the upgrade migrates
@@ -1699,9 +1699,9 @@ move/merge every general-state row into that one shape. Re-run the preflights,
 then the upgrade. On any refusal, the whole 0037 transaction rolls back: agent
 flags, state rows, the constraint, and the Alembic revision stay unchanged.
 
-### Slack route identity migration (Alembic revision 0061)
+### Slack route identity migration (Alembic revision 0068)
 
-Revision 0061 is a contract migration (ADR-0168 decision 3). It stores the
+Revision 0068 is a contract migration (ADR-0168 decision 3). It stores the
 identity on every Slack binding, `default` where none was named, and makes the
 binding key `(kind, address, adapter)`, so two identities can bind one channel.
 Before it changes anything it refuses, naming each row, while a Slack binding
@@ -1718,7 +1718,7 @@ During the roll, an API pod still on the previous release can answer a Slack
 binding write with a 500: creating an agent with a Slack channel, adding or
 changing a Slack binding (`surfaces --add`, or a deploy that binds a channel),
 or moving a binding to Slack. The previous release writes a Slack binding with
-no identity, which 0061's check refuses. The window runs
+no identity, which 0068's check refuses. The window runs
 from the `-schema-migrate` Job to the last previous-release API pod stopping.
 The chart's upgrade drain runs before the migration and pauses worker claims,
 not API writes, so it does not cover this window; hold binding changes until
@@ -1726,7 +1726,7 @@ the API Deployment has rolled, and retry any write that failed during it.
 
 A local stack runs the same schema check in its one-shot `curie-migrate`
 service, which takes no forward-only flag, so `curie local up` on a volume that
-predates 0061 fails at that service. Run `curie local up --dry-run`, with the
+predates 0068 fails at that service. Run `curie local up --dry-run`, with the
 flags you normally pass, to print the exact compose command it would run.
 Run that command with its trailing `up -d --wait` replaced by
 `run --rm -e CURIE_SCHEMA_FORWARD_ONLY=true curie-migrate`, then run

@@ -232,7 +232,7 @@ async def lock_issue(session: AsyncSession, repository_id: int, issue_number: in
 
 
 async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
-    # `agent_channels_route_key` (migration 0061) lets one repository pair
+    # `agent_channels_route_key` (migration 0068) lets one repository pair
     # hold several routes, so the query can return more than one row. The
     # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
     # belongs to some OTHER agent's repo, e.g. a stale rename), not what

@@ -139,7 +139,7 @@ def test_a_declared_identity_with_a_blank_token_is_named_and_left_out(
         ("slack", "ops-bot", None, "ops-bot"),
         ("slack", "curie-cluster-message", None, "default"),
         # A Slack approval's endpoint is only a CLI stub turn's per-turn origin:
-        # no Slack binding carries a transport since migration 0061, so the
+        # no Slack binding carries a transport since migration 0068, so the
         # custom-transport form this row used to pin no longer exists.
         ("slack", "default", "http://stub.example/api/", "default"),
         ("slack", "ops-bot", "http://stub.example/api/", "ops-bot"),

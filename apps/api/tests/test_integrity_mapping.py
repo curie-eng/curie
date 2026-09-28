@@ -158,7 +158,7 @@ def test_the_map_no_longer_carries_the_retired_one_binding_per_agent_entry() -> 
     HAS that constraint, and no database will ever carry `agent_channels_agent_id_key`
     while also serving a platform that offers the subresource.
 
-    Migration 0061 replaced the pair key with `agent_channels_route_key`
+    Migration 0068 replaced the pair key with `agent_channels_route_key`
     (ADR-0168 decision 3). The pair key's entry keeps its pair wording, since
     it fires on the pair whatever identity the write names; the route key's
     entry names the identity, since that key is the triple.

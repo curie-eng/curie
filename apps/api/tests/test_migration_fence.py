@@ -867,7 +867,7 @@ def test_one_declaration_document_survives_a_full_upgrade_head(
 
     command.upgrade(cfg, "head")
 
-    # 0061 backfills the default identity onto every Slack reply.
+    # 0068 backfills the default identity onto every Slack reply.
     assert _reply_identity(orphan) == ("slack", "default")
     # Honored exactly once, by 0022, and never re-applied by a later revision.
     honored = [r for r in _audit_rows(orphan) if r.action == HONORED_ACTION]
@@ -911,7 +911,7 @@ def test_0022_and_0024_still_apply_from_the_pre_0022_state(
     command.upgrade(cfg, REVISION_0024)
     assert _reply_identity(approval) == ("slack", None)
     command.upgrade(cfg, "head")
-    # 0061 backfills the default identity onto every Slack reply.
+    # 0068 backfills the default identity onto every Slack reply.
     assert _reply_identity(approval) == ("slack", "default")
 
 
@@ -955,7 +955,7 @@ def test_a_retained_installation_upgrades_with_its_pending_approvals_intact(
     command.upgrade(cfg, "head")
 
     # Pending, with its original reply identity (the default Slack app, which
-    # 0061 names), and its history whole.
+    # 0068 names), and its history whole.
     assert _sql("SELECT status FROM curie.approvals WHERE id = :id", {"id": approval}) == [
         ("pending",)
     ]

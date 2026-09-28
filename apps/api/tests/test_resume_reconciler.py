@@ -449,7 +449,7 @@ async def _seed_binding(
                 "agent": agent_id,
                 "kind": kind,
                 "addr": address,
-                # A Slack row names its identity (migration 0061).
+                # A Slack row names its identity (migration 0068).
                 "adapter": "default" if kind == "slack" else None,
             },
         )
