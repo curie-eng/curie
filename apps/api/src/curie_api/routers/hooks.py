@@ -47,6 +47,7 @@ from aci_protocol import (
     TurnSource,
     parse_queued_turn,
 )
+from aci_protocol.turn import route_identity
 from channel_protocol import hook_conversation_id
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -77,6 +78,7 @@ from ..hook_partition import (
     PartitionError,
     derive_partition,
 )
+from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
 from ..source_binding import MappingOutcome, resolve_source_binding
 from ..wirebody import read_bounded_body
@@ -287,6 +289,7 @@ async def ingest_hook(
     hook: str,
     kind: str | None = None,
     address: str | None = None,
+    adapter: str | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
@@ -367,6 +370,11 @@ async def ingest_hook(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "hook reply surface requires both kind and address",
         )
+    if adapter is not None and kind is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "hook reply surface adapter names a route within kind and address; pass all three",
+        )
     # Both or neither, checked just above; naming both here lets the type
     # checker see that the `else` branch holds a full pair.
     if kind is None or address is None:
@@ -378,26 +386,30 @@ async def ingest_hook(
             )
         binding = agent.channels[0]
     else:
-        # The hook route names no adapter -- there is no such query parameter
-        # -- so `adapter=None` is the whole request: the default Slack
+        # The route is the triple (ADR-0168 decision 3): `adapter` names the
+        # identity for Slack and the adapter slug for any other kind, and an
+        # omitted one means what it means to every reader -- the default Slack
         # identity, or the agent's single route on a non-Slack pair.
         # `crud.matching_bindings` is the one matching rule every reader of a
-        # route shares; `agent.channels` is already
-        # loaded, so this calls it directly rather than issuing a fresh query.
-        matches = crud.matching_bindings(agent.channels, kind, address, None)
+        # route shares; `agent.channels` is already loaded, so this calls it
+        # directly rather than issuing a fresh query.
+        if adapter is not None:
+            try:
+                refuse_undeclared(kind, route_identity(kind, adapter))
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        matches = crud.matching_bindings(agent.channels, kind, address, adapter)
         if not matches:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "this agent has no binding for the selected kind and address",
-            )
+            unbound = "this agent has no binding for the selected kind and address"
+            if adapter is not None:
+                unbound += f" as {route_identity(kind, adapter)!r}"
+            raise HTTPException(status.HTTP_404_NOT_FOUND, unbound)
         if len(matches) > 1:
-            # Two of this agent's routes on one pair (ADR-0168 decision 3):
-            # replying through either would be a guess.
+            # Two of this agent's routes on one pair and no adapter to name
+            # one: replying through either would be a guess.
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"{len(matches)} routes are bound to {kind}:{address}; this hook "
-                "cannot name an adapter, so bind one route per pair for a hook "
-                "reply surface",
+                f"{len(matches)} routes are bound to {kind}:{address}; pass adapter to name one",
             )
         binding = matches[0]
 

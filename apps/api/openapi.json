@@ -13503,6 +13503,22 @@
             }
           },
           {
+            "in": "query",
+            "name": "adapter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Adapter"
+            }
+          },
+          {
             "in": "header",
             "name": "x-curie-signature-256",
             "required": false,
