@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
+import logging
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -1188,3 +1189,63 @@ def test_ref_and_token_mount_the_tools_and_claim_them(
     gate, published = _gated_boot(monkeypatch, tmp_path, fake_model=False, token=True)
     assert MEMORY_TOOLS <= published
     assert gate.memory_tools_mounted is True
+
+
+# The boot log line: counts and guidance source, never content ------------------
+
+_FACTS_LOG = re.compile(
+    r"^memory facts loaded session=(?P<session>\S+) agent=(?P<agent>\d+) "
+    r"channel=(?P<channel>\d+) guidance=(?P<guidance>default|operator|none)$"
+)
+
+
+def _facts_log_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and r.getMessage().startswith("memory facts loaded")
+    ]
+
+
+def test_boot_logs_one_facts_line_with_counts_and_operator_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeStateApi()
+    api.seed(AGENT_NS, A_OLD, _fact_value("agent secret one", "2026-08-01T09:00:00Z", "UAUTH1"))
+    api.seed(AGENT_NS, A_NEW, _fact_value("agent secret two", "2026-09-02T09:00:00Z", "UAUTH2"))
+    for i, fact_id in enumerate((C_OLD, C_NEW, "fact-" + "6" * 32)):
+        api.seed(
+            CHANNEL_NS,
+            fact_id,
+            _fact_value(f"channel secret {i}", f"2026-09-0{i + 3}T09:00:00Z", f"UCH{i}"),
+        )
+    api.seed(AGENT_NS, "guidance", {"text": "OPERATOR-GUIDANCE-TEXT"})
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    _boot_options(monkeypatch, tmp_path, api, channel=True)
+
+    lines = _facts_log_lines(caplog)
+    assert len(lines) == 1, lines
+    match = _FACTS_LOG.match(lines[0])
+    assert match, lines[0]
+    assert match.group("session") == "s-memory"
+    assert (match.group("agent"), match.group("channel")) == ("2", "3")
+    assert match.group("guidance") == "operator"
+    for secret in ("secret", "UAUTH", "UCH", "OPERATOR-GUIDANCE-TEXT"):
+        assert secret not in lines[0]
+
+
+def test_boot_logs_channel_zero_and_no_guidance_without_a_channel_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    api = _seeded_api(guidance="OPERATOR-GUIDANCE-TEXT")
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    _boot_options(monkeypatch, tmp_path, api, channel=False)
+
+    lines = _facts_log_lines(caplog)
+    assert len(lines) == 1, lines
+    match = _FACTS_LOG.match(lines[0])
+    assert match, lines[0]
+    assert (match.group("agent"), match.group("channel")) == ("2", "0")
+    assert match.group("guidance") == "none"
