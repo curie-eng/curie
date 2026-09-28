@@ -302,8 +302,16 @@ recognize them will treat the resume as an unrelated user message and the verdic
 silently dropped. Give the skill a section that says what to do on each, including for
 a rejection.
 
-The reply streams back into the **same message** the "awaiting approval" notice was left
-on, because the resume turn replays the original turn's reply handle.
+Where the reply lands depends on where the card went
+([ADR-0179](adr/0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md)).
+When the card was posted into the requester's own thread, the message above it reads
+only "Approval requested. See the card below.", and the resumed answer is posted as a
+new message below the card, so the thread reads request, card, answer. When the card
+went somewhere else (a route bound to another channel, or the `cluster message` relay),
+the requester's thread gets the full `Awaiting approval (<id>): ...` notice, and the
+reply streams back into that same message, because the resume turn replays the
+original turn's reply handle. The CLI reads the id from the card when its stub
+receives one and from that full notice otherwise.
 
 ## Driving it from the CLI
 
