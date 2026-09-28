@@ -4,8 +4,9 @@ Date: 2026-09-28
 
 Status: Accepted
 
-Accepted with explicit maintainer approval in the review of the pull request
-that published this status, before implementation. Tracked in
+Accepted with explicit maintainer approval in the review of
+[#3452](https://github.com/curie-eng/curie/pull/3452), the pull request that
+published this status, before implementation. Tracked in
 [#3448](https://github.com/curie-eng/curie/issues/3448) and
 [#3449](https://github.com/curie-eng/curie/issues/3449).
 
