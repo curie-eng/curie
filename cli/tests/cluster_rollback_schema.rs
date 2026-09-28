@@ -244,7 +244,10 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
-    assert_eq!(revisions, ["0063", "0064", "0065", "0066", "0067", "0068", "0069"]);
+    assert_eq!(
+        revisions,
+        ["0063", "0064", "0065", "0066", "0067", "0068", "0069"]
+    );
     let (last, earlier) = pending.split_last().expect("0069 is pending");
     assert!(earlier.iter().all(|step| step.kind == "expand"));
     assert_eq!(
