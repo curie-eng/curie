@@ -193,8 +193,8 @@ service is material:
   (`apps/api/src/curie_api/authorizer.py::PrincipalKind`). It no longer needs
   the platform-wide key at runtime for the return path. No Slack approver set
   admits an adapter, since only the Slack dispatcher vouches for a Slack ID
-  (ADR-0177's separate finding).
-- **Fixed (ADR-0177): an approval is answered where it was asked.** An adapter
+  ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding).
+- **Fixed ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)): an approval is answered where it was asked.** An adapter
   is served the approvals whose card went to one of its own bindings, and a
   card shown on its channel is answered by the requester alone
   (`apps/api/src/curie_api/approvers.py::RequesterOnly`). The platform half
@@ -227,4 +227,4 @@ service is material:
 - **Related seam:** [channel-interaction](../channel-interaction/INTERFACE.md) — the neutral interaction primitives used by the reply edge; they are not a third-party adapter conformance contract.
 - **Epic(s):** #19 — per-turn reply endpoint routing, which the generic egress edge builds on; #158 — multi-tenancy, deliberately out of scope until it settles what a tenant owns
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the standing restraint that no speculative adapter layer is written ahead of a real second implementation; this is not one of the six swap-readiness Jobs, so it is not separately graded
-- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md), the scoped credential and authenticated adapter principal; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary
+- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md), the scoped credential and authenticated adapter principal; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary; [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md), the approval an adapter carries back from its own channel

@@ -439,9 +439,9 @@ Slack feature.
   for `operator` principals; Console principals may use it or a verified user group. It
   refuses `adapter` principals: its entries are Slack IDs, and only the Slack dispatcher
   vouches for a Slack ID (ADR-0106), so an adapter naming a listed ID proves nothing
-  (ADR-0177's separate finding). The authenticated subject must appear in the selected set.
+  ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding). The authenticated subject must appear in the selected set.
 
-- **`RequesterOnly`** (ADR-0177, `approvers.py`), the set for a card shown in a non-Slack
+- **`RequesterOnly`** ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md), `approvers.py`), the set for a card shown in a non-Slack
   conversation, such as an email thread. The selector picks it when the card went to the
   conversation that asked (a routeless approval, or a route in `requesting_surface` mode,
   `apps/api/src/curie_api/approvers.py::card_on_requesting_surface`) and that conversation is not Slack. It
@@ -504,7 +504,7 @@ subject, but it still cannot satisfy channel membership without an attested chan
 except Slack today. Notification `endpoint` and `adapter` remain stored server-side for
 egress and are omitted from read responses.
 
-**A route may instead show its card where the request was asked (ADR-0177).** A
+**A route may instead show its card where the request was asked ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)).** A
 `resolution` of exactly `{"mode": "requesting_surface"}` sends the card into the
 conversation that asked, on whatever channel that is, the way a routeless approval's card
 already goes. Anything else beside `mode`, a mix of the mode and a fixed target, or a
@@ -645,7 +645,7 @@ establishes the actor and writes `principal_kind` (`chat`, `console`, `operator`
 and verdict. For an `adapter` principal, `principal_subject` names the adapter itself, not
 the sender it vouches for: the sender is carried as `actor` from the
 `X-Curie-Approval-Actor` header, and no Slack approver set admits an adapter, not even an
-explicit user list (ADR-0177's separate finding). An adapter is served, and so may list
+explicit user list ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding). An adapter is served, and so may list
 and resolve, an approval whose card went to one of its own bindings on the same agent:
 the conversation that asked (routeless or `requesting_surface`), matched on the record's
 `(reply_kind, reply_channel)` pair, or a fixed route target the recorded `card_channel`
@@ -666,3 +666,4 @@ one authenticated member confirmed their own request, not that a second person r
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
 - **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. [ADR-0106](../../adr/0106-an-approver-is-an-authenticated-principal.md) — An approver is an authenticated principal (Accepted); removes caller-asserted resolver identity/channel, makes membership the boundary even for the requester, limits operators to explicit users, and lets Console subjects pass through the same membership sets their authenticated identity can satisfy. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
 - **Additional ADR:** [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md): Adapter principal with a scoped credential (Accepted); adds the adapter authentication boundary and restricts adapter principals to explicit-user routes.
+- **Additional ADR:** [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md): An approval is answered where it was asked, including by email (Accepted); adds the `requesting_surface` route mode and the requester-only set for non-Slack cards, and refuses adapter principals on every Slack approver set.

@@ -154,7 +154,9 @@ A fixed resolution target stays Slack-only, and a notification never resolves an
 
 ### Answering where it was asked, including by email
 
-A route whose `resolution` is `{ "mode": "requesting_surface" }` puts its card in the
+This is
+[ADR-0177](adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md). A
+route whose `resolution` is `{ "mode": "requesting_surface" }` puts its card in the
 conversation that asked, the way an approval with no route already does. It cannot carry a
 `notification`, since the card is already in the thread that asked. Who may answer follows
 the channel the card lands on:
