@@ -60,7 +60,8 @@ def test_put_stores_operator_guidance_and_get_returns_it(
 ) -> None:
     aid = _agent(client, auth_headers)
     resp = client.put(_url(aid), json={"text": OPERATOR_TEXT}, headers=auth_headers)
-    assert resp.status_code in (200, 204), resp.text
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"text": OPERATOR_TEXT, "source": "operator"}
     assert _get(client, auth_headers, aid) == {"text": OPERATOR_TEXT, "source": "operator"}
 
 
@@ -71,7 +72,7 @@ def test_put_writes_the_agent_memory_namespace_guidance_key(
     stored shape is the contract: `{"text": ...}` at the agent-wide scope."""
     aid = _agent(client, auth_headers)
     resp = client.put(_url(aid), json={"text": OPERATOR_TEXT}, headers=auth_headers)
-    assert resp.status_code in (200, 204), resp.text
+    assert resp.status_code == 200, resp.text
     state = client.get(f"/agents/{aid}/state/memory/guidance", headers=auth_headers)
     assert state.status_code == 200, state.text
     assert state.json()["value"] == {"text": OPERATOR_TEXT}
@@ -83,7 +84,7 @@ def test_put_twice_replaces_the_stored_guidance(
     aid = _agent(client, auth_headers)
     for text in ("first guidance", OPERATOR_TEXT):
         resp = client.put(_url(aid), json={"text": text}, headers=auth_headers)
-        assert resp.status_code in (200, 204), resp.text
+        assert resp.status_code == 200, resp.text
     assert _get(client, auth_headers, aid) == {"text": OPERATOR_TEXT, "source": "operator"}
 
 
@@ -92,7 +93,7 @@ def test_guidance_is_not_a_memory_log_entry(
 ) -> None:
     aid = _agent(client, auth_headers)
     resp = client.put(_url(aid), json={"text": OPERATOR_TEXT}, headers=auth_headers)
-    assert resp.status_code in (200, 204), resp.text
+    assert resp.status_code == 200, resp.text
     listed = client.get(f"/agents/{aid}/memory", headers=auth_headers)
     assert listed.status_code == 200, listed.text
     assert listed.json() == []
@@ -103,9 +104,9 @@ def test_delete_returns_get_to_the_default(
 ) -> None:
     aid = _agent(client, auth_headers)
     resp = client.put(_url(aid), json={"text": OPERATOR_TEXT}, headers=auth_headers)
-    assert resp.status_code in (200, 204), resp.text
+    assert resp.status_code == 200, resp.text
     resp = client.delete(_url(aid), headers=auth_headers)
-    assert resp.status_code in (200, 204), resp.text
+    assert resp.status_code == 204, resp.text
     assert _get(client, auth_headers, aid) == {
         "text": DEFAULT_MEMORY_GUIDANCE,
         "source": "default",
@@ -119,7 +120,7 @@ def test_empty_text_is_refused_and_keeps_the_stored_value(
 ) -> None:
     aid = _agent(client, auth_headers)
     resp = client.put(_url(aid), json={"text": OPERATOR_TEXT}, headers=auth_headers)
-    assert resp.status_code in (200, 204), resp.text
+    assert resp.status_code == 200, resp.text
     resp = client.put(_url(aid), json={"text": ""}, headers=auth_headers)
     assert resp.status_code == 422, resp.text
     assert _get(client, auth_headers, aid) == {"text": OPERATOR_TEXT, "source": "operator"}

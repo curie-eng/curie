@@ -1070,3 +1070,121 @@ def test_update_does_not_overwrite_a_fact_that_changed_after_the_read() -> None:
 
     anyio.run(go)
     assert api.data[AGENT_NS][SEEDED] == concurrent
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 2
+# --------------------------------------------------------------------------- #
+
+
+# G2: the 500-character cap also holds at render time ----------------------------
+
+
+def test_an_over_long_stored_statement_is_truncated_with_an_ellipsis_at_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Written outside the tools (the state API directly, or older data), so the
+    # tool-side cap never saw it.
+    long_statement = "word " * 150  # 750 characters
+    api = FakeStateApi()
+    api.seed(AGENT_NS, A_NEW, _fact_value(long_statement, "2026-09-02T09:00:00Z"))
+    _options, prompt = _boot_options(monkeypatch, tmp_path, api, channel=True)
+    assert prompt is not None
+
+    [line] = [text for text in prompt.splitlines() if text.startswith(f"- [{A_NEW}] ")]
+    rendered = line.removeprefix(f"- [{A_NEW}] ").removesuffix(" (as of 2026-09-02)")
+    assert rendered.endswith("…"), line
+    assert len(rendered) <= 501, len(rendered)
+    assert rendered.startswith("word word word")
+    assert " ".join(long_statement.split()) not in prompt
+
+
+# G3: no date renders as no date; the prompt order is pinned ---------------------
+
+
+@pytest.mark.parametrize("stated_at", ["", None], ids=["empty", "missing"])
+def test_a_fact_without_a_date_renders_no_date_and_the_prompt_order_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stated_at: str | None
+) -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    api = _seeded_api()
+    undated = "fact-" + "5" * 32
+    value: dict[str, str] = {"statement": "undated fact", "author": "U1", "session_id": "s"}
+    if stated_at is not None:
+        value["stated_at"] = stated_at
+    api.seed(CHANNEL_NS, undated, value)
+    _options, prompt = _boot_options(monkeypatch, tmp_path, api, channel=True)
+    assert prompt is not None
+
+    assert "(as of )" not in prompt, prompt
+    [line] = [text for text in prompt.splitlines() if text.startswith(f"- [{undated}] ")]
+    assert line == f"- [{undated}] undated fact", line
+
+    legacy_at = prompt.index("legacy operator lesson")
+    facts_at = prompt.index("Remembered facts")
+    guidance_at = prompt.index(DEFAULT_GUIDANCE.strip())
+    bundle_at = prompt.index(BUNDLE_PROMPT)
+    assert legacy_at < facts_at < guidance_at < bundle_at
+
+
+# G4: the toolPolicy exemption claims only the tools that really mount ----------
+
+
+def _gated_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    fake_model: bool,
+    token: bool,
+) -> tuple[Any, set[str]]:
+    """Boot with a permission gate and a channel ref; return the gate and the tools."""
+
+    api = FakeStateApi()
+    captured: dict[str, Any] = {}
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            env = _env(monkeypatch, tmp_path, server, channel=True)
+            env["CURIE_APPROVAL_REQUIRED_TOOLS"] = "Bash"
+            if not token:
+                env.pop("CURIE_MEMORY_TOKEN", None)
+                monkeypatch.delenv("CURIE_MEMORY_TOKEN", raising=False)
+            config = RunnerConfig.from_env(env)
+            monkeypatch.setattr(boot, "ClaudeAgentSession", _ScriptedSession)
+            runner = build_runner(config, fake_model=fake_model, mcp_capability=_PROBE)
+            captured["gate"] = runner._approval_gate
+            if not fake_model:
+                captured["options"] = runner._factory().options
+
+    anyio.run(go)
+    gate = captured["gate"]
+    assert gate is not None
+    published = _published(captured["options"]) if "options" in captured else set()
+    return gate, published
+
+
+def test_fake_model_boot_does_not_exempt_memory_tools_it_never_mounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fake path mounts no platform MCP server at all, so an exemption for
+    # the memory tools would cover names this session never published.
+    gate, _published_names = _gated_boot(monkeypatch, tmp_path, fake_model=True, token=True)
+    assert gate.memory_tools_mounted is False
+
+
+def test_no_memory_token_mounts_no_memory_tools_and_claims_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, published = _gated_boot(monkeypatch, tmp_path, fake_model=False, token=False)
+    assert not (MEMORY_TOOLS & published), published
+    assert gate.memory_tools_mounted is False
+
+
+def test_ref_and_token_mount_the_tools_and_claim_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control: with both present the claim and the mount agree on True.
+    gate, published = _gated_boot(monkeypatch, tmp_path, fake_model=False, token=True)
+    assert MEMORY_TOOLS <= published
+    assert gate.memory_tools_mounted is True

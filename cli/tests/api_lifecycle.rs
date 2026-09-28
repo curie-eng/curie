@@ -525,7 +525,7 @@ fn agent_list_with_overrides() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true}}]"##
         ),
     )
 }
@@ -554,11 +554,17 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
             thinking,
             execution_deadline_seconds: _,
             runner_resources: _,
+            memory_writes,
             changed,
         } => {
             assert_eq!(agent, "deal-desk");
             assert_eq!(model.as_deref(), Some("kimi-k2"));
             assert_eq!(thinking.as_deref(), Some("adaptive"));
+            // #1461: the inspect reports the memory-writes switch as stored.
+            assert!(
+                memory_writes,
+                "inspect must report memory_writes as the API stored it"
+            );
             assert!(!changed, "an inspect must not report itself as a write");
         }
         other => panic!("expected Done, got {other:?}"),
@@ -914,7 +920,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         ("GET", "/agents") => Response::json(
             200,
             &format!(
-                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false}}]"##
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":false}}]"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -936,6 +942,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         thinking,
         execution_deadline_seconds,
         runner_resources,
+        memory_writes,
         changed,
     } = &out
     else {
@@ -957,6 +964,13 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         "inspect JSON must keep execution_deadline_seconds: {json}"
     );
     assert!(json["execution_deadline_seconds"].is_null());
+    // #1461: memory_writes is a plain boolean in the inspect JSON, never null.
+    assert_eq!(
+        json.get("memory_writes"),
+        Some(&serde_json::Value::Bool(false)),
+        "inspect JSON must include memory_writes false: {json}"
+    );
+    assert!(!memory_writes);
     assert_eq!(
         json.get("runner_resources").map(serde_json::Value::is_null),
         Some(true),
@@ -969,11 +983,12 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         thinking,
         execution_deadline_seconds,
         runner_resources,
+        *memory_writes,
         *changed,
     );
     assert_eq!(
         line,
-        "overrides for deal-desk: model kimi-k2, thinking adaptive, execution deadline platform default, runner resources platform default"
+        "overrides for deal-desk: model kimi-k2, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off"
     );
 
     let rec = server.recorded();
