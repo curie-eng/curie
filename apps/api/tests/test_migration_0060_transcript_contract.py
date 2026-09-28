@@ -13,7 +13,13 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
-from curie_api.schema_compat import KIND_CONTRACT, load_kinds, load_window, plan_upgrade
+from curie_api.schema_compat import (
+    KIND_CONTRACT,
+    AppWindow,
+    load_kinds,
+    load_window,
+    plan_upgrade,
+)
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -97,9 +103,11 @@ def _seed_copy(
 
 
 def test_0060_contract_requires_forward_only() -> None:
-    window = load_window()
+    # 0060 set the floor for the release that shipped it; a later contract
+    # (0068) raises it again, so the pin is that it never falls below 0060.
+    assert load_window().schema_min >= "0060"
+    window = AppWindow(schema_min="0060", schema_head="0067")
     kinds = load_kinds()
-    assert window.schema_min == "0060"
     assert kinds["0060"] == KIND_CONTRACT
 
     refused = plan_upgrade(
