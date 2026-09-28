@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aci_protocol import HookRunRef, QueuedTurn, ReplyHandle, TurnSource
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import text
@@ -217,10 +218,21 @@ async def fire_hook(
                 .mappings()
                 .all()
             )
-            if len(bindings) != 1:
+            candidates = list(bindings)
+            if len(candidates) > 1:
+                # ADR-0168 decision 3: a trigger names an address, never an
+                # identity; several of this agent's identities there mean its
+                # default Slack one, as the cron loop reads the same target.
+                candidates = [
+                    b
+                    for b in candidates
+                    if b["kind"] == SLACK_KIND
+                    and route_identity(b["kind"], b["adapter"]) == DEFAULT_IDENTITY
+                ]
+            if len(candidates) != 1:
                 terminal = "failed"
             else:
-                binding = bindings[0]
+                binding = candidates[0]
                 handle = ReplyHandle(
                     kind=binding["kind"],
                     channel=binding["address"],
