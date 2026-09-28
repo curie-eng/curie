@@ -219,7 +219,10 @@ async def fire_hook(
                 .all()
             )
             candidates = list(bindings)
-            if len(candidates) > 1:
+            slack_identities = len(candidates) > 1 and all(
+                b["kind"] == SLACK_KIND for b in candidates
+            )
+            if slack_identities:
                 # ADR-0168 decision 3: a trigger names an address, never an
                 # identity; several of this agent's identities there mean its
                 # default Slack one, as the cron loop reads the same target.

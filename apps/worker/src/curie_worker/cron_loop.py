@@ -742,7 +742,10 @@ class CronSchedulerLoop:
                     .all()
                 )
             candidates = bindings
-            if len(candidates) > 1:
+            slack_identities = len(candidates) > 1 and all(
+                b["kind"] == SLACK_KIND for b in candidates
+            )
+            if slack_identities:
                 # ADR-0168 decision 3: a trigger names an address, never an
                 # identity; several of this agent's identities there mean its
                 # default Slack one.
@@ -753,14 +756,23 @@ class CronSchedulerLoop:
                     and route_identity(b["kind"], b["adapter"]) == DEFAULT_IDENTITY
                 ]
             if len(candidates) != 1:
-                logger.warning(
-                    "cron hook %s for agent=%s targets %r, which matches %d bindings; "
-                    "recording failed",
-                    name,
-                    target.agent_name,
-                    address,
-                    len(bindings),
-                )
+                if slack_identities and not candidates:
+                    logger.warning(
+                        "cron hook %s for agent=%s targets %r, which has no binding "
+                        "as 'default'; recording failed",
+                        name,
+                        target.agent_name,
+                        address,
+                    )
+                else:
+                    logger.warning(
+                        "cron hook %s for agent=%s targets %r, which matches %d bindings; "
+                        "recording failed",
+                        name,
+                        target.agent_name,
+                        address,
+                        len(bindings),
+                    )
                 raise _UnboundTarget
             binding = candidates[0]
             handle = ReplyHandle(
