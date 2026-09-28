@@ -61,6 +61,8 @@ from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_nam
 # also rejects bare names ("general"), pasted URLs, and lowercase IDs -- none of
 # which the worker can route on.
 _SLACK_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{7,}$")
+# Public alias for the approval plane, which must recognize the shape too.
+SLACK_CHANNEL_ID = _SLACK_CHANNEL_ID
 # Slack user-group (subteam) IDs start with S; user IDs start with U, or W for
 # enterprise-grid users. Same allowlist discipline and same reason as channels:
 # a @handle or a bare name never resolves, and the S/C prefix is the whole

@@ -648,9 +648,14 @@ the sender it vouches for: the sender is carried as `actor` from the
 explicit user list (ADR-0177's separate finding). An adapter is served, and so may list
 and resolve, an approval whose card went to one of its own bindings on the same agent:
 the conversation that asked (routeless or `requesting_surface`), matched on the record's
-`(reply_kind, reply_channel)` pair, or a fixed route target. On a non-Slack conversation
-the `RequesterOnly` set then admits the sender it names only when that sender is the
-approval's author.
+`(reply_kind, reply_channel)` pair, or a fixed route target the recorded `card_channel`
+names. Where the card went is read from the record, not the current route: re-pointing a
+route after the ask neither moves the card nor hands the approval to the new target's
+adapter, and approvers added meanwhile make a non-Slack card admit nobody. The record
+keeps the card's address but not its kind, so a non-Slack asking address shaped like a
+Slack channel ID is read as a possible Slack card, which no adapter may answer. On a
+non-Slack conversation the `RequesterOnly` set then admits the sender it names only when
+that sender is the approval's author.
 Historical assertion-era rows remain visibly unauthenticated with a null principal kind.
 An audit row may truthfully show the same principal as requester and approver: that says
 one authenticated member confirmed their own request, not that a second person reviewed it.

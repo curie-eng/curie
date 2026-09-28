@@ -29,7 +29,7 @@ from typing import Any, Protocol
 from aci_protocol.turn import SLACK_KIND
 
 from .models import Approval
-from .schemas import REQUESTING_SURFACE_MODE
+from .schemas import SLACK_CHANNEL_ID
 
 # The audit vocabulary is FROZEN, and each set pins its own ``audit_name`` to the
 # class name it had before ADR-0034 turned it from an authorizer into a set. The
@@ -235,26 +235,31 @@ class UnboundRoute:
 def card_on_requesting_surface(approval: Approval, binding: Any) -> bool:
     """Whether this approval's card was shown in the conversation that asked.
 
-    True for a routeless approval, and for a route whose resolution is
-    ``{"mode": "requesting_surface"}`` (ADR-0177 decision 1). ``binding`` is the
-    route binding read fresh, like every other authority fact here, so a route
-    re-pointed to a fixed channel stops counting at once. The row must agree
-    as well: ``card_channel`` is where the worker actually posted the card, and
-    a card recorded anywhere but the asking address is not the asking
-    surface's to answer, whatever the route says now. Both halves must hold, so
-    neither a rewritten route map nor a stray row can move the answer.
+    The record decides, not the current route: the card stays where it was
+    shown when an operator re-points the route later (ADR-0177: an approval is
+    answered where its card is shown). ``card_channel`` is where the worker
+    posted the card, so a card recorded anywhere but the asking address is not
+    the asking conversation's. A routeless approval's card always went there.
+
+    A routed one needs its binding still readable (ADR-0123: a named route
+    with no binding left admits nobody, through ``UnboundRoute``). And the
+    record keeps the card's address but not its kind, so a non-Slack asking
+    address shaped like a Slack channel ID cannot be told apart from a fixed
+    Slack card at that same ID; that case is read as the Slack card, which no
+    adapter may answer. Every other routed record whose card sits at the asking
+    address was shown there: fixed targets are Slack channel IDs, so a
+    non-Slack asking address can only hold a requesting_surface card.
     """
 
     if approval.card_channel is not None and approval.card_channel != approval.reply_channel:
         return False
     if not approval.route:
         return True
-    if not isinstance(binding, Mapping):
+    if not isinstance(binding, Mapping) or not isinstance(binding.get("resolution"), Mapping):
         return False
-    resolution = binding.get("resolution")
-    return isinstance(resolution, Mapping) and dict(resolution) == {
-        "mode": REQUESTING_SURFACE_MODE
-    }
+    if approval.reply_kind != SLACK_KIND and SLACK_CHANNEL_ID.fullmatch(approval.reply_channel):
+        return False
+    return True
 
 
 def answered_by_requester_only(approval: Approval, binding: Any) -> bool:

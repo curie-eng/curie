@@ -2547,8 +2547,8 @@ def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
       Then the asking pair, ``(reply_kind, reply_channel)``, must be one of the
       adapter's bindings. The record stores that pair, and it is a fact about
       the original turn that no later rebinding rewrites.
-    - Its route names a fixed target, and that target's ``(kind, address)`` is
-      one of the adapter's bindings.
+    - Its route names a fixed target, the recorded card is at that target, and
+      the target's ``(kind, address)`` is one of the adapter's bindings.
 
     An approval with no agent, or a route whose resolution is missing or
     malformed, is served by no adapter: fail closed.
@@ -2574,6 +2574,10 @@ def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
         return False
     kind, address = resolution.get("kind"), resolution.get("address")
     if not isinstance(kind, str) or not isinstance(address, str):
+        return False
+    # The card must actually be there: a route re-pointed after the ask does
+    # not hand the pending approval to whoever serves the new target.
+    if (approval.card_channel or approval.reply_channel) != address:
         return False
     return (kind, address) in pairs
 

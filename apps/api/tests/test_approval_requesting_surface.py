@@ -342,32 +342,198 @@ def test_a_card_recorded_elsewhere_is_not_served_from_the_asking_binding(
     assert refused.status_code == 404, refused.text
 
 
-def test_route_repointed_to_a_fixed_target_stops_serving_the_thread(
+def _repoint(client: TestClient, auth: dict[str, str], agent_id: str, binding: dict) -> None:
+    moved = client.patch(
+        f"/agents/{agent_id}", json={"approval_routes": {"confirm": binding}}, headers=auth
+    )
+    assert moved.status_code == 200, moved.text
+
+
+def test_a_route_repointed_after_the_ask_leaves_the_card_where_it_was_shown(
     surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """The route is read fresh: re-pointing it to Slack takes the pending
-    approval away from the email thread at once."""
+    """The record says where the card went; re-pointing the route later does
+    not move it. The email card stays answerable only in the email thread, and
+    a listed Slack user (here through an operator token) cannot answer it."""
 
     agent = _email_agent(
         surface_client, auth_headers, routes={"confirm": {"resolution": REQUESTING_SURFACE}}
     )
     approval = _email_approval(surface_client, auth_headers, agent, route="confirm")
     token = _adapter_token([agent["binding_id"]])
-    assert _listed(surface_client, token) == {approval["id"]}
+    _repoint(
+        surface_client,
+        auth_headers,
+        agent["agent_id"],
+        {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "approvers": {"users": ["U0EXAMPLE1"]},
+        },
+    )
 
-    moved = surface_client.patch(
-        f"/agents/{agent['agent_id']}",
+    assert _listed(surface_client, token) == {approval["id"]}
+    operator = approval_principal.mint(
+        get_settings().api_key,
+        subject="U0EXAMPLE1",
+        kind="operator",
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(time.time()) + 60,
+    )
+    refused = _resolve(surface_client, approval["id"], {PRINCIPAL_HEADER: operator})
+    assert refused.status_code == 403, refused.text
+    # The new approvers are Slack users nobody on the email thread can prove
+    # to be, so the requester cannot answer either: it fails closed.
+    closed = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
+    assert closed.status_code == 403, closed.text
+    assert _status(surface_client, auth_headers, approval["id"]) == "pending"
+
+    # Re-pointed without approvers, the card is still the requester's to answer.
+    _repoint(
+        surface_client,
+        auth_headers,
+        agent["agent_id"],
+        {"resolution": {"kind": "slack", "address": "C0EXAMPLE1"}},
+    )
+    accepted = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
+    assert accepted.status_code == 200, accepted.text
+
+
+def test_a_repointed_route_does_not_hand_the_approval_to_the_new_target(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """An adapter serving the route's NEW fixed target must not see an approval
+    whose card was shown somewhere else."""
+
+    channel = f"C0NEW{_uid().upper()}"
+    agent = _email_agent(
+        surface_client, auth_headers, routes={"confirm": {"resolution": REQUESTING_SURFACE}}
+    )
+    added = surface_client.post(
+        f"/agents/{agent['agent_id']}/channels",
+        json={"kind": "slack", "address": channel},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    approval = _email_approval(surface_client, auth_headers, agent, route="confirm")
+    _repoint(
+        surface_client,
+        auth_headers,
+        agent["agent_id"],
+        {"resolution": {"kind": "slack", "address": channel}},
+    )
+    slack_token = _adapter_token([_binding_ids(agent["agent_id"])[channel]])
+
+    assert _listed(surface_client, slack_token) == set()
+    refused = _resolve(surface_client, approval["id"], _adp(slack_token, REQUESTER))
+    assert refused.status_code == 404, refused.text
+
+
+def test_a_fixed_route_repointed_to_an_adapters_binding_does_not_serve_the_old_card(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A Slack card posted to one fixed channel, then the route moved to
+    another: an adapter serving the new channel must not list it."""
+
+    asking, old_target, new_target = (f"C0{tag}{_uid().upper()}" for tag in ("ASK", "OLD", "NEW"))
+    created = surface_client.post(
+        "/agents",
         json={
-            "approval_routes": {
-                "confirm": {"resolution": {"kind": "slack", "address": "C0EXAMPLE1"}}
-            }
+            "name": f"surface-fixed-{_uid()}",
+            "channel": {"kind": "slack", "address": asking},
+            "approval_routes": {"ops": {"resolution": {"kind": "slack", "address": old_target}}},
         },
         headers=auth_headers,
     )
+    assert created.status_code == 201, created.text
+    agent_id = str(created.json()["id"])
+    added = surface_client.post(
+        f"/agents/{agent_id}/channels",
+        json={"kind": "slack", "address": new_target},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    response = surface_client.post(
+        "/approvals",
+        json={
+            "conversation_id": f"th-{_uid()}",
+            "author": "U0EXAMPLE2",
+            "summary": "Confirm the requested action",
+            "reply_kind": "slack",
+            "reply_channel": asking,
+            "reply_placeholder": "p-1",
+            "dedupe_key": uuid.uuid4().hex,
+            "agent_id": agent_id,
+            "route": "ops",
+            "card_channel": old_target,
+            "gate_kind": "policy",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 201, response.text
+    moved = surface_client.patch(
+        f"/agents/{agent_id}",
+        json={"approval_routes": {"ops": {"resolution": {"kind": "slack", "address": new_target}}}},
+        headers=auth_headers,
+    )
     assert moved.status_code == 200, moved.text
+
+    token = _adapter_token([_binding_ids(agent_id)[new_target]])
+    assert _listed(surface_client, token) == set()
+
+
+def test_a_slack_shaped_asking_address_is_never_read_as_the_asking_card(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The record keeps the card's address but not its kind. When a non-Slack
+    asking address is shaped like the Slack channel a fixed route posted to,
+    the card may be that Slack card, and no adapter may answer a Slack card,
+    even after the route is switched to requesting_surface."""
+
+    shared = f"C0SHR{_uid().upper()}"
+    created = surface_client.post(
+        "/agents",
+        json={
+            "name": f"surface-shared-{_uid()}",
+            "channel": {
+                "kind": "webchat",
+                "address": shared,
+                "endpoint": EMAIL_ENDPOINT,
+                "adapter": EMAIL_ADAPTER,
+            },
+            "approval_routes": {"confirm": {"resolution": {"kind": "slack", "address": shared}}},
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = str(created.json()["id"])
+    response = surface_client.post(
+        "/approvals",
+        json={
+            "conversation_id": f"th-{_uid()}",
+            "author": REQUESTER,
+            "summary": "Confirm the requested action",
+            "reply_kind": "webchat",
+            "reply_channel": shared,
+            "reply_placeholder": None,
+            "reply_endpoint": EMAIL_ENDPOINT,
+            "reply_adapter": EMAIL_ADAPTER,
+            "dedupe_key": uuid.uuid4().hex,
+            "agent_id": agent_id,
+            "route": "confirm",
+            "card_channel": shared,
+            "gate_kind": "policy",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 201, response.text
+    approval = response.json()
+    _repoint(surface_client, auth_headers, agent_id, {"resolution": REQUESTING_SURFACE})
+    token = _adapter_token([_binding_ids(agent_id)[shared]])
+
     assert _listed(surface_client, token) == set()
     refused = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
     assert refused.status_code == 404, refused.text
+    assert _status(surface_client, auth_headers, approval["id"]) == "pending"
 
 
 # --- 3. the requester-only approver set ---------------------------------------
