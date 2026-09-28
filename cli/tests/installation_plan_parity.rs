@@ -1523,7 +1523,9 @@ fn cluster_up_reports_a_preserved_sealing_key_as_preserved() {
         "the existing sealing key must be counted and named as preserved:\n{visible}"
     );
     assert!(
-        !visible.contains("generated") || !visible.contains("sealing"),
+        !visible
+            .lines()
+            .any(|line| line.contains("generated") && line.contains("sealing")),
         "a recorded sealing key must not be reported as generated:\n{visible}"
     );
     assert!(
