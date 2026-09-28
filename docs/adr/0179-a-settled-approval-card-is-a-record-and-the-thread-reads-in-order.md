@@ -212,9 +212,9 @@ wait tracks the posted message instead and reports its last edit as the reply.
 6. Post the card first and pick the notice from the card's result. Rejected: a
    placeholderless turn's notice would then land below the card, and a
    buffering channel would lose the card when the notice replaced its reply.
-8. Write the full notice back when the card does not land. Rejected for the
+7. Write the full notice back when the card does not land. Rejected for the
    same buffering reason: on email the rewrite replaces the text the card had
    appended.
-7. Tell the CLI apart by its endpoint, or by channel kind in the kernel.
+8. Tell the CLI apart by its endpoint, or by channel kind in the kernel.
    Rejected: kind is switched only below the reply seam (ADR-0096), an endpoint
    is transport and not identity, and the card already gives the CLI its id.
