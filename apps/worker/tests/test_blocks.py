@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 from channel_protocol import Action, ChoiceIntent, ConfirmIntent, OutboundMessage
 from curie_worker.behaviorpacks import NavPack
 from curie_worker.blocks import Reply, _reply_from_message, chunk, parse_reply, render, to_blocks
+
+# The decision instant the settled-card tests pin, and its Slack date token
+# (``<!date^unix^token_string|fallback>``, rendered only in mrkdwn: "Date
+# formatting", https://docs.slack.dev/messaging/formatting-message-text).
+_DECIDED = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+_DECIDED_TOKEN = "<!date^1790000000^{date_short_pretty} at {time}|2026-09-21 14:13 UTC>"
 
 # An enabled nav pack, same shape as tests/test_behaviorpacks.py.
 _NAV = NavPack(enabled=True, hub_label="Help", hub_command="help")
@@ -500,7 +507,11 @@ def test_the_rebuilt_settled_card_matches_the_edited_one() -> None:
     So: render a live card, settle it both ways, compare block for block.
     """
 
-    from curie_dispatcher.approval_actions import _resolved_card_blocks, settled_verdict_line
+    from curie_dispatcher.approval_actions import (
+        _resolved_card_blocks,
+        settled_card_header,
+        settled_verdict_line,
+    )
     from curie_worker.blocks import approval_card, resolved_approval_card
 
     summary = "Give ACME a 20% discount"
@@ -513,15 +524,21 @@ def test_the_rebuilt_settled_card_matches_the_edited_one() -> None:
     )
 
     verdict = settled_verdict_line(
-        decision="approved", resolver="U_MANAGER", note="approved for Q3"
+        decision="approved",
+        resolver="U_MANAGER",
+        note="approved for Q3",
+        resolved_at=_DECIDED,
     )
-    edited = _resolved_card_blocks({"blocks": live}, verdict)
+    edited = _resolved_card_blocks(
+        {"blocks": live}, verdict, header=settled_card_header("approved")
+    )
     _rebuilt_text, rebuilt = resolved_approval_card(
         summary=summary,
         requested_by=requested_by,
         decision="approved",
         resolver="U_MANAGER",
         note="approved for Q3",
+        resolved_at=_DECIDED,
     )
 
     assert rebuilt == edited, (
@@ -531,6 +548,38 @@ def test_the_rebuilt_settled_card_matches_the_edited_one() -> None:
     )
     # And the thing that makes it a SETTLED card in the first place.
     assert not any(b.get("type") == "actions" for b in rebuilt)
+    # ADR-0179: both paths head the card with the outcome and stamp the time.
+    assert rebuilt[0]["text"]["text"] == "Approved"
+    assert _DECIDED_TOKEN in rebuilt[-1]["elements"][0]["text"]
+
+
+def test_a_settled_card_heads_with_its_outcome() -> None:
+    """ADR-0179 decision 1: the header says how the approval ended.
+
+    Only the settled forms change. The live card still asks, so a reader can
+    tell a waiting card from a decided one by its first line.
+    """
+
+    from curie_worker.blocks import approval_card, expired_approval_card, resolved_approval_card
+
+    _fallback, live = approval_card(
+        approval_id="appr-1", summary="Refund order 42", requested_by="U_AE"
+    )
+    assert live[0]["text"]["text"] == "Approval required"
+
+    for decision, header in (("approved", "Approved"), ("rejected", "Rejected")):
+        _text, settled = resolved_approval_card(
+            summary="Refund order 42",
+            requested_by="U_AE",
+            decision=decision,
+            resolver="U_MANAGER",
+            note=None,
+        )
+        assert settled[0]["type"] == "header"
+        assert settled[0]["text"]["text"] == header
+
+    _text, expired = expired_approval_card(summary="Refund order 42", requested_by="U_AE")
+    assert expired[0]["text"]["text"] == "Expired"
 
 
 def test_a_settled_card_without_a_remembered_requester_omits_the_line() -> None:
@@ -633,6 +682,22 @@ def test_expired_approval_card_drops_buttons_and_marks_expired() -> None:
     assert card[0]["type"] == "header"
     assert "Give ACME a 20% discount" in card[1]["text"]["text"]
     assert all(block.get("type") != "actions" for block in card)
+    assert "expired" in str(card[-1]).lower()
+    # A card remembered without its requester omits the line, as a resolved one does.
+    assert not any("Requested by" in str(block) for block in card)
+
+
+def test_an_expired_card_still_names_its_requester() -> None:
+    """ADR-0179 decision 1: the expired record keeps who asked, like a resolved one."""
+
+    from curie_worker.blocks import expired_approval_card
+
+    _fallback, card = expired_approval_card(summary="Refund order 42", requested_by="U_AE")
+
+    assert {
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "Requested by <@U_AE>"}],
+    } in card
     assert "expired" in str(card[-1]).lower()
 
 

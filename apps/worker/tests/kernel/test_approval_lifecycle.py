@@ -18,6 +18,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1712,6 +1713,46 @@ def test_worker_approval_http_requests_carry_the_active_turn_parent() -> None:
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The API serializes the row's naive UTC ``resolved_at`` with no offset.
+        ("2026-09-21T14:13:20", datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)),
+        (None, None),
+        ("garbage", None),
+    ],
+)
+def test_the_approval_read_carries_the_decision_time(
+    raw: str | None, expected: datetime | None
+) -> None:
+    """ADR-0179 decision 1: the worker's settle path gets the time the click saw."""
+
+    async def go() -> SettledApproval | None:
+        def handle(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "approved",
+                    "resolved_by": "U0APPROVER1",
+                    "resolution_note": None,
+                    "resolved_at": raw,
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.test",
+                api_key="platform-test-key",
+                client=http,
+                read_timeout_s=1.0,
+            )
+            return await client.get("00000000-0000-0000-0000-000000000001")
+
+    record = asyncio.run(go())
+    assert record is not None
+    assert record.resolved_at == expected
+
+
 def test_private_lineage_truth_is_read_from_api_without_publication_credentials() -> None:
     """Routing gets refreshed PR truth from the trusted API, never GitHub directly."""
 
@@ -3350,6 +3391,54 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
 
             # The memory is still consumed, so a later approval cannot collide.
             assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("timed", [True, False], ids=["with-time", "without-time"])
+def test_a_resolve_resume_carries_the_records_decision_time_to_the_card(
+    make_harness, timed: bool
+) -> None:
+    """ADR-0179 decision 1: the settled card says when, read off the record.
+
+    The reply wire's ``SettledOutcome`` is decoded strictly by out-of-process
+    adapters, so the instant travels in the settle message's existing ``fields``
+    list, which every adapter already accepts. A record with no time carries no
+    field rather than a guessed one.
+    """
+
+    from curie_worker.approvals import decided_at
+
+    decided = datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+    record = (
+        SettledApproval(
+            status="approved", resolved_by="U9", resolution_note=None, resolved_at=decided
+        )
+        if timed
+        else _APPROVED
+    )
+
+    async def go() -> None:
+        reader = RecordingReader(record)
+        thread = "th-decided"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            _channel, _ts, message, _endpoint, settled = h.sink.card_updates[0]
+            assert settled is not None and settled.decision == "approved"
+            if timed:
+                assert decided_at(message) == decided
+            else:
+                assert message.fields == []
 
     asyncio.run(go())
 
