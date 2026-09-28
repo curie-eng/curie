@@ -1002,6 +1002,51 @@ mod tests {
         assert_eq!(seen, vec!["Starting up", "Filed report-v1.md"]);
     }
 
+    /// ADR-0179 decision 3: a fast resume can post before the first wait finishes
+    /// draining the approval turn. That post belongs to the NEXT wait, not the
+    /// already-populated pause notice.
+    #[test]
+    fn a_fast_resumed_post_is_preserved_for_the_resume_wait() {
+        let post = stub_call("chat.postMessage", None, Some("p1"), "Starting up");
+        let mut first_tracked = "ph".to_string();
+        let mut pause = Some("Approval requested. See the card below.".to_string());
+        let mut seen = Vec::new();
+
+        assert!(!observe_reply(
+            &post,
+            &mut first_tracked,
+            &mut pause,
+            &mut |text| seen.push(text.to_string()),
+        ));
+        assert_eq!(pause.as_deref(), Some("Approval requested. See the card below."));
+
+        let mut resume_tracked = "ph".to_string();
+        let mut resumed = None;
+        assert!(observe_reply(
+            &post,
+            &mut resume_tracked,
+            &mut resumed,
+            &mut |text| seen.push(text.to_string()),
+        ));
+        assert_eq!(resumed.as_deref(), Some("Starting up"));
+    }
+
+    /// Calls drained from an approval turn are replayed in wire order when the
+    /// resume wait starts, so the new post is seen before edits to its minted ts.
+    #[tokio::test]
+    async fn deferred_calls_are_replayed_in_wire_order() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let post = stub_call("chat.postMessage", None, Some("p1"), "Starting up");
+        let update = stub_call("chat.update", Some("p1"), None, "Done");
+
+        stub.restore_calls(vec![post, update]);
+
+        assert_eq!(stub.recv().await.unwrap().method, "chat.postMessage");
+        assert_eq!(stub.recv().await.unwrap().method, "chat.update");
+    }
+
     /// The negative: once the placeholder carries the reply, a later post (a
     /// second message the turn happens to send) does not take its place.
     #[test]
