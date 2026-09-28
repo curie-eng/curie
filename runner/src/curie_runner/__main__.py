@@ -79,6 +79,7 @@ from .mcp_tool_capability import (
 from .memory import MEMORY_TOKEN_ENV, MemoryStore, format_memory_preamble, resolve_memory
 from .memory_facts import (
     DEFAULT_GUIDANCE,
+    MAX_FACTS_PER_MEMORY,
     Fact,
     MemoryTurn,
     format_facts_preamble,
@@ -918,12 +919,20 @@ async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | No
         tg.start_soon(load_agent)
         tg.start_soon(load_channel)
         tg.start_soon(load_guidance)
+    # Counts and the guidance source only: never statements, authors or the
+    # guidance text. Counts are what the prompt shows, after the per-memory cap.
+    # "none" mirrors build_runner's mount rule as far as boot can see it (a
+    # channel store and a memory token).
+    if channel_store is None or not token:
+        guidance_source = "none"
+    else:
+        guidance_source = "operator" if guidance is not None else "default"
     logger.info(
-        "memory facts loaded session=%s agent=%d channel=%d operator_guidance=%s",
+        "memory facts loaded session=%s agent=%d channel=%d guidance=%s",
         config.session.session_id,
-        len(agent_facts),
-        len(channel_facts),
-        guidance is not None,
+        min(len(agent_facts), MAX_FACTS_PER_MEMORY),
+        min(len(channel_facts), MAX_FACTS_PER_MEMORY),
+        guidance_source,
     )
     return format_facts_preamble(agent_facts, channel_facts), guidance
 
