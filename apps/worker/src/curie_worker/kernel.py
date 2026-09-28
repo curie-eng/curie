@@ -119,6 +119,7 @@ from .binding import (
     PROGRESS_URL_ENV,
     RESUMED_KIND_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
+    AmbiguousRoute,
     BindingResolver,
 )
 from .capacity_wait import (
@@ -2355,16 +2356,26 @@ class Kernel:
                 # under two kinds, and one pair can answer to only one identity
                 # at a time, so dropping either would answer with somebody
                 # else's route.
-                resolved = await self._binding.resolve(handle.kind, handle.adapter, handle.channel)
+                try:
+                    resolved = await self._binding.resolve(
+                        handle.kind, handle.adapter, handle.channel
+                    )
+                except AmbiguousRoute as exc:
+                    await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
+                    return
                 if resolved is None:
                     # Binding doubles predate the diagnostic lookup; keep a miss
                     # on those doubles on the established polite-drop path.
                     undeployed_lookup = getattr(self._binding, "undeployed_binding", None)
-                    undeployed = (
-                        await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
-                        if undeployed_lookup is not None
-                        else None
-                    )
+                    try:
+                        undeployed = (
+                            await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
+                            if undeployed_lookup is not None
+                            else None
+                        )
+                    except AmbiguousRoute as exc:
+                        await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
+                        return
                     if undeployed is not None:
                         # A bound non-Slack route may carry the only endpoint the
                         # platform can use to deliver this status reply.
@@ -3464,6 +3475,31 @@ class Kernel:
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
         await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease)
+
+    async def _drop_ambiguous_route(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        exc: AmbiguousRoute,
+        *,
+        lease: DeliveryLease | None = None,
+    ) -> None:
+        """Complete a turn whose route selects several agents' bindings.
+
+        It runs under no deployment and replies through no route: every route
+        on the pair belongs to an agent the turn may not be from, so a reply
+        through any of them is the misroute being refused (ADR-0168 decision 3).
+        """
+
+        logger.error("dropping event %s without a run or a reply: %s", qevent.event_id, exc)
+        await self._complete(
+            qevent,
+            route,
+            "dropped",
+            telemetry_outcome="interrupted",
+            lease=lease,
+            hook_outcome="failed",
+        )
 
     async def _drop_sibling_turn(
         self,

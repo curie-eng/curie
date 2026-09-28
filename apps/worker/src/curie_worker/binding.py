@@ -69,7 +69,7 @@ from typing import Any
 from urllib.parse import quote
 
 from aci_protocol import BootEnv, Budget
-from aci_protocol.turn import matching_routes
+from aci_protocol.turn import SLACK_KIND, matching_routes
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -382,6 +382,39 @@ class ResolvedDeployment(BaseModel):
     memory: bool = False
 
 
+class AmbiguousRoute(RuntimeError):
+    """A turn names no adapter on a non-Slack pair that several agents bind.
+
+    An omitted non-Slack adapter selects every route on the pair
+    (``matching_routes``), and migration 0068's triple key lets two agents hold
+    one pair under different adapters, so no deployment is this turn's. The
+    worker's twin of the API's ``crud.AmbiguousRoute``: never resolved by
+    picking one, because the pick runs one agent's turn under another's
+    deployment, secrets and reply route (ADR-0168 decision 3, #38).
+    """
+
+    def __init__(self, kind: str, address: str, agent_ids: Sequence[uuid.UUID]) -> None:
+        self.kind = kind
+        self.address = address
+        self.agent_ids = sorted(str(agent_id) for agent_id in agent_ids)
+        super().__init__(
+            f"{len(self.agent_ids)} agents are bound to {kind}:{address} and the turn "
+            f"names no adapter to choose one ({', '.join(self.agent_ids)})"
+        )
+
+
+def refuse_several_agents(kind: str, address: str, rows: Sequence[Any]) -> None:
+    """Raise ``AmbiguousRoute`` when ``rows`` belong to more than one agent.
+
+    Counts distinct agents, not rows: one agent's several rows are one
+    deployment whichever row answers.
+    """
+
+    agents = {row["agent_id"] for row in rows}
+    if len(agents) > 1:
+        raise AmbiguousRoute(kind, address, list(agents))
+
+
 class BoundAgent(BaseModel):
     """An agent bound to a route but without a deployable active version."""
 
@@ -405,9 +438,11 @@ def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) 
     ``agent_channels_address_key`` and 0017's ``agents_slack_channel_key``), so
     a Slack turn, or a turn that names its adapter, cannot reach this state
     through the write paths. A non-Slack turn that omits its adapter selects
-    every route on the pair and can. It stays for that, as defense in depth
-    for rows written out of band, and because silently shadowing an agent is
-    the failure mode #38 existed to kill.
+    every route on the pair, and ``resolve`` refuses it with ``AmbiguousRoute``
+    before this runs when those routes belong to several agents. So this is
+    reachable only through rows written out of band, and stays as defense in
+    depth there, because silently shadowing an agent is the failure mode #38
+    existed to kill.
 
     One agent with both a dev and a prod deployment active is two rows but one
     agent, so count distinct agents, not rows.
@@ -491,9 +526,20 @@ class BindingResolver:
         identity or an address-only overload would silently answer with
         whichever row happened to be bound, which is #38's misroute wearing a
         new hat.
+
+        An omitted non-Slack adapter selects every route on the pair, so when
+        those routes belong to several agents this raises ``AmbiguousRoute``
+        rather than answer. That is judged over every BINDING on the pair, not
+        only the deployed ones this query returns: an undeployed agent's
+        route-less binding would otherwise leave the other agent's row as the
+        only match, and the turn would run as that agent.
         """
+        params = {"kind": kind, "address": address}
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._sql, {"kind": kind, "address": address})
+            if adapter is None and kind != SLACK_KIND:
+                bound = (await conn.execute(self._undeployed_binding_sql, params)).all()
+                refuse_several_agents(kind, address, [dict(row._mapping) for row in bound])
+            result = await conn.execute(self._sql, params)
             rows = result.all()
         matches = matching_routes(rows, kind, address, adapter)
         if not matches:
@@ -534,7 +580,11 @@ class BindingResolver:
         matches = matching_routes(rows, kind, address, adapter)
         if not matches:
             return None
-        return BoundAgent.model_validate(dict(matches[0]._mapping))
+        mapped = [dict(row._mapping) for row in matches]
+        # The same refusal as ``resolve``: the diagnostic reply goes out
+        # through the bound agent's route, so naming either agent is a guess.
+        refuse_several_agents(kind, address, mapped)
+        return BoundAgent.model_validate(mapped[0])
 
     async def identity_for_address(self, kind: str, address: str) -> str | None:
         """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""
