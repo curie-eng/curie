@@ -190,7 +190,9 @@ def test_an_omitted_adapter_keeps_the_unbound_404(
     two_identities: None,
     clean_db: None,
 ) -> None:
-    """A Slack pair bound only under a named identity has no default route."""
+    """A Slack pair bound only under a named identity has no default route,
+    and the 404 names the identities that do bind it (ADR-0168's evidence:
+    a refusal that does not mention the missing selector)."""
     agent_id = _agent(
         hooks_client,
         auth_headers,
@@ -201,7 +203,10 @@ def test_an_omitted_adapter_keeps_the_unbound_404(
     resp = _hook(hooks_client, agent_id, "kind=slack&address=C0EXAMPLE5", "u-1")
 
     assert resp.status_code == 404, resp.text
-    assert resp.json()["detail"] == "this agent has no binding for the selected kind and address"
+    assert resp.json()["detail"] == (
+        "this agent has no binding for the selected kind and address as 'default'; "
+        "it binds slack:C0EXAMPLE5 only as 'second', so pass adapter to name one"
+    )
 
 
 def test_an_adapter_that_names_no_route_is_a_404_naming_it(

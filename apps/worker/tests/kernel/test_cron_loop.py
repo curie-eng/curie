@@ -796,6 +796,82 @@ def test_a_target_bound_under_several_identities_none_default_records_failed(
     asyncio.run(body())
 
 
+async def _extra_binding(
+    seed: Any, kind: str, adapter: str | None
+) -> uuid.UUID:
+    extra = uuid.uuid4()
+    async with seed.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                "VALUES (:id, :agent, :kind, :address, :adapter)"
+            ),
+            {
+                "id": extra,
+                "agent": seed.agent_id,
+                "kind": kind,
+                "address": seed.address,
+                "adapter": adapter,
+            },
+        )
+    return extra
+
+
+async def _drop_bindings(seed: Any, ids: list[uuid.UUID]) -> None:
+    async with seed.engine.begin() as conn:
+        for extra in ids:
+            await conn.execute(
+                text("DELETE FROM curie.agent_channels WHERE id = :id"), {"id": extra}
+            )
+
+
+def test_a_target_bound_under_two_kinds_records_failed_even_with_a_default_identity(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    """The default-identity reading narrows several Slack identities only. An
+    address bound under another kind too is ambiguous across kinds, as it was
+    before identities: the fire does not go to Slack silently."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            extras = [
+                await _extra_binding(seed, "slack", "default"),
+                await _extra_binding(seed, "email", None),
+            ]
+            try:
+                await _pass_once(seed, names["stream"], _trigger(seed))
+                rows = await seed.runs()
+                assert [(r.slot_utc, r.outcome) for r in rows] == [(seed.slot, "failed")]
+                assert _entries(sync_redis, names["stream"]) == []
+            finally:
+                await _drop_bindings(seed, extras)
+
+    asyncio.run(body())
+
+
+def test_an_ambiguous_target_logs_why_it_matched_no_single_binding(
+    sync_redis: redis.Redis, names: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two named identities and no default: the log says the default identity
+    is unbound there, not that the target matched two bindings."""
+
+    async def body() -> None:
+        async with _seed() as seed:
+            extras = [await _extra_binding(seed, "slack", "third-bot")]
+            try:
+                with caplog.at_level(logging.WARNING, logger="curie_worker.cron_loop"):
+                    await _pass_once(seed, names["stream"], _trigger(seed))
+                [message] = [
+                    r.getMessage() for r in caplog.records if r.name == "curie_worker.cron_loop"
+                ]
+                assert "matches 2 bindings" not in message, message
+                assert "no binding as 'default'" in message, message
+            finally:
+                await _drop_bindings(seed, extras)
+
+    asyncio.run(body())
+
+
 def test_loops_resolving_adjacent_slots_of_one_hook_admit_exactly_once(
     sync_redis: redis.Redis, names: dict[str, str]
 ) -> None:

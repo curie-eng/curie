@@ -312,3 +312,42 @@ def test_a_target_bound_under_several_identities_none_default_fails(
         for item in _payloads_for("ambiguous-check")
         if item["event_id"].startswith(f"cron:{agent_id}:")
     ] == []
+
+
+def _bind_email(agent_id: str, address: str) -> None:
+    """A route-less email binding on the same address string, below the API."""
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+                        "VALUES (:id, :agent, 'email', :address)"
+                    ),
+                    {"id": uuid.uuid4(), "agent": uuid.UUID(agent_id), "address": address},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_a_target_bound_under_two_kinds_fails_even_with_a_default_identity(
+    tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The default-identity reading narrows several Slack identities only; an
+    address bound under another kind too stays ambiguous, as the cron loop reads it."""
+    root = _bundle(tmp_path, [{**_cron("kinds-check", "0 9 * * *"), "target": "C0EXAMPLE3"}])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-fire-two-kinds", channel="C0EXAMPLE3"
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    _bind(agent_id, "C0EXAMPLE3", "second-bot")
+    _bind_email(agent_id, "C0EXAMPLE3")
+
+    fired = _fire(client, auth_headers, "acme-fire-two-kinds", "kinds-check")
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["outcome"] == "failed"
+    assert _payloads_for("kinds-check") == []
