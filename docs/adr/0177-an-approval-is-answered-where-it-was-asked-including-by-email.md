@@ -2,7 +2,11 @@
 
 Date: 2026-09-25
 
-Status: Draft
+Status: Accepted
+
+Accepted with explicit maintainer approval from Brian Conn in the review of
+[#3252](https://github.com/curie-eng/curie/pull/3252), the pull request that
+published this status, before implementation.
 
 When a bot pauses for a person's approval, it can only be answered by a click
 in Slack. A request raised in an email thread therefore can never be approved:
