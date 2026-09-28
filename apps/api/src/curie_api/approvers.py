@@ -1,9 +1,10 @@
 """The approver-set port: who counts as an approver (#420, ADR-0034).
 
-An ``ApproverSet`` answers whether an actor belongs to the set and whether that
-set can be evaluated from a channel-less operator/console credential.  That
-second fact prevents a terminal or browser principal manufacturing provider
-membership evidence.  Requester equality is deliberately absent: ADR-0106
+An ``ApproverSet`` answers whether an actor belongs to the set and which
+principal kinds it can be evaluated for: a channel-less operator or console
+credential, or an adapter principal carrying another channel's sender.  That
+second fact prevents a terminal, a browser or an adapter manufacturing
+provider membership evidence.  Requester equality is deliberately absent: ADR-0106
 makes set membership the authorization boundary for every requester.
 
 Two axes decide an approval today, and they are not symmetrical:
@@ -70,6 +71,9 @@ class ApproverSet(Protocol):
     @property
     def console_eligible(self) -> bool: ...
 
+    @property
+    def adapter_eligible(self) -> bool: ...
+
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict: ...
 
 
@@ -87,6 +91,12 @@ class ExplicitUsers:
     audit_name = "ExplicitUserListAuthorizer"
     operator_eligible = True
     console_eligible = True
+    # The list holds Slack user IDs (``ApprovalApprovers`` validates them), and
+    # only the Slack dispatcher vouches for a Slack ID (ADR-0106). An adapter
+    # principal authenticated some other channel's sender, so letting it name a
+    # listed ID would let any adapter serving the binding approve as that
+    # person (ADR-0177, "A separate finding").
+    adapter_eligible = False
 
     def __init__(self, users: Sequence[str]) -> None:
         self._users = tuple(users)
@@ -131,6 +141,7 @@ class InvalidApprovers:
     # principal receives the same undetermined, fail-closed verdict below.
     operator_eligible = True
     console_eligible = True
+    adapter_eligible = True
 
     def __init__(self, error: str) -> None:
         self._error = error
@@ -177,6 +188,7 @@ class UnboundRoute:
     # or channel evidence; let ``contains`` preserve that reason in the audit.
     operator_eligible = True
     console_eligible = True
+    adapter_eligible = True
 
     def __init__(self, route: str) -> None:
         self._route = route

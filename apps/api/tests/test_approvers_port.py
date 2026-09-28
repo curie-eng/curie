@@ -31,6 +31,7 @@ class _EveryoneIsAMember:
     audit_name = "FakeApproverSet"
     operator_eligible = True
     console_eligible = True
+    adapter_eligible = True
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(member=True, evidence={"kind": "fake", "actor": actor})
@@ -40,6 +41,7 @@ class _NobodyIsAMember:
     audit_name = "FakeApproverSet"
     operator_eligible = True
     console_eligible = True
+    adapter_eligible = True
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
@@ -53,6 +55,7 @@ class _CannotTell:
     audit_name = "FakeApproverSet"
     operator_eligible = True
     console_eligible = True
+    adapter_eligible = True
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(

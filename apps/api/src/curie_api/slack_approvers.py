@@ -67,6 +67,8 @@ class SlackChannelMembers:
     audit_name = "ChannelMembershipAuthorizer"
     operator_eligible = False
     console_eligible = False
+    # Only the dispatcher's attested click proves Slack channel membership.
+    adapter_eligible = False
 
     def __init__(self, approvers_channel: str | None) -> None:
         self._approvers_channel = approvers_channel
@@ -110,6 +112,8 @@ class SlackUserGroupMembers:
     # server-side Slack lookup; unlike channel membership, no channel evidence
     # is required. Operator tokens remain explicit-user-only per ADR-0106.
     console_eligible = True
+    # Group members are Slack IDs, which only the dispatcher vouches for.
+    adapter_eligible = False
 
     def __init__(
         self,

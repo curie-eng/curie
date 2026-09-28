@@ -436,8 +436,10 @@ Slack feature.
   IDs**: the binding schema rejects anything that is not a Slack `U`/`W`-prefixed ID
   (`apps/api/src/curie_api/schemas.py::_SLACK_USER_ID`), never a handle or a name, so even this
   "Slack-free" set is expressed in Slack-shaped identifiers. It is the only set eligible
-  for `operator` and `adapter` principals; Console principals may use it or a verified user group. The
-  authenticated subject must appear in the selected set.
+  for `operator` principals; Console principals may use it or a verified user group. It
+  refuses `adapter` principals: its entries are Slack IDs, and only the Slack dispatcher
+  vouches for a Slack ID (ADR-0106), so an adapter naming a listed ID proves nothing
+  (ADR-0177's separate finding). The authenticated subject must appear in the selected set.
 
 Platform-RBAC remains the epic's fourth set and is not built.
 
@@ -526,8 +528,9 @@ resolves normally; nothing is lost.
 ### The three ports
 
 **`ApproverSet`** (`approvers.py`) is the black line #420 draws: `async contains(actor,
-actor_channel) -> MembershipVerdict`, plus `audit_name`, `operator_eligible`, and
-`console_eligible` policies for the audit and principal eligibility checks. It is async
+actor_channel) -> MembershipVerdict`, plus `audit_name`, `operator_eligible`,
+`console_eligible`, and `adapter_eligible` policies for the audit and principal eligibility
+checks. It is async
 because a set may own a lookup; `ExplicitUsers` simply never awaits. `MembershipVerdict`
 carries a third state beyond member/not-member: `undetermined`, meaning the set could not
 find out. The authorizer fails closed on it, and it is deliberately never collapsed into
@@ -535,9 +538,11 @@ find out. The authorizer fails closed on it, and it is deliberately never collap
 reasons, and telling a clicker the first when the second is true sends them arguing with
 policy over an outage.
 
-`operator_eligible` governs both channel-less principal kinds, `operator` and `adapter`.
-Only `ExplicitUsers` sets it, so neither principal can inherit a channel or user-group
-membership proof.
+`operator_eligible` governs the `operator` principal. Only `ExplicitUsers` sets it, so an
+operator cannot inherit a channel or user-group membership proof. `adapter_eligible`
+governs the `adapter` principal, and no Slack set sets it: every Slack set names Slack IDs,
+which an adapter cannot vouch for. The config sentinels (`InvalidApprovers`,
+`UnboundRoute`) set every flag so their own fail-closed reason reaches the audit row.
 
 The two Slack sets are asymmetrical and the port does not hide it. `contains` takes
 `actor_channel` precisely because channel membership proves membership from the authenticated
@@ -611,8 +616,8 @@ establishes the actor and writes `principal_kind` (`chat`, `console`, `operator`
 `adapter`) with `authenticated=true`; authorization writes the selected set's evidence
 and verdict. For an `adapter` principal, `principal_subject` names the adapter itself, not
 the sender it vouches for: the sender is carried as `actor` from the
-`X-Curie-Approval-Actor` header, and an adapter resolves only explicit-user routes, the
-same restriction as `operator`.
+`X-Curie-Approval-Actor` header, and no Slack approver set admits an adapter, not even an
+explicit user list (ADR-0177's separate finding).
 Historical assertion-era rows remain visibly unauthenticated with a null principal kind.
 An audit row may truthfully show the same principal as requester and approver: that says
 one authenticated member confirmed their own request, not that a second person reviewed it.
