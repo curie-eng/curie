@@ -915,6 +915,7 @@ mod tests {
             text: Some("the answer".into()),
             approval_card: false,
             approval_id: None,
+            posted_ts: None,
         };
         assert_eq!(placeholder_update_text(&update, "1.2"), Some("the answer"));
         // Wrong ts (a different message).
@@ -925,6 +926,92 @@ mod tests {
             ..update.clone()
         };
         assert_eq!(placeholder_update_text(&post, "1.2"), None);
+    }
+
+    fn stub_call(method: &str, ts: Option<&str>, posted: Option<&str>, text: &str) -> SlackCall {
+        SlackCall {
+            method: method.into(),
+            channel: Some("C1".into()),
+            ts: ts.map(str::to_string),
+            text: Some(text.into()),
+            approval_card: false,
+            approval_id: None,
+            posted_ts: posted.map(str::to_string),
+        }
+    }
+
+    fn replay(calls: &[SlackCall]) -> (Option<String>, Vec<String>) {
+        let mut tracked = "ph".to_string();
+        let mut latest = None;
+        let mut seen = Vec::new();
+        for call in calls {
+            observe_reply(call, &mut tracked, &mut latest, &mut |text| {
+                seen.push(text.to_string())
+            });
+        }
+        (latest, seen)
+    }
+
+    /// ADR-0179 decision 3: a resumed answer below an in-thread card is a NEW
+    /// message, so the wait follows the post instead of the placeholder above
+    /// the card. The settled card's own edit is not the reply.
+    #[test]
+    fn a_resumed_answer_posted_below_the_card_is_the_reply() {
+        let (latest, seen) = replay(&[
+            stub_call("chat.update", Some("card-ts"), None, "Approved"),
+            stub_call("chat.postMessage", None, Some("p1"), "Starting up"),
+            stub_call("chat.update", Some("p1"), None, "Filed report-v1.md"),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("Filed report-v1.md"));
+        assert_eq!(seen, vec!["Starting up", "Filed report-v1.md"]);
+    }
+
+    /// The negative: once the placeholder carries the reply, a later post (a
+    /// second message the turn happens to send) does not take its place.
+    #[test]
+    fn a_post_after_the_placeholder_was_edited_is_not_the_reply() {
+        let (latest, _seen) = replay(&[
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            stub_call("chat.postMessage", None, Some("p2"), "something else"),
+            stub_call("chat.update", Some("p2"), None, "something else, edited"),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("the answer"));
+    }
+
+    /// An approval card is never the reply, even when it is the first post.
+    #[test]
+    fn an_approval_card_post_is_never_followed_as_the_reply() {
+        let mut card = stub_call("chat.postMessage", None, Some("p1"), "Approval required: x");
+        card.approval_card = true;
+        let (latest, seen) = replay(&[card, stub_call("chat.update", Some("p1"), None, "edited")]);
+
+        assert_eq!(latest, None);
+        assert!(seen.is_empty());
+    }
+
+    /// The stub reports the ts it answered a post with, which is what lets the
+    /// wait follow a reply posted as a new message.
+    #[tokio::test]
+    async fn the_stub_reports_the_ts_it_answered_a_post_with() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let response: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .form(&[("channel", "C1"), ("thread_ts", "1.0"), ("text", "hello")])
+            .send()
+            .await
+            .expect("the stub answers")
+            .json()
+            .await
+            .expect("the stub answers JSON");
+        let call = stub.recv().await.expect("the stub records the call");
+
+        assert_eq!(call.method, "chat.postMessage");
+        assert_eq!(call.posted_ts.as_deref(), response["ts"].as_str());
+        assert!(call.posted_ts.is_some());
     }
 
     #[test]
