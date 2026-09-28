@@ -5713,7 +5713,12 @@ def test_cluster_message_review_revision_consumes_its_reservation(
 def test_cluster_message_review_revision_cannot_take_a_configured_route(
     review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
 ) -> None:
-    """#2789 negative: the relay binding still refuses an operator-configured route."""
+    """#2789 negative: the relay binding still refuses an operator-configured route.
+
+    A Slack route names an identity and never a transport (ADR-0168 decision
+    3), so the configured route here is the default identity with an origin
+    endpoint, which the relay's route-less binding does not have.
+    """
     client, truth, _ = review_lineage_app
     deployment, _, lineage = _verified_lineage(client, truth, auth_headers, route=_relay_route())
     assert _reserve_review(client, lineage, "review:relay-routed").status_code == 201
@@ -5723,7 +5728,7 @@ def test_cluster_message_review_revision_cannot_take_a_configured_route(
     payload.update(
         review_origin_key="review:relay-routed",
         reply_endpoint="https://adapter.example.com/reply",
-        reply_adapter="agentmail-sandbox",
+        reply_adapter="default",
     )
     refused = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
     assert refused.status_code == 409, refused.text
