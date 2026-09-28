@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -79,6 +79,13 @@ class AmbiguousRoute(RuntimeError):
     """Raised when an omitted non-Slack adapter selects several routes on one
     pair, which migration 0068's triple key allows. Never resolved by picking
     one: every caller answers it.
+    """
+
+
+class RoutelessPairShared(RuntimeError):
+    """A route-less non-Slack binding and another agent's route on one pair.
+
+    Raised by `refuse_routeless_pair_sharing`; its message is the 409 detail.
     """
 
 
@@ -417,6 +424,71 @@ async def agent_id_for_route(
             owner: uuid.UUID = owner_id
             return owner
     return None
+
+
+def _pair_lock_keys(kind: str, address: str) -> tuple[int, int]:
+    digest = hashlib.sha256(f"curie-route-pair:{kind}:{address}".encode()).digest()
+    return (
+        int.from_bytes(digest[:4], "big", signed=True),
+        int.from_bytes(digest[4:8], "big", signed=True),
+    )
+
+
+async def refuse_routeless_pair_sharing(
+    session: AsyncSession,
+    agent_id: uuid.UUID | None,
+    kind: str,
+    address: str,
+    adapter: str | None,
+) -> None:
+    """Refuse a non-Slack route that would share its pair with a route-less row
+    of ANOTHER agent (ADR-0168 decision 3).
+
+    A route-less binding's turn names no adapter, and an omitted non-Slack
+    adapter selects every route on the pair, so a route-less row beside another
+    agent's route makes that turn's agent a guess, which is #38's misroute.
+    `agent_channels_route_key` cannot say this: under NULLS NOT DISTINCT a
+    NULL adapter and a named one are different keys. So the write paths keep
+    0023's exclusivity for the route-less case, in both orders. Two named
+    adapters on one pair stay legal, and `agent_id`'s own rows are not
+    counted: one agent's rows are one deployment, and the per-agent readers
+    already answer their ambiguity. Slack never stores a NULL adapter.
+
+    Takes a transaction-scoped advisory lock on the pair first, so two writers
+    racing onto one pair from opposite sides serialize and the second sees the
+    first's committed row. The caller holds it to its commit. Raises
+    `RoutelessPairShared`.
+    """
+
+    if kind == SLACK_KIND:
+        return
+    classid, objid = _pair_lock_keys(kind, address)
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
+        {"classid": classid, "objid": objid},
+    )
+    others = select(AgentChannel.id).where(
+        AgentChannel.kind == kind, AgentChannel.address == address
+    )
+    if agent_id is not None:
+        others = others.where(AgentChannel.agent_id != agent_id)
+    if adapter is None:
+        routed = await session.scalar(others.where(AgentChannel.adapter.is_not(None)).limit(1))
+        if routed is not None:
+            raise RoutelessPairShared(
+                f"another agent holds a route on {kind}:{address}; a binding with no "
+                "adapter answers every route on that pair, so it would take that agent's "
+                "turns. Bind this one with its own endpoint and adapter, move or delete "
+                "the other agent, or pick another address"
+            )
+        return
+    routeless = await session.scalar(others.where(AgentChannel.adapter.is_(None)).limit(1))
+    if routeless is not None:
+        raise RoutelessPairShared(
+            f"another agent is bound to {kind}:{address} with no adapter, which answers "
+            "every route on that pair; give that binding its own endpoint and adapter "
+            "first, move or delete the other agent, or pick another address"
+        )
 
 
 async def agent_holds_channel_pair(

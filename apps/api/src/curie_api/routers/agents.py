@@ -143,7 +143,13 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # letting it bubble as an opaque 500. A non-unique violation (NOT NULL, FK)
     # is a genuine server fault -- re-raise it so it surfaces as a 500.
     try:
+        await crud.refuse_routeless_pair_sharing(
+            session, None, data.channel.kind, data.channel.address, data.channel.adapter
+        )
         agent = await crud.create_agent(session, data)
+    except crud.RoutelessPairShared as exc:
+        await session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except IntegrityError as exc:
         await session.rollback()
         classified = classify_integrity_error(exc)
@@ -535,6 +541,11 @@ async def add_agent_channel(
         try:
             async with session.begin_nested():  # SAVEPOINT
                 await crud.add_channel_binding(session, agent_id, data)
+                await crud.refuse_routeless_pair_sharing(
+                    session, agent_id, data.kind, data.address, data.adapter
+                )
+        except crud.RoutelessPairShared as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
             if classify_integrity_error(exc) is None:
                 raise
@@ -586,6 +597,13 @@ async def move_agent_channel(
         try:
             async with session.begin_nested():  # SAVEPOINT
                 await crud.update_channel_binding(session, binding, data)
+                # The moved row's route, not the request's: an omitted route
+                # keeps the stored one within a kind.
+                await crud.refuse_routeless_pair_sharing(
+                    session, agent_id, binding.kind, binding.address, binding.adapter
+                )
+        except crud.RoutelessPairShared as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
             # The same recovery as the add: a move onto a route another agent (or
             # this one) already holds raises the identical violation and needs the
