@@ -36,7 +36,9 @@ import os
 import time
 import unittest.mock
 import uuid
+from typing import Any
 
+import curie_worker.binding as binding_module
 import pytest
 from curie_worker.binding import (
     APPROVAL_REQUIRED_ENV,
@@ -1856,6 +1858,172 @@ def test_a_non_slack_turn_with_an_adapter_resolves_only_its_own_row() -> None:
 
                 wrong = await _resolver(engine).resolve("webhook", "other", address)
                 assert wrong is None
+            finally:
+                await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+async def _outcome(awaitable: Any) -> Any:
+    """The resolver's answer, or the exception it refused with."""
+
+    try:
+        return await awaitable
+    except Exception as exc:  # noqa: BLE001 - the refusal IS the answer under test
+        return exc
+
+
+async def _seed_routeless_beside_routed(
+    engine: AsyncEngine, token: str, *, deploy_routeless: bool
+) -> tuple[uuid.UUID, uuid.UUID, str]:
+    """Agent A routed on an email pair, agent B route-less on the same pair.
+
+    The triple key admits both rows, `(email, x, 'inbox-a')` and
+    `(email, x, NULL)`, so they are seeded as the database holds them rather
+    than through the API that now refuses the second.
+    """
+
+    address = f"ops-{token}@example.com"
+    routed = await _seed_agent(
+        engine, channel=address, name=f"inbox-a-{token}", max_usd=None, max_tokens=None,
+        kind="email", endpoint="https://inbox-a.example.test/", adapter="inbox-a",
+    )
+    routeless = await _seed_agent(
+        engine, channel=address, name=f"inbox-b-{token}", max_usd=None, max_tokens=None,
+        kind="email",
+    )
+    await _seed_deployment(
+        engine, agent_id=routed, environment="prod", bundle_ref=f"bundles/a-{token}.zip"
+    )
+    if deploy_routeless:
+        await _seed_deployment(
+            engine, agent_id=routeless, environment="dev", bundle_ref=f"bundles/b-{token}.zip"
+        )
+    return routed, routeless, address
+
+
+def test_a_routeless_turn_on_a_pair_two_agents_bind_is_refused() -> None:
+    """ADR-0168 decision 3: an omitted non-Slack adapter selects every route on
+    the pair, so when those routes belong to two agents no deployment is the
+    turn's. The resolver refuses rather than running B's turn under A's
+    deployment, secrets and route, which is #38's misroute."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            token = uuid.uuid4().hex[:8]
+            routed, routeless, address = await _seed_routeless_beside_routed(
+                engine, token, deploy_routeless=True
+            )
+            try:
+                outcome = await _outcome(_resolver(engine).resolve("email", None, address))
+
+                assert not isinstance(outcome, ResolvedDeployment), (
+                    f"the route-less turn ran under agent {outcome.agent_id}"
+                )
+                assert isinstance(outcome, binding_module.AmbiguousRoute), outcome
+                assert str(routed) in str(outcome) and str(routeless) in str(outcome)
+            finally:
+                await _cleanup(engine, [routed, routeless])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_a_routeless_turn_is_refused_when_only_the_other_agent_is_deployed() -> None:
+    """The resolve query joins active deployments, so an undeployed B would
+    otherwise leave A's row as the only match and B's turn would run as A."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            token = uuid.uuid4().hex[:8]
+            routed, routeless, address = await _seed_routeless_beside_routed(
+                engine, token, deploy_routeless=False
+            )
+            try:
+                resolver = _resolver(engine)
+                outcome = await _outcome(resolver.resolve("email", None, address))
+
+                assert not isinstance(outcome, ResolvedDeployment), (
+                    f"the route-less turn ran under agent {outcome.agent_id}"
+                )
+                assert isinstance(outcome, binding_module.AmbiguousRoute), outcome
+
+                diagnostic = await _outcome(resolver.undeployed_binding("email", None, address))
+                assert not isinstance(diagnostic, BoundAgent), diagnostic
+                assert isinstance(diagnostic, binding_module.AmbiguousRoute), diagnostic
+            finally:
+                await _cleanup(engine, [routed, routeless])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_a_turn_naming_its_adapter_still_resolves_beside_a_routeless_binding() -> None:
+    """Pin: a named adapter selects one route, so it is never ambiguous."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            token = uuid.uuid4().hex[:8]
+            routed, routeless, address = await _seed_routeless_beside_routed(
+                engine, token, deploy_routeless=True
+            )
+            try:
+                resolved = await _resolver(engine).resolve("email", "inbox-a", address)
+                assert resolved is not None and resolved.agent_id == routed
+            finally:
+                await _cleanup(engine, [routed, routeless])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_one_agent_holding_a_routeless_binding_beside_its_own_route_resolves() -> None:
+    """Pin: two rows of ONE agent are one deployment, whichever row answers."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            token = uuid.uuid4().hex[:8]
+            address = f"ops-{token}@example.com"
+            agent_id = await _seed_agent(
+                engine, channel=address, name=f"inbox-{token}", max_usd=None, max_tokens=None,
+                kind="email", endpoint="https://inbox-a.example.test/", adapter="inbox-a",
+            )
+            await _seed_binding(engine, agent_id=agent_id, channel=address, kind="email")
+            await _seed_deployment(
+                engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
+            )
+            try:
+                resolved = await _resolver(engine).resolve("email", None, address)
+                assert resolved is not None and resolved.agent_id == agent_id
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
