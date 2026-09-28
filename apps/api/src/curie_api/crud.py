@@ -1506,14 +1506,14 @@ def _binding_route_matches(
 
     The built-in cluster-message relay is not a configurable route: the channel
     API reserves its adapter, so the binding it replies for is one with no
-    route of its own (#2789). Any configured route is compared through
-    `route_identity`, not the raw column (ADR-0168 decision 3): a stored
-    `adapter=None` Slack binding and a wire-side `reply_adapter='default'` name
-    the same identity.
+    route of its own (#2789) -- no endpoint, and the identity an omitted
+    adapter resolves to, which on Slack is 'default' (ADR-0168 decision 3).
+    Any configured route is compared through `route_identity`, not the raw
+    column, so a handle that names no identity and a stored `'default'` match.
     """
 
     if data.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
-        return endpoint is None and adapter is None
+        return endpoint is None and route_identity(kind, adapter) == route_identity(kind, None)
     return endpoint == data.reply_endpoint and route_identity(kind, adapter) == route_identity(
         data.reply_kind, data.reply_adapter
     )
