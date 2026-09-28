@@ -255,6 +255,33 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
     assert_eq!(decision.action, "apply");
 }
 
+/// Released 0.10.3 owns revision 0063. The feature train must start after it,
+/// so an upgrade applies every unreleased expansion without mistaking the
+/// released factory queue migration for runner resources.
+#[test]
+fn released_v0103_upgrades_through_the_renumbered_feature_train() {
+    let source = window_for("0.10.3").expect("released 0.10.3 is catalogued");
+    let target: TargetMetadata =
+        serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
+            .expect("packaged chart schema compatibility metadata parses");
+
+    assert_eq!(source.schema_head, "0063");
+    let pending = pending_revisions(Some(&source.schema_head), &target)
+        .expect("released 0.10.3 reaches the new head");
+    let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
+    assert_eq!(revisions, ["0064", "0065", "0066", "0067", "0068", "0069"]);
+    assert!(pending.iter().all(|step| step.kind == "expand"));
+
+    let decision = plan_upgrade(
+        Some(&source.schema_head),
+        &target,
+        &pending,
+        false,
+        Some(&source.schema_head),
+    );
+    assert_eq!(decision.action, "apply");
+}
+
 fn write_exec(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
     fs::write(&path, body).expect("write fake executable");
