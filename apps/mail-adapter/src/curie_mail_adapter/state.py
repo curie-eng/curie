@@ -46,7 +46,7 @@ _ADMISSION_BACKPRESSURE_CODES = frozenset(
 
 DeliveryAdmission = Literal["admitted", "known", "full"]
 EventClaim = Literal["claimed", "busy", "done", "deleted"]
-ApprovalRefState = Literal["live", "answered", "spent"]
+ApprovalRefState = Literal["live", "answered", "settling", "spent"]
 
 
 class MailState:
@@ -676,6 +676,32 @@ class MailState:
                     "ORDER BY updated_at, reference LIMIT ?)",
                     (excess,),
                 )
+
+    def claim_approval_settlement(self, reference: str) -> bool:
+        """Take the one right to send a card's follow-up, or report it is taken.
+
+        A timed lease, like a completion claim: a delivery that died holding it
+        is reclaimable after ``LEASE_SECONDS``, and a spent reference is never
+        claimed again. Concurrent settle deliveries therefore send once.
+        """
+        now = time.time()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE approval_refs SET state='settling', updated_at=? "
+                "WHERE reference=? AND (state IN ('live', 'answered') "
+                "OR (state='settling' AND updated_at<?))",
+                (now, reference, now - LEASE_SECONDS),
+            )
+            return int(cursor.rowcount) == 1
+
+    def release_approval_settlement(self, reference: str) -> None:
+        """Give the claim back after a failed send, so a retry can take it."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET state='answered', updated_at=? "
+                "WHERE reference=? AND state='settling'",
+                (time.time(), reference),
+            )
 
     def reopen_reply(self, conversation_id: str, reply_ref: str) -> None:
         """Make the asking message's reply owner live again for the resumed turn.

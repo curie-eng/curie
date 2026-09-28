@@ -14,6 +14,7 @@ none of them starts a turn.
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -380,3 +381,56 @@ def test_a_redelivered_card_keeps_its_one_reference(
     assert post_event(url, completed("ev-1", outcome="awaiting-approval"))[0] == 200
     (request_email,) = mail.replies_to("msg-1")
     assert len(set(APPROVAL_REF_PATTERN.findall(request_email))) == 1
+
+
+# --- settlement is sent once, and never skipped ---------------------------------
+
+
+def test_a_lost_answer_response_still_gets_its_follow_up_and_the_resumed_reply(
+    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    """The platform took the first answer but its response was lost: the retry
+    reads 409. The card's settlement must still send the follow-up and reopen
+    the asking reply, or the resumed turn has nowhere to answer."""
+
+    reference = _ask(mail, approvals_adapter, url)
+    ingress.resolve_responses = [(409, {"detail": f"already resolved by {ALLOWED_SENDER}"})]
+    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference)
+
+    assert post_event(url, settled_card(CARD_REF, decision="approved"))[0] == 200
+    assert mail.replies_to("msg-1")[-1].startswith("This request was approved")
+    assert post_event(url, update("Sent the quote.", reply_ref="msg-1"))[0] == 200
+    assert post_event(url, completed("ev-2"))[0] == 200
+    assert mail.replies_to("msg-1")[-1].startswith("Sent the quote.")
+
+
+def test_concurrent_settlements_send_one_follow_up(
+    mail: MailState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    _ask(mail, approvals_adapter, url)
+    mail.hold_replies()
+    first: list[int] = []
+    sender = threading.Thread(
+        target=lambda: first.append(post_event(url, settled_card(CARD_REF, decision=None))[0])
+    )
+    sender.start()
+    assert mail.reply_entered.wait(10)
+
+    # The second delivery finds the send claimed and does not send again.
+    assert post_event(url, settled_card(CARD_REF, decision=None))[0] == 200
+    mail.release_replies()
+    sender.join(10)
+
+    assert first == [200]
+    assert mail.replies_to("msg-1").count("This approval expired before anyone answered it.") == 1
+
+
+def test_a_failed_follow_up_is_retried_by_the_next_settlement(
+    mail: MailState, approvals_adapter: MailAdapter, url: str
+) -> None:
+    _ask(mail, approvals_adapter, url)
+    mail.fail_next_reply = 503
+
+    assert post_event(url, settled_card(CARD_REF, decision=None))[0] == 502
+    assert post_event(url, settled_card(CARD_REF, decision=None))[0] == 200
+    assert mail.replies_to("msg-1")[-1] == "This approval expired before anyone answered it."

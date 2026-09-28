@@ -743,7 +743,10 @@ class MailAdapter:
             # it, and the pending answer then goes through, like CURIE_CHANNEL_TOKEN.
             return "retry"
         if result.status in (409, 410):
-            self.state.set_approval_ref_state(ref["reference"], "spent")
+            # Over, but not spent: the card's settlement still owes the one
+            # follow-up and must reopen the asking reply for the resumed turn.
+            # A lost 200 retried into a 409 lands here too.
+            self.state.set_approval_ref_state(ref["reference"], "answered")
             text = (
                 "This approval has already been answered."
                 if result.status == 409
@@ -813,7 +816,8 @@ class MailAdapter:
         """
         approval_id = card_ref[len(APPROVAL_CARD_REF_PREFIX) :]
         ref = self.state.approval_ref_for(approval_id)
-        if ref is None or ref["state"] == "spent":
+        if ref is None or not self.state.claim_approval_settlement(ref["reference"]):
+            # Unknown, already spent, or another delivery holds the send.
             return 200
         self.state.reopen_reply(ref["conversation_id"], ref["reply_ref"])
         if settled.decision is None:
@@ -832,6 +836,7 @@ class MailAdapter:
                 _correlation(approval_id),
                 status,
             )
+            self.state.release_approval_settlement(ref["reference"])
             return 502
         self.state.set_approval_ref_state(ref["reference"], "spent")
         return 200
