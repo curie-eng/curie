@@ -20,22 +20,30 @@ through `aci_protocol.turn.route_identity`, so every upgrade from v0.10.x
 crosses it, and a rollback below v0.11.0 is refused as for any contract.
 v0.10.x pods still serving during the roll keep running against it: their
 schema check treats a revision they do not know as a compatible expand, runs
-only at API startup, and the worker has none. Those pods write a Slack binding
-with no identity, which the new check refuses, and compare a publication
+only at API startup, and the worker has none. Those API pods write a Slack
+binding with no identity, which the new check refuses; compare a publication
 replay's `reply_adapter` raw, so a replay of a publication stored before this
-revision, now `'default'`, is refused as a conflict.
+revision, now `'default'`, is refused as a conflict; and refuse a publication
+create whose Slack reply names `'default'` with no endpoint, the shape every
+Slack turn carries from here. The chart's worker upgrade drain holds worker
+claims from before this revision until the roll has finished, which keeps the
+last failure, and v0.10.x workers resolving by pair against the triple key,
+out of the window unless the drain is disabled or ends early.
 
 The pre-flight refuses, before anything moves, while a Slack binding or a Slack
-approval notification still carries an endpoint: the pre-ADR custom-transport
-form, retired here. It names each row by agent, address and adapter slug, never
-by endpoint value, which can carry a token (0024's `_redacted` rule).
+approval notification still carries an endpoint, the pre-ADR custom-transport
+form retired here, or while an approval raised through one is pending or owed
+its resume, since the resume replays that transport's slug. It names each row
+by agent, address and adapter slug, never by endpoint value, which can carry a
+token (0024's `_redacted` rule).
 
 `downgrade` refuses while a Slack identity other than `'default'` is bound, or
 while two rows share one `(kind, address)`: 0023's key cannot hold either. It
 then restores 0023's key and 0024's check, and hands NULL back to every Slack
-route and reply, because the pre-0068 application compares `reply_adapter` raw
-on a replay. It never writes `generation`, which is what revokes a token minted
-before a rebind.
+route and to every Slack reply stored as `'default'`, because the pre-0068
+application compares `reply_adapter` raw on a replay. A reply raised under a
+named identity keeps its name. It never writes `generation`, which is what
+revokes a token minted before a rebind.
 
 Revision ID: 0068
 Revises: 0067
@@ -99,14 +107,44 @@ def _custom_transport(conn: sa.engine.Connection) -> list[str]:
         ),
         {"slack": SLACK},
     ).all()
-    return [
-        f"agent {name!r} ({agent_id}) binds slack:{address} with adapter {adapter!r}"
-        for name, agent_id, address, adapter in bindings
-    ] + [
-        f"agent {name!r} ({agent_id}) approval route {route!r} notifies slack:{address} "
-        f"through an endpoint with adapter {adapter!r}"
-        for name, agent_id, route, address, adapter in notifications
-    ]
+    # An approval whose resume is still owed replays its reply route verbatim
+    # (`resumequeue._build_turn`), so the transport's slug would name no
+    # identity once the binding is rebound, and the resume turn is dropped.
+    # Rewriting it to 'default' would instead send the resume through a
+    # different transport than the card went out on; naming it lets it be
+    # settled on the running release, which loses nothing. The resumable
+    # statuses are `crud._RESUMABLE_STATUSES`; a publication's approval is never
+    # resumed (`crud.list_resolved_unresumed`).
+    approvals = conn.execute(
+        sa.text(
+            "SELECT ap.id, a.name, ap.agent_id, ap.reply_channel, ap.reply_adapter, ap.status "
+            f"FROM {SCHEMA}.approvals ap LEFT JOIN {SCHEMA}.agents a ON a.id = ap.agent_id "
+            "WHERE ap.reply_kind = :slack AND ap.reply_endpoint IS NOT NULL "
+            "AND ap.reply_adapter IS NOT NULL "
+            "AND (ap.status = 'pending' OR (ap.purpose <> 'publication' "
+            "AND ap.status IN ('approved', 'rejected', 'expired') "
+            "AND ap.resolved_at IS NOT NULL AND ap.resumed_at IS NULL)) "
+            "ORDER BY a.name, ap.id"
+        ),
+        {"slack": SLACK},
+    ).all()
+    return (
+        [
+            f"agent {name!r} ({agent_id}) binds slack:{address} with adapter {adapter!r}"
+            for name, agent_id, address, adapter in bindings
+        ]
+        + [
+            f"agent {name!r} ({agent_id}) approval route {route!r} notifies slack:{address} "
+            f"through an endpoint with adapter {adapter!r}"
+            for name, agent_id, route, address, adapter in notifications
+        ]
+        + [
+            f"approval {approval_id} of agent {name!r} ({agent_id}) replies to "
+            f"slack:{address} through an endpoint with adapter {adapter!r} and "
+            + ("is pending" if approval_status == "pending" else "is owed its resume")
+            for approval_id, name, agent_id, address, adapter, approval_status in approvals
+        ]
+    )
 
 
 def upgrade() -> None:
@@ -122,11 +160,15 @@ def upgrade() -> None:
             "cannot upgrade to 0068: these Slack routes still carry an endpoint, the "
             "custom-transport form ADR-0168 decision 3 retires -- "
             + "; ".join(refused)
-            + ". Move each binding to an identity (PATCH /agents/<agent id>/channels"
-            "?kind=slack&address=<address>&adapter=<adapter> with the body "
-            '{"kind": "slack", "address": "<address>", "adapter": "default"}) or delete '
-            "it, and drop endpoint and adapter from each notification, then re-run the "
-            "upgrade. Nothing was changed."
+            + ". Settle each approval listed first (resolve it, or let it expire) and "
+            "let its resume turn finish, because a resume replays the transport it was "
+            "raised through. Then clear the route on each binding (PATCH "
+            "/agents/<agent id>/channels?kind=slack&address=<address> with the body "
+            '{"kind": "slack", "address": "<address>", "endpoint": null, "adapter": null}'
+            "), which this upgrade binds as the default identity, or delete it, and drop "
+            "endpoint and adapter from each notification, then re-run the upgrade. A "
+            "named identity can be bound once the upgrade has finished. Nothing was "
+            "changed."
         )
 
     # The old check goes first: a Slack row naming 'default' with no endpoint is

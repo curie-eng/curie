@@ -1706,10 +1706,29 @@ v0.11.0. It stores the identity on every Slack binding, `default` where none was
 named, and makes the binding key `(kind, address, adapter)`, so two identities
 can bind one channel. Before it changes anything it refuses, naming each row,
 while a Slack binding or an approval route's Slack notification still carries an
-`endpoint`: that is the retired custom-transport form. Move each one to an
-identity first. Rebind a Slack binding with no endpoint (under `default`, or a
-declared identity), or delete it, and drop `endpoint` and `adapter` from a Slack
-notification in the agent's approval routes. Then upgrade from v0.10.x with
+`endpoint`, which is the retired custom-transport form, or while an approval
+raised through one is pending or owed its resume. Clear each of them first, on
+the release you are upgrading from:
+
+- Settle each approval it names: resolve it, or let it expire, and let its
+  resume turn finish. A resume replays the transport the approval was raised
+  through, so after the upgrade it would be dropped.
+- Clear the route on each Slack binding it names, or delete the binding. The
+  v0.10.x API accepts only a body that clears both route fields, and it ignores
+  an `adapter` query parameter:
+
+  ```bash
+  curl -X PATCH "$CURIE_API_URL/agents/<agent id>/channels?kind=slack&address=<address>" \
+    -H "X-API-Key: $CURIE_API_KEY" -H 'Content-Type: application/json' \
+    -d '{"kind": "slack", "address": "<address>", "endpoint": null, "adapter": null}'
+  ```
+
+  The upgrade then binds it as the `default` identity. Bind a named identity
+  once the upgrade has finished; v0.10.x cannot store one.
+- Drop `endpoint` and `adapter` from each Slack notification in the agent's
+  approval routes.
+
+Then upgrade from v0.10.x with
 `curie cluster upgrade --to 0.11.0 --forward-only`, or set
 `api.migrate.forwardOnly=true` on a direct `helm upgrade`. Without it the schema
 check refuses the upgrade before any mutation. As with any contract, a rollback
@@ -1718,7 +1737,7 @@ below v0.11.0 is refused once the migration has run.
 During the roll, v0.10.x pods keep serving against the migrated schema. Their
 schema check treats a revision they do not know as a compatible expand and runs
 only when an API pod starts, and the worker has none, so nothing stops them.
-Two things they do fail against it:
+Three things they do fail against it:
 
 - A v0.10.x API pod answers a Slack binding write with a 500: creating an agent
   with a Slack channel, adding or changing a Slack binding (`surfaces --add`, or
@@ -1727,11 +1746,23 @@ Two things they do fail against it:
 - A v0.10.x API pod compares a publication replay's reply adapter as stored, so
   a replay of a publication raised before the migration, which now names
   `default`, is refused as a conflict.
+- A v0.10.x API pod refuses a publication create whose Slack reply names
+  `default` with no endpoint, with a 422 the worker reports as an approval
+  backend error. Every Slack turn carries that shape after the migration.
 
 The window runs from the `-schema-migrate` Job to the last v0.10.x API pod
-stopping. The chart's upgrade drain runs before the migration and pauses worker
-claims, not API writes, so it does not cover this window; hold binding changes
-until the API Deployment has rolled, and retry any write that failed during it.
+stopping. The chart's worker upgrade drain (`worker.upgradeDrain.enabled`, on by
+default) runs before the migration and pauses worker claims until the
+post-upgrade hook, which `helm upgrade --wait` runs only after the Deployments
+have rolled. So it keeps the publication failure out of the window, and it is
+also what keeps v0.10.x workers, which resolve a turn by `(kind, address)`
+alone, from choosing between two identities bound on one channel. It does not
+cover the window when the drain is disabled, when the roll outlasts
+`worker.upgradeDrain.quiesceTtlSeconds`, or on a `helm upgrade` without
+`--wait`; in those cases hold publications and second-identity binds until the
+worker and API Deployments have rolled. The drain pauses worker claims, not API
+writes, so hold binding changes until the API Deployment has rolled either way,
+and retry any write that failed during it.
 
 A local stack runs the same schema check in its one-shot `curie-migrate`
 service, which takes no forward-only flag, so `curie local up` on a volume that
