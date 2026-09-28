@@ -808,6 +808,56 @@ export const commandManifest = {
           "name": "eval"
         },
         {
+          "about": "Run a declared cron hook against the local runner, or report that a durable schedule or record is unavailable at this tier (ADR-0099)",
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run the named cron hook now against the local runner. No durable record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trigger name from `.claude-plugin/plugin.json`",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "."
+                  ],
+                  "global": false,
+                  "help": "Plugin bundle directory",
+                  "id": "plugin_dir",
+                  "long": "plugin-dir",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Runner base URL. Default: the URL recorded by `skill up`",
+                  "id": "url",
+                  "long": "url",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            },
+            {
+              "about": "Not available at this tier: there is no scheduler",
+              "hidden": false,
+              "name": "schedule"
+            },
+            {
+              "about": "Not available at this tier: there is no hook run record",
+              "hidden": false,
+              "name": "record"
+            }
+          ]
+        },
+        {
           "about": "Interview to generate a starter `evals/cases.json` (guided eval generation)",
           "args": [
             {
@@ -1740,6 +1790,161 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "versions"
+        },
+        {
+          "about": "Manage an agent's hook configuration and signing secret",
+          "hidden": false,
+          "name": "hooks",
+          "subcommands": [
+            {
+              "about": "Show an agent's hook partition and source binding maps",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Replace one or both hook maps from a JSON file. An empty map clears it",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "file",
+                  "long": "file",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "configure"
+            },
+            {
+              "about": "Read the derived hook signing secret for an agent",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "secret"
+            }
+          ]
         },
         {
           "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
@@ -2811,6 +3016,22 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pause one named cron hook on the selected agent",
+              "id": "pause",
+              "long": "pause",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Resume one named cron hook on the selected agent",
+              "id": "resume",
+              "long": "resume",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -2847,6 +3068,79 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "schedules"
+        },
+        {
+          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run one cron hook now, bypassing its schedule, and print the run record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "120"
+                  ],
+                  "global": false,
+                  "help": "How long to wait for the turn to settle, in seconds",
+                  "id": "wait_secs",
+                  "long": "wait-secs",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            }
+          ]
         },
         {
           "about": "Delete an agent via the local platform API",
@@ -2925,6 +3219,45 @@ export const commandManifest = {
       "hidden": false,
       "name": "cluster",
       "subcommands": [
+        {
+          "about": "Report value paths that differ between a release and pending Helm files. A nonempty report is advisory and exits successfully",
+          "args": [
+            {
+              "global": false,
+              "help": "Pending Helm values files in application order",
+              "id": "files",
+              "long": "values",
+              "positional": false,
+              "required": true,
+              "short": "f"
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "lint-values"
+        },
         {
           "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. Existing singleton resources are reused only from complete Helm ownership metadata. An exact admission result that the gvisor RuntimeClass is absent applies security.gvisor.mode=off and retries once. Every inferred value is printed",
           "args": [
@@ -3089,6 +3422,18 @@ export const commandManifest = {
               "help": "Apply contract or irreversible schema migrations. Without this flag the upgrade Job refuses those migrations before mutation so a patch rollback window stays intact (#2300)",
               "id": "forward_only",
               "long": "forward-only",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Install the end to end connector's identity on this release's cluster (ADR 0176 decision 4). Pass it only on the owner release of a separate TEST cluster. It renders a service account that may create and delete only namespaces carrying the connector's prefix and ownership label, may act only inside them, and holds no cluster scoped write; a ValidatingAdmissionPolicy enforces the prefix and label at the API server (Kubernetes 1.30 or newer). A later `cluster up` without this flag removes the identity",
+              "id": "e2e_connector_identity",
+              "long": "e2e-connector-identity",
               "positional": false,
               "possible_values": [
                 "true",
@@ -4117,7 +4462,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Host the in-cluster worker uses to reach the stub. Omit to auto-detect the local IP the kernel would use to reach the cluster",
+              "help": "Accepted so older command lines still parse. Text-graded cluster eval does not use it: replies go through the cluster message relay",
               "id": "listen_host",
               "long": "listen-host",
               "positional": false,
@@ -4128,7 +4473,7 @@ export const commandManifest = {
                 "0"
               ],
               "global": false,
-              "help": "Port the stub binds (0.0.0.0); the worker posts here. Default 0 lets the kernel assign an ephemeral port",
+              "help": "Accepted so older command lines still parse. Text-graded cluster eval does not use it: replies go through the cluster message relay",
               "id": "listen_port",
               "long": "listen-port",
               "positional": false,
@@ -4159,7 +4504,7 @@ export const commandManifest = {
                 "0"
               ],
               "global": false,
-              "help": "Local port the API port-forward binds (default-channel lookup). Default 0 is kernel-assigned, matching `cluster message`",
+              "help": "Local port the API port-forward binds. The relay poll and a missing channel lookup both use it. Default 0 is kernel-assigned, matching `cluster message`",
               "id": "api_local_port",
               "long": "api-local-port",
               "positional": false,
@@ -4168,7 +4513,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_KEY",
               "global": false,
-              "help": "Platform API key for the default-channel lookup. Omit to read the release's own key from its chart Secret",
+              "help": "Platform API key. It authenticates the relay poll and a missing-channel lookup. Omit to read the release's own key from its chart Secret",
               "id": "api_key",
               "long": "api-key",
               "positional": false,
@@ -4269,7 +4614,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Print the kubectl commands, stub URL, and enqueue description that a real run would produce, and exit without executing anything",
+              "help": "Print the kubectl port-forwards and relay poll a real run would use, and exit without executing anything",
               "id": "dry_run",
               "long": "dry-run",
               "positional": false,
@@ -5418,6 +5763,22 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Pause one named cron hook on the selected agent",
+              "id": "pause",
+              "long": "pause",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Resume one named cron hook on the selected agent",
+              "id": "resume",
+              "long": "resume",
+              "positional": false,
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -5473,6 +5834,100 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "schedules"
+        },
+        {
+          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "args": [
+            {
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": true,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": true,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "hook",
+          "subcommands": [
+            {
+              "about": "Run one cron hook now, bypassing its schedule, and print the run record",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "120"
+                  ],
+                  "global": false,
+                  "help": "How long to wait for the turn to settle, in seconds",
+                  "id": "wait_secs",
+                  "long": "wait-secs",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "fire"
+            }
+          ]
         },
         {
           "about": "List an agent's immutable versions (`GET /agents/{id}/versions`)",
@@ -5539,6 +5994,218 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "versions"
+        },
+        {
+          "about": "Manage an agent's hook configuration and signing secret",
+          "hidden": false,
+          "name": "hooks",
+          "subcommands": [
+            {
+              "about": "Show an agent's hook partition and source binding maps",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Replace one or both hook maps from a JSON file. An empty map clears it",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "file",
+                  "long": "file",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "configure"
+            },
+            {
+              "about": "Read the derived hook signing secret for an agent",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "secret"
+            }
+          ]
         },
         {
           "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
@@ -5897,7 +6564,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Install the upgrade path: the self-upgrade connector, the platform upgrade Job, and the two identities behind them",
+                  "help": "Install the upgrade path: the self-upgrade connector, the platform upgrade Job, and the two identities behind them. Applies upgrade-role.yaml, platform-upgrade-role.yaml, and the rendered platform-upgrade ConfigMap and suspended CronJob. Arms only upgrade_platform: no self-upgrade CronJob is applied, so upgrade_self stays unarmed",
                   "id": "platform_upgrade",
                   "long": "platform-upgrade",
                   "positional": false,

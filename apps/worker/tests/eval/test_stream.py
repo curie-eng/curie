@@ -464,8 +464,13 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                 consumer.request_stop()
                 await asyncio.sleep(0.35)
                 assert not task.done(), "graceful stop must drain the inline eval handler"
-                assert await client.pttl(alive) > 0
-                assert await client.pttl(capable) > 0
+                renewal_deadline = time.monotonic() + 2
+                while time.monotonic() < renewal_deadline:
+                    if await client.pttl(alive) > 0 and await client.pttl(capable) > 0:
+                        break
+                    await asyncio.sleep(0.005)
+                else:
+                    pytest.fail("eval consumer did not renew both liveness markers")
                 release.set()
                 await task
                 assert reports and reports[0]["passed_count"] == 1
@@ -1927,6 +1932,9 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
         SubstrateConfig(
             namespace="test-ns",
             warm_pool="curie-runner-pool",
+            # The chart renders acme-a's pool (CURIE_AGENT_SANDBOX_POOLS, #2943).
+            agent_pools=frozenset({"acme-a"}),
+            connector_secret_pools=frozenset({"acme-a"}),
             claim_timeout_seconds=3.0,
             poll_interval_seconds=0.005,
             key_prefix=sandbox_prefix,
@@ -3260,7 +3268,8 @@ def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
         # dead-lettered on the next pass.
         assert (
             await store.release(
-                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner
+                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner,
+                resume_event_id=None,
             )
             is True
         )

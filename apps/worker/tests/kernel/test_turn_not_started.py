@@ -137,7 +137,12 @@ def test_a_failed_turn_edits_the_placeholder_to_the_not_started_text(make_harnes
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -172,7 +177,12 @@ def test_a_placeholderless_turn_gets_no_message_at_all(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -206,7 +216,12 @@ def test_the_notice_fires_even_under_no_edit_streaming(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness(slack_no_edit_streaming=True) as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
 
@@ -234,7 +249,12 @@ def test_a_failing_slack_sink_does_not_change_the_pending_outcome(
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
             h.sink.fail_events.add("reply.update")
@@ -279,14 +299,19 @@ def test_a_turn_that_already_settled_keeps_its_answer(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             async def settled_then_raised(qevent: QueuedTurn, *, lease: Any = None) -> None:
                 await h.kernel._reply_for(
                     qevent, _route_from_handle(qevent), "the answer", terminal=False
                 )
-                await h.kernel._markers.mark_done(qevent.event_id)
+                await h.kernel._markers.mark_done(qevent.event_id, marker_value="1")
                 raise ConnectionError("the settle applied and lost its response")
 
             h.kernel.process_event = settled_then_raised  # type: ignore[method-assign,assignment]
@@ -329,7 +354,12 @@ def test_a_done_outbox_record_without_a_done_marker_keeps_its_answer(
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
 
@@ -394,7 +424,12 @@ def test_an_unreadable_terminality_check_leaves_the_placeholder_alone(
 
     async def go() -> None:
         async with make_harness() as h:
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
             _failing_process_event(h)
 

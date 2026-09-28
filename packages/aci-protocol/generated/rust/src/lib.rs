@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.3";
+pub const PROTOCOL_VERSION: &str = "0.5.6";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -177,6 +177,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub approval_grant_tool: Option<String>,
     #[serde(default)]
+    pub approval_grant_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
     pub approval_resumed_kind: Option<String>,
     #[serde(default)]
     pub approval_decision: Option<String>,
@@ -199,7 +201,11 @@ pub struct BootEnv {
     #[serde(default)]
     pub thinking: Option<String>,
     #[serde(default)]
+    pub deployment_environment: Option<String>,
+    #[serde(default)]
     pub model_env_key: Option<String>,
+    #[serde(default)]
+    pub metrics_temporality_preference: Option<String>,
     #[serde(default)]
     pub max_turns: Option<i64>,
     #[serde(default)]
@@ -214,6 +220,7 @@ pub struct BootEnv {
 pub mod env_keys {
     pub const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
     pub const CURIE_APPROVAL_DECISION: &str = "CURIE_APPROVAL_DECISION";
+    pub const CURIE_APPROVAL_GRANT_ARGUMENTS: &str = "CURIE_APPROVAL_GRANT_ARGUMENTS";
     pub const CURIE_APPROVAL_GRANT_TOOL: &str = "CURIE_APPROVAL_GRANT_TOOL";
     pub const CURIE_APPROVAL_REQUIRED_TOOLS: &str = "CURIE_APPROVAL_REQUIRED_TOOLS";
     pub const CURIE_APPROVAL_RESUMED_KIND: &str = "CURIE_APPROVAL_RESUMED_KIND";
@@ -226,6 +233,7 @@ pub mod env_keys {
     pub const CURIE_CONNECTOR_RELEASE: &str = "CURIE_CONNECTOR_RELEASE";
     pub const CURIE_CONNECTOR_SECRET_KEYS: &str = "CURIE_CONNECTOR_SECRET_KEYS";
     pub const CURIE_CREDENTIALS: &str = "CURIE_CREDENTIALS";
+    pub const CURIE_DEPLOYMENT_ENVIRONMENT: &str = "CURIE_DEPLOYMENT_ENVIRONMENT";
     pub const CURIE_FAKE_MODEL: &str = "CURIE_FAKE_MODEL";
     pub const CURIE_HISTORY_MAX_BYTES: &str = "CURIE_HISTORY_MAX_BYTES";
     pub const CURIE_HISTORY_MAX_TURNS: &str = "CURIE_HISTORY_MAX_TURNS";
@@ -249,6 +257,7 @@ pub mod env_keys {
     pub const CURIE_THINKING: &str = "CURIE_THINKING";
     pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
+    pub const OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: &str = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE";
     pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 }
 
@@ -348,6 +357,8 @@ pub struct ApprovalRequest {
     #[serde(default)]
     pub granted_tool: Option<String>,
     #[serde(default)]
+    pub granted_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
     pub expires_in_seconds: Option<i64>,
 }
 
@@ -425,6 +436,8 @@ pub enum OutboundEvent {
         #[serde(default)]
         approval_granted_tool: Option<String>,
         #[serde(default)]
+        approval_granted_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        #[serde(default)]
         approval_display: Option<String>,
         #[serde(default)]
         input_tokens: Option<i64>,
@@ -472,6 +485,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -491,6 +505,7 @@ mod tests {
             approval_route: Some("managers".to_string()),
             approval_gate_kind: Some("policy".to_string()),
             approval_granted_tool: None,
+            approval_granted_arguments: None,
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
@@ -548,13 +563,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.4","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.7","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.3","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.6","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

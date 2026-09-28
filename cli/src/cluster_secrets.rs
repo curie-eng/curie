@@ -11,6 +11,8 @@
 //! `connectors.lock.yaml` records lands in `agentSandbox.runnerImages.<agent>`,
 //! and a bundle with no runner entry clears an earlier value.
 
+#![deny(clippy::let_underscore_must_use, clippy::let_underscore_untyped)]
+
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
@@ -167,9 +169,102 @@ pub fn bind_commands(opts: &BindOpts) -> Result<Vec<OpsCommand>> {
     ])
 }
 
+/// The release's supplied values with `agent`'s connector-secret binding
+/// removed, its runner image updated as `runner_image` says (#3260), and
+/// everything else untouched (#3021).
+pub fn without_agent_binding(
+    release_values: &serde_json::Value,
+    agent: &str,
+    runner_image: &RunnerImageUpdate,
+) -> serde_json::Value {
+    let mut values = release_values.clone();
+    if let Some(all) = values
+        .pointer_mut("/agentSandbox/connectorSecrets")
+        .and_then(|all| all.as_object_mut())
+    {
+        all.remove(agent);
+    }
+    match runner_image {
+        RunnerImageUpdate::Keep => {}
+        RunnerImageUpdate::Clear => {
+            if let Some(all) = values
+                .pointer_mut("/agentSandbox/runnerImages")
+                .and_then(|all| all.as_object_mut())
+            {
+                all.remove(agent);
+            }
+        }
+        RunnerImageUpdate::Set(digest) => {
+            if !values.is_object() {
+                values = serde_json::json!({});
+            }
+            let sandbox = values
+                .as_object_mut()
+                .expect("an object")
+                .entry("agentSandbox")
+                .or_insert_with(|| serde_json::json!({}));
+            if !sandbox.is_object() {
+                *sandbox = serde_json::json!({});
+            }
+            let images = sandbox
+                .as_object_mut()
+                .expect("an object")
+                .entry("runnerImages")
+                .or_insert_with(|| serde_json::json!({}));
+            if !images.is_object() {
+                *images = serde_json::json!({});
+            }
+            images
+                .as_object_mut()
+                .expect("an object")
+                .insert(agent.to_string(), serde_json::Value::String(digest.clone()));
+        }
+    }
+    values
+}
+
+/// Remove the agent's binding from the release, then replace its claimed
+/// sandboxes (#3021).
+///
+/// The upgrade replaces the supplied values with `release_values` minus the
+/// agent's entry (`--reset-values` plus a private values file), so the chart
+/// stops rendering the per-agent Secret and SandboxTemplate and Helm prunes
+/// both. A `--reuse-values --set <agent>=null` upgrade is NOT equivalent: Helm
+/// drops the key from the stored values but still renders the old objects, so
+/// the credential would survive. Retiring the claims afterwards means no
+/// running pod keeps the removed credential in its env.
+pub fn clear_commands(
+    common: &CommonOpts,
+    chart: &str,
+    agent: &str,
+    release_values: &serde_json::Value,
+    runner_image: &RunnerImageUpdate,
+) -> Result<Vec<OpsCommand>> {
+    validate_agent_resource_name(agent)?;
+    Ok(vec![
+        OpsCommand::new(
+            "helm",
+            vec![
+                plain("upgrade"),
+                plain(&common.release),
+                plain(chart),
+                plain("-n"),
+                plain(&common.namespace),
+                plain("--reset-values"),
+                CmdArg::SecretValuesDocument(without_agent_binding(
+                    release_values,
+                    agent,
+                    runner_image,
+                )),
+            ],
+        ),
+        retire_claims_command(&common.namespace, agent),
+    ])
+}
+
 /// Replace the agent's claimed sandboxes so the next turn starts a fresh pod
 /// with the newly deployed bundle and re-resolved secretKeyRef env.
-fn retire_claims_command(namespace: &str, agent: &str) -> OpsCommand {
+pub(crate) fn retire_claims_command(namespace: &str, agent: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -200,6 +295,12 @@ pub enum BindNeed {
         secrets: Vec<String>,
         runner_image: bool,
     },
+    /// The redeploy carries no connector secret for this agent but the release
+    /// still binds some (#3021). Leaving them would keep a removed credential
+    /// reachable by the agent's runner pods, so the binding is cleared.
+    /// `runner_image` is true when the same upgrade must also set or clear the
+    /// agent's runner image (#3260).
+    Clear { runner_image: bool },
 }
 
 /// Pure over the JSON `helm get values -o json` returns for the release.
@@ -217,6 +318,31 @@ pub fn bind_need(
     let bound = release_values
         .pointer("/agentSandbox/connectorSecrets")
         .and_then(|all| all.get(agent));
+    let bound_runner = release_values
+        .pointer("/agentSandbox/runnerImages")
+        .and_then(|all| all.get(agent))
+        .filter(|v| !v.is_null());
+    let runner_changed = match runner_image {
+        Some(digest) => bound_runner.and_then(|v| v.as_str()) != Some(digest),
+        None => bound_runner.is_some(),
+    };
+    if secrets.is_empty() {
+        let still_bound = bound
+            .and_then(|b| b.as_object())
+            .is_some_and(|b| !b.is_empty());
+        return if still_bound {
+            BindNeed::Clear {
+                runner_image: runner_changed,
+            }
+        } else if runner_changed {
+            BindNeed::Changed {
+                secrets: Vec::new(),
+                runner_image: true,
+            }
+        } else {
+            BindNeed::Current
+        };
+    }
     let changed: Vec<String> = secrets
         .iter()
         .filter(|(name, value)| {
@@ -227,14 +353,6 @@ pub fn bind_need(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    let bound_runner = release_values
-        .pointer("/agentSandbox/runnerImages")
-        .and_then(|all| all.get(agent))
-        .filter(|v| !v.is_null());
-    let runner_changed = match runner_image {
-        Some(digest) => bound_runner.and_then(|v| v.as_str()) != Some(digest),
-        None => bound_runner.is_some(),
-    };
     if changed.is_empty() && !runner_changed {
         BindNeed::Current
     } else {
@@ -260,13 +378,54 @@ fn helm_values_command(common: &CommonOpts) -> OpsCommand {
     )
 }
 
+/// The release's supplied values, or `None` when the read fails or does not
+/// parse.
+async fn read_release_values(common: &CommonOpts) -> Result<Option<serde_json::Value>> {
+    require_on_path("helm")?;
+    let (ok, stdout, _stderr) = crate::ops::run_capture(&helm_values_command(common)).await?;
+    Ok(if ok {
+        serde_json::from_str::<serde_json::Value>(&stdout).ok()
+    } else {
+        None
+    })
+}
+
+/// Judge the bind against the values read, or against their absence. A values
+/// read that fails or does not parse cannot prove the bind is a no-op, so
+/// every name counts as changed and the caller upgrades exactly as it did
+/// before this check existed. The runner image counts as changed too: with
+/// none locked, an unread release could still hold an earlier image, and a
+/// `null` override of an absent key is harmless, so the clear is sent rather
+/// than silently skipped (#3260). With no secret to bind, an unreadable
+/// release cannot prove a stale connector binding exists, so that binding is
+/// left alone and the operator is told (#3021).
+fn need_from_values(
+    values: Option<&serde_json::Value>,
+    common: &CommonOpts,
+    agent: &str,
+    secrets: &BTreeMap<String, String>,
+    runner_image: Option<&str>,
+) -> BindNeed {
+    match values {
+        Some(values) => bind_need(values, agent, secrets, runner_image),
+        None => {
+            if secrets.is_empty() {
+                crate::ui::ui().note(&format!(
+                    "could not read the values of release {}; any existing connector-secret \
+                     binding for agent {agent} was left in place",
+                    common.release
+                ));
+            }
+            BindNeed::Changed {
+                secrets: secrets.keys().cloned().collect(),
+                runner_image: true,
+            }
+        }
+    }
+}
+
 /// Read the release's supplied values and judge whether binding `secrets`
-/// for `agent` changes anything. A values read that fails or does not parse
-/// cannot prove the bind is a no-op, so every name counts as changed and the
-/// caller upgrades exactly as it did before this check existed. The runner
-/// image counts as changed too: with none locked, an unread release could
-/// still hold an earlier image, and a `null` override of an absent key is
-/// harmless, so the clear is sent rather than silently skipped.
+/// for `agent` changes anything.
 pub async fn read_bind_need(
     common: &CommonOpts,
     agent: &str,
@@ -274,22 +433,14 @@ pub async fn read_bind_need(
     runner_image: Option<&str>,
 ) -> Result<BindNeed> {
     validate_agent_resource_name(agent)?;
-    // Even a deploy that wants nothing reads the release: an earlier runner
-    // image may still need clearing, and without helm that cannot be known.
-    require_on_path("helm")?;
-    let (ok, stdout, _stderr) = crate::ops::run_capture(&helm_values_command(common)).await?;
-    let parsed = if ok {
-        serde_json::from_str::<serde_json::Value>(&stdout).ok()
-    } else {
-        None
-    };
-    Ok(match parsed {
-        Some(values) => bind_need(&values, agent, secrets, runner_image),
-        None => BindNeed::Changed {
-            secrets: secrets.keys().cloned().collect(),
-            runner_image: true,
-        },
-    })
+    let values = read_release_values(common).await?;
+    Ok(need_from_values(
+        values.as_ref(),
+        common,
+        agent,
+        secrets,
+        runner_image,
+    ))
 }
 
 /// Bind only when the release does not already hold these values (#3082).
@@ -311,7 +462,15 @@ pub async fn bind_if_changed<F>(
 where
     F: std::future::Future<Output = Result<String>>,
 {
-    let need = read_bind_need(&common, &agent, &secrets, runner_image.as_deref()).await?;
+    validate_agent_resource_name(&agent)?;
+    let values = read_release_values(&common).await?;
+    let need = need_from_values(
+        values.as_ref(),
+        &common,
+        &agent,
+        &secrets,
+        runner_image.as_deref(),
+    );
     let ui = crate::ui::ui();
     match &need {
         BindNeed::Current => {
@@ -341,17 +500,14 @@ where
             if !names.is_empty() {
                 what.push(format!("connector secret(s) {}", names.join(", ")));
             }
-            let update = match (&runner_image, runner_changed) {
-                (Some(digest), true) => {
-                    what.push(format!("runner image digest {digest}"));
-                    RunnerImageUpdate::Set(digest.clone())
+            let update = runner_image_update(runner_image.as_deref(), *runner_changed);
+            match &update {
+                RunnerImageUpdate::Set(digest) => {
+                    what.push(format!("runner image digest {digest}"))
                 }
-                (None, true) => {
-                    what.push("removal of the runner image".to_string());
-                    RunnerImageUpdate::Clear
-                }
-                (_, false) => RunnerImageUpdate::Keep,
-            };
+                RunnerImageUpdate::Clear => what.push("removal of the runner image".to_string()),
+                RunnerImageUpdate::Keep => {}
+            }
             ui.note(&format!(
                 "platform change required: {} for agent {agent} changed, so release {} \
                  is being helm-upgraded to bind it",
@@ -368,8 +524,40 @@ where
             })
             .await?;
         }
+        BindNeed::Clear {
+            runner_image: runner_changed,
+        } => {
+            ui.note(&format!(
+                "platform change required: agent {agent} no longer declares any connector \
+                 secret, so release {} is being helm-upgraded to remove its binding",
+                common.release
+            ));
+            let chart = chart.await?;
+            require_on_path("kubectl")?;
+            let cl = ui.checklist();
+            let label = format!(
+                "clearing connector secrets for agent {agent} on release {}",
+                common.release
+            );
+            // `Clear` is only judged from values that were read.
+            let values = values.unwrap_or_default();
+            let update = runner_image_update(runner_image.as_deref(), *runner_changed);
+            for cmd in &clear_commands(&common, &chart, &agent, &values, &update)? {
+                run_step(&cl, &label, "cleared", cmd).await?;
+            }
+        }
     }
     Ok(need)
+}
+
+/// The runner image change a bind applies, from the locked digest and whether
+/// the release's value differs from it (#3260).
+fn runner_image_update(runner_image: Option<&str>, changed: bool) -> RunnerImageUpdate {
+    match (runner_image, changed) {
+        (Some(digest), true) => RunnerImageUpdate::Set(digest.to_string()),
+        (None, true) => RunnerImageUpdate::Clear,
+        (_, false) => RunnerImageUpdate::Keep,
+    }
 }
 
 pub async fn bind(opts: BindOpts) -> Result<()> {
@@ -389,6 +577,311 @@ pub async fn bind(opts: BindOpts) -> Result<()> {
         run_step(&cl, &label, "bound", cmd).await?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The installation's runner and a layered runner's base (#3218, ADR 0173 d5)
+// ---------------------------------------------------------------------------
+//
+// A layered runner is built on one exact platform runner, recorded in the
+// bundle's lock as `runner.base`. The worker serves the runner its own release
+// ships, so a layer on any other base is a runner the worker may not serve.
+// Two checks keep them together, and both compare by the sha256 digest only,
+// because the same image can be spelled with different repositories:
+//
+// - `curie cluster deploy` refuses a bundle whose recorded base is not the
+//   installation's runner ([`check_layered_runner_base`]).
+// - `curie cluster upgrade` names every agent in
+//   `agentSandbox.runnerImages` whose layer will stop matching, and in the
+//   same `helm upgrade` clears those entries (`=null`, as
+//   [`RunnerImageUpdate::Clear`] does) so the agent runs the new platform
+//   runner the worker serves until its owner rebuilds and redeploys
+//   ([`layers_stopping_to_match`]). Leaving the old layer bound would run an
+//   old runner under a new worker; refusing the upgrade would let one bundle
+//   owner block every platform upgrade.
+//
+// When the installation's runner cannot be determined, deploy refuses and
+// upgrade treats every layered agent as affected: neither passes silently.
+
+/// The runner reference `agentSandbox.runner` renders, from the release's
+/// computed values (`helm get values --all`) and the release chart's
+/// appVersion. A digest wins over a tag, and an empty tag means the chart
+/// appVersion, exactly as the chart's helper renders it. `None` when the
+/// values name no image, or no tag and no appVersion is known.
+pub fn effective_runner_ref(
+    values: &serde_json::Value,
+    app_version: Option<&str>,
+) -> Option<String> {
+    let runner = values.pointer("/agentSandbox/runner")?;
+    let field = |name: &str| {
+        runner
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let image = field("image")?;
+    if let Some(digest) = field("digest") {
+        return Some(format!("{image}@{digest}"));
+    }
+    let tag = field("tag").or(app_version.map(str::trim).filter(|v| !v.is_empty()))?;
+    Some(format!("{image}:{tag}"))
+}
+
+/// The `sha256:<hex>` a digest-pinned reference carries, if any.
+pub fn reference_digest(reference: &str) -> Option<&str> {
+    reference
+        .split_once('@')
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.starts_with("sha256:"))
+}
+
+/// Whether two digest-pinned references name the same image. The repository
+/// is ignored on purpose: a mirror or a renamed repo serves the same bytes.
+/// A reference with no digest never matches, since it proves nothing.
+pub fn same_runner(a: &str, b: &str) -> bool {
+    matches!((reference_digest(a), reference_digest(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The agents the release binds a layered runner to: every non-null
+/// `agentSandbox.runnerImages.<agent>`, in name order.
+pub fn layered_agents(values: &serde_json::Value) -> Vec<String> {
+    values
+        .pointer("/agentSandbox/runnerImages")
+        .and_then(|all| all.as_object())
+        .map(|all| {
+            let mut agents: Vec<String> = all
+                .iter()
+                .filter(|(_, image)| image.as_str().is_some_and(|s| !s.trim().is_empty()))
+                .map(|(agent, _)| agent.clone())
+                .collect();
+            agents.sort();
+            agents
+        })
+        .unwrap_or_default()
+}
+
+/// The layered agents an upgrade from `current` to `target` leaves on a base
+/// that is no longer the installation's runner. Both are digest-pinned
+/// runner references, `None` when they could not be determined. Only a proven
+/// digest match spares them: an unknown on either side affects every layer.
+pub fn layers_stopping_to_match(
+    layered: &[String],
+    current: Option<&str>,
+    target: Option<&str>,
+) -> Vec<String> {
+    match (current, target) {
+        (Some(current), Some(target)) if same_runner(current, target) => Vec::new(),
+        _ => layered.to_vec(),
+    }
+}
+
+/// The `--set` pairs that clear each affected agent's layered runner.
+pub fn runner_image_clears(agents: &[String]) -> Vec<String> {
+    agents
+        .iter()
+        .map(|agent| format!("agentSandbox.runnerImages.{agent}=null"))
+        .collect()
+}
+
+/// The deploy-time decision: `Ok` when the lock's recorded base is the
+/// installation's runner, else the refusal naming the `curie build` that
+/// rebuilds the layer on it. `installed` is `(reference, pinned)`: the
+/// reference an operator passes to `--runner-image`, and its digest-pinned
+/// form, or the reason it could not be determined.
+pub fn runner_base_verdict(
+    plugin_dir: &std::path::Path,
+    recorded_base: &str,
+    installed: std::result::Result<(String, String), String>,
+) -> Result<()> {
+    let (reference, pinned) = match installed {
+        Ok(found) => found,
+        Err(reason) => {
+            let fix = "confirm the release is healthy with `curie cluster status` and that \
+                       its runner image resolves in its registry, then redeploy";
+            // The human presenter prints only the message, so the fix is
+            // composed into it as well as carried for `--json` (#3423).
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "this bundle's runner layer was built on {recorded_base}, but the \
+                     installation's runner could not be determined ({reason}), so the deploy \
+                     cannot prove the worker serves that base. Refusing rather than risk an \
+                     old runner under a new worker; {fix}."
+                ))
+                .with_fix(fix),
+            ));
+        }
+    };
+    if same_runner(recorded_base, &pinned) {
+        return Ok(());
+    }
+    let fix = format!(
+        "run `curie build --plugin-dir {} --registry <ref> --runner-image {reference}` and \
+         redeploy",
+        plugin_dir.display()
+    );
+    Err(anyhow::Error::from(
+        crate::exit::CliError::usage(format!(
+            "this bundle's runner layer was built on {recorded_base}, but the installation \
+             runs {pinned}. A layer on another base is a runner this worker may not serve; \
+             {fix}."
+        ))
+        .with_fix(fix),
+    ))
+}
+
+fn helm_get_json(common: &CommonOpts, what: &str, all: bool, revision: u32) -> OpsCommand {
+    let mut args = vec![
+        plain("get"),
+        plain(what),
+        plain(&common.release),
+        plain("-n"),
+        plain(&common.namespace),
+        plain("--revision"),
+        plain(revision.to_string()),
+    ];
+    if all {
+        args.push(plain("--all"));
+    }
+    args.push(plain("-o"));
+    args.push(plain("json"));
+    OpsCommand::new("helm", args)
+}
+
+/// The revision the release is serving: the newest `deployed` row of
+/// `helm history -o json`. A failed or pending upgrade leaves the previous
+/// revision deployed, and that one is what the worker runs. With no deployed
+/// revision at all, the reason names the newest record so the operator knows
+/// which revision to roll back from.
+fn serving_revision(
+    history: &serde_json::Value,
+    release: &str,
+) -> std::result::Result<u32, String> {
+    let rows = history
+        .as_array()
+        .ok_or_else(|| format!("`helm history {release}` did not return a list"))?;
+    let revision = |row: &serde_json::Value| {
+        row.get("revision")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+    };
+    let status = |row: &serde_json::Value| {
+        row.get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    if let Some(deployed) = rows
+        .iter()
+        .filter(|row| status(row) == "deployed")
+        .filter_map(revision)
+        .max()
+    {
+        return Ok(deployed);
+    }
+    match rows.iter().max_by_key(|row| revision(row)) {
+        Some(newest) => Err(format!(
+            "release {release} has no deployed revision; its newest, revision {}, is {}. \
+             Roll back to a known-good revision with `curie cluster rollback --revision N`",
+            revision(newest).map_or_else(|| "?".to_string(), |r| r.to_string()),
+            status(newest)
+        )),
+        None => Err(format!("release {release} has no revisions")),
+    }
+}
+
+/// Pin a runner reference to its registry manifest digest. A reference that
+/// already carries one is returned as it is.
+pub async fn pin_runner_reference(reference: &str) -> Result<String> {
+    if reference_digest(reference).is_some() {
+        return Ok(reference.to_string());
+    }
+    let inspect = OpsCommand::new(
+        "docker",
+        vec![
+            plain("buildx"),
+            plain("imagetools"),
+            plain("inspect"),
+            plain(reference),
+            plain("--format"),
+            plain("{{json .Manifest}}"),
+        ],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&inspect).await?;
+    if !ok {
+        bail!(
+            "could not resolve {reference} in its registry: {}",
+            stderr.trim()
+        );
+    }
+    let manifest: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|err| anyhow::anyhow!("the manifest of {reference} is malformed: {err}"))?;
+    let digest = manifest
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow::anyhow!("the manifest of {reference} names no digest"))?;
+    Ok(crate::connector_build::digest_pinned_ref(reference, digest))
+}
+
+/// The installation's runner as `(reference, pinned)`, read from the
+/// release's computed values and chart metadata, or why it could not be.
+pub async fn installed_runner(
+    common: &CommonOpts,
+) -> std::result::Result<(String, String), String> {
+    let read = |cmd: OpsCommand| async move {
+        match crate::ops::run_capture(&cmd).await {
+            Ok((true, out, _)) => serde_json::from_str::<serde_json::Value>(&out)
+                .map_err(|err| format!("`{}` returned malformed JSON: {err}", cmd.display())),
+            Ok((false, _, err)) => Err(format!("`{}` failed: {}", cmd.display(), err.trim())),
+            Err(err) => Err(format!("{err:#}")),
+        }
+    };
+    // A bare `helm get` answers from the newest record, even a failed upgrade
+    // whose runner never served (#3421), so read the deployed revision.
+    let history = read(crate::ops::helm_history_cmd(common)).await?;
+    let revision = serving_revision(&history, &common.release)?;
+    let values = read(helm_get_json(common, "values", true, revision)).await?;
+    let app_version = read(helm_get_json(common, "metadata", false, revision))
+        .await
+        .ok()
+        .and_then(|m| {
+            m.get("appVersion")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+    let reference = effective_runner_ref(&values, app_version.as_deref()).ok_or_else(|| {
+        format!(
+            "release {} names no agentSandbox.runner image and tag",
+            common.release
+        )
+    })?;
+    let pinned = pin_runner_reference(&reference)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    Ok((reference, pinned))
+}
+
+/// Refuse a cluster deploy whose layered runner was built on anything but the
+/// installation's runner (#3218). A bundle without a locked runner layer is
+/// untouched and costs no helm read.
+pub async fn check_layered_runner_base(
+    common: &CommonOpts,
+    plugin_dir: &std::path::Path,
+) -> Result<()> {
+    if crate::connector_build::load(plugin_dir)?.runner.is_none() {
+        return Ok(());
+    }
+    let Some(entry) = crate::connector_build::load_lock(plugin_dir)?.and_then(|lock| lock.runner)
+    else {
+        return Ok(());
+    };
+    // A missing runner entry or a local-daemon one is `lock_preflight`'s to
+    // refuse, with its own message; this check is about a registry base.
+    if entry.delivery != crate::connector_build::Delivery::Registry {
+        return Ok(());
+    }
+    require_on_path("helm")?;
+    runner_base_verdict(plugin_dir, &entry.base, installed_runner(common).await)
 }
 
 #[cfg(test)]
@@ -559,7 +1052,9 @@ mod tests {
     const HELM_STUB: &str = r#"#!/bin/sh
 case "$1 $2" in
   "get values") cat "$CURIE_TEST_BIND_DIR/values.json" ;;
-  upgrade*) echo "$*" >> "$CURIE_TEST_BIND_DIR/helm.log"; r=$(cat "$CURIE_TEST_BIND_DIR/revision"); echo $((r + 1)) > "$CURIE_TEST_BIND_DIR/revision" ;;
+  upgrade*) echo "$*" >> "$CURIE_TEST_BIND_DIR/helm.log"
+    prev=; for a in "$@"; do [ "$prev" = -f ] && cat "$a" >> "$CURIE_TEST_BIND_DIR/helm-values.log"; prev=$a; done
+    r=$(cat "$CURIE_TEST_BIND_DIR/revision"); echo $((r + 1)) > "$CURIE_TEST_BIND_DIR/revision" ;;
   *) echo "unexpected helm invocation: $*" >&2; exit 64 ;;
 esac
 "#;
@@ -960,5 +1455,285 @@ esac
             "{}",
             helm.helm_log()
         );
+    }
+
+    // --- #3218: the installation's runner and a layered runner's base ---
+
+    const RUNNER_A: &str =
+        "ghcr.io/curie-eng/curie-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RUNNER_A_MIRROR: &str =
+        "mirror.example/curie-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RUNNER_B: &str =
+        "ghcr.io/curie-eng/curie-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn runner_values(image: &str, tag: &str, digest: &str) -> serde_json::Value {
+        serde_json::json!({"agentSandbox": {"runner": {"image": image, "tag": tag, "digest": digest}}})
+    }
+
+    #[test]
+    fn effective_runner_ref_prefers_digest_then_tag_then_app_version() {
+        let img = "ghcr.io/curie-eng/curie-runner";
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "0.9.0", "sha256:abc"), Some("0.10.0")),
+            Some(format!("{img}@sha256:abc"))
+        );
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "0.9.0", ""), Some("0.10.0")),
+            Some(format!("{img}:0.9.0"))
+        );
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "", ""), Some("0.10.0")),
+            Some(format!("{img}:0.10.0"))
+        );
+        assert_eq!(
+            effective_runner_ref(&runner_values(img, "", ""), None),
+            None
+        );
+        assert_eq!(
+            effective_runner_ref(&serde_json::json!({}), Some("0.10.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn same_runner_compares_digests_only() {
+        assert!(same_runner(RUNNER_A, RUNNER_A_MIRROR));
+        assert!(!same_runner(RUNNER_A, RUNNER_B));
+        assert!(!same_runner(
+            "ghcr.io/curie-eng/curie-runner:0.10.0",
+            "ghcr.io/curie-eng/curie-runner:0.10.0"
+        ));
+    }
+
+    #[test]
+    fn layered_agents_skip_null_and_empty_entries() {
+        let values = serde_json::json!({"agentSandbox": {"runnerImages": {
+            "zeta": RUNNER_B, "alpha": RUNNER_A, "gone": null, "blank": ""
+        }}});
+        assert_eq!(layered_agents(&values), vec!["alpha", "zeta"]);
+        assert!(layered_agents(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn layers_stop_matching_unless_the_digest_is_proven_equal() {
+        let layered = vec!["factory".to_string()];
+        assert!(
+            layers_stopping_to_match(&layered, Some(RUNNER_A), Some(RUNNER_A_MIRROR)).is_empty()
+        );
+        assert_eq!(
+            layers_stopping_to_match(&layered, Some(RUNNER_A), Some(RUNNER_B)),
+            layered
+        );
+        assert_eq!(
+            layers_stopping_to_match(&layered, None, Some(RUNNER_B)),
+            layered
+        );
+        assert_eq!(
+            layers_stopping_to_match(&layered, Some(RUNNER_A), None),
+            layered
+        );
+        assert!(layers_stopping_to_match(&[], Some(RUNNER_A), Some(RUNNER_B)).is_empty());
+        assert_eq!(
+            runner_image_clears(&layered),
+            vec!["agentSandbox.runnerImages.factory=null"]
+        );
+    }
+
+    #[test]
+    fn serving_revision_skips_a_newer_failed_upgrade() {
+        // #3421: revision 2 serves, revision 3 failed in its pre-upgrade hook.
+        let history = serde_json::json!([
+            {"revision": 1, "status": "superseded"},
+            {"revision": 2, "status": "deployed"},
+            {"revision": 3, "status": "failed"},
+        ]);
+        assert_eq!(serving_revision(&history, "curie"), Ok(2));
+        // After `cluster rollback --revision 2` the new revision 4 serves.
+        let history = serde_json::json!([
+            {"revision": 2, "status": "superseded"},
+            {"revision": 3, "status": "failed"},
+            {"revision": 4, "status": "deployed"},
+        ]);
+        assert_eq!(serving_revision(&history, "curie"), Ok(4));
+    }
+
+    #[test]
+    fn serving_revision_refuses_naming_the_newest_when_none_is_deployed() {
+        let history = serde_json::json!([
+            {"revision": 1, "status": "superseded"},
+            {"revision": 2, "status": "failed"},
+            {"revision": 3, "status": "pending-upgrade"},
+        ]);
+        let err = serving_revision(&history, "curie").unwrap_err();
+        assert!(err.contains("no deployed revision"), "{err}");
+        assert!(err.contains("revision 3, is pending-upgrade"), "{err}");
+        assert!(serving_revision(&serde_json::json!([]), "curie").is_err());
+    }
+
+    #[test]
+    fn helm_reads_pin_the_serving_revision() {
+        let common = CommonOpts {
+            release: "curie".into(),
+            namespace: "curie".into(),
+            dry_run: false,
+        };
+        let shown = helm_get_json(&common, "values", true, 2).display();
+        assert!(shown.contains("--revision 2"), "{shown}");
+    }
+
+    #[test]
+    fn runner_base_verdict_passes_a_matching_base_across_repo_spellings() {
+        let dir = std::path::Path::new("/bundles/sre-bot");
+        runner_base_verdict(
+            dir,
+            RUNNER_A_MIRROR,
+            Ok((
+                "ghcr.io/curie-eng/curie-runner:0.10.0".into(),
+                RUNNER_A.into(),
+            )),
+        )
+        .expect("same digest");
+    }
+
+    #[test]
+    fn runner_base_verdict_refuses_another_base_with_the_build_command() {
+        let dir = std::path::Path::new("/bundles/sre-bot");
+        let err = runner_base_verdict(
+            dir,
+            RUNNER_B,
+            Ok((
+                "ghcr.io/curie-eng/curie-runner:0.10.0".into(),
+                RUNNER_A.into(),
+            )),
+        )
+        .expect_err("another base is refused");
+        let cli = err
+            .downcast_ref::<crate::exit::CliError>()
+            .expect("a CliError");
+        assert_eq!(cli.class, crate::exit::ExitClass::Usage);
+        let (message, fix) = (cli.message.clone(), cli.fix.clone());
+        assert!(
+            message.contains(RUNNER_B) && message.contains(RUNNER_A),
+            "{message}"
+        );
+        // #3423: the human presenter shows only the message, so the rebuild
+        // command must be part of it, not only of the `--json` fix.
+        let (human, _) = crate::exit::present_error(&err);
+        assert!(
+            human.contains(
+                "curie build --plugin-dir /bundles/sre-bot --registry <ref> --runner-image \
+                 ghcr.io/curie-eng/curie-runner:0.10.0"
+            ),
+            "{human}"
+        );
+        assert_eq!(
+            fix.as_deref(),
+            Some(
+                "run `curie build --plugin-dir /bundles/sre-bot --registry <ref> --runner-image \
+                 ghcr.io/curie-eng/curie-runner:0.10.0` and redeploy"
+            )
+        );
+    }
+
+    #[test]
+    fn runner_base_verdict_refuses_when_the_installation_runner_is_unknown() {
+        let err = runner_base_verdict(
+            std::path::Path::new("/b"),
+            RUNNER_A,
+            Err("`helm get values` failed: boom".into()),
+        )
+        .expect_err("an unknown installation runner never passes");
+        let (message, _) = crate::exit::present_error(&err);
+        assert!(
+            message.contains("could not be determined") && message.contains("boom"),
+            "{message}"
+        );
+        // #3423: the remedy reaches human output, not only `--json`.
+        assert!(message.contains("curie cluster status"), "{message}");
+    }
+
+    #[test]
+    fn bind_need_clears_a_binding_the_redeploy_no_longer_carries() {
+        let bound = serde_json::json!({"agentSandbox": {"connectorSecrets": {
+            "acme-a": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_agent_a"},
+            "acme-b": {"JIRA_TOKEN": "jira-b"}
+        }}});
+        assert_eq!(
+            bind_need(&bound, "acme-a", &BTreeMap::new(), None),
+            BindNeed::Clear {
+                runner_image: false
+            }
+        );
+        assert_eq!(
+            bind_need(&bound, "acme-c", &BTreeMap::new(), None),
+            BindNeed::Current
+        );
+        assert_eq!(
+            bind_need(&serde_json::json!({}), "acme-a", &BTreeMap::new(), None),
+            BindNeed::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_every_secret_clears_the_binding_then_retires_claims() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"agentSandbox": {
+            "connectorSecrets": {
+                "acme-a": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_agent_a"},
+                "acme-b": {"JIRA_TOKEN": "jira-b"}
+            }
+        }, "worker": {"replicas": 2}}));
+        let need = bind_if_changed(common(), "acme-a".into(), BTreeMap::new(), None, async {
+            Ok("charts/curie".to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            need,
+            BindNeed::Clear {
+                runner_image: false
+            }
+        );
+        assert_eq!(
+            helm.revision(),
+            8,
+            "the stale binding was left in the release"
+        );
+        let upgrade = std::fs::read_to_string(helm.dir.path().join("helm.log")).unwrap();
+        // `--reuse-values --set <agent>=null` drops the key from the stored
+        // values but still renders the old Secret, so the supplied values
+        // must be replaced, not merged.
+        assert!(upgrade.contains("--reset-values"), "{upgrade}");
+        assert!(!upgrade.contains("--reuse-values"), "{upgrade}");
+        let supplied: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(helm.dir.path().join("helm-values.log")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            supplied,
+            serde_json::json!({"agentSandbox": {"connectorSecrets": {
+                "acme-b": {"JIRA_TOKEN": "jira-b"}
+            }}, "worker": {"replicas": 2}}),
+            "only the agent's binding may be removed from the supplied values"
+        );
+        let kubectl = std::fs::read_to_string(helm.dir.path().join("kubectl.log")).unwrap();
+        assert!(
+            kubectl.contains("delete sandboxclaim") && kubectl.contains("=acme-a"),
+            "claims must be refreshed so no pod keeps the removed credential: {kubectl}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_secrets_and_no_binding_leaves_the_release_alone() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({}));
+        let need = bind_if_changed(common(), "acme-a".into(), BTreeMap::new(), None, async {
+            panic!("nothing to clear must not resolve a chart")
+        })
+        .await
+        .unwrap();
+        assert_eq!(need, BindNeed::Current);
+        assert_eq!(helm.revision(), 7);
+        assert!(!helm.dir.path().join("kubectl.log").exists());
     }
 }

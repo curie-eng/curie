@@ -1598,3 +1598,32 @@ def test_quiesce_ttl_may_be_at_or_below_the_drain_wait() -> None:
             upgrade_drain_timeout_s=60.0, upgrade_quiesce_ttl_s=ttl
         )
         assert config.upgrade_quiesce_ttl_s == ttl
+
+
+def test_hook_claim_lease_defaults_to_the_delivery_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cron claim outlives its turn only while the delivery could still be
+    running; past the overall budget the turn is dead by construction (#2931)."""
+    _clear_all_config_env(monkeypatch)
+    config = _lease_config(delivery_budget_s=1800.0)
+    assert config.hook_claim_lease_s is None
+    assert config.effective_hook_claim_lease_s == 1800.0
+
+
+def test_hook_claim_lease_reads_its_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_HOOK_CLAIM_LEASE_S", "7200")
+    config = _lease_config(delivery_budget_s=600.0)
+    assert config.effective_hook_claim_lease_s == 7200.0
+
+
+def test_hook_claim_lease_shorter_than_the_budget_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lease shorter than the longest turn would reclaim a live run."""
+    _clear_all_config_env(monkeypatch)
+    assert _lease_config(delivery_budget_s=600.0, hook_claim_lease_s=600.0)
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=600.0, hook_claim_lease_s=599.0)
+    assert "CURIE_HOOK_CLAIM_LEASE_S" in str(exc_info.value)

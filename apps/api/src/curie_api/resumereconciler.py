@@ -26,35 +26,49 @@ Three qualifications shape the design:
 
 - **Grace window (load-bearing).** ``reconcile_once`` only considers records
   resolved at least ``grace_seconds`` ago. Helm derives this value from the
-  worker's delivery budget plus its delivery-shutdown reserve, ensuring the
-  reconciler does not re-enqueue while an inline-delivered resume turn is still
-  live. Callers outside Helm should use a conservative grace that covers the
-  worker's configured turn lifecycle. The worker writes its done-marker only
-  post-terminal, so a duplicate landing mid-turn is steered into that live turn
-  and re-runs the approved action -- a too-small grace re-introduces exactly
-  that. The two clocks it compares (``resolved_at`` is the DB ``func.now()``,
-  ``resolved_before`` is this pod's clock) only add a small skew margin on top of
-  a large grace, not a correctness dependency.
+  worker's delivery budget plus its delivery-shutdown reserve, giving the
+  resume delivered inline time to finish before the backstop retries it.
+  Callers outside Helm should use a conservative grace that covers the worker's
+  configured turn lifecycle. The worker serializes concurrent copies of a
+  resume event with an active claim, so a duplicate does not enter the live
+  turn. The two clocks it compares (``resolved_at`` is the DB ``func.now()``,
+  ``resolved_before`` is this pod's clock) only add a small skew margin on top
+  of a large grace, not a correctness dependency.
 - **Absorption is TTL-bounded.** A duplicate enqueue is safe because the resume
-  turn's ``event_id`` is deterministic per approval and the worker's done-marker
-  dedupes it -- but only within ``idempotency_ttl_s`` (default 24h). In steady
-  state the reconciler retries on the interval (seconds), far inside that
-  window. The bound only bites for pre-fix historical rows, which the migration
-  backfills (``resumed_at = resolved_at``) exclude from the work-list: 0011 for
-  the resolved rows, 0012 for the expired rows that #418's widened work-list
-  first made candidates.
-- **Concurrency.** The done-marker CANNOT dedupe a concurrent double-enqueue
-  (it is written only post-terminal), so two overlapping copies steer into one
-  live turn. Two races, two guards: (1) *reconciler vs reconciler* (``api.replicas
-  > 1``) -- a per-row ``SELECT ... FOR UPDATE SKIP LOCKED`` claim locks each
-  candidate in its own short transaction, so two replicas never grab the same
-  row; (2) *inline resolver vs reconciler* -- the grace above outlasts the max
-  worker turn, so an inline-delivered turn is terminal (done-marked) before the
-  reconciler would re-enqueue. Residual, NOT unconditional exactly-once: a worker
-  retry loop can keep a turn live past the grace after an inline mark-failure; a
-  fully airtight guarantee needs a worker-side in-flight lease (follow-up). The
-  done-marker still dedupes strictly-sequential redeliveries within the 24h TTL.
-  No leader election.
+  turn's ``event_id`` is deterministic per approval. The worker's active event
+  claim prevents concurrent copies from entering the turn. The losing stream
+  entry is acknowledged as redundant, while the original delivery remains
+  pending under its delivery lease. After that delivery finishes, the done
+  marker absorbs later enqueues. The marker only lasts for
+  ``idempotency_ttl_s`` (default 24h). In steady state the
+  reconciler retries on the interval (seconds), far inside that window. If a
+  worker crashes, its claim may outlive its delivery lease. A new claimant
+  detects that the recorded winner's lease is gone or its PEL row is absent,
+  then atomically replaces the stale claim so the original delivery can be
+  recovered. Neither mechanism guarantees exactly
+  once external side effects if a worker crashes after performing one but
+  before writing the terminal marker. The TTL bound also matters for later
+  enqueues delayed beyond the marker lifetime. Pre-fix historical rows are
+  excluded from the work-list by migration backfills
+  (``resumed_at = resolved_at``): 0011 for resolved rows and 0012 for expired
+  rows that #418's widened work-list first made candidates.
+- **Concurrency.** The done marker CANNOT dedupe a concurrent double enqueue
+  (it is written only post-terminal). Three guards cover distinct races:
+  (1) *reconciler vs reconciler* (``api.replicas > 1``): a per-row
+  ``SELECT ... FOR UPDATE SKIP LOCKED`` claim locks each candidate in its own
+  short transaction, so two replicas do not grab the same row; (2) *inline
+  resolver vs reconciler*: the grace lets the original delivery finish before
+  the backstop retries; and (3) *duplicate worker deliveries*: the worker
+  claims the deterministic resume event id under the active delivery lease.
+  The claim is renewed with that lease. A duplicate entry that loses the claim
+  is acknowledged as redundant, while the original delivery stays pending and
+  recoverable. If the holder crashes, a new claimant detects that the recorded
+  winner's lease is gone or its PEL row is absent, then atomically replaces the
+  stale claim so that original delivery can be recovered. After terminal
+  completion, the done marker absorbs
+  later enqueues within its TTL. This serializes execution while a claim is live,
+  but does not guarantee exactly once external side effects across a crash or
+  after the marker TTL expires. No leader election.
 """
 
 import asyncio

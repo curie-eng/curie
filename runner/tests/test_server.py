@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 import anyio
+import pytest
 from aci_protocol import SessionStatus, parse_ndjson
 from aiohttp.test_utils import TestClient, TestServer
 from curie_runner import RunTracer, SideEffectClassifier, create_app
+from curie_runner import session as session_module
 from curie_runner.__main__ import build_runner
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
@@ -569,6 +571,125 @@ def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
             )
             assert delayed_replay.status == 409
             assert session.interrupts == 2
+
+    anyio.run(go)
+
+
+def test_capacity_admission_uses_the_turn_that_owns_the_lock() -> None:
+    async def go() -> None:
+        session = _EpochControlledSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            async def control_status() -> dict[str, object]:
+                response = await client.get("/v1/status", headers=_AUTH)
+                assert response.status == 200
+                return await response.json()
+
+            assert (await control_status())["turn_epoch"] is None
+            probe = await client.get("/status")
+            assert "turn_epoch" not in await probe.json()
+
+            first = await client.post("/v1/event", json=_EVENT_FRAME, headers=_AUTH)
+            first_epoch = first.headers[_TURN_EPOCH_HEADER]
+            await session.entered[0].wait()
+            assert (await control_status())["turn_epoch"] == first_epoch
+
+            second = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={**_AUTH, "X-Curie-Capacity-Admission": "wait"},
+            )
+            second_epoch = second.headers[_TURN_EPOCH_HEADER]
+            assert second_epoch != first_epoch
+            assert (await control_status())["turn_epoch"] == first_epoch
+            assert session.turn == 0
+
+            session.release[0].set()
+            await first.text()
+            with anyio.fail_after(2):
+                while (await control_status())["turn_epoch"] != second_epoch:
+                    await anyio.sleep(0.01)
+            assert session.turn == 0
+
+            stale = await client.post(
+                "/v1/turn-admit",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: first_epoch},
+                json={"allow": True},
+            )
+            assert stale.status == 409
+            assert session.turn == 0
+            granted = await client.post(
+                "/v1/turn-admit",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: second_epoch},
+                json={"allow": True},
+            )
+            assert granted.status == 200
+            await session.entered[1].wait()
+            assert session.turn == 1
+            session.release[1].set()
+            await second.text()
+            assert (await control_status())["turn_epoch"] is None
+
+            denied = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={**_AUTH, "X-Curie-Capacity-Admission": "wait"},
+            )
+            denied_epoch = denied.headers[_TURN_EPOCH_HEADER]
+            with anyio.fail_after(2):
+                while (await control_status())["turn_epoch"] != denied_epoch:
+                    await anyio.sleep(0.01)
+            refusal = await client.post(
+                "/v1/turn-admit",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: denied_epoch},
+                json={"allow": False},
+            )
+            assert refusal.status == 200
+            denied_events = parse_ndjson(await denied.text())
+            assert denied_events[-1].type == "final"
+            assert denied_events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+            assert session.turn == 1
+            assert (await control_status())["turn_epoch"] is None
+
+    anyio.run(go)
+
+
+def test_capacity_admission_without_grant_times_out_before_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "_CAPACITY_ADMISSION_TIMEOUT_S", 0.05)
+
+    async def go() -> None:
+        session = _EpochControlledSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            pending = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={**_AUTH, "X-Curie-Capacity-Admission": "wait"},
+            )
+            with anyio.fail_after(2):
+                events = parse_ndjson(await pending.text())
+            assert events[-1].type == "final"
+            assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+            assert session.turn == -1
+            assert session.interrupts == 0
+            status = await client.get("/v1/status", headers=_AUTH)
+            assert (await status.json())["turn_epoch"] is None
 
     anyio.run(go)
 

@@ -27,6 +27,8 @@ from _support import (
     completed,
     free_port,
     post_event,
+    refused_agentmail_connection,
+    refused_agentmail_reply,
     reply_post,
     spawn_adapter,
     stop,
@@ -50,11 +52,12 @@ def seed(mail: MailState, adapter: MailAdapter, message_id: str = "msg-1", **kwa
 def restarted_adapter(
     adapter: MailAdapter,
     serve_egress: Callable[[MailAdapter], str],
+    config: MailAdapterConfig,
 ) -> Iterator[tuple[MailAdapter, str]]:
     """Reopen the same durable state the way a replacement pod does."""
     adapter.shutdown.set()
     adapter.close()
-    replacement = MailAdapter(adapter.config)
+    replacement = MailAdapter(config)
     try:
         yield replacement, serve_egress(replacement) + "/"
     finally:
@@ -166,7 +169,10 @@ def test_a_restart_does_not_double_send_a_terminal_event(
     post_event(egress_url, completed("ev-1"))
     assert len(mail.replies) == 1
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         assert post_event(replacement_url, completed("ev-1"))[0] == 200
 
     assert len(mail.replies) == 1
@@ -182,7 +188,10 @@ def test_after_a_restart_an_unmarked_event_id_still_sends(
     post_event(egress_url, update("answer one"))
     post_event(egress_url, completed("ev-1"))
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         post_event(replacement_url, completed("ev-2"))
 
     assert len(mail.replies) == 2
@@ -443,7 +452,10 @@ def test_a_restart_preserves_admitted_reply_text(
     seed(mail, adapter)
     post_event(egress_url, update("the answer"))
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         status, _ = post_event(replacement_url, completed("ev-1"))
 
     assert status == 200
@@ -464,7 +476,10 @@ def test_a_delivered_reply_is_acked_after_a_restart(
     assert len(mail.replies) == 1
     assert f"{EVENT_MARKER} ev-1" in mail.replies[0][1]
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         status, _ = post_event(replacement_url, completed("ev-1"))
 
     assert status == 200
@@ -624,7 +639,10 @@ def test_an_unreadable_thread_does_not_send_a_duplicate_email(
     assert post_event(egress_url, completed("ev-1"))[0] == 502
     assert len(mail.replies) == 1
 
-    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+    with restarted_adapter(adapter, serve_egress, adapter.config) as (
+        _replacement,
+        replacement_url,
+    ):
         mail.fail_next_thread = thread_status
 
         status, _ = post_event(replacement_url, completed("ev-1"))
@@ -636,10 +654,36 @@ def test_an_unreadable_thread_does_not_send_a_duplicate_email(
     assert len(mail.replies) == 1
 
 
+@pytest.mark.parametrize("refusal_stage", ["thread", "reply"])
+def test_refused_provider_connection_has_a_distinct_egress_status(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
+    refusal_stage: str,
+) -> None:
+    # Observed in #2824 and #2731: a denied provider socket dial raises ECONNREFUSED.
+    seed(mail, adapter)
+    post_event(egress_url, update("answer one"))
+    provider = (
+        refused_agentmail_connection() if refusal_stage == "thread" else refused_agentmail_reply()
+    )
+    with provider as provider_url:
+        with restarted_adapter(
+            adapter,
+            serve_egress,
+            adapter.config.model_copy(update={"agentmail_base_url": provider_url}),
+        ) as (_, replacement_url):
+            status, body = post_event(replacement_url, completed("ev-1"))
+
+    assert status == 424
+    assert body == {"detail": "provider egress refused"}
+    assert mail.replies == []
+
+
 def test_a_403_from_the_provider_is_a_delivery_failure(
     mail: MailState, adapter: MailAdapter, egress_url: str
 ) -> None:
-    """The spike logged "rejected by the send allow list; continuing" and acked 200."""
     seed(mail, adapter)
     post_event(egress_url, update("answer one"))
     mail.fail_next_reply = 403
@@ -717,7 +761,7 @@ def test_deleted_provider_thread_is_terminal_once_across_restart(
     with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
-        with restarted_adapter(adapter, serve_egress) as (_, replacement_url):
+        with restarted_adapter(adapter, serve_egress, adapter.config) as (_, replacement_url):
             assert post_event(replacement_url, completed("ev-deleted"))[0] == 410
     assert mail.thread_calls == 1
     assert mail.replies == []

@@ -1437,6 +1437,8 @@ for d in docs:
         for c in d["spec"]["template"]["spec"]["containers"]:
             env.update({e["name"]: e.get("value") for e in c.get("env", [])})
 assert env.get("CURIE_AGENT_SANDBOX_POOLS") == "factory", env.get("CURIE_AGENT_SANDBOX_POOLS")
+# A registry-only pool carries no connector secrets (#2943).
+assert env.get("CURIE_AGENT_CONNECTOR_SECRET_POOLS") == "", env.get("CURIE_AGENT_CONNECTOR_SECRET_POOLS")
 print(f"ok: {template} labels agent factory's pods and the worker routes factory claims to it")
 PYEOF
 

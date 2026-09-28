@@ -23,6 +23,7 @@ change in either producer fails CI rather than silently disabling the grant.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from typing import Any
@@ -87,6 +88,7 @@ async def _seed_approval(
     agent_id: uuid.UUID | None = None,
     gate_kind: Any = _UNSET,
     granted_tool: Any = _UNSET,
+    granted_arguments: Any = _UNSET,
 ) -> None:
     columns = [
         "id",
@@ -122,12 +124,19 @@ async def _seed_approval(
     if granted_tool is not _UNSET:
         columns.append("granted_tool")
         params["granted_tool"] = granted_tool
+    if granted_arguments is not _UNSET:
+        columns.append("granted_arguments")
+        params["granted_arguments"] = json.dumps(granted_arguments)
 
     async with engine.begin() as conn:
+        placeholders = [
+            "CAST(:granted_arguments AS jsonb)" if column == "granted_arguments" else f":{column}"
+            for column in columns
+        ]
         await conn.execute(
             text(
                 f"INSERT INTO {_SCHEMA}.approvals ({', '.join(columns)}) "
-                f"VALUES ({', '.join(':' + c for c in columns)})"
+                f"VALUES ({', '.join(placeholders)})"
             ),
             params,
         )
@@ -757,6 +766,38 @@ def test_pins_summarize_tool_call_format() -> None:
                     resume_event_id(approval_id), agent_id
                 )
                 assert tool == "mcp__crm__send_contract"
+            finally:
+                await _cleanup_agents(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_approved_permission_gate_returns_stored_arguments_not_summary() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await _skip_if_unreachable(engine)
+            agent_id = uuid.uuid4()
+            approval_id = uuid.uuid4()
+            stored = {"command": "printf ok", "options": {"flags": ["a"]}}
+            await _seed_agent(engine, agent_id)
+            await _seed_approval(
+                engine,
+                approval_id=approval_id,
+                status="approved",
+                summary='Tool call awaiting approval: Bash {"command":"forged"}',
+                agent_id=agent_id,
+                gate_kind="permission",
+                granted_tool="Bash",
+                granted_arguments=stored,
+            )
+            try:
+                resolver = _resolver(engine)
+                event = resume_event_id(approval_id)
+                assert await resolver.approval_grant_arguments(event, agent_id) == stored
+                assert await resolver.approval_grant_arguments(event, uuid.uuid4()) is None
             finally:
                 await _cleanup_agents(engine, [agent_id])
         finally:

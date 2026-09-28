@@ -97,7 +97,7 @@ def test_review_terminal_observer_requires_exact_current_fenced_completion(
     make_harness,
 ) -> None:
     from curie_api.config import Settings
-    from curie_api.github_review_terminal import worker_event_is_terminal
+    from curie_api.github_review_terminal import worker_event_terminal_outcome
 
     async def exercise() -> None:
         async with make_harness() as h:
@@ -145,6 +145,7 @@ def test_review_terminal_observer_requires_exact_current_fenced_completion(
                 h.config.consumer_group,
                 entry_id,
                 owner=stale.owner,
+                resume_event_id=None,
             )
             await h.async_redis.xclaim(
                 h.config.stream,
@@ -187,22 +188,35 @@ def test_review_terminal_observer_requires_exact_current_fenced_completion(
                     entry_id=lease.entry_id,
                     owner=lease.owner,
                     generation=lease.generation,
+                    marker_value="1",
                 )
 
             assert await settle(stale) is None
-            assert not await worker_event_is_terminal(h.async_redis, settings, event_id)
+            assert (
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
+                is None
+            )
             assert await settle(current) is not None
-            assert await worker_event_is_terminal(h.async_redis, settings, event_id)
-            assert not await worker_event_is_terminal(
+            assert (
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
+                == "complete"
+            )
+            assert await worker_event_terminal_outcome(
                 h.async_redis,
                 settings,
                 event_id + "-other",
-            )
+            ) is None
             # The completion outbox remains independently terminal after the
             # shorter ordinary done marker has gone away.
             await h.async_redis.delete(h.config.done_key(event_id))
-            assert await worker_event_is_terminal(h.async_redis, settings, event_id)
+            assert (
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
+                == "complete"
+            )
             await h.async_redis.hset(h.config.completion_key(event_id), "done", "0")
-            assert not await worker_event_is_terminal(h.async_redis, settings, event_id)
+            assert (
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
+                is None
+            )
 
     asyncio.run(exercise())

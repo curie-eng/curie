@@ -234,6 +234,13 @@ impl ChannelBinding {
 pub struct Agent {
     pub id: String,
     pub name: String,
+    /// Hook name to conversation partition pointer. The operator CLI reads
+    /// these maps and sends replacements through the existing agent PATCH.
+    #[serde(default)]
+    pub hook_partitions: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Hook name to allowlisted workload mapping.
+    #[serde(default)]
+    pub source_bindings: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// Every channel this agent answers on, ordered by `(kind, address)`
     /// server-side. One or more (ADR-0118): the API refuses to remove the last
     /// one, because an agent bound to nothing is deployed and answers nowhere.
@@ -292,6 +299,44 @@ pub struct Agent {
     pub publication_draft: bool,
     #[serde(default)]
     pub publication_branch_prefix: Option<String>,
+}
+
+/// An operator authored hook configuration file. Absent maps are omitted from
+/// PATCH so changing one map leaves the other untouched. An empty map clears
+/// that map. The API remains the authority for pointer and name validation.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfigInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hook_partitions: Option<std::collections::BTreeMap<String, HookPartitionInput>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_bindings: Option<std::collections::BTreeMap<String, SourceBindingInput>>,
+}
+
+impl HookConfigInput {
+    pub fn is_empty(&self) -> bool {
+        self.hook_partitions.is_none() && self.source_bindings.is_none()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HookPartitionInput {
+    pointer: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceBindingInput {
+    workload_pointer: String,
+    map: std::collections::BTreeMap<String, SourceBindingEntryInput>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceBindingEntryInput {
+    repository: String,
+    revision: String,
 }
 
 fn default_publication_policy() -> String {
@@ -542,6 +587,14 @@ pub struct ScheduleHook {
     pub zone: String,
     pub last_fire_at: Option<String>,
     pub last_outcome: Option<String>,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleControl {
+    pub agent: String,
+    pub name: String,
+    pub paused: bool,
 }
 
 /// Scheduled hooks for one agent (`AgentSchedulesOut`).
@@ -557,6 +610,20 @@ pub struct AgentSchedules {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScheduleList {
     pub schedules: Vec<AgentSchedules>,
+}
+
+/// One test-fire run record (`HookFireOut`, #2932).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct HookFireRecord {
+    pub id: String,
+    pub agent_id: String,
+    pub agent: String,
+    pub name: String,
+    pub trigger: String,
+    pub slot_utc: String,
+    pub outcome: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
 }
 
 /// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
@@ -1821,6 +1888,25 @@ impl ApiClient {
             .context("decoding agent list")
     }
 
+    /// Deliberate operator read of the derived hook signing secret. Keep the
+    /// response body out of errors and debug output.
+    pub async fn hook_secret(&self, agent_id: &str) -> Result<String> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/hook-secret", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/hook-secret",
+            )
+            .await?;
+        let body: serde_json::Value = Self::expect_ok(resp, "reading hook secret")
+            .await?
+            .json()
+            .await
+            .context("decoding hook secret response")?;
+        required_response_string(&body, "secret", "hook secret response")
+    }
+
     /// Poll one opaque disconnected cluster-message reply bucket.
     ///
     /// `reply_ref` is a UUID rather than an arbitrary string so caller input can
@@ -2932,6 +3018,75 @@ impl ApiClient {
             .json()
             .await
             .context("decoding schedule list")
+    }
+
+    pub async fn control_schedule(
+        &self,
+        agent: &str,
+        name: &str,
+        pause: bool,
+    ) -> Result<ScheduleControl> {
+        let action = if pause { "pause" } else { "resume" };
+        let mut url = reqwest::Url::parse(&format!("{}/schedules", self.base_url))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("schedule URL cannot hold path segments"))?
+            .push(agent)
+            .push(name)
+            .push(action);
+        let request = self.http.post(url).header("X-API-Key", &self.api_key);
+        let response = self
+            .send_request(request, "POST /schedules control")
+            .await?;
+        Self::expect_ok(response, "changing schedule control")
+            .await?
+            .json()
+            .await
+            .context("decoding schedule control")
+    }
+
+    /// Start a hook now: `POST /agents/{agent}/hooks/{name}/fire`.
+    pub async fn fire_hook(&self, agent: &str, name: &str) -> Result<HookFireRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent}/hooks/{name}/fire",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "POST /agents/{agent}/hooks/{name}/fire",
+            )
+            .await?;
+        Self::expect_ok(resp, "firing hook")
+            .await?
+            .json()
+            .await
+            .context("decoding hook fire")
+    }
+
+    /// Read one hook run: `GET /agents/{agent}/hooks/{name}/runs/{id}`.
+    pub async fn get_hook_run(
+        &self,
+        agent: &str,
+        name: &str,
+        run_id: &str,
+    ) -> Result<HookFireRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent}/hooks/{name}/runs/{run_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{agent}/hooks/{name}/runs/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading hook run")
+            .await?
+            .json()
+            .await
+            .context("decoding hook run")
     }
 
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.

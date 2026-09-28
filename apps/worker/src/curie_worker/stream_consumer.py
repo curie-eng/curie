@@ -39,6 +39,7 @@ from .consumer_liveness import ConsumerLivenessStore
 from .delivery_lease import (
     DeliveryLease,
     DeliveryLeaseStore,
+    LeaseLostError,
     LeaseRefused,
     unfenced_lease,
 )
@@ -607,7 +608,21 @@ class StreamConsumer:
         await self._redis.xack(stream, group, entry_id)
 
     async def _ack(self, entry_id: str) -> None:
-        await self._redis.xack(self._spec.stream, self._spec.group, entry_id)
+        lease = self._held_leases.get(entry_id)
+        if lease is None:
+            await self._redis.xack(self._spec.stream, self._spec.group, entry_id)
+            return
+        async with lease.settlement_lock:
+            lease.raise_if_lost()
+            removed = await self._redis.xack(
+                self._spec.stream, self._spec.group, entry_id
+            )
+            if removed != 1:
+                lease.lost.set()
+                raise LeaseLostError(
+                    f"entry {entry_id} was not pending at terminal acknowledgement"
+                )
+            lease.acknowledged.set()
 
     async def _settle_delivery(self, entry_id: str) -> None:
         """Remove this delivery's lease AND its state after a terminal settlement.
@@ -795,7 +810,11 @@ class StreamConsumer:
                 await heartbeat
             try:
                 await self._leases.release(
-                    spec.stream, spec.group, entry_id, owner=lease.owner
+                    spec.stream,
+                    spec.group,
+                    entry_id,
+                    owner=lease.owner,
+                    resume_event_id=lease.resume_event_id,
                 )
             except Exception:
                 # Releasing is an optimization: the lease expires on its own at
@@ -828,22 +847,30 @@ class StreamConsumer:
         spec = self._spec
         while True:
             await asyncio.sleep(self._leases.heartbeat_interval_s)
-            try:
-                budget = await self._leases.heartbeat(
-                    spec.stream,
-                    spec.group,
-                    entry_id,
-                    consumer=spec.consumer,
-                    owner=lease.owner,
-                    generation=lease.generation,
-                )
-            except Exception as exc:  # noqa: BLE001 - any failure is lease-lost
-                budget = None
-                reason = f"renewal raised {type(exc).__name__}: {exc}"
-            else:
-                reason = "renewal refused by Valkey"
+            async with lease.settlement_lock:
+                if lease.acknowledged.is_set():
+                    return
+                try:
+                    budget = await self._leases.heartbeat(
+                        spec.stream,
+                        spec.group,
+                        entry_id,
+                        consumer=spec.consumer,
+                        owner=lease.owner,
+                        generation=lease.generation,
+                        resume_event_id=lease.resume_event_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - any failure is lease-lost
+                    budget = None
+                    reason = f"renewal raised {type(exc).__name__}: {exc}"
+                else:
+                    reason = "renewal refused by Valkey"
+                if budget is None:
+                    lease.lost.set()
+                else:
+                    # The deadline does not move; only this clock anchor does.
+                    lease.budget = budget
             if budget is None:
-                lease.lost.set()
                 spec.logger.warning(
                     "delivery lease LOST for entry %s on stream %s "
                     "(owner=%s generation=%d): %s; this owner may no longer ack, "
@@ -867,9 +894,6 @@ class StreamConsumer:
                             spec.stream,
                         )
                 return
-            # Re-anchor in place so the holder always reads the freshest
-            # observation. The DEADLINE never moves: only the anchor does.
-            lease.budget = budget
 
     async def _dead_letter_refusal(self, entry_id: str) -> str | None:
         """Why this process may NOT dead-letter ``entry_id``, or None if it may.

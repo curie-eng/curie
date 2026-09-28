@@ -702,21 +702,33 @@ fn cluster_namespace_env_reaches_every_cluster_verb() {
         let name = subcommand["name"]
             .as_str()
             .expect("cluster subcommand has a name");
-        let namespace_args: Vec<_> = subcommand["args"]
-            .as_array()
-            .expect("cluster subcommand has arguments")
-            .iter()
-            .filter(|arg| arg["id"] == "namespace")
-            .collect();
-        assert_eq!(
-            namespace_args.len(),
-            1,
-            "cluster {name} must expose exactly one namespace argument"
-        );
-        assert_eq!(
-            namespace_args[0]["env"], "CURIE_NAMESPACE",
-            "cluster {name} must read CURIE_NAMESPACE"
-        );
+        let leaves: Vec<_> = if subcommand["args"].as_array().is_some() {
+            vec![subcommand]
+        } else {
+            subcommand["subcommands"]
+                .as_array()
+                .expect("cluster command has arguments or nested actions")
+                .iter()
+                .collect()
+        };
+        for leaf in leaves {
+            let leaf_name = leaf["name"].as_str().expect("cluster leaf has a name");
+            let namespace_args: Vec<_> = leaf["args"]
+                .as_array()
+                .expect("cluster leaf has arguments")
+                .iter()
+                .filter(|arg| arg["id"] == "namespace")
+                .collect();
+            assert_eq!(
+                namespace_args.len(),
+                1,
+                "cluster {name} {leaf_name} must expose exactly one namespace argument"
+            );
+            assert_eq!(
+                namespace_args[0]["env"], "CURIE_NAMESPACE",
+                "cluster {name} {leaf_name} must read CURIE_NAMESPACE"
+            );
+        }
     }
 }
 

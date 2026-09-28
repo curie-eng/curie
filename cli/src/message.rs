@@ -552,17 +552,18 @@ pub fn port_forward_command(
     )
 }
 
-/// The `/api/` base URL the worker posts its placeholder edits to.
-fn advertised_url(host: &str, port: u16) -> String {
-    format!("http://{host}:{port}/api/")
-}
-
 /// Reserved built-in worker adapter for disconnected `cluster message` turns.
 /// It is intentionally language-local and byte-identical to the worker/API
 /// literal: the frozen queue contract already has an adapter slot, so no wire
 /// change is needed. `pub(crate)` so `queue::thread_key_for` shares this one
 /// constant instead of duplicating the literal.
 pub(crate) const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
+
+/// Case output when a text-graded cluster eval relay wait hits its deadline.
+/// Not [`diagnostics`]: that dump is Redis stream internals and must not land
+/// under the graded reply.
+const CLUSTER_EVAL_RELAY_TIMEOUT: &str =
+    "the cluster message relay did not deliver a reply before the deadline";
 
 /// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
 /// Deployment NAME is unit-testable without a cluster (#1533).
@@ -1330,78 +1331,9 @@ impl crate::ui::CliOutput for MessageOutcomeOutput {
 // Effectful helpers
 // ---------------------------------------------------------------------------
 
-/// The routable host the stub advertises: `--listen-host` verbatim, otherwise
-/// the local IP the kernel would use to reach the cluster's API server (via a
-/// UDP-connect that sends no packets -- it only resolves the source interface).
-/// The address a container/pod uses to reach the Docker Desktop host from inside
-/// the Docker VM (macOS/Windows). Not routable on native-Linux Docker, where the
-/// host is reached via the bridge gateway instead.
+/// The address a container uses to reach the Docker Desktop host from inside
+/// the Docker VM (macOS/Windows). Not routable on native-Linux Docker.
 const DOCKER_INTERNAL_HOST: &str = "host.docker.internal";
-
-/// Whether the cluster-message reply stub should advertise `host.docker.internal`
-/// rather than a host-local IP. True only under Docker Desktop's VM topology
-/// (macOS/Windows) talking to a loopback-exposed API server -- i.e. a local
-/// cluster (kind) whose in-VM worker cannot reach the host's own LAN IP or the
-/// kind bridge gateway (both live in the VM), only `host.docker.internal` (#900).
-/// `platform_is_docker_vm` is passed in (a compile-time OS check at the call
-/// site) so the decision stays unit-testable off those platforms.
-fn prefers_docker_internal_host(server_host: &str, platform_is_docker_vm: bool) -> bool {
-    platform_is_docker_vm && host_is_loopback(server_host)
-}
-
-/// Whether `host` names the loopback interface (`localhost`, `127.0.0.0/8`, `::1`).
-fn host_is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
-}
-
-async fn resolve_advertise_host(listen_host: Option<&str>) -> Result<String> {
-    if let Some(host) = listen_host {
-        return Ok(host.to_string());
-    }
-    let (ok, out, err) = run_capture(&crate::ops::kubeconfig_host_cmd()).await?;
-    if !ok {
-        bail!(
-            "could not read the kubeconfig API server to auto-detect a routable host ({}); \
-             pass --listen-host <host>",
-            err.trim()
-                .lines()
-                .next()
-                .unwrap_or("kubectl config view failed")
-        );
-    }
-    let server = out.trim();
-    let (host, port) = server_host_and_port(server).with_context(|| {
-        format!("could not parse the kubeconfig server url {server:?}; pass --listen-host <host>")
-    })?;
-    // Docker Desktop (macOS/Windows) runs the cluster inside a LinuxKit VM, so a
-    // host-local IP or the kind bridge gateway is unreachable from the in-cluster
-    // worker -- it reaches the host only via host.docker.internal. Detect that
-    // (a loopback-exposed API server on a Docker-VM platform, i.e. a local kind
-    // cluster) and advertise host.docker.internal instead of the local egress IP
-    // (#900). Native-Docker Linux (CI included) is unaffected: it passes
-    // --listen-host explicitly (returned above), and this branch is false off
-    // macOS/Windows anyway.
-    if prefers_docker_internal_host(&host, cfg!(any(target_os = "macos", target_os = "windows"))) {
-        return Ok(DOCKER_INTERNAL_HOST.to_string());
-    }
-    let ip = detect_local_ip(&host, port).with_context(|| {
-        format!("could not detect the local IP toward {host}:{port}; pass --listen-host <host>")
-    })?;
-    Ok(ip.to_string())
-}
-
-/// The local source IP the kernel would use to reach `host:port`. A UDP socket
-/// `connect` only sets the default peer and picks the egress interface; no
-/// datagram is sent, so this needs no reachability and touches no network.
-fn detect_local_ip(host: &str, port: u16) -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect((host, port)).ok()?;
-    socket.local_addr().ok().map(|addr| addr.ip())
-}
 
 /// Spawn a `kubectl port-forward` child (killed on drop via `kill_on_drop`) and
 /// block until its effective local port accepts TCP, so callers can use it
@@ -3801,13 +3733,10 @@ pub fn eval_dry_run_lines(
             &api_base,
         ));
     } else {
-        let host = opts
-            .listen_host
-            .clone()
-            .unwrap_or_else(|| "<auto-detected-local-ip>".to_string());
         // Offline by contract: a dry run contacts no cluster, so it renders the
         // chart's no-override `curie.fullname` rule rather than discovering the
-        // rendered name (#1533).
+        // rendered name (#1533). `--listen-host` and `--listen-port` stay on
+        // the opts struct but do not select a Slack stub.
         let fullname = crate::ops::chart_fullname(&opts.release);
         lines.push(
             port_forward_command(
@@ -3819,21 +3748,23 @@ pub fn eval_dry_run_lines(
             )
             .display(),
         );
-        if opts.channel.is_none() {
-            lines.push(
-                port_forward_command(
-                    &opts.namespace,
-                    &fullname,
-                    "api",
-                    opts.api_local_port,
-                    API_REMOTE_PORT,
-                )
-                .display(),
-            );
-        }
+        lines.push(
+            port_forward_command(
+                &opts.namespace,
+                &fullname,
+                "api",
+                opts.api_local_port,
+                API_REMOTE_PORT,
+            )
+            .display(),
+        );
         lines.push(format!(
-            "stub advertised at {}",
-            advertised_url(&host, opts.listen_port)
+            "poll replies at http://127.0.0.1:{}/cluster-message-replies/<uuid-v4>",
+            opts.api_local_port
+        ));
+        lines.push(format!(
+            "enqueue a synthetic QueuedTurn (adapter {CLUSTER_MESSAGE_RELAY_ADAPTER}, no reply \
+             endpoint, UUIDv4 reply ref)"
         ));
     }
     lines.push(format!("concurrency: sequential ({})", opts.concurrency));
@@ -3864,18 +3795,25 @@ fn resolve_eval(explicit: Option<PathBuf>) -> Result<LoadedEval> {
     crate::evals::load_eval(&path)
 }
 
+/// How one text-graded eval sample collects its reply.
+///
+/// Local eval keeps the compose Slack stub. Cluster eval uses the same
+/// ref-keyed relay as disconnected `cluster message` and never starts a stub.
+enum EvalReplyTransport<'a> {
+    Stub(&'a mut SlackStub),
+    Relay(&'a ApiClient),
+}
+
 /// The shared per-tier eval engine: enqueue one synthetic `QueuedTurn` per case
-/// through the already-stood-up stub + Valkey (the same enqueue+await path a
-/// single `message` walks), grade the captured reply, and collect
-/// `(id, passed, seconds, output)` rows for `report_eval`. Tier-agnostic: the
-/// caller binds the stub/connection for its tier, then hands them here.
+/// through the caller's reply transport + Valkey, grade the captured reply, and
+/// collect `(id, passed, seconds, output)` rows for `report_eval`.
 async fn run_eval_turns(
     opts: &EvalOpts,
     channel: &str,
     identity: Option<&str>,
     suite: &EvalSuite,
     conn: &mut MultiplexedConnection,
-    stub: &mut SlackStub,
+    mut transport: EvalReplyTransport<'_>,
 ) -> Result<crate::commands::EvalReport> {
     let ui = crate::ui::ui();
     let sampling = opts.sampling;
@@ -3899,19 +3837,44 @@ async fn run_eval_turns(
                 // Thread reset (#1534) must use the same prefixed key the
                 // worker claimed.
                 let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
-                let reply_endpoint = stub.base_api_url().to_string();
-                let event = speak_as(
-                    eval_case_turn(
-                        "slack",
-                        &channel_id,
-                        &opts.user,
-                        &case.input,
-                        &thread_ts,
-                        &placeholder_ts,
-                        Some(reply_endpoint),
-                    ),
-                    identity,
-                );
+                let (event, relay_ref) = match &transport {
+                    EvalReplyTransport::Stub(stub) => {
+                        let reply_endpoint = stub.base_api_url().to_string();
+                        (
+                            speak_as(
+                                eval_case_turn(
+                                    "slack",
+                                    &channel_id,
+                                    &opts.user,
+                                    &case.input,
+                                    &thread_ts,
+                                    &placeholder_ts,
+                                    Some(reply_endpoint),
+                                ),
+                                identity,
+                            ),
+                            None,
+                        )
+                    }
+                    EvalReplyTransport::Relay(_) => {
+                        let reply_ref = uuid::Uuid::new_v4();
+                        let mut event = eval_case_turn(
+                            "slack",
+                            &channel_id,
+                            &opts.user,
+                            &case.input,
+                            &thread_ts,
+                            reply_ref.hyphenated().to_string(),
+                            None,
+                        );
+                        event
+                            .reply_handle
+                            .as_mut()
+                            .expect("eval turns are targeted")
+                            .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
+                        (event, Some(reply_ref))
+                    }
+                };
                 // The worker claims under quote(kind):quote(channel):quote(conversation_id),
                 // not the bare eval-prefixed conversation_id. SADD the scoped key
                 // or the drain is a no-op and the sandbox keeps its quota slot (#2259).
@@ -3920,16 +3883,34 @@ async fn run_eval_turns(
                 let started = Instant::now();
                 let stream_id = xadd(conn, &opts.stream, &event).await?;
                 let mut observe_update = |_: &str| {};
-                let outcome = await_reply(
-                    stub,
-                    conn,
-                    &opts.stream,
-                    &stream_id,
-                    &placeholder_ts,
-                    Duration::from_secs(opts.timeout_secs),
-                    &mut observe_update,
-                )
-                .await;
+                let outcome = match &mut transport {
+                    EvalReplyTransport::Stub(stub) => {
+                        await_reply(
+                            stub,
+                            conn,
+                            &opts.stream,
+                            &stream_id,
+                            &placeholder_ts,
+                            Duration::from_secs(opts.timeout_secs),
+                            &mut observe_update,
+                        )
+                        .await
+                    }
+                    EvalReplyTransport::Relay(api) => {
+                        let reply_ref = relay_ref
+                            .as_ref()
+                            .expect("cluster eval relay samples carry a reply ref");
+                        await_cluster_relay(
+                            api,
+                            reply_ref,
+                            0,
+                            Duration::from_secs(opts.timeout_secs),
+                            &mut observe_update,
+                        )
+                        .await?
+                        .outcome
+                    }
+                };
                 // Release this sample's sandbox on every completed/red/timed-out
                 // path so a three-case suite run twice cannot pin eight
                 // curie-thread-* claims against the default ResourceQuota (#1534).
@@ -3939,7 +3920,12 @@ async fn run_eval_turns(
                     Outcome::Replied(reply) => reply.clone(),
                     Outcome::AwaitingApproval { reply, .. } => reply.clone().unwrap_or_default(),
                     Outcome::CompletedNoEdit => String::new(),
-                    Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
+                    Outcome::TimedOut => match relay_ref {
+                        // Local stub timeouts keep the capped stream dump (#751).
+                        // Cluster relay timeouts must not.
+                        None => diagnostics(conn, &opts.stream, &stream_id).await,
+                        Some(_) => CLUSTER_EVAL_RELAY_TIMEOUT.to_string(),
+                    },
                 };
                 let passed = reply_passes(case, &outcome);
                 let completed = matches!(
@@ -4899,7 +4885,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         identity.as_deref(),
         &suite,
         &mut conn,
-        &mut stub,
+        EvalReplyTransport::Stub(&mut stub),
     )
     .await?;
     crate::commands::report_eval(&results, None, stub)
@@ -4961,15 +4947,8 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     // cluster, and every kubectl target below is a chart resource (#1533).
     let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
 
-    let advertise_host = resolve_advertise_host(opts.listen_host.as_deref()).await?;
-    let mut stub = SlackStub::start("0.0.0.0", opts.listen_port, &advertise_host).await?;
-    ui.note(&format!(
-        "slack stub listening; the worker will post to {}",
-        stub.base_api_url()
-    ));
-
     // Valkey port-forward for the enqueue, kept alive for the whole eval loop.
-    let (_valkey_pf, valkey_local_port) = start_port_forward(
+    let (valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &fullname,
@@ -4982,44 +4961,41 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     )
     .await?;
 
-    let (channel, identity) = if let Some(agent) = opts.agent.as_deref() {
-        let (_api_pf, api_local_port) = start_port_forward(
-            &port_forward_command(
-                &opts.namespace,
-                &fullname,
-                "api",
-                opts.api_local_port,
-                API_REMOTE_PORT,
-            ),
-            opts.api_local_port,
+    // Relay polling and a missing-channel lookup share one API forward for the
+    // whole run, including when `--channel` is already set.
+    let (api_pf, api_local_port) = start_port_forward(
+        &port_forward_command(
+            &opts.namespace,
+            &fullname,
             "api",
-        )
-        .await?;
-        let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+            opts.api_local_port,
+            API_REMOTE_PORT,
+        ),
+        opts.api_local_port,
+        "api",
+    )
+    .await?;
+    let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+
+    let (channel, identity) = if let Some(agent) = opts.agent.as_deref() {
         let agents = api
             .list_agents()
             .await
             .context("listing agents through the api port-forward")?;
         let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
+        // Cluster eval replies come back through the message relay, which
+        // speaks only as the default identity (ADR-0168 d8).
+        refuse_named_route(
+            route.identity.as_deref(),
+            agent,
+            &route.channel,
+            "the cluster message relay",
+        )?;
         (route.channel, route.identity)
     } else {
         let channel = match opts.channel.as_deref() {
             Some(channel) => channel.to_string(),
             None => {
-                let (_api_pf, api_local_port) = start_port_forward(
-                    &port_forward_command(
-                        &opts.namespace,
-                        &fullname,
-                        "api",
-                        opts.api_local_port,
-                        API_REMOTE_PORT,
-                    ),
-                    opts.api_local_port,
-                    "api",
-                )
-                .await?;
-                let api =
-                    ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
                 let agents = api
                     .list_agents()
                     .await
@@ -5043,16 +5019,16 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         identity.as_deref(),
         &suite,
         &mut conn,
-        &mut stub,
+        EvalReplyTransport::Relay(&api),
     )
     .await
     {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
-    // report_eval process::exits on a red suite without unwinding, so the
-    // Valkey forward and stub must move in as guards (#1908).
-    crate::commands::report_eval(&results, None, (_valkey_pf, stub))
+    // report_eval process::exits on a red suite without unwinding, so both
+    // port-forwards must move in as guards (#1908). There is no stub guard.
+    crate::commands::report_eval(&results, None, (valkey_pf, api_pf))
 }
 
 #[cfg(test)]
@@ -6449,6 +6425,8 @@ mod tests {
         Agent {
             id: format!("id-{name}"),
             name: name.to_string(),
+            hook_partitions: None,
+            source_bindings: None,
             channels: channels
                 .iter()
                 .map(|c| crate::api::ChannelBinding {
@@ -7544,119 +7522,6 @@ mod tests {
     }
 
     #[test]
-    fn host_is_loopback_recognizes_loopback_names_and_addresses() {
-        assert!(host_is_loopback("localhost"));
-        assert!(host_is_loopback("LocalHost")); // case-insensitive
-        assert!(host_is_loopback("127.0.0.1"));
-        assert!(host_is_loopback("127.0.0.5")); // all of 127.0.0.0/8
-        assert!(host_is_loopback("::1"));
-        assert!(!host_is_loopback("10.0.0.5"));
-        assert!(!host_is_loopback("192.168.65.254"));
-        assert!(!host_is_loopback("my-eks.example.com"));
-    }
-
-    #[test]
-    fn docker_internal_advertise_only_under_vm_platform_and_loopback_server() {
-        // Docker Desktop (VM platform) + a loopback-exposed API server (local
-        // kind) -> advertise host.docker.internal (#900).
-        assert!(prefers_docker_internal_host("127.0.0.1", true));
-        assert!(prefers_docker_internal_host("localhost", true));
-        assert!(prefers_docker_internal_host("::1", true));
-        // Native-Docker Linux never rewrites, even with a loopback API server
-        // (it reaches the host via the bridge gateway / an explicit --listen-host).
-        assert!(!prefers_docker_internal_host("127.0.0.1", false));
-        // A remote / non-loopback API server keeps the local-IP detection path
-        // even on a VM platform (not the local-kind case #900 addresses).
-        assert!(!prefers_docker_internal_host("10.0.0.5", true));
-        assert!(!prefers_docker_internal_host("my-eks.example.com", true));
-    }
-
-    const ADVERTISE_HOST_CHILD_CASE: &str = "CURIE_TEST_ADVERTISE_HOST_CASE";
-
-    fn run_advertise_host_child(case: &str, path: &std::path::Path) {
-        let output =
-            std::process::Command::new(std::env::current_exe().expect("resolve test executable"))
-                .arg("message::tests::advertise_host_child")
-                .arg("--exact")
-                .arg("--nocapture")
-                .env(ADVERTISE_HOST_CHILD_CASE, case)
-                .env("PATH", path)
-                .output()
-                .expect("run advertise host child");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "advertise host child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        let sentinel = format!("ADVERTISE_HOST_OK {case}");
-        assert!(
-            stdout
-                .lines()
-                .any(|line| line.trim() == sentinel.as_str()),
-            "advertise host child did not prove case {case} ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-
-    #[tokio::test]
-    async fn advertise_host_child() {
-        let Ok(case) = std::env::var(ADVERTISE_HOST_CHILD_CASE) else {
-            return;
-        };
-        match case.as_str() {
-            "kernel_route" => {
-                let target = "192.0.2.1";
-                let socket =
-                    std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route source probe");
-                socket
-                    .connect((target, 6443))
-                    .expect("select route toward documentation address");
-                let expected = socket.local_addr().expect("read route source").ip();
-                let actual = resolve_advertise_host(None)
-                    .await
-                    .expect("derive advertise host");
-                assert_eq!(actual, expected.to_string());
-                assert_ne!(actual, target);
-            }
-            "explicit" => {
-                let actual = resolve_advertise_host(Some("192.0.2.44"))
-                    .await
-                    .expect("accept explicit listen host");
-                assert_eq!(actual, "192.0.2.44");
-            }
-            other => panic!("unknown advertise host child case {other}"),
-        }
-        println!("ADVERTISE_HOST_OK {case}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_advertise_host_uses_kernel_route_source() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tools = tempfile::tempdir().expect("create kubectl stub directory");
-        let kubectl = tools.path().join("kubectl");
-        std::fs::write(
-            &kubectl,
-            "#!/bin/sh\nprintf '%s\\n' 'https://192.0.2.1:6443'\n",
-        )
-        .expect("write kubectl stub");
-        let mut permissions = std::fs::metadata(&kubectl)
-            .expect("read kubectl stub metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&kubectl, permissions).expect("make kubectl stub executable");
-
-        run_advertise_host_child("kernel_route", tools.path());
-    }
-
-    #[test]
-    fn explicit_listen_host_bypasses_auto_detection() {
-        let no_tools = tempfile::tempdir().expect("create empty executable directory");
-        run_advertise_host_child("explicit", no_tools.path());
-    }
-
-    #[test]
     fn dry_run_lists_distinct_valkey_and_api_forwards_without_a_callback_endpoint() {
         let lines = dry_run_lines(&opts(Some("C123")), "10.1.2.3");
         assert!(
@@ -7935,7 +7800,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_eval_dry_run_plan_lists_the_valkey_forward_and_stub() {
+    fn cluster_eval_dry_run_plan_lists_the_relay_even_with_a_channel() {
         let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2)
             .expect("eval dry-run plan");
         assert!(
@@ -7950,16 +7815,26 @@ mod tests {
                 .any(|l| l == "kubectl -n curie port-forward svc/curie-valkey 56381:6379"),
             "{lines:?}"
         );
-        // Explicit channel -> no api forward.
-        assert!(
-            !lines.iter().any(|l| l.contains("svc/curie-api")),
-            "explicit channel needs no api forward: {lines:?}"
-        );
+        // An explicit channel still polls the relay, so the API forward stays.
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("stub advertised at http://")),
+                .any(|l| l == "kubectl -n curie port-forward svc/curie-api 8123:8000"),
+            "explicit channel still needs the relay api forward: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| {
+                l == "poll replies at http://127.0.0.1:8123/cluster-message-replies/<uuid-v4>"
+            }),
             "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("no reply endpoint")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("stub advertised")),
+            "cluster eval must not advertise a Slack stub: {lines:?}"
         );
     }
 
@@ -8040,6 +7915,8 @@ mod tests {
             Agent {
                 id: "a1".into(),
                 name: "one".into(),
+                hook_partitions: None,
+                source_bindings: None,
                 channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C1".into(),
@@ -8061,6 +7938,8 @@ mod tests {
             Agent {
                 id: "a2".into(),
                 name: "two".into(),
+                hook_partitions: None,
+                source_bindings: None,
                 channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C2".into(),

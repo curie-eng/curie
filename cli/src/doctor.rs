@@ -132,6 +132,12 @@ pub struct Facts {
     /// runnable, while `model_pin_fix` keeps its own `<ns>`/`<release>`
     /// placeholders (#1950).
     pub target: Option<(String, String)>,
+    /// A validated `curie.yaml` was loaded for this doctor run, so a release
+    /// model remedy can update the declared installation and reapply it.
+    pub declared_installation: bool,
+    /// The exact observed context when it differs from the file's context.
+    /// The apply remedy passes it explicitly to address this same cluster.
+    pub apply_context: Option<String>,
     /// Non-secret provider inferred from the bound `CURIE_CREDENTIALS` value.
     /// The credential itself is deliberately discarded during observation.
     pub model_credential_provider: Option<&'static str>,
@@ -251,6 +257,53 @@ fn ready_workload_replicas(items: &[serde_json::Value]) -> usize {
                 .unwrap_or(0) as usize
         })
         .sum()
+}
+
+/// The worker claim gate's row. Rendered even when the release is not serving:
+/// a cancelled `helm upgrade` leaves the latest revision `failed`, which is when
+/// a lingering quiesce marker most needs reporting (#3198).
+fn worker_claims_check(
+    worker_claims: &crate::worker_claims::ClaimsState,
+    namespace: &str,
+    release: &str,
+) -> Check {
+    match worker_claims {
+        crate::worker_claims::ClaimsState::ClaimsEnabled => {
+            ok("worker-claims", "Worker claims", "claims enabled")
+        }
+        crate::worker_claims::ClaimsState::Quiescing { revision, .. } => {
+            let detail = worker_claims
+                .wait_reason()
+                .expect("a quiescing claim state has a wait reason");
+            missing(
+                "worker-claims",
+                "Worker claims",
+                detail,
+                format!(
+                    "wait for upgrade revision {revision} to finish, then re-run `curie doctor \
+                     --namespace {namespace} --release {release}` and `{}`",
+                    targeted("status", namespace, release)
+                ),
+            )
+        }
+        crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable { .. } => missing(
+            "worker-claims",
+            "Worker claims",
+            worker_claims
+                .wait_reason()
+                .expect("a metadata-free quiescing state has a wait reason"),
+            format!(
+                "wait for the current upgrade to finish, then re-run `curie doctor \
+                 --namespace {namespace} --release {release}` and `{}`",
+                targeted("status", namespace, release)
+            ),
+        ),
+        crate::worker_claims::ClaimsState::Unknown => skipped(
+            "worker-claims",
+            "Worker claims",
+            "worker claim state unknown",
+        ),
+    }
 }
 
 /// Why an Installed helm record is not serving. Only Helm's `failed` status
@@ -646,27 +699,35 @@ pub(crate) fn helm_truthy(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-/// The command that pins the model at the source it is actually in force from.
+/// Pin the model at the source it is actually in force from.
 ///
-/// Bare and runnable, with angle-bracket placeholders only: a fix string that
-/// names a flag which does not exist fails for whoever pastes it (#1813). Note
-/// `curie cluster up` has NO `--model` -- that flag belongs to `skill up` -- so
-/// the release default is set through `--set <key>=`, where the key is the one
-/// the release actually reads ([`ReleaseModelKey`]) rather than always
-/// `agentSandbox.runner.model`, which a local-inference install ignores. The
-/// namespace and release come from the run itself rather than defaulting to
-/// `curie/curie` (#1358 item 1).
+/// A file backed release gets the chart key under `set:` and an apply command.
+/// Direct cluster diagnosis keeps the runnable `cluster up --set` command.
+/// Both paths use the key the release actually reads ([`ReleaseModelKey`]);
+/// local inference installs ignore `agentSandbox.runner.model`. Direct cluster
+/// commands name the namespace and release diagnosed by this run (#1358).
 fn model_pin_fix(f: &Facts, source: &ModelSource) -> String {
     match source {
         ModelSource::Agent(name) => {
             format!("curie cluster overrides {name} --model <dated-snapshot-id>")
         }
         ModelSource::ReleaseDefault(key) => {
+            let key = key.chart_key();
+            if f.declared_installation {
+                let apply = match f.apply_context.as_deref() {
+                    Some(context) => {
+                        format!("curie apply --context {}", crate::ops::shell_quote(context))
+                    }
+                    None => "curie apply".to_string(),
+                };
+                return format!(
+                    "set `{key}: \"<dated-snapshot-id>\"` under `set:` in `curie.yaml`, then run `{apply}`"
+                );
+            }
             let (namespace, release) = match &f.target {
                 Some((namespace, release)) => (namespace.as_str(), release.as_str()),
                 None => ("<ns>", "<release>"),
             };
-            let key = key.chart_key();
             format!(
                 "curie cluster up --namespace {namespace} --release {release} \
                  --set {key}=<dated-snapshot-id>"
@@ -1066,47 +1127,14 @@ fn evaluate_with_worker_claims(
         ] {
             out.push(skipped(id, title, reason));
         }
+        if let Some(worker_claims) = worker_claims {
+            out.push(worker_claims_check(worker_claims, namespace, release));
+        }
         return out;
     }
 
     if let Some(worker_claims) = worker_claims {
-        out.push(match worker_claims {
-            crate::worker_claims::ClaimsState::ClaimsEnabled => {
-                ok("worker-claims", "Worker claims", "claims enabled")
-            }
-            crate::worker_claims::ClaimsState::Quiescing { revision, .. } => {
-                let detail = worker_claims
-                    .wait_reason()
-                    .expect("a quiescing claim state has a wait reason");
-                missing(
-                    "worker-claims",
-                    "Worker claims",
-                    detail,
-                    format!(
-                        "wait for upgrade revision {revision} to finish, then re-run `curie doctor \
-                         --namespace {namespace} --release {release}` and `{}`",
-                        targeted("status", namespace, release)
-                    ),
-                )
-            }
-            crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable { .. } => missing(
-                "worker-claims",
-                "Worker claims",
-                worker_claims
-                    .wait_reason()
-                    .expect("a metadata-free quiescing state has a wait reason"),
-                format!(
-                    "wait for the current upgrade to finish, then re-run `curie doctor \
-                     --namespace {namespace} --release {release}` and `{}`",
-                    targeted("status", namespace, release)
-                ),
-            ),
-            crate::worker_claims::ClaimsState::Unknown => skipped(
-                "worker-claims",
-                "Worker claims",
-                "worker claim state unknown",
-            ),
-        });
+        out.push(worker_claims_check(worker_claims, namespace, release));
     }
 
     if f.mail_channels.is_empty() {
@@ -1176,7 +1204,7 @@ fn evaluate_with_worker_claims(
         (false, false) => skipped(
             "slack",
             "Slack",
-            "no tokens recorded; reachable with `curie cluster message`",
+            "no tokens recorded; reachable with `curie cluster message` and `curie cluster eval`",
         ),
     });
 
@@ -1319,7 +1347,7 @@ pub fn summary(checks: &[Check]) -> String {
     }
     if !has("slack") {
         return "Deployable to the cluster. Slack is not wired; talk to the agent with \
-                `curie cluster message`."
+                `curie cluster message` or `curie cluster eval`."
             .to_string();
     }
     if !has("clone-credential")
@@ -1584,6 +1612,29 @@ mod tests {
         assert!(find(&checks, "worker-claims")
             .detail
             .contains("marker expires in 30s"));
+    }
+
+    /// #3198: a cancelled `helm upgrade` leaves the latest revision `failed`,
+    /// which is exactly when the quiesce marker matters. The worker-claims row
+    /// must still render, not be dropped with the values-backed checks.
+    #[test]
+    fn worker_claims_still_render_when_the_latest_revision_failed() {
+        let mut f = wired();
+        f.release_status = Some("failed".into());
+        let quiescing = crate::worker_claims::ClaimsState::Quiescing {
+            since: "2026-09-27T11:50:00+00:00".into(),
+            revision: 3,
+            ttl_seconds: Some(24),
+        };
+        let checks = evaluate_with_worker_claims(&f, Some(&quiescing));
+        assert_eq!(find(&checks, "release").state, State::Missing);
+        let claims = find(&checks, "worker-claims");
+        assert_eq!(claims.state, State::Missing);
+        assert!(
+            claims.detail.contains("marker expires in 24s"),
+            "the row must name the marker expiry: {}",
+            claims.detail
+        );
     }
 
     /// The one check this issue is about, pulled out of a full `evaluate`.
@@ -4553,11 +4604,17 @@ esac
             c.detail
         );
         assert!(
+            c.detail.contains("cluster eval"),
+            "point at cluster eval as well: {}",
+            c.detail
+        );
+        assert!(
             c.fix.is_none(),
             "do not send the operator to mint Slack: {c:?}"
         );
         let s = summary(&checks);
         assert!(s.contains("cluster message"), "{s}");
+        assert!(s.contains("cluster eval"), "{s}");
         assert!(s.contains("Slack is not wired"), "{s}");
         assert!(
             !s.contains("no way to be reached"),
@@ -5463,12 +5520,16 @@ pub async fn doctor(
     release: &str,
     api_url: Option<&str>,
     api_key: Option<&str>,
+    declared_installation: bool,
+    apply_context: Option<&str>,
 ) -> DoctorOutput {
     let resolved = resolve_api(namespace, release, api_url, api_key).await;
     let api = resolved
         .as_ref()
         .map(|(url, key)| (url.as_str(), key.as_str()));
-    let (facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    let (mut facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    facts.declared_installation = declared_installation;
+    facts.apply_context = apply_context.map(str::to_string);
     let checks = evaluate_with_worker_claims(&facts, worker_claims.as_ref());
     let summary = summary(&checks);
     DoctorOutput { checks, summary }

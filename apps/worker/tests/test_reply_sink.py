@@ -45,6 +45,7 @@ from curie_worker.reply_sink import (
     InvalidReplyTargetError,
     MissingAdapterCredentialError,
     OversizedAdapterResponseError,
+    ProviderEgressRefusedError,
     RedirectedAdapterEndpointError,
     RejectedAdapterResponseError,
     TargetRoute,
@@ -1328,6 +1329,71 @@ def test_only_gone_completion_is_a_terminal_delivery_failure(
             if not (completion and status == 410 and terminal_response):
                 assert f"answered {status};" in str(caught.value)
             assert "provider body" not in str(caught.value)
+        finally:
+            await adapter.aclose()
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "event_kind", "expect_refusal"),
+    [
+        (424, "provider egress refused", "completed", True),
+        (424, "other provider error", "completed", False),
+        (424, "thread deleted at provider", "completed", False),
+        (424, None, "completed", False),
+        (410, "provider egress refused", "completed", False),
+        (502, "provider egress refused", "completed", False),
+        (424, "provider egress refused", "update", False),
+        (424, "provider egress refused", "post", False),
+    ],
+)
+def test_only_exact_refused_completion_classifies_provider_egress(
+    status: int, detail: str | None, event_kind: str, expect_refusal: bool
+) -> None:
+    async def go() -> None:
+        async def handler(request: web.Request) -> web.Response:
+            if detail is None:
+                return web.Response(status=status, text="not json")
+            return web.json_response({"detail": detail}, status=status)
+
+        server = await _serve(handler)
+        adapter = HttpReplyAdapter({ADAPTER_A: SECRET_A})
+        try:
+            event: ReplyUpdate | ReplyPost | TurnCompleted = _update("email")
+            if event_kind == "completed":
+                event = TurnCompleted(
+                    version=REPLY_WIRE_VERSION,
+                    event="turn.completed",
+                    target=event.target,
+                    event_id="ev-refused",
+                    outcome="delivered",
+                )
+            elif event_kind == "post":
+                event = ReplyPost(
+                    version=REPLY_WIRE_VERSION,
+                    event="reply.post",
+                    target=event.target,
+                    message=OutboundMessage(version="1.0", text="answer"),
+                    requested_by="U9",
+                )
+            with pytest.raises(RejectedAdapterResponseError) as caught:
+                await adapter.emit(
+                    event,
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{server.port}/ack",
+                        adapter=ADAPTER_A,
+                    ),
+                )
+            assert isinstance(caught.value, ProviderEgressRefusedError) == expect_refusal
+            if expect_refusal:
+                assert str(caught.value) == ProviderEgressRefusedError.reason
+            else:
+                assert type(caught.value) is RejectedAdapterResponseError
+                assert f"answered {status};" in str(caught.value)
+                if detail is not None:
+                    assert detail not in str(caught.value)
         finally:
             await adapter.aclose()
             await server.close()

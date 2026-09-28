@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 
 from curie_api.factory_notices import FINAL_MARKER, marker_for, status_body
-from curie_api.factory_progress import PhaseSlot, PhaseView
+from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
 CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
@@ -21,6 +21,31 @@ def _view() -> PhaseView:
         ),
         loops=(),
         current="plan",
+        stages=(
+            StageSlot(
+                id="read_issue",
+                label="Read issue",
+                phase_ids=("read_issue",),
+                state="done",
+                round_label=None,
+            ),
+            StageSlot(
+                id="plan",
+                label="Plan",
+                phase_ids=("plan",),
+                state="current",
+                round_label="round 1 of 3",
+            ),
+            StageSlot(
+                id="ci",
+                label="Wait for CI",
+                phase_ids=("ci",),
+                state="pending",
+                round_label=None,
+            ),
+        ),
+        reviewer_model=None,
+        staged=False,
     )
 
 

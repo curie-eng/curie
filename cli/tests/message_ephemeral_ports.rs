@@ -211,8 +211,24 @@ fn cluster_eval_uses_ephemeral_defaults() {
         "cluster eval must not select the historical fixed Valkey port: {plan}"
     );
     assert!(
-        plan.contains("stub advertised at http://127.0.0.1:0/api/"),
-        "an omitted listen port must request zero: {plan}"
+        plan.contains("kubectl -n curie port-forward svc/curie-api 0:8000"),
+        "an omitted API local port must request zero even when --channel is set: {plan}"
+    );
+    assert!(
+        plan.contains("cluster-message-replies"),
+        "cluster eval must name the relay route: {plan}"
+    );
+    assert!(
+        plan.contains("poll replies at http://127.0.0.1:0/cluster-message-replies/<uuid-v4>"),
+        "the ephemeral API port must shape the loopback relay poll URL: {plan}"
+    );
+    assert!(
+        plan.contains("no reply endpoint"),
+        "the queued relay handle must advertise no callback endpoint: {plan}"
+    );
+    assert!(
+        !plan.contains("stub advertised"),
+        "cluster eval must not advertise a Slack callback stub: {plan}"
     );
 }
 
@@ -231,7 +247,15 @@ fn cluster_eval_preserves_explicit_port_overrides() {
         "the explicit Valkey local port must remain exact: {plan}"
     );
     assert!(
-        plan.contains("stub advertised at http://127.0.0.1:18155/api/"),
-        "the explicit listen port must remain exact: {plan}"
+        plan.contains("kubectl -n curie port-forward svc/curie-api 18157:8000"),
+        "the explicit API local port must remain exact: {plan}"
+    );
+    assert!(
+        plan.contains("poll replies at http://127.0.0.1:18157/cluster-message-replies/<uuid-v4>"),
+        "the explicit API port must shape the loopback relay poll URL: {plan}"
+    );
+    assert!(
+        !plan.contains("stub advertised"),
+        "--listen-host and --listen-port must not bring the Slack stub back: {plan}"
     );
 }

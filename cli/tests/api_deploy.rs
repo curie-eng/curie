@@ -1810,22 +1810,22 @@ async fn a_local_deploy_narrows_the_bring_up_to_the_targets_connectors() {
     std::fs::write(
         dir.path().join("connectors.yaml"),
         "connectors:\n  excluded:\n    image: ghcr.io/example/e:1\n    \
-         secrets: [CURIE_TEST_D8_EXCLUDED_TOKEN]\n  kept:\n    image: ghcr.io/example/k:1\n    \
-         secrets: [CURIE_TEST_D8_KEPT_TOKEN]\n",
+         secrets: [D8_TEST_EXCLUDED_TOKEN]\n  kept:\n    image: ghcr.io/example/k:1\n    \
+         secrets: [D8_TEST_KEPT_TOKEN]\n",
     )
     .unwrap();
-    std::env::remove_var("CURIE_TEST_D8_EXCLUDED_TOKEN");
-    std::env::remove_var("CURIE_TEST_D8_KEPT_TOKEN");
+    std::env::remove_var("D8_TEST_EXCLUDED_TOKEN");
+    std::env::remove_var("D8_TEST_KEPT_TOKEN");
 
     let opts = identity_deploy_opts(&server, dir.path(), None, Some("dev"), Some(BOUND));
     let err = commands::deploy(opts).await.unwrap_err();
     let message = format!("{err:#}");
     assert!(
-        message.contains("CURIE_TEST_D8_KEPT_TOKEN"),
+        message.contains("D8_TEST_KEPT_TOKEN"),
         "the kept connector's own missing secret is named: {message}"
     );
     assert!(
-        !message.contains("CURIE_TEST_D8_EXCLUDED_TOKEN"),
+        !message.contains("D8_TEST_EXCLUDED_TOKEN"),
         "excluded is not this target's connector and must never reach bring_up_local: {message}"
     );
 }

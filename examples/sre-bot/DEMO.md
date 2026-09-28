@@ -41,12 +41,16 @@ defaults: the curie release in the curie namespace and the observability
 stack in the observability namespace. A stock kind cluster provides a default
 storage class, so each retained volume uses that class without an override.
 
-Install the SRE bot first. This creates the platform on its fake model default,
-installs the observability stack and Kubernetes identity, binds the approval
-route, and deploys the bundle. The workspace repository stays allowlisted for
-both selection and publication.
+Enter the model credential without echoing it, then install the SRE bot. The
+installer records the credential in the release, opens egress to the provider
+its prefix names, installs the observability stack and Kubernetes identity,
+binds the approval route, and deploys the bundle. The workspace repository
+stays allowlisted for both selection and publication.
 
 ```bash
+read -rsp 'Model credential: ' CURIE_CREDENTIALS
+printf '\n'
+export CURIE_CREDENTIALS
 curie example sre-bot install --observability --dry-run \
   --workspace-repo acme-corp/acme-bot \
   --slack-channel C0EXAMPLE1 --approvers U0EXAMPLE1
@@ -55,26 +59,13 @@ curie example sre-bot install --observability \
   --slack-channel C0EXAMPLE1 --approvers U0EXAMPLE1
 ```
 
-Next, enter the model credential without echoing it and run the normal cluster
-command. This records the credential in the release and replaces the temporary
-fake model configuration. Repeat the allowlist because it remains an explicit
-release value.
-
-```bash
-read -rsp 'Model credential: ' CURIE_CREDENTIALS
-printf '\n'
-export CURIE_CREDENTIALS
-curie cluster up --dry-run --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
-curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
-```
-
-The example installer is a fresh install command. If the selected release
-already records a model credential, it refuses before platform mutation because
-its declarative platform step would clear that credential and restore the fake
-model default. Manage an existing release with the normal cluster lifecycle.
+If the selected release already records a model credential and
+`CURIE_CREDENTIALS` is not exported, the installer refuses before platform
+mutation because its declarative platform step would clear that credential and
+restore the fake model default.
 
 Slack and the GitHub App are optional integrations. Export their values from a
-secure source, then connect them after `curie cluster up` succeeds. Do not put
+secure source, then connect them after the install succeeds. Do not put
 tokens or the private key directly on the command line.
 
 ```bash

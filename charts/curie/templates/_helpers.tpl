@@ -128,6 +128,11 @@ affinity:
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Resolve a store credential Secret, defaulting to the chart Secret. */}}
+{{- define "curie.storeSecretName" -}}
+{{- .store.existingSecret | default (include "curie.secretName" .root) -}}
+{{- end -}}
+
 {{/* Dedicated namespace for short-lived publication resources. */}}
 {{- define "curie.publicationNamespace" -}}
 {{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
@@ -481,7 +486,7 @@ http
 {{- if .Values.otelCollector.otlpAuthHeader -}}
 {{- include "curie.secretName" . -}}
 {{- else -}}
-{{- .Values.langfuse.existingSecret | default (include "curie.secretName" .) -}}
+{{- include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) -}}
 {{- end -}}
 {{- end -}}
 
@@ -517,6 +522,10 @@ http
 {{- fail (printf "otelCollector.%s references undefined exporter %q. Add it under otelCollector.extraExporters." $valueName $exporter) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- $eventsEnabled := .Values.otelCollector.kubernetesEvents.enabled -}}
+{{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
+{{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
 {{- end -}}
 {{- range $name, $config := .Values.otelCollector.extraExporters -}}
 {{- if hasKey $reservedExporterNames $name -}}
@@ -584,12 +593,29 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+{{- if $eventsEnabled }}
+  # Kubernetes Events for the release namespace (#2954), watched so each new
+  # or updated Event becomes one log record in the logs pipeline.
+  k8sobjects/events:
+    auth_type: serviceAccount
+    objects:
+      - name: events
+        group: events.k8s.io
+        mode: watch
+        namespaces: [{{ .Release.Namespace | quote }}]
+{{- end }}
 processors:
   memory_limiter:
     check_interval: {{ .Values.otelCollector.memoryLimiter.checkInterval }}
     limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
     spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
+  transform/runner_identity:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - 'set(attributes["service.instance.id"], resource.attributes["service.instance.id"]) where resource.attributes["service.name"] == "curie-runner"'
 exporters:
   otlphttp/langfuse:
     endpoint: {{ include "curie.langfuse.url" . }}/api/public/otel
@@ -639,12 +665,12 @@ service:
       processors: [memory_limiter, batch]
       exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
     logs:
-      receivers: [otlp]
+      receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]
       processors: [memory_limiter, batch]
       exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, transform/runner_identity, batch]
       exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
@@ -692,6 +718,13 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- if and (not (empty $protocol)) (not (or (eq $protocol "http/protobuf") (eq $protocol "grpc") (eq $protocol "http/json"))) -}}
 {{- fail "otelCollector.protocol must be grpc, http/protobuf, or http/json." -}}
 {{- end -}}
+{{- $temporality := "delta" -}}
+{{- if hasKey $otel "metricsTemporalityPreference" -}}
+{{- $temporality = get $otel "metricsTemporalityPreference" -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $temporality) (has $temporality (list "delta" "cumulative" "lowmemory"))) -}}
+{{- fail "otelCollector.metricsTemporalityPreference must be delta, cumulative, or lowmemory." -}}
+{{- end -}}
 {{- if and .Values.security.checkDefaultCredentials (not $otel.deploy) (not $otel.telemetryDisabled) (empty $otel.endpoint) -}}
 {{- fail "security.checkDefaultCredentials is on but neither a chart-managed collector nor otelCollector.endpoint is configured. Set otelCollector.endpoint to the external collector, keep otelCollector.deploy true, or set otelCollector.telemetryDisabled=true to acknowledge that telemetry is disabled." -}}
 {{- end -}}
@@ -706,13 +739,16 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- $hasEndpoint := false -}}
 {{- $hasProtocol := false -}}
 {{- $hasHeaders := false -}}
+{{- $hasMetricsTemporalityPreference := false -}}
 {{- range $extra -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" -}}{{- $hasEndpoint = true -}}{{- end -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" -}}{{- $hasProtocol = true -}}{{- end -}}
 {{- if eq .name "OTEL_EXPORTER_OTLP_HEADERS" -}}{{- $hasHeaders = true -}}{{- end -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE" -}}{{- $hasMetricsTemporalityPreference = true -}}{{- end -}}
 {{- end -}}
 {{- $endpoint := include "curie.otel.endpoint" .root | trim -}}
 {{- $protocol := .root.Values.otelCollector.protocol | default "http/protobuf" -}}
+{{- $temporality := .root.Values.otelCollector.metricsTemporalityPreference | default "delta" -}}
 {{- if and (not $hasEndpoint) (ne $endpoint "") }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ $endpoint | quote }}
@@ -720,6 +756,10 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- if and (not $hasProtocol) (ne $endpoint "") }}
 - name: OTEL_EXPORTER_OTLP_PROTOCOL
   value: {{ $protocol | quote }}
+{{- end }}
+{{- if and (not $hasMetricsTemporalityPreference) (ne $endpoint "") }}
+- name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+  value: {{ $temporality | quote }}
 {{- end }}
 {{- if and (not $hasHeaders) (not .root.Values.otelCollector.deploy) (not .root.Values.otelCollector.telemetryDisabled) (ne $endpoint "") }}
 {{- if not (empty .root.Values.otelCollector.headersExistingSecret) }}
@@ -773,7 +813,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
      (hence the general name) once its design pass lands. */}}
 {{- define "curie.checkDefaultCredentials" -}}
 {{- if .Values.security.checkDefaultCredentials -}}
-{{- if eq (.Values.langfuse.existingSecret | default (include "curie.secretName" .)) (include "curie.secretName" .) -}}
+{{- if eq (include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse)) (include "curie.secretName" .) -}}
 {{- if eq .Values.langfuse.init.projectSecretKey "sk-lf-curie-dev" -}}
 {{- fail "security.checkDefaultCredentials is on but langfuse.init.projectSecretKey is still the published dev default \"sk-lf-curie-dev\". Override it (or set langfuse.existingSecret) before installing on a shared/production cluster -- this key also feeds the OTel Collector auth header." -}}
 {{- end -}}
@@ -987,7 +1027,7 @@ before contacting Valkey.
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.postgres) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql+asyncpg://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "asyncpg") }}
@@ -1009,7 +1049,7 @@ before contacting Valkey.
 - name: VALKEY_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
       key: valkeyPassword
 - name: VALKEY_TLS
   value: {{ include "curie.valkey.tls" . | quote }}
@@ -1421,19 +1461,19 @@ livenessProbe:
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.postgres) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "prisma") }}
 - name: SALT
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
       key: langfuseSalt
 - name: ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse) }}
       key: langfuseEncryptionKey
 - name: TELEMETRY_ENABLED
   value: {{ .Values.langfuse.telemetryEnabled | quote }}
@@ -1464,7 +1504,7 @@ livenessProbe:
 - name: CLICKHOUSE_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.clickhouse.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.clickhouse) }}
       key: clickhousePassword
 - name: CLICKHOUSE_CLUSTER_ENABLED
   value: {{ .Values.clickhouse.clusterEnabled | quote }}
@@ -1475,7 +1515,7 @@ livenessProbe:
 - name: REDIS_AUTH
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
       key: valkeyPassword
 {{- /* Same helper as curie.env.valkey, so the two Langfuse Deployments and the
        first-party apps cannot disagree about the transport of the one store
@@ -1504,7 +1544,7 @@ livenessProbe:
 - name: LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
       key: rustfsSecretKey
 {{- end }}
 {{- /* Both endpoints go through curie.rustfs.endpoint, never a literal
@@ -1528,7 +1568,7 @@ livenessProbe:
 - name: LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
       key: rustfsSecretKey
 {{- end }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT
@@ -1818,6 +1858,17 @@ securityContext:
      never follows. */}}
 {{- define "curie.worker.upgradeDrain.timeout" -}}
 {{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
+{{- end -}}
+
+{{/* The drain Job may run for 120 seconds beyond its effective wait. */}}
+{{- define "curie.worker.upgradeDrain.jobDeadline" -}}
+{{- add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 120 -}}
+{{- end -}}
+
+{{/* The upgrade timeout covers the complete drain Job deadline, one worker
+     termination grace, and 60 seconds for scheduling and Helm operations. */}}
+{{- define "curie.worker.minimumHelmTimeoutSeconds" -}}
+{{- add (int64 (include "curie.worker.upgradeDrain.jobDeadline" .)) (int64 (include "curie.worker.terminationGrace" .)) 60 -}}
 {{- end -}}
 
 {{/* The roll hold: min(quiesceTtlSeconds, effective wait). */}}

@@ -13,16 +13,25 @@ import os
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from curie_worker.bundle_store import extract_bundle
-from curie_worker.sandbox import QuotaRejection
+from curie_worker.sandbox import (
+    AffinityStore,
+    ClaimView,
+    QuotaRejection,
+    SandboxSubstrate,
+    SandboxView,
+    SubstrateConfig,
+)
 from curie_worker.sandbox.docker import (
     RUNNER_CONTAINER_PORT,
     DockerError,
     DockerSandboxClient,
     RunnerHardening,
 )
+from curie_worker.sandbox.types import RouteState
 
 from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker
 
@@ -163,6 +172,63 @@ def test_create_claim_preserves_declared_connector_secret() -> None:
         entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
     }
     assert {"CURIE_CONNECTOR_SECRET_KEYS", "SLACK_BOT_TOKEN"} <= child_env_names
+
+
+def test_local_substrate_claims_runner_with_connector_secret_without_a_warm_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    pools: list[str] = []
+    original_create_claim = client.create_claim
+
+    def record_claim(
+        name: str,
+        *,
+        pool: str,
+        env: dict[str, str] | None = None,
+        labels: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        pools.append(pool)
+        original_create_claim(name, pool=pool, env=env, labels=labels, **kwargs)
+
+    monkeypatch.setattr(client, "create_claim", record_claim)
+    monkeypatch.setattr(
+        client,
+        "get_claim",
+        lambda name, *, request_timeout_seconds: ClaimView(
+            name, True, name, datetime.now(UTC), None, None, None
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "get_sandbox",
+        lambda name, *, request_timeout_seconds: SandboxView(
+            name, True, "127.0.0.1", "Running", 8080
+        ),
+    )
+    substrate = SandboxSubstrate(
+        client,
+        cast(AffinityStore, object()),
+        SubstrateConfig(namespace="default", warm_pool="curie-runner-pool"),
+    )
+    env = {
+        "CURIE_CONNECTOR_SECRET_KEYS": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN": "placeholder",
+    }
+
+    handle = substrate._claim_fresh(
+        "local-connector",
+        env=env,
+        state=RouteState.LIVE,
+        agent_name="sre-bot",
+        publish=False,
+    )
+
+    assert handle.sandbox_name == handle.claim_name
+    assert pools == ["curie-runner-pool"]
+    child_env = _flag_values(client.calls[0], "-e")
+    assert "GRAFANA_SERVICE_ACCOUNT_TOKEN=placeholder" in child_env
 
 
 def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential() -> None:

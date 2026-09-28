@@ -757,6 +757,7 @@ def test_targetless_run_under_a_lost_lease_writes_no_done_marker(
                 h.config.consumer_group,
                 entry_id,
                 owner=lease.owner,
+                resume_event_id=None,
             )
             lease.lost.set()
             h.runner.default_script = [Final(text="done", status=SessionStatus.DONE)]

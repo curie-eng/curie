@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 
@@ -75,7 +75,7 @@ rpassword = "7.5.4"
 # `PluginManifest` field in Rust. Default features pull reqwest + a second TLS
 # stack for remote `$ref` resolution neither use case needs; the committed
 # schemas are self-contained, so keep it lean.
-jsonschema = { version = "0.56", default-features = false }
+jsonschema = { version = "0.57", default-features = false }
 serde_norway = "0.9.42"
 crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"

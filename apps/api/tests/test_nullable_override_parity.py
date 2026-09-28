@@ -77,6 +77,7 @@ BLANKS = ("", "   ")
 KNOWN_BODY_MODULES = frozenset(
     {
         "curie_api.factory_progress",
+        "curie_api.factory_usage",
         "curie_api.schemas",
         "aci_protocol.turn",
         "aci_protocol.wire",

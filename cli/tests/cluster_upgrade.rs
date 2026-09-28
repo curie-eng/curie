@@ -145,6 +145,75 @@ async fn same_version_rerun_is_idempotent_and_still_proves_canary() {
     );
 }
 
+// #2861: a same-version rerun runs no drain preflight, checkpoint, migrate or
+// Helm upgrade. The persisted record and the plan must say so instead of
+// listing those phases as completed.
+#[tokio::test]
+async fn same_version_rerun_records_skipped_phases_not_completed_ones() {
+    let mut host = FakeUpgradeHost::installed("0.9.0").with_known_good("0.9.0");
+    let out = run_lifecycle(opts("0.9.0"), &mut host)
+        .await
+        .expect("same-version rerun");
+    let record: serde_json::Value =
+        serde_json::from_str(&host.persisted_json()).expect("persisted record");
+    assert_eq!(
+        record["completed"],
+        serde_json::json!(["plan", "validate", "converge", "canary", "commit"]),
+        "only phases that executed are completed: {record}"
+    );
+    assert_eq!(
+        record["skipped"],
+        serde_json::json!(["drain_preflight", "checkpoint", "migrate", "apply"]),
+        "{record}"
+    );
+    let json = output_json(&out);
+    let plan: Vec<String> = serde_json::from_value(json["plan"].clone()).unwrap();
+    assert!(
+        plan.iter().any(|l| l.contains("0.9.0 is already installed")
+            && l.contains("no helm upgrade runs")),
+        "the plan must say the apply is skipped: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|l| l.starts_with("helm upgrade")
+            || l.starts_with("phase drain_preflight:")
+            || l.starts_with("phase checkpoint:")
+            || l.starts_with("phase migrate:")),
+        "a skipped apply must not be planned as a helm upgrade: {plan:?}"
+    );
+}
+
+// A fresh install has nothing in flight, so DrainPreflight is skipped, not run.
+// An interrupted install must still not replay it on resume.
+#[tokio::test]
+async fn fresh_install_records_drain_preflight_as_skipped_across_resume() {
+    let mut host = FakeUpgradeHost::empty().interrupt_after(UpgradePhase::Apply);
+    run_lifecycle(opts("0.9.0"), &mut host)
+        .await
+        .expect_err("interrupted");
+    host.clear_interrupt();
+    run_lifecycle(opts("0.9.0"), &mut host)
+        .await
+        .expect("resume");
+    let record: serde_json::Value =
+        serde_json::from_str(&host.persisted_json()).expect("persisted record");
+    assert_eq!(
+        record["skipped"],
+        serde_json::json!(["drain_preflight"]),
+        "{record}"
+    );
+    assert!(
+        !record["completed"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("drain_preflight")),
+        "{record}"
+    );
+    assert_eq!(
+        host.drain_calls, 0,
+        "resume must not replay a skipped preflight"
+    );
+}
+
 // Schema refusal at Validate must not begin mutation. `--forward-only` is a
 // clap/LiveHost flag; FakeUpgradeHost keeps a boolean `refuse_schema`.
 // The live binary tests in `cluster_upgrade_live.rs` own that AC:
@@ -450,4 +519,89 @@ async fn dry_run_apply_line_carries_install_and_retained_values_only_when_passed
         line,
         "helm upgrade curie charts/curie -n curie --wait --timeout 15m"
     );
+}
+
+/// #3218: an upgrade that changes the platform runner names every layered
+/// agent before it upgrades and clears each one's runner image in the same
+/// `helm upgrade`, after the retained values so the clear wins.
+#[tokio::test]
+async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
+    let mut host = FakeUpgradeHost::installed("0.10.0")
+        .with_retained_values()
+        .with_runner_layer_clears(&["factory", "sre-bot"]);
+    let out = run_lifecycle(dry_opts("0.11.0"), &mut host)
+        .await
+        .expect("dry-run plan");
+    let ClusterUpgradeOutput::DryRun(plan) = &out else {
+        panic!("dry-run must not mutate: {out:?}");
+    };
+    let apply = plan
+        .lines
+        .iter()
+        .find(|l| l.starts_with("helm upgrade "))
+        .expect("plan has an apply line");
+    assert_eq!(
+        apply,
+        "helm upgrade curie charts/curie -n curie --wait --timeout 15m -f <retained-values> \
+         --set agentSandbox.runnerImages.factory=null --set agentSandbox.runnerImages.sre-bot=null"
+    );
+    let notice = plan
+        .lines
+        .iter()
+        .find(|l| l.starts_with("runner layers:"))
+        .expect("plan names the stale runner layers");
+    assert!(notice.contains("factory, sre-bot"), "{notice}");
+    assert!(notice.contains("WITHOUT their layer"), "{notice}");
+    assert!(notice.contains("curie build --plugin-dir"), "{notice}");
+    // #3422: the plan retires each cleared agent's claims right after Apply.
+    let apply_at = plan.lines.iter().position(|l| l == apply).unwrap();
+    assert_eq!(
+        &plan.lines[apply_at + 1..apply_at + 3],
+        &[
+            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=factory --wait=true --ignore-not-found=true",
+            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=sre-bot --wait=true --ignore-not-found=true",
+        ]
+    );
+    assert!(
+        notice.contains("Their live sandboxes are retired"),
+        "{notice}"
+    );
+    let json = output_json(&out).to_string();
+    assert!(
+        json.contains("agentSandbox.runnerImages.sre-bot=null"),
+        "{json}"
+    );
+    assert_eq!(host.mutate_calls, 0);
+
+    let mut untouched = FakeUpgradeHost::installed("0.10.0").with_retained_values();
+    let ClusterUpgradeOutput::DryRun(plan) = run_lifecycle(dry_opts("0.11.0"), &mut untouched)
+        .await
+        .unwrap()
+    else {
+        panic!("dry-run must not mutate");
+    };
+    assert!(plan.lines.iter().all(|l| !l.contains("runnerImages")
+        && !l.starts_with("runner layers:")
+        && !l.contains("sandboxclaim")));
+}
+
+/// #3422: a real upgrade that clears layered agents' runner images retires
+/// their SandboxClaims after Apply, so live threads leave the old layer the
+/// way `cluster deploy` makes them (#3300). An upgrade clearing nothing
+/// retires nothing.
+#[tokio::test]
+async fn upgrade_retires_claims_of_every_cleared_runner_layer_after_apply() {
+    let mut host =
+        FakeUpgradeHost::installed("0.10.0").with_runner_layer_clears(&["factory", "sre-bot"]);
+    let out = run_lifecycle(opts("0.11.0"), &mut host)
+        .await
+        .expect("upgrade");
+    assert_eq!(output_json(&out)["status"], "succeeded", "{out:?}");
+    assert_eq!(host.retired_claims, vec!["factory", "sre-bot"]);
+
+    let mut plain = FakeUpgradeHost::installed("0.10.0");
+    run_lifecycle(opts("0.11.0"), &mut plain)
+        .await
+        .expect("upgrade");
+    assert!(plain.retired_claims.is_empty());
 }

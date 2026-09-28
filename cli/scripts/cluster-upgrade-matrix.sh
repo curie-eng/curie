@@ -75,7 +75,7 @@ SCENARIOS_ALL=(
     fail-every-phase
     interrupt-resume
     n-to-n1
-    compatible-rollback
+    guarded-rollback
     rollback-published-088
     rollback-published-089
     migration-crash
@@ -107,7 +107,7 @@ s05 setup fail-every-phase:canary
 s06 setup fail-every-phase:commit
 s07 setup interrupt-resume:checkpoint+migrate
 s08 setup interrupt-resume:apply+commit
-s09 setup n-to-n1 compatible-rollback
+s09 setup n-to-n1 guarded-rollback
 s10 setup rollback-published-088
 s11 nosetup rollback-published-089
 s12 nosetup migration-crash
@@ -124,7 +124,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|compatible-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -432,10 +432,10 @@ run_self_test() {
         log "self-test: exclusive_kind_tag must untag siblings before and after kind load"
         failed=1
     fi
-    if awk '/^run_compatible_rollback\(\)/,/^}/' "$script_path" | grep -q 'exclusive_kind_tag "0.10.0"'; then
-        log "compatible rollback reloads exclusive 0.10.0 images"
+    if awk '/^run_guarded_rollback\(\)/,/^}/' "$script_path" | grep -q 'exclusive_kind_tag "0.10.0"'; then
+        log "guarded rollback reloads exclusive 0.10.0 images"
     else
-        log "self-test: compatible rollback must exclusive_kind_tag 0.10.0 before helm rollback"
+        log "self-test: guarded rollback must exclusive_kind_tag 0.10.0 before helm rollback"
         failed=1
     fi
     if awk '/^run_rollback_published_088\(\)/,/^}/' "$script_path" | grep -q 'load_tag_images "0.8.8"'; then
@@ -444,10 +444,10 @@ run_self_test() {
         log "self-test: rollback-published-088 must load 0.8.8 images before helm rollback"
         failed=1
     fi
-    if awk '/^run_rollback_published_089\(\)/,/^}/' "$script_path" | grep -q 'run_compatible_rollback'; then
-        log "published 0.8.9 refusal keeps the compatible rollback proof in one scenario"
+    if awk '/^run_rollback_published_089\(\)/,/^}/' "$script_path" | grep -q 'run_guarded_rollback'; then
+        log "published 0.8.9 refusal keeps the guarded rollback proof in one scenario"
     else
-        log "self-test: rollback-published-089 must run the compatible rollback proof"
+        log "self-test: rollback-published-089 must run the guarded rollback proof"
         failed=1
     fi
     if awk '/^run_migration_crash\(\)/,/^}/' "$script_path" | awk '
@@ -1342,25 +1342,30 @@ run_n_to_n1() {
     log "n-to-n1 helm version 0.10.1"
 }
 
-run_compatible_rollback() {
+run_guarded_rollback() {
     local status=0
     # n-to-n1 left exclusive 0.10.1 on the node. Rollback to 0.10.0 cannot
     # pull that tag with pullPolicy Never.
     exclusive_kind_tag "0.10.0"
     set +e
     "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
-        >"$EVIDENCE_DIR/compatible-rollback.json" 2>"$EVIDENCE_DIR/compatible-rollback.err"
+        >"$EVIDENCE_DIR/guarded-rollback.json" 2>"$EVIDENCE_DIR/guarded-rollback.err"
     status=$?
     set -e
-    (( status == 0 )) || die "compatible rollback exited $status"
-    wait_rollout || die "compatible rollback rollout timed out (helm $(helm_version))"
-    [[ "$(helm_version)" == "0.10.0" ]] || die "compatible rollback helm version is $(helm_version) not 0.10.0"
+    (( status != 0 )) || die "rollback to 0.10.0 unexpectedly succeeded at schema $TARGET_HEAD"
+    local err
+    err="$(cat "$EVIDENCE_DIR/guarded-rollback.json" "$EVIDENCE_DIR/guarded-rollback.err" 2>/dev/null || true)"
+    echo "$err" | grep -F "outside its declared schema range" >/dev/null \
+        || die "rollback refusal did not identify the schema range: $err"
+    echo "$err" | grep -F "$TARGET_HEAD" >/dev/null \
+        || die "rollback refusal did not name live schema head $TARGET_HEAD: $err"
+    [[ "$(helm_version)" == "0.10.1" ]] || die "refused rollback changed helm version to $(helm_version)"
     kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
-        || die "api not Ready after compatible rollback"
-    api_health >/dev/null || die "api health failed after compatible rollback"
+        || die "api not Ready after refused rollback"
+    api_health >/dev/null || die "api health failed after refused rollback"
     assert_sentinel
-    assert_alembic "$SUPPORTED_ROLLBACK_HEAD"
-    log "compatible rollback previous version 0.10.0 serves"
+    assert_alembic "$TARGET_HEAD"
+    log "rollback to 0.10.0 refused at schema $TARGET_HEAD; 0.10.1 serves"
 }
 
 helm_history_088() {
@@ -1466,8 +1471,8 @@ run_rollback_published_089() {
         || die "rollback-089 refusal did not name 0.8.9: $err"
     echo "$err" | grep -F "$PUBLISHED_HEAD" >/dev/null \
         || die "rollback-089 refusal did not name published head $PUBLISHED_HEAD: $err"
-    echo "$err" | grep -F "$SUPPORTED_ROLLBACK_HEAD" >/dev/null \
-        || die "rollback-089 refusal did not name supported head $SUPPORTED_ROLLBACK_HEAD: $err"
+    echo "$err" | grep -F "$TARGET_HEAD" >/dev/null \
+        || die "rollback-089 refusal did not name live head $TARGET_HEAD: $err"
     echo "$err" | grep -F "outside its declared schema range" >/dev/null \
         || die "rollback-089 refusal did not name the declared schema range: $err"
     if echo "$err" | grep -F "could not establish" >/dev/null; then
@@ -1484,11 +1489,11 @@ run_rollback_published_089() {
 
     local advance=0
     cluster_upgrade "0.10.1" "$CHART_0101" || advance=$?
-    record_upgrade_json "rollback-089-compatible-setup"
-    [[ "$advance" -eq 0 ]] || die "rollback-089 compatible setup exited $advance"
+    record_upgrade_json "rollback-089-guarded-setup"
+    [[ "$advance" -eq 0 ]] || die "rollback-089 guarded setup exited $advance"
     wait_rollout
-    [[ "$(helm_version)" == "0.10.1" ]] || die "rollback-089 compatible setup did not reach 0.10.1"
-    run_compatible_rollback
+    [[ "$(helm_version)" == "0.10.1" ]] || die "rollback-089 guarded setup did not reach 0.10.1"
+    run_guarded_rollback
 }
 
 schema_migrate_busy() {
@@ -1746,7 +1751,7 @@ scenario_fn() {
         fail-every-phase) echo run_fail_every_phase ;;
         interrupt-resume) echo run_interrupt_resume ;;
         n-to-n1) echo run_n_to_n1 ;;
-        compatible-rollback) echo run_compatible_rollback ;;
+        guarded-rollback) echo run_guarded_rollback ;;
         rollback-published-088) echo run_rollback_published_088 ;;
         rollback-published-089) echo run_rollback_published_089 ;;
         migration-crash) echo run_migration_crash ;;

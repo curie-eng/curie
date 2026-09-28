@@ -35,6 +35,7 @@ from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.markers import CompletionRecord, Markers
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient
@@ -130,9 +131,14 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
     # The adapter would have sent the email and the turn would then run again.
     # Mutation: move the emit into the ``finally`` and all four fail.
     async def go() -> None:
-        async with make_harness(shimmer=False) as h:
+        async with make_harness(shimmer=False, reclaim_min_idle_ms=5000) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             if layer == "sink":
@@ -148,9 +154,7 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
                 async def db_boom(*_a: object, **_k: object) -> object:
                     raise RuntimeError("database layer failure")
 
-                monkeypatch.setattr(
-                    Markers, "mark_done", db_boom
-                )
+                monkeypatch.setattr(Markers, "settle_fenced", db_boom)
             else:
 
                 async def cancelled(*_a: object, **_k: object) -> object:
@@ -308,7 +312,12 @@ def test_the_startup_sweep_delivers_a_record_whose_entry_was_already_acked(
             await Markers(h.async_redis, h.config).mark_completion_pending(
                 "c1", _record("c1", thread="tC", done=True)
             )
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
             await consumer.ensure_group()
 
             task = asyncio.create_task(consumer.run())
@@ -674,7 +683,8 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             )
             assert (
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner
+                    h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner,
+                    resume_event_id=None,
                 )
                 is True
             )

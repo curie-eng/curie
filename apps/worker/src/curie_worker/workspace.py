@@ -176,6 +176,26 @@ class WorkspaceSelectionRefused(WorkspacePreparationError):
         super().__init__("repository-selection", detail)
 
 
+class WorkspaceRepositoryNotAllowed(WorkspaceSelectionRefused):
+    """The API refused the named repository against the installation allowlist."""
+
+
+class RepoFact(str):
+    """A repository full name plus where it came from (#2947).
+
+    ``bare`` is True when the name was inferred from an ``owner/repo`` token
+    rather than parsed from a github.com URL. A bare token is a guess, so the
+    allowlist decides whether it named a repository at all.
+    """
+
+    bare: bool
+
+    def __new__(cls, full_name: str, *, bare: bool) -> RepoFact:
+        fact = super().__new__(cls, full_name)
+        fact.bare = bare
+        return fact
+
+
 class _OwnershipWriteUncertain(WorkspacePreparationError):
     """A ledger write may have committed but could not be read back safely."""
 
@@ -247,7 +267,7 @@ class WorkspaceCredential:
             raise ValueError("workspace authorization header contains control characters")
 
 
-def parse_github_repo_fact(message: str) -> str | None:
+def parse_github_repo_fact(message: str) -> RepoFact | None:
     """Extract one canonical GitHub repository from trusted turn text."""
 
     repositories: dict[str, str] = {}
@@ -311,7 +331,7 @@ def parse_github_repo_fact(message: str) -> str | None:
     if repositories:
         # A URL wins outright. A bare token beside one is noise next to a plain
         # statement, so it neither competes with it nor refuses.
-        return next(iter(repositories.values()))
+        return RepoFact(next(iter(repositories.values())), bare=False)
     # AMBIGUOUS MEANS ABSENT, NEVER REFUSED (#2767). A bare owner/repo is a
     # guess: `P/L`, `24/7`, `him/her` and `headlines/taglines` all match, and so
     # does every media type, `application/pdf` and `image/png` included. One
@@ -328,12 +348,12 @@ def parse_github_repo_fact(message: str) -> str | None:
     # they much more often are, ordinary prose, and this message names no
     # repository. Two URLs still refuse -- a sender who writes two github.com
     # URLs has plainly named two repositories.
-    if len(bare_repositories) > 1:
+    if len(bare_repositories) != 1:
         return None
-    return next(iter(bare_repositories.values()), None)
+    return RepoFact(next(iter(bare_repositories.values())), bare=True)
 
 
-def trusted_repository_fact(message: str, *, ignore_message: bool) -> str | None:
+def trusted_repository_fact(message: str, *, ignore_message: bool) -> RepoFact | None:
     """Repository facts for workspace selection.
 
     Job payloads (webhook/cron), verified-review bodies, and approval resume
@@ -447,7 +467,7 @@ class WorkspaceCredentialClient:
                 "repository-selection", "worker could not reach the internal workspace API"
             ) from exc
         if response.status == 403:
-            raise WorkspaceSelectionRefused(
+            raise WorkspaceRepositoryNotAllowed(
                 "That repository is not in api.githubRepoAllowlist for this installation; "
                 "allow `owner/repo` or `owner/*` in the chart values."
             )

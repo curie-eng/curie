@@ -101,6 +101,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
         "CURIE_BOOTING_TEXT",
+        # Read by the worker capacity wait store, which bounds how long a
+        # queued chat turn may wait. It is never sent to a sandbox.
+        "CURIE_CAPACITY_WAIT_BUDGET_S",
         "CURIE_CONSUMER_GROUP",
         "CURIE_CONSUMER_CAPABILITY_TTL_MS",
         "CURIE_CONSUMER_HEARTBEAT_TTL_MS",
@@ -264,14 +267,18 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
         # Cron scheduler tick (#268), read by the worker process only.
         "CURIE_CRON_TICK_INTERVAL_S",
+        # Cron hook run claim lease (#2931), read by the worker process only.
+        "CURIE_HOOK_CLAIM_LEASE_S",
         # WorkItem orphan sweep cadence (#3076), read by the worker process only.
         "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
         "CURIE_WARM_POOL",
-        # Agents with a registry-egress per-agent pool (#3083), substrate only.
+        # Agents with a per-agent pool (#3083, #2943), substrate only.
         "CURIE_AGENT_SANDBOX_POOLS",
+        # Agents whose per-agent pool carries connector secrets (#2943), substrate only.
+        "CURIE_AGENT_CONNECTOR_SECRET_POOLS",
         # The runner-facing API base (#678): WorkerConfig reads it from the
         # WORKER's env to MINT CURIE_MEMORY_REF/CURIE_HISTORY_REF (which ARE
         # declared boot keys, rendered from the declaration). It is a worker-side
@@ -294,6 +301,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the ambient ones by name. Renaming a BootEnv key cannot move these.
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        # The Claude SDK consumes this background model setting for session
+        # titles. The runner passes it to the SDK, outside the BootEnv contract.
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         # PR #663 operator-tunable Docker runner hardening knobs; the docker
         # substrate reads these from its OWN env, never injected into the runner
         # boot contract.

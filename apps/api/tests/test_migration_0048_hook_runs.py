@@ -12,10 +12,9 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
-from curie_api.models import HookRun
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 BELOW = "0047"
@@ -73,28 +72,22 @@ def _insert_hook_run(
     slot_utc: datetime,
     outcome: str | None,
 ) -> None:
-    async def run() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            sessions = async_sessionmaker(engine, expire_on_commit=False)
-            async with sessions() as session:
-                session.add(
-                    HookRun(
-                        id=uuid.uuid4(),
-                        agent_id=agent_id,
-                        name="daily-digest",
-                        slot_utc=slot_utc,
-                        version_id=version_id,
-                        outcome=outcome,
-                        started_at=STARTED,
-                        ended_at=None,
-                    )
-                )
-                await session.commit()
-        finally:
-            await engine.dispose()
-
-    asyncio.run(run())
+    # Raw SQL, not the ORM model: the model tracks head, and later revisions
+    # add columns this revision does not have.
+    _sql(
+        "INSERT INTO curie.hook_runs "
+        "(id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at) "
+        "VALUES (:id, :agent_id, 'daily-digest', :slot, :version_id, :outcome, "
+        ":started, NULL)",
+        {
+            "id": uuid.uuid4(),
+            "agent_id": agent_id,
+            "slot": slot_utc,
+            "version_id": version_id,
+            "outcome": outcome,
+            "started": STARTED,
+        },
+    )
 
 
 def _hook_run_count() -> int:

@@ -3,6 +3,7 @@
 import hashlib
 import secrets
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -12,6 +13,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from .config import get_settings
 from .models import (
@@ -47,6 +49,7 @@ from .publication_policy import (
 )
 from .resumequeue import parse_resume_event_id
 from .schemas import (
+    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     ActionComplete,
     ActionRecord,
     AgentCreate,
@@ -144,19 +147,28 @@ async def _adopt_publication_replay(
         or approval.reply_channel != data.reply_channel
         or approval.reply_placeholder != data.reply_placeholder
         or approval.reply_endpoint != data.reply_endpoint
-        or approval.reply_adapter != data.reply_adapter
+        or route_identity(approval.reply_kind, approval.reply_adapter)
+        != route_identity(data.reply_kind, data.reply_adapter)
         or publication.deployment_id != data.deployment_id
         or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
         or publication.patch_bytes != patch
         or publication.changed_paths != data.changed_paths
+        or publication.observed_title_sha256
+        != (
+            hashlib.sha256(data.observed_title.encode()).hexdigest()
+            if data.observed_title is not None
+            else None
+        )
+        or publication.observed_body_sha256 != data.observed_body_sha256
         or publication.title != (data.title or data.summary)
         or publication.body != (data.body or "Approved platform publication.")
         or publication.reply_kind != data.reply_kind
         or publication.reply_channel != data.reply_channel
         or publication.reply_placeholder != data.reply_placeholder
         or publication.reply_endpoint != data.reply_endpoint
-        or publication.reply_adapter != data.reply_adapter
+        or route_identity(publication.reply_kind, publication.reply_adapter)
+        != route_identity(data.reply_kind, data.reply_adapter)
         or publication.lineage is None
         or publication.lineage.agent_id != deployment.agent_id
         or publication.lineage.conversation_id != workspace_conversation_id
@@ -1220,6 +1232,7 @@ async def create_publication(
     data: PublicationCreate,
     *,
     patch: bytes,
+    metadata_check: Callable[[], Awaitable[None]],
     traceparent: str | None = None,
 ) -> tuple[Publication, bool]:
     """Atomically create the durable approval and its private publication.
@@ -1233,6 +1246,12 @@ async def create_publication(
     if existing is not None:
         await session.refresh(existing, ["lineage"])
         return existing, False
+    await metadata_check()
+    if bool(patch) != bool(data.changed_paths):
+        raise PublicationLineageConflict(
+            "publication.invalid_snapshot",
+            "publication patch and changed paths must both be present or both be empty",
+        )
 
     workspace_conversation_id = (
         data.conversation_id
@@ -1267,6 +1286,11 @@ async def create_publication(
         repo_full_name=thread_workspace.repo_full_name,
         for_update=True,
     )
+    if not patch and (lineage is None or lineage.pr_number is None):
+        raise PublicationLineageConflict(
+            "publication.metadata_requires_pull",
+            "a metadata-only revision requires an existing pull request",
+        )
     reservation: PublicationReviewReservation | None = None
     if lineage is None:
         if data.review_origin_key is not None:
@@ -1284,10 +1308,8 @@ async def create_publication(
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if binding is not None and (
-            binding.endpoint != data.reply_endpoint
-            or route_identity(data.reply_kind, binding.adapter)
-            != route_identity(data.reply_kind, data.reply_adapter)
+        if binding is not None and not _binding_route_matches(
+            data, data.reply_kind, binding.endpoint, binding.adapter
         ):
             # Compared through `route_identity`, not the raw column (ADR-0168
             # decision 3): a Slack binding is stored with `adapter=None` and a
@@ -1390,14 +1412,9 @@ async def create_publication(
             if (
                 data.reply_kind != review_binding.kind
                 or data.reply_channel != review_binding.address
-                or data.reply_endpoint != review_binding.endpoint
-                # Through `route_identity`, not the raw column (ADR-0168
-                # decision 3): a stored `adapter=None` Slack binding and a
-                # wire-side `reply_adapter='default'` name the same identity,
-                # so comparing the raw columns would refuse a review revision
-                # replaying the exact route its own reservation was raised on.
-                or route_identity(data.reply_kind, data.reply_adapter)
-                != route_identity(review_binding.kind, review_binding.adapter)
+                or not _binding_route_matches(
+                    data, review_binding.kind, review_binding.endpoint, review_binding.adapter
+                )
                 or (data.reply_conversation_id or data.conversation_id)
                 != lineage.reply_conversation_id
             ):
@@ -1489,6 +1506,12 @@ async def create_publication(
         base_sha=data.base_sha,
         patch_bytes=patch,
         changed_paths=data.changed_paths,
+        observed_title_sha256=(
+            hashlib.sha256(data.observed_title.encode()).hexdigest()
+            if data.observed_title is not None
+            else None
+        ),
+        observed_body_sha256=data.observed_body_sha256,
         title=data.title or data.summary,
         body=data.body or "Approved platform publication.",
         reply_kind=data.reply_kind,
@@ -1500,12 +1523,6 @@ async def create_publication(
     if owned_request is not None:
         publication.execution_request_id = owned_request.id
     session.add(publication)
-    await _bind_running_work_item_lineage(
-        session,
-        agent_id=deployment.agent_id,
-        conversation_id=workspace_conversation_id,
-        lineage_id=lineage.id,
-    )
     if auto:
         session.add(
             ApprovalAuditEntry(
@@ -1547,38 +1564,69 @@ async def create_publication(
     return publication, True
 
 
+def _binding_route_matches(
+    data: PublicationCreate, kind: str, endpoint: str | None, adapter: str | None
+) -> bool:
+    """Whether a stored binding route is the one a publication's reply names.
+
+    The built-in cluster-message relay is not a configurable route: the channel
+    API reserves its adapter, so the binding it replies for is one with no
+    route of its own (#2789). Any configured route is compared through
+    `route_identity`, not the raw column (ADR-0168 decision 3): a stored
+    `adapter=None` Slack binding and a wire-side `reply_adapter='default'` name
+    the same identity.
+    """
+
+    if data.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+        return endpoint is None and adapter is None
+    return endpoint == data.reply_endpoint and route_identity(kind, adapter) == route_identity(
+        data.reply_kind, data.reply_adapter
+    )
+
+
 async def _bind_running_work_item_lineage(
     session: AsyncSession,
     *,
-    agent_id: uuid.UUID,
-    conversation_id: str,
-    lineage_id: uuid.UUID,
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    identity: VerifiedPublicationIdentity | None,
 ) -> None:
-    """Point the running factory request at this publication before commit.
+    """Bind only the running request that created the successful publication."""
 
-    The publication transaction already holds the work item. A conversation
-    with no running request is left alone.
-    """
-
+    if publication.execution_request_id is None:
+        return
+    request_owns_item = (
+        select(ExecutionRequest.id)
+        .where(
+            ExecutionRequest.id == publication.execution_request_id,
+            ExecutionRequest.work_item_id == WorkItem.id,
+            ExecutionRequest.status == "running",
+        )
+        .exists()
+    )
+    predicates: list[ColumnElement[bool]] = [
+        WorkItem.agent_id == lineage.agent_id,
+        WorkItem.conversation_id.in_(
+            await thread_key_forms(session, lineage.agent_id, lineage.conversation_id)
+        ),
+        func.lower(WorkItem.repo_full_name) == lineage.repo_full_name.casefold(),
+        WorkItem.cancelled_at.is_(None),
+        WorkItem.publication_lineage_id.is_(None),
+        request_owns_item,
+    ]
+    repository_id = identity.repository_id if identity is not None else lineage.github_repository_id
+    installation_id = (
+        identity.installation_id if identity is not None else lineage.github_installation_id
+    )
+    if repository_id is not None:
+        predicates.append(WorkItem.github_repository_id == repository_id)
+    if installation_id is not None:
+        predicates.append(WorkItem.github_installation_id == installation_id)
     await session.execute(
         update(WorkItem)
-        .where(
-            WorkItem.agent_id == agent_id,
-            WorkItem.conversation_id.in_(
-                await thread_key_forms(session, agent_id, conversation_id)
-            ),
-            WorkItem.cancelled_at.is_(None),
-            WorkItem.publication_lineage_id.is_(None),
-            select(ExecutionRequest.id)
-            .where(
-                ExecutionRequest.work_item_id == WorkItem.id,
-                ExecutionRequest.status == "running",
-                ExecutionRequest.execution_deadline > func.clock_timestamp(),
-            )
-            .exists(),
-        )
+        .where(*predicates)
         .values(
-            publication_lineage_id=lineage_id,
+            publication_lineage_id=lineage.id,
             version=WorkItem.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1921,6 +1969,12 @@ def publication_lineage_outcome_conflict(
             "publication.revision_not_approved",
             "publication revision must be approved before advancing its lineage",
         )
+    needs_metadata_timestamp = data.state == "open" and not publication.patch_bytes
+    if needs_metadata_timestamp != (data.metadata_updated_at is not None):
+        return PublicationLineageConflict(
+            "publication.metadata_timestamp_invalid",
+            "a GitHub update time is required only for metadata only success",
+        )
     return None
 
 
@@ -1945,6 +1999,13 @@ async def advance_publication_lineage(
         raise PublicationLineageConflict(
             "publication.lineage_absent",
             "publication has no thread pull request lineage",
+        )
+    if publication.execution_request_id is not None:
+        await session.scalar(
+            select(WorkItem.id)
+            .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
+            .where(ExecutionRequest.id == publication.execution_request_id)
+            .with_for_update(of=WorkItem)
         )
     lineage = await session.scalar(
         select(ThreadPublicationLineage)
@@ -2046,6 +2107,7 @@ async def advance_publication_lineage(
         "terminal_at": func.now(),
         "updated_at": func.now(),
         "result_url": data.pr_url,
+        "metadata_updated_at": data.metadata_updated_at,
         # Success replaces an earlier attempt's error, as the worker CAS did.
         "error": None,
     }
@@ -2069,6 +2131,13 @@ async def advance_publication_lineage(
         raise PublicationLineageConflict(
             "publication.lineage_stale",
             "publication revision changed before its lineage could advance",
+        )
+    if not terminal_state:
+        await _bind_running_work_item_lineage(
+            session,
+            publication=publication,
+            lineage=lineage,
+            identity=identity,
         )
     await session.commit()
     refreshed = await session.get(ThreadPublicationLineage, lineage.id)
@@ -2268,6 +2337,7 @@ async def create_approval(
         card_channel=data.card_channel,
         gate_kind=data.gate_kind,
         granted_tool=data.granted_tool,
+        granted_arguments=data.granted_arguments,
         expires_at=expires_at,
     )
     session.add(approval)

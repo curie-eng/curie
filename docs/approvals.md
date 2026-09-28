@@ -352,6 +352,13 @@ so a human knows where that authenticated card lives. A null or empty `card_chan
 from an older row or a direct API write that omitted the field; for that compatibility
 case, the requesting channel is the card location.
 
+A single operator does not need a second person to settle a card. An authenticated
+member of the approver set may approve their own request, including the person who
+asked. Terminal resolution still works only for an explicit `approvers.users`
+binding, because an operator principal carries no channel. If nobody resolves a
+worker-raised request, it expires after 24 hours and the paused session wakes on
+the timeout branch instead of staying pending.
+
 ## Operational guarantees
 
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
@@ -361,10 +368,14 @@ case, the requesting channel is the card location.
   ([ADR-0003](adr/0003-stateless-first-rehydrate-on-resume.md)). Resume cold-creates a
   fresh one and rehydrates from history. Never design a feature that needs in-process
   state to survive a pause.
-- **Unresolved approvals expire.** A sweeper settles records nobody answered and wakes
-  the session down its timeout branch (`apps/api/src/curie_api/sweeper.py`), and a
-  reconciler re-drives resolutions whose resume turn never landed
-  (`apps/api/src/curie_api/resumereconciler.py`).
+- **Worker-raised approvals expire.** Session approvals the worker creates, and
+  publication approvals, carry a 24 hour deadline. The sweeper settles a lapsed
+  record and wakes the paused session down its timeout branch
+  (`apps/api/src/curie_api/sweeper.py`), and a reconciler re-drives resolutions
+  whose resume turn never landed (`apps/api/src/curie_api/resumereconciler.py`).
+  A direct API create that omits `expires_in_seconds` is still the wire's no-SLA
+  path and is not swept. Approvals created before this deadline existed keep a
+  null `expires_at` and are not swept; settle those by hand.
 - **Every attempt is audited.** `GET /approvals/{id}/audit` returns each resolution
   attempt with the authorizer, membership evidence, `principal_kind`, and
   `authenticated` proof state, including refusals. Historical rows remain

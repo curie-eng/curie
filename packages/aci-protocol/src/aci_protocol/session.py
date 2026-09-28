@@ -22,12 +22,15 @@ It is deliberately not an extension of SessionConfig -- see ADR-0049 and the
 class docstring.
 """
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
-from pydantic import Field
+from pydantic import Field, TypeAdapter
 
 from .events import _AciModel
+
+_JSON_OBJECT = TypeAdapter(dict[str, Any])
 
 
 class Budget(_AciModel):
@@ -346,11 +349,16 @@ class BootEnv(_AciModel):
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
     )
-    # One-shot post-approval allowance (#430, ADR-0035) and the authority-free
-    # turn-end reconciliation marker (#544). Both are the kernel resume overlay's:
-    # the binding never writes them, only the resume path does.
+    # One use grant after approval (#430, ADR-0035), canonical arguments of
+    # the denied call (#3255), and the authority free turn end reconciliation
+    # marker (#544). All are the kernel resume overlay's: the binding never
+    # writes them, only the resume path does. The arguments remain an object,
+    # including an empty object, and are never reconstructed from the summary.
     approval_grant_tool: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_GRANT_TOOL", "kernel")
+    )
+    approval_grant_arguments: dict[str, Any] | None = Field(
+        default=None, json_schema_extra=_env("CURIE_APPROVAL_GRANT_ARGUMENTS", "kernel")
     )
     approval_resumed_kind: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_RESUMED_KIND", "kernel")
@@ -426,11 +434,24 @@ class BootEnv(_AciModel):
     thinking: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_THINKING", "worker")
     )
+    # The active deployment's environment (``prod`` or ``dev``, #3166). The
+    # runner's telemetry maps it onto the ``deployment.environment.name``
+    # resource attribute, which Langfuse stores as the trace ``environment``
+    # that environment-filtered metrics query on. Unset, traces land in the
+    # backend's default environment, as before.
+    deployment_environment: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_DEPLOYMENT_ENVIRONMENT", "worker")
+    )
     # Which env var(s) carry the model credential (#514): a bare name or a JSON
     # array of them, walked in order. Unset, the runner falls back to
     # CURIE_CREDENTIALS, which is today's behavior.
     model_env_key: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MODEL_ENV_KEY", "worker")
+    )
+    # The chart sets this on runner sandboxes for push metrics exporters.
+    metrics_temporality_preference: str | None = Field(
+        default=None,
+        json_schema_extra=_env("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "substrate"),
     )
     # Operator-owned bounds, reachable through the chart's ``runner.extraEnv``
     # and docker ``-e``. No code producer emits them, and they hold no default
@@ -541,6 +562,7 @@ class BootEnv(_AciModel):
         base_url: str | None = None,
         api_backend: str | None = None,
         thinking: str | None = None,
+        deployment_environment: str | None = None,
         model_env_key: str | None = None,
         history_token: str | None = None,
         memory_token: str | None = None,
@@ -599,6 +621,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("api_backend")] = api_backend
         if thinking:
             env[cls.env_key("thinking")] = thinking
+        if deployment_environment:
+            env[cls.env_key("deployment_environment")] = deployment_environment
         if model_env_key:
             env[cls.env_key("model_env_key")] = model_env_key
         if model:
@@ -671,6 +695,13 @@ class BootEnv(_AciModel):
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
             env[self.env_key("approval_grant_tool")] = self.approval_grant_tool
+        if self.approval_grant_arguments is not None:
+            env[self.env_key("approval_grant_arguments")] = json.dumps(
+                self.approval_grant_arguments,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
         if self.approval_resumed_kind is not None:
             env[self.env_key("approval_resumed_kind")] = self.approval_resumed_kind
         if self.approval_decision is not None:
@@ -685,8 +716,14 @@ class BootEnv(_AciModel):
             env[self.env_key("api_backend")] = self.api_backend
         if self.thinking is not None:
             env[self.env_key("thinking")] = self.thinking
+        if self.deployment_environment is not None:
+            env[self.env_key("deployment_environment")] = self.deployment_environment
         if self.model_env_key is not None:
             env[self.env_key("model_env_key")] = self.model_env_key
+        if self.metrics_temporality_preference is not None:
+            env[self.env_key("metrics_temporality_preference")] = (
+                self.metrics_temporality_preference
+            )
         if self.max_turns is not None:
             env[self.env_key("max_turns")] = str(self.max_turns)
         if self.history_max_turns is not None:
@@ -726,6 +763,11 @@ class BootEnv(_AciModel):
             progress_token=_str_or_none(env.get("CURIE_PROGRESS_TOKEN")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
+            approval_grant_arguments=(
+                _JSON_OBJECT.validate_json(env["CURIE_APPROVAL_GRANT_ARGUMENTS"])
+                if "CURIE_APPROVAL_GRANT_ARGUMENTS" in env
+                else None
+            ),
             approval_resumed_kind=_stripped_or_none(env.get("CURIE_APPROVAL_RESUMED_KIND")),
             approval_decision=_stripped_or_none(env.get("CURIE_APPROVAL_DECISION")),
             connector_secret_keys=_list_or_none(env.get("CURIE_CONNECTOR_SECRET_KEYS")),
@@ -742,7 +784,11 @@ class BootEnv(_AciModel):
             # Empty is "not declared" here too: an unset or blank knob leaves the
             # runner sending no thinking configuration at all (ADR-0098).
             thinking=_str_or_none(env.get("CURIE_THINKING")),
+            deployment_environment=_str_or_none(env.get("CURIE_DEPLOYMENT_ENVIRONMENT")),
             model_env_key=_str_or_none(env.get("CURIE_MODEL_ENV_KEY")),
+            metrics_temporality_preference=_str_or_none(
+                env.get("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")
+            ),
             max_turns=_required_int(env.get("CURIE_MAX_TURNS")),
             history_max_turns=_tolerant_int(env.get("CURIE_HISTORY_MAX_TURNS")),
             history_max_bytes=_tolerant_int(env.get("CURIE_HISTORY_MAX_BYTES")),

@@ -118,6 +118,12 @@ def test_a_provider_cause_still_labels_a_provider_message() -> None:
     body = result_section("model_error", pr_url=None, detail="upstream 500")
     assert "Provider message: upstream 500\n" in body
     assert "Agent's last message" not in body
+
+
+def test_approval_create_failure_has_plain_terminal_issue_notice() -> None:
+    body = result_section("approval_create_failed", pr_url=None)
+    assert body.startswith("Could not complete: the requested approval could not be created.")
+    assert body.endswith("Cause: approval_create_failed\n")
     assert "```" not in body
 
 

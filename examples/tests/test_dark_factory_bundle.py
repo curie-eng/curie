@@ -53,12 +53,23 @@ def _skill_parts() -> tuple[dict, str]:
     return yaml.safe_load(match.group(1)) or {}, match.group(2)
 
 
+def _only_the_unbuilt_runner_layer(errors: list) -> bool:
+    """The shipped bundle's one intake error is its unbuilt runner layer (#3420).
+
+    Its stdio MCP servers live in the layer `curie build` builds and locks for
+    the operator's own registry, so the checkout carries no lock and intake
+    refuses it until that build runs. Anything else is a real defect."""
+
+    return [(e.code, e.message.split(":", 1)[0]) for e in errors] == [
+        ("connectors.lock_missing", "runner")
+    ]
+
+
 def test_bundle_validates() -> None:
     # The platform's deploy path validates with the enforcing contract; a
     # toolPolicy bundle is refused by the non-enforcing default.
     result = validate_bundle(BUNDLE, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
-    assert result.valid, result.errors
-    assert result.errors == []
+    assert _only_the_unbuilt_runner_layer(result.errors), result.errors
 
 
 def test_manifest_identity_secrets_and_policy() -> None:
@@ -221,6 +232,14 @@ def test_progress_declaration_lists_the_skill_phases_in_order() -> None:
     assert declared["loops"] == [
         {"start": "plan", "review": "plan_review", "cap": 3},
         {"start": "implement", "review": "review_diff", "cap": 3},
+        {"start": "implement", "review": "wait_ci", "cap": 3},
+    ]
+    assert declared["stages"] == [
+        {"id": "plan", "label": "Plan", "phases": ["read_issue", "pin_criteria", "plan"]},
+        {"id": "plan_review", "label": "Plan review", "phases": ["plan_review"]},
+        {"id": "implement", "label": "Implement", "phases": ["failing_test", "implement"]},
+        {"id": "review_diff", "label": "Review diff", "phases": ["review_diff", "publish"]},
+        {"id": "wait_ci", "label": "Wait for CI", "phases": ["wait_ci"]},
     ]
 
 

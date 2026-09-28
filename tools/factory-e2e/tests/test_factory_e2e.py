@@ -44,6 +44,8 @@ def _env(app: Path) -> dict[str, str]:
         "CURIE_FACTORY_KUBE_CONTEXT": "scratch",
         "CURIE_FACTORY_APP_DIR": str(app),
         "CURIE_FACTORY_ACTOR_TOKEN": "actor-token",
+        # The default bundle declares a runner layer and ships no lock (#3420).
+        "CURIE_FACTORY_LAYER_REGISTRY": "registry.example/factory",
     }
 
 
@@ -1333,7 +1335,9 @@ def test_helm_upgrade_reuses_values_so_the_agent_pool_survives() -> None:
         chart="/chart",
         namespace="ns",
         values_file="/values.json",
+        timeout="20m",
     )
+    assert argv[argv.index("--timeout") + 1] == "20m"
     assert "--reuse-values" in argv
     assert "--reset-values" not in argv
     assert fe.agent_warm_pool_name("curie", "factory-e2e") == (
@@ -2322,7 +2326,14 @@ def test_check_app_refuses_when_the_actor_is_the_operator(
     env = _env(_app_dir(tmp_path))
     env["CURIE_FACTORY_OPERATOR_LOGIN"] = "operator"
     preflight = _preflight(tmp_path, env)
-    monkeypatch.setattr(preflight, "as_app", lambda method, path, body=None: (200, {}))
+    monkeypatch.setattr(
+        preflight,
+        "as_app",
+        lambda method, path, body=None: (
+            200,
+            {"permissions": {"checks": "read", "statuses": "read"}},
+        ),
+    )
     login = {"value": "Operator"}
 
     def as_actor(method: str, path: str, body: Any = None) -> tuple[int, Any]:
@@ -2339,6 +2350,28 @@ def test_check_app_refuses_when_the_actor_is_the_operator(
     assert preflight.evidence["actor_login"] == "factory-tester"
 
 
+def test_check_app_names_a_missing_ci_permission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(_app_dir(tmp_path))
+    env["CURIE_FACTORY_OPERATOR_LOGIN"] = "operator"
+    preflight = _preflight(tmp_path, env)
+    monkeypatch.setattr(
+        preflight,
+        "as_app",
+        lambda method, path, body=None: (200, {"permissions": {"checks": "read"}}),
+    )
+
+    def as_actor(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        raise AssertionError("actor checks run only after CI permissions pass")
+
+    monkeypatch.setattr(preflight, "as_actor", as_actor)
+    with pytest.raises(fe.PreflightFailed, match="Commit statuses: read") as raised:
+        preflight.check_app()
+    message = str(raised.value)
+    assert "Checks: read" not in message.split("missing", 1)[1].split(".", 1)[0]
+    assert "Permissions and events" in message
+    assert "accept the permission update" in message
 
 
 def test_only_the_default_model_gets_a_context_window_by_default(tmp_path: Path) -> None:
@@ -2526,3 +2559,280 @@ def test_the_final_reply_falls_back_to_the_transcript_without_a_comment_block() 
     assert text is None
     assert calls and calls[0].endswith("/state/transcript")
     assert "404" in source
+
+
+# --- quiesce scenario (#3198) ---
+
+_QUIESCING_LINE = (
+    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00",'
+    '"revision":3,"ttl_seconds":28}'
+)
+
+
+def test_parse_claim_status_takes_the_last_status_line() -> None:
+    stdout = "log line\n" + '{"state":"claims_enabled"}\n' + "noise\n" + _QUIESCING_LINE + "\n"
+    parsed = fe.parse_claim_status(stdout)
+    assert parsed is not None
+    assert parsed["state"] == "quiescing"
+    assert parsed["ttl_seconds"] == 28
+    assert fe.parse_claim_status('{"state":"unknown"}')["state"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "garbage\nmore garbage", '{"state":"other"}', '[{"state":"quiescing"}]'],
+)
+def test_parse_claim_status_none_without_a_status_line(stdout: str) -> None:
+    assert fe.parse_claim_status(stdout) is None
+
+
+@pytest.mark.parametrize(
+    ("poll", "timeout", "expected"), [(5, 900, 30), (20, 900, 60), (5, 20, 20)]
+)
+def test_quiesce_lease_seconds(poll: float, timeout: float, expected: float) -> None:
+    assert fe.quiesce_lease_seconds(poll, timeout) == expected
+
+
+def test_paused_for_upgrade_line_matches_the_api_constant() -> None:
+    import ast
+
+    path = REPO_ROOT / "apps" / "api" / "src" / "curie_api" / "factory_notices.py"
+    tree = ast.parse(path.read_text())
+    value = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE"
+            for t in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+    assert value is not None
+    assert fe.PAUSED_FOR_UPGRADE_LINE == value
+
+
+def _app_comment(body: str) -> dict[str, Any]:
+    return {"user": {"login": "curie[bot]"}, "performed_via_github_app": None, "body": body}
+
+
+def test_paused_status_comment_finds_the_app_queued_notice() -> None:
+    line = fe.PAUSED_FOR_UPGRADE_LINE
+    good = _app_comment(f"Status: QUEUED\n{line}")
+    human = {
+        "user": {"login": "someone"},
+        "performed_via_github_app": None,
+        "body": f"Status: QUEUED\n{line}",
+    }
+    running = _app_comment(f"Status: RUNNING\n{line}")
+    no_line = _app_comment("Status: QUEUED\nwaiting")
+    kw = {"mention": "curie", "app_id": 42}
+    assert fe.paused_status_comment([human, running, no_line, good], **kw) == good
+    assert fe.paused_status_comment([running], **kw) is None
+    assert fe.paused_status_comment([human], **kw) is None
+    assert fe.paused_status_comment([no_line], **kw) is None
+
+
+def _passing_quiesce_obs() -> dict[str, Any]:
+    return {
+        "lease_seconds": 30.0,
+        "immediate_clear_seconds": 10.0,
+        "clear_slack_seconds": 10.0,
+        "helm_timeout_seconds": 60,
+        "seed_status_before": "running",
+        "baseline_state": "claims_enabled",
+        "path_a_quiescing_seen": True,
+        "path_a_helm_exit_code": 1,
+        "path_a_helm_elapsed_seconds": 70.0,
+        "path_a_after_cancel_state": "quiescing",
+        "path_a_after_cancel_ttl": 25,
+        "path_a_drain_job_active_after_cancel": True,
+        "doctor_worker_claims_line": "worker claims: quiescing, marker expires in 25s",
+        "paused_comment_found": True,
+        "queued_status_while_quiesced": "waiting",
+        "path_a_after_renewal_state": "quiescing",
+        "path_a_after_renewal_ttl": 28,
+        "path_a_clear_seconds": 25.0,
+        "path_a_kill_method": "sigkill",
+        "path_a_state_after_kill": "quiescing",
+        "queued_status_after_release": "running",
+        "path_b_quiescing_seen": True,
+        "path_b_clear_seconds": 3.0,
+        "path_b_terminated_logged": True,
+        "path_b_helm_exit_code": 143,
+        "final_state": "claims_enabled",
+    }
+
+
+def test_judge_quiesce_passes_a_good_run() -> None:
+    assert fe.judge_quiesce(_passing_quiesce_obs()) == []
+
+
+def test_judge_quiesce_empty_obs_fails_without_raising() -> None:
+    assert fe.judge_quiesce({})
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("seed_status_before", "waiting"),
+        ("baseline_state", "quiescing"),
+        ("path_a_quiescing_seen", False),
+        ("path_a_helm_exit_code", 0),
+        ("path_a_helm_exit_code", None),
+        ("path_a_helm_elapsed_seconds", 500),
+        ("path_a_after_cancel_state", "claims_enabled"),
+        ("path_a_after_cancel_ttl", 1800),
+        ("path_a_after_cancel_ttl", None),
+        ("path_a_drain_job_active_after_cancel", False),
+        ("doctor_worker_claims_line", "claims enabled"),
+        ("paused_comment_found", False),
+        ("queued_status_while_quiesced", "running"),
+        ("path_a_after_renewal_state", "claims_enabled"),
+        ("path_a_after_renewal_ttl", 1800),
+        ("path_a_clear_seconds", None),
+        ("path_a_clear_seconds", 90.0),
+        ("queued_status_after_release", "waiting"),
+        ("queued_status_after_release", "failed"),
+        ("path_a_kill_method", "sigkill failed"),
+        ("path_a_helm_forced_stop", True),
+        ("path_a_state_after_kill", "claims_enabled"),
+        ("path_b_quiescing_seen", False),
+        ("path_b_clear_seconds", 25.0),
+        ("path_b_clear_seconds", None),
+        ("path_b_terminated_logged", False),
+        ("final_state", "quiescing"),
+    ],
+)
+def test_judge_quiesce_flags_each_broken_observation(key: str, bad: Any) -> None:
+    obs = _passing_quiesce_obs()
+    obs[key] = bad
+    assert fe.judge_quiesce(obs), key
+
+
+def test_quiesce_is_a_registered_scenario() -> None:
+    assert "quiesce" in fe.SCENARIO_NAMES
+    assert callable(fe.resolve_scenario("quiesce"))
+
+
+def test_helm_upgrade_command_passes_the_timeout() -> None:
+    argv = fe.helm_upgrade_command(
+        context="k8",
+        release="curie",
+        chart="/chart",
+        namespace="ns",
+        values_file="/values.json",
+        timeout="60s",
+    )
+    i = argv.index("--timeout")
+    assert argv[i : i + 2] == ["--timeout", "60s"]
+
+
+def test_quiesce_refuses_without_a_model_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(_app_dir(tmp_path))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("CURIE_FACTORY_MODEL_API_KEY", raising=False)
+    monkeypatch.setattr(fe, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no run")))
+    monkeypatch.setattr(fe, "_resolve_candidate", lambda *a, **k: "c" * 40)
+
+    def refuse_run(self: Any, driver: Any) -> Any:
+        raise AssertionError("must refuse before the live preflight runs")
+
+    monkeypatch.setattr(fe.Preflight, "run", refuse_run)
+    assert fe.main(["run", "--scenario", "quiesce"]) == fe.EXIT_CONFIG
+
+
+def test_poll_until_clear_ignores_an_unknown_marker_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed marker read is not a clear; only claims_enabled ends the wait."""
+
+    reads = iter([{"state": "quiescing"}, {"state": "unknown"}, {"state": "claims_enabled"}])
+    seen: list[str] = []
+
+    def fake_status(_p: Any) -> dict[str, Any]:
+        status = next(reads)
+        seen.append(status["state"])
+        return status
+
+    monkeypatch.setattr(fe, "_claim_status", fake_status)
+    monkeypatch.setattr(fe.time, "sleep", lambda _s: None)
+    cleared = fe._poll_until_clear(object(), fe.time.time(), 60, 0.1)  # type: ignore[arg-type]
+    assert cleared is not None
+    assert seen == ["quiescing", "unknown", "claims_enabled"]
+
+
+def test_judge_quiesce_does_not_require_path_b_helm_to_fail() -> None:
+    """Helm rolls on once its hook Job is deleted; the clear is what path B proves."""
+
+    obs = _passing_quiesce_obs()
+    obs["path_b_helm_exit_code"] = 0
+    assert fe.judge_quiesce(obs) == []
+
+
+# --- #3420: the default bundle's runner layer is built before deploy ----------
+
+
+def test_default_bundle_declares_a_runner_layer() -> None:
+    assert fe.bundle_declares_runner_layer(fe.DEFAULT_BUNDLE)
+
+
+def test_bundle_without_connectors_declares_no_layer(tmp_path: Path) -> None:
+    assert not fe.bundle_declares_runner_layer(tmp_path)
+
+
+def test_unlocked_layer_without_a_registry_is_refused(tmp_path: Path) -> None:
+    env = _env(_app_dir(tmp_path))
+    del env["CURIE_FACTORY_LAYER_REGISTRY"]
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_LAYER_REGISTRY"):
+        fe.load_config(env, context=None, gh_token=_no_gh)
+
+
+def test_locked_layer_needs_no_registry(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    shutil.copytree(fe.DEFAULT_BUNDLE, bundle)
+    (bundle / "connectors.lock.yaml").write_text("version: 1\n")
+    env = _env(_app_dir(tmp_path))
+    del env["CURIE_FACTORY_LAYER_REGISTRY"]
+    env["CURIE_FACTORY_BUNDLE_DIR"] = str(bundle)
+    config = fe.load_config(env, context=None, gh_token=_no_gh)
+    assert config.layer_registry is None
+
+
+def test_layer_is_built_into_a_private_copy_on_the_candidate_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(fe.subprocess, "run", fake_run)
+    deployed = preflight.build_runner_layer(fe.DEFAULT_BUNDLE)
+    assert deployed != fe.DEFAULT_BUNDLE
+    assert (deployed / "connectors.yaml").is_file()
+    assert calls == [
+        [
+            "curie",
+            "build",
+            "--plugin-dir",
+            str(deployed),
+            "--registry",
+            "registry.example/factory",
+            "--runner-image",
+            f"ghcr.io/curie-eng/curie-runner:sha-{'c' * 40}",
+        ]
+    ]
+
+
+def test_failed_layer_build_fails_the_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _preflight(tmp_path)
+    monkeypatch.setattr(
+        fe.subprocess,
+        "run",
+        lambda argv, **_: subprocess.CompletedProcess(argv, 1, "", "push denied"),
+    )
+    with pytest.raises(fe.PreflightFailed, match="push denied"):
+        preflight.build_runner_layer(fe.DEFAULT_BUNDLE)

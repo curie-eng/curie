@@ -510,6 +510,94 @@ def test_rotating_the_generation_invalidates_the_old_secret(
     assert accepted.status_code == 200
 
 
+def test_operator_read_returns_the_current_secret_used_by_hook_ingress(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="readhookagent")
+
+    first = hooks_client.get(f"/agents/{agent_id}/hook-secret", headers=auth_headers)
+    second = hooks_client.get(f"/agents/{agent_id}/hook-secret", headers=auth_headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    secret = first.json()["secret"]
+    assert secret == second.json()["secret"] == _secret_for(agent_id)
+    assert "no-store" in first.headers["cache-control"].lower()
+
+    body = b'{"issue": 42}'
+    accepted = _post(hooks_client, agent_id, "issues", body, secret=secret)
+    assert accepted.status_code == 200, accepted.text
+    assert len(_queued(valkey, runs_stream)) == 1
+
+
+def test_operator_secret_read_requires_the_platform_api_key(
+    hooks_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="privatehookagent")
+    path = f"/agents/{agent_id}/hook-secret"
+
+    missing = hooks_client.get(path)
+    invalid = hooks_client.get(path, headers={"X-API-Key": "wrong-key"})
+
+    assert missing.status_code == 401, missing.text
+    assert invalid.status_code == 401, invalid.text
+    assert "secret" not in missing.text.lower()
+    assert "secret" not in invalid.text.lower()
+
+
+def test_operator_secret_read_refuses_an_unknown_agent(
+    hooks_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    unknown = hooks_client.get(f"/agents/{uuid.uuid4()}/hook-secret", headers=auth_headers)
+
+    assert unknown.status_code == 404, unknown.text
+    assert unknown.json()["detail"] == "agent not found"
+
+
+def test_operator_secret_read_tracks_rotation_and_ordinary_agent_reads_hide_it(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="rotatedreadagent")
+    path = f"/agents/{agent_id}/hook-secret"
+    first = hooks_client.get(path, headers=auth_headers)
+    assert first.status_code == 200, first.text
+    old = first.json()["secret"]
+
+    _bump_generation(agent_id)
+
+    rotated = hooks_client.get(path, headers=auth_headers)
+    assert rotated.status_code == 200, rotated.text
+    current = rotated.json()["secret"]
+    assert current != old
+    assert current == _secret_for(agent_id, generation=1)
+
+    body = b"{}"
+    refused = _post(hooks_client, agent_id, "issues", body, secret=old)
+    accepted = _post(hooks_client, agent_id, "issues", body, secret=current)
+    assert refused.status_code == 401, refused.text
+    assert accepted.status_code == 200, accepted.text
+    assert len(_queued(valkey, runs_stream)) == 1
+
+    ordinary_get = hooks_client.get(f"/agents/{agent_id}", headers=auth_headers)
+    ordinary_list = hooks_client.get("/agents", headers=auth_headers)
+    ordinary_patch = hooks_client.patch(
+        f"/agents/{agent_id}", json={"memory": True}, headers=auth_headers
+    )
+    for response in (ordinary_get, ordinary_list, ordinary_patch):
+        assert response.status_code == 200, response.text
+        assert old not in response.text
+        assert current not in response.text
+        assert '"hook_secret"' not in response.text
+
+
 def test_an_unknown_agent_answers_the_same_401_as_a_bad_signature(
     hooks_client: TestClient, clean_db: None
 ) -> None:

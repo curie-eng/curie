@@ -241,7 +241,7 @@ fn random_hex(n_bytes: usize) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("OS random number generator unavailable: {e}"))?;
     let mut out = String::with_capacity(n_bytes * 2);
     for b in buf {
-        let _ = write!(out, "{b:02x}");
+        write!(out, "{b:02x}").expect("writing to a String cannot fail");
     }
     Ok(out)
 }
@@ -1145,6 +1145,30 @@ const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
 /// `diff`'s reset reporting and the secret classifier read the one key.
 const SLACK_IDENTITIES_KEY: &str = "dispatcher.slack.identities";
 
+/// Secret and key *names* the SRE example installer records on
+/// `grafanaConnector`. None of these leaves holds a credential value: the
+/// token stays in the Kubernetes Secret those names point at.
+///
+/// A plain `cluster up` copies live operator values forward, then skips any
+/// key [`is_secret_value_key`] matches so a password cannot ride on argv.
+/// These names contain "secret", "key", "token", or "password", so that skip
+/// deleted `adminSecretName`, `secretName`, and `secretKey` from an sre-bot
+/// release and left every other `grafanaConnector` leaf in place (#2921).
+/// The same skip would drop `adminUserKey`, `adminPasswordKey`, and
+/// `tokenName` the moment an install records them.
+const GRAFANA_CONNECTOR_REFERENCE_KEYS: &[&str] = &[
+    "grafanaConnector.adminSecretName",
+    "grafanaConnector.adminUserKey",
+    "grafanaConnector.adminPasswordKey",
+    "grafanaConnector.tokenName",
+    "grafanaConnector.secretName",
+    "grafanaConnector.secretKey",
+];
+
+fn is_grafana_connector_reference_key(key: &str) -> bool {
+    GRAFANA_CONNECTOR_REFERENCE_KEYS.contains(&key)
+}
+
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
@@ -1415,6 +1439,33 @@ fn resolve_preserved_slack_trusted_origins_value(
     }
 }
 
+/// Carry recorded Grafana connector Secret and key names into a later plain
+/// `cluster up` (issue #2921).
+///
+/// The example installer writes them with `helm upgrade --reuse-values`. `up`
+/// is a full upgrade, and the live-value copy refuses secret-shaped key names,
+/// so a rerun that only changes the model dropped the three names the chart
+/// hook and the connector pods address. Re-supplied here, one leaf at a time,
+/// through `--set-string`: the values are names, not credentials, and an
+/// operator `--set` for one leaf still owns that leaf. Empty and absent
+/// records stay absent.
+fn resolve_preserved_grafana_connector_reference_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+    for key in GRAFANA_CONNECTOR_REFERENCE_KEYS {
+        if overridden.contains(*key) {
+            continue;
+        }
+        if let Some(value) = preserved_value(existing, key) {
+            opts.set_string
+                .push(format!("{key}={}", escape_helm_set_string_value(&value)));
+        }
+    }
+}
+
 fn resolve_preserved_runner_egress_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
@@ -1510,8 +1561,9 @@ fn is_retained_mail_key(key: &str) -> bool {
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
 /// [`resolve_preserved_runner_egress_values`],
-/// [`resolve_preserved_gvisor_mode_value`], and
-/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, plus the
+/// [`resolve_preserved_gvisor_mode_value`],
+/// [`resolve_preserved_slack_trusted_origins_value`], and
+/// [`resolve_preserved_grafana_connector_reference_values`] re-supply, plus the
 /// [`SLACK_IDENTITIES_KEY`] list the live-value overlay carries, which survive
 /// untouched.
 /// Reporting those as removals would be the exact
@@ -1540,6 +1592,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
         || key_is_or_descends_from(key, SLACK_IDENTITIES_KEY)
+        || is_grafana_connector_reference_key(key)
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1584,11 +1637,16 @@ pub fn is_secret_value_key(key: &str) -> bool {
     // Most preserve-on-up keys are credentials, but an inferred gVisor posture
     // is ordinary safety configuration and must remain visible in `curie diff`.
     // A Slack trusted-origin list (issue #1897) is the same shape: it is
-    // operator-visible dev configuration -- hostnames, not a token -- and
+    // operator-visible dev configuration, hostnames rather than a token, and
     // masking it would hide the very value the operator opens `curie diff` to
-    // confirm survived the upgrade. The Slack identity list is the same: its
+    // confirm survived the upgrade. Grafana connector reference names (#2921)
+    // are the same kind of configuration: Secret and data-key names, not the
+    // token those names point at. The Slack identity list is the same: its
     // names are configuration, and its Secret references are masked below by
     // their key names, exactly as before the family was preserved.
+    if is_grafana_connector_reference_key(key) {
+        return false;
+    }
     if (is_preserved_by_up(key)
         && key != GVISOR_MODE_KEY
         && key != SLACK_TRUSTED_ORIGINS_KEY
@@ -2191,6 +2249,7 @@ fn complete_up_opts_without_runner_egress(
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
+    resolve_preserved_grafana_connector_reference_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -2329,6 +2388,7 @@ fn overlay_family_is_managed(key: &str) -> bool {
         || key_is_or_descends_from(key, GVISOR_MODE_KEY)
         || key_is_or_descends_from(key, ALLOWED_EGRESS_KEY)
         || key_is_or_descends_from(key, SLACK_TRUSTED_ORIGINS_KEY)
+        || is_grafana_connector_reference_key(key)
         || key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY)
         || key_is_or_descends_from(key, "api.extraEnv")
         || key_is_or_descends_from(key, "dispatcher.extraEnv")
@@ -3671,7 +3731,11 @@ impl RunningInstall {
         let status = match status {
             Ok(status) => status,
             Err(error) => {
-                let _ = terminate_process(&mut self.child).await;
+                if let Err(cleanup_error) = terminate_process(&mut self.child).await {
+                    crate::ui::ui().plumbing(&format!(
+                        "failed to stop Helm after status error: {cleanup_error}"
+                    ));
+                }
                 return Err(error).with_context(|| {
                     format!("failed to invoke `{}`; is it on PATH?", self.program)
                 });
@@ -3693,11 +3757,32 @@ impl RunningInstall {
     }
 
     async fn terminate(mut self) {
-        let _ = terminate_helm_process(&mut self.child).await;
+        let termination = terminate_helm_process(&mut self.child).await;
         self.stdout.abort();
         self.stderr.abort();
-        let _ = self.stdout.await;
-        let _ = self.stderr.await;
+        match self.stdout.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                crate::ui::ui().plumbing(&format!("failed to read Helm stdout: {error}"));
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                crate::ui::ui().plumbing(&format!("failed to join Helm stdout reader: {error}"));
+            }
+        }
+        match self.stderr.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                crate::ui::ui().plumbing(&format!("failed to read Helm stderr: {error}"));
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                crate::ui::ui().plumbing(&format!("failed to join Helm stderr reader: {error}"));
+            }
+        }
+        if let Err(error) = termination {
+            crate::ui::ui().plumbing(&format!("failed to stop Helm: {error}"));
+        }
     }
 }
 
@@ -3858,8 +3943,19 @@ async fn terminate_process(child: &mut Child) -> std::io::Result<std::process::E
     if let Ok(Some(status)) = child.try_wait() {
         return Ok(status);
     }
-    let _ = child.start_kill();
-    child.wait().await
+    match child.start_kill() {
+        Ok(()) => child.wait().await,
+        Err(error) => match child.try_wait()? {
+            Some(status) => Ok(status),
+            None => Err(error),
+        },
+    }
+}
+
+async fn stop_gvisor_event_watch(watch: &mut RunningGvisorEventWatch) {
+    if let Err(error) = terminate_process(&mut watch.child).await {
+        crate::ui::ui().plumbing(&format!("failed to stop gVisor event watch: {error}"));
+    }
 }
 
 /// Give Helm its interrupt path so it can mark the release failed before a
@@ -3926,7 +4022,7 @@ async fn run_install_with_gvisor_observer(
         Ok(install) => install,
         Err(error) => {
             if let Some(GvisorEventWatchStart::Watching(watch)) = &mut watch_start {
-                let _ = terminate_process(&mut watch.child).await;
+                stop_gvisor_event_watch(watch).await;
             }
             step.fail("failed");
             return Err(error);
@@ -3998,7 +4094,7 @@ async fn run_install_with_gvisor_observer(
                                     GvisorEventWatchLine::Ignore => None,
                                 },
                                 Ok(None) | Err(_) => {
-                                    let _ = terminate_process(&mut running_watch.child).await;
+                                    stop_gvisor_event_watch(running_watch).await;
                                     Some(GvisorInstallRace::Helm(install.child.wait().await))
                                 }
                             }
@@ -4018,7 +4114,7 @@ async fn run_install_with_gvisor_observer(
     match race {
         GvisorInstallRace::Helm(status) => {
             if let Some(watch) = watch.as_mut() {
-                let _ = terminate_process(&mut watch.child).await;
+                stop_gvisor_event_watch(watch).await;
             }
             let captured = install.finish(status).await;
             match captured {
@@ -4034,7 +4130,7 @@ async fn run_install_with_gvisor_observer(
         }
         GvisorInstallRace::RuntimeClassRejected(rejection) => {
             if let Some(watch) = watch.as_mut() {
-                let _ = terminate_process(&mut watch.child).await;
+                stop_gvisor_event_watch(watch).await;
             }
             install.terminate().await;
             Ok(GvisorInstallOutcome::RuntimeClassRejected { rejection, step })
@@ -4088,8 +4184,7 @@ impl crate::ui::CliOutput for ClusterUpOutput {
 /// specific regression this function exists to make visible. `dry_run` is the
 /// only thing that skips the read, since `--dry-run` stays fully offline and
 /// never touches helm.
-fn should_read_existing(dev: bool, dry_run: bool) -> bool {
-    let _ = dev;
+fn should_read_existing(_dev: bool, dry_run: bool) -> bool {
     !dry_run
 }
 
@@ -4191,6 +4286,21 @@ enum UpInferencePolicy {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpInvocation {
+    ClusterUp,
+    Apply,
+}
+
+impl UpInvocation {
+    fn gvisor_fix(self) -> &'static str {
+        match self {
+            Self::ClusterUp => "curie cluster up --set security.gvisor.mode=off",
+            Self::Apply => "set `platform.gvisor: off` in `curie.yaml` and rerun `curie apply`",
+        }
+    }
+}
+
 pub async fn up(
     mut opts: UpOpts,
     github_token: Option<String>,
@@ -4244,6 +4354,7 @@ pub async fn up(
         existing,
         github_token.as_deref(),
         UpInferencePolicy::Detect(inferences),
+        UpInvocation::ClusterUp,
     )
     .await
 }
@@ -4264,6 +4375,7 @@ pub(crate) async fn up_prepared(
         existing,
         github_token.as_deref(),
         UpInferencePolicy::Disabled,
+        UpInvocation::Apply,
     )
     .await
 }
@@ -4274,6 +4386,7 @@ async fn run_prepared_up(
     existing: Option<serde_json::Value>,
     github_token: Option<&str>,
     inference_policy: UpInferencePolicy,
+    invocation: UpInvocation,
 ) -> Result<ClusterUpOutput> {
     // The single call site, and deliberately the first statement of the single
     // choke point both `up()` and `up_prepared()` funnel through: upstream of
@@ -4328,7 +4441,10 @@ async fn run_prepared_up(
             opts.common.dry_run,
         ) {
             SealingPrivateKeyDisposition::Generated => {
-                ui.note("generated a sealing private key for this release; later cluster up runs preserve it");
+                match invocation {
+                    UpInvocation::ClusterUp => ui.note("generated a sealing private key for this release; later cluster up runs preserve it"),
+                    UpInvocation::Apply => ui.note("generated a sealing private key for this release; later `curie apply` runs preserve it"),
+                }
             }
             SealingPrivateKeyDisposition::Deferred => {
                 ui.note("a live run discovers sealing state and preserves an existing private key or generates one when absent; skipped here to keep --dry-run offline");
@@ -4353,9 +4469,14 @@ async fn run_prepared_up(
                 })
                 .count();
             if generated_required_secrets > 0 {
-                ui.note(&format!(
-                    "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); re-running `cluster up` reuses them"
-                ));
+                match invocation {
+                    UpInvocation::ClusterUp => ui.note(&format!(
+                        "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); re-running `cluster up` reuses them"
+                    )),
+                    UpInvocation::Apply => ui.note(&format!(
+                        "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); rerunning `curie apply` reuses them"
+                    )),
+                }
             }
         }
     }
@@ -4415,10 +4536,10 @@ async fn run_prepared_up(
             // explicit value (state 4 in `resolve_github_token`). One note per
             // outcome: when the value was empty, say so here rather than
             // trailing a second, overlapping note after this match.
-            if empty_flag {
-                ui.note("--github-token (or CURIE_GITHUB_TOKEN) was empty; preserving the GitHub credential recorded by an earlier cluster up. Pass --clear-github-token to remove it.");
-            } else {
-                ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it");
+            match invocation {
+                UpInvocation::ClusterUp if empty_flag => ui.note("--github-token (or CURIE_GITHUB_TOKEN) was empty; preserving the GitHub credential recorded by an earlier cluster up. Pass --clear-github-token to remove it."),
+                UpInvocation::ClusterUp => ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it"),
+                UpInvocation::Apply => ui.note("preserving the GitHub credential recorded by the release; set `credentials.github_token` in `curie.yaml` and rerun `curie apply` to change it"),
             }
         }
         GithubTokenPlan::Untouched
@@ -4427,7 +4548,10 @@ async fn run_prepared_up(
                 .iter()
                 .any(|(key, value)| key == GITHUB_TOKEN_REFERENCE_KEYS[0] && !value.is_empty()) =>
         {
-            ui.note("preserving the GitHub credential reference recorded by the release; pass --github-token to replace it or --clear-github-token to remove it");
+            match invocation {
+                UpInvocation::ClusterUp => ui.note("preserving the GitHub credential reference recorded by the release; pass --github-token to replace it or --clear-github-token to remove it"),
+                UpInvocation::Apply => ui.note("preserving the GitHub credential reference recorded by the release; set `credentials.github_token` in `curie.yaml` and rerun `curie apply` to replace it"),
+            }
         }
         GithubTokenPlan::Untouched => {
             // Distinct wording: an empty value with nothing recorded preserves
@@ -4438,7 +4562,10 @@ async fn run_prepared_up(
         }
     }
     if set_passthrough_leaks_github_token(&opts.operator_sets()) {
-        ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
+        match invocation {
+            UpInvocation::ClusterUp => ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too"),
+            UpInvocation::Apply => ui.warn("a GitHub credential placed under `set:` in `curie.yaml` reaches the Helm process table; use `credentials.github_token` to name a credential source instead"),
+        }
     }
 
     if !opts.allow_egress_host.is_empty()
@@ -4524,6 +4651,7 @@ async fn run_prepared_up(
         &opts.allow_egress_host,
         any_egress,
         opts.common.dry_run,
+        invocation,
     ) {
         if warn {
             ui.warn(&msg)
@@ -4582,9 +4710,9 @@ async fn run_prepared_up(
     // created (#2856). Empty/absent history is a fresh install and is left
     // alone; the Detect gVisor retry still uninstalls an unrecorded abort.
     if let Err(error) =
-        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true).await
+        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true, invocation).await
     {
-        return Err(convergence::installation_failure(&opts.common, error).await);
+        return Err(convergence::installation_failure(&opts.common, error, invocation).await);
     }
     for cmd in &cmds {
         if let Some(job) = gvisor_preflight_job.as_deref() {
@@ -4601,7 +4729,9 @@ async fn run_prepared_up(
             {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    return Err(convergence::installation_failure(&opts.common, error).await)
+                    return Err(
+                        convergence::installation_failure(&opts.common, error, invocation).await,
+                    )
                 }
             };
             match outcome {
@@ -4624,25 +4754,43 @@ async fn run_prepared_up(
                     step.warn("retrying");
                     value_plan.set(GVISOR_MODE_KEY, "off");
                     ClusterUpInference::GvisorOff.render(ui);
-                    if let Err(error) =
-                        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, false)
-                            .await
+                    if let Err(error) = discard_failed_gvisor_install_if_never_deployed(
+                        &cl,
+                        &opts.common,
+                        false,
+                        invocation,
+                    )
+                    .await
                     {
-                        return Err(convergence::installation_failure(&opts.common, error).await);
+                        return Err(convergence::installation_failure(
+                            &opts.common,
+                            error,
+                            invocation,
+                        )
+                        .await);
                     }
                     let retry = up_commands_with_plan(&opts, &value_plan)
                         .into_iter()
                         .next()
                         .expect("cluster up always has one Helm command");
                     if let Err(error) = run_step(&cl, &label, "installed", &retry).await {
-                        return Err(convergence::installation_failure(&opts.common, error).await);
+                        return Err(convergence::installation_failure(
+                            &opts.common,
+                            error,
+                            invocation,
+                        )
+                        .await);
                     }
                 }
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
                     step.fail("failed");
-                    let fix = "curie cluster up --set security.gvisor.mode=off";
+                    let fix = invocation.gvisor_fix();
+                    let instruction = match invocation {
+                        UpInvocation::ClusterUp => format!("run `{fix}`"),
+                        UpInvocation::Apply => fix.to_string(),
+                    };
                     return Err(crate::exit::CliError::failure(format!(
-                        "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."
+                        "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, {instruction}."
                     ))
                     .with_fix(fix)
                     .into());
@@ -4650,7 +4798,9 @@ async fn run_prepared_up(
             }
         } else {
             if let Err(error) = run_step(&cl, &label, "installed", cmd).await {
-                return Err(convergence::installation_failure(&opts.common, error).await);
+                return Err(
+                    convergence::installation_failure(&opts.common, error, invocation).await,
+                );
             }
         }
     }
@@ -4679,7 +4829,7 @@ async fn run_prepared_up(
     }
 
     let step = cl.step("waiting for exact target workload convergence");
-    if let Err(error) = convergence::wait(&opts.common).await {
+    if let Err(error) = convergence::wait(&opts.common, invocation).await {
         step.fail("not converged");
         return Err(error);
     }
@@ -5588,6 +5738,200 @@ mod tests {
         }
     }
 
+    fn grafana_reference_release() -> serde_json::Value {
+        serde_json::json!({
+            "grafanaConnector": {
+                "enabled": true,
+                "url": "http://grafana.observability.svc.cluster.local",
+                "namespace": "observability",
+                "adminSecretName": "acme-grafana-admin",
+                "adminUserKey": "admin-user",
+                "adminPasswordKey": "admin-password",
+                "tokenName": "acme-sre-token",
+                "secretName": "acme-grafana-connector",
+                "secretKey": "ACME_GRAFANA_TOKEN",
+                "restartDeploymentNames": ["curie-sre-bot-mcp-grafana", "curie-sre-bot-mcp-tempo"]
+            },
+            "rustfs": {"auth": {"secretKey": "do-not-print-this-password"}}
+        })
+    }
+
+    fn finish_recorded_up(
+        existing: Option<&serde_json::Value>,
+        set: Vec<String>,
+        set_string: Vec<String>,
+        overlay_live: bool,
+    ) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                retained_mail_values: None,
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                adopt: false,
+                no_expose: true,
+                set,
+                set_string,
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            existing,
+            None,
+            false,
+            overlay_live,
+        )
+        .unwrap()
+    }
+
+    fn helm_argv(opts: &UpOpts) -> String {
+        let (materialized, _guards) = up_commands(opts)[0].materialize_secret_files().unwrap();
+        materialized.argv().join(" ")
+    }
+
+    /// The names the example installer records are not credential values.
+    /// A plain `cluster up` must hand each one back, and must not print a
+    /// real store password that only shares the "secret"/"key" spelling.
+    #[test]
+    fn plain_up_re_supplies_grafana_connector_reference_names() {
+        let opts = finish_recorded_up(Some(&grafana_reference_release()), vec![], vec![], true);
+        let argv = helm_argv(&opts);
+        for assignment in [
+            "grafanaConnector.adminSecretName=acme-grafana-admin",
+            "grafanaConnector.adminUserKey=admin-user",
+            "grafanaConnector.adminPasswordKey=admin-password",
+            "grafanaConnector.tokenName=acme-sre-token",
+            "grafanaConnector.secretName=acme-grafana-connector",
+            "grafanaConnector.secretKey=ACME_GRAFANA_TOKEN",
+        ] {
+            let rendered = format!("--set-string {assignment}");
+            assert_eq!(
+                argv.matches(rendered.as_str()).count(),
+                1,
+                "plain up must re-supply {assignment} exactly once: {argv}"
+            );
+        }
+        assert!(
+            argv.contains("--set grafanaConnector.enabled=true"),
+            "non-secret grafanaConnector leaves must still be copied: {argv}"
+        );
+        assert!(
+            argv.contains(
+                "--set-string grafanaConnector.restartDeploymentNames[0]=curie-sre-bot-mcp-grafana"
+            ),
+            "restart targets are not secret-shaped and must survive: {argv}"
+        );
+        assert!(
+            !argv.contains("do-not-print-this-password"),
+            "a real secretKey value must stay off the helm argv: {argv}"
+        );
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+        let shown = up_commands(&opts)[0].display();
+        assert!(
+            !shown.contains("do-not-print-this-password"),
+            "a real secretKey value must stay out of the displayed command: {shown}"
+        );
+    }
+
+    /// `apply` does not copy the live overlay, but these names are sibling-verb
+    /// state, same as a Slack origin list. The resolver has to run on that
+    /// path too, or the next apply repeats the drop.
+    #[test]
+    fn apply_path_re_supplies_grafana_connector_reference_names() {
+        let opts = finish_recorded_up(Some(&grafana_reference_release()), vec![], vec![], false);
+        let argv = helm_argv(&opts);
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretName=acme-grafana-connector"),
+            "apply must re-supply the recorded connector Secret name: {argv}"
+        );
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretKey=ACME_GRAFANA_TOKEN"),
+            "apply must re-supply the recorded connector Secret key: {argv}"
+        );
+        assert!(
+            !argv.contains("do-not-print-this-password"),
+            "apply must not move a store password onto argv: {argv}"
+        );
+    }
+
+    /// One leaf the operator sets on this run stays theirs. The other recorded
+    /// names still come back.
+    #[test]
+    fn explicit_grafana_connector_secret_name_overrides_the_recorded_value() {
+        let opts = finish_recorded_up(
+            Some(&grafana_reference_release()),
+            vec![],
+            vec!["grafanaConnector.secretName=operator-chosen-secret".into()],
+            true,
+        );
+        let argv = helm_argv(&opts);
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretName=operator-chosen-secret"),
+            "the operator secret name must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("acme-grafana-connector"),
+            "an explicit secret name must suppress the recorded one: {argv}"
+        );
+        assert!(
+            argv.contains("--set-string grafanaConnector.secretKey=ACME_GRAFANA_TOKEN"),
+            "overriding one leaf must not drop the other recorded names: {argv}"
+        );
+    }
+
+    #[test]
+    fn up_invents_no_grafana_connector_reference_when_none_is_recorded() {
+        for existing in [
+            Some(serde_json::json!({
+                "grafanaConnector": {"secretName": "", "secretKey": ""}
+            })),
+            Some(serde_json::json!({})),
+            None,
+        ] {
+            let opts = finish_recorded_up(existing.as_ref(), vec![], vec![], true);
+            let argv = helm_argv(&opts);
+            assert!(
+                !argv.contains("grafanaConnector.secretName"),
+                "up must not supply a connector Secret name it has no record of: {argv}"
+            );
+            assert!(
+                !argv.contains("grafanaConnector.secretKey"),
+                "up must not supply a connector Secret key it has no record of: {argv}"
+            );
+        }
+    }
+
+    #[test]
+    fn grafana_connector_reference_names_are_preserved_and_never_masked() {
+        for key in GRAFANA_CONNECTOR_REFERENCE_KEYS {
+            assert!(
+                is_preserved_by_up(key),
+                "diff must not report a reset for {key}"
+            );
+            assert!(
+                !is_secret_value_key(key),
+                "{key} names a Secret or a data key; masking it hides the install"
+            );
+        }
+        assert!(
+            is_secret_value_key("rustfs.auth.secretKey"),
+            "a store password that only shares the spelling must stay masked"
+        );
+        assert!(
+            !is_preserved_by_up("rustfs.auth.secretKey"),
+            "a store password is not a Grafana connector reference"
+        );
+    }
+
     #[test]
     fn up_no_expose_drops_the_nodeport_sets() {
         let cmds = up_commands(&UpOpts {
@@ -6328,8 +6672,12 @@ mod tests {
         // The whole generate/reuse path is a pure function: no stdin, no TTY, so
         // a non-interactive / CI `cluster up` resolves secrets without blocking.
         // (Exercising it here would hang the test run if it ever read a TTY.)
-        let _ = resolve_generated_secrets(None, &[]).unwrap();
-        let _ = resolve_generated_secrets(Some(&serde_json::Value::Null), &[]).unwrap();
+        assert!(!resolve_generated_secrets(None, &[]).unwrap().is_empty());
+        assert!(
+            resolve_generated_secrets(Some(&serde_json::Value::Null), &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8085,6 +8433,7 @@ async fn discard_failed_gvisor_install_if_never_deployed(
     cl: &crate::ui::Checklist,
     common: &CommonOpts,
     recorded_only: bool,
+    invocation: UpInvocation,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     let history_cmd = helm_history_cmd(common);
@@ -8101,8 +8450,13 @@ async fn discard_failed_gvisor_install_if_never_deployed(
                 err.trim()
             ))
             .with_fix(format!(
-                "inspect `helm history {} -n {}` and rerun `curie apply` or `curie cluster up`",
-                common.release, common.namespace
+                "inspect `helm history {} -n {}` and rerun `{}`",
+                common.release,
+                common.namespace,
+                match invocation {
+                    UpInvocation::ClusterUp => "curie cluster up",
+                    UpInvocation::Apply => "curie apply",
+                }
             ))
             .into());
         }

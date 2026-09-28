@@ -77,7 +77,13 @@ from .mcp_tool_capability import (
 from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
-from .progress import ProgressActivity, build_progress_tool, resolve_progress
+from .progress import (
+    PROGRESS_TOKEN_ENV,
+    PROGRESS_URL_ENV,
+    ProgressActivity,
+    build_progress_tool,
+    resolve_progress,
+)
 from .publication_precheck import PublicationPrecheck
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
@@ -85,6 +91,7 @@ from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .usage_report import USAGE_PATH, UsageReporter
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
 logger = logging.getLogger("curie_runner")
@@ -194,7 +201,17 @@ def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
         "Do not git clone, git fetch, or git pull this repository over the network.\n"
         "General network egress is unavailable in this sandbox; git hosts including "
         "github.com are unreachable by design.\n"
-        "Do not git push; use publish_changes when ready."
+        "Do not git push; use publish_changes when ready.\n"
+        "Python, pip, and venv are already in the image. "
+        "Create a virtualenv only under /workspace.\n"
+        "Install dependencies only from files already in the checkout, with pip --no-index. "
+        "Do not contact a package index.\n"
+        "Run only the repository's documented check command.\n"
+        "Do not write a substitute test runner or shim.\n"
+        "If those checks cannot be installed from files already in the checkout, say that "
+        "in-sandbox verification is unavailable. Do not request publication. "
+        "The published pull request's CI is the only repository check, and it runs only "
+        "after a person publishes the change."
     )
 
 
@@ -403,6 +420,15 @@ def build_runner(
         progress = None
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
+    # Per-model token usage for the run's cost line (#3223): reported whenever
+    # the progress URL and token are injected, phases.json or not.
+    progress_url = os.environ.get(PROGRESS_URL_ENV, "").strip()
+    progress_token = os.environ.get(PROGRESS_TOKEN_ENV, "").strip()
+    usage_reporter = (
+        UsageReporter(progress_url.rstrip("/") + USAGE_PATH, progress_token)
+        if progress_url and progress_token
+        else None
+    )
     # Tell the gate whether the platform's own ``curie-state`` tools exist this
     # session (#2286 adversarial round). The toolPolicy exemption is by exact
     # live tool name, and a name the platform never published is not ours -- an
@@ -655,6 +681,8 @@ def build_runner(
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
             progress_activity=progress_activity if progress is not None else None,
+            usage_reporter=usage_reporter,
+            primary_model=config.model,
             connector_failures=connector_failures
             or (
                 capability.connector_failures

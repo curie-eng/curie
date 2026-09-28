@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from aci_protocol import (
+    ErrorEvent,
     Final,
     QueuedTurn,
     ReplyHandle,
@@ -516,6 +517,69 @@ def test_verified_review_posts_receipt_and_terminal_outcome_to_bare_thread(
             assert completion.target.conversation_id == THREAD
             assert completion.outcome == "delivered"
             assert h.runner.steer_headers == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("classification", "expected_marker", "expected_outcome"),
+    [
+        pytest.param(
+            "history-persistence-error",
+            "history_capacity",
+            "escalated",
+            id="history-capacity",
+        ),
+        pytest.param(None, "1", "delivered", id="successful-review"),
+        pytest.param(
+            "model-credit-exhausted",
+            "1",
+            "escalated",
+            id="other-failure",
+        ),
+    ],
+)
+def test_verified_review_records_history_capacity_in_terminal_marker(
+    make_harness,
+    classification: str | None,
+    expected_marker: str,
+    expected_outcome: str,
+) -> None:
+    async def exercise() -> None:
+        turn = _review_turn()
+        api = ReviewPublicationApi(turn)
+        async with make_harness(
+            binding=ReviewBinding(),
+            publication_creator=api,
+            workspace_factory=ReviewWorkspace,
+        ) as h:
+            _claim_matching_route(h, turn)
+            h.runner.default_script = (
+                [Final(text="Review complete.", status=SessionStatus.DONE)]
+                if classification is None
+                else [
+                    ErrorEvent(
+                        message="conversation history capacity exceeded",
+                        classification=classification,
+                    ),
+                    Final(text="Review failed.", status=SessionStatus.CLASSIFIED_FAILURE),
+                ]
+            )
+
+            await h.kernel.process_event(turn)
+
+            assert api.verify_calls == [(turn, DEPLOYMENT_ID)]
+            assert len(api.reserve_calls) == 1
+            assert h.runner.opened == [turn.text]
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == expected_outcome
+            done_key = h.config.done_key(turn.event_id)
+            assert await h.async_redis.get(done_key) == expected_marker
+            marker_ttl = await h.async_redis.ttl(done_key)
+            if expected_marker == "history_capacity":
+                assert marker_ttl == -1
+            else:
+                assert marker_ttl > 0
 
     asyncio.run(exercise())
 

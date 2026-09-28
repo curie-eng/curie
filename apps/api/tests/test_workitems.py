@@ -1986,16 +1986,6 @@ def test_a_terminal_work_item_expires_only_its_own_transcript(clean_db: None) ->
         running = await _start(session, await _request(session, item))
         await _seed_transcript(session, agent_id, CONVERSATION)
         await _seed_transcript(session, agent_id, other_thread)
-        # A pre-0053 row an older API instance still holds for the same thread.
-        await session.execute(
-            text(
-                "INSERT INTO curie.workflow_state_entries "
-                "(id, agent_id, namespace, key, value) "
-                "VALUES (:id, :agent, 'transcript', :thread, CAST('[]' AS jsonb))"
-            ),
-            {"id": uuid.uuid4(), "agent": agent_id, "thread": CONVERSATION},
-        )
-        await session.commit()
         request = running.request
         assert request is not None
 
@@ -2021,14 +2011,6 @@ def test_a_terminal_work_item_expires_only_its_own_transcript(clean_db: None) ->
         assert isinstance(failed, workitems.WorkItemOutcome), failed
         assert failed.request is not None and failed.request.status == "failed"
         assert await _transcript_threads(session, agent_id) == {other_thread}
-        legacy = await session.scalar(
-            text(
-                "SELECT count(*) FROM curie.workflow_state_entries "
-                "WHERE agent_id = :agent AND namespace = 'transcript'"
-            ),
-            {"agent": agent_id},
-        )
-        assert legacy == 0
 
     with_session(body)
 

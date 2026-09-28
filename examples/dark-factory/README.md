@@ -70,7 +70,9 @@ the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
   gives every session the built-in file tools. The sandbox has no general
   network access, and it holds no push or publication credential.
 - **The issue.** `.mcp.json` declares the GitHub MCP server. This bundle's
-  `runner.Dockerfile` installs it on the platform runner. The server is
+  `runner.Dockerfile` installs it in a runner layer that `connectors.yaml`
+  declares (ADR 0173). The platform runner does not carry it, so the layer
+  must be built with `curie build` before the deploy (below). The server is
   authenticated with the bundle's own `GITHUB_PERSONAL_ACCESS_TOKEN`
   (ADR 0145: reading the ticket is the bundle's job). The manifest's
   `toolPolicy` allows `github/get_issue` and `github/add_issue_comment`.
@@ -100,14 +102,17 @@ Enable factory intake first (see "Admitting a labelled GitHub issue" in
 ```bash
 # The skill plans for a 3 hour run. The execution deadline defaults to 1800 s
 # and the worker budget to 600 s, so raise all three. The chart raises the
-# worker termination grace with the budget.
+# worker termination grace with the budget. At this budget, the drain Job
+# publishes a minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
+  --timeout 21900s \
   --set worker.deliveryBudgetSeconds=10800 \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
 
 # The factory's default model: GLM 5.3 Flash through OpenRouter.
 helm upgrade curie <chart> -n curie --reuse-values \
+  --timeout 21900s \
   --set agentSandbox.runner.fakeModel=false \
   --set agentSandbox.runner.model=z-ai/glm-5.3-flash \
   --set agentSandbox.runner.credentials=<openrouter-api-key>
@@ -115,9 +120,15 @@ helm upgrade curie <chart> -n curie --reuse-values \
 # Runner egress to the GitHub API for the MCP server, one entry per CIDR
 # from the "api" list at https://api.github.com/meta.
 helm upgrade curie <chart> -n curie --reuse-values \
+  --timeout 21900s \
   --set 'agentSandbox.connectorEgress.dark-factory[0].cidr=<github-api-cidr>' \
   --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].port=443' \
   --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].protocol=TCP'
+
+# Build the runner layer that carries the GitHub MCP server. It records the
+# layer digest in connectors.lock.yaml, which the deploy requires. Rebuild and
+# redeploy after every platform upgrade.
+curie build --plugin-dir examples/dark-factory --registry <registry-ref>
 
 export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
 curie cluster deploy --plugin-dir examples/dark-factory \

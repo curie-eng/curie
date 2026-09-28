@@ -40,9 +40,7 @@ SLACK_TS = "1700000000.000100"
 
 
 def test_route_thread_key_resolves_the_route_identity() -> None:
-    assert (
-        route_thread_key("slack", None, "C0EXAMPLE1", SLACK_TS) == f"slack:C0EXAMPLE1:{SLACK_TS}"
-    )
+    assert route_thread_key("slack", None, "C0EXAMPLE1", SLACK_TS) == f"slack:C0EXAMPLE1:{SLACK_TS}"
     assert (
         route_thread_key("slack", "default", "C0EXAMPLE1", SLACK_TS)
         == f"slack:C0EXAMPLE1:{SLACK_TS}"
@@ -154,9 +152,7 @@ def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def test_admission_keys_a_mail_work_item_by_its_identity(
-    clean_db: None, allowlisted: None
-) -> None:
+def test_admission_keys_a_mail_work_item_by_its_identity(clean_db: None, allowlisted: None) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _mail_agent(session)
         admitted = await admit(session, _facts(agent_id))
@@ -240,9 +236,7 @@ def test_a_cancelled_work_item_keyed_before_the_identity_still_fences_publicatio
 ) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id, work_item_id, version = await _legacy_mail_work_item(session)
-        cancelled = await cancel(
-            session, work_item_id=work_item_id, expected_version=version
-        )
+        cancelled = await cancel(session, work_item_id=work_item_id, expected_version=version)
         assert getattr(cancelled, "work_item", None) is not None, cancelled
         conflict = await crud.publication_cancellation_conflict(
             session, agent_id=agent_id, conversation_id=NEW_KEY
@@ -300,9 +294,7 @@ def test_a_cancelled_legacy_work_item_still_fences_publication_after_its_binding
 ) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id, work_item_id, version = await _legacy_mail_work_item(session)
-        cancelled = await cancel(
-            session, work_item_id=work_item_id, expected_version=version
-        )
+        cancelled = await cancel(session, work_item_id=work_item_id, expected_version=version)
         assert getattr(cancelled, "work_item", None) is not None, cancelled
         # `thread_key_forms`'s single-binding guard would refuse to adopt the
         # old key once the binding it names is gone; the refusal lookup must
@@ -373,9 +365,7 @@ def test_refuse_fenced_work_item_still_fences_a_cancelled_legacy_work_item(
 ) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id, work_item_id, version = await _legacy_mail_work_item(session)
-        cancelled = await cancel(
-            session, work_item_id=work_item_id, expected_version=version
-        )
+        cancelled = await cancel(session, work_item_id=work_item_id, expected_version=version)
         assert getattr(cancelled, "work_item", None) is not None, cancelled
         with pytest.raises(crud.PublicationLineageConflict) as caught:
             await crud._refuse_fenced_work_item(
@@ -430,6 +420,28 @@ async def _bare_lineage(session: AsyncSession, agent_id: uuid.UUID) -> uuid.UUID
     return lineage_id
 
 
+async def _bind_lineage(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    lineage_id: uuid.UUID,
+    request_id: uuid.UUID,
+) -> None:
+    """Bind through the publication's own running request, as the API does."""
+    lineage: Any = SimpleNamespace(
+        id=lineage_id,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        repo_full_name="acme-corp/acme-bot",
+        github_repository_id=None,
+        github_installation_id=None,
+    )
+    publication: Any = SimpleNamespace(execution_request_id=request_id)
+    await crud._bind_running_work_item_lineage(
+        session, publication=publication, lineage=lineage, identity=None
+    )
+
+
 def test_bind_running_work_item_lineage_finds_a_legacy_work_items_running_request(
     clean_db: None, allowlisted: None
 ) -> None:
@@ -452,9 +464,7 @@ def test_bind_running_work_item_lineage_finds_a_legacy_work_items_running_reques
         )
         await session.commit()
         lineage_id = await _bare_lineage(session, agent_id)
-        await crud._bind_running_work_item_lineage(
-            session, agent_id=agent_id, conversation_id=NEW_KEY, lineage_id=lineage_id
-        )
+        await _bind_lineage(session, agent_id, NEW_KEY, lineage_id, request_id)
         await session.commit()
         bound = await session.scalar(
             text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
@@ -491,9 +501,7 @@ def test_bind_running_work_item_lineage_does_not_adopt_a_legacy_key_under_anothe
         # key can only be ITS route's, so a write implying another route's
         # identity must not adopt it.
         other = scoped_conversation_id("email", ADDRESS, THREAD, identity="other-inbox")
-        await crud._bind_running_work_item_lineage(
-            session, agent_id=agent_id, conversation_id=other, lineage_id=lineage_id
-        )
+        await _bind_lineage(session, agent_id, other, lineage_id, request_id)
         await session.commit()
         bound = await session.scalar(
             text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),

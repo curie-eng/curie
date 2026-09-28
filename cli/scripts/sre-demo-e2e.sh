@@ -370,6 +370,12 @@ wait_pending_tool() {
       local result=$?
       [[ "$result" == 1 ]] || return 1
     fi
+    # A turn that already exited cannot create the approval any more.
+    if [[ -n "${TURN_PID:-}" ]] && ! kill -0 "$TURN_PID" 2>/dev/null; then
+      pending_for_tool "$tool" && return 0
+      echo "the turn ended before a pending ${tool} approval appeared" >&2
+      return 4
+    fi
     sleep 2
   done
   echo "no pending approval named ${tool} appeared" >&2
@@ -432,10 +438,18 @@ if last.get("actor")!=operator:
 
 assert_operator_audit() {
   local approval_id="$1"
-  local secret port
+  local secret port service_port
   secret="$(discover_release_secret)"
+  # Resolve the Service's named http port; the chart serves the API on 8000,
+  # so a hardcoded 80 made every audit check fail before any request.
+  service_port="$(kubectl get svc "${RELEASE}-api" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.ports[?(@.name=="http")].port}')"
+  [[ -n "$service_port" ]] || {
+    echo "the platform API Service has no http port" >&2
+    return 1
+  }
   port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-  kubectl port-forward --address=127.0.0.1 -n "$NAMESPACE" "svc/${RELEASE}-api" "${port}:80" >/dev/null 2>&1 &
+  kubectl port-forward --address=127.0.0.1 -n "$NAMESPACE" "svc/${RELEASE}-api" "${port}:${service_port}" >/dev/null 2>&1 &
   API_FORWARD_PID=$!
   local i
   for i in $(seq 1 20); do
@@ -526,20 +540,33 @@ drive_gated_turn() {
   shift $(( $# >= 4 ? 4 : 3 ))
   local out="${evidence_dir:-$HOME}/gated-turn.out"
   local err="${evidence_dir:-$HOME}/gated-turn.err"
-  : >"$out"
-  : >"$err"
-  local bin
+  local bin id attempt waited
   bin="$(curie_bin)"
-  "$bin" --json cluster message --namespace "$NAMESPACE" --release "$RELEASE" \
-    --chart "$ROOT/charts/curie" --timeout-secs "$TIMEOUT_SECS" \
-    "$@" "$text" >"$out" 2>"$err" &
-  TURN_PID=$!
-  local id
-  if ! id="$(wait_pending_tool "$tool" 180)"; then
+  # One fresh turn is retried only when the first ended without creating any
+  # approval (for example a transient provider error). A turn that created
+  # one is never retried, so the one-pending and re-arm controls still hold.
+  for attempt in 1 2; do
+    : >"$out"
+    : >"$err"
+    "$bin" --json cluster message --namespace "$NAMESPACE" --release "$RELEASE" \
+      --chart "$ROOT/charts/curie" --timeout-secs "$TIMEOUT_SECS" \
+      "$@" "$text" >"$out" 2>"$err" &
+    TURN_PID=$!
+    waited=0
+    id="$(wait_pending_tool "$tool" 180)" || waited=$?
+    (( waited == 0 )) && break
     stop_turn
-    echo "gated turn did not produce a pending ${tool} approval" >&2
-    return 1
-  fi
+    # Process exit alone does not prove the queued turn is over, so retry only
+    # when its JSON shows a finalized reply that is not awaiting approval.
+    if (( waited == 4 )) && ! turn_is_reply <"$out" >/dev/null 2>&1; then
+      waited=1
+    fi
+    if (( waited != 4 || attempt == 2 )); then
+      echo "gated turn did not produce a pending ${tool} approval" >&2
+      return 1
+    fi
+    echo "gated turn ended without an approval; retrying once" >&2
+  done
   if [[ -n "$before_resolve" ]]; then
     "$before_resolve" || {
       local held=$?
@@ -734,11 +761,15 @@ assert_scale() {
     hold_scale_at_one)"
   wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" 2
   [[ -n "$id" ]] || return 1
-  SCALE_APPROVAL_ID="$id"
+  # Each row runs in a subshell, so a variable would not reach the re-arm row.
+  printf '%s' "$id" >"$evidence_dir/scale-approval-id"
 }
 
 assert_rearm() {
   local id
+  if [[ -s "$evidence_dir/scale-approval-id" ]]; then
+    SCALE_APPROVAL_ID="$(cat "$evidence_dir/scale-approval-id")"
+  fi
   [[ -n "$SCALE_APPROVAL_ID" ]] || {
     echo "re-arm requires the scale approval id from the preceding grant" >&2
     return 1
@@ -779,8 +810,9 @@ assert_configuration_denial() {
 }
 
 assert_rbac_ceiling() {
-  local before want id
+  local before want id demo_before
   before="$(spec_replicas_of "$NAMESPACE" "${RELEASE}-api")"
+  demo_before="$(spec_replicas_of "$DEMO_NS" "$DEMO_DEPLOY")"
   [[ -n "$before" ]] || return 1
   want=$((before + 1))
   hold_platform_replicas() {
@@ -795,7 +827,7 @@ assert_rbac_ceiling() {
     echo "platform API replica count changed after an approved scale" >&2
     return 1
   }
-  wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" 2
+  wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" "$demo_before"
   [[ -n "$id" ]] || return 1
 }
 

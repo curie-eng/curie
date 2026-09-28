@@ -55,14 +55,24 @@ def _write_catalog(
     *,
     revisions: list[str],
     window_heads: dict[str, str],
+    window_mins: dict[str, str] | None = None,
+    candidate_min: str = "0001",
+    candidate_head: str | None = None,
+    schema_compat_min: str | None = None,
+    published_versions: tuple[str, ...] = (),
 ) -> None:
     catalog_dir = repo_root / "cli" / "src"
     catalog_dir.mkdir(parents=True, exist_ok=True)
+    resolved_candidate_head = candidate_head or revisions[-1]
     payload = {
         "revisions": revisions,
+        "candidate": {
+            "schema_min": candidate_min,
+            "schema_head": resolved_candidate_head,
+        },
         "windows": {
             version: {
-                "schema_min": "0001",
+                "schema_min": (window_mins or {}).get(version, "0001"),
                 "schema_head": head,
             }
             for version, head in window_heads.items()
@@ -70,6 +80,27 @@ def _write_catalog(
     }
     (catalog_dir / "application_schema_windows.json").write_text(
         json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    schema_compat_path = (
+        repo_root / "apps" / "api" / "src" / "curie_api" / "schema_compat.json"
+    )
+    schema_compat_path.parent.mkdir(parents=True, exist_ok=True)
+    schema_compat_path.write_text(
+        json.dumps(
+            {
+                "schema_min": schema_compat_min or candidate_min,
+                "schema_head": resolved_candidate_head,
+            }
+        ),
+        encoding="utf-8",
+    )
+    versions_path = repo_root / "docs" / "architecture-atlas" / "versions.json"
+    versions_path.parent.mkdir(parents=True, exist_ok=True)
+    versions_path.write_text(
+        json.dumps(
+            {"versions": [{"id": f"v{version}"} for version in published_versions]}
+        ),
         encoding="utf-8",
     )
 
@@ -102,30 +133,32 @@ def test_real_tree_window_matches_alembic_head() -> None:
 
     assert result.returncode == 0, result.stderr
     assert app_version in catalog["windows"]
+    assert catalog["windows"][app_version]["schema_min"] == catalog["candidate"]["schema_min"]
+    assert catalog["windows"][app_version]["schema_head"] == catalog["candidate"]["schema_head"]
     assert f"appVersion {app_version}" in result.stdout
-    assert "catalog appVersion" in result.stdout
-    assert "schema_head" in result.stdout
+    assert f"candidate schema_head {catalog['candidate']['schema_head']}" in result.stdout
 
 
-def test_tree_head_without_newer_catalog_window_fails(tmp_path: Path) -> None:
+def test_candidate_head_behind_tree_fails(tmp_path: Path) -> None:
     _write_chart(tmp_path, app_version="0.9.0")
     _write_catalog(
         tmp_path,
         revisions=["0001", "0002"],
         window_heads={"0.9.0": "0001"},
+        candidate_head="0001",
     )
     _write_linear_migrations(tmp_path)
 
     result = _run_gate(tmp_path)
 
     assert result.returncode == 1, result.stderr or result.stdout
+    assert "candidate.schema_head" in result.stderr
+    assert "0001" in result.stderr
     assert "0002" in result.stderr
-    err = result.stderr.lower()
-    assert "schema_head" in err or "window" in err
 
 
-def test_older_chart_version_uses_newest_numeric_catalog_window(tmp_path: Path) -> None:
-    _write_chart(tmp_path, app_version="0.9.0")
+def test_previous_release_windows_stay_pinned_as_candidate_advances(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.9.10")
     _write_catalog(
         tmp_path,
         revisions=["0001", "0002"],
@@ -140,9 +173,8 @@ def test_older_chart_version_uses_newest_numeric_catalog_window(tmp_path: Path) 
     result = _run_gate(tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert "chart appVersion 0.9.0" in result.stdout
-    assert "catalog appVersion 0.9.10" in result.stdout
-    assert "schema_head 0002" in result.stdout
+    assert "chart appVersion 0.9.10" in result.stdout
+    assert "candidate schema_head 0002" in result.stdout
 
 
 def test_release_candidate_chart_requires_its_exact_catalog_window(tmp_path: Path) -> None:
@@ -160,7 +192,7 @@ def test_release_candidate_chart_requires_its_exact_catalog_window(tmp_path: Pat
     assert "no window for appVersion 0.10.0-rc.1" in result.stderr
 
 
-def test_release_candidate_precedes_stable_in_catalog_order(tmp_path: Path) -> None:
+def test_previous_release_candidate_window_can_lag_current_stable(tmp_path: Path) -> None:
     _write_chart(tmp_path, app_version="0.10.0")
     _write_catalog(
         tmp_path,
@@ -176,7 +208,7 @@ def test_release_candidate_precedes_stable_in_catalog_order(tmp_path: Path) -> N
 
     assert result.returncode == 0, result.stderr
     assert "chart appVersion 0.10.0" in result.stdout
-    assert "catalog appVersion 0.10.0 schema_head 0002" in result.stdout
+    assert "candidate schema_head 0002" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -207,7 +239,7 @@ def test_malformed_or_noncanonical_catalog_key_fails(
     assert version in result.stderr
 
 
-def test_release_candidate_chart_window_matches_alembic_head(tmp_path: Path) -> None:
+def test_current_release_candidate_window_matches_candidate_head(tmp_path: Path) -> None:
     _write_chart(tmp_path, app_version="0.10.0-rc.1")
     _write_catalog(
         tmp_path,
@@ -215,8 +247,8 @@ def test_release_candidate_chart_window_matches_alembic_head(tmp_path: Path) -> 
         window_heads={
             "0.9.9": "0001",
             "0.10.0-rc.1": "0002",
-            "0.10.0": "0002",
-            "0.10.1": "0002",
+            "0.10.0": "0001",
+            "0.10.1": "0001",
         },
     )
     _write_linear_migrations(tmp_path)
@@ -225,10 +257,98 @@ def test_release_candidate_chart_window_matches_alembic_head(tmp_path: Path) -> 
 
     assert result.returncode == 0, result.stderr
     assert "chart appVersion 0.10.0-rc.1" in result.stdout
-    assert "catalog appVersion 0.10.1 schema_head 0002" in result.stdout
+    assert "candidate schema_head 0002" in result.stdout
 
 
-def test_release_candidate_window_must_match_alembic_head(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("published_versions", "expected_action"),
+    [
+        (("0.10.1",), "bump"),
+        ((), "rerun"),
+    ],
+)
+def test_current_chart_head_mismatch_refuses_with_the_correct_release_action(
+    tmp_path: Path,
+    published_versions: tuple[str, ...],
+    expected_action: str,
+) -> None:
+    _write_chart(tmp_path, app_version="0.10.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.1": "0001"},
+        published_versions=published_versions,
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "0.10.1" in result.stderr
+    assert "differs from candidate" in result.stderr
+    assert expected_action in result.stderr.lower()
+
+
+def test_current_chart_minimum_mismatch_refuses_even_when_heads_match(
+    tmp_path: Path,
+) -> None:
+    _write_chart(tmp_path, app_version="0.10.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.1": "0002"},
+        candidate_min="0002",
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "differs from candidate" in result.stderr
+    assert "rerun" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("published_versions", [(), ("0.10.1",)])
+def test_current_chart_window_equal_to_candidate_passes(
+    tmp_path: Path, published_versions: tuple[str, ...]
+) -> None:
+    _write_chart(tmp_path, app_version="0.10.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.1": "0002"},
+        window_mins={"0.10.1": "0002"},
+        candidate_min="0002",
+        published_versions=published_versions,
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "candidate schema_head 0002" in result.stdout
+
+
+def test_candidate_minimum_must_match_api_schema_compatibility(tmp_path: Path) -> None:
+    _write_chart(tmp_path, app_version="0.10.1")
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.1": "0002"},
+        window_mins={"0.10.1": "0002"},
+        candidate_min="0002",
+        schema_compat_min="0001",
+    )
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "schema_compat" in result.stderr
+    assert "schema bounds" in result.stderr
+
+
+def test_candidate_minimum_cannot_follow_its_head(tmp_path: Path) -> None:
     _write_chart(tmp_path, app_version="0.10.0-rc.1")
     _write_catalog(
         tmp_path,
@@ -239,15 +359,56 @@ def test_release_candidate_window_must_match_alembic_head(tmp_path: Path) -> Non
             "0.10.0": "0002",
             "0.10.1": "0002",
         },
+        candidate_min="0002",
+        candidate_head="0001",
     )
     _write_linear_migrations(tmp_path)
 
     result = _run_gate(tmp_path)
 
     assert result.returncode == 1, result.stdout
-    assert "windows['0.10.0-rc.1']" in result.stderr
-    assert "schema_head" in result.stderr
-    assert "0002" in result.stderr
+    assert "candidate.schema_min is after candidate.schema_head" in result.stderr
+
+
+@pytest.mark.parametrize("field", ["schema_min", "schema_head"])
+def test_chart_window_requires_both_catalog_revision_bounds(
+    tmp_path: Path, field: str
+) -> None:
+    _write_chart(tmp_path)
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.8.8": "0001"},
+    )
+    catalog_path = tmp_path / "cli" / "src" / "application_schema_windows.json"
+    payload = json.loads(catalog_path.read_text())
+    del payload["windows"]["0.8.8"][field]
+    catalog_path.write_text(json.dumps(payload), encoding="utf-8")
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert f"windows['0.8.8'].{field}" in result.stderr
+
+
+def test_chart_window_minimum_cannot_follow_its_head(tmp_path: Path) -> None:
+    _write_chart(tmp_path)
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.8.8": "0001"},
+    )
+    catalog_path = tmp_path / "cli" / "src" / "application_schema_windows.json"
+    payload = json.loads(catalog_path.read_text())
+    payload["windows"]["0.8.8"]["schema_min"] = "0002"
+    catalog_path.write_text(json.dumps(payload), encoding="utf-8")
+    _write_linear_migrations(tmp_path)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "windows['0.8.8'].schema_min is after its schema_head" in result.stderr
 
 
 def test_migration_with_matching_window_passes(tmp_path: Path) -> None:

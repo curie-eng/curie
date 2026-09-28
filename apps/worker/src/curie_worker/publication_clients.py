@@ -212,6 +212,7 @@ class PublicationLineageClient:
         pr_number: int,
         pr_url: str,
         head_sha: str,
+        metadata_updated_at: datetime | None,
     ) -> None:
         try:
             response = await self._client.patch(
@@ -226,6 +227,11 @@ class PublicationLineageClient:
                     "pr_number": pr_number,
                     "pr_url": pr_url,
                     "head_sha": head_sha,
+                    "metadata_updated_at": (
+                        metadata_updated_at.isoformat()
+                        if metadata_updated_at is not None
+                        else None
+                    ),
                 },
                 follow_redirects=False,
             )

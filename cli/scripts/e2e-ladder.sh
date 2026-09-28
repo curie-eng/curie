@@ -5606,8 +5606,10 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     echo
     echo "=== curie cluster eval --dry-run (suite parity) ==="
     # ONE array feeding every cluster eval call (the dry-run plan, the live
-    # grade, and the #1534 retention pair), so `--listen-host` cannot reach one
-    # and be forgotten on another. `--json` is deliberately NOT in the array:
+    # grade, and the #1534 retention pair). Text-graded cluster eval ignores
+    # `--listen-host`: replies use the cluster message relay, not a stub. The
+    # flag is still appended when set so an older ladder env keeps parsing.
+    # `--json` is deliberately NOT in the array:
     # call sites need it for DIFFERENT reasons -- a machine-readable `--dry-run`
     # plan here, an auditable green on the live/retention grades -- and passing
     # it once per call site is what keeps it from being passed twice at any.

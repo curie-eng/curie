@@ -5,15 +5,39 @@ rules:
     compose.dev.yaml: [local]
     pyproject.toml: [skill, local, local-release, cluster]
     uv.lock: [skill, local, local-release, cluster]
+    # The upgrade matrix and the repository files it reads. A test scans the
+    # script's $REPO_ROOT reads and fails on any that skips released-upgrade.
+    cli/scripts/gnu-process.py: [released-upgrade]
+    apps/api/src/curie_api/schema_compat.json: [released-upgrade]
+    cli/src/application_schema_windows.json: [released-upgrade]
     cli/scripts/cluster-upgrade-matrix.sh: [released-upgrade]
     cli/tests/data/upgrade-driver.py: [released-upgrade]
+    # The only charts/curie/ci files the released-upgrade jobs run.
+    charts/curie/ci/live_manifest_parity.py: [released-upgrade]
+    charts/curie/ci/make-upgrade-mutants.py: [released-upgrade]
     apps/worker/src/curie_worker/approval_cards.py: [local, local-release, cluster, released-upgrade]
     apps/worker/src/curie_worker/config.py: [local, local-release, cluster, released-upgrade]
     apps/worker/src/curie_worker/consumer_liveness.py: [local, local-release, cluster, released-upgrade]
     apps/worker/src/curie_worker/workspace.py: [local, local-release, cluster, released-upgrade]
   prefixes:
     charts: [cluster]
-    charts/curie: [released-upgrade]
+    # Everything `helm package charts/curie` ships. charts/curie/ci is
+    # helmignored, so its test scripts cannot change an upgrade and stay on
+    # the cluster tier only.
+    charts/curie/.helmignore: [released-upgrade]
+    charts/curie/CLAUDE.md: [released-upgrade]
+    charts/curie/Chart.yaml: [released-upgrade]
+    charts/curie/README.md: [released-upgrade]
+    charts/curie/crds: [released-upgrade]
+    charts/curie/files: [released-upgrade]
+    charts/curie/templates: [released-upgrade]
+    charts/curie/values-dev.yaml: [released-upgrade]
+    charts/curie/values-e2e-harness.yaml: [released-upgrade]
+    charts/curie/values-e2e-nogvisor.yaml: [released-upgrade]
+    charts/curie/values-e2e-two-release-consumer.yaml: [released-upgrade]
+    charts/curie/values-external.yaml: [released-upgrade]
+    charts/curie/values.schema.json: [released-upgrade]
+    charts/curie/values.yaml: [released-upgrade]
     compose: [local-release]
     apps/api: [local, local-release, cluster]
     apps/api/src/curie_api/migrations: [released-upgrade]
@@ -42,6 +66,8 @@ rules:
     apps/ui: []
     apps/dispatcher: []
     scripts: []
+    # Edits to the released-upgrade jobs select nothing either. Dispatch CI on
+    # the branch to run them before merge.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []

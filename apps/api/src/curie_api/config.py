@@ -153,6 +153,10 @@ class Settings(BaseSettings):
     # form a complete bootable configuration.
     github_review_ingress_enabled: bool = False
     github_review_reconciler_interval_s: float = 5.0
+    # A review can arrive before the publication records the PR's GitHub
+    # identity (#2962). Such feedback is held and replayed for this long after
+    # the lineage was created, then rejected as lineage_absent_or_ambiguous.
+    github_review_identity_hold_s: float = 900.0
     # Factory issue intake is separately gated from push and review handling.
     # The label is the initial admission convention. The mention is the login
     # an authorized human must name to request another bounded execution.
@@ -178,6 +182,10 @@ class Settings(BaseSettings):
         le=10800,
         validation_alias="GITHUB_FACTORY_CI_WAIT_S",
     )
+    # Public model price list the factory's per-run cost estimate reads
+    # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
+    # the estimate unset and the token counts are still stored. Empty disables.
+    factory_price_source_url: str = "https://openrouter.ai/api/v1/models"
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status

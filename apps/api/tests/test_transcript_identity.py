@@ -3,14 +3,13 @@
 Under ADR-0168 decision 4, a route whose adapter names a non-default
 identity gains an identity segment in its thread key. A mail thread's
 transcript written before the upgrade sits under the old key. The first read
-or write under the new key adopts it, as ``transcripts._adopt_legacy`` adopts
-pre-0053 rows, and leaves the old row for a worker that has not rolled.
+or write under the new key adopts it and leaves the old row for a worker that
+has not rolled.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from typing import Any
 from urllib.parse import quote
@@ -62,8 +61,7 @@ def _seed(client: Any, headers: dict[str, str], agent_id: str, key: str, value: 
 
 def _sql(statement: str, **params: Any) -> None:
     # Reaches under the API for a row no HTTP route writes directly: an
-    # already-expired transcript, or a pre-0053 legacy row with no
-    # ``thread_transcripts`` counterpart yet.
+    # already-expired transcript.
     async def run() -> None:
         engine = create_async_engine(get_settings().database_url)
         try:
@@ -214,9 +212,8 @@ def test_a_deleted_transcript_is_not_readopted(
 def test_an_expired_old_row_is_not_adopted(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """The old row's own TTL has to be honored the same way ``_adopt_legacy``
-    honors it, or a thread whose history the TTL already ended comes back
-    from a row nothing else is reading anymore."""
+    """The old row's own TTL has to be honored, or a thread whose history the
+    TTL already ended comes back from a row nothing else is reading anymore."""
     aid = _mail_agent(client, auth_headers)
     _seed(client, auth_headers, aid, OLD_KEY, HISTORY)
     _sql(
@@ -226,29 +223,6 @@ def test_an_expired_old_row_is_not_adopted(
     )
 
     assert client.get(_url(aid, NEW_KEY), headers=auth_headers).status_code == 404
-
-
-def test_a_pre_0053_row_under_the_old_key_is_adopted(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """Only a pre-0053 ``workflow_state_entries`` row sits under OLD_KEY here
-    -- no ``thread_transcripts`` counterpart yet -- so reading NEW_KEY must
-    chain through ``_adopt_legacy`` on the old key before there is anything
-    to adopt from it."""
-    aid = _mail_agent(client, auth_headers)
-    _sql(
-        "INSERT INTO curie.workflow_state_entries "
-        "(id, agent_id, binding_scope, namespace, key, value, version) "
-        "VALUES (:id, :a, NULL, 'transcript', :k, CAST(:v AS jsonb), 1)",
-        id=uuid.uuid4(),
-        a=uuid.UUID(aid),
-        k=OLD_KEY,
-        v=json.dumps(HISTORY),
-    )
-
-    read = client.get(_url(aid, NEW_KEY), headers=auth_headers)
-    assert read.status_code == 200, read.text
-    assert read.json()["value"] == HISTORY
 
 
 def test_pre_identity_thread_key_for_refuses_a_second_binding_on_the_pair() -> None:

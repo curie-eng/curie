@@ -38,6 +38,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from ..binding import CONNECTOR_CALLER_TOKEN_ENV, MAX_TURNS_ENV, RUNNER_TOKEN_ENV
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
+from .docker import DockerSandboxClient
 from .types import (
     AGENT_LABEL,
     MANAGED_BY_LABEL,
@@ -1106,9 +1107,22 @@ class SandboxSubstrate:
         if agent_name:
             labels[AGENT_LABEL] = agent_name
 
+        # Docker has no warm pools and passes connector secrets directly to
+        # the runner. The rendered pool check applies only to Kubernetes.
+        pool = (
+            config.warm_pool
+            if isinstance(self._k8s, DockerSandboxClient)
+            else claim_warm_pool(
+                config.warm_pool,
+                env,
+                agent_name,
+                config.agent_pools,
+                config.connector_secret_pools,
+            )
+        )
         self._k8s.create_claim(
             name,
-            pool=claim_warm_pool(config.warm_pool, env, agent_name, config.agent_pools),
+            pool=pool,
             env=env,
             labels=labels,
             runner_resources=runner_resources,

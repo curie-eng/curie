@@ -206,6 +206,10 @@ fn slack_free_serving_release_is_ready_and_points_at_cluster_message() {
         "must point at cluster message: {summary}"
     );
     assert!(
+        summary.contains("cluster eval"),
+        "must point at cluster eval: {summary}"
+    );
+    assert!(
         !summary.contains("no way to be reached"),
         "that claim is the bug: {summary}"
     );
@@ -214,6 +218,7 @@ fn slack_free_serving_release_is_ready_and_points_at_cluster_message() {
         "Slack is unset: {summary}"
     );
     assert!(run.human.contains("cluster message"), "{}", run.human);
+    assert!(run.human.contains("cluster eval"), "{}", run.human);
     assert_human_json_agree(&run);
 }
 

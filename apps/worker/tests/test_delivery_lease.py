@@ -19,9 +19,11 @@ The API this file pins, for the implementer of ``delivery_lease.py``:
       .acquire(stream, group, entry_id, *, consumer)  -> DeliveryLease
           raises LeaseRefused, whose ``.reason`` is "held" (a live lease exists)
           or "not-owner" (we do not hold the PEL row)
-      .heartbeat(stream, group, entry_id, *, consumer, owner, generation)
+      .heartbeat(stream, group, entry_id, *, consumer, owner, generation,
+                 resume_event_id)
           -> DeliveryBudget | None   (None == fail-closed refusal, lease lost)
-      .release(stream, group, entry_id, *, owner) -> bool   (compare-and-delete)
+      .release(stream, group, entry_id, *, owner, resume_event_id) -> bool
+          (compare-and-delete)
       .settle(stream, group, entry_id) -> None    (lease AND state key removed)
       .is_live(stream, group, entry_id) -> bool   (the cheap reclaim-path read)
       .peek(stream, group, entry_id) -> dict[str, str]   ({} when absent)
@@ -168,7 +170,8 @@ def test_acquire_refuses_a_replacement_while_the_lease_is_live(names) -> None:  
             # Once A's lease is gone, the very same call is granted.
             assert (
                 await store.release(
-                    config.stream, config.consumer_group, entry, owner=lease_a.owner
+                    config.stream, config.consumer_group, entry, owner=lease_a.owner,
+                    resume_event_id=None,
                 )
                 is True
             )
@@ -303,6 +306,7 @@ def test_heartbeat_refuses_a_wrong_owner_token(names) -> None:  # noqa: ANN001
                 consumer="worker-a",
                 owner="not-the-owner-token",
                 generation=lease.generation,
+                resume_event_id=None,
             )
             assert refused is None
 
@@ -315,6 +319,7 @@ def test_heartbeat_refuses_a_wrong_owner_token(names) -> None:  # noqa: ANN001
                 consumer="worker-a",
                 owner=lease.owner,
                 generation=lease.generation,
+                resume_event_id=None,
             )
             assert renewed is not None
 
@@ -350,6 +355,7 @@ def test_heartbeat_refuses_a_stale_fencing_generation(names) -> None:  # noqa: A
                 consumer="worker-b",
                 owner=lease_b.owner,
                 generation=lease_a.generation,
+                resume_event_id=None,
             )
             assert refused is None
 
@@ -361,6 +367,7 @@ def test_heartbeat_refuses_a_stale_fencing_generation(names) -> None:  # noqa: A
                 consumer="worker-b",
                 owner=lease_b.owner,
                 generation=lease_b.generation,
+                resume_event_id=None,
             )
             assert renewed is not None
 
@@ -388,6 +395,7 @@ def test_heartbeat_refuses_once_the_pel_row_is_owned_by_someone_else(names) -> N
                     consumer="worker-a",
                     owner=lease.owner,
                     generation=lease.generation,
+                    resume_event_id=None,
                 )
                 is not None
             )
@@ -403,6 +411,7 @@ def test_heartbeat_refuses_once_the_pel_row_is_owned_by_someone_else(names) -> N
                 consumer="worker-a",
                 owner=lease.owner,
                 generation=lease.generation,
+                resume_event_id=None,
             )
             assert refused is None
 
@@ -438,6 +447,7 @@ def test_heartbeat_extends_the_lease_without_bumping_times_delivered(names) -> N
                     consumer="worker-a",
                     owner=renewed.owner,
                     generation=renewed.generation,
+                    resume_event_id=None,
                 )
                 assert anchor is not None
                 # Every successful renewal re-anchors on a fresh server TIME, so
@@ -482,7 +492,8 @@ def test_release_is_compare_and_delete_so_a_stale_token_frees_nothing(names) -> 
 
             assert (
                 await store.release(
-                    config.stream, config.consumer_group, entry, owner="stale-owner-token"
+                    config.stream, config.consumer_group, entry, owner="stale-owner-token",
+                    resume_event_id=None,
                 )
                 is False
             )
@@ -490,7 +501,8 @@ def test_release_is_compare_and_delete_so_a_stale_token_frees_nothing(names) -> 
 
             assert (
                 await store.release(
-                    config.stream, config.consumer_group, entry, owner=lease.owner
+                    config.stream, config.consumer_group, entry, owner=lease.owner,
+                    resume_event_id=None,
                 )
                 is True
             )

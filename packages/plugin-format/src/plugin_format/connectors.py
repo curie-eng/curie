@@ -777,14 +777,18 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                             "would expand empty.",
                         )
                     )
-            elif len(secret_env_names) > 1:
+            elif len(secret_env_names) > 1 and any(isinstance(s, str) for s in spec.secrets):
+                # All-`SecretRef` connectors are exempt (#3057): a `SecretRef` is
+                # the server's own upstream credential, delivered only to the pod
+                # under ADR-0090, so it implies no client auth and there is no
+                # correct `bearer_secret` to name.
                 errors.append(
                     (
                         "connectors.bearer_secret_required",
-                        f"{where}: a hosted connector with more than one secret must "
-                        "set `bearer_secret` to the name the Authorization header "
-                        "expands. Picking secrets[0] is positional and binds every "
-                        "declared name into the sandbox.",
+                        f"{where}: a hosted connector with more than one secret, any "
+                        "of them a plain string, must set `bearer_secret` to the name "
+                        "the Authorization header expands. Picking secrets[0] is "
+                        "positional and binds every declared name into the sandbox.",
                     )
                 )
         seen_secret_names: set[str] = set()

@@ -840,7 +840,9 @@ so Curie can re-read the issue, keep its one status comment, and set the
 `curie-factory:*` state labels. **Metadata: Read** is already implied by repository
 installation discovery.
 
-Give the App **Checks: Read**, **Commit statuses: Read**, and **Actions: Read**.
+Give the App **Checks: Read** and **Commit statuses: Read** (the factory
+preflight names whichever of those two the installation does not grant), and
+**Actions: Read**.
 The Actions permission lets repair rounds include the failing job's log tail.
 Without it, CI verdicts still use checks and commit statuses; the repair prompt
 keeps the check summary and says `Job log unavailable.` After a factory
@@ -871,11 +873,13 @@ against every criterion, and ends in one pull request or a stated reason. Any
 other bundle can take its place; the platform does not require this one.
 
 The bundle reads the issue through the GitHub MCP server installed by
-`examples/dark-factory/runner.Dockerfile` on the platform runner, with its own
+`examples/dark-factory/runner.Dockerfile` in a runner layer the bundle
+declares in `connectors.yaml` (ADR-0173), with its own
 `GITHUB_PERSONAL_ACCESS_TOKEN` bound at deploy
-(`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). A deploy still
-starts the platform image, which does not contain that server, until the
-bundle can declare the layer (#3216). Give it a token
+(`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). The platform
+runner does not contain that server, so run
+`curie build --plugin-dir examples/dark-factory --registry <ref>` before the
+deploy; the deploy refuses the bundle until its lock records the layer. Give it a token
 limited to **Issues: Read and write**. Its `toolPolicy` allows `github/get_issue`
 and `github/add_issue_comment`, and the bundle's review gate hook allows that
 comment only once, to post unresolved findings after a failed or capped review,
@@ -899,6 +903,22 @@ replaces the agent's claimed sandboxes. Deploying a bundle with no runner entry
 clears that agent's earlier value. That agent gets its own
 SandboxTemplate rendering the digest, and the runner prewarm DaemonSet pulls it
 on every node. A tag is refused at render time.
+
+A layer only runs on the platform runner it was built on. `curie cluster deploy`
+compares the lock's `runner.base` digest with the installation's runner (the
+release's `agentSandbox.runner` digest, else its tag or the chart appVersion
+resolved in the registry) and refuses a mismatch, or a runner it cannot
+determine, with the fix `curie build --plugin-dir <dir> --registry <ref>
+--runner-image <installed runner>`. `curie cluster upgrade` compares the current
+runner with the one the target release renders. When they differ, or either
+cannot be determined, it names every agent in `agentSandbox.runnerImages` before
+upgrading, in the plan and `--dry-run` output too, and clears those entries in
+the same `helm upgrade`. After that upgrade it deletes those agents'
+SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
+starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
+layer until their owners rebuild with `curie build` and redeploy. Both checks need
+docker buildx and registry access to resolve runner digests: without it, `curie
+cluster deploy` refuses and `curie cluster upgrade` clears every layer.
 
 For a run that can last three hours, set an illustrative $100 USD cap after
 deploying the agent:
@@ -1143,7 +1163,7 @@ forks work with no further step.
 A missing input is refused, with every missing name listed, before the cluster
 or GitHub is touched. `curie dev factory-e2e run --scenario <name>` runs the
 preflight and then one scenario driver: `issue-to-pr`, `revision`,
-`cancel-waiting`, `cancel-running` or `evaluation`. `evaluation` runs six
+`cancel-waiting`, `cancel-running`, `quiesce` or `evaluation`. `evaluation` runs six
 labelled tickets (a correct change, a seeded failing test, an ambiguous
 request, an unavailable dependency, an execution-deadline budget, and a
 malicious instruction) on the configured model and again on
@@ -1243,6 +1263,30 @@ of the three runs `curie cluster work-items <id> --json` at every state it
 judges and requires exit 0 with the api's state and request statuses, and
 requires exit 1 for an unknown id. The evidence records every id, delivery,
 comment, pull request head, status seen with its time, and CLI read.
+
+`run --scenario quiesce [--issue-file <ticket.md>]` is the live proof for
+issue #3198 that the worker upgrade quiesce marker clears after a cancelled
+`helm upgrade`. It needs `CURIE_FACTORY_MODEL_API_KEY` so the seed request
+stays `running`. Path A runs `helm upgrade --reuse-values --timeout 60s`, which
+the client cancels while the drain gate waits; the marker must stay
+`quiescing` on a lease no longer than one drain lease, `curie doctor` must
+report `marker expires in`, and a second labelled issue must stay `waiting`
+with the paused-for-upgrade status comment. The driver then SIGKILLs the drain
+process through the node's container runtime, so no SIGTERM handler can clear
+the marker, and deletes the Job. The marker must read `claims_enabled` within
+one lease plus slack, and a worker must claim the queued request. The kill needs
+ssh with passwordless sudo and `crictl` on the drain pod's node (the node name,
+or `CURIE_FACTORY_NODE_SSH_HOST`); without it the run fails rather than passing
+on SIGTERM cleanup. Path B deletes the drain Job
+while a 20 minute upgrade still waits; the marker must clear within 10 s and
+the drain pod log must say the gate was terminated. Helm treats a deleted hook
+Job as finished and goes on with the upgrade, so path B records the helm exit
+code without judging it. The evidence judges
+`seed_status_before`, `baseline_state`, the `path_a_*` helm exit, elapsed,
+state and ttl fields, `doctor_worker_claims_line`, `paused_comment_found`,
+`queued_status_while_quiesced`, `path_a_clear_seconds`,
+`queued_status_after_release`, the `path_b_*` clear and
+log fields, and `final_state`.
 
 ### Reading work item outcomes
 
@@ -1592,6 +1636,26 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
+### Bundles that carry their own stdio MCP servers (0.11.0)
+
+From 0.11.0 the platform runner no longer contains `mcp-server-github` or
+`slack-mcp` (#3230). The shipped `examples/dark-factory`,
+`examples/github-issues` and `examples/mean-tester` bundles now declare a
+runner layer in `connectors.yaml` that installs them. An agent already running
+one of these bundles loses its server on `curie cluster upgrade` alone, because
+the platform runner is what changes. After upgrading to 0.11.0, rebuild and
+redeploy each such agent from the updated bundle:
+
+```bash
+curie build --plugin-dir examples/dark-factory --registry <ref>
+curie cluster deploy --plugin-dir examples/dark-factory --agent <agent> ...
+```
+
+The same applies to your own bundle if it ships a `runner.Dockerfile`: declare
+`runner.build` in its `connectors.yaml`, or nothing builds it. A deploy of a
+bundle with a `runner.Dockerfile` and no `runner:` declaration prints a warning
+saying so.
+
 ### State-identity migration (Alembic revision 0037)
 
 Before upgrading to a release containing revision 0037, take a
@@ -1718,11 +1782,20 @@ re-supplied or the upgrade rotates them out from under a running database.
 
 ```bash
 helm get values <release> -n <ns> -o yaml > values.yaml
-helm upgrade <release> <chart> -n <ns> -f values.yaml
+helm upgrade <release> <chart> -n <ns> -f values.yaml --timeout <minimum>s
 ```
 
-`curie cluster up` and `curie apply` do this without asking the operator to
-choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
+Set `<minimum>` from the `curie.ai/minimum-helm-timeout-seconds` annotation on
+the chart's rendered pre-upgrade drain Job, using the same chart, values file,
+and overrides as the upgrade. That annotation accounts for the effective drain
+wait, the Job's 120 second allowance, the effective worker termination grace,
+and 60 seconds for scheduling and Helm operations. The default is 2940 seconds.
+Raising `worker.deliveryBudgetSeconds` raises the effective drain wait and
+termination grace automatically, so read the annotation for the customized
+values instead of reusing the default timeout.
+
+`curie cluster up` and `curie apply` preserve values without asking the operator
+to choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
 `config.schemaVersion` on the release, run pure migrations from supported
 v0.8.x user values onto the v0.9.0 schema (legacy extraEnv entries with a
 first-class successor, external Secret references), and overlay the result so
@@ -1756,7 +1829,7 @@ helm get values <release> -n <ns> -o yaml > values.yaml
 helm list -n <ns>                       # note the revision
 
 # 3. Upgrade
-helm upgrade <release> <chart> -n <ns> -f values.yaml
+helm upgrade <release> <chart> -n <ns> -f values.yaml --timeout <minimum>s
 
 # 4. Import into RustFS
 IP=$(kubectl get svc -n <ns> <release>-rustfs -o jsonpath='{.spec.clusterIP}')

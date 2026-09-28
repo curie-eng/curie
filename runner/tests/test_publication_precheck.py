@@ -386,7 +386,6 @@ def test_refused_proposal_can_be_corrected_with_a_file_change_in_the_same_turn(
 @pytest.mark.parametrize(
     ("status", "reply", "reason"),
     [
-        (200, {"result": "metadata_changed"}, "metadata_only_unsupported"),
         (409, {"detail": {"code": "stale_context"}}, "stale_context"),
         (503, {"detail": "precheck_unavailable"}, "precheck_unavailable"),
     ],
@@ -409,8 +408,30 @@ def test_remote_refusal_is_actionable_and_does_not_park_the_turn(
             frames = await _run(runner, model, _event(_context(head, url)))
             _assert_refusal(model, gate, frames, reason)
             assert len(calls) == 1
-            if reason == "metadata_only_unsupported":
-                assert "file" in model.permissions[0].message.casefold()
+
+    anyio.run(go)
+
+
+def test_body_only_revision_reaches_publication_approval(
+    tmp_path: Path,
+    workspace: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        repo, head = workspace
+        changed_body = "Correct the pull request body for CI.\n"
+        async with _api([(200, {"result": "metadata_changed"})]) as (url, calls):
+            runner = await _boot(tmp_path, repo, url, monkeypatch)
+            gate = runner._approval_gate
+            assert gate is not None
+            model = _PublicationModel(
+                gate, [("bodyfix", {"title": TITLE, "body": changed_body})]
+            )
+            frames = await _run(runner, model, _event(_context(head, url)))
+            assert frames[-1]["status"] == "awaiting-approval"
+            assert gate.publication_body == changed_body
+            assert gate.publication_title == TITLE
+            assert len(calls) == 1
 
     anyio.run(go)
 
@@ -609,16 +630,21 @@ def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
         def __init__(self) -> None:
             super().__init__()
             self.message_count = 0
+            self.offered_publication = False
 
         async def respond(self, request: Request) -> StreamingResponse:
             self.message_count += 1
-            # The first response can arrive during SDK tool catalog setup;
-            # offer the same tool call again after that setup completes.
-            frames = (
-                _tool_use_frames(PLATFORM_PUBLISH_TOOL_NAME, {"title": TITLE, "body": BODY})
-                if self.message_count <= 2
-                else _text_frames("The publication request was refused.")
-            )
+            names = self._names(await request.json())
+            self.tool_lists.append(names)
+            # Setup requests may arrive before the platform tool is available.
+            # Offer one call only after the real request advertises that tool.
+            if PLATFORM_PUBLISH_TOOL_NAME in names and not self.offered_publication:
+                self.offered_publication = True
+                frames = _tool_use_frames(
+                    PLATFORM_PUBLISH_TOOL_NAME, {"title": TITLE, "body": BODY}
+                )
+            else:
+                frames = _text_frames("The publication request was refused.")
             return StreamingResponse(_sse(frames), media_type="text/event-stream")
 
     stream_ids: list[str] = []
@@ -715,6 +741,7 @@ def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
                     await runner.close()
 
         assert provider.message_count >= 2
+        assert provider.offered_publication is True
         assert stream_ids == ["toolu_loopback_1"]
         assert hook_ids == stream_ids
         assert permission_ids == stream_ids

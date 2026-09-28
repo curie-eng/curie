@@ -35,14 +35,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary,
-    ScheduleList, Version,
+    ApprovalRecord, ChannelBinding, HookFireRecord, MemoryEntry, MetricPoint, MetricSeries,
+    MetricsSummary, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
-    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, HookFireOutput, HookOutput,
+    KillOutput, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
+    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -252,7 +252,8 @@ fn locked_schedule_list() -> serde_json::Value {
                         "schedule": "30 2 * * *",
                         "zone": "UTC",
                         "last_fire_at": "2026-09-25T02:30:00Z",
-                        "last_outcome": "failed"
+                        "last_outcome": "failed",
+                        "paused": false
                     }
                 ]
             }
@@ -419,6 +420,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Pending" => ApprovalsOutput::Pending {
                 agent: "a".to_string(),
                 records: vec![approval_record()],
+                routes: Default::default(),
                 truncated: false,
             },
             "Resolved" => ApprovalsOutput::Resolved { record: approval_record() },
@@ -495,12 +497,37 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "HookFireOutput",
+        samples![
+            "DryRun" => HookFireOutput::DryRun(plan()),
+            "Record" => HookFireOutput::Record(
+                serde_json::from_value::<HookFireRecord>(serde_json::json!({
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "agent_id": "11111111-1111-4111-8111-111111111111",
+                    "agent": "acme-bot",
+                    "name": "nightly-cleanup",
+                    "trigger": "cron",
+                    "slot_utc": "2026-09-26T12:00:00Z",
+                    "outcome": "ran",
+                    "started_at": "2026-09-26T12:00:00Z",
+                    "ended_at": "2026-09-26T12:00:01Z"
+                }))
+                .unwrap(),
+            ),
+        ],
+    );
+    m.insert(
         "SchedulesOutput",
         samples![
             "DryRun" => SchedulesOutput::DryRun(plan()),
             "List" => SchedulesOutput::List(
                 serde_json::from_value::<ScheduleList>(locked_schedule_list()).unwrap(),
             ),
+            "Control" => SchedulesOutput::Control(curie::api::ScheduleControl {
+                agent: "acme-bot".to_string(),
+                name: "nightly-cleanup".to_string(),
+                paused: true,
+            }),
         ],
     );
     m.insert(
@@ -561,6 +588,19 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => CommsOutput::DryRun(plan()),
             "Done" => CommsOutput::Done { connected: true },
+        ],
+    );
+    m.insert(
+        "HookOutput",
+        samples![
+            "DryRun" => HookOutput::DryRun(plan()),
+            "Config" => HookOutput::Config {
+                id: "11111111-1111-4111-8111-111111111111".to_string(),
+                agent: "acme-bot".to_string(),
+                hook_partitions: Some(BTreeMap::new()),
+                source_bindings: Some(BTreeMap::new()),
+            },
+            "Secret" => HookOutput::Secret { secret: "example-secret".to_string() },
         ],
     );
     m.insert(

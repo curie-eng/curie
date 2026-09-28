@@ -43,6 +43,7 @@ from starlette.concurrency import run_in_threadpool
 from .config import Settings
 from .factory_progress import PhaseView, phase_view, pill_for
 from .factory_reply_target import ReplyTarget, parse_reply_target
+from .factory_usage import usage_line, work_item_usage
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     ExecutionRequest,
@@ -101,6 +102,10 @@ _CAUSE_TEXT = {
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
     "runner_failed": "the run ended without a result.",
+    "approval_create_failed": (
+        "the requested approval could not be created. Check the publication "
+        "request or approval service, then retry."
+    ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
     "execution_deadline": "the run did not finish before its deadline.",
@@ -556,6 +561,11 @@ async def _render(
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
             )
+            # Tokens and estimated cost over every round of the work item
+            # (#3223), after the Cause line so its parse is unchanged.
+            usage = usage_line(await work_item_usage(session, work_item.id))
+            if usage is not None:
+                result = result.rstrip("\n") + "\n" + usage + "\n"
     publishing = (
         await session.scalar(
             select(Publication.id)
