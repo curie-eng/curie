@@ -25,6 +25,8 @@ Realizing path, named so the implementation has one:
 `curie_worker.blocks.expired_approval_card`,
 `curie_worker.slack_sink.SlackReplyAdapter`,
 `curie_worker.approvals.ApprovalClient.get`,
+`curie_worker.publication_loop.PublicationReconciler._settle_card`,
+`curie_worker.publication_store.PostgresPublicationStore.pending_result`,
 `curie_worker.approval_cards.ApprovalCardStore`,
 `curie_worker.kernel.Kernel._pause_for_approval`,
 `curie_worker.kernel.Kernel._finalize_settled_card`,
@@ -108,7 +110,7 @@ Both settling paths still render through the one module in the dispatcher, and
   loser's refresh (a 409) keeps the header it read, because a 409 body names who
   resolved the approval but not the outcome.
 - The worker reads `resolved_at` from the row with the verdict it already reads,
-  and hands it to the Slack adapter as one entry of the settle message's
+  on the resume path and on the publication path alike, and hands it to the Slack adapter as one entry of the settle message's
   existing `fields` list: label `Decided`, value an RFC 3339 instant in UTC. The
   kernel says when, as data; the adapter chooses how to show it. An adapter that
   renders fields generically shows the instant as text, and one that ignores
