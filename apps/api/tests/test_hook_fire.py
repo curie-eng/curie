@@ -16,6 +16,7 @@ from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
 from curie_api.killswitch import kill_key
 from curie_api.models import HookRun
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
@@ -233,3 +234,71 @@ def test_open_row_skips_without_a_new_turn(
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "skipped"
     assert len(_payloads_for("nightly-cleanup")) == before
+
+
+def _bind(agent_id: str, address: str, identity: str) -> None:
+    """A Slack binding under a named identity, written below the API: this
+    installation declares only the default identity, and the route key is the
+    triple (ADR-0168 decision 3), so one address can carry several."""
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+                        "VALUES (:id, :agent, 'slack', :address, :identity)"
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "agent": uuid.UUID(agent_id),
+                        "address": address,
+                        "identity": identity,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_a_target_bound_under_several_identities_fires_as_the_default_one(
+    tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A trigger names an address, never an identity, as the cron loop reads it."""
+    root = _bundle(tmp_path, [{**_cron("identity-check", "0 9 * * *"), "target": "C0EXAMPLE1"}])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-fire-identities", channel="C0EXAMPLE1"
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    _bind(agent_id, "C0EXAMPLE1", "second-bot")
+
+    fired = _fire(client, auth_headers, "acme-fire-identities", "identity-check")
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["outcome"] is None
+    [queued] = _payloads_for("identity-check")
+    handle = queued["reply_handle"]
+    assert (handle["kind"], handle["channel"], handle["adapter"]) == (
+        "slack",
+        "C0EXAMPLE1",
+        "default",
+    )
+
+
+def test_a_target_bound_under_several_identities_none_default_fails(
+    tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Without the default identity among them, several routes are ambiguous."""
+    root = _bundle(tmp_path, [{**_cron("ambiguous-check", "0 9 * * *"), "target": "C0EXAMPLE2"}])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-fire-no-default", channel="C0EXAMPLE1"
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    _bind(agent_id, "C0EXAMPLE2", "second-bot")
+    _bind(agent_id, "C0EXAMPLE2", "third-bot")
+
+    fired = _fire(client, auth_headers, "acme-fire-no-default", "ambiguous-check")
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["outcome"] == "failed"
+    assert _payloads_for("ambiguous-check") == []
