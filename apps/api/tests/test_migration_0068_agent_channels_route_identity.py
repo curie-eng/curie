@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -197,6 +198,122 @@ def test_upgrade_refuses_a_slack_notification_target_that_carries_an_endpoint() 
     assert "C0EXAMPLE4" in message
     assert "never-echo-me" not in message and "127.0.0.1" not in message
     assert _sql("SELECT version_num FROM curie.alembic_version") == [(BELOW,)]
+
+
+def _printed_fix_body(message: str) -> dict[str, Any]:
+    """The PATCH body the refusal tells the operator to send."""
+
+    bodies = re.findall(r"the body (\{[^}]*\})", message)
+    assert len(bodies) == 1, message
+    parsed: dict[str, Any] = json.loads(bodies[0])
+    return parsed
+
+
+@pytest.mark.usefixtures("isolated_migration_db")
+def test_the_printed_fix_is_a_body_the_released_api_accepts() -> None:
+    """The pre-flight fires while only v0.10.x API pods serve, and v0.10.x
+    refuses an adapter without an endpoint (`ChannelBindingWrite._check_route`)
+    and ignores an `adapter` query parameter. Clearing both route fields is
+    the one rebind it accepts, and it means the default identity after the
+    upgrade; a named identity is bound once the upgrade has finished."""
+
+    command.upgrade(_cfg(), BELOW)
+    agent = _agent("custom-transport")
+    _bind(agent, "slack", "C0EXAMPLE2", endpoint=SECRET_ENDPOINT, adapter="proof-offline")
+
+    with pytest.raises(RuntimeError) as err:
+        command.upgrade(_cfg(), REVISION)
+
+    message = str(err.value)
+    assert _printed_fix_body(message) == {
+        "kind": "slack",
+        "address": "<address>",
+        "endpoint": None,
+        "adapter": None,
+    }
+    assert "?kind=slack&address=<address> " in message, message
+    assert "&adapter=" not in message, message
+    assert "named identity can be bound once the upgrade has finished" in message, message
+
+
+def _owed_approval(
+    agent: uuid.UUID,
+    channel: str,
+    *,
+    adapter: str | None,
+    status: str = "pending",
+    resolved: bool = False,
+    resumed: bool = False,
+) -> uuid.UUID:
+    """A Slack approval raised through an endpoint, in a given lifecycle state."""
+
+    approval_id = uuid.uuid4()
+    _sql(
+        "INSERT INTO curie.approvals (id, agent_id, conversation_id, author, summary, "
+        "reply_kind, reply_channel, reply_placeholder, reply_endpoint, reply_adapter, "
+        "dedupe_key, status, resolved_at, resumed_at) "
+        "VALUES (:id, :agent, 'th-0068', 'U1', 'seeded', 'slack', :channel, NULL, "
+        ":endpoint, :adapter, :dedupe, :status, "
+        "CASE WHEN :resolved THEN now() END, CASE WHEN :resumed THEN now() END)",
+        {
+            "id": approval_id,
+            "agent": agent,
+            "channel": channel,
+            "endpoint": SECRET_ENDPOINT,
+            "adapter": adapter,
+            "dedupe": uuid.uuid4().hex,
+            "status": status,
+            "resolved": resolved,
+            "resumed": resumed,
+        },
+    )
+    return approval_id
+
+
+@pytest.mark.usefixtures("isolated_migration_db")
+def test_upgrade_refuses_an_owed_approval_raised_through_a_custom_transport_by_name() -> None:
+    """Its resume replays the transport's adapter slug verbatim, which names no
+    identity once its binding is rebound, so the turn would be dropped. The
+    pre-flight names it instead, so it is settled first and never lost."""
+
+    command.upgrade(_cfg(), BELOW)
+    agent = _agent("custom-approver")
+    _bind(agent, "slack", "C0EXAMPLE7")
+    pending = _owed_approval(agent, "C0EXAMPLE7", adapter="proof-offline")
+    unresumed = _owed_approval(
+        agent, "C0EXAMPLE7", adapter="proof-offline", status="approved", resolved=True
+    )
+
+    with pytest.raises(RuntimeError) as err:
+        command.upgrade(_cfg(), REVISION)
+
+    message = str(err.value)
+    assert message.startswith("cannot upgrade to 0068:"), message
+    assert str(pending) in message and str(unresumed) in message, message
+    assert "custom-approver" in message and "C0EXAMPLE7" in message
+    assert "proof-offline" in message
+    assert "never-echo-me" not in message and "127.0.0.1" not in message
+    assert _sql("SELECT version_num FROM curie.alembic_version") == [(BELOW,)]
+
+
+@pytest.mark.usefixtures("isolated_migration_db")
+def test_a_settled_custom_transport_approval_and_a_stub_approval_do_not_block() -> None:
+    """Pins: a resumed approval owes nothing, and a Slack reply endpoint with
+    no adapter is the CLI stub's per-turn base, which becomes `default`."""
+
+    command.upgrade(_cfg(), BELOW)
+    agent = _agent("settled")
+    _bind(agent, "slack", "C0EXAMPLE8")
+    settled = _owed_approval(
+        agent, "C0EXAMPLE8", adapter="proof-offline", status="approved",
+        resolved=True, resumed=True,
+    )
+    stub = _owed_approval(agent, "C0EXAMPLE8", adapter=None)
+
+    command.upgrade(_cfg(), REVISION)
+
+    replies = dict(_sql("SELECT id, reply_adapter FROM curie.approvals"))
+    assert replies == {settled: "proof-offline", stub: "default"}
 
 
 @pytest.mark.usefixtures("isolated_migration_db")
