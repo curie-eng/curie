@@ -9641,8 +9641,8 @@ mod tests {
         route_write_refusal, routing_warning, seed_env_if_missing, select_in_force_deployment,
         select_passthrough_env, sweep_json_row, sweep_table_row, unbound_approval_routes,
         validate_channel_binding, validate_notification_target, ApprovalGateDecl, DeclaringVersion,
-        DeployTier, DownPlan,
-        EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
+        DeployTier, DownPlan, EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown,
+        SweepRow,
     };
     use serde::Deserialize;
     use serde_json::json;
