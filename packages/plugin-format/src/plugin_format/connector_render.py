@@ -445,17 +445,18 @@ def substitute(value: str, subs: dict[str, str]) -> str:
     return value
 
 
-def _readiness_probe() -> dict[str, Any]:
-    """``tcpSocket`` on the connector port.
+def _readiness_probe(port: str = "http") -> dict[str, Any]:
+    """``tcpSocket`` on the named container port.
 
     The connector spec declares no health path today, so the probe checks the
     one thing every MCP server must do: accept a connection on its port. That
     catches a server that hangs before binding, fails to bind, or listens on
-    the wrong port (#3058).
+    the wrong port (#3058). The caller proxy gets the same probe on its own
+    port, because with a proxy that is the port the Service targets.
     """
 
     return {
-        "tcpSocket": {"port": "http"},
+        "tcpSocket": {"port": port},
         "initialDelaySeconds": 2,
         "periodSeconds": 10,
         "timeoutSeconds": 3,
@@ -638,6 +639,7 @@ def _proxy_container(agent: str, spec: ConnectorSpec, proxy: ConnectorProxy) -> 
             },
         ],
         "ports": [{"name": _CALLER_PORT_NAME, "containerPort": port}],
+        "readinessProbe": _readiness_probe(_CALLER_PORT_NAME),
         "securityContext": {
             "allowPrivilegeEscalation": False,
             "readOnlyRootFilesystem": True,
