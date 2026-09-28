@@ -2016,3 +2016,17 @@ def test_every_shipped_sre_bot_connector_renders_a_readiness_probe() -> None:
         dep = r.render_deployment("curie", "sre-bot", "curie", name, spec, "s")
         (container,) = dep["spec"]["template"]["spec"]["containers"]
         assert "readinessProbe" in container, name
+
+
+# @spec ADR-0168 d7
+def test_a_proxied_connector_is_ready_only_when_its_proxy_accepts() -> None:
+    # The Service targets the proxy's port, so a proxy that never binds must
+    # take the pod out of the Service the way a server that never binds does.
+    for spec in (HOSTED, HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})):
+        containers = _containers(_proxied(spec))
+        proxy = containers[r.CALLER_PROXY_CONTAINER]
+        assert proxy["readinessProbe"]["tcpSocket"] == {"port": "caller"}
+        assert {"name": "caller", "containerPort": r.caller_proxy_port(spec)} in proxy["ports"]
+        assert "livenessProbe" not in proxy
+        assert "startupProbe" not in proxy
+        assert containers["server"]["readinessProbe"]["tcpSocket"] == {"port": "http"}
